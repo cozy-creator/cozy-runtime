@@ -28,12 +28,13 @@ from cozy_runtime.author import Cut, split  # noqa: E402
 from cozy_runtime.author._errors import MEMORY_EXHAUSTED, Fault, classify, fault  # noqa: E402
 from cozy_runtime.author._split import install as install_split  # noqa: E402
 from cozy_runtime.internal import attention_ulysses, execution  # noqa: E402
-from cozy_runtime.internal.execution import catch  # noqa: E402
+from cozy_runtime.internal.execution import catch, cuts  # noqa: E402
 from execution_models import (  # noqa: E402
     Card,
     checkpoint,
     memory,
     placed,
+    scores,
     transformer,
     vae,
 )
@@ -61,9 +62,9 @@ def test_varena_s_exhausted_is_the_one_memory_error() -> None:
     it is, it fails the attempt as capacity and never the process."""
     mem, x = memory(1 << 20), torch.ones(64)
     with (
+        Card(limit=1),
         mem.request("exhausted") as r,
         execution.serving(r),
-        Card(limit=1),
         pytest.raises(Exception) as raised,
     ):
         catch.settle(lambda: x * 2, None, (x,))
@@ -94,7 +95,7 @@ def test_ooms_at_seeded_random_ops_in_a_transformer_change_nothing(
     card, xs = Card(seed=seed, rate=0.04), [tokens(n) for n in range(3)]
     with torch.no_grad():
         want = [plain(x) for x in xs]
-        with mem.request(f"random-{seed}") as r, execution.serving(r), card:
+        with card, mem.request(f"random-{seed}") as r, execution.serving(r):
             got = [model(x) for x in xs]
     assert card.refused, "the seed ran nothing out"
     assert all(torch.equal(a, b) for a, b in zip(got, want, strict=True))
@@ -113,31 +114,38 @@ def test_a_small_card_cuts_ffn_tokens_and_attention_and_keeps_the_cuts(tmp_path:
     with torch.no_grad():
         want = plain(x)
         first, again = Card(limit=64 << 10), Card(limit=64 << 10)
-        with mem.request("short") as r, execution.serving(r), first:
+        with first, mem.request("short") as r, execution.serving(r):
             got = model(x)
         assert first.refused and r.stats().cuts >= 2
         assert torch.equal(got, want)
-        with mem.request("short again") as r, execution.serving(r), again:
+        with again, mem.request("short again") as r, execution.serving(r):
             got = model(x)
     assert torch.equal(got, want)
     assert again.refused == 0, "the cuts that fit were not applied up front"
 
 
-def test_a_vae_decode_runs_in_conv_norm_and_elementwise_bands(tmp_path: Path) -> None:
-    """At 36 KiB no [16, 32, 32] activation of the decoder fits beside its input: its convs,
-    group norms, SiLUs, adds and nearest upsampling run in row bands, results on the device."""
+def banded(func: Any) -> bool:
+    """The ops a band cut serves: their working memory spans their operands (`Card`)."""
+    return func.overloadpacket in catch.RULES
+
+
+def test_a_vae_decode_runs_in_conv_norm_and_upsampling_bands(tmp_path: Path) -> None:
+    """At 36 KiB no [16, 32, 32] conv, group norm or nearest upsampling of the decoder fits
+    with its working memory: they run in row bands, results on the device."""
     plain = vae()
     mem = memory()
     model = placed(mem, checkpoint(tmp_path, "vae", plain), "vae", vae)
     z = torch.randn(1, 4, 16, 16, generator=torch.Generator().manual_seed(2)).to(BF16)
-    card = Card(limit=36 << 10)
+    card = Card(limit=36 << 10, working=banded)
     with torch.no_grad():
         want = plain.decode(z).sample
-        with mem.request("decode") as r, execution.serving(r), card:
+        with card, mem.request("decode") as r, execution.serving(r):
             got = model.decode(z).sample
     assert card.refused and r.stats().cuts >= 1
     # every band is the whole op's but group norm's statistics, merged from the bands in
     # float32 (`test_each_band_rule_is_the_whole_op`): an ulp of bf16 where they round apart
+    error = (got.float() - want.float()).abs().max().item()
+    print(f"vae decode in bands: max error {error:.3g} against whole")
     torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
 
 
@@ -152,7 +160,7 @@ def test_ooms_at_seeded_random_ops_in_a_vae_decode_change_nothing(
     card = Card(seed=seed, rate=0.05)
     with torch.no_grad():
         want = plain.decode(z).sample
-        with mem.request(f"decode-{seed}") as r, execution.serving(r), card:
+        with card, mem.request(f"decode-{seed}") as r, execution.serving(r):
             got = model.decode(z).sample
     assert card.refused
     torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
@@ -160,11 +168,9 @@ def test_ooms_at_seeded_random_ops_in_a_vae_decode_change_nothing(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
-    """Every op band at levels 1-3 against the op whole, on real CPU kernels: conv (with its
-    halo), constant pad, nearest upsampling, add and mul are bit-exact. SiLU and GELU are too in
-    bf16; in float32 the CPU's SIMD and scalar paths differ by an ulp where a band's elements fall
-    (a GPU computes every element alike). Group norm's statistics merge the bands' in float32,
-    equal up to that rounding."""
+    """Every op band at levels 1-3 against the op whole, on real CPU kernels, each one's measured
+    max error printed: conv (with its halo), constant pad and nearest upsampling are bit-exact;
+    group norm's statistics merge the bands' in float32, equal up to that rounding."""
     aten = torch.ops.aten
     gen = torch.Generator().manual_seed(9)
     x = torch.randn(1, 16, 32, 32, generator=gen).to(dtype)
@@ -173,10 +179,6 @@ def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
         "conv": (aten.convolution.default, (x, w, b, [1, 1], [1, 1], [1, 1], False, [0, 0], 1)),
         "pad": (aten.constant_pad_nd.default, (x, [1, 1, 2, 2], 0.5)),
         "upsample": (aten.upsample_nearest2d.vec, (x, [64, 64], None)),
-        "silu": (aten.silu.default, (x,)),
-        "gelu": (aten.gelu.default, (x,)),
-        "add": (aten.add.Tensor, (x, x.flip(-1))),
-        "mul": (aten.mul.Tensor, (x, b.view(16, 1, 1))),
         "group_norm": (aten.native_group_norm.default, (x, b, b, 1, 16, 1024, 4, 1e-6)),
     }
     for name, (func, args) in cases.items():
@@ -185,12 +187,45 @@ def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
         assert plan is not None and plan.finest >= 3, name
         for level in (1, 2, 3):
             got: Any = plan(catch.Scope(name, plan.finest, level))
+            got, want = (got[0], whole[0]) if name == "group_norm" else (got, whole)
+            error = (got.float() - want.float()).abs().max().item()
+            print(f"{dtype} {name} level {level}: max error {error:.3g} against whole")
             if name == "group_norm":
-                torch.testing.assert_close(got[0], whole[0], rtol=2**-20, atol=2**-20)
-            elif name in ("silu", "gelu") and dtype == torch.float32:
-                torch.testing.assert_close(got, whole, rtol=2**-22, atol=2**-22)
+                torch.testing.assert_close(got, want, rtol=2**-20, atol=2**-20)
             else:
-                assert torch.equal(got, whole), (name, level)
+                assert torch.equal(got, want), (name, level)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_ffn_tokens_and_attention_pieces_against_the_whole(dtype: Any) -> None:
+    """FFN token pieces and attention head groups and query rows at levels 1-3 against the call
+    whole on real CPU kernels, each one's measured max error printed. A GEMM of fewer rows may
+    sum in another order on a CPU, so pieces are equal up to rounding (the output bar)."""
+    gen = torch.Generator().manual_seed(10)
+    ffn = nn.Sequential(nn.Linear(64, 256), nn.GELU(), nn.Linear(256, 64)).to(dtype)
+    x = torch.randn(2, 48, 64, generator=gen).to(dtype)
+    q, k, v = (torch.randn(1, 64, 8, 16, generator=gen).to(dtype) for _ in range(3))
+    tolerance = 2**-6 if dtype == torch.bfloat16 else 2**-18
+    with torch.no_grad():
+        whole_ffn, whole_attention = ffn(x), scores(q, k, v)
+        units = cuts._head_units(8, 1)
+        for level in (1, 2, 3):
+            pieces = {
+                "ffn tokens": (cuts._tokens(ffn, x, 96, level), whole_ffn),
+                "attention heads": (
+                    cuts._attend(lambda *t: scores(*t[:3]), q, k, v, None, 1, units[level], 64),
+                    whole_attention,
+                ),
+                "attention rows": (
+                    cuts._attend(lambda *t: scores(*t[:3]), q, k, v, None, 1, 8, 64 >> level),
+                    whole_attention,
+                ),
+            }
+            for name, (got, want) in pieces.items():
+                assert isinstance(got, torch.Tensor)
+                error = (got.float() - want.float()).abs().max().item()
+                print(f"{dtype} {name} level {level}: max error {error:.3g} against whole")
+                torch.testing.assert_close(got, want, rtol=tolerance, atol=tolerance)
 
 
 class Tiles(nn.Module):  # type: ignore[misc]
@@ -219,7 +254,7 @@ def test_a_package_split_runs_in_the_windows_rust_cuts(tmp_path: Path) -> None:
     card = Card(limit=24 << 10)  # a [8, 8, 16, 16] activation is 32 KiB
     with torch.no_grad():
         want = plain(x)
-        with mem.request("split") as r, execution.serving(r), card:
+        with card, mem.request("split") as r, execution.serving(r):
             got = model(x)
     assert card.refused and r.stats().cuts >= 1
     assert torch.equal(got, want)
@@ -319,12 +354,113 @@ def test_a_bare_block_runs_again_with_its_generators_and_declared_state_back() -
 def test_an_oom_on_one_rank_becomes_the_same_cut_on_every_rank(tmp_path: Path, short: int) -> None:
     """Two gloo ranks: one runs out allocating its exchange's buffers in the first pass. It
     recovers locally mid-pass (both cross every head at once), and from the next pass both
-    agree its finer level and cross the heads in halves. Every pass is degree 1's result."""
+    agree its finer level and cross the heads in halves. Measured, the collective block runs
+    bare; out of memory there both fail typed with no replay, and the next pass at those shapes
+    runs under the layer. Every pass that completes is degree 1's result."""
     argv = [sys.executable, str(AGREEMENT), str(tmp_path), "--degree", "2", "--short", str(short)]
     subprocess.run(argv, env=ENV, check=True)
     rows = [json.loads((tmp_path / f"rank-{rank}.json").read_text()) for rank in range(2)]
-    assert [row["refused"] for row in rows] == [int(rank == short) for rank in range(2)]
+    assert [row["refused"] for row in rows] == [1 + int(rank == short) for rank in range(2)]
     for row in rows:
-        assert all(p["byte_equal"] for p in row["passes"]), row
-        heads = [p["exchanged_heads"] for p in row["passes"]]
-        assert heads == [[8], [4, 4], [4, 4]], row
+        passes = row["passes"]
+        assert all(p["byte_equal"] for n, p in enumerate(passes) if n != 3), row
+        assert passes[3]["failed"] == "device_out_of_memory", row
+        heads = [p["exchanged_heads"] for n, p in enumerate(passes) if n != 3]
+        assert heads == [[8], [4, 4], [4, 4], [4, 4]], row
+        assert [p["layered"] for p in passes] == [True, False, False, False, True], row
+
+
+# ------------------------------------------------------------ in place, park, package code
+
+
+class UpBlock(nn.Module):  # type: ignore[misc]
+    """A VAE up-block's shape: norm, SiLU, conv; the SiLU's input is dead after it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.norm, self.conv = nn.GroupNorm(4, 16), nn.Conv2d(16, 16, 3, padding=1)
+
+    def forward(self, x: Any) -> Any:
+        return self.conv(torch.nn.functional.silu(self.norm(x)))
+
+
+class Decoder(nn.Module):  # type: ignore[misc]
+    _no_split_modules = ("UpBlock",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.up = UpBlock()
+
+    def forward(self, x: Any) -> Any:
+        return self.up(torch.nn.functional.interpolate(x, scale_factor=2.0))
+
+
+def decoder() -> Decoder:
+    torch.manual_seed(12)
+    model = Decoder()
+    model.to(BF16).eval()
+    return model
+
+
+def test_a_silu_whose_input_is_dead_runs_in_place_else_needs_the_park(tmp_path: Path) -> None:
+    """At 40 KiB the up-block's [16, 32, 32] SiLU beside its input does not fit. Cold, nothing
+    has shown its input dead: Rust's answers reach Park, and a CPU has nothing to park, so the
+    request is exhausted. Once a run has shown the input dead, the SiLU runs in place, the norm
+    and conv in bands, and the result is the whole one."""
+    plain = decoder()
+    ck = checkpoint(tmp_path, "decoder", plain)
+    x = torch.randn(1, 16, 16, 16, generator=torch.Generator().manual_seed(13)).to(BF16)
+    with torch.no_grad():
+        want = plain(x)
+        cold = memory()
+        model = placed(cold, ck, "decoder", decoder)
+        with (
+            pytest.raises(Exception) as raised,
+            Card(limit=40 << 10),
+            cold.request("cold") as r,
+            execution.serving(r),
+        ):
+            model(x)
+        assert fault(raised.value) is Fault.EXHAUSTED and r.stats().parks >= 1
+        warm = memory()
+        model = placed(warm, ck, "decoder", decoder)
+        with warm.request("warm") as r, execution.serving(r):
+            assert torch.equal(model(x), want)
+        card = Card(limit=40 << 10)
+        with card, warm.request("short") as r, execution.serving(r):
+            got = model(x)
+    assert card.refused and r.stats().parks == 0
+    error = (got.float() - want.float()).abs().max().item()
+    print(f"up-block, SiLU in place, norm and conv in bands: max error {error:.3g} against whole")
+    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
+
+
+class Short(TorchDispatchMode):  # type: ignore[misc]
+    """The next `target` op runs out of memory once while `armed`, as an allocation would."""
+
+    def __init__(self, target: Any) -> None:
+        super().__init__()
+        self.target, self.armed, self.attempts = target, False, 0
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        if self.armed and func is self.target:
+            self.attempts += 1
+            if self.attempts == 1:
+                raise torch.OutOfMemoryError("out of memory. Tried to allocate 24 KiB")
+        return func(*args, **(kwargs or {}))
+
+
+def test_a_package_s_code_between_passes_is_caught(tmp_path: Path) -> None:
+    """An op outside every block (a package's code between passes) runs under the request's
+    layer: out of memory it asks Rust like any op and runs again."""
+    plain = transformer()
+    mem = memory()
+    model = placed(mem, checkpoint(tmp_path, "dit", plain), "dit", transformer)
+    x, short = tokens(3), Short(torch.ops.aten.mul.Tensor)
+    with torch.no_grad():
+        want = plain(x) * 2
+        with short, mem.request("between") as r, execution.serving(r):
+            h = model(x)
+            short.armed = True
+            got = h * 2
+    assert short.attempts == 2 and torch.equal(got, want)

@@ -3,7 +3,9 @@ varena's host pages with the catch installed, and a card that runs out of memory
 
 The card is a dispatch mode under the catch: an op whose result and largest operand pass its
 `limit` raises torch's `OutOfMemoryError` after telling the allocator's OOM observer the bytes,
-as torch does; with a seed, an op runs out at seeded random points (each such op once).
+as torch does; with a seed, an op runs out at seeded random points (each such op once). With
+`working` it counts operands only for those ops (their working memory spans them, a conv's); any
+other op runs out only when its result alone passes the limit.
 """
 
 from __future__ import annotations
@@ -63,9 +65,15 @@ def placed[M: nn.Module](
 class Card(TorchDispatchMode):  # type: ignore[misc]
     """A device that runs out of memory (module docstring)."""
 
-    def __init__(self, limit: int = 0, seed: int | None = None, rate: float = 0.0) -> None:
+    def __init__(
+        self,
+        limit: int = 0,
+        seed: int | None = None,
+        rate: float = 0.0,
+        working: Callable[[Any], bool] = lambda func: True,
+    ) -> None:
         super().__init__()
-        self.limit, self.rate = limit, rate
+        self.limit, self.rate, self.working = limit, rate, working
         self.random = random.Random(seed) if seed is not None else None
         self.refused = 0
 
@@ -74,7 +82,8 @@ class Card(TorchDispatchMode):  # type: ignore[misc]
         if any(r.alias_info is not None for r in func._schema.returns) or func._schema.is_mutable:
             return out
         made = sum(t.numel() * t.element_size() for t in catch.tensors(out))
-        read = max((t.numel() * t.element_size() for t in catch.tensors(args)), default=0)
+        sizes = (t.numel() * t.element_size() for t in catch.tensors(args))
+        read = max(sizes, default=0) if self.working(func) else 0
         short = self.limit and made and made + read > self.limit
         if short or (self.random is not None and made and self.random.random() < self.rate):
             self.refused += 1

@@ -1,10 +1,13 @@
 """Two or more gloo ranks agree the Ulysses cut level once per pass (varena-slim §1).
 
 Each rank loads a tiny sharded attention model through varena's host pages, with the catch
-installed, and runs three passes in one request. In the first, one rank's exchange runs out of
-memory allocating its buffers: Rust answers it locally (never a cut mid-pass) and keeps the finer
-level, so from the second pass every rank crosses the heads in the same smaller groups. Every
-pass must equal degree 1, byte for byte. One JSON report per rank.
+installed, and runs five passes in one request. In the first (unmeasured: under the per-op
+layer), one rank's exchange runs out of memory allocating its buffers: Rust answers it locally
+(never a cut mid-pass) and keeps the finer level, so from the second pass every rank crosses the
+heads in the same smaller groups. Measured, the second and third run their collective block
+bare. In the fourth every rank runs out in its bare exchange: no rank runs it again, each fails
+typed, and the fifth (the same shapes) runs under the layer. Every pass that completes equals
+degree 1, byte for byte. One JSON report per rank.
 """
 
 from __future__ import annotations
@@ -24,13 +27,16 @@ from tensorfs.varena import GpuId
 from tensorfs.varena.torch import Declared, Memory, Weights
 from torch import nn
 from torch.multiprocessing.spawn import spawn
-from torch.utils._python_dispatch import TorchDispatchMode
+from torch.utils._python_dispatch import TorchDispatchMode, _get_current_dispatch_mode
 
+from cozy_runtime.author._errors import classify
 from cozy_runtime.internal import attention_ulysses, execution
 from cozy_runtime.internal.execution import catch
 from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
 
 DIM, HEADS, ROWS = 64, 8, 37
+#: whether each forward of `Sharded` ran under the per-op layer
+LAYERED: list[bool] = []
 
 
 def scores(query: Any, key: Any, value: Any, **options: Any) -> Any:
@@ -51,6 +57,7 @@ class Sharded(nn.Module):
         )
 
     def forward(self, x: Any, parallel: Any = None) -> Any:
+        LAYERED.append(isinstance(_get_current_dispatch_mode(), catch.Layer))
         b, s, _ = x.shape
         q, k, v = (p(x).view(b, s, HEADS, DIM // HEADS) for p in (self.q, self.k, self.v))
         return dispatch_attention_fn(q, k, v, backend=self.member, parallel_config=parallel)
@@ -120,13 +127,18 @@ def rank_main(rank: int, degree: int, root: Path, short: int) -> None:
         passes: list[dict[str, Any]] = []
         with torch.no_grad():
             whole = plain(x).tensor_split(degree, dim=1)[rank]
-            with mem.request("agreement") as r, execution.serving(r), injector:
-                for n in range(3):
-                    injector.armed = rank == short and n == 0
+            with injector, mem.request("agreement") as r, execution.serving(r):
+                for n in range(5):
+                    injector.armed = (rank == short and n == 0) or n == 3
                     exchanged.clear()
-                    got = model(mine, config)
-                    equal = bool(torch.equal(got, whole))
-                    passes.append({"exchanged_heads": list(exchanged), "byte_equal": equal})
+                    row: dict[str, Any] = {}
+                    try:
+                        got = model(mine, config)
+                        row["byte_equal"] = bool(torch.equal(got, whole))
+                    except Exception as exc:
+                        row["failed"] = classify(exc).code
+                    row |= {"exchanged_heads": list(exchanged), "layered": LAYERED[-1]}
+                    passes.append(row)
         report = {"rank": rank, "refused": injector.refused, "passes": passes}
         (root / f"rank-{rank}.json").write_text(json.dumps(report))
     finally:
