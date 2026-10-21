@@ -1,0 +1,1 @@
+The no_network fence also refuses name lookups (`socket.gethostbyname`, `gethostbyaddr`, `getnameinfo`) and a `socket.sendmsg` that names an address, except over the executor's AF_UNIX seam. A `sendmsg` with no address goes where its socket's fenced connect went.

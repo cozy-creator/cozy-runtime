@@ -30,7 +30,8 @@ BYTES = b"a\r\nb\nc\x1ad\x00"
 #: The executor's fence, armed as at its boot; then an async entrypoint (its loop's self-pipe is
 #: a loopback pair on Windows) and non-blocking dials, each refused or admitted: the same pair
 #: spelled out and its listener dialled over UDP, another process's 127.0.0.1 listener (port in
-#: argv) plainly and after a UDP bind to its port, and a remote address after a free bind to it.
+#: argv) plainly and after a UDP bind to its port, and a remote address after a free bind to it;
+#: then name lookups, a UDP `sendmsg` to an address, and a `sendmsg` on a connected pair.
 FENCED = """
 import asyncio, json, socket, sys, time
 from pathlib import Path
@@ -55,6 +56,15 @@ deadline = time.monotonic() + 30
 result, outcome, _ = attempt(app.get("main"), {}, Invocation("f", Path(sys.argv[1]), deadline))
 print(outcome.terminal, outcome.message, result and result.result)
 
+def tried(call):
+    try:
+        call()
+    except FenceViolation as exc:
+        return exc.fence
+    except OSError:
+        pass
+    return "admitted"
+
 def dial(address, decoy=False, free=False, kind=socket.SOCK_STREAM):
     if decoy:
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -63,13 +73,7 @@ def dial(address, decoy=False, free=False, kind=socket.SOCK_STREAM):
         udp.bind(address)
     client = socket.socket(socket.AF_INET, kind)
     client.setblocking(False)
-    try:
-        client.connect(address)
-    except FenceViolation as exc:
-        return exc.fence
-    except OSError:
-        pass
-    return "admitted"
+    return tried(lambda: client.connect(address))
 
 service = ("127.0.0.1", int(sys.argv[2]))
 with socket.create_server(("127.0.0.1", 0)) as listener:
@@ -79,6 +83,15 @@ dials["service"] = dial(service)
 dials["udp decoy"] = dial(service, decoy=True)
 if sys.platform == "linux":
     dials["free bind"] = dial(("192.0.2.1", 44444), decoy=True, free=True)
+dials["gethostbyname"] = tried(lambda: socket.gethostbyname("cozy.invalid"))
+dials["gethostbyaddr"] = tried(lambda: socket.gethostbyaddr("127.0.0.1"))
+numeric = socket.NI_NUMERICHOST | socket.NI_NUMERICSERV
+dials["getnameinfo"] = tried(lambda: socket.getnameinfo(("192.0.2.1", 53), numeric))
+if hasattr(socket.socket, "sendmsg"):
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    dials["udp sendmsg"] = tried(lambda: udp.sendmsg([b"x"], [], 0, ("192.0.2.1", 53)))
+    ours, theirs = socket.socketpair()
+    dials["pair sendmsg"] = tried(lambda: ours.sendmsg([b"x"]))
 print(json.dumps(dials))
 """
 
@@ -156,7 +169,7 @@ def test_a_kernel_build_is_absent_where_the_os_cannot_end_its_tree(tmp_path: Pat
     assert kernel_compile.wait(store, job).state == "absent"
 
 
-def test_an_async_call_runs_under_the_network_fence_which_still_refuses_loopback(
+def test_an_async_call_runs_under_the_network_fence_which_refuses_every_other_egress(
     tmp_path: Path,
 ) -> None:
     with socket.create_server(("127.0.0.1", 0)) as service:
@@ -171,7 +184,9 @@ def test_an_async_call_runs_under_the_network_fence_which_still_refuses_loopback
     assert ran == "succeeded  Reply(total=3)", fenced.stdout
     # Only where Python pairs loopback TCP (no AF_UNIX) is its own pair admitted.
     own = "admitted" if getattr(socket, "AF_UNIX", None) is None else "no_network"
-    refused = {"udp to own pair": "no_network", "service": "no_network", "udp decoy": "no_network"}
-    if sys.platform == "linux":
-        refused["free bind"] = "no_network"
-    assert json.loads(dials) == {"own pair": own, **refused}, fenced.stdout
+    refused = ["udp to own pair", "service", "udp decoy", "gethostbyname", "gethostbyaddr"]
+    refused += ["getnameinfo", *(["free bind"] if sys.platform == "linux" else [])]
+    sends = {"udp sendmsg": "no_network", "pair sendmsg": "admitted"}
+    expected = {"own pair": own, **dict.fromkeys(refused, "no_network")}
+    expected |= sends if hasattr(socket.socket, "sendmsg") else {}
+    assert json.loads(dials) == expected, fenced.stdout

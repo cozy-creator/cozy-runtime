@@ -45,12 +45,17 @@ WEIGHT_SUFFIXES: tuple[str, ...] = (
     ".cozy",
 )
 
-#: Audit events that are network egress under any spelling. ONE definition, shared by every
-#: process in this runtime that claims to have no outbound network (cr-042).
+#: Audit events that are network egress under any spelling, name lookups included. ONE
+#: definition, shared by every process in this runtime that claims to have no outbound network
+#: (cr-042). A `sendmsg` naming no address goes where its socket's fenced connect went.
 NETWORK_EVENTS: tuple[str, ...] = (
     "socket.connect",
     "socket.getaddrinfo",
+    "socket.gethostbyname",
+    "socket.gethostbyaddr",
+    "socket.getnameinfo",
     "socket.sendto",
+    "socket.sendmsg",
     "urllib.Request",
     "http.client.connect",
     "ftplib.connect",
@@ -91,8 +96,8 @@ class FenceViolation(Exception):
 
 
 def unix_seam(event: str, args: tuple[object, ...]) -> bool:
-    """True when a `NETWORK_EVENTS` hit is an AF_UNIX connect: a local seam, not egress."""
-    if event != "socket.connect" or not args:
+    """True when a `NETWORK_EVENTS` hit is an AF_UNIX connect or send: a local seam, not egress."""
+    if event not in ("socket.connect", "socket.sendmsg") or not args:
         return False
     unix = getattr(socket, "AF_UNIX", None)  # none on Windows
     return unix is not None and getattr(args[0], "family", None) == unix
@@ -153,6 +158,7 @@ def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
             bound.add(args[0])
         elif (
             event in NETWORK_EVENTS
+            and not (event == "socket.sendmsg" and args[1:2] == (None,))
             and not (allow_unix_seam and unix_seam(event, args))
             and not _own_listener(bound, event, args)
         ):
