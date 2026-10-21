@@ -238,22 +238,16 @@ def test_real_call_selection_waits_for_each_attempt_and_same_a_keeps_content_ide
 
 
 def test_fixed_stored_lora_transform_is_ready_without_call_arguments(tmp_path: Path) -> None:
-    class FixedLayer(module_type):  # type: ignore[misc]
-        """The ordinary stored PEFT layer contract, with no external selector."""
-
-        _cozy_baked = False
-
-        def __init__(self, base: Any) -> None:
-            super().__init__()
-            self.base_layer = base
-            self.lora_A = torch.nn.ModuleDict({"fixed": torch.nn.Linear(2, 1, bias=False)})
-            self.lora_B = torch.nn.ModuleDict({"fixed": torch.nn.Linear(1, 2, bias=False)})
-            self.active_adapters = ["fixed"]
-            self.scaling = {"fixed": 1.0}
-
     root = torch.nn.Module()
     root.block = Block()
-    root.block.linear = FixedLayer(root.block.linear)
+    layer = torch.nn.Module()
+    layer._cozy_baked = False
+    layer.base_layer = root.block.linear
+    layer.lora_A = torch.nn.ModuleDict({"fixed": torch.nn.Linear(2, 1, bias=False)})
+    layer.lora_B = torch.nn.ModuleDict({"fixed": torch.nn.Linear(1, 2, bias=False)})
+    layer.active_adapters = ["fixed"]
+    layer.scaling = {"fixed": 1.0}
+    root.block.linear = layer
     values = {
         "block.linear.base_layer.weight": BASE,
         "block.linear.lora_A.fixed.weight": [[1.0, 0.0]],
