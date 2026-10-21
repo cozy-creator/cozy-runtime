@@ -69,6 +69,10 @@ jobs:
           mkdir libcuda
           cp stub/usr/local/cuda-13.0/targets/x86_64-linux/lib/stubs/libcuda.so libcuda/
           ln -s libcuda.so libcuda/libcuda.so.1
+      - name: Rust source-build installer
+        run: |
+          curl -fsSL https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init -o rustup-init
+          chmod +x rustup-init
       - uses: actions/cache/restore@v4
         with:
           path: ledger
@@ -80,6 +84,11 @@ jobs:
           docker run --rm -v "$PWD:/w" -e TRITON_LIBCUDA_PATH=/w/libcuda -e LIBRARY_PATH=/w/libcuda \
             -e LD_LIBRARY_PATH=/w/libcuda \
             --entrypoint bash "$IMAGE" -euo pipefail -c '
+              # The unreleased TensorFS git pin builds from source; the worker image carries no Rust.
+              if ! command -v cargo >/dev/null; then
+                /w/rustup-init -y --profile minimal --default-toolchain 1.99.1
+                export PATH="$HOME/.cargo/bin:$PATH"
+              fi
               uv pip install --quiet --python /opt/cozy/python/bin/python /w/source
               /opt/cozy/python/bin/python /w/tools/checks/kernel_formation.py --ledger /w/ledger/formed.jsonl
             ' | tee formation.log

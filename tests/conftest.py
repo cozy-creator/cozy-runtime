@@ -6,6 +6,7 @@ import atexit
 import functools
 import os
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -47,6 +48,24 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
 
 
 @functools.cache
+def locked() -> Path:
+    """The lock's pins as constraints, so an installed wheel gets the locked TensorFS (an
+    unreleased one is a git source), not whatever an index offers."""
+    uv = shutil.which("uv")
+    assert uv is not None
+    root = Path(tempfile.mkdtemp(prefix="cozy-locked."))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+    out = root / "locked.txt"
+    subprocess.run(
+        [uv, "export", "--frozen", "--no-dev", "--no-emit-project", "--no-hashes"]
+        + ["--project", str(Path(__file__).parent.parent), "-o", str(out)],
+        check=True,
+        capture_output=True,
+    )
+    return out
+
+
+@functools.cache
 def image_python() -> Path:
     """A REAL base interpreter that owns the runtime closure in its own site-packages —
     the shape a worker image's python actually has.
@@ -84,7 +103,7 @@ def image_python() -> Path:
     )
     runtime_wheel = next(wheels.glob("cozy_runtime-*.whl"))
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(runtime_wheel)],
+        [uv, "pip", "install", "--python", str(python), "-c", str(locked()), str(runtime_wheel)],
         check=True,
         capture_output=True,
     )
@@ -106,7 +125,9 @@ def authored_python() -> Path:
     wheel = next((root / "wheels").glob("cozy_runtime-*.whl"))
     python = sdk / "bin/python"
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(wheel)], check=True, capture_output=True
+        [uv, "pip", "install", "--python", str(python), "-c", str(locked()), str(wheel)],
+        check=True,
+        capture_output=True,
     )
     return python
 
@@ -127,7 +148,17 @@ def sample_python() -> Path:
     python = sdk / "bin/python"
     project = Path(__file__).parent.parent / "examples/marco-polo"
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(wheel), str(project)],
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "-c",
+            str(locked()),
+            str(wheel),
+            str(project),
+        ],
         check=True,
         capture_output=True,
     )

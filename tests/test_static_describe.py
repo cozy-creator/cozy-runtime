@@ -27,6 +27,7 @@ from pathlib import Path
 
 import pytest
 
+from conftest import locked
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.static_interface import StaticRefusal
@@ -531,6 +532,8 @@ def torch_free() -> Iterator[Path]:
             "install",
             "--python",
             str(root / "venv" / "bin" / "python"),
+            "-c",
+            str(locked()),
             str(runtime),
             "numpy",
         )
