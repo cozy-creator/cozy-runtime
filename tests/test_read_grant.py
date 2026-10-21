@@ -23,8 +23,11 @@ from cozy_runtime.internal.seam import Channel, sealed
 from tensord_peer import answer_read_grants
 
 
+type Stored = tuple[tensorfs.Store, str, list[tuple[str, int]]]
+
+
 @pytest.fixture
-def checkpoint(tmp_path: Path) -> tuple[tensorfs.Store, str, list[tuple[str, int]]]:
+def checkpoint(tmp_path: Path) -> Stored:
     store = tensorfs.Store(tmp_path / "store")
     writer = store.writer()
     writer.put("dit", "a.weight", "F32", [20 << 18], np.arange(20 << 18, dtype=np.float32))
@@ -51,7 +54,9 @@ def grants(
         right.close()
 
 
-def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, checkpoint) -> None:
+def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(
+    tmp_path: Path, checkpoint: Stored
+) -> None:
     store, manifest, objects = checkpoint
     layout = sealed("layout", b"a host layout varena sealed in another executor")
     try:
@@ -65,7 +70,7 @@ def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path, che
 
 
 def test_a_layout_another_process_seals_is_asked_again_until_its_one_copy_is_deposited(
-    tmp_path: Path, checkpoint
+    tmp_path: Path, checkpoint: Stored
 ) -> None:
     store, manifest, objects = checkpoint
     layout = sealed("layout", b"sealed by GPU 0 while GPU 1 asked")
@@ -81,7 +86,7 @@ def test_a_layout_another_process_seals_is_asked_again_until_its_one_copy_is_dep
 
 
 def test_a_layout_still_filling_comes_with_the_chunk_files_its_regions_fall_back_to(
-    tmp_path: Path, checkpoint
+    tmp_path: Path, checkpoint: Stored
 ) -> None:
     store, manifest, objects = checkpoint
     layout = sealed("layout", b"opened, its sealer still filling it")
@@ -99,7 +104,7 @@ def test_a_layout_still_filling_comes_with_the_chunk_files_its_regions_fall_back
 
 
 def test_chunk_files_come_in_sha256_order_named_by_their_lists_digest(
-    tmp_path: Path, checkpoint
+    tmp_path: Path, checkpoint: Stored
 ) -> None:
     store, manifest, objects = checkpoint
     with grants(tmp_path, store, {}) as (executor, _):
@@ -110,7 +115,7 @@ def test_chunk_files_come_in_sha256_order_named_by_their_lists_digest(
             os.close(file)
 
 
-def test_a_grant_of_another_chunk_list_is_refused(tmp_path: Path, checkpoint) -> None:
+def test_a_grant_of_another_chunk_list_is_refused(tmp_path: Path, checkpoint: Stored) -> None:
     store, manifest, objects = checkpoint
     with grants(tmp_path, store, {}) as (executor, _):
         with pytest.raises(RuntimeFailure, match="a different list") as refused:
@@ -119,7 +124,7 @@ def test_a_grant_of_another_chunk_list_is_refused(tmp_path: Path, checkpoint) ->
 
 
 def test_a_held_layout_carries_kept_regions_and_their_fingerprint(
-    tmp_path: Path, checkpoint
+    tmp_path: Path, checkpoint: Stored
 ) -> None:
     _, manifest, objects = checkpoint
     layout = sealed("layout", b"held layout")

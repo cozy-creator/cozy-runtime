@@ -8,6 +8,7 @@ import os
 import socket
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -27,17 +28,17 @@ from tensord_peer import answer_read_grants, model_source  # noqa: E402
 DIM, BLOCKS = 64, 4
 
 
-class Block(nn.Module):
+class Block(nn.Module):  # type: ignore[misc]
     def __init__(self) -> None:
         super().__init__()
         self.lin = nn.Linear(DIM, DIM)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Any) -> Any:
         return x + torch.relu(self.lin(x))
 
 
-class Net(nn.Module):
-    _no_split_modules = ("Block",)
+class Net(nn.Module):  # type: ignore[misc]
+    _no_split_modules: tuple[str, ...] = ("Block",)
 
     def __init__(self) -> None:
         super().__init__()
@@ -45,7 +46,7 @@ class Net(nn.Module):
         self.blocks = nn.ModuleList(Block() for _ in range(BLOCKS))
         self.head = nn.Linear(DIM, DIM)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Any) -> Any:
         x = self.embed(x)
         for block in self.blocks:
             x = block(x)
@@ -55,7 +56,7 @@ class Net(nn.Module):
 def built(grant: WeightGrant, blocks: list[str] | None = None) -> Net:
     with torch.device("meta"):
         net = Net()
-    vars(net)["_varena"] = Declared(grant, blocks=blocks)
+    net.__dict__["_varena"] = Declared(grant, blocks=blocks)
     return net
 
 
@@ -83,7 +84,7 @@ def test_a_changed_held_layout_regrants_chunks_for_a_header_only_executor(tmp_pa
         release="test",
     )
     left, right = socket.socketpair()
-    executor, asked = Executor(Channel(left), tmp_path), []
+    executor, asked = Executor(Channel(left), tmp_path), list[str]()
     serving = threading.Thread(
         target=answer_read_grants,
         args=(Channel(right), store, {backend._layout("net"): held}, asked),

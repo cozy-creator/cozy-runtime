@@ -19,7 +19,7 @@ import hashlib
 from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 from msgspec import Struct
@@ -223,7 +223,7 @@ class _Launcher:
             for i, value in zip(at, real, strict=True):
                 operands[i] = value
             # out of memory, a launch did not run: it runs again with room made (12586)
-            device = operands[at[0]].device if at else torch.device("cuda")
+            device = cast("torch.Tensor", real[0]).device if real else torch.device("cuda")
             cuts.launch(device, kernel.__name__, lambda: found[grid](*operands))
 
 
