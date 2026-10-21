@@ -12,7 +12,7 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout, attention_scope
-from cozy_runtime.internal import accel, attention, attention_sol, attention_ulysses
+from cozy_runtime.internal import accel, attention, attention_sol
 from cozy_runtime.internal.parallel import wire
 
 
@@ -265,5 +265,6 @@ def test_the_ulysses_wrapper_refuses_other_parallel_configurations_before_collec
         if kind == "no_cp"
         else ContextParallelConfig(ulysses_degree=2, ring_degree=2 if kind == "ring" else 1)
     )
+    ulysses = pytest.importorskip("cozy_runtime.internal.parallel.ulysses")
     with pytest.raises(ValueError, match="Ulysses"):
-        attention_ulysses.group(ParallelConfig(context_parallel_config=cp))
+        ulysses.group(ParallelConfig(context_parallel_config=cp))

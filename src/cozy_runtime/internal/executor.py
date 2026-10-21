@@ -2524,8 +2524,7 @@ class Executor:
                     _own_bytes, self.device_kind, host.device_entry
                 )
             _split.install(cuts.split)
-            # a TensorFS without the room hook crosses every head at once, as before it
-            attention_ulysses.install(cuts.attend, getattr(cuts, "available", None))
+            attention_ulysses.install(cuts.attend)
         backend = Backend(
             checkpoints,
             rows,

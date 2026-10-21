@@ -59,6 +59,13 @@ def test_heads_cross_in_groups_the_room_holds(
         assert row["exchanged_heads"] == groups, row
 
 
+def test_heads_that_do_not_divide_are_padded_and_dropped(tmp_path: Path) -> None:
+    # 30 heads over 4 GPUs: two zero heads cross with them and none returns.
+    for row in _ranks(tmp_path, 4, "--heads", "30"):
+        assert row["byte_equal"] and row["rel_l2_to_degree1"] == 0.0, row
+        assert row["exchanged_heads"] == [32], row
+
+
 def test_a_rank_local_wrapper_is_caught(tmp_path: Path) -> None:
     for row in _ranks(tmp_path, 2, "--rows", "67", "--heads", "4", "--plant"):
         assert not row["byte_equal"] and float(row["rel_l2_to_degree1"]) > 0.1, row
