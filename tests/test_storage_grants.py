@@ -451,9 +451,10 @@ def test_a_destination_commits_each_output_under_its_private_tag(
         # A tag resolves through its endpoint: what it names now is the endpoint's to say.
         with tensorfs.open(repo, revision=moved, endpoint=origin, cache_dir=store) as tagged:
             assert tagged.id == artifact.checkpoint
-        with tensorfs.open(
-            repo, revision=tree, endpoint=origin, cache_dir=store, local_files_only=True
-        ) as committed:
+        # Immutable local content is addressed directly; a repo's moving alias is not a
+        # cache binding for every tree it once named.
+        with tensorfs.open(tree, cache_dir=store, local_files_only=True) as committed:
+            assert committed.tree == tree
             assert committed.id == artifact.checkpoint
             array = committed.components["model"].tensors.read("w")
             assert isinstance(array, tensorfs.Array) and array.tobytes() == value
@@ -464,10 +465,17 @@ def test_a_destination_commits_each_output_under_its_private_tag(
                 assert len(files) == 1 and files[0].endswith(".cozytensors"), files
         if origin is not None:  # the chunks reached the endpoint from the store
             fresh = tmp_path / f"fresh-{value.decode()}"
-            with tensorfs.open(repo, revision=tree, endpoint=origin, cache_dir=fresh) as got:
+            with tensorfs.open(tree, endpoint=origin, cache_dir=fresh) as got:
+                assert got.tree == tree and got.id == artifact.checkpoint
                 array = got.components["model"].tensors.read("w")
                 assert isinstance(array, tensorfs.Array) and array.tobytes() == value
     assert trees[0] != trees[1]
+    # Both committed trees remain readable after the destination alias has moved again.
+    for tree, value in zip(trees, (b"one", b"two"), strict=True):
+        with tensorfs.open(tree, cache_dir=store, local_files_only=True) as kept:
+            assert kept.tree == tree
+            array = kept.components["model"].tensors.read("w")
+            assert isinstance(array, tensorfs.Array) and array.tobytes() == value
     # A new tag is private: no public tag names a default for the destination.
     with pytest.raises(tensorfs.NotFoundError):
         tensorfs.open(repo, endpoint=origin, cache_dir=tmp_path / "default")
