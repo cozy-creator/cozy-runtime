@@ -165,7 +165,7 @@ def fixture(folder: Path, device: str = "cpu") -> tuple[Any, ...]:
     root = Root(hook)
     rows = {row.name: row for row in Checkpoint(checkpoint).rows("net")}
     bakes = _Bakes(torch, root, rows, {"block"})
-    root._varena = Declared(fill=bakes.snapshot({}))
+    root._varena = Declared(fill=bakes.pending())
     model = memory.load(root, ck=checkpoint, component="net", level="gpu")
     return root, hook, bakes, model, factor_models, memory, checkpoint
 
@@ -200,6 +200,105 @@ def test_selected_bytes_and_fingerprint_base_a_same_a_b_base(tmp_path: Path) -> 
         assert torch.equal(fill_bytes(frozen, checkpoint), torch.tensor(EXPECTED["A"]))
     finally:
         memory.close()
+        checkpoint.close()
+
+
+def test_real_call_selection_waits_for_each_attempt_and_same_a_keeps_content_identity(
+    tmp_path: Path,
+) -> None:
+    root, _, bakes, model, fixed, memory, checkpoint = fixture(tmp_path)
+    placed = residency(memory, model)
+    placed.bakes["net"] = bakes
+    bakes.install_call(model)
+    seen: list[object] = []
+
+    def selected_before_prehooks(_: Any, args: Any, kwargs: Any) -> None:
+        selected = model.fill
+        assert selected is not None and selected.prefetch_ready
+        # The real immutable Fill reads the real checkpoint and selects before
+        # the mutable hook arming that follows this prepended observer.
+        value = fill_bytes(selected, checkpoint)
+        with torch.no_grad():
+            root.block.linear.weight.copy_(value)
+        seen.append(selected.prepare())
+
+    handle = root.register_forward_pre_hook(
+        selected_before_prehooks, with_kwargs=True, prepend=True
+    )
+    try:
+        for attempt, adapters in enumerate((("A", "B", None, "A"), ("A",)), 1):
+            placed.open_attempt()
+            assert model.fill is not None and not model.fill.prefetch_ready
+            assert all(current.fill is None for current in fixed)
+            raw = (fixed[0], (model, fixed[1]), (model, fixed[1]))
+            with memory.request(f"attempt-{attempt}", plan=raw) as request:
+                assert request.declared == (
+                    (fixed[0].name,),
+                    tuple(sorted((model.name, fixed[1].name))),
+                    tuple(sorted((model.name, fixed[1].name))),
+                )
+                assert model in request._pending
+                for adapter in adapters:
+                    result = root(torch.eye(2), adapter=adapter)
+                    assert torch.equal(result, torch.tensor(EXPECTED[adapter]).t())
+                    assert not request._pending
+        assert seen[0] == seen[-2] == seen[-1], "same A changed immutable content identity"
+        assert len(set(seen)) == 3, "A/B/inactive selections were conflated"
+        with memory.request("waiting", plan=raw) as waiting:
+            root(torch.eye(2), adapter="A")
+            expected_a = waiting._selected[model]
+            with memory.request("selected", plan=raw) as active:
+                root(torch.eye(2), adapter="B")
+                assert not active._pending
+                waiting.plan(raw)
+                assert waiting._selected[model] == expected_a
+                assert active._selected[model] != expected_a
+                assert model in waiting._pending, "A borrowed the globally selected B content"
+            result = root(torch.eye(2), adapter="A")
+            assert torch.equal(result, torch.tensor(EXPECTED["A"]).t())
+            assert waiting._selected[model] == expected_a and not waiting._pending
+    finally:
+        handle.remove()
+        memory.close()
+        checkpoint.close()
+
+
+def test_fixed_stored_lora_transform_is_ready_without_call_arguments(tmp_path: Path) -> None:
+    root = torch.nn.Module()
+    root.block = Block()
+    layer = torch.nn.Module()
+    layer._cozy_baked = False
+    layer.base_layer = root.block.linear
+    layer.lora_A = torch.nn.ModuleDict({"fixed": torch.nn.Linear(2, 1, bias=False)})
+    layer.lora_B = torch.nn.ModuleDict({"fixed": torch.nn.Linear(1, 2, bias=False)})
+    layer.active_adapters = ["fixed"]
+    layer.scaling = {"fixed": 1.0}
+    root.block.linear = layer
+    values = {
+        "block.linear.base_layer.weight": BASE,
+        "block.linear.lora_A.fixed.weight": [[1.0, 0.0]],
+        "block.linear.lora_B.fixed.weight": [[2.0], [3.0]],
+    }
+    writer = tensorfs.Writer(cache_dir=tmp_path)
+    component = writer.component("net", cls="", config={})
+    for key, value in values.items():
+        tensor = torch.tensor(value)
+        component.put(key, tensor.numpy(), dtype="F32", shape=list(tensor.shape))
+    checkpoint = writer.commit()
+    try:
+        rows = {row.name: row for row in Checkpoint(checkpoint).rows("net")}
+        bakes = _Bakes(torch, root, rows, {"block"})
+        assert bakes.bakes and not bakes.call_selected
+        pending = bakes.pending()
+        assert pending.prefetch_ready
+        assert pending.prepare() == bakes.snapshot({}).prepare()
+        parts = {
+            key: {"value": torch.from_dlpack(checkpoint.components["net"].tensors.read(key)).clone()}
+            for key in values
+        }
+        pending(None, parts)
+        assert torch.equal(parts["block.linear.base_layer.weight"]["value"], torch.tensor(EXPECTED["A"]))
+    finally:
         checkpoint.close()
 
 
@@ -288,42 +387,80 @@ def test_real_page_in_switches_before_prehooks_and_reuses_only_same_fingerprint(
     root, hook, bakes, model, factors, memory, checkpoint = fixture(tmp_path, "cuda:0")
     registrations, versions, copied = [], [], []
     placed = residency(memory, model)
+    placed.bakes["net"] = bakes
+
+    def retire_recordings() -> None:
+        # Normal completion calls this inside the final request, after replay.
+        recorder = graphs._RECORDERS.pop(root, None)
+        if recorder is not None:
+            graphs._shed(torch, recorder)
+        recorder = None
+        for token in tuple(placed.pins.values()):
+            token.cache.close()
+        placed.pins.clear()
+
     try:
         graphs.install(torch, object(), {"net": root})
         bakes.install_call(model)
-        with torch.inference_mode(), memory.request("switch", plan=[(model, *factors)]) as request:
-            for adapter in (None, "A", "A", "A", "B", None):
-                result = root(torch.eye(2, device="cuda"), adapter=adapter)
-                assert torch.equal(result.cpu(), torch.tensor(EXPECTED[adapter]).t())
-                registrations.append(model.ws.id)
-                assert model.fill is not None
-                versions.append(model.fill.prepare())
-                copied.append(len(memory.native.stats(memory._current().native_id)["copies"]))
-            assert registrations[1] == registrations[2] == registrations[3]
-            assert registrations[0] != registrations[1] != registrations[4]
-            assert copied[1] == copied[2] == copied[3], (
-                "same A unexpectedly refilled resident pages"
-            )
-            assert versions[0] == versions[-1]
-            assert versions[1] == versions[2] == versions[3]
-            assert len(set(versions)) == 3
-            del result
-            # This test owns the recorder; retire it before closing its Memory.
-            recorder = graphs._RECORDERS.pop(root, None)
-            if recorder is not None:
-                graphs._shed(torch, recorder)
-            recorder = None
-            for token in tuple(placed.pins.values()):
-                token.cache.close()
-            placed.pins.clear()
-            torch.cuda.synchronize(device)
-            gc.collect()
-        assert request.stats is not None and not request.cleanup_errors
-        assert request.stats.leftover == ((0, 0),), request.stats.leftover
+        with torch.inference_mode():
+            with memory.request("switch", plan=[(model, *factors)]) as request:
+                for adapter in (None, "A", "A", "A", "B", None):
+                    result = root(torch.eye(2, device=device), adapter=adapter)
+                    assert torch.equal(result.cpu(), torch.tensor(EXPECTED[adapter]).t())
+                    registrations.append(model.ws.id)
+                    assert model.fill is not None
+                    versions.append(model.fill.prepare())
+                    copied.append(len(memory.native.stats(request.native_id)["copies"]))
+                assert registrations[1] == registrations[2] == registrations[3]
+                assert registrations[0] != registrations[1] != registrations[4]
+                assert copied[1] == copied[2] == copied[3], (
+                    "same A unexpectedly refilled resident pages"
+                )
+                assert versions[0] == versions[-1]
+                assert versions[1] == versions[2] == versions[3]
+                assert len(set(versions)) == 3
+                del result
+                torch.cuda.synchronize(device)
+                gc.collect()
+            assert request.stats is not None and not request.cleanup_errors
+            assert request.stats.leftover == ((0, 0),), request.stats.leftover
+
+            warm_id = warm_recorder_id = None
+            warm_replays, warm_record_s = 0, 0.0
+            for attempt in range(2):
+                placed.open_attempt()
+                assert model.fill is not None and not model.fill.prefetch_ready
+                with memory.request(f"warm-A-{attempt}", plan=[(model, *factors)]) as request:
+                    assert model in request._pending
+                    result = root(torch.eye(2, device=device), adapter="A")
+                    assert torch.equal(result.cpu(), torch.tensor(EXPECTED["A"]).t())
+                    assert not request._pending
+                    recorder = graphs._RECORDERS.get(root)
+                    assert recorder is not None and recorder.recordings
+                    if warm_id is not None:
+                        assert model.ws.id == warm_id
+                        assert not memory.native.stats(request.native_id)["copies"], (
+                            "readiness-only activation refilled unchanged warm A"
+                        )
+                        assert id(recorder) == warm_recorder_id
+                        assert recorder.record_s == warm_record_s, "warm A recorded again"
+                        assert recorder.replays > warm_replays, "warm A did not replay"
+                    warm_id, warm_recorder_id = model.ws.id, id(recorder)
+                    warm_replays, warm_record_s = recorder.replays, recorder.record_s
+                    recorder = None
+                    del result
+                    if attempt == 1:
+                        # Keep the first A graph live across requests, then retire
+                        # it only after the second request's real replay oracle.
+                        retire_recordings()
+                    torch.cuda.synchronize(device)
+                    gc.collect()
+                assert request.stats is not None and not request.cleanup_errors
+                assert request.stats.leftover == ((0, 0),), request.stats.leftover
     finally:
-        for token in placed.pins.values():
-            token.cache.close()
-        placed.pins.clear()
+        retire_recordings()
+        torch.cuda.synchronize(device)
+        gc.collect()
         memory.close()
         checkpoint.close()
     assert not memory.models and not memory.caches

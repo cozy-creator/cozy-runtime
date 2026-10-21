@@ -442,7 +442,7 @@ class Backend:
         vars(root)["_varena"] = Declared(
             source,
             state=tuple(getattr(root, "_cozy_state", ())),
-            fill=bakes.snapshot({}) if bakes.bakes else None,
+            fill=bakes.pending() if bakes.bakes else None,
             bind=_Routes(self, rows),
         )
         return self.memory.load(root, level="ram")
@@ -627,6 +627,11 @@ class _BakeSnapshot:
     strategy: lora_bake.Strategy
     uses: tuple[_BakeUse, ...]
     owner: _Bakes
+    prefetch_ready: bool = True
+
+    @property
+    def call_selected(self) -> bool:
+        return self.owner.call_selected
 
     def prepare(self) -> str:
         return self.version
@@ -679,6 +684,7 @@ class _Bakes:
             if site == local or not lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles):
                 continue
             bake = _Bake(stored)
+            hooks: list[object]
             try:
                 hooks = list(root.get_submodule(site)._forward_hooks.values())
             except AttributeError:  # a tensor named `.weight` on no module of its own
@@ -699,8 +705,15 @@ class _Bakes:
                         bake.layer = layer
             if bake.layer is not None or bake.hooks:
                 self.bakes[stored] = bake
+        self.call_selected = any(bake.hooks for bake in self.bakes.values())
 
-    def snapshot(self, arguments: Mapping[str, object]) -> _BakeSnapshot:
+    def pending(self) -> _BakeSnapshot:
+        """Fixed transforms are already known; external selections await their real call."""
+        return self.snapshot({}, prefetch_ready=not self.call_selected)
+
+    def snapshot(
+        self, arguments: Mapping[str, object], *, prefetch_ready: bool = True
+    ) -> _BakeSnapshot:
         """Resolve metadata once; later fills never ask a mutable hook which overlay is armed."""
         strategy = self.strategy
         uses, identities = [], []
@@ -725,7 +738,7 @@ class _Bakes:
                 "weights": identities,
             }
         )
-        return _BakeSnapshot(version, strategy, tuple(uses), self)
+        return _BakeSnapshot(version, strategy, tuple(uses), self, prefetch_ready)
 
     def _flags(self) -> list[LoRALayer | LoRASource]:
         flags: list[LoRALayer | LoRASource] = []
@@ -746,6 +759,8 @@ class _Bakes:
                 raise Unbound("a nested call cannot change an active LoRA selection")
             flags = [(item, item._cozy_baked) for item in self._flags()]
             model.fill = self.active = active or selected
+            if self.call_selected:
+                model.memory._select(model, selected.prepare())
             for item, _ in flags:
                 item._cozy_baked = selected.strategy == "bake"
             try:
@@ -819,6 +834,9 @@ class Residency:
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
+        for name, bakes in self.bakes.items():
+            if bakes.call_selected:
+                self.models[name].fill = bakes.pending()
 
     def prepare_calls(self) -> None:
         """Install only after graph wrappers, so replays also select their transform first."""
@@ -850,6 +868,9 @@ class Residency:
                 if name == component:
                     token.cache.shrink(token.nbytes)
             return None
+        # A graph replay bypasses the eager prehook. The selected bytes may be
+        # unchanged warm content whose request-local edges are still pending.
+        self.memory._fresh(model)
         held = self.pins.get(key)
         if held is not None:
             return held

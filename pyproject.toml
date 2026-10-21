@@ -85,10 +85,10 @@ package = true
 # The historical SDXL development corpus keeps its own locked dependency cohort.
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
-# TensorFS 0.13 is unreleased: the matched slim/release reconciliation until the
-# cohort publishes it (never a test publish). The release replaces this with the version.
+# Post-release Varena comparison branch: pin the matching structured-metadata SDK.
+# This branch is not part of the TensorFS 0.13 shipping cohort.
 [tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "035efa1ffd6748bfc5ae7815fa6d622dfe9af6d8", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "afd1481fa1f221b2d14c7144f012adff9ebb6240", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
