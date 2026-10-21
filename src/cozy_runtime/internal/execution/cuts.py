@@ -167,14 +167,19 @@ def install(module: nn.Module) -> int:
         kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
         rms = _rms_contract(sub, kinds)
         if rms is not None and "_cozy_cut" not in vars(sub):
-            sub.forward = _rms(f"{path}:rows", *rms, sub.forward)
+            sub.forward = _rms(f"{path}:rows", *rms, _forward(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
         if any(k in _FFN for k in kinds) and "_cozy_cut" not in vars(sub):
-            sub.forward = _ffn(f"{path}:tokens", sub.forward)
+            sub.forward = _ffn(f"{path}:tokens", _forward(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
     return count
+
+
+def _forward(module: nn.Module) -> Callable[..., object]:
+    """A forward set on the instance as it is now, else its class's at each call."""
+    return vars(module).get("forward") or catch.current(module)
 
 
 def _ffn(site: str, forward: Callable[..., object]) -> Callable[..., object]:
