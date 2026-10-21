@@ -2,8 +2,8 @@
 memory allows, and the windows put together are the whole op's result.
 
 Real torch modules on the CPU. The memory is `Sizes`: it runs the split at each window size it
-is given, as varena's `cuts.split` does after each out-of-memory (its lattice is varena's own
-test, `scripts/varena-cuts.py`).
+is given, as the execution layer's `split` does at each level Rust holds (its levels run in
+`test_execution.py`).
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ class Sizes:
         self.pieces: list[int] = []
 
     def __call__(
-        self, name: str, key: str, device: Any, total: int, finest: int, run: Callable[[int], Any]
+        self, name: str, key: str, total: int, finest: int, run: Callable[[int], Any]
     ) -> Any:
         self.asked.append((name, total, finest))
         return run(self.most)

@@ -174,21 +174,6 @@ class Channel:
         finally:
             descriptor.close()
 
-    def send_memfd(self, fd: int) -> None:
-        """Transfer one weight set's pinned host tier (`tensorfs.varena` memfd)."""
-        _require_memfd(fd)
-        self._send_fd(fd, "memfd")
-
-    def recv_memfd(self) -> int:
-        """Receive exactly one memfd; anything else is closed and refused."""
-        received = self._recv_fd()
-        try:
-            _require_memfd(received)
-        except SeamError:
-            os.close(received)
-            raise
-        return received
-
     def recv_file(self) -> int:
         """Receive exactly one read-only regular file (a verified object file the machine
         hands over); anything else is closed and refused."""
@@ -207,47 +192,16 @@ class Channel:
             raise
         return received
 
-    def send_shared(self, fd: int) -> None:
-        """Transfer one exported GPU allocation (a CUDA POSIX fd: a character device)."""
-        _require_device(fd)
-        self._send_fd(fd, "GPU allocation")
-
-    def recv_shared(self) -> int:
-        """Receive exactly one exported GPU allocation; anything else is closed and refused."""
-        received = self._recv_fd()
-        try:
-            _require_device(received)
-        except SeamError:
-            os.close(received)
-            raise
-        return received
-
-    def send_lease(self, fd: int) -> None:
-        """Transfer one lease socket (the machine's half of a device-tier answer)."""
-        if not stat.S_ISSOCK(os.fstat(fd).st_mode):
-            raise SeamError("seam_descriptor", "a lease must be a socket")
-        self._send_fd(fd, "lease")
-
-    def recv_lease(self) -> int:
-        """Receive exactly one lease: a connected local stream socket, nothing else."""
-        received = self._recv_fd()
-        try:
-            if not stat.S_ISSOCK(os.fstat(received).st_mode):
-                raise SeamError("seam_descriptor", "a lease must be a socket")
-        except (OSError, SeamError):
-            os.close(received)
-            raise
-        return received
-
     def send_ledger(self, memfd: int, eventfd: int) -> None:
-        """Hand over one GPU's ledger (`tensorfs.varena.Ledger`): its memfd, then its eventfd."""
+        """Hand over one GPU's grant (`tensorfs.varena.Grant`): its table memfd, then its
+        eventfd."""
         _require_memfd(memfd)
         _require_eventfd(eventfd)
         self._send_fd(memfd, "ledger memfd")
         self._send_fd(eventfd, "ledger eventfd")
 
     def recv_ledger(self) -> list[int]:
-        """One GPU's ledger memfd and eventfd; anything else is closed and refused."""
+        """One GPU's grant: its table memfd and eventfd; anything else is closed and refused."""
         fds = self.recv_fds(2)
         try:
             _require_memfd(fds[0])
@@ -259,7 +213,7 @@ class Channel:
         return fds
 
     def recv_fds(self, count: int) -> list[int]:
-        """`count` descriptors, unopened, for a relay to pass on (`send_fds`)."""
+        """`count` descriptors, unopened."""
         received: list[int] = []
         try:
             for _ in range(count):
@@ -269,18 +223,6 @@ class Channel:
                 os.close(fd)
             raise
         return received
-
-    def send_fds(self, fds: list[int]) -> None:
-        for fd in fds:
-            self._send_fd(fd, "relayed capability")
-
-    def pass_fd(self, to: Channel) -> None:
-        """Relay one descriptor to another seam unopened: its receiver checks what it is."""
-        fd = self._recv_fd()
-        try:
-            to._send_fd(fd, "relayed capability")
-        finally:
-            os.close(fd)
 
     def _send_fd(self, fd: int, what: str) -> None:
         try:
@@ -636,16 +578,6 @@ def connect(path: str) -> Channel:
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(path)
     return Channel(sock)
-
-
-def _require_device(fd: int) -> None:
-    """An exported GPU allocation is a descriptor of the driver's character device."""
-    try:
-        mode = os.fstat(fd).st_mode
-    except OSError as exc:
-        raise SeamError("seam_descriptor", f"GPU allocation descriptor unreadable: {exc}") from exc
-    if not stat.S_ISCHR(mode):
-        raise SeamError("seam_descriptor", "a GPU allocation must be a driver descriptor")
 
 
 def anonymous(name: str, sealing: bool = False) -> int:

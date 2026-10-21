@@ -205,11 +205,11 @@ def fault(exc: BaseException) -> Fault:
             return Fault.STICKY if code in _STICKY else Fault.DEVICE
         if kind == "DistBackendError":
             return Fault.DEVICE
-    if module.startswith("tensorfs.varena"):
+    if module.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):  # varena's errors
         if kind == "Exhausted":
             return Fault.EXHAUSTED
-        if getattr(exc, "code", None) == "device":
-            return Fault.STICKY if getattr(exc, "sticky", False) else Fault.DEVICE
+        if getattr(exc, "code", "") == "DEVICE":
+            return Fault.STICKY if exc.sticky else Fault.DEVICE
         return Fault.OTHER
     if isinstance(exc, RuntimeError):
         text = str(exc)
@@ -261,7 +261,7 @@ def classify(exc: BaseException | None) -> Outcome:
     if found in (Fault.STICKY, Fault.DEVICE):
         text = f"{type(exc).__name__}: {exc}"[:400]
         return Outcome("failed", "runtime", DEVICE_FAULT, text, (), _trace(exc))
-    if type(exc).__module__.startswith("tensorfs.varena"):  # an internal memory failure
+    if type(exc).__module__.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):
         return Outcome("failed", "runtime", "memory_error", str(exc)[:400], (), _trace(exc))
     return Outcome(
         "failed",

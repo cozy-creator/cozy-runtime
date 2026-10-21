@@ -53,11 +53,7 @@ frame = channel.recv()
 fd = channel.recv_file()
 data = os.read(fd, 100)
 os.close(fd)
-cell = seam.anonymous("cozy-test")
-os.write(cell, b"from the executor")
 channel.send({"got": frame["n"], "file": data.decode()})
-channel.send_memfd(cell)
-os.close(cell)
 try:
     channel.recv_file()
 except seam.SeamError as exc:
@@ -86,10 +82,6 @@ channel.close()
             machine._send_fd(read_only, "object file")
             os.close(read_only)
             assert machine.recv() == {"got": 7, "file": "object bytes"}
-            cell = machine.recv_memfd()
-            os.lseek(cell, 0, os.SEEK_SET)
-            assert os.read(cell, 100) == b"from the executor"
-            os.close(cell)
             writable = os.open(objects, os.O_RDWR | os.O_BINARY)
             machine._send_fd(writable, "object file")
             os.close(writable)

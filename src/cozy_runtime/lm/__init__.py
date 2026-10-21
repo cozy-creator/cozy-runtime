@@ -831,7 +831,7 @@ def _derived(models: Iterable[Any]) -> list[Any]:
 
 
 def _reservation(model: Any, shed: Callable[[int], int]) -> Any:
-    """The memory's count of an engine's buffers, shed on ask (`Residency.cache`); None for a
+    """The memory's count of an engine's buffers, shed on ask (`Placement.cache`); None for a
     model Runtime does not place (its tensors are where its caller put them)."""
     placed = PLACED.get(model)
     return None if placed is None else placed[0].cache(f"lm:{type(model).__name__}", shed)
@@ -964,6 +964,8 @@ class _Engine:
         #: seconds the last admission took: decoding gets as long before the next one
         self.debt = 0.0
         self.reservation: Any = None
+        #: the bytes `reservation` counts
+        self.held = 0
         self.retire = False
         self.cache_device: Any = None
         self.open: bool | float
@@ -1107,33 +1109,19 @@ class _Engine:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
     def _hold(self, stack: ExitStack) -> bool:
-        """The model (and its head) pinned at home for the decode graphs (`Residency.pin`);
-        False when part of one streams (the calls then decode through Transformers' loop)."""
-        targets = self._targets()
+        """The decode graphs' weights at fixed addresses; False for a model the memory places
+        (its blocks bind per forward, and graph pins are not wired to varena yet: its calls
+        decode through Transformers' loop)."""
+        if self._targets():
+            return False
         # The steps also read buffers the model builds (its rotary tables): a rebuilt one (a
         # component placed again) records anew.
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
-        built = tuple(t.data_ptr() for t in derived)
-        if not targets:
-            self.where = (built,)
-            return True
-        pins = [r.pin(name, f"lm:{name}", self._unpinned) for _, (r, name) in targets]
-        if any(pin is None for pin in pins):
-            return False
-        self.where = (*pins, built)
+        self.where = (tuple(t.data_ptr() for t in derived),)
         return True
 
-    #: the pins the graphs read weights through: they live while this engine refers to them
+    #: what the graphs read weights and built buffers through
     where: tuple[object, ...] = ()
-
-    def _unpinned(self) -> int:
-        """Memory asks for the pinned weights: an idle engine lets its graphs and pins go now,
-        a busy one at its next loop."""
-        if self.idle():
-            self.where = ()
-        else:
-            self.rehold = self.stale = True
-        return 0
 
     def _cancelled(self) -> bool:
         """Whether a held row's call was cancelled: the host stops queueing steps for it."""
@@ -1410,9 +1398,8 @@ class _Engine:
                 raise
             return False
         if self.reservation is not None:
-            self.reservation.nbytes = (
-                _slot_bytes(fresh, capacity, self.draft is not None, self.text) * size
-            )
+            self.held = _slot_bytes(fresh, capacity, self.draft is not None, self.text) * size
+            self.reservation.cached(self.held)
         return True
 
     def _buffers(self, size: int, capacity: int, fresh: _Prefill) -> None:
@@ -1792,7 +1779,7 @@ class _Engine:
         self.layout = None
         if self.reservation is not None:
             self.reservation.close()
-            self.reservation = None
+            self.reservation, self.held = None, 0
 
     def idle(self) -> bool:
         """Its buffers and graphs go back when no call holds it: what the plane takes before
@@ -1810,7 +1797,7 @@ class _Engine:
     def _shed(self, nbytes: int) -> int:
         """Room the memory manager asks for under pressure: an idle engine drops its buffers;
         a busy one gives nothing (its rows are mid-flight)."""
-        before = self.reservation.nbytes if self.reservation is not None else 0
+        before = self.held
         return before if self.idle() else 0
 
 

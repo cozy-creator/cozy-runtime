@@ -260,26 +260,16 @@ class Residency(Protocol):
 
     Declared here because the contract has one home; implemented nowhere in this package,
     because it needs a device and this package is torch-free by construction. cozy-runtime
-    supplies the body on varena's memory (`internal/weights.py`).
+    supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
     """
 
-    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> object | None:
-        """Every weight of `component` bound at its home address for `owner` (a CUDA graph
-        reads them there) until memory asks for room, when `shed` drops what read them; they
-        stay bound while the returned token lives. None when part of it streams."""
-        ...
-
     def cache(self, owner: str, shed: Callable[[int], int]) -> Any:
-        """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `resize`,
-        `close` and `nbytes`; None off a GPU."""
+        """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `cached`
+        and `close`; None off a GPU."""
         ...
 
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
-        ...
-
-    def plan(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
-        """The attempt's declared steps by component name (`Context.plan`)."""
         ...
 
     #: How many attempts (requests) it has opened.

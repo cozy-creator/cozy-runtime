@@ -69,8 +69,7 @@ class ChildProcess(Protocol):
 
 class Frame(msgspec.Struct, frozen=True):
     """What rank 0 reads of every follower frame to route it: a progress event is
-    forwarded, a request is relayed to the machine, anything else is the reply to the
-    command in flight."""
+    forwarded, anything else is the reply to the command in flight."""
 
     event: str = ""
     name: str = ""
@@ -145,10 +144,6 @@ class Follower:
     replies: queue.Queue[tuple[Frame, dict[str, Any]] | None] = field(default_factory=queue.Queue)
     #: the seam-closed verdict once the reader saw EOF or a torn frame; "" while live
     gone: str = ""
-    #: a request of its own is with the machine: that wait is not its stillness; and how
-    #: many it made (a call's movement while it recovers, `RankGroup.watched`)
-    relaying: bool = False
-    relayed: int = 0
     #: a byte here aborts its collectives (its watcher thread; `RankGroup.interrupt`)
     abort: socket.socket | None = None
 
@@ -238,16 +233,25 @@ def _device(torch: ModuleType, backend: str) -> object:
 
 
 def warm(torch: ModuleType, backend: str, rank: int, world: int) -> None:
-    """GPU 0 and each follower exchange one element, so the pair's point-to-point communicator
-    (a request's broadcasts and results ride it) exists from the group's start too."""
+    """One of each collective a request uses, so NCCL connects them all as the group forms
+    (varena counts what they hold as context): GPU 0 and each follower exchange one element
+    (a request's broadcasts and results ride that pair's communicator), then the pass's level
+    agreement (an int64 max), the Ulysses row gather and its all-to-all."""
     if "nccl" not in backend:
         return
-    dist, one = torch.distributed, torch.zeros(1, device=_device(torch, backend))
+    dist, device = torch.distributed, _device(torch, backend)
+    one = torch.zeros(1, device=device)
     for peer in range(1, world) if rank == 0 else (0,):
         if rank == 0:
             dist.send(one, peer)
         else:
             dist.recv(one, peer)
+    level = torch.zeros(1, dtype=torch.int64, device=device)
+    dist.all_reduce(level, op=dist.ReduceOp.MAX)
+    rows = torch.zeros(world, dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(rows, level)
+    sent = torch.zeros(world, dtype=torch.bfloat16, device=device)
+    dist.all_to_all_single(torch.empty_like(sent), sent)
     torch.cuda.synchronize()
 
 
@@ -317,7 +321,6 @@ class RankGroup:
         root: str = "",
         sample_seconds: float = liveness.SAMPLE_SECONDS,
         forward: Callable[[dict[str, object]], None] | None = None,
-        relay: Callable[[Channel, dict[str, Any]], None] | None = None,
         launch: Callable[[list[str], int], ChildProcess] | None = None,
         devices: Iterable[str] = (),
     ) -> None:
@@ -333,8 +336,6 @@ class RankGroup:
         #: where a follower's progress frame goes: rank 0's own seam, so the worker keeps
         #: reading movement while rank 0 waits on its followers
         self.forward = forward
-        #: answers a follower's own request to the machine on its channel (rank 0's `_relay`)
-        self.relay = relay
         #: how a follower's program is started: the trampoline's `inherit` backend under
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
@@ -434,17 +435,6 @@ class RankGroup:
                     with contextlib.suppress(SeamError):
                         self.forward({**frame, "name": f"{follower.gpu}:{head.name}"})
                 continue
-            if head.event == "request" and self.relay is not None:
-                follower.relaying = True
-                try:
-                    self.relay(follower.channel, {**frame, "rank": follower.rank})
-                except SeamError as exc:
-                    follower.gone = f"{follower.gpu}'s request was not relayed: {exc}"
-                    break
-                finally:
-                    follower.relaying = False
-                    follower.relayed += 1
-                continue
             follower.replies.put((head, frame))
             if head.reply != "run" or head.ok:
                 continue
@@ -481,10 +471,9 @@ class RankGroup:
     def watched(self, name: str, device: Callable[[], int]) -> Iterator[None]:
         """A mirrored call in flight, judged by its own pace (`liveness.Pace`), never a clock:
         the reading is GPU 0's device progress (`device`), the bytes each follower moved and
-        the answers that arrived, and the requests each made of the machine for room. Every GPU
-        of a call waits on the others in its collectives, so a GPU stuck in one stops them all;
-        a spinning wait burns CPU, which is why CPU time is not in the reading. A request with
-        the machine is no stillness. Still for longer than STILL_FACTOR times the
+        the answers that arrived. Every GPU of a call waits on the others in its collectives,
+        so a GPU stuck in one stops them all; a spinning wait burns CPU, which is why CPU time
+        is not in the reading. Still for longer than STILL_FACTOR times the
         longest pause any call of this component showed (the first call learns its own, from
         its device progress) and the noise floor: the group breaks, naming the GPUs that
         have not answered. NCCL's own watchdog is off (`abortable`): this is the one that
@@ -500,12 +489,12 @@ class RankGroup:
                     (
                         device(),
                         tuple(
-                            (liveness.moved(f.pid), f.replies.qsize(), f.relayed)
+                            (liveness.moved(f.pid), f.replies.qsize())
                             for f in self.followers
                         ),
                     )
                 )
-                if pace.wedged(floor) and not any(f.relaying for f in self.followers):
+                if pace.wedged(floor):
                     quiet = [f.gpu for f in self.followers if f.replies.empty()] or ["GPU 0"]
                     self._break(f"{', '.join(quiet)} wedged in {name!r}: {pace.verdict(floor)}")
                     return
@@ -730,8 +719,6 @@ class RankGroup:
             try:
                 frame = follower.replies.get(timeout=self.sample_seconds)
             except queue.Empty:
-                if follower.relaying:
-                    continue
                 pace.observe(liveness.burn(follower.pid))
                 if pace.wedged(floor):
                     self._break(f"{follower.gpu} wedged during {name!r}: {pace.verdict(floor)}")

@@ -7,6 +7,7 @@ the one GPU case requires the existing explicit --real-gpu opt-in. No model down
 from __future__ import annotations
 
 import base64
+import os
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -91,6 +92,7 @@ def test_plain_only_output_dtypes_leave_comfy_unmeasured(dtype: str) -> None:
 
 
 def test_real_backend_serves_original_logical_dtype_from_resident_parts(tmp_path: Path) -> None:
+    from tensorfs.varena import GpuId
     from tensorfs.varena.torch import Memory
 
     from cozy_runtime.internal.fill import Checkpoint
@@ -113,7 +115,7 @@ def test_real_backend_serves_original_logical_dtype_from_resident_parts(tmp_path
     del component, writer
     checkpoint = Checkpoint(native)
     rows = checkpoint.rows("net")
-    memory = Memory.open(torch.device("cpu"))
+    memory = Memory.open(GpuId(f"cozy-comfy-{os.getpid()}", "cpu", 1 << 30))
     backend = Backend.for_script(
         {"net": checkpoint},
         rows,

@@ -178,14 +178,14 @@ def answer(
     match found:
         case Next.Retry():
             return
-        case Next.Cut(level) if scope is not None and not collective:
+        case Next.Cut(level=level) if scope is not None and not collective:
             level = min(max(level, scope.level + 1), scope.finest)
             if scope is not own:
                 raise Finer(scope, level)
             scope.level = level
-        case Next.Park(budget):
+        case Next.Park(budget=budget):
             request.parked(park(_device_of(operands), nbytes, budget, operands))
-        case Next.Exhausted(error):
+        case Next.Exhausted(error=error):
             raise error
         case _:
             raise RuntimeError(f"varena answered {found!r} for {scope}")

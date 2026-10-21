@@ -1,12 +1,14 @@
-"""CPU executor for request-memory transport tests; no simulated memory implementation."""
+"""A CPU follower executor for the request-memory tests: a real memory over host pages."""
 
 import argparse
+import os
 import socket
 from pathlib import Path
 
-import torch
+from tensorfs.varena import GpuId
 from tensorfs.varena.torch import Memory
 
+from cozy_runtime.internal import execution
 from cozy_runtime.internal.executor import Executor, serve
 from cozy_runtime.internal.seam import Channel
 
@@ -19,8 +21,9 @@ parser.add_argument("--leader")
 args = parser.parse_args()
 channel = Channel(socket.socket(fileno=args.rank_fd))
 worker = Executor(channel, args.root, rank=args.rank, world=args.world)
-worker.memory = Memory.open(torch.device("cpu"))
-worker.torch, worker.device_kind, worker.ready = torch, "cpu", True
+worker.memory = Memory.open(GpuId(f"cozy-follower-{os.getpid()}", "cpu", 1 << 30))
+worker.execution, worker.store = execution, args.root / "store"
+worker.device_kind, worker.ready = "cpu", True
 construction = worker._construction_child("construction")
 construction.ready = True
 worker.constructions["construction"] = construction

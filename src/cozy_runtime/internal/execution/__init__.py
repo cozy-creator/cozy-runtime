@@ -7,9 +7,13 @@ the catch on every model it loads (`install`); nothing else here is the executor
 
 from __future__ import annotations
 
+import functools
+import json
 from collections.abc import Sequence
+from pathlib import Path
 
-from tensorfs.varena.torch import blocks_of
+import tensorfs
+from tensorfs.varena.torch import Stats, blocks_of
 from torch import nn
 
 from cozy_runtime.internal.execution import agree, catch, cuts
@@ -17,7 +21,7 @@ from cozy_runtime.internal.execution.agree import agreed
 from cozy_runtime.internal.execution.catch import collective, serving
 from cozy_runtime.internal.execution.cuts import attend, launch, split
 
-__all__ = ["agreed", "attend", "collective", "install", "launch", "serving", "split"]
+__all__ = ["agreed", "attend", "collective", "install", "launch", "record", "serving", "split"]
 
 
 def install(module: nn.Module, state: Sequence[str] = ()) -> None:
@@ -29,3 +33,22 @@ def install(module: nn.Module, state: Sequence[str] = ()) -> None:
         catch.wrap(module.get_submodule(path), catch.Block(path, module, kept))
     catch.wrap(module, catch.Block("model", module, kept), agree.passing)
     cuts.install(module)
+
+
+def record(stats: Stats, gpu: int, device: int | None, store: Path) -> dict[str, object]:
+    """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`: TensorFS's fill
+    ceilings for CUDA `device` (None: no GPU) and `store`, and varena's record of the request
+    as its core writes it."""
+    h2d, disk = _ceiling(device, store)
+    return {
+        "gpu": gpu,
+        "ceiling": {"h2d_gbps": h2d, "disk_gbps": disk},
+        "stats": json.loads(stats.json()),
+    }
+
+
+@functools.cache
+def _ceiling(device: int | None, store: Path) -> tuple[float, float]:
+    """Measured once per executor (TensorFS times the copies)."""
+    found = tensorfs.ceiling(device=device, path=store)
+    return float(found.h2d_gbps), float(found.disk_gbps)

@@ -96,10 +96,6 @@ class Unload(Command, frozen=True, kw_only=True, tag="unload"):
     construction: str
 
 
-class KeepWeights(Command, frozen=True, kw_only=True, tag="keep_weights"):
-    construction: str
-
-
 class RequestMemory(Command, frozen=True, kw_only=True, tag="request_memory"):
     construction: str
     request_id: str
@@ -182,10 +178,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
-    #: Its GPUs' ledgers follow the frame, a memfd and an eventfd per GPU in `devices` order
-    #: (memory-varena §5.6): rank 0 claims its row in the first and hands follower r the r-th.
+    #: Its GPUs' grants follow the frame, a table and an events descriptor per GPU in `devices`
+    #: order: rank 0 opens its memory on the first and hands follower r the r-th.
     ledgers: int = 0
-    memory_mode: Literal["shared", "dedicated"] = "shared"
     #: The callables its attempts may call: their proxies are installed before the package is
     #: imported, and every attempt gets the call broker over them.
     call_interfaces: tuple[CallInterface, ...] = ()
@@ -353,7 +348,6 @@ type KnownCommand = (
     | Fork
     | Map
     | Unload
-    | KeepWeights
     | RequestMemory
     | Activate
     | Attention
