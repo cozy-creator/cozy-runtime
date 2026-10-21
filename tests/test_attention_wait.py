@@ -223,7 +223,8 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
         assert host.activate(Activate(construction="a"))["ok"]
         construction, roots = host.constructions["a"], _sites()
         construction.backend, construction.device_facts = (
-            SimpleNamespace(roots=roots, gemm_sites={}),
+            # weightless: nothing to keep past a request
+            SimpleNamespace(roots=roots, gemm_sites={}, keep=lambda quiescent=False: None),
             CPU,
         )
         construction._reselect = partial(attention.select, CPU, roots)

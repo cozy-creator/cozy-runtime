@@ -178,7 +178,7 @@ class App:
         `memoize=True` admits deterministic results to the operation cache (never for a
         writer); `memo_dependencies`/`memo_version` declare what else decides the result, and
         `Memoize(requires=("seed",))` memoizes only requests that name each listed option.
-        `components={"model": ("dit", "vae")}` names the components each model argument
+        `components={"model": ("transformer", "vae")}` names the components each model argument
         uses, so a machine fetches those first; absent means all. `on_demand=("upsampler",)`
         names the model arguments a request may leave unused: each is built, and its weights
         fetched, when the function first reads it."""

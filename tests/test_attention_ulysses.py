@@ -39,13 +39,24 @@ def test_the_wrapper_reproduces_one_process_at_degree(tmp_path: Path, degree: in
         assert any(impl in str(row["impl"]) for impl in ("flash", "efficient", "math")), row
 
 
-@pytest.mark.parametrize("degree", [2, 4])
-def test_the_exchange_runs_under_a_package_calls_recovery(tmp_path: Path, degree: int) -> None:
-    # A group GPU runs every op of its call under recovery: the exchange's collective results
-    # are wrappers with no bytes of their own, which no op may read a storage of (run 6349).
-    for row in _ranks(tmp_path, degree, "--recovery"):
-        assert row["wrapped_ops"] > 0, row
+@pytest.mark.parametrize(
+    ("degree", "room", "groups"),
+    [
+        # 1031 rows of float32: 528 KB a head on a GPU, 14.8 MB of output at degree 2
+        (2, 110 << 20, [56]),  # every head's buffers fit: 7 x 14.8 MB
+        (2, 30 << 20, [8] * 7),  # 14.8 MB of output beside 7 x 4 heads
+        (4, 16 << 20, [8] * 7),  # 7.4 MB of output beside 7 x 2 heads
+        (2, 1 << 20, [2] * 28),  # nothing fits: the smallest groups
+    ],
+)
+def test_heads_cross_in_groups_the_room_holds(
+    tmp_path: Path, degree: int, room: int, groups: list[int]
+) -> None:
+    # Each GPU reports a different room; every GPU sizes from the least, so all run the same
+    # collectives, and the result is degree 1's, byte for byte.
+    for row in _ranks(tmp_path, degree, "--room", str(room)):
         assert row["byte_equal"] and row["rel_l2_to_degree1"] == 0.0, row
+        assert row["exchanged_heads"] == groups, row
 
 
 def test_a_rank_local_wrapper_is_caught(tmp_path: Path) -> None:

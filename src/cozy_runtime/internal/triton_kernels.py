@@ -19,7 +19,7 @@ import hashlib
 from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 from msgspec import Struct
@@ -38,6 +38,7 @@ from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, to
 try:
     import torch
     import triton
+    from tensorfs.varena import cuts
     from triton.backends.compiler import BaseBackend, GPUTarget
     from triton.backends.nvidia import driver as _cuda_driver
     from triton.compiler import ASTSource
@@ -221,7 +222,9 @@ class _Launcher:
             operands = list(args)
             for i, value in zip(at, real, strict=True):
                 operands[i] = value
-            found[grid](*operands)
+            # out of memory, a launch did not run: it runs again with room made (12586)
+            device = cast("torch.Tensor", real[0]).device if real else torch.device("cuda")
+            cuts.launch(device, kernel.__name__, lambda: found[grid](*operands))
 
 
 #: Loaded sets by (name, device index).

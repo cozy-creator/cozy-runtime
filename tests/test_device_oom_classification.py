@@ -11,7 +11,6 @@ from cozy_runtime.author._errors import (
     classify,
     is_device_oom,
 )
-from cozy_runtime.internal.memory import shortage
 from cozy_runtime.internal.parallel.group import ENDED
 from cozy_runtime.internal.parallel.mirror import ending
 
@@ -25,6 +24,8 @@ ALLOCATION_FAILURES = (
     "NCCL error in: ProcessGroupNCCL.cpp:3356, unhandled cuda error, NCCL version 2.27.5\n"
     "ncclUnhandledCudaError: Call to CUDA function failed.\nLast error:\n"
     "Cuda failure 2 'out of memory'",
+    "Triton Error [CUDA]: out of memory",
+    "CUDA driver error: out of memory",
 )
 
 
@@ -59,7 +60,7 @@ def test_torch_device_oom_is_still_recognized() -> None:
 
 def test_a_plane_driver_call_out_of_device_memory_is_a_device_oom() -> None:
     """Run 10996: the weight plane's own driver calls run out of device memory too."""
-    errors = pytest.importorskip("tensorfs.plane")
+    errors = pytest.importorskip("tensorfs.varena")
     exc = errors.CudaError("cuda driver: cuEventCreate failed with CUDA_ERROR_OUT_OF_MEMORY (2)")
     assert classify(exc).code == DEVICE_OOM
     other = errors.CudaError("cuda driver: cuMemMap failed with CUDA_ERROR_INVALID_VALUE (1)")
@@ -78,14 +79,23 @@ def test_a_driver_call_out_of_device_memory_is_a_device_oom() -> None:
     assert classify(exc).code == DEVICE_OOM
 
 
-def test_a_collective_out_of_memory_is_the_groups_to_run_again() -> None:
-    """No op runs a collective again alone: its peers wait in it. The group does, and every
-    other way a GPU's part ends either keeps the group (capacity, an ended collective) or
-    breaks it (a fault)."""
+def test_a_gpu_short_of_memory_ends_the_group_call_whole() -> None:
+    """Any GPU of a group short of memory, in a collective or not, ends the attempt with the
+    group whole (memory-varena §5.5); an ended collective keeps it too, and a fault breaks it."""
     torch = pytest.importorskip("torch")
     nccl = torch.distributed.DistBackendError(ALLOCATION_FAILURES[-1])
-    assert shortage(nccl) is None and ending(nccl) == DEVICE_OOM
+    assert ending(nccl) == MEMORY_EXHAUSTED
     assert ending(torch.OutOfMemoryError("CUDA out of memory.")) == MEMORY_EXHAUSTED
-    assert ending(RuntimeFailure("the ladder ran out", code=MEMORY_EXHAUSTED)) == MEMORY_EXHAUSTED
+    assert ending(RuntimeFailure("it did not fit", code=MEMORY_EXHAUSTED)) == MEMORY_EXHAUSTED
     assert ending(torch.distributed.DistBackendError("NCCL communicator was aborted")) == ENDED
     assert ending(ValueError("a fault")) is None
+
+
+def test_varena_exhausted_is_capacity() -> None:
+    """`tensorfs.varena.torch.Exhausted`, known by its module and name, fails the attempt as
+    capacity; its `Unbound` is a weight bound to nothing, a fault."""
+    varena = pytest.importorskip("tensorfs.varena.torch")
+    peaks = (varena.Peak("unet", "1024x1024", 1 << 30, ()),)
+    exhausted = varena.Exhausted(0, 1 << 20, "bind unet", {"unet": 5 << 30}, peaks)
+    assert classify(exhausted).code == MEMORY_EXHAUSTED
+    assert classify(varena.Unbound("a weight binds to nothing")).code == "weight_unbound"

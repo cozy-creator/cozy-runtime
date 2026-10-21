@@ -421,6 +421,16 @@ def synchronize(torch: Any, kind: str) -> None:
         torch.cuda.synchronize()
 
 
+def healthy(torch: ModuleType, kind: str) -> bool:
+    """Whether the device still answers a fence: a fault is sticky (an illegal address, a copy
+    engine's), and every later call of this process fails with it."""
+    try:
+        synchronize(torch, kind)
+    except Exception:  # the fault itself, whatever torch calls it
+        return False
+    return True
+
+
 def drain(torch: Any, kind: str) -> None:
     """Wait for the CURRENT stream only: the caller's own queued work, not other streams'.
     MPS has one command queue per process: its drain is a synchronize."""

@@ -16,9 +16,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, TypedDict
 
-from cozy_runtime.author._errors import is_device_oom
-from cozy_runtime.internal import bands, spill
-
 if TYPE_CHECKING:
     from diffusers.models.attention_dispatch import AttentionBackendName
     from torch import Tensor
@@ -55,7 +52,7 @@ class Local:
     `forward(query, key, value, *, attn_mask, dropout_p, is_causal, scale, enable_gqa)`
     validates what it serves; `impl(query, key, value, options)` names the concrete
     implementation serving those operands, e.g. the SDPA backend torch dispatches. `rows`: the
-    query block a call may be cut at and compute each row as whole (`bands.Bands.attend`);
+    query block a call may be cut at and compute each row as whole (memory's `attend` cut);
     0 where the kernel needs every query row at once (a scale or mean over the sequence).
     """
 
@@ -71,6 +68,18 @@ _SEEN: ContextVar[tuple[dict[str, set[str]], set[object]] | None] = ContextVar(
     "cozy_attention_seen", default=None
 )
 _MEMBERS: dict[str, AttentionBackendName] = {}
+#: the memory's attention cut (`tensorfs.varena.cuts.attend`), installed with the memory
+_CUT: Callable[..., Tensor] | None = None
+#: what one allocation on a device may take now (`tensorfs.varena.cuts.available`; 0 unknown)
+_ROOM: Callable[[object], int] | None = None
+#: an exchange's buffers at their most, in GPU shares of the heads crossing: Q, K and V in
+#: flight, each in its exchange's layout and its result (6), and the next one being laid out
+_BUFFERS = 7
+
+
+def install(cut: Callable[..., Tensor] | None, room: Callable[[object], int] | None = None) -> None:
+    global _CUT, _ROOM
+    _CUT, _ROOM = cut, room
 
 
 @contextmanager
@@ -136,7 +145,6 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
     return attention
 
 
-@bands.cuts
 def _call(
     backend: str, local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options
 ) -> Tensor:
@@ -148,26 +156,18 @@ def _call(
         if signature not in named:
             named.add(signature)
             seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
-    if not (spill.HELD and any(map(spill.hosted, (query, key, value)))):
-        try:
-            return local.forward(query, key, value, **options)
-        except Exception as exc:
-            if not is_device_oom(exc):
-                raise
-    return _cut(local, query, key, value, options)
-
-
-def _cut(local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options) -> Tensor:
-    """Attention that ran out of device memory whole, or reads host memory, in pieces where
-    this device cuts (`bands.Bands.attend`); else whole once more, room made for its ops. Apart
-    from `_call`, whose hot path then holds no closure."""
-    cut = bands.ON.get(str(query.device))
-    rows = 0 if options["is_causal"] else local.rows
-    out = None if cut is None else cut.attend(
+    cut = _CUT
+    if cut is None:
+        return local.forward(query, key, value, **options)
+    return cut(
         lambda q, k, v, mask: local.forward(q, k, v, **{**options, "attn_mask": mask}),
-        query, key, value, options["attn_mask"], rows, local.head_local,
-    )  # fmt: skip
-    return bands.held(lambda: local.forward(query, key, value, **options)) if out is None else out
+        query,
+        key,
+        value,
+        options["attn_mask"],
+        rows=0 if options["is_causal"] else local.rows,
+        heads=local.head_local,
+    )
 
 
 def group(config: object) -> ProcessGroup:
@@ -198,7 +198,50 @@ def exchange(
 ) -> Tensor:
     """Sequence shards -> full sequence per head subset -> `compute` -> back, using Diffusers'
     unequal-length exchange in both directions (packed H3 lengths do not divide), or the
-    group's copy engines when it formed over them (`copy_engine`)."""
+    group's copy engines when it formed over them (`copy_engine`). Heads cross all at once when
+    their buffers fit the room every GPU of the group has, else in the largest groups that do
+    (`_heads`), each group's output back before the next group's Q/K/V cross."""
+    import torch
+    import torch.distributed as dist
+
+    heads, world = int(query.shape[2]), handle.size()
+    room = _ROOM(query.device) if _ROOM is not None else 0
+    mine = torch.tensor([int(query.shape[1]), room or 1 << 62], device=query.device)
+    every = [torch.empty_like(mine) for _ in range(world)]
+    dist.all_gather(every, mine, group=handle)  # every GPU sizes its groups from the same facts
+    rows, room = sum(int(e[0]) for e in every), min(int(e[1]) for e in every)
+    step = _heads(heads, world, rows * int(query.shape[3]) * query.element_size(), room)
+    if step == heads:
+        return _exchange(query, key, value, handle, compute)
+    out = query.new_empty(query.shape)
+    for at in range(0, heads, step):
+        part = slice(at, at + step)
+        out[:, :, part] = _exchange(
+            query[:, :, part], key[:, :, part], value[:, :, part], handle, compute
+        )
+    return out
+
+
+def _heads(heads: int, world: int, per_head: int, room: int) -> int:
+    """Heads one exchange moves: all of them when their buffers (`_BUFFERS` GPU shares of
+    `per_head` bytes a head, every row) fit `room`, else the largest group of whole heads on
+    each GPU, dividing them, whose buffers fit beside the output the groups fill, else the
+    smallest such group."""
+    whole = heads // world * per_head
+    groups = [s for s in range(world, heads, world) if heads % s == 0]
+    if not groups or _BUFFERS * whole <= room:
+        return heads
+    fits = (s for s in groups if whole + _BUFFERS * (s // world) * per_head <= room)
+    return max(fits, default=groups[0])
+
+
+def _exchange(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    handle: ProcessGroup,
+    compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+) -> Tensor:
     from diffusers.models.attention_dispatch import (
         all_to_all_single_any_o_async,
         all_to_all_single_any_qkv_async,
@@ -215,6 +258,7 @@ def exchange(
     waits = [all_to_all_single_any_qkv_async(t, handle, **metadata) for t in (query, key, value)]
     q, k, v = (wait() for wait in waits)
     output = compute(q, k, v)
+    del q, k, v  # not live through the output's exchange
     result = all_to_all_single_any_o_async(output, handle, **metadata)()
     if result.shape != query.shape or result.dtype != query.dtype:
         raise ValueError("Ulysses attention returned incompatible output")

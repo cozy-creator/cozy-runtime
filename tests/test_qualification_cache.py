@@ -30,6 +30,7 @@ from cozy_runtime.internal.encoding import (
     measure_device,
     measure_runtime,
 )
+from cozy_runtime.internal.encoding.adapters import CoreDequant
 from cozy_runtime.internal.probe import QualificationResult
 
 OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
@@ -59,7 +60,7 @@ def table() -> QualificationResult:
         observations=[
             msgspec.structs.replace(
                 by_name[(provider.name, dtype)],
-                encoding_spec_id=encoding,
+                scheme=encoding,
                 implementation_digest=implementation_digest(provider),
             )
             for encoding, group in providers().items()
@@ -186,12 +187,24 @@ def test_a_kept_table_missing_a_destination_measures(
         load(shipped.device, tmp_path / "qualification", dtypes=("float64",))
 
 
+def _providers() -> dict[str, Any]:
+    """The launch table less the schemes only the cores' rows serve (each row is qualified on its
+    own in test_encoding_cores): these tests are about keeping tables, and measuring 36 more rows
+    on a CPU three times over would be their whole cost."""
+    return {
+        scheme: candidates
+        for scheme, candidates in launch_providers().items()
+        if not all(isinstance(p, CoreDequant) for p in candidates)
+    }
+
+
 def test_the_gate_writes_the_table_a_load_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The release gate's own entry, on this host's CPU: its table answers the next load."""
     torch = pytest.importorskip("torch")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    monkeypatch.setattr(qualify, "launch_providers", _providers)
     monkeypatch.setattr(qualification, "SHIPPED", tmp_path)
     device, runtime = measure_device(torch, 0), measure_runtime(torch, "any")
     stale = tmp_path / f"{qualification.table_name(device, runtime).rsplit('-', 2)[0]}-0-v2.json"
@@ -202,7 +215,7 @@ def test_the_gate_writes_the_table_a_load_reads(
     assert not stale.exists() and other.exists()
     answer = qualification.qualified(
         NO_TORCH,
-        launch_providers(),
+        _providers(),
         device,
         ("float16",),
         release="any",
@@ -224,7 +237,7 @@ def test_a_machine_measures_only_what_its_table_lacks_and_keeps_both(
 
     def load_here(on: Any, dtypes: tuple[str, ...]) -> qualification.Qualification:
         return qualification.qualified(
-            on, launch_providers(), device, dtypes, release="any", runtime=runtime, cache=str(cache)
+            on, _providers(), device, dtypes, release="any", runtime=runtime, cache=str(cache)
         )
 
     first, second = load_here(torch, ("float16",)), load_here(torch, ("bfloat16",))
@@ -238,9 +251,7 @@ def test_a_machine_measures_only_what_its_table_lacks_and_keeps_both(
 
 
 def test_every_shipped_table_is_filed_under_its_own_name() -> None:
-    shipped = sorted(qualification.SHIPPED.glob("*.json"))
-    assert shipped
-    for path in shipped:
+    for path in sorted(qualification.SHIPPED.glob("*.json")):  # the release gate measures them
         table = qualification._read(path)
         assert table is not None, path
         assert f"{qualification.table_name(table.device, table.runtime)}.json" == path.name

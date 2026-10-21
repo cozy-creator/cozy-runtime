@@ -180,7 +180,7 @@ def test_a_forked_child_is_a_sealed_executor_with_the_imports_done(
 ) -> None:
     process, channel, start = zygote
     hello = _call(channel, {"cmd": "hello"})
-    assert "fork/1" in hello["memory"]
+    assert "fork/1" in hello["capabilities"]
     assert _call(channel, {**start, "import_only": True})["ok"]
     listener = _listener(tmp_path / "a.sock")
     began = time.monotonic()
@@ -224,13 +224,15 @@ def test_a_fork_refuses_what_it_cannot_keep(
 
 
 @pytest.mark.parametrize("many", [False, True])
-def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
+def test_a_model_load_without_torch_fails_and_poisons_its_generation(
     zygote: tuple[subprocess.Popen[bytes], Channel, dict[str, Any]], tmp_path: Path, many: bool
 ) -> None:
-    """A real control peer cannot turn an installed full Store into model authority."""
+    """A real control peer cannot turn an installed full Store into model authority: after a
+    weightless load, a model-bearing one in this torch-free executor fails named, and its
+    generation is poisoned (the worker replaces it)."""
     import tensorfs
 
-    store = tensorfs.Store.init(tmp_path / "store")
+    store = tensorfs.Store(tmp_path / "store")
     _process, channel, start = zygote
     assert _call(channel, start)["ok"]
     binding = {"model_class": "UnimportableModel", "store": str(store.root)}
@@ -245,23 +247,24 @@ def test_model_load_requires_sources_and_leaves_weightless_execution_usable(
         if many
         else {"binding": binding}
     )
-    loaded = _call(
-        channel,
-        {
-            "cmd": "load",
-            "construction": "weightless",
-            "devices": "",
-            "binding": {
-                "application": start["application"],
-                "package_interface": start["package_interface"],
-            },
+    weightless = {
+        "cmd": "load",
+        "construction": "weightless",
+        "devices": "",
+        "binding": {
+            "application": start["application"],
+            "package_interface": start["package_interface"],
         },
-    )
+    }
+    loaded = _call(channel, weightless)
     assert loaded["ok"], loaded
-    # A model-bearing load meets its own admission check. It does not require a particular
-    # wheel flavor or fabricate a device budget for this peer.
+    # No device budget is asked of this peer: the load reaches torch, which is not installed.
     admitted = _call(channel, command)
-    assert admitted["code"] == "authorization_absent", admitted
+    assert not admitted["ok"] and admitted["terminal"] == "failed", admitted
+    assert "No module named 'torch'" in admitted["detail"], admitted
+    again = _call(channel, weightless)
+    assert again["code"] == "poisoned_generation", again
+    assert _call(channel, {"cmd": "hello"})["torch_loaded"] is False
 
 
 def test_children_die_with_their_parent(

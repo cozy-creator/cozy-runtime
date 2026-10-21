@@ -86,24 +86,6 @@ def register_workspace(root: Path, reclaim: Callable[[int], object]) -> Registra
     return registration
 
 
-def native_write(path: Path | None, payload: int = 0, objects: int = 1) -> Write:
-    """Conservative CAS payload, atomic metadata and directory allocation bound.
-
-    Metadata uses the native document ceiling; object fanout charges an inode
-    per MiB (well above native's 64 MiB pack grid), plus per-file fanout. These
-    are transient write estimates, never TensorFS reachability or quota policy.
-    """
-    if not pressure_enabled():
-        return Write(path or Path("/"), 0, 0)
-    if path is None:
-        raise StorageRefusal("native writer has no configured Store root")
-    from cozy_runtime.internal import fill
-
-    metadata = int(fill.tensorfs_module().manifest_max_bytes())
-    blocks = (payload + (1 << 20) - 1) >> 20
-    return Write(path, payload + 4 * metadata, 3 * (objects + blocks) + 16)
-
-
 def inherit(descriptor: int | None) -> None:
     """Consume the pod's fixed descriptor before any executor is launched."""
     global _channel

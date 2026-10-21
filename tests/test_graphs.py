@@ -11,6 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cozy_runtime import graphs  # noqa: E402
+from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope  # noqa: E402
 from cozy_runtime.author._model import WARNINGS  # noqa: E402
 
 CUDA = torch.cuda.is_available()
@@ -50,6 +51,17 @@ def test_calls_on_a_cpu_run_as_written() -> None:
     assert type(module).__name__ == "Sequential" and isinstance(module, torch.nn.Sequential)
 
 
+def test_attention_layouts_bypass_graph_pins_on_a_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    """H3 scopes every DiT step: this branch must not create a recording or a lifetime pin."""
+    module = _mlp("cpu")
+    x = torch.randn(4, 64)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    with torch.inference_mode(), attention_scope(AttentionLayout(4, 0, 0)):
+        assert torch.equal(module(x), torch.nn.Sequential.__call__(module, x))
+    assert module not in graphs._RECORDERS
+
+
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
 def test_recordings_replay_across_calls_and_signatures() -> None:
     module = _mlp("cuda")
@@ -69,7 +81,8 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         finally:
             graphs.BYPASS.reset(token)
         assert recorder.replays == 4
-        assert graphs.release() and not recorder.recordings
+        graphs._shed(torch, recorder)
+        assert not recorder.recordings
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
