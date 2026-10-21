@@ -21,7 +21,7 @@ class Result(msgspec.Struct):
     files: Tree
 
 
-@pytest.mark.parametrize("bad", ["", "symlink", "oversize", "unreturned"])
+@pytest.mark.parametrize("bad", ["", "symlink", "file-symlink", "oversize", "unreturned"])
 def test_tree_snapshot_and_result_serialization(tmp_path: Path, bad: str) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -30,6 +30,8 @@ def test_tree_snapshot_and_result_serialization(tmp_path: Path, bad: str) -> Non
     (source / "nested/sketches.f32").write_bytes(b"12345678")
     if bad == "symlink":
         (source / "escape").symlink_to(tmp_path)
+    if bad == "file-symlink":
+        (source / "linked.json").symlink_to(source / "capture.json")
     app = App()
 
     @app.entrypoint(accelerator=False)
@@ -58,6 +60,7 @@ def test_tree_snapshot_and_result_serialization(tmp_path: Path, bad: str) -> Non
             outcome.code
             == {
                 "symlink": "output_tree",
+                "file-symlink": "output_tree",
                 "oversize": "output_too_large",
                 "unreturned": "unreturned_handle",
             }[bad]

@@ -37,6 +37,7 @@ from pathlib import Path
 
 import msgspec
 
+from cozy_runtime import _fs
 from cozy_runtime.internal import filelock
 
 SCHEMA = 1
@@ -149,13 +150,13 @@ class Store:
                 if name in facts:
                     entry[name] = facts.pop(name)
             _write(staging / _ENTRY, json.dumps(entry, sort_keys=True, indent=1).encode())
-            _fsync_dir(staging)
+            _fs.sync_directory(staging)
             try:
                 os.rename(staging, final)
             except OSError as exc:
                 if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                     raise
-            _fsync_dir(kernel)
+            _fs.sync_directory(kernel)
         finally:
             shutil.rmtree(staging, ignore_errors=True)
         return final
@@ -213,9 +214,7 @@ class Store:
         if self.trusted is None:
             return False
         try:
-            fd = os.open(
-                self.trusted / key.kernel / f"{key.digest}.lock", os.O_RDONLY | os.O_CLOEXEC
-            )
+            fd = os.open(self.trusted / key.kernel / f"{key.digest}.lock", os.O_RDONLY)
         except OSError:
             return False
         try:
@@ -233,7 +232,7 @@ class Store:
 
     def _open_lock(self, key: Key) -> int:
         path = self._kernel_dir(key) / f"{key.digest}.lock"
-        return os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o644)
+        return os.open(path, os.O_RDWR | os.O_CREAT | _fs.NOFOLLOW, 0o644)
 
 
 def _read(namespace: Path, key: Key, *, repair: bool) -> bytes | None:
@@ -264,19 +263,11 @@ def _read(namespace: Path, key: Key, *, repair: bool) -> bytes | None:
 
 
 def _write(path: Path, data: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _fs.BINARY, 0o644)
     try:
         view = memoryview(data)
         while view:
             view = view[os.write(fd, view) :]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def _fsync_dir(path: Path) -> None:
-    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
-    try:
         os.fsync(fd)
     finally:
         os.close(fd)

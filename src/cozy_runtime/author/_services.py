@@ -27,6 +27,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
+from cozy_runtime import _fs
 from cozy_runtime.author import _codec
 from cozy_runtime.author._activity import settle, work_clock
 from cozy_runtime.author._assets import (
@@ -742,7 +743,7 @@ class Outputs(_Bound):
                     code="output_too_large",
                 )
             os.link(temporary, final)
-            self._fsync_directory(final.parent)
+            _fs.sync_directory(final.parent)
             temporary.unlink()
             asset = VideoAsset(
                 handle,
@@ -886,14 +887,14 @@ class Outputs(_Bound):
         try:
             for directory, dirs, files in os.walk(source, followlinks=False):
                 current = Path(directory)
-                if any((current / name).is_symlink() for name in dirs):
+                if any((current / name).is_symlink() for name in (*dirs, *files)):
                     raise OutputError("output tree cannot contain symlinks", code="output_tree")
                 for name in sorted(files):
                     count += 1
                     if count > 8192:
                         raise OutputError("output tree exceeds its file bound", code="output_tree")
                     original = current / name
-                    fd = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                    fd = os.open(original, os.O_RDONLY | _fs.BINARY | _fs.NOFOLLOW | _fs.NONBLOCK)
                     with os.fdopen(fd, "rb") as reader:
                         if not stat.S_ISREG(os.fstat(reader.fileno()).st_mode):
                             raise OutputError(
@@ -1009,16 +1010,6 @@ class Outputs(_Bound):
                 length += len(chunk)
                 digest.update(chunk)
         return length, "blake2b:" + digest.hexdigest()
-
-    @staticmethod
-    def _fsync_directory(path: Path) -> None:
-        if os.name != "posix":
-            return
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
 
 
 class VideoJoin:

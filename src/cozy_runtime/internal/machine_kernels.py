@@ -145,7 +145,7 @@ def main() -> int:
         "driver": accel.driver_version(),
         "store": str(store.own) if store is not None else "",
         "kernels": len(ended),
-        "failed": sum(state != "ready" for state in ended),
+        "failed": ended.count("failed"),
         "ms": round((time.perf_counter() - started) * 1000),
     }
     print(json.dumps(last), flush=True)

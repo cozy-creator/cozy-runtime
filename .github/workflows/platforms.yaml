@@ -247,4 +247,4 @@ jobs:
         run: |
           uv venv --python 3.12 .venv
           uv pip install --python .venv/Scripts/python.exe -e . pytest
-          .venv/Scripts/python.exe -m pytest -q -rs tests/test_windows_executor_path.py
+          .venv/Scripts/python.exe -m pytest -q -rs tests/test_windows_executor_path.py tests/test_platform_seams.py

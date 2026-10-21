@@ -1,6 +1,7 @@
-"""The CPUs this process may use: its affinity under its cgroup's quota, v2 (`cpu.max` at its
-cgroup and every ancestor) or v1 (`cpu.cfs_quota_us`). Never the host's cores: a vast pod on a
-128-core EPYC with a 15-CPU v1 quota ran `ninja -j 128` (2026-10-15)."""
+"""The CPUs this process may use: its affinity (the CPU count where the OS keeps none) under its
+cgroup's quota, v2 (`cpu.max` at its cgroup and every ancestor) or v1 (`cpu.cfs_quota_us`). Never
+the host's cores: a vast pod on a 128-core EPYC with a 15-CPU v1 quota ran `ninja -j 128`
+(2026-10-15)."""
 
 from __future__ import annotations
 
@@ -14,7 +15,9 @@ CGROUP = Path("/sys/fs/cgroup")
 @functools.cache
 def cpus() -> int:
     """Every CPU this process may use: its affinity and its cgroup's quota, at least one."""
-    return max(1, min([len(os.sched_getaffinity(0)), *_v2_quotas(), *_v1_quota()]))
+    affinity = getattr(os, "sched_getaffinity", None)
+    allowed = len(affinity(0)) if affinity is not None else os.cpu_count() or 1
+    return max(1, min([allowed, *_v2_quotas(), *_v1_quota()]))
 
 
 def _whole(quota: int, period: int) -> list[int]:

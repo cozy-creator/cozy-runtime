@@ -16,7 +16,6 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
-import re
 import subprocess
 import sys
 import threading
@@ -26,7 +25,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
-from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
+from cozy_runtime.internal.config import sees_no_gpu
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
 #: silently runs unsupported operations on CPU, which violates the CPU-refusal law. Forced,
@@ -40,6 +39,8 @@ BACKENDS = ("cuda", "mps")
 _NVML_SUCCESS = 0
 _NVML_ERROR_NOT_SUPPORTED = 3
 _NVML_ERROR_INSUFFICIENT_SIZE = 7
+#: The driver's management library, where each OS's driver installs it (TensorD loads the same).
+_NVML = "nvml.dll" if sys.platform == "win32" else "libnvidia-ml.so.1"
 
 
 class AcceleratorUnsupported(Exception):
@@ -130,7 +131,7 @@ def _nvml_library() -> ctypes.CDLL | None:
         if _nvml is not None or _nvml_absent or sees_no_gpu():
             return _nvml
         try:
-            library = ctypes.CDLL("libnvidia-ml.so.1")
+            library = ctypes.CDLL(_NVML)
             if library.nvmlInit_v2() != _NVML_SUCCESS:
                 raise OSError("nvmlInit_v2 refused")
         except (OSError, AttributeError):
@@ -216,7 +217,9 @@ def compute_processes(device: str) -> dict[int, int] | None:
     None where the driver will not say."""
     library = _nvml_library()
     handle = _nvml_handle(library, device) if library is not None and device else None
-    return _nvml_device_compute_table(library, handle) if library is not None and handle is not None else None
+    if library is None or handle is None:
+        return None
+    return _nvml_device_compute_table(library, handle)
 
 
 def _table_rows(pids: set[int], table: dict[int, int]) -> dict[int, ProcessMemory]:
@@ -348,32 +351,14 @@ def device_capability(device: str) -> int:
 
 
 def driver_version() -> str:
-    """The loaded NVIDIA driver's version, read from the kernel: no NVML and no thread, so a
-    fork parent may ask. A compiled kernel's key carries it. Empty where there is none."""
-    for path in ("/sys/module/nvidia/version", "/proc/driver/nvidia/version"):
-        with suppress(OSError):
-            found = re.search(r"\d+\.\d+(\.\d+)*", Path(path).read_text().splitlines()[0])
-            if found:
-                return found.group()
-    return ""
-
-
-def drives_display(index: int) -> bool:
-    """Whether a display is initialized on CUDA device `index` of this process (NVML's display
-    active state: a display server holds memory for a screen there); False where NVML cannot
-    say. A connector with a display attached (NVML's display mode: a dummy plug on many
-    datacenter GPUs) is not one."""
-    visible = inherited_environment().get("CUDA_VISIBLE_DEVICES", "")
-    entries = [e.strip() for e in visible.split(",")]
-    entries = [e for e in entries if e]
+    """The NVIDIA driver's version, which a compiled kernel's key and a kernel's verdict carry;
+    empty where NVML is absent. NVML leaves a driver thread: a process that will fork does not
+    ask (`zygote`)."""
     library = _nvml_library()
-    entry = entries[index] if index < len(entries) else str(index)
-    handle = _nvml_handle(library, entry) if library is not None else None
-    if library is None or handle is None:
-        return False
-    state = ctypes.c_int()
-    active = library.nvmlDeviceGetDisplayActive(handle, ctypes.byref(state))
-    return bool(active == _NVML_SUCCESS and state.value == 1)
+    version = ctypes.create_string_buffer(80)  # NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE
+    if library is None or library.nvmlSystemGetDriverVersion(version, 80) != _NVML_SUCCESS:
+        return ""
+    return version.value.decode()
 
 
 def _device_memory_of(free: int, total: int) -> DeviceMemory:

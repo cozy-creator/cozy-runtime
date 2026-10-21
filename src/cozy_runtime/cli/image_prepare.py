@@ -25,6 +25,7 @@ try:
 except ImportError:  # Windows has no resource module; optional local preparation defers.
     resource = None  # type: ignore[assignment]
 
+from cozy_runtime import _fs
 from cozy_runtime.author import _codec
 from cozy_runtime.author._decode import (
     DEFAULT_DECODE_LIMITS,
@@ -174,7 +175,7 @@ def _prepare(request: _Request) -> Result:
                 os.link(temporary, target)
         finally:
             temporary.unlink(missing_ok=True)
-    descriptor = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(target, os.O_RDONLY | _fs.BINARY | _fs.NOFOLLOW)
     with os.fdopen(descriptor, "rb") as existing:
         facts = os.fstat(existing.fileno())
         if (

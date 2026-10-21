@@ -167,10 +167,13 @@ def status(store: kernel_cache.Store, job: Job) -> State:
 
 
 def submit(store: kernel_cache.Store, job: Job) -> State:
-    """`status`, after starting the builder when nobody on this machine is building the key."""
+    """`status`, after starting the builder when nobody on this machine is building the key.
+    A builder runs in its own process group (`run`): where the OS has none, it is absent."""
     current = status(store, job)
     if current.state != "pending":
         return current
+    if not hasattr(os, "killpg"):
+        return replace(current, state="absent", detail="local kernel builds need process groups")
     with _GUARD:
         process, reaper = _STARTED.get(job.key.digest) or (None, None)
         if process is not None and reaper is not None and process.poll() is not None:
@@ -399,7 +402,7 @@ def _ledger(path: Path) -> Iterator[dict[str, Any]]:
     pruned to live processes) and `budget`, the memory and CPUs the machine's compilers may
     take, measured again whenever no compiler job runs."""
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o666)
+    fd = os.open(path.with_suffix(".lock"), os.O_RDWR | os.O_CREAT, 0o666)
     try:
         filelock.lock(fd)
         try:
