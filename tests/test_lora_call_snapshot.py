@@ -137,14 +137,14 @@ class Root(module_type):  # type: ignore[misc]
 
 def fixture(folder: Path, device: str = "cpu") -> tuple[Any, ...]:
     writer = tensorfs.Writer(cache_dir=folder)
-    writer.component("net", config={}).put(
+    writer.component("net", cls="", config={}).put(
         "block.linear.weight", torch.tensor(BASE).numpy(), dtype="F32", shape=[2, 2]
     )
     for name, down, up in (
         ("A", [[1.0, 0.0]], [[2.0], [3.0]]),
         ("B", [[0.0, 1.0]], [[5.0], [7.0]]),
     ):
-        component = writer.component(name, config={})
+        component = writer.component(name, cls="", config={})
         component.put("down", torch.tensor(down).numpy(), dtype="F32", shape=[1, 2])
         component.put("up", torch.tensor(up).numpy(), dtype="F32", shape=[2, 1])
     checkpoint = writer.commit()
@@ -225,12 +225,31 @@ def test_real_call_selection_waits_for_each_attempt_and_same_a_keeps_content_ide
             assert all(current.fill is None for current in fixed)
             raw = (fixed[0], (model, fixed[1]), (model, fixed[1]))
             with memory.request(f"attempt-{attempt}", plan=raw) as request:
-                assert request.declared == (("A",), ("B", "net"), ("B", "net"))
+                assert request.declared == (
+                    (fixed[0].name,),
+                    tuple(sorted((model.name, fixed[1].name))),
+                    tuple(sorted((model.name, fixed[1].name))),
+                )
+                assert model in request._pending
                 for adapter in adapters:
                     result = root(torch.eye(2), adapter=adapter)
                     assert torch.equal(result, torch.tensor(EXPECTED[adapter]).t())
+                    assert not request._pending
         assert seen[0] == seen[-2] == seen[-1], "same A changed immutable content identity"
         assert len(set(seen)) == 3, "A/B/inactive selections were conflated"
+        with memory.request("waiting", plan=raw) as waiting:
+            root(torch.eye(2), adapter="A")
+            expected_a = waiting._selected[model]
+            with memory.request("selected", plan=raw) as active:
+                root(torch.eye(2), adapter="B")
+                assert not active._pending
+                waiting.plan(raw)
+                assert waiting._selected[model] == expected_a
+                assert active._selected[model] != expected_a
+                assert model in waiting._pending, "A borrowed the globally selected B content"
+            result = root(torch.eye(2), adapter="A")
+            assert torch.equal(result, torch.tensor(EXPECTED["A"]).t())
+            assert waiting._selected[model] == expected_a and not waiting._pending
     finally:
         handle.remove()
         memory.close()
@@ -254,7 +273,7 @@ def test_fixed_stored_lora_transform_is_ready_without_call_arguments(tmp_path: P
         "block.linear.lora_B.fixed.weight": [[2.0], [3.0]],
     }
     writer = tensorfs.Writer(cache_dir=tmp_path)
-    component = writer.component("net", config={})
+    component = writer.component("net", cls="", config={})
     for key, value in values.items():
         tensor = torch.tensor(value)
         component.put(key, tensor.numpy(), dtype="F32", shape=list(tensor.shape))

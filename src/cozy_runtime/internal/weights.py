@@ -629,6 +629,10 @@ class _BakeSnapshot:
     owner: _Bakes
     prefetch_ready: bool = True
 
+    @property
+    def call_selected(self) -> bool:
+        return self.owner.call_selected
+
     def prepare(self) -> str:
         return self.version
 
@@ -754,6 +758,8 @@ class _Bakes:
                 raise Unbound("a nested call cannot change an active LoRA selection")
             flags = [(item, item._cozy_baked) for item in self._flags()]
             model.fill = self.active = active or selected
+            if self.call_selected:
+                model.memory._select(model, selected.prepare())
             for item, _ in flags:
                 item._cozy_baked = selected.strategy == "bake"
             try:
