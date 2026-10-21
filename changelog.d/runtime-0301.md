@@ -1,0 +1,1 @@
+Runtime 0.30.1: a component's config file is part of its folder's run files. A processor's `preprocessor_config.json` is its D10 config, and packages (qwen-image-2, flux-3-klein, character-describer) read it by that path; on 0.30.0 that read failed with `model_asset_missing`.

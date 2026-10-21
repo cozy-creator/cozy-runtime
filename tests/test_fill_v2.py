@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 import tensorfs
 
+from cozy_runtime.author._loader import ModelAssets
 from cozy_runtime.internal import model_config
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.fill import (
@@ -114,8 +115,16 @@ def test_an_executor_opens_a_checkpoint_from_the_store_with_its_configs_and_asse
             "vae": {"z": 4},
         }
         assets = ck.assets()
-        assert sorted(assets) == ["tokenizer/merges.txt", "tokenizer/vocab.json"]
+        assert sorted(assets) == [
+            "scheduler/config.json",
+            "tokenizer/config.json",
+            "tokenizer/merges.txt",
+            "tokenizer/vocab.json",
+            "unet/config.json",
+            "vae/config.json",
+        ]
         assert (assets["tokenizer/vocab.json"], assets["tokenizer/merges.txt"]) == (VOCAB, MERGES)
+        assert json.loads(assets["unet/config.json"]) == UNET
         assert ck.ck.pipeline is not None and ck.ck.pipeline.config == INDEX
         assert not list((tmp_path / "tensorfs").rglob("config.json")), "loading exported files"
         assert set(ck.asset_digests()) == {"tokenizer/vocab.json", "tokenizer/merges.txt"}
@@ -136,8 +145,35 @@ def test_a_model_without_a_pipeline_is_its_root_folder(
         assets={"model": {"tokenizer.json": b"{}", "tokenizer_config.json": b'{"x": 1}'}},
     )
     assets = Checkpoint(tensorfs.open(ref, cache_dir=store, local_files_only=True)).assets()
-    assert sorted(assets) == ["tokenizer.json", "tokenizer_config.json"]
+    assert sorted(assets) == ["config.json", "tokenizer.json", "tokenizer_config.json"]
     assert assets["tokenizer_config.json"] == b'{"x": 1}'
+    assert json.loads(assets["config.json"]) == {"hidden_size": 2}
+
+
+def test_a_processor_reads_its_config_as_the_file_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Transformers processor folder has no config.json: its preprocessor_config.json is the
+    component's config, and a package still reads it by that path (qwen-image-2 on D10)."""
+    image = {"image_processor_type": "Qwen2VLImageProcessor", "patch_size": 16}
+    video = b'{"video_processor_type": "Qwen2VLVideoProcessor"}'
+    store = home(tmp_path, monkeypatch)
+    writer = tensorfs.Writer(cache_dir=store)
+    writer.pipeline(("diffusers", "", "QwenImagePipeline"), {"_class_name": "QwenImagePipeline"})
+    processor = writer.component(
+        "processor", cls=("transformers", "", "Qwen2VLProcessor"), config=image,
+        config_file="preprocessor_config.json",
+    )  # fmt: skip
+    processor.asset("video_preprocessor_config.json", video)
+    vae = writer.component("vae", cls=("diffusers", "", "AutoencoderKL"), config={"z": 4})
+    vae.put("decoder.weight", np.ones(3, np.float32), dtype="F32", shape=[3])
+    ref = writer.commit().id
+    ck = Checkpoint(tensorfs.open(ref, cache_dir=store, local_files_only=True))
+    model = ModelAssets(ck.assets(), lambda _: None)
+    assert json.loads(model.read("processor/preprocessor_config.json")) == image
+    assert model.read("processor/video_preprocessor_config.json") == video
+    assert "processor/config.json" not in model.names()
+    assert set(ck.asset_digests()) == {"processor/video_preprocessor_config.json"}
 
 
 def test_configs_construct_and_the_fit_judges_the_census(

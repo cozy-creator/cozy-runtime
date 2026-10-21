@@ -276,23 +276,26 @@ class Checkpoint:
 
 
 class Assets(Mapping[str, bytes]):
-    """Supporting files read directly from component assets, never an exported directory.
-
-    Construction configuration is read separately through component.config. Filename
-    recreation belongs to explicit TensorFS compatibility export, not model loading.
+    """A component folder's files read directly from the checkpoint, never an exported
+    directory: its assets, and its config as its `config_file` (a processor's
+    `preprocessor_config.json` is its config, and packages read it as a file).
     """
 
     def __init__(self, checkpoint: Checkpoint) -> None:
         ck = checkpoint.ck
         self._checkpoint = checkpoint
-        self._assets: dict[str, tuple[str, str]] = {}
+        self._assets: dict[str, tuple[str, str | None]] = {}
         for component, held in ck.components.items():
             prefix = "" if ck.pipeline is None and component == ROOT_COMPONENT else f"{component}/"
+            if held.config:
+                self._assets[f"{prefix}{held.config_file}"] = (component, None)
             for name in held.assets:
                 self._assets[f"{prefix}{name}"] = (component, name)
 
     def __getitem__(self, path: str) -> bytes:
         component, name = self._assets[path]
+        if name is None:
+            return json.dumps(self._checkpoint.ck.components[component].config, indent=2).encode()
         return self._checkpoint.asset(component, name)
 
     def __iter__(self) -> Iterator[str]:
