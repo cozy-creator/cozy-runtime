@@ -140,12 +140,16 @@ def bind_dense(
     _DENSE, _DENSE_IDENTITY, _EXACT = call, identity, exact
 
 
-def binding() -> tuple[Callable[..., Tensor] | None, str, Callable[..., Tensor] | None]:
+#: A bound dense reference: (dense, its identity, exact).
+type Binding = tuple[Callable[..., Tensor] | None, str, Callable[..., Tensor] | None]
+
+
+def binding() -> Binding:
     """The dense reference bound now, for `rebind` after a request changes it."""
     return _DENSE, _DENSE_IDENTITY, _EXACT
 
 
-def rebind(held: tuple[Callable[..., Tensor] | None, str, Callable[..., Tensor] | None]) -> None:
+def rebind(held: Binding) -> None:
     global _DENSE, _DENSE_IDENTITY, _EXACT
     _DENSE, _DENSE_IDENTITY, _EXACT = held
 
