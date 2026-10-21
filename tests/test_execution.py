@@ -316,6 +316,138 @@ def test_a_warm_unet_s_bare_blocks_send_no_op_through_the_request_s_layer(
     assert not computed, computed
 
 
+# ------------------------------------------------------------------------------ HiDiffusion
+
+#: paul/sdxl's high-resolution path: 12 steps cover both its phases (RAU-Net, then full size)
+STEPS = 12
+
+
+def hidiffused(module: Any) -> Any:
+    """HiDiffusion applied as paul/sdxl's `begin_denoise_request` does, after the catch was
+    installed: it re-classes blocks the catch wrapped, and its blocks keep step counters and
+    one `info` dict on every module, which each run changes."""
+    hidiffusion = pytest.importorskip("hidiffusion")
+    module.name_or_path = ""
+    hidiffusion.apply_hidiffusion(module)
+    module._num_timesteps = STEPS
+    module.info["size"] = module.info["upsample_size"] = None
+    for sub in module.modules():
+        if hasattr(sub, "timestep"):
+            sub.timestep = 0
+        if hasattr(sub, "max_timestep"):
+            sub.max_timestep = STEPS
+    return module
+
+
+def denoise(module: Any, x: dict[str, Any], step: int) -> Any:
+    """One step as paul/sdxl calls it (the latents positional), its window shift drawn from
+    the step's seed."""
+    torch.manual_seed(step)
+    rest = {k: v for k, v in x.items() if k not in ("sample", "timestep")}
+    return module(x["sample"], x["timestep"], **rest).sample
+
+
+def counters(module: nn.Module) -> list[object]:
+    return [vars(m).get(k) for m in module.modules() for k in ("timestep", "max_timestep", "T1")]
+
+
+def test_hidiffusion_s_blocks_run_bare_and_every_step_is_plain_hidiffusion_s(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every step equals the plain HiDiffusion model's bit for bit (its re-classed blocks run
+    their new forward), and warm, every block runs bare: no computing op passes the request's
+    layer (its blocks' counters and `info` are put back only if a run runs out)."""
+    x = unet_inputs()
+    plain = hidiffused(unet())
+    with torch.no_grad():
+        want = [denoise(plain, x, step) for step in range(STEPS)]
+    mem = memory()
+    model = hidiffused(placed(mem, checkpoint(tmp_path, "unet", unet()), "unet", unet))
+    computed: list[str] = []
+    dispatch = catch.Layer.__torch_dispatch__
+
+    def counted(self: Any, func: Any, *rest: Any) -> Any:
+        if all(a.alias_info is None for a in func._schema.returns):
+            computed.append(str(func))
+        return dispatch(self, func, *rest)
+
+    got = []
+    with torch.no_grad(), mem.request("hidiffusion") as r, execution.serving(r):
+        for step in range(STEPS):
+            if step == 1:  # the first step journals every block
+                monkeypatch.setattr(catch.Layer, "__torch_dispatch__", counted)
+            got.append(denoise(model, x, step))
+    assert not computed, sorted(set(computed))
+    assert all(torch.equal(a, b) for a, b in zip(got, want, strict=True))
+
+
+class Midway(TorchDispatchMode):  # type: ignore[misc]
+    """Counts the computing ops the root block runs itself in a step; armed, the op at `at`
+    runs out of memory once, as an allocation would."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count, self.at, self.refused = 0, -1, 0
+
+    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
+        run = catch._local.run
+        if run is not None and run.block.name == "model" and func._schema.returns:
+            if all(a.alias_info is None for a in func._schema.returns):
+                self.count += 1
+                if self.count == self.at:
+                    self.refused += 1
+                    raise torch.OutOfMemoryError("out of memory. Tried to allocate 2.00 MiB")
+        return func(*args, **(kwargs or {}))
+
+
+def test_a_hidiffusion_step_out_of_memory_midway_runs_again_from_its_counters(
+    tmp_path: Path,
+) -> None:
+    """A warm step runs out halfway through the UNet's bare run, after HiDiffusion's down blocks
+    advanced their counters and wrote `info`: they and the generators are put back, the step
+    runs again under the layer, and it equals the uninterrupted step bit for bit, its counters
+    advanced once. The steps after it are plain HiDiffusion's too."""
+    x = unet_inputs()
+    plain = hidiffused(unet())
+    with torch.no_grad():
+        want = [(denoise(plain, x, step), counters(plain)) for step in range(STEPS)]
+    mem = memory()
+    model = hidiffused(placed(mem, checkpoint(tmp_path, "unet", unet()), "unet", unet))
+    midway, unequal, ran = Midway(), list[int](), 0
+    with torch.no_grad(), midway, mem.request("hidiffusion") as r, execution.serving(r):
+        for step in range(STEPS):
+            midway.count = 0
+            if step == 3:  # warm: the root runs bare
+                midway.at = ran // 2
+            got = denoise(model, x, step)
+            ran, midway.at = midway.count, -1
+            assert counters(model) == want[step][1], step
+            if not torch.equal(got, want[step][0]):
+                unequal.append(step)
+    assert midway.refused == 1 and not unequal, unequal
+
+
+def test_a_module_re_classed_after_install_runs_its_new_forward() -> None:
+    """A package that swaps a wrapped module's class later (HiDiffusion's patches, a fused
+    block) gets its new forward, in a request and outside one."""
+
+    class Doubled(nn.Module):  # type: ignore[misc]
+        def forward(self, x: Any) -> Any:
+            return x * 2
+
+    class Tripled(Doubled):
+        def forward(self, x: Any) -> Any:
+            return x * 3
+
+    module, x = Doubled(), torch.ones(4)
+    catch.wrap(module, catch.Block("block", module))
+    module.__class__ = Tripled
+    mem = memory()
+    assert torch.equal(module(x), x * 3)
+    with torch.no_grad(), mem.request("re-classed") as r, execution.serving(r):
+        assert torch.equal(module(x), x * 3)
+
+
 # ------------------------------------------------------------------- mutation-safe replay
 
 

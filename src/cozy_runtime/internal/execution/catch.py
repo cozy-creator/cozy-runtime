@@ -5,14 +5,16 @@ Retry runs it again, Cut(level) runs the innermost cut around it at that level (
 its own bands), Park moves idle tensors to page-locked host memory, Exhausted raises. Python
 keeps no rung order, room arithmetic, retry count or size memo: progress is Rust's to judge.
 
-The catch wraps blocks. A block runs bare unless its first run wrote a tensor that existed
-before it or changed its attributes, or it once ran short; bare and out of memory, it gets its
-generators and declared state back and runs again under the per-op layer, which catches each op
-at itself (a dispatch mode on every op costs CPU, so only those blocks). A block that joins a
-collective is never run again on one GPU alone: it runs bare in a pass whose room was measured
-(`r.measured`), and out of memory there it fails typed and runs under the layer at those shapes
-from then on. Ops outside every block (a package's code between passes) run under the request's
-layer, which no block's bare run sees.
+The catch wraps blocks, calling each one's class forward as it is at the call (a class swap
+after install, such as HiDiffusion's at a request's first step, runs). A block runs bare unless
+its first run wrote a tensor that existed before it, or it once ran short; bare and out of
+memory, it gets back its generators, its declared state and the attributes its first run showed
+it changes (step counters, a shared dict's items), and runs again under the per-op layer, which
+catches each op at itself (a dispatch mode on every op costs CPU, so only those blocks). A
+block that joins a collective is never run again on one GPU alone: it runs bare in a pass whose
+room was measured (`r.measured`), and out of memory there it fails typed and runs under the
+layer at those shapes from then on. Ops outside every block (a package's code between passes)
+run under the request's layer, which no block's bare run sees.
 """
 
 from __future__ import annotations
@@ -105,6 +107,8 @@ class _Run:
     block: Block
     ordinals: dict[str, int] = field(default_factory=dict)
     ops: int = 0
+    #: its ops so far are its first run's (`Block.ops`): an in-place op there is the same op
+    same: bool = True
 
     def site(self, kind: str) -> str:
         n = self.ordinals[kind] = self.ordinals.get(kind, 0) + 1
@@ -418,8 +422,10 @@ def reclaim() -> None:
 class Block:
     """A block for the catch: its site name, the model root its declared `state` paths are
     under, and what its first run showed (`bare` None: not run yet): whether it may run bare,
-    whether it joins a collective, the generators it draws from, the ops whose first input is
-    dead after them, and the input shapes at which it ran out bare in a collective."""
+    whether it joins a collective, the generators it draws from, the attributes it rebinds and the
+    lists and dicts it changes in place, the
+    ops whose first input is dead after them (by index among its ops, which were `ops`), and the
+    input shapes at which it ran out bare in a collective."""
 
     name: str
     root: nn.Module
@@ -427,7 +433,10 @@ class Block:
     bare: bool | None = None
     joined: bool = False
     generators: tuple[torch.Generator, ...] = ()
+    changes: tuple[tuple[object, str], ...] = ()
+    contents: tuple[list[object] | dict[object, object], ...] = ()
     dead: frozenset[int] = frozenset()
+    ops: tuple[OpOverload, ...] = ()
     short: set[tuple[object, ...]] = field(default_factory=set)
 
 
@@ -437,10 +446,10 @@ def wrap(
     around: Callable[[nn.Module, Args, Kwargs], AbstractContextManager[None]] | None = None,
 ) -> None:
     """`module`'s forward runs through the catch as `block`, inside `around(module, args,
-    kwargs)`."""
-    forward = module.forward
+    kwargs)`: a forward set on the instance as it is now, else its class's at each call."""
+    forward = vars(module).get("forward") or current(module)
 
-    @functools.wraps(forward)
+    @functools.wraps(module.forward)
     def caught(*args: object, **kwargs: object) -> object:
         with nullcontext() if around is None else around(module, args, kwargs):
             request = CURRENT.get()
@@ -479,10 +488,11 @@ def run[T](
                 out = forward(*args, **kwargs)
             finally:
                 layer.journals.remove(journal)
-        same = before == _attributes(module)
-        block.bare = not journal.wrote and same and layer.short == short_before
+        block.bare = not journal.wrote and layer.short == short_before
         block.joined, block.generators = journal.joined, tuple(journal.generators.values())
+        block.changes, block.contents = _changed(module, before, _attributes(module))
         block.dead = journal.dead((out, args, kwargs, _held(module)))
+        block.ops = tuple(journal.ops) if block.dead else ()
         return out
     finally:
         _local.run = outer
@@ -490,7 +500,7 @@ def run[T](
 
 def _bare[T](block: Block, forward: Callable[..., T], args: Args, kwargs: Kwargs) -> T:
     states = [(g, g.get_state()) for g in block.generators]
-    put = _kept(block.root, block.state)
+    put = _kept(block.root, block.state, block)
     try:
         with _unlayered():
             return forward(*args, **kwargs)
@@ -558,16 +568,31 @@ def _layer() -> Iterator[Layer]:
         _local.layer = None
 
 
-def _kept(root: nn.Module, paths: Sequence[str]) -> Callable[[], None]:
-    """Declared state as it is now, and how to put it back (lists and dicts by their items)."""
-    taken: list[tuple[object, str, object, object]] = []
+def current(module: nn.Module) -> Callable[..., object]:
+    """`module`'s class forward as it is at each call."""
+    return lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)
+
+
+def _kept(root: nn.Module, paths: Sequence[str], block: Block | None = None) -> Callable[[], None]:
+    """Declared state and what `block`'s run changes (`_changed`) as they are now, and how to
+    put them back (lists and dicts by their items)."""
+    owners: list[tuple[object, str]] = []
     for path in paths:
         where, _, attr = path.rpartition(".")
-        owner = functools.reduce(getattr, where.split("."), root) if where else root
+        owners.append((functools.reduce(getattr, where.split("."), root) if where else root, attr))
+    taken: list[tuple[object, str, object, object]] = []
+    for owner, attr in (*owners, *(block.changes if block else ())):
         value = getattr(owner, attr, _MISSING)
         taken.append((owner, attr, value, value.copy() if isinstance(value, list | dict) else 0))
+    filled = [(held, held.copy()) for held in (block.contents if block else ())]
 
     def put() -> None:
+        for container, saved in filled:
+            if isinstance(container, dict) and isinstance(saved, dict):
+                container.clear()
+                container.update(saved)
+            elif isinstance(container, list) and isinstance(saved, list):
+                container[:] = saved
         for owner, attr, value, items in taken:
             if value is _MISSING:
                 vars(owner).pop(attr, None)
@@ -580,6 +605,30 @@ def _kept(root: nn.Module, paths: Sequence[str]) -> Callable[[], None]:
             setattr(owner, attr, value)
 
     return put
+
+
+def _changed(
+    module: nn.Module,
+    before: Mapping[tuple[int, str], object],
+    after: Mapping[tuple[int, str], object],
+) -> tuple[tuple[tuple[object, str], ...], tuple[list[object] | dict[object, object], ...]]:
+    """What `_attributes` saw change between `before` and `after`: the attributes rebound, and
+    the lists and dicts whose items changed in place, each once however many attributes hold it
+    (HiDiffusion's one `info` dict on every module)."""
+    owners = {id(m): m for m in module.modules()}
+    rebound: list[tuple[object, str]] = []
+    contents: dict[int, list[object] | dict[object, object]] = {}
+    for key in before.keys() | after.keys():
+        was = before.get(key, _MISSING)
+        if key[0] not in owners or was == after.get(key, _MISSING):
+            continue
+        owner = owners[key[0]]
+        value = getattr(owner, key[1], _MISSING)
+        if isinstance(value, list | dict) and isinstance(was, tuple) and was[0] == id(value):
+            contents[id(value)] = value
+        else:
+            rebound.append((owner, key[1]))
+    return tuple(rebound), tuple(contents.values())
 
 
 def _attributes(module: nn.Module) -> dict[tuple[int, str], object]:
@@ -655,6 +704,8 @@ class _Journal:
     seen: int = 0
     last: dict[_Key, int] = field(default_factory=dict)
     candidates: list[tuple[int, int, _Key]] = field(default_factory=list)
+    #: its own run's ops in order (not a nested block's)
+    ops: list[OpOverload] = field(default_factory=list)
 
     def key(self, at: int) -> _Key:
         """The storage at address `at` now."""
@@ -675,6 +726,8 @@ class _Journal:
             self.generators.update((id(g), g) for g in _generators(func, args, kwargs))
         self.seen += 1
         self.last.update((self.key(p), self.seen) for p in _storages((args, kwargs)))
+        if _local.run is self.run:
+            self.ops.append(func)
         if func in _IN_PLACE and _local.run is self.run and args:
             self.candidates.append((self.seen, index, self.key(_storage(tensors(args[0])[0]))))
 
@@ -716,6 +769,8 @@ class Layer(TorchDispatchMode):  # type: ignore[misc]
         index = -1 if run is None else run.ops
         if run is not None:
             run.ops += 1
+            ops = run.block.ops
+            run.same = run.same and index < len(ops) and ops[index] is func
         for journal in self.journals:
             journal.before(func, args, kwargs, index)
         out = self._run(func, args, kwargs, index)
@@ -731,6 +786,7 @@ class Layer(TorchDispatchMode):  # type: ignore[misc]
             run is not None
             and func in _IN_PLACE
             and index in run.block.dead
+            and run.same  # the same ops led here as in the run that showed its input dead
             and not _local.scopes  # no cut around it runs again and reads its input
             and not torch.is_grad_enabled()
         ):
