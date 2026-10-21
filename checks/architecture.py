@@ -597,6 +597,10 @@ def fence_canonical_numbers() -> list[str]:
     return bad[:10]
 
 
+#: The execution layer is torch: only an executor with a device imports it (`internal.execution`).
+TORCH_PACKAGES = (SRC / "internal" / "execution",)
+
+
 def fence_torch_free_import() -> list[str]:
     """`import cozy_runtime` must never pull torch (§1.0), derivation harness included.
 
@@ -605,6 +609,8 @@ def fence_torch_free_import() -> list[str]:
     """
     bad = []
     for path in (p for p in py_files() if (p.parent / "__init__.py").exists()):
+        if any(path.is_relative_to(package) for package in TORCH_PACKAGES):
+            continue
         tree = ast.parse(path.read_text())
         for node in ast.walk(tree):
             if not isinstance(node, (ast.Import, ast.ImportFrom)):

@@ -1,5 +1,5 @@
-"""`split`: the package says how an op cuts (`Cut`); the memory says how finely (varena's
-`cuts.split`, installed with it): whole, else in the windows that fit, remembered per op."""
+"""`split`: the package says how an op cuts (`Cut`); the memory says how finely (the execution
+layer's `split`, installed with it): whole, else in the windows the level Rust holds gives."""
 
 from __future__ import annotations
 
@@ -24,10 +24,10 @@ class Cut:
 
 class Pieces(Protocol):
     """The memory's side of `split`: `run(most)` in windows of at most `most` of `total`
-    elements, the least `finest`, retried finer while out of memory."""
+    elements, the least `finest`, run finer while out of memory."""
 
     def __call__(
-        self, name: str, key: str, device: Any, total: int, finest: int, run: Callable[[int], Any]
+        self, name: str, key: str, total: int, finest: int, run: Callable[[int], Any]
     ) -> Any: ...
 
 
@@ -49,7 +49,6 @@ def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
     return runtime(
         _name(fn),
         _key(fn, shape, cuts, x.dtype),
-        x.device,
         math.prod(shape),
         _finest(shape, cuts),
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most)),

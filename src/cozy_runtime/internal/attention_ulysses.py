@@ -11,10 +11,10 @@ reduction (`head_local=False`) is registered without context parallelism.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 if TYPE_CHECKING:
     from diffusers.models.attention_dispatch import AttentionBackendName
@@ -68,18 +68,37 @@ _SEEN: ContextVar[tuple[dict[str, set[str]], set[object]] | None] = ContextVar(
     "cozy_attention_seen", default=None
 )
 _MEMBERS: dict[str, AttentionBackendName] = {}
-#: the memory's attention cut (`tensorfs.varena.cuts.attend`), installed with the memory
-_CUT: Callable[..., Tensor] | None = None
-#: what one allocation on a device may take now (`tensorfs.varena.cuts.available`; 0 unknown)
-_ROOM: Callable[[object], int] | None = None
-#: an exchange's buffers at their most, in GPU shares of the heads crossing: Q, K and V in
-#: flight, each in its exchange's layout and its result (6), and the next one being laid out
-_BUFFERS = 7
 
 
-def install(cut: Callable[..., Tensor] | None, room: Callable[[object], int] | None = None) -> None:
-    global _CUT, _ROOM
-    _CUT, _ROOM = cut, room
+class Execution(Protocol):
+    """The execution layer's side (`internal.execution`, installed with the memory): the
+    attention cut, the pass's agreed exchange level, and a collective's extent."""
+
+    def attend(
+        self,
+        call: Callable[..., Tensor],
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Tensor | None = None,
+        *,
+        rows: int = 0,
+        heads: bool = True,
+    ) -> Tensor: ...
+
+    def agreed(self) -> int: ...
+
+    def collective(self, site: str) -> AbstractContextManager[None]: ...
+
+
+_EXECUTION: Execution | None = None
+#: the exchanges' one cut site (`execution.agree.SITE`)
+SITE = "ulysses"
+
+
+def install(execution: Execution | None) -> None:
+    global _EXECUTION
+    _EXECUTION = execution
 
 
 @contextmanager
@@ -156,10 +175,9 @@ def _call(
         if signature not in named:
             named.add(signature)
             seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
-    cut = _CUT
-    if cut is None:
+    if _EXECUTION is None:
         return local.forward(query, key, value, **options)
-    return cut(
+    return _EXECUTION.attend(
         lambda q, k, v, mask: local.forward(q, k, v, **{**options, "attn_mask": mask}),
         query,
         key,
@@ -196,43 +214,25 @@ def exchange(
     handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
 ) -> Tensor:
-    """Sequence shards -> full sequence per head subset -> `compute` -> back, using Diffusers'
-    unequal-length exchange in both directions (packed H3 lengths do not divide), or the
-    group's copy engines when it formed over them (`copy_engine`). Heads cross all at once when
-    their buffers fit the room every GPU of the group has, else in the largest groups that do
-    (`_heads`), each group's output back before the next group's Q/K/V cross."""
-    import torch
-    import torch.distributed as dist
-
+    """Sequence shards -> full sequence per head subset -> `compute` -> back, rows unequal
+    across GPUs (packed H3 lengths do not divide), over NCCL or the group's copy engines when it
+    formed over them (`copy_engine`). Heads cross in the groups of the level the pass agreed
+    (`Execution.agreed`: all at once at 0, then ever smaller groups of whole heads per GPU),
+    each group's output back before the next group's Q/K/V cross."""
     heads, world = int(query.shape[2]), handle.size()
-    room = _ROOM(query.device) if _ROOM is not None else 0
-    mine = torch.tensor([int(query.shape[1]), room or 1 << 62], device=query.device)
-    every = [torch.empty_like(mine) for _ in range(world)]
-    dist.all_gather(every, mine, group=handle)  # every GPU sizes its groups from the same facts
-    rows, room = sum(int(e[0]) for e in every), min(int(e[1]) for e in every)
-    step = _heads(heads, world, rows * int(query.shape[3]) * query.element_size(), room)
-    if step == heads:
-        return _exchange(query, key, value, handle, compute)
-    out = query.new_empty(query.shape)
-    for at in range(0, heads, step):
-        part = slice(at, at + step)
-        out[:, :, part] = _exchange(
-            query[:, :, part], key[:, :, part], value[:, :, part], handle, compute
-        )
+    groups = sorted({heads, *(s for s in range(world, heads, world) if heads % s == 0)})[::-1]
+    level = _EXECUTION.agreed() if _EXECUTION is not None else 0
+    step = groups[min(level, len(groups) - 1)]
+    with nullcontext() if _EXECUTION is None else _EXECUTION.collective(SITE):
+        if step == heads:
+            return _exchange(query, key, value, handle, compute)
+        out = query.new_empty(query.shape)
+        for at in range(0, heads, step):
+            part = slice(at, at + step)
+            out[:, :, part] = _exchange(
+                query[:, :, part], key[:, :, part], value[:, :, part], handle, compute
+            )
     return out
-
-
-def _heads(heads: int, world: int, per_head: int, room: int) -> int:
-    """Heads one exchange moves: all of them when their buffers (`_BUFFERS` GPU shares of
-    `per_head` bytes a head, every row) fit `room`, else the largest group of whole heads on
-    each GPU, dividing them, whose buffers fit beside the output the groups fill, else the
-    smallest such group."""
-    whole = heads // world * per_head
-    groups = [s for s in range(world, heads, world) if heads % s == 0]
-    if not groups or _BUFFERS * whole <= room:
-        return heads
-    fits = (s for s in groups if whole + _BUFFERS * (s // world) * per_head <= room)
-    return max(fits, default=groups[0])
 
 
 def _exchange(
@@ -242,11 +242,8 @@ def _exchange(
     handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
 ) -> Tensor:
-    from diffusers.models.attention_dispatch import (
-        all_to_all_single_any_o_async,
-        all_to_all_single_any_qkv_async,
-        ulysses_anything_metadata,
-    )
+    import torch
+    import torch.distributed as dist
 
     engines = copy_engine.for_group(handle)
     if engines is not None:
@@ -254,12 +251,33 @@ def _exchange(
         if result.shape != query.shape or result.dtype != query.dtype:
             raise ValueError("Ulysses attention returned incompatible output")
         return result
-    metadata = ulysses_anything_metadata(query)
-    waits = [all_to_all_single_any_qkv_async(t, handle, **metadata) for t in (query, key, value)]
-    q, k, v = (wait() for wait in waits)
+    batch, rows, heads, dim = (int(n) for n in query.shape)
+    world = handle.size()
+    local = heads // world
+    gathered = torch.empty(world, dtype=torch.int64, device=query.device)
+    dist.all_gather_into_tensor(gathered, torch.tensor([rows], device=query.device), group=handle)
+    sizes, mine = [int(n) for n in gathered.tolist()], [rows] * world
+    # Every buffer the exchanges cross through, before the first: out of memory, this GPU
+    # recovers (or fails) before its peers wait on it. Q's send buffer takes the output back
+    # and K's receive buffer sends it, so the peak is the exchange's, not more.
+    sends = [query.new_empty((world * rows, batch, local, dim)) for _ in range(3)]
+    gots = [query.new_empty((sum(sizes), batch, local, dim)) for _ in range(3)]
+    for send, tensor in zip(sends, (query, key, value), strict=True):
+        grouped = tensor.reshape(batch, rows, world, local, dim).permute(2, 1, 0, 3, 4)
+        send.view(world, rows, batch, local, dim).copy_(grouped)
+    for got, send in zip(gots, sends, strict=True):
+        dist.all_to_all_single(got, send, sizes, mine, group=handle)
+    returned, back = sends[0], gots[1]
+    del sends
+    q, k, v = (got.permute(1, 0, 2, 3).contiguous() for got in gots)
+    del gots
     output = compute(q, k, v)
     del q, k, v  # not live through the output's exchange
-    result = all_to_all_single_any_o_async(output, handle, **metadata)()
+    back.copy_(output.permute(1, 0, 2, 3))
+    del output
+    dist.all_to_all_single(returned, back, mine, sizes, group=handle)
+    merged = returned.view(world, rows, batch, local, dim).permute(2, 1, 0, 3, 4)
+    result = merged.reshape(batch, rows, heads, dim)
     if result.shape != query.shape or result.dtype != query.dtype:
         raise ValueError("Ulysses attention returned incompatible output")
     return result
