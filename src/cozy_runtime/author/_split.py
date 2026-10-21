@@ -23,12 +23,15 @@ class Cut:
 
 
 class Pieces(Protocol):
-    """The memory's side of `split`: `run(most)` in windows of at most `most` of `total`
-    elements, the least `finest`, run finer while out of memory."""
+    """The memory's side of `split`: `split` runs `run(most)` in windows of at most `most` of
+    `total` elements, the least `finest`, finer while out of memory; `piece` marks each window's
+    start (the ops inside are numbered per window)."""
 
-    def __call__(
+    def split(
         self, name: str, key: str, total: int, finest: int, run: Callable[[int], Any]
     ) -> Any: ...
+
+    def piece(self) -> None: ...
 
 
 _RUNTIME: Pieces | None = None
@@ -46,12 +49,12 @@ def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
     if runtime is None or not cuts:
         return fn(x)
     shape = tuple(int(n) for n in x.shape)
-    return runtime(
+    return runtime.split(
         _name(fn),
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
-        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most)),
+        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece),
     )
 
 
@@ -123,7 +126,13 @@ def _largest(
     return rest * math.prod(_longest(s) for s in spans)
 
 
-def _run(fn: Callable[[Any], Any], x: Any, cuts: tuple[Cut, ...], windows: list[Window]) -> Any:
+def _run(
+    fn: Callable[[Any], Any],
+    x: Any,
+    cuts: tuple[Cut, ...],
+    windows: list[Window],
+    piece: Callable[[], None],
+) -> Any:
     if len(windows) == 1:
         return fn(x)
     ndim = x.dim()
@@ -136,6 +145,7 @@ def _run(fn: Callable[[Any], Any], x: Any, cuts: tuple[Cut, ...], windows: list[
         index = [slice(None)] * ndim
         for d, (a, b) in zip(dims, window, strict=True):
             index[d] = slice(a, b)
+        piece()
         part = fn(x[tuple(index)])
         place = [slice(None)] * part.dim()
         for d, c, (a, _), size in zip(dims, cuts, window, sizes, strict=True):

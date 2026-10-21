@@ -1,24 +1,31 @@
-"""Ulysses' cut level, agreed once per pass (varena-slim §1, Collectives).
+"""Ulysses' cut level and row counts, agreed once per pass (varena-slim §1, Collectives).
 
-At a sharded model's pass start every GPU of its group sends the most of the levels Rust
-proposes for the pass's collective sites (`r.levels()`) in one small async all-reduce (max, one
-int64 whatever sites a GPU knows, so no GPU can wait on a different collective); the first
-exchange waits on it and tells Rust (`r.agree`), and every exchange of the pass crosses in the
-same head groups. An OOM on one GPU so becomes the same cut on all of them from the next pass;
-mid-pass a GPU recovers only locally (`catch.collective`).
+At a sharded model's pass start every GPU of its group sends two int64s in one small async
+all-gather: the most of the levels Rust proposes for the pass's collective sites (`r.levels()`;
+one number whatever sites a GPU knows, so no GPU can wait on a different collective) and a
+digest of its input shapes. The first exchange waits on it and tells Rust the most of them
+(`r.agree`); every exchange of the pass crosses in the same head groups. An OOM on one GPU so
+becomes the same cut on all of them from the next pass; mid-pass a GPU recovers only locally
+(`catch.collective`).
+
+Every GPU's input shapes fix every exchange's rows on every GPU. So an exchange gathers its
+rows only in the first pass at a group's shapes (`sizes`), and later passes at the same shapes
+read them: each GPU decides alike, on the same gathered digests.
 """
 
 from __future__ import annotations
 
 import threading
-from collections.abc import Iterator
+import weakref
+import zlib
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 
 import torch
 import torch.distributed as dist
 from torch import nn
 
-from cozy_runtime.internal.execution.catch import CURRENT
+from cozy_runtime.internal.execution.catch import CURRENT, Args, Kwargs, tensors
 
 #: every exchange of a model is one cut site: the same shapes cross in every block
 SITE = "ulysses"
@@ -26,31 +33,43 @@ SITE = "ulysses"
 
 class _Pass(threading.local):
     def __init__(self) -> None:
-        #: the pass's level: in flight (the all-reduce and its tensor), agreed, or None
+        #: the pass's gathered (level, shapes digest) per GPU: in flight, or agreed
         self.level: tuple[dist.Work, torch.Tensor] | int | None = None
+        #: its model and every GPU's shapes digest (None: no sharded pass), and the exchanges
+        #: it ran so far
+        self.model: nn.Module | None = None
+        self.key: tuple[int, ...] | None = None
+        self.exchanges = 0
 
 
 _pass = _Pass()
+#: per sharded model, the rows each exchange of a pass at the latest shapes gathered, by its
+#: position in the pass
+_ROWS: weakref.WeakKeyDictionary[nn.Module, tuple[tuple[int, ...], list[list[int]]]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 @contextmanager
-def passing(module: nn.Module) -> Iterator[None]:
-    """A pass of `module`: when it is sharded, its group's level is being agreed meanwhile."""
+def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
+    """A pass of `module`: when it is sharded, its group's level and shapes are being gathered
+    meanwhile."""
     group = _group(module)
-    outer = _pass.level
+    outer = (_pass.level, _pass.model, _pass.key, _pass.exchanges)
+    _pass.level, _pass.model, _pass.key, _pass.exchanges = None, None, None, 0
     if group is not None:
         request = CURRENT.get()
         proposed = request.levels() if request is not None else []
         mine = max((level for _, level in proposed), default=0)
-        level = torch.tensor([mine], dtype=torch.int64, device=_device())
-        work = dist.all_reduce(level, op=dist.ReduceOp.MAX, group=group, async_op=True)
-        _pass.level = (work, level)
-    else:
-        _pass.level = None
+        shapes = zlib.crc32(repr([(t.shape, t.dtype) for t in tensors((args, kwargs))]).encode())
+        sent = torch.tensor([mine, shapes], dtype=torch.int64, device=_device())
+        got = sent.new_empty(2 * group.size())
+        work = dist.all_gather_into_tensor(got, sent, group=group, async_op=True)
+        _pass.level, _pass.model = (work, got), module
     try:
         yield
     finally:
-        _pass.level = outer
+        _pass.level, _pass.model, _pass.key, _pass.exchanges = outer
 
 
 def agreed() -> int:
@@ -58,13 +77,33 @@ def agreed() -> int:
     first time it is read."""
     found = _pass.level
     if isinstance(found, tuple):
-        work, level = found
+        work, got = found
         work.wait()
-        found = _pass.level = int(level.item())
+        level, *_ = gathered = got.view(-1, 2).T.tolist()
+        found = _pass.level = max(level)
+        _pass.key = tuple(gathered[1])
         request = CURRENT.get()
         if request is not None:
             request.agree([(SITE, found)])
     return found or 0
+
+
+def sizes(gather: Callable[[], list[int]]) -> list[int]:
+    """Every GPU's rows at this exchange: `gather()` in the first pass at the group's shapes
+    (and outside a sharded pass), else what it gathered then."""
+    agreed()
+    at, key, model = _pass.exchanges, _pass.key, _pass.model
+    _pass.exchanges += 1
+    if key is None or model is None:
+        return gather()
+    known = _ROWS.get(model)
+    if known is None or known[0] != key:
+        known = _ROWS[model] = (key, [])
+    if at < len(known[1]):
+        return known[1][at]
+    rows = gather()
+    known[1].append(rows)
+    return rows
 
 
 def _group(module: nn.Module) -> dist.ProcessGroup | None:

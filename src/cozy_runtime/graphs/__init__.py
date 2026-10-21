@@ -310,6 +310,8 @@ def _record(
         recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
     reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
+    if placed is not None:  # replays read them at their addresses: never parked
+        placed[0].keep(*(t for t in inputs if t is not None))
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []

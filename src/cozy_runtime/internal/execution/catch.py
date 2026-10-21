@@ -17,10 +17,13 @@ layer, which no block's bare run sees.
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import gc
+import mmap
 import threading
 import traceback
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
@@ -53,13 +56,17 @@ _NO_REPLAY = "_cozy_no_replay"
 class Request(Protocol):
     """varena's request handle, as the execution layer uses it."""
 
-    def oom(self, need: int | None, site: str | None, collective: bool = False) -> Next: ...
+    def oom(
+        self, need: int | None, site: str | None, collective: bool = False, finest: int = 0
+    ) -> Next: ...
     def cut(self, site: str) -> int: ...
     def measured(self) -> bool: ...
     def levels(self) -> list[tuple[str, int]]: ...
     def agree(self, levels: list[tuple[str, int]]) -> None: ...
     def parked(self, nbytes: int) -> None: ...
-    def site(self, name: str) -> AbstractContextManager[None]: ...
+    def site(
+        self, name: str, collective: bool = False, finest: int = 0
+    ) -> AbstractContextManager[None]: ...
 
 
 #: the request the running attempt's ops answer to (`serving`)
@@ -76,13 +83,18 @@ class Finer(Exception):
 
 @dataclass(eq=False, slots=True)
 class Scope:
-    """A cut in force: its site, its level and the finest level it has. Across a `collective`
-    one no cut goes finer mid-pass (its peers run the same pass): Rust answers it locally."""
+    """A cut in force: its site, its level and the finest level it has, the operands it reads
+    (never parked while it runs), and how many ops of each kind its current piece ran (the
+    sites of the ops inside it: the same in every piece, whatever the level). Across a
+    `collective` one no cut goes finer mid-pass (its peers run the same pass): Rust answers it
+    locally."""
 
     site: str
     finest: int
     level: int = 0
     collective: bool = False
+    operands: object = ()
+    ordinals: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(eq=False, slots=True)
@@ -140,8 +152,22 @@ def _refused(device: int, nbytes: int, allocated: int, free: int) -> None:
 
 
 def site(kind: str) -> str | None:
-    """The cut site of a call of `kind` in the running block (None outside one)."""
-    return None if _local.run is None else _local.run.site(kind)
+    """The cut site of a call of `kind` in the running block (None outside one): numbered within
+    the innermost cut's piece when one is running, so a level Rust keeps for it lands on the same
+    call in every pass at any level of the cuts around it."""
+    if _local.run is None:
+        return None
+    if not _local.scopes:
+        return _local.run.site(kind)
+    scope = _local.scopes[-1]
+    n = scope.ordinals[kind] = scope.ordinals.get(kind, 0) + 1
+    return f"{scope.site}/{kind}#{n}"
+
+
+def piece() -> None:
+    """A cut's next piece starts: the ops inside it are numbered from the start again."""
+    if _local.scopes:
+        _local.scopes[-1].ordinals.clear()
 
 
 def short(exc: BaseException) -> bool:
@@ -185,17 +211,20 @@ def answer(
         (s for s in order if s is not None and (s.collective or s.level < s.finest)), None
     )
     collective = scope is not None and scope.collective
-    found = request.oom(nbytes, None if scope is None else scope.site, collective)
+    if scope is None:
+        found = request.oom(nbytes, None)
+    else:
+        found = request.oom(nbytes, scope.site, collective, scope.finest)
     match found:
         case Next.Retry():
             return
         case Next.Cut(level=level) if scope is not None and not collective:
-            level = min(max(level, scope.level + 1), scope.finest)
             if scope is not own:
                 raise Finer(scope, level)
             scope.level = level
         case Next.Park(budget=budget):
-            request.parked(park(_device_of(operands), nbytes, budget, operands))
+            used = [operands, *(s.operands for s in _local.scopes)]
+            request.parked(park(_device_of(operands), nbytes, budget, used))
         case Next.Exhausted(error=error):
             raise error
         case _:
@@ -206,6 +235,7 @@ def settle[T](run: Callable[[], T], own: Scope | None, operands: object, first: 
     """`run()` until it runs, each OOM answered (`answer`); `run` reads `own.level`."""
     request = CURRENT.get()
     while True:
+        _local.need = None  # an OOM torch answered itself before this leaves no stale size
         try:
             return run()
         except Exception as exc:
@@ -223,13 +253,18 @@ def cut[T](site: str, finest: int, run: Callable[[int], T], operands: object) ->
     request = CURRENT.get()
     if request is None:
         return run(0)
-    scope = Scope(site, finest, min(request.cut(site), finest))
+    scope = Scope(site, finest, request.cut(site), operands=operands)
     _local.scopes.append(scope)
+
+    def whole() -> T:
+        scope.ordinals.clear()
+        return run(scope.level)
+
     try:
-        with request.site(site):
+        with request.site(site, False, finest):
             while True:
                 try:
-                    return settle(lambda: run(scope.level), scope, operands, first=True)
+                    return settle(whole, scope, operands, first=True)
                 except Finer as finer:
                     if finer.scope is not scope:
                         raise
@@ -240,33 +275,63 @@ def cut[T](site: str, finest: int, run: Callable[[int], T], operands: object) ->
 
 
 @contextmanager
-def collective(site: str) -> Iterator[None]:
-    """A collective's extent: an OOM inside asks Rust as `collective` (local answers only, the
-    finer level kept for the next pass's agreement), and no cut outside it goes finer."""
-    scope = Scope(site, 0, 0, collective=True)
+def collective(site: str, finest: int) -> Iterator[None]:
+    """A collective's extent, `finest` its finest level: an OOM inside asks Rust as
+    `collective` (local answers only, the finer level kept for the next pass's agreement), and
+    no cut outside it goes finer. Its peak is measured as the site's."""
+    request = CURRENT.get()
+    scope = Scope(site, finest, 0, collective=True)
     _local.scopes.append(scope)
     for journal in _local.layer.journals if _local.layer is not None else ():
         journal.joined = True  # its block never runs again on this GPU alone
     try:
-        yield
+        with nullcontext() if request is None else request.site(site, True, finest):
+            yield
     finally:
         _local.scopes.remove(scope)
 
 
 def attempt[T](run: Callable[[], T], operands: object) -> T:
     """`run()` where no dispatch sees it (a Triton launch): out of memory it did not run, so it
-    runs again as an op does."""
+    runs again as an op does. A block whose first run launches it writes what its operands are,
+    as far as the layer can tell: one it did not make keeps the block from running bare."""
+    for journal in _local.layer.journals if _local.layer is not None else ():
+        journal.wrote |= any(p not in journal.made for p in map(_storage, tensors(operands)))
     return settle(run, None, operands)
 
 
 # ---------------------------------------------------------------------------------- park
 
 
-def park(device: torch.device | None, nbytes: int | None, budget: int, operands: object) -> int:
-    """Tensors this process holds in torch's allocator on `device` that the failing op does not
-    read move to page-locked host memory in place, largest first, until `nbytes` moved (as many
-    as fit when unsaid) within `budget`, the host headroom varena measured. Each stays a CUDA
-    tensor read over the bus, so whatever holds it is unchanged. Returns the bytes moved."""
+#: storages a cache or a hold owns (KV slots, a graph's static inputs), by data address: park
+#: never moves them while their tensor lives
+_KEPT: dict[int, int] = {}
+#: cudaHostRegisterPortable | cudaHostRegisterMapped: every device addresses it over the bus
+_MAPPED = 0x1 | 0x2
+
+
+def keep(*held: Tensor) -> None:
+    """Tensors a cache or a hold owns: park never moves them while they live."""
+    for tensor in held:
+        at = _storage(tensor)
+        if at:
+            _KEPT[at] = _KEPT.get(at, 0) + 1
+            weakref.finalize(tensor, _unkeep, at)
+
+
+def _unkeep(at: int) -> None:
+    if _KEPT.get(at, 0) <= 1:
+        _KEPT.pop(at, None)
+    else:
+        _KEPT[at] -= 1
+
+
+def park(device: torch.device | None, nbytes: int | None, budget: int, used: object) -> int:
+    """Tensors this process holds in torch's own pool on `device` move to page-locked host
+    memory in place, largest first, until `nbytes` moved (as many as fit when unsaid) within
+    `budget`, the host headroom varena measured. Never one the failing op or a cut around it
+    reads (`used`), one a cache or a hold owns (`keep`), nor one in a graph's pool. Each stays a
+    CUDA tensor read over the bus, so whatever holds it is unchanged. Returns the bytes moved."""
     if device is None or device.type != "cuda":
         return 0
     reclaim()
@@ -274,15 +339,15 @@ def park(device: torch.device | None, nbytes: int | None, budget: int, operands:
     segments = [
         (s["address"], s["address"] + s["total_size"])
         for s in torch.cuda.memory_snapshot()
-        if s["device"] == device.index
+        if s["device"] == device.index and tuple(s["segment_pool_id"]) == (0, 0)
     ]
-    read = {_storage(t) for t in tensors(operands)}
+    read = set(map(_storage, tensors(used, depth=6)))
     found: dict[int, torch.UntypedStorage] = {}
     for value in gc.get_objects():
         if type(value) not in (Tensor, nn.Parameter) or value.device != device:
             continue
         at = _storage(value)
-        if at and at not in read and any(lo <= at < hi for lo, hi in segments):
+        if at and at not in read and at not in _KEPT and any(lo <= at < hi for lo, hi in segments):
             found.setdefault(at, value.untyped_storage())
     moved, goal = 0, budget if nbytes is None else min(nbytes, budget)
     for storage in sorted(found.values(), key=lambda s: -s.nbytes()):
@@ -298,17 +363,20 @@ def park(device: torch.device | None, nbytes: int | None, budget: int, operands:
 
 
 #: parked host blocks whose tensors are gone, until the device passes their last reader
-_GONE: list[tuple[torch.cuda.Event, Tensor]] = []
+_GONE: list[tuple[torch.cuda.Event, _Parked]] = []
 
 
 class _Parked:
-    """A parked tensor's bytes: page-locked host memory the GPU addresses over the bus, kept by
-    its tensor. When the tensor goes they wait for an event the device passes, then go back."""
+    """A parked tensor's bytes: anonymous host memory (never torch's host cache) page-locked
+    and mapped, which the GPU addresses over the bus, kept by its tensor. When the tensor goes
+    they wait for an event the device passes, then are unmapped."""
 
     def __init__(self, nbytes: int, device: torch.device) -> None:
-        self.host = torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
-        self.device = device
-        data = (self.host.data_ptr(), False)
+        self.memory = mmap.mmap(-1, nbytes)
+        self.view = ctypes.c_char.from_buffer(self.memory)
+        self.address, self.device = ctypes.addressof(self.view), device
+        _cuda(torch.cuda.cudart().cudaHostRegister(self.address, nbytes, _MAPPED))
+        data = (self.address, False)
         self.__cuda_array_interface__ = {
             "shape": (nbytes,),
             "typestr": "|u1",
@@ -319,12 +387,28 @@ class _Parked:
     def __del__(self) -> None:
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(self.device))
-        _GONE.append((event, self.host))
+        _GONE.append((event, self))
+
+    def free(self) -> None:
+        _cuda(torch.cuda.cudart().cudaHostUnregister(self.address))
+        del self.view
+        self.memory.close()
+
+
+def _cuda(status: object) -> None:
+    if int(getattr(status, "value", status)):  # type: ignore[call-overload]
+        raise RuntimeError(f"CUDA host registration failed: {status}")
 
 
 def reclaim() -> None:
-    """Parked blocks the device has passed go back to the host allocator."""
-    _GONE[:] = [(event, host) for event, host in _GONE if not event.query()]
+    """Parked blocks the device has passed go back."""
+    waiting = []
+    for event, parked in _GONE:
+        if event.query():
+            parked.free()
+        else:
+            waiting.append((event, parked))
+    _GONE[:] = waiting
 
 
 # -------------------------------------------------------------------------------- blocks
@@ -350,14 +434,15 @@ class Block:
 def wrap(
     module: nn.Module,
     block: Block,
-    around: Callable[[nn.Module], AbstractContextManager[None]] | None = None,
+    around: Callable[[nn.Module, Args, Kwargs], AbstractContextManager[None]] | None = None,
 ) -> None:
-    """`module`'s forward runs through the catch as `block`, inside `around(module)`."""
+    """`module`'s forward runs through the catch as `block`, inside `around(module, args,
+    kwargs)`."""
     forward = module.forward
 
     @functools.wraps(forward)
     def caught(*args: object, **kwargs: object) -> object:
-        with nullcontext() if around is None else around(module):
+        with nullcontext() if around is None else around(module, args, kwargs):
             request = CURRENT.get()
             if request is None:
                 return forward(*args, **kwargs)
@@ -649,9 +734,9 @@ class Layer(TorchDispatchMode):  # type: ignore[misc]
                     setattr(exc, _NO_REPLAY, True)
                 raise
         own: Scope | None = None
-        if rule is not None and _local.run is not None:
-            own = Scope(_local.run.site(func.overloadpacket.__name__), 0)
-            own.level = request.cut(own.site)
+        named = site(func.overloadpacket.__name__) if rule is not None else None
+        if named is not None:
+            own = Scope(named, 0, request.cut(named))
         bands: list[Banded | None] = []  # the op's bands, made once, when first needed
         states = [(g, g.get_state()) for g in _generators(func, args, kwargs)] if draws else []
 

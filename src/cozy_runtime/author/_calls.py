@@ -304,7 +304,7 @@ class _Broker:
         bindings: Mapping[tuple[str, str], _CallType],
         exchange: Exchange,
         watch: Callable[[], int | None] | None = None,
-        yielding: Callable[[], AbstractContextManager[None]] = nullcontext,
+        yielding: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
         #: Opens the worker's nudge socket once; None when no peer can nudge.

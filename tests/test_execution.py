@@ -47,7 +47,7 @@ ENV = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "CUDA_VISIB
 @pytest.fixture(autouse=True)
 def installed() -> Iterator[None]:
     attention_ulysses.install(execution)
-    install_split(execution.split)
+    install_split(execution)
     yield
     attention_ulysses.install(None)
     install_split(None)
@@ -131,22 +131,24 @@ def banded(func: Any) -> bool:
 
 def test_a_vae_decode_runs_in_conv_norm_and_upsampling_bands(tmp_path: Path) -> None:
     """At 36 KiB no [16, 32, 32] conv, group norm or nearest upsampling of the decoder fits
-    with its working memory: they run in row bands, results on the device."""
+    with its working memory: they run in channel bands, each the whole op's. Each op's site is
+    its block's path and its place among the block's ops of its kind, the same in every pass:
+    the next request starts each at the level Rust kept, and nothing runs out."""
     plain = vae()
     mem = memory()
     model = placed(mem, checkpoint(tmp_path, "vae", plain), "vae", vae)
     z = torch.randn(1, 4, 16, 16, generator=torch.Generator().manual_seed(2)).to(BF16)
-    card = Card(limit=36 << 10, working=banded)
+    cold, warm = Card(limit=36 << 10, working=banded), Card(limit=36 << 10, working=banded)
     with torch.no_grad():
         want = plain.decode(z).sample
-        with card, mem.request("decode") as r, execution.serving(r):
+        with cold, mem.request("decode") as r, execution.serving(r):
             got = model.decode(z).sample
-    assert card.refused and r.stats().cuts >= 1
-    # every band is the whole op's but group norm's statistics, merged from the bands in
-    # float32 (`test_each_band_rule_is_the_whole_op`): an ulp of bf16 where they round apart
-    error = (got.float() - want.float()).abs().max().item()
-    print(f"vae decode in bands: max error {error:.3g} against whole")
-    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
+        assert cold.refused and r.stats().cuts >= 1
+        assert torch.equal(got, want)
+        with warm, mem.request("decode again") as r, execution.serving(r):
+            got = model.decode(z).sample
+    assert warm.refused == 0 and r.stats().retries == r.stats().cuts == 0
+    assert torch.equal(got, want)
 
 
 @pytest.mark.parametrize("seed", [21, 22])
@@ -168,32 +170,41 @@ def test_ooms_at_seeded_random_ops_in_a_vae_decode_change_nothing(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
-    """Every op band at levels 1-3 against the op whole, on real CPU kernels, each one's measured
-    max error printed: conv (with its halo), constant pad and nearest upsampling are bit-exact;
-    group norm's statistics merge the bands' in float32, equal up to that rounding."""
+    """Every op band at every level against the op whole on real CPU kernels, each one's max
+    error printed: nearest upsampling at a non-integer scale and to a size no scale divides
+    (the whole op's index mapping in every band) and group norm by whole groups and by images
+    (eps 0 stays 0) are bit-exact; conv by images and by output channels (whole groups of a
+    grouped one) is in bfloat16, and in float32 within the rounding of another blocking."""
     aten = torch.ops.aten
     gen = torch.Generator().manual_seed(9)
     x = torch.randn(1, 16, 32, 32, generator=gen).to(dtype)
+    four = torch.randn(4, 16, 8, 8, generator=gen).to(dtype)
     w, b = torch.randn(16, 16, 3, 3, generator=gen).to(dtype), torch.randn(16).to(dtype)
+    grouped = torch.randn(16, 4, 3, 3, generator=gen).to(dtype)
+    conv = ([1, 1], [1, 1], [1, 1], False, [0, 0])
     cases = {
-        "conv": (aten.convolution.default, (x, w, b, [1, 1], [1, 1], [1, 1], False, [0, 0], 1)),
-        "pad": (aten.constant_pad_nd.default, (x, [1, 1, 2, 2], 0.5)),
-        "upsample": (aten.upsample_nearest2d.vec, (x, [64, 64], None)),
-        "group_norm": (aten.native_group_norm.default, (x, b, b, 1, 16, 1024, 4, 1e-6)),
+        "conv by channels": (aten.convolution.default, (x, w, b, *conv, 1)),
+        "grouped conv by groups": (aten.convolution.default, (x, grouped, b, *conv, 4)),
+        "conv by images": (aten.convolution.default, (four, w, None, *conv, 1)),
+        "upsample x1.5": (aten.upsample_nearest2d.vec, (x, None, [1.5, 1.5])),
+        "exact upsample to 45": (aten._upsample_nearest_exact2d.vec, (four, [45, 45], None)),
+        "upsample x2": (aten.upsample_nearest2d.default, (x, [64, 64], 2.0, 2.0)),
+        "group norm by groups": (aten.native_group_norm.default, (x, b, b, 1, 16, 1024, 4, 1e-6)),
+        "group norm eps 0": (aten.native_group_norm.default, (four, b, b, 4, 16, 64, 4, 0.0)),
     }
     for name, (func, args) in cases.items():
         whole = func(*args)
         plan = catch.RULES[func.overloadpacket](func, args, {})
-        assert plan is not None and plan.finest >= 3, name
-        for level in (1, 2, 3):
-            got: Any = plan(catch.Scope(name, plan.finest, level))
-            got, want = (got[0], whole[0]) if name == "group_norm" else (got, whole)
-            error = (got.float() - want.float()).abs().max().item()
-            print(f"{dtype} {name} level {level}: max error {error:.3g} against whole")
-            if name == "group_norm":
-                torch.testing.assert_close(got, want, rtol=2**-20, atol=2**-20)
-            else:
-                assert torch.equal(got, want), (name, level)
+        assert plan is not None and plan.finest >= 2, name
+        for level in range(1, plan.finest + 1):
+            got = plan(catch.Scope(name, plan.finest, level))
+            for a, b in zip(catch.tensors(got), catch.tensors(whole), strict=True):
+                error = (a.float() - b.float()).abs().max().item()
+                print(f"{dtype} {name} level {level}: max error {error:.3g} against whole")
+                if name.startswith(("conv", "grouped")):  # a CPU kernel blocks fewer channels
+                    torch.testing.assert_close(a, b, rtol=2**-16, atol=2**-14)  # otherwise
+                else:
+                    assert torch.equal(a, b), (name, level)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
@@ -208,12 +219,12 @@ def test_ffn_tokens_and_attention_pieces_against_the_whole(dtype: Any) -> None:
     tolerance = 2**-6 if dtype == torch.bfloat16 else 2**-18
     with torch.no_grad():
         whole_ffn, whole_attention = ffn(x), scores(q, k, v)
-        units = cuts._head_units(8, 1)
         for level in (1, 2, 3):
+            heads = cuts.pieces(8, level)  # 2^level pieces of whole K/V heads
             pieces = {
                 "ffn tokens": (cuts._tokens(ffn, x, 96, level), whole_ffn),
                 "attention heads": (
-                    cuts._attend(lambda *t: scores(*t[:3]), q, k, v, None, 1, units[level], 64),
+                    cuts._attend(lambda *t: scores(*t[:3]), q, k, v, None, 1, heads, 64),
                     whole_attention,
                 ),
                 "attention rows": (
@@ -356,7 +367,8 @@ def test_an_oom_on_one_rank_becomes_the_same_cut_on_every_rank(tmp_path: Path, s
     recovers locally mid-pass (both cross every head at once), and from the next pass both
     agree its finer level and cross the heads in halves. Measured, the collective block runs
     bare; out of memory there both fail typed with no replay, and the next pass at those shapes
-    runs under the layer. Every pass that completes is degree 1's result."""
+    runs under the layer. Every pass that completes is degree 1's result. The ranks' rows cross
+    once, in the first pass: the later ones have its shapes."""
     argv = [sys.executable, str(AGREEMENT), str(tmp_path), "--degree", "2", "--short", str(short)]
     subprocess.run(argv, env=ENV, check=True)
     rows = [json.loads((tmp_path / f"rank-{rank}.json").read_text()) for rank in range(2)]
@@ -368,6 +380,7 @@ def test_an_oom_on_one_rank_becomes_the_same_cut_on_every_rank(tmp_path: Path, s
         heads = [p["exchanged_heads"] for n, p in enumerate(passes) if n != 3]
         assert heads == [[8], [4, 4], [4, 4], [4, 4]], row
         assert [p["layered"] for p in passes] == [True, False, False, False, True], row
+        assert [p["gathered"] for p in passes] == [1, 0, 0, 0, 0], row
 
 
 # ------------------------------------------------------------ in place, park, package code

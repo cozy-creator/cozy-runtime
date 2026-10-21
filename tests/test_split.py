@@ -27,11 +27,14 @@ class Sizes:
         self.asked: list[tuple[str, int, int]] = []
         self.pieces: list[int] = []
 
-    def __call__(
+    def split(
         self, name: str, key: str, total: int, finest: int, run: Callable[[int], Any]
     ) -> Any:
         self.asked.append((name, total, finest))
         return run(self.most)
+
+    def piece(self) -> None:
+        self.pieces.append(len(self.pieces))
 
 
 @pytest.fixture

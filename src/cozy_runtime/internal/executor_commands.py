@@ -63,7 +63,8 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
-    #: The follower's GPU ledger memfd and eventfd follow this command: it claims its row there.
+    #: The follower's GPU grant (its table and row descriptions) follows this command: it
+    #: claims its row there.
     ledger: bool = False
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False
@@ -178,7 +179,7 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
-    #: Its GPUs' grants follow the frame, a table and an events descriptor per GPU in `devices`
+    #: Its GPUs' grants follow the frame, a table and a row description per GPU in `devices`
     #: order: rank 0 opens its memory on the first and hands follower r the r-th.
     ledgers: int = 0
     #: The callables its attempts may call: their proxies are installed before the package is

@@ -192,25 +192,26 @@ class Channel:
             raise
         return received
 
-    def send_ledger(self, memfd: int, eventfd: int) -> None:
-        """Hand over one GPU's grant (`tensorfs.varena.Grant`): its table memfd, then its
-        eventfd."""
-        _require_memfd(memfd)
-        _require_eventfd(eventfd)
-        self._send_fd(memfd, "ledger memfd")
-        self._send_fd(eventfd, "ledger eventfd")
+    def send_ledger(self, table: int, row: int) -> None:
+        """Hand over one GPU's grant (`tensorfs.varena.Grant`): its table, then the table's
+        description for this process's row lock."""
+        for fd in (table, row):
+            _require_table(fd)
+        self._send_fd(table, "ledger table")
+        self._send_fd(row, "ledger row")
 
-    def recv_ledger(self) -> list[int]:
-        """One GPU's grant: its table memfd and eventfd; anything else is closed and refused."""
-        fds = self.recv_fds(2)
+    def recv_ledger(self) -> tuple[int, int]:
+        """One GPU's grant: its table and row descriptions; anything else is closed and
+        refused."""
+        table, row = self.recv_fds(2)
         try:
-            _require_memfd(fds[0])
-            _require_eventfd(fds[1])
+            _require_table(table)
+            _require_table(row)
         except SeamError:
-            for fd in fds:
-                os.close(fd)
+            os.close(table)
+            os.close(row)
             raise
-        return fds
+        return table, row
 
     def recv_fds(self, count: int) -> list[int]:
         """`count` descriptors, unopened."""
@@ -629,28 +630,13 @@ def sealed(name: str, body: bytes) -> int:
     return fd
 
 
-def _require_eventfd(fd: int) -> None:
-    """An eventfd, a ledger's freed-bytes signal (Linux only, as varena's ledger is)."""
-    try:
-        named = os.readlink(f"/proc/self/fd/{fd}")
-    except OSError as exc:
-        raise SeamError("seam_descriptor", f"eventfd unreadable: {exc}") from exc
-    if named != "anon_inode:[eventfd]":
-        raise SeamError("seam_descriptor", f"capability must be an eventfd, not {named}")
-
-
-def _require_memfd(fd: int) -> None:
-    """A regular file the kernel names `/memfd:…`: an anonymous in-memory tier, never a path.
-    macOS has no memfd: there an unlinked regular file, which no path names either. Windows
-    cannot see whether a file's name goes with its last handle: there any regular file."""
+def _require_table(fd: int) -> None:
+    """A varena table: a regular file open to read and write (varena checks its owner and
+    modes when it adopts it). Linux only, as varena's ledger is."""
     try:
         found = os.fstat(fd)
-        named = os.readlink(f"/proc/self/fd/{fd}") if sys.platform == "linux" else ""
+        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
     except OSError as exc:
-        raise SeamError("seam_descriptor", f"memfd unreadable: {exc}") from exc
-    if sys.platform == "linux":
-        anonymous = named.startswith("/memfd:")
-    else:
-        anonymous = sys.platform == "win32" or found.st_nlink == 0
-    if not stat.S_ISREG(found.st_mode) or not anonymous:
-        raise SeamError("seam_descriptor", "capability must be a memfd")
+        raise SeamError("seam_descriptor", f"ledger unreadable: {exc}") from exc
+    if not stat.S_ISREG(found.st_mode) or access != os.O_RDWR:
+        raise SeamError("seam_descriptor", "a ledger must be a regular file open read-write")

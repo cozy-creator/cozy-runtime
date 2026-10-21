@@ -1,10 +1,11 @@
 """Exact cuts (varena-slim §2): each computes what the whole computes, results on the device, at
 the level Rust holds for its site (`r.cut`). Level L is 2^L pieces, down to the finest.
 
-Op bands (the layer's, `catch.RULES`): conv, constant pad, nearest upsampling and group norm in
-row bands with halos and two-pass statistics. An elementwise op whose one allocation is its result
-has no band that saves room; SiLU and GELU run in place when their input is dead (`catch`), else
-Rust parks.
+Op bands (the layer's, `catch.RULES`): conv, nearest upsampling and group norm by images, else by
+channels (whole groups), each band written by the op's `out` form straight into its slice of the
+op's results: only the op's own working memory (conv's workspace, a norm's float32 upcast)
+shrinks with the band. An elementwise op whose one allocation is its result has no band that
+saves room; SiLU and GELU run in place when their input is dead (`catch`), else Rust parks.
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
 """
@@ -44,50 +45,56 @@ def pieces(units: int, level: int) -> int:
 # ---------------------------------------------------------------------------- op bands
 
 
+#: What a band writes: the op on [lo, hi) of its first result's band axis, straight into its
+#: slices of the op's preallocated results (`outs`), through the op's `out` form.
+type Write = Callable[[int, int, Sequence[Tensor]], None]
+
+
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """An op as rows [a, b) of its result `out` (meta) along `axis`: `band(a, b)` computes them,
-    starting on multiples of `align`; `gather(rows)` reads what every band needs first;
-    `finish` makes the op's own result from the filled tensor."""
+    """An op in bands of its first result's outermost axis of more than one (a batch, else the
+    channels: a contiguous slice of each result), `align` of them a unit. `write` runs the op on
+    its operands' matching part straight into its slices of the preallocated results: no band
+    holds a result of its own. Its results are the op's own."""
 
     x: Tensor
-    out: Tensor
+    outs: tuple[Tensor, ...]  # the op's results, meta
     axis: int
-    band: Band
+    write: Write
     align: int = 1
-    gather: Callable[[int], None] | None = None
-    finish: Callable[[Tensor], object] | None = None
+
+    @property
+    def units(self) -> int:
+        return -(-int(self.outs[0].shape[self.axis]) // self.align)
 
     @property
     def finest(self) -> int:
-        return levels(-(-int(self.out.shape[self.axis]) // self.align))
-
-    def rows(self, level: int) -> int:
-        return pieces(-(-int(self.out.shape[self.axis]) // self.align), level) * self.align
+        return levels(self.units)
 
     def __call__(self, own: Scope) -> object:
-        operands = (self.x,)
-        out = catch.settle(lambda: _empty(self.out, self.x.device), None, operands)
-        if self.gather is not None:
-            gather = self.gather
-            catch.settle(lambda: gather(self.rows(own.level)), own, operands, first=True)
-        height, at = int(self.out.shape[self.axis]), 0
-        while at < height:
-            write = functools.partial(self._write, out, at, own)
+        device = self.x.device
+        outs = [catch.settle(functools.partial(_empty, m, device), None, self.x) for m in self.outs]
+        operands = (self.x, outs)  # never parked while a band writes them
+        at = 0
+        while at < self.units:
+            write = functools.partial(self._band, outs, at, own)
             at = catch.settle(write, own, operands, first=True)
-        return out if self.finish is None else self.finish(out)
+        return outs[0] if len(outs) == 1 else tuple(outs)
 
-    def _write(self, out: Tensor, at: int, own: Scope) -> int:
-        stop = min(at + self.rows(own.level), int(out.shape[self.axis]))
-        out.narrow(self.axis, at, stop - at).copy_(self.band(at, stop))
+    def _band(self, outs: Sequence[Tensor], at: int, own: Scope) -> int:
+        stop = min(at + pieces(self.units, own.level), self.units)
+        self.write(at * self.align, stop * self.align, outs)
         return stop
 
 
-def _plan(made: list[Tensor], x: Tensor, axis: int, band: Band, **more: object) -> Plan | None:
-    """When the op makes a tensor of two rows or more."""
-    if not made or made[0].shape[axis] < 2:
+def _plan(made: list[Tensor], x: Tensor, write: Write, align: int = 1) -> Plan | None:
+    """Over the results' outermost axis of more than one unit, when every result is contiguous."""
+    if not made or not all(m.is_contiguous() for m in made):
         return None
-    return Plan(x, made[0], axis, band, **more)  # type: ignore[arg-type]
+    axis = next((i for i, n in enumerate(made[0].shape[:2]) if n > 1), None)
+    if axis is None or made[0].shape[axis] < 2 * align:
+        return None
+    return Plan(x, tuple(made), axis, write, align)
 
 
 def _arguments(func: OpOverload, args: Args, kwargs: Kwargs) -> dict[str, object]:
@@ -119,130 +126,84 @@ def _empty(like: Tensor, device: torch.device) -> Tensor:
     return torch.empty_strided(like.shape, like.stride(), dtype=like.dtype, device=device)
 
 
-def _rows(x: Tensor, axis: int, first: int, last: int, value: float = 0.0) -> Tensor:
-    """Rows [first, last) of `x` along `axis`, `value` past its edges."""
-    size = int(x.shape[axis])
-    start, before = min(max(first, 0), size), min(max(-first, 0), last - first)
-    length = max(min(last, size) - start, 0)
-    edge = [0, 0] * (x.dim() - 1 - axis) + [before, last - first - before - length]
-    rows = x.narrow(axis, start, length)
-    return aten.constant_pad_nd.default(rows, edge, value) if any(edge) else rows
-
-
-def _axis(x: Tensor) -> int:
-    """The rows bands cut: a 1D signal's length, else the second-to-last dim."""
-    return x.dim() - 2 if x.dim() > 3 else 2
-
-
-def _each(value: object, n: int, default: int) -> list[int]:
-    values = list(value) if isinstance(value, list | tuple) else [value or default]
-    return [int(cast(int, v)) for v in values] * (n if len(values) == 1 else 1)
-
-
 def _conv(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """Output rows [a, b) read input rows [a*s - p, (b-1)*s - p + d*(k-1) + 1), zeros past the
-    edges."""
+    """By images, else by output channels (whole groups of them, each reading its groups' input
+    channels): what the whole conv computes for them."""
     a = _arguments(func, args, kwargs)
-    x, w, bias, groups = a.get("input"), a.get("weight"), a.get("bias"), a.get("groups") or 1
-    if not isinstance(x, Tensor) or not isinstance(w, Tensor) or not x.dim() == w.dim() > 2:
+    x, w, bias = a.get("input"), a.get("weight"), a.get("bias")
+    groups = int(cast(int, a.get("groups") or 1))
+    if not isinstance(x, Tensor) or not isinstance(w, Tensor) or a.get("transposed"):
         return None
-    if a.get("transposed") or isinstance(a.get("padding"), str):
-        return None
-    n, axis = w.dim() - 2, _axis(x)
-    stride, padding = _each(a.get("stride"), n, 1), _each(a.get("padding"), n, 0)
-    dilation, j = _each(a.get("dilation"), n, 1), axis - 2
-    s, d, k = stride[j], dilation[j], int(w.shape[axis])
+    out, made = cast(OpOverload, aten.convolution.out), _meta(func, args, kwargs)
+    rest = [a[k] for k in ("stride", "padding", "dilation", "transposed", "output_padding")]
+    per_out, per_in = int(w.shape[0]) // groups, int(x.shape[1]) // groups
+    by_image = bool(made) and made[0].shape[0] > 1
 
-    def band(lo: int, hi: int) -> Tensor:
-        rows = _rows(x, axis, lo * s - padding[j], (hi - 1) * s - padding[j] + d * (k - 1) + 1)
-        pads = [0 if i == j else p for i, p in enumerate(padding)]
-        conv = aten.convolution.default
-        return conv(rows, w, bias, stride, pads, dilation, False, [0] * n, groups)
+    def write(lo: int, hi: int, outs: Sequence[Tensor]) -> None:
+        if by_image:
+            out(x[lo:hi], w, bias, *rest, groups, out=outs[0][lo:hi])
+            return
+        part = bias[lo:hi] if isinstance(bias, Tensor) else None
+        g0, g1 = lo // per_out, hi // per_out
+        inputs = x if groups == 1 else x[:, g0 * per_in : g1 * per_in]
+        out(inputs, w[lo:hi], part, *rest, 1 if groups == 1 else g1 - g0, out=outs[0][:, lo:hi])
 
-    return _plan(_meta(func, args, kwargs), x, axis, band)
-
-
-def _pad(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """A constant padding: output rows [a, b) are input rows [a - top, b - top), the value past
-    its edges."""
-    a = _arguments(func, args, kwargs)
-    x, pad = a.get("self"), list(a.get("pad") or ())  # type: ignore[call-overload]
-    value = float(a.get("value") or 0)  # type: ignore[arg-type]
-    if not isinstance(x, Tensor) or x.dim() < 2 or min(pad, default=0) < 0:
-        return None
-    if a.get("mode", "constant") != "constant":
-        return None
-    axis, rest = x.dim() - 2, [*pad, 0, 0, 0, 0][: max(len(pad), 4)]
-    others = [*rest[:2], 0, 0, *rest[4:]]
-
-    def band(lo: int, hi: int) -> Tensor:
-        rows = _rows(x, axis, lo - rest[2], hi - rest[2], value)
-        return aten.constant_pad_nd.default(rows, others, value)
-
-    return _plan(_meta(aten.constant_pad_nd.default, (x, pad, value), {}), x, axis, band)
+    return _plan(made, x, write, 1 if by_image or groups == 1 else per_out)
 
 
 def _upsample(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """Nearest upsampling by a whole factor `r`: output rows [a, b), on multiples of `r`, read
-    input rows [a/r, b/r)."""
+    """By images, else by channels: each band the whole op's index mapping (its output size
+    and scales, a `vec` call's as the `out` form takes them) over its own planes."""
     x, made = args[0] if args else None, _meta(func, args, kwargs)
     if not isinstance(x, Tensor) or x.dim() < 3 or not made:
         return None
-    axis, sizes = _axis(x), [int(n) for n in made[0].shape[2:]]
-    r = sizes[axis - 2] // max(int(x.shape[axis]), 1)
-    if r < 2 or r * x.shape[axis] != sizes[axis - 2]:
-        return None
+    rest: Sequence[object] = args[1:]
+    if func._overloadname == "vec":
+        scales = cast(list[float | None] | None, _arguments(func, args, kwargs).get("scale_factors"))
+        rest, kwargs = [list(made[0].shape[2:]), *(scales or [None] * (x.dim() - 2))], {}
+    out, by_image = cast(OpOverload, func.overloadpacket.out), made[0].shape[0] > 1
 
-    def band(lo: int, hi: int) -> Tensor:
-        cut = [hi - lo if i == axis - 2 else n for i, n in enumerate(sizes)]
-        return func.overloadpacket.vec(x.narrow(axis, lo // r, (hi - lo) // r), cut, None)
+    def write(lo: int, hi: int, outs: Sequence[Tensor]) -> None:
+        if by_image:
+            out(x[lo:hi], *rest, **kwargs, out=outs[0][lo:hi])
+        else:
+            out(x[:, lo:hi], *rest, **kwargs, out=outs[0][:, lo:hi])
 
-    return _plan(made, x, axis, band, align=r)
+    return _plan(made, x, write)
 
 
 def _group_norm(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """Per image and group, mean and variance over every band in float32 or wider, merged as one
-    pass over all of it would be (up to rounding); then each band normalized."""
+    """By images, else by whole groups: each group's statistics over its own channels, as the
+    whole op computes them."""
     a = _arguments(func, args, kwargs)
     x, weight, bias = a.get("input"), a.get("weight"), a.get("bias")
-    groups = int(cast(int, a.get("num_groups", a.get("group")) or 1))
-    eps = float(a.get("eps") or 1e-5)  # type: ignore[arg-type]
-    if not isinstance(x, Tensor) or x.dim() < 3 or x.shape[1] % groups:
+    if not isinstance(x, Tensor) or x.dim() < 2:
         return None
-    axis, made, batch = _axis(x), _meta(func, args, kwargs), int(x.shape[0])
-    per, height, total = int(x.shape[1]) // groups, int(x.shape[axis]), x.numel() // batch // groups
-    wide, shape = torch.promote_types(x.dtype, torch.float32), [batch, -1] + [1] * (x.dim() - 2)
-    held: list[Tensor] = []  # scale, shift, mean, rstd
+    n, c, hxw = (int(cast(int, a[k])) for k in ("N", "C", "HxW"))
+    groups, eps = int(cast(int, a["group"])), float(cast(float, a["eps"]))
+    out, made = cast(OpOverload, aten.native_group_norm.out), _meta(func, args, kwargs)
+    per, by_image = c // groups, n > 1
 
-    def gather(rows: int) -> None:
-        parts = []
-        for lo in range(0, height, rows):
-            flat = x.narrow(axis, lo, min(rows, height - lo)).to(wide).reshape(batch, groups, -1)
-            parts.append((*torch.var_mean(flat, dim=-1, correction=0), flat.shape[-1] / total))
-        mean = sum(m * n for _, m, n in parts)
-        rstd = torch.rsqrt(sum((v + (m - mean) ** 2) * n for v, m, n in parts) + eps)
-        scale = rstd.repeat_interleave(per, dim=1)
-        scale = scale * weight.to(wide) if isinstance(weight, Tensor) else scale
-        shift = -mean.repeat_interleave(per, dim=1) * scale
-        shift = shift + bias.to(wide) if isinstance(bias, Tensor) else shift
-        held[:] = [scale.reshape(shape), shift.reshape(shape), mean, rstd]
+    def write(lo: int, hi: int, outs: Sequence[Tensor]) -> None:
+        y, mean, rstd = outs
+        if by_image:
+            out(x[lo:hi], weight, bias, hi - lo, c, hxw, groups, eps,
+                out0=y[lo:hi], out1=mean[lo:hi], out2=rstd[lo:hi])
+            return
+        g0, g1 = lo // per, hi // per
+        w = weight[lo:hi] if isinstance(weight, Tensor) else None
+        b = bias[lo:hi] if isinstance(bias, Tensor) else None
+        out(x[:, lo:hi], w, b, n, hi - lo, hxw, g1 - g0, eps,
+            out0=y[:, lo:hi], out1=mean[:, g0:g1], out2=rstd[:, g0:g1])
 
-    def band(lo: int, hi: int) -> Tensor:
-        return torch.addcmul(held[1], x.narrow(axis, lo, hi - lo), held[0])
-
-    def finish(out: Tensor) -> object:
-        stats = (held[2].to(made[1].dtype), held[3].to(made[2].dtype)) if len(made) > 2 else ()
-        return (out, *stats) if stats else out
-
-    return _plan(made, x, axis, band, gather=gather, finish=finish)
+    return _plan(made, x, write, 1 if by_image else per)
 
 
 _UPSAMPLES = [f"{p}{d}d" for p in ("upsample_nearest", "_upsample_nearest_exact") for d in "123"]
 _SPEC = {
-    _conv: "convolution conv1d conv2d conv3d",
-    _pad: "constant_pad_nd pad",
+    _conv: "convolution",
     _upsample: " ".join(_UPSAMPLES),
-    _group_norm: "group_norm native_group_norm",
+    _group_norm: "native_group_norm",
 }
 catch.RULES.update({getattr(aten, n): r for r, ns in _SPEC.items() for n in ns.split()})
 
@@ -298,6 +259,7 @@ def _tokens(forward: Callable[..., object], x: Tensor, tokens: int, level: int) 
         return forward(x)
     size, flat, out = pieces(tokens, level), x.reshape(tokens, x.shape[-1]), None
     for at in range(0, tokens, size):
+        catch.piece()
         part = forward(flat[at : at + size])
         if not isinstance(part, Tensor):
             raise _Whole
@@ -359,6 +321,7 @@ def _rms_bands(forward: Callable[..., object], x: Tensor, axis: int, level: int)
     rows, out = pieces(height, level), None
     for at in range(0, height, rows):
         length = min(rows, height - at)
+        catch.piece()
         part = forward(x.narrow(axis, at, length))
         expected = (*x.shape[:axis], length, *x.shape[axis + 1 :])
         if not isinstance(part, Tensor) or part.shape != expected:
@@ -382,31 +345,27 @@ def attend(
     heads: bool = True,
 ) -> Tensor:
     """`call(q, k, v, mask)` over [batch, sequence, heads, dim], in pieces at its site's level,
-    each computed as the whole computes it: query heads with the K/V heads they read (whole K/V
-    groups, then heads sharing one), when `heads` (the kernel reduces within a head); then query
-    rows on multiples of `rows` (the kernel's query block; 0: never), each beside every key."""
+    each computed as the whole computes it. Level L is 2^L pieces of whole K/V groups (their
+    query heads with them) when `heads` (the kernel reduces within a head); past one group a
+    piece, the rows halve: query rows on multiples of `rows` (the kernel's query block; 0:
+    never), each beside every key."""
     site = catch.site("attention")
     if site is None:
         return call(q, k, v, mask)
-    count, length = int(q.shape[2]), int(q.shape[1])
-    group = max(count // int(k.shape[2]), 1)
+    count, length, kv = int(q.shape[2]), int(q.shape[1]), int(k.shape[2])
+    group = max(count // kv, 1)
     if mask is not None and mask.dim() != 4:
         rows, heads = 0, False
-    cuts = [(h, length) for h in (_head_units(count, group) if heads else [count])]
-    while 0 < rows < cuts[-1][1]:
-        cuts.append((cuts[-1][0], max(rows, cuts[-1][1] // 2 // rows * rows)))
+    by_heads = levels(kv) if heads else 0
+    blocks = -(-length // rows) if rows else 1
 
     def piece(level: int) -> Tensor:
-        return _attend(call, q, k, v, mask, group, *cuts[level])
+        across = min(level, by_heads)
+        hp = pieces(kv, across) * group if heads else count
+        rp = pieces(blocks, level - across) * rows if rows else length
+        return _attend(call, q, k, v, mask, group, hp, rp)
 
-    return catch.cut(site, len(cuts) - 1, piece, (q, k, v))
-
-
-@functools.cache
-def _head_units(count: int, group: int) -> list[int]:
-    """Query heads per piece that keep each piece on whole K/V groups or inside one."""
-    wholes = {group * m for m in range(1, count // group + 1)}
-    return sorted(wholes | {d for d in range(1, group + 1) if group % d == 0}, reverse=True)
+    return catch.cut(site, by_heads + levels(blocks), piece, (q, k, v))
 
 
 def _attend(
@@ -422,6 +381,7 @@ def _attend(
     for h in range(0, count, hp):
         n, lo, hi = min(hp, count - h), h // group, (min(h + hp, count) - 1) // group + 1
         for s in range(0, length, rp):
+            catch.piece()
             part = whole[:, h : h + n, s : s + rp] if whole is not None else None
             piece = call(q[:, s : s + rp, h : h + n], k[:, :, lo:hi], v[:, :, lo:hi], part)
             out = piece.new_empty((batch, length, count, *piece.shape[3:])) if out is None else out

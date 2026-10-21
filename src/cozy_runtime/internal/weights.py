@@ -719,6 +719,10 @@ class Placement:
         self.pins[(component, owner)] = (token, cache)
         return token
 
+    def keep(self, *held: Tensor) -> None:
+        """Tensors a cache or a hold owns (KV slots, a graph's static inputs): never parked."""
+        execution.keep(*held)
+
     def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
         return self.memory.cache(owner, shed) if self.memory.cuda else None

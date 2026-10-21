@@ -565,9 +565,9 @@ class RankGroup:
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
-        follower joining it, rank 0 joining last, one barrier as the proof. `ledgers`, a pair
-        per follower in rank order, are their GPUs' ledger memfds and eventfds: each pair follows
-        its `join`, then the
+        follower joining it, rank 0 joining last, one barrier as the proof. `ledgers`, a pair per
+        follower in rank order, are their GPUs' grants (table, row): each follows its `join`,
+        then the
         socket its watcher reads (`interrupt`). `again` forms it AGAIN after an `interrupt`:
         every follower joins a new store.
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
