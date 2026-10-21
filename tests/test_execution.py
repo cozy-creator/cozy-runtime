@@ -60,9 +60,13 @@ def test_varena_s_exhausted_is_the_one_memory_error() -> None:
     """With nothing evictable and nothing to cut, Rust's answers end in Exhausted: raised as
     it is, it fails the attempt as capacity and never the process."""
     mem, x = memory(1 << 20), torch.ones(64)
-    with mem.request("exhausted") as r, execution.serving(r), Card(limit=1):
-        with pytest.raises(Exception) as raised:
-            catch.settle(lambda: x * 2, None, (x,))
+    with (
+        mem.request("exhausted") as r,
+        execution.serving(r),
+        Card(limit=1),
+        pytest.raises(Exception) as raised,
+    ):
+        catch.settle(lambda: x * 2, None, (x,))
     assert fault(raised.value) is Fault.EXHAUSTED
     assert classify(raised.value).code == MEMORY_EXHAUSTED
 
@@ -87,11 +91,11 @@ def test_ooms_at_seeded_random_ops_in_a_transformer_change_nothing(
     plain = transformer()
     mem = memory()
     model = placed(mem, checkpoint(tmp_path, "dit", plain), "dit", transformer)
-    card = Card(seed=seed, rate=0.04)
+    card, xs = Card(seed=seed, rate=0.04), [tokens(n) for n in range(3)]
     with torch.no_grad():
-        want = [plain(tokens(n)) for n in range(3)]
+        want = [plain(x) for x in xs]
         with mem.request(f"random-{seed}") as r, execution.serving(r), card:
-            got = [model(tokens(n)) for n in range(3)]
+            got = [model(x) for x in xs]
     assert card.refused, "the seed ran nothing out"
     assert all(torch.equal(a, b) for a, b in zip(got, want, strict=True))
     stats = r.stats()
@@ -132,7 +136,9 @@ def test_a_vae_decode_runs_in_conv_norm_and_elementwise_bands(tmp_path: Path) ->
         with mem.request("decode") as r, execution.serving(r), card:
             got = model.decode(z).sample
     assert card.refused and r.stats().cuts >= 1
-    torch.testing.assert_close(got, want, rtol=0, atol=0)
+    # every band is the whole op's but group norm's statistics, merged from the bands in
+    # float32 (`test_each_band_rule_is_the_whole_op`): an ulp of bf16 where they round apart
+    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
 
 
 @pytest.mark.parametrize("seed", [21, 22])
@@ -149,7 +155,42 @@ def test_ooms_at_seeded_random_ops_in_a_vae_decode_change_nothing(
         with mem.request(f"decode-{seed}") as r, execution.serving(r), card:
             got = model.decode(z).sample
     assert card.refused
-    assert torch.equal(got, want)
+    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
+    """Every op band at levels 1-3 against the op whole, on real CPU kernels: conv (with its
+    halo), constant pad, nearest upsampling, add and mul are bit-exact. SiLU and GELU are too in
+    bf16; in float32 the CPU's SIMD and scalar paths differ by an ulp where a band's elements fall
+    (a GPU computes every element alike). Group norm's statistics merge the bands' in float32,
+    equal up to that rounding."""
+    aten = torch.ops.aten
+    gen = torch.Generator().manual_seed(9)
+    x = torch.randn(1, 16, 32, 32, generator=gen).to(dtype)
+    w, b = torch.randn(16, 16, 3, 3, generator=gen).to(dtype), torch.randn(16).to(dtype)
+    cases = {
+        "conv": (aten.convolution.default, (x, w, b, [1, 1], [1, 1], [1, 1], False, [0, 0], 1)),
+        "pad": (aten.constant_pad_nd.default, (x, [1, 1, 2, 2], 0.5)),
+        "upsample": (aten.upsample_nearest2d.vec, (x, [64, 64], None)),
+        "silu": (aten.silu.default, (x,)),
+        "gelu": (aten.gelu.default, (x,)),
+        "add": (aten.add.Tensor, (x, x.flip(-1))),
+        "mul": (aten.mul.Tensor, (x, b.view(16, 1, 1))),
+        "group_norm": (aten.native_group_norm.default, (x, b, b, 1, 16, 1024, 4, 1e-6)),
+    }
+    for name, (func, args) in cases.items():
+        whole = func(*args)
+        plan = catch.RULES[func.overloadpacket](func, args, {})
+        assert plan is not None and plan.finest >= 3, name
+        for level in (1, 2, 3):
+            got = plan(catch.Scope(name, plan.finest, level))
+            if name == "group_norm":
+                torch.testing.assert_close(got[0], whole[0], rtol=2**-20, atol=2**-20)
+            elif name in ("silu", "gelu") and dtype == torch.float32:
+                torch.testing.assert_close(got, whole, rtol=2**-22, atol=2**-22)
+            else:
+                assert torch.equal(got, whole), (name, level)
 
 
 class Tiles(nn.Module):

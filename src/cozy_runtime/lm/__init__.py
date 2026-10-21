@@ -1109,19 +1109,33 @@ class _Engine:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
     def _hold(self, stack: ExitStack) -> bool:
-        """The decode graphs' weights at fixed addresses; False for a model the memory places
-        (its blocks bind per forward, and graph pins are not wired to varena yet: its calls
-        decode through Transformers' loop)."""
-        if self._targets():
-            return False
+        """The model (and its head) pinned at home for the decode graphs (`Placement.pin`);
+        False when part of one streams (the calls then decode through Transformers' loop)."""
+        targets = self._targets()
         # The steps also read buffers the model builds (its rotary tables): a rebuilt one (a
         # component placed again) records anew.
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
-        self.where = (tuple(t.data_ptr() for t in derived),)
+        built = tuple(t.data_ptr() for t in derived)
+        if not targets:
+            self.where = (built,)
+            return True
+        pins = [r.pin(name, f"lm:{name}", self._unpinned) for _, (r, name) in targets]
+        if any(pin is None for pin in pins):
+            return False
+        self.where = (*pins, built)
         return True
 
-    #: what the graphs read weights and built buffers through
+    #: the pins the graphs read weights through: they live while this engine refers to them
     where: tuple[object, ...] = ()
+
+    def _unpinned(self) -> int:
+        """Memory asks for the pinned weights: an idle engine lets its graphs and pins go now,
+        a busy one at its next loop."""
+        if self.idle():
+            self.where = ()
+        else:
+            self.rehold = self.stale = True
+        return 0
 
     def _cancelled(self) -> bool:
         """Whether a held row's call was cancelled: the host stops queueing steps for it."""

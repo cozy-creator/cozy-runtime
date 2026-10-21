@@ -69,7 +69,7 @@ import tensorfs
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime import weights_store
+from cozy_runtime import graphs, weights_store
 from cozy_runtime.author import _split, describe
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
 from cozy_runtime.author._app import Registration
@@ -2658,8 +2658,8 @@ class Executor:
         # shared `use` of its components, and each block binds its weights while it runs.
         self.residency = Placement(host.memory, backend)
         object.__setattr__(model, "_cozy_residency", self.residency)
-        # No CUDA graphs over placed components: a graph's pins are not wired to varena yet
-        # (it binds every block it captures and holds the pins as a cache).
+        # Its components' calls replay CUDA graphs once recorded (`graphs`), unless uncaptured.
+        graphs.install(self.torch, model, {name: m.module for name, m in backend.models.items()})
         stage_memo.install(
             model,
             torch=torch,

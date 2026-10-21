@@ -25,12 +25,17 @@ __all__ = ["agreed", "attend", "collective", "install", "launch", "record", "ser
 
 
 def install(module: nn.Module, state: Sequence[str] = ()) -> None:
-    """The catch on a loaded model: each block varena binds and the model itself (its pass,
-    which agrees its exchanges' level when sharded), with its FFN and norm cuts. `state`: the
-    attribute paths its forward changes (`_cozy_state`), put back before a block runs again."""
-    kept = tuple(state)
-    for path in blocks_of(module):
+    """The catch on a loaded model: each block varena binds, and what a pass runs outside them
+    (the model's forward, which agrees its exchanges' level when sharded, and each direct
+    child's, which a method such as `vae.decode` calls), with its FFN and norm cuts. `state`:
+    the attribute paths its forward changes (`_cozy_state`), put back before a block runs
+    again."""
+    kept, blocks = tuple(state), blocks_of(module)
+    for path in blocks:
         catch.wrap(module.get_submodule(path), catch.Block(path, module, kept))
+    for path, child in module.named_children():
+        if path not in blocks:
+            catch.wrap(child, catch.Block(path, module, kept))
     catch.wrap(module, catch.Block("model", module, kept), agree.passing)
     cuts.install(module)
 

@@ -3,7 +3,7 @@
 Runtime records each placed component's calls and replays them (`install`, run by the executor
 when it constructs a model); a package declares a component `@uncaptured` to opt out. A graph
 reads weights at their addresses, so its component is pinned for as long as its recordings live
-(`Residency.pin`): wholly bound at home, counted as a cache. When memory needs room, or the
+(`Placement.pin`): every block held bound, counted as a cache. When memory needs room, or the
 component's LoRAs change, the pin's shed drops every recording and its pool, and the weights go.
 
 The first call of each signature runs as written; one whose GPU work outlasts its launches

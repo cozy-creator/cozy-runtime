@@ -263,6 +263,12 @@ class Residency(Protocol):
     supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
     """
 
+    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> object | None:
+        """Every weight of `component` bound at its address for `owner` (a CUDA graph reads
+        them there) until memory asks for room, when `shed` drops what read them; they stay
+        bound while the returned token lives. None when part of it streams."""
+        ...
+
     def cache(self, owner: str, shed: Callable[[int], int]) -> Any:
         """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `cached`
         and `close`; None off a GPU."""

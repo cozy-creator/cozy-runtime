@@ -20,10 +20,9 @@ from typing import Any
 
 import msgspec
 import pytest
-from tensorfs.varena import Ledger
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import executor_commands, package_interface, spawn
+from cozy_runtime.internal import executor_commands, package_interface, seam, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
@@ -31,7 +30,6 @@ from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
-GiB = 1 << 30
 
 
 def _torch_here() -> str:
@@ -320,9 +318,9 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
 @needs_torch
 @pytest.mark.skipif(sys.platform != "linux", reason="varena's ledger is Linux's")
 def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one ledger memfd and eventfd per GPU; rank 0 relays each
-    follower's pair at join, and the follower claims its row there. A real varena ledger's
-    pair crosses the real seam to a real follower process, and the group forms past join:
+    """TensorD hands rank 0 one grant (a table memfd and an eventfd) per GPU; rank 0 relays
+    each follower's pair at join, and the follower opens its memory on it. A real memfd and
+    eventfd cross the real seam to a real follower process, and the group forms past join:
     run 11905 broke there, its eventfd refused as a memfd ("cannot take a host tier")."""
     import torch
 
@@ -336,15 +334,16 @@ def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Pa
         launch=_launcher(env),
         devices=("4", "5"),
     )
-    ledger = Ledger.create("GPU-follower-5", GiB)
-    assert ledger.events_fd is not None
+    table, events = seam.anonymous("cozy-test-table"), os.eventfd(0)
     try:
         group.spawn()
         group.dial_back(seal_snapshot(env))
-        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[ledger.fd, ledger.events_fd])
+        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[table, events])
         assert group.formed and torch.distributed.get_world_size() == 2
     finally:
         group.close()
+        os.close(table)
+        os.close(events)
     assert not torch.distributed.is_initialized()
 
 

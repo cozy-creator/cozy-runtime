@@ -1,9 +1,11 @@
 """Ulysses' cut level, agreed once per pass (varena-slim §1, Collectives).
 
-At a sharded model's pass start every GPU of its group sends the level Rust holds for the
-exchanges (`r.cut(SITE)`) in one small async all-reduce (max); its exchanges wait on it at the
-first one and all cross in the same head groups, so an OOM on one GPU becomes the same cut on
-all of them from the next pass. Mid-pass a GPU recovers only locally (`catch.collective`).
+At a sharded model's pass start every GPU of its group sends the most of the levels Rust
+proposes for the pass's collective sites (`r.levels()`) in one small async all-reduce (max, one
+int64 whatever sites a GPU knows, so no GPU can wait on a different collective); the first
+exchange waits on it and tells Rust (`r.agree`), and every exchange of the pass crosses in the
+same head groups. An OOM on one GPU so becomes the same cut on all of them from the next pass;
+mid-pass a GPU recovers only locally (`catch.collective`).
 """
 
 from __future__ import annotations
@@ -38,7 +40,8 @@ def passing(module: nn.Module) -> Iterator[None]:
     outer = _pass.level
     if group is not None:
         request = CURRENT.get()
-        mine = request.cut(SITE) if request is not None else 0
+        proposed = request.levels() if request is not None else []
+        mine = max((level for _, level in proposed), default=0)
         level = torch.tensor([mine], dtype=torch.int64, device=_device())
         work = dist.all_reduce(level, op=dist.ReduceOp.MAX, group=group, async_op=True)
         _pass.level = (work, level)
@@ -51,12 +54,16 @@ def passing(module: nn.Module) -> Iterator[None]:
 
 
 def agreed() -> int:
-    """The level this pass's exchanges cross at (0 outside a sharded pass)."""
+    """The level this pass's exchanges cross at (0 outside a sharded pass), told to Rust the
+    first time it is read."""
     found = _pass.level
     if isinstance(found, tuple):
         work, level = found
         work.wait()
         found = _pass.level = int(level.item())
+        request = CURRENT.get()
+        if request is not None:
+            request.agree([(SITE, found)])
     return found or 0
 
 

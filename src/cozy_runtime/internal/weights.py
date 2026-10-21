@@ -6,12 +6,14 @@ buffers real, `fill` checks each destination against its stored row, and `commit
 encoded leaves, loads each component (`Memory.load`) and puts the execution layer's catch on it.
 A stored tensor becomes the module's through its route (`_Routes`: as stored, decoded, or a
 native leaf's buffers); a LoRA'd linear bakes on page-in (`_Bakes`), named by its fill identity.
-`Placement` is what Runtime mechanisms reach a placed component through: caches and notes.
+`Placement` is what Runtime mechanisms reach a placed component through: graph pins, KV caches
+and notes.
 """
 
 from __future__ import annotations
 
 import time
+import weakref
 import zlib
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -21,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from tensorfs.varena.torch import Cache, Declared, Memory, Model, Weights, blocks_of
 
+from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
 from cozy_runtime.internal import execution, lora_bake
@@ -674,16 +677,18 @@ class _Bakes:
 
 
 class Placement:
-    """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): the
-    memory's caches (KV slots), a request's LoRA serving, and notes. A CUDA graph's pins are
-    not wired to varena yet, so a placed component runs as written (no graphs)."""
+    """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
+    pins and KV caches as the memory's caches, a request's LoRA serving, and notes."""
 
     def __init__(self, memory: Memory, backend: Backend) -> None:
         self.memory = memory
+        self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
-        for name, model in backend.models.items():
+        #: (component, owner) -> its pin and the cache that holds it
+        self.pins: dict[tuple[str, str], tuple[_Pin, Cache]] = {}
+        for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
     def open_attempt(self) -> None:
@@ -695,6 +700,37 @@ class Placement:
         for bakes in self.bakes.values():
             bakes.strategy = strategy
 
+    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> _Pin | None:
+        """Every block of `component` bound for `owner` (a CUDA graph replays at their
+        addresses, decoded copies included), held as a cache of the memory's: when memory asks
+        for room, `shed` drops what read them and the hold goes. The weights stay bound while
+        the returned token lives, so a replay in flight keeps them. None when they do not all
+        fit (the component streams)."""
+        held = self.pins.get((component, owner))
+        if held is not None:
+            return held[0]
+        model = self.models.get(component)
+        if model is None:
+            return None
+        try:
+            hold = model.hold()
+        except Exception as exc:
+            if fault(exc) is not Fault.EXHAUSTED:
+                raise
+            return None
+
+        def give(_: int) -> int:
+            self.pins.pop((component, owner), None)
+            cache.close()
+            return shed()
+
+        cache = self.memory.cache(owner, give)
+        token = _Pin()
+        weakref.finalize(token, hold.close)
+        cache.cached(sum(model.set.spans))
+        self.pins[(component, owner)] = (token, cache)
+        return token
+
     def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
         return self.memory.cache(owner, shed) if self.memory.cuda else None
@@ -704,6 +740,12 @@ class Placement:
 
     def baked(self) -> int:
         return sum(bakes.baked for bakes in self.bakes.values())
+
+
+class _Pin:
+    """A pinned component's token: its blocks stay bound while a reference lives."""
+
+    __slots__ = ("__weakref__",)
 
 
 def _derived_values(root: Module) -> dict[tuple[Module, str], Tensor]:
