@@ -597,31 +597,51 @@ def fence_canonical_numbers() -> list[str]:
     return bad[:10]
 
 
-def fence_torch_free_import() -> list[str]:
-    """`import cozy_runtime` must never pull torch (§1.0), derivation harness included.
+#: What a CPU path imports with torch absent: the package, its author surface, the executor
+#: (it loads torch only for a model) and every console script (added from pyproject).
+TORCH_FREE_ENTRIES = ("cozy_runtime", "cozy_runtime.author", "cozy_runtime.internal.executor")
+_BLOCKED_TORCH_PROBE = """
+import importlib, json, pkgutil, sys
+sys.modules["torch"] = None  # any attempt to import torch raises ImportError
+failed, torch_only = {}, []
+for name in json.loads(sys.argv[1]):
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        failed[name] = f"{type(exc).__name__}: {exc}"
+for info in pkgutil.walk_packages(importlib.import_module("cozy_runtime").__path__, "cozy_runtime."):
+    if info.name in sys.modules or info.name.endswith(".__main__"):
+        continue
+    try:
+        importlib.import_module(info.name)
+    except ImportError as exc:
+        if (exc.name or "").partition(".")[0] == "torch":
+            torch_only.append(info.name)
+print(json.dumps({"failed": failed, "torch_only": torch_only}))
+"""
 
-    torch is an optional extra: the derive harness imports it INSIDE `torch_module()`, so a
-    cloned package stays inspectable and the base package installs without a 3 GB wheel.
-    """
-    bad = []
-    for path in (p for p in py_files() if (p.parent / "__init__.py").exists()):
-        tree = ast.parse(path.read_text())
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.Import, ast.ImportFrom)):
-                continue
-            names = (
-                [a.name for a in node.names]
-                if isinstance(node, ast.Import)
-                else [node.module or ""]
-            )
-            if not any(n.split(".")[0] == "torch" for n in names):
-                continue
-            if node.col_offset == 0:
-                bad.append(
-                    f"{module_of(path)}:{node.lineno} imports torch at module scope — the "
-                    "harness imports it inside a function so the base package stays torch-free"
-                )
-    return bad
+
+def fence_torch_free_import() -> list[str]:
+    """`import cozy_runtime` and every torch-free entry point import with torch blocked, in a
+    fresh interpreter (§1.0). A torch-only module imports torch at its top, as the owner's
+    imports-at-top rule puts it; it is then reachable only from other torch-only modules, which
+    this proves by importing rather than by reading where an import sits."""
+    scripts = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"].get("scripts", {})
+    entries = [*TORCH_FREE_ENTRIES, *(target.partition(":")[0] for target in scripts.values())]
+    run = subprocess.run(
+        [sys.executable, "-c", _BLOCKED_TORCH_PROBE, json.dumps(entries)],
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+    )
+    if run.returncode:
+        return [f"the blocked-torch probe failed: {run.stderr.strip()[-600:]}"]
+    result = json.loads(run.stdout.strip().splitlines()[-1])
+    print(f"torch-free-import: {len(result['torch_only'])} torch-only modules, none reached")
+    return [
+        f"{name} does not import with torch absent: {why}"[:400]
+        for name, why in result["failed"].items()
+    ]
 
 
 STATIC_READERS = tuple(
@@ -927,11 +947,15 @@ def fence_any_ratchet() -> list[str]:
 #: The repo is public: a home directory in a tracked file points at evidence nobody else can open. tests/ holds
 #: inputs, and a placeholder user (`/home/user/…`) is obviously fake anywhere.
 HOME_PATH = re.compile(r"(?:/home/|/Users/|[A-Za-z]:\\{1,2}Users\\{1,2})([A-Za-z0-9._-]+)")
-PLACEHOLDER_USERS = frozenset({"user", "username", "name", "me", "you", "alice", "bob", "example", "runner"})
+PLACEHOLDER_USERS = frozenset(
+    {"user", "username", "name", "me", "you", "alice", "bob", "example", "runner"}
+)
 
 
 def fence_no_home_paths() -> list[str]:
-    tracked = subprocess.run(["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True).stdout
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=ROOT, capture_output=True, check=True
+    ).stdout
     found = []
     for rel in tracked.decode().split("\0"):
         if not rel or rel.startswith("tests/"):
@@ -941,8 +965,11 @@ def fence_no_home_paths() -> list[str]:
         except (UnicodeDecodeError, OSError):
             continue
         for n, line in enumerate(text.splitlines(), 1):
-            found += [f"{rel}:{n}: {m[0]} is a local path; cite the evidence another way"
-                      for m in HOME_PATH.finditer(line) if m[1].lower() not in PLACEHOLDER_USERS]
+            found += [
+                f"{rel}:{n}: {m[0]} is a local path; cite the evidence another way"
+                for m in HOME_PATH.finditer(line)
+                if m[1].lower() not in PLACEHOLDER_USERS
+            ]
     return found
 
 
