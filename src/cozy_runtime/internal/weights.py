@@ -713,7 +713,7 @@ class Placement:
 
         cache = self.memory.cache(owner, give)
         token = _Pin()
-        weakref.finalize(token, hold.close)
+        weakref.finalize(token, hold.release)
         cache.cached(sum(model.set.spans))
         self.pins[(component, owner)] = (token, cache)
         return token

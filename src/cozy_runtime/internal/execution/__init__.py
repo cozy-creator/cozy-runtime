@@ -53,7 +53,7 @@ def record(stats: Stats, gpu: int, device: int | None, store: Path) -> dict[str,
 
 
 @functools.cache
-def _ceiling(device: int | None, store: Path) -> tuple[float, float]:
-    """Measured once per executor (TensorFS times the copies)."""
+def _ceiling(device: int | None, store: Path) -> tuple[float | None, float]:
+    """Measured once per executor (TensorFS times the copies); no GPU has no H2D."""
     found = tensorfs.ceiling(device=device, path=store)
-    return float(found.h2d_gbps), float(found.disk_gbps)
+    return found.h2d_gbps, found.disk_gbps

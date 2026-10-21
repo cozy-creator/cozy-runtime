@@ -8,9 +8,10 @@ import msgspec
 
 
 class Ceiling(msgspec.Struct, frozen=True, kw_only=True):
-    """TensorFS's measured ceilings for a GPU's fills: host to device, and disk."""
+    """TensorFS's measured ceilings for a GPU's fills: host to device (None: no GPU), and
+    disk."""
 
-    h2d_gbps: float
+    h2d_gbps: float | None
     disk_gbps: float
 
 
