@@ -12,9 +12,8 @@ Three properties are structural rather than reviewed:
   or hostile length prefix, before any body byte is read. Every wire byte in both directions
   is counted. Output bytes never cross this seam — they land in the attempt spool the worker
   brokered, which keeps the executor's writable storage to exactly that spool (§3.1).
-* **No credentials cross it.** `send` refuses a frame carrying a key from `SECRET_KEYS`, so a
-  grant token or worker JWT reaching the executor is a typed refusal at the boundary and not
-  a code-review rule. The executor holds no RecordOwner, storage or billing credential.
+* **Machine credentials stay outside it.** `send` refuses keys from `SECRET_KEYS`; Load,
+  Invoke and `bearer` may carry a signer's supplied bearer at `tensorfs.token`.
 * **A torn frame is typed.** EOF or a peer reset exactly at a frame boundary is the
   disposable executor's normal end (`None`); EOF inside a header or body is
   `seam_eof_mid_frame`, never a silent short read.
@@ -65,8 +64,7 @@ MAX_FRAME = DOC_MAX_BYTES
 #: exactly how many header bytes to collect before it commits to anything.
 HEADER = struct.Struct("!I")
 
-#: Key names that must never appear in a frame, at any depth. Credentials stop at the
-#: worker (§3.1); the executor cannot leak what it was never handed.
+#: Secret field names outside the explicitly supplied TensorFS command options.
 SECRET_KEYS = frozenset({"token", "credential", "authorization", "secret", "jwt"})
 
 #: The attempt-spool file the executor writes its serialized typed result into: the bytes
@@ -88,18 +86,24 @@ class SeamError(Exception):
         self.detail = detail
 
 
-def _scan(value: Any, path: str = "") -> None:
+#: The commands that may carry a signer's supplied bearer, at `tensorfs.token` only.
+SUPPLYING = frozenset({"load", "invoke", "bearer"})
+
+
+def _scan(value: Any, path: str = "", *, supplied: bool = False) -> None:
     if isinstance(value, dict):
         for key, item in value.items():
-            if key.lower() in SECRET_KEYS:
+            at = f"{path}{key}"
+            allowed = supplied and at == "tensorfs.token" and isinstance(item, str)
+            if key.lower() in SECRET_KEYS and not allowed:
                 raise SeamError(
                     "credential_at_seam",
                     f"{path}{key!r}: credentials never cross the worker/executor seam",
                 )
-            _scan(item, f"{path}{key}.")
+            _scan(item, f"{at}.", supplied=supplied)
     elif isinstance(value, (list, tuple)):
         for item in value:
-            _scan(item, path)
+            _scan(item, path, supplied=supplied)
 
 
 @dataclass(slots=True)
@@ -123,7 +127,7 @@ class Channel:
     sending: threading.RLock = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def send(self, message: dict[str, Any]) -> None:
-        _scan(message)
+        _scan(message, supplied=message.get("cmd") in SUPPLYING)
         data = json.dumps(message, separators=(",", ":"), sort_keys=True).encode()
         if len(data) > MAX_FRAME:
             self.refusals.append("frame_too_large")
@@ -498,11 +502,13 @@ class _Asked:
 class Mux:
     """One seam shared by every thread of the process. Whoever needs a frame reads the next
     one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
-    mark, anything else to the commands, in order. No reader thread exists, so a process that
-    has served no call stays single-threaded and forkable (`zygote`)."""
+    mark, a frame that may carry a bearer (`SUPPLYING`) to `bearer` as it is read (a `bearer`
+    frame goes nowhere else), anything else to the commands, in order. No reader thread exists,
+    so a process that has served no call stays single-threaded and forkable (`zygote`)."""
 
-    def __init__(self, channel: Channel) -> None:
+    def __init__(self, channel: Channel, bearer: Callable[[Frame], None] = _nothing) -> None:
         self.channel = channel
+        self._bearer = bearer
         self._seq = 0
         self._asked: dict[int, _Asked] = {}
         self._commands: deque[Frame] = deque()
@@ -608,7 +614,11 @@ class Mux:
                 asked.answer = frame
         elif frame.get("cmd") == "cancel":
             self.cancel(str(frame.get("request_id", "")))
+        elif frame.get("cmd") == "bearer":
+            self._bearer(frame)
         else:
+            if frame.get("cmd") in SUPPLYING:
+                self._bearer(frame)
             with self._changed:
                 self._commands.append(frame)
 

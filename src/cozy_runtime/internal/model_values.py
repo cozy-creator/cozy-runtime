@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import importlib
 import math
 from types import ModuleType
 
+import numpy as np
+from tensorfs import raw
+
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.derive.safetensors_io import to_f32
 from cozy_runtime.internal.encoding.formats import RowwiseDequant, params_of
-from cozy_runtime.tensord_channels import Source
+from cozy_runtime.weights_store import Checkpoint, read_into
 
 _ELEMENTS = 1 << 22
 _FLOATS = {"F32": "float32", "F16": "float16", "BF16": "bfloat16"}
@@ -21,50 +26,58 @@ _ROWWISE = {
 
 
 def _part(
-    source: Source, component: str, key: str, role: str, offset: int, length: int
+    source: Checkpoint, component: str, key: str, role: str, offset: int, length: int
 ) -> bytearray:
     data = bytearray(length)
-    source.read_into(component, key, role, offset, memoryview(data))
+    read_into(source, component, key, role, offset, memoryview(data))
     return data
 
 
 def read_values_into(
-    torch: ModuleType, source: Source, component: str, key: str, offset: int, into: memoryview
+    torch: ModuleType | None,
+    source: Checkpoint,
+    component: str,
+    key: str,
+    offset: int,
+    into: memoryview,
 ) -> None:
     """Elements `offset..` of a plain float or per-row (`fp8.rowwise`, `int8.rowwise`) tensor,
-    as f32."""
-    tensor = source.checkpoint.tensors.get(component, {}).get(key)
+    as f32. Plain floats need no torch; a per-row decode does."""
+    held = source.components.get(component)
+    tensor = None if held is None else held.tensors.get(key)
     count = into.nbytes // 4
     if tensor is None:
         raise CapabilityError("model tensor is absent", code="weights_reader_tensor")
     if offset < 0 or offset + count > math.prod(tensor.shape):
         raise CapabilityError("logical read leaves the tensor", code="weights_reader_bounds")
-    target = torch.frombuffer(into, dtype=torch.float32)
     if tensor.encoding is None:
-        name = _FLOATS.get(tensor.dtype)
-        if name is None:
+        size = _WIDTHS.get(tensor.dtype)
+        if size is None:
             raise CapabilityError("logical dtype is not a float", code="weights_reader_encoding")
-        dtype = getattr(torch, name)
-        size = torch.empty((), dtype=dtype).element_size()
+        values = np.frombuffer(into, dtype=np.float32)
         for start in range(0, count, _ELEMENTS):
             length = min(_ELEMENTS, count - start)
-            raw = _part(source, component, key, "", (offset + start) * size, length * size)
-            target[start : start + length].copy_(torch.frombuffer(raw, dtype=dtype))
+            payload = _part(source, component, key, "", (offset + start) * size, length * size)
+            values[start : start + length] = to_f32(payload, tensor.dtype, [length])
         return
+    if torch is None:
+        try:
+            torch = importlib.import_module("torch")
+        except ImportError as exc:
+            raise CapabilityError(
+                "logical model decoder is unavailable", code="weights_reader_decoder_unavailable"
+            ) from exc
+    target = torch.frombuffer(into, dtype=torch.float32)
     params = dict(tensor.encoding.params)
-    stored = tensor.parts.get("weight")
+    parts = raw.parts(source, component, key)
+    stored, scaled = parts.get("weight"), parts.get("scale")
     element = _ROWWISE.get((tensor.encoding.scheme, stored.dtype if stored else ""))
-    if (
-        element is None
-        or params.get("axis") != 0
-        or params.get("scale_dtype") not in _WIDTHS
-        or len(tensor.shape) != 2
-    ):
+    scale_dtype = scaled.dtype if scaled else ""
+    if element is None or params or scale_dtype not in _WIDTHS or len(tensor.shape) != 2:
         raise CapabilityError(
             f"no model reader for {tensor.encoding.scheme} {params}", code="weights_reader_encoding"
         )
     provider = RowwiseDequant(tensor.encoding.scheme, params=params_of(params))
-    scale_dtype = str(params.get("scale_dtype"))
     scale_width, scale_element = _WIDTHS[scale_dtype], getattr(torch, _FLOATS[scale_dtype])
     columns = tensor.shape[1]
     consumed = 0

@@ -331,8 +331,6 @@ def ensure(
     seal. Python is shared under the host's install root, while Torch and every
     other dependency still belong to the existing exact package closure cache.
     """
-    from cozy_runtime.internal import storage_admission
-
     constraint = _constraint(requires, version)
     _check_cancel(cancel)
     chosen = _choose(available(default, root=root), constraint, version)
@@ -343,54 +341,51 @@ def ensure(
         raise InterpreterRefusal("uv is required to provision a supported Python interpreter")
     selected = _download_version(uv, constraint, cancel, version)
     _check_cancel(cancel)
-    # Reserve archive + extraction + cache before creating any owned directories.
-    # CPython's stripped standalone build fits well below this conservative bound.
-    with storage_admission.admit(storage_admission.Write(root, 1 << 30, 20000)):
-        _require_owned_root(root)
-        # Recheck after admission. uv itself locks its managed directory across
-        # the installed-version check and atomic publication, including races here.
-        chosen = _choose(available(default, root=root), constraint, version)
-        if chosen is not None:
-            return chosen
-        if progress is not None:
-            progress(f"Installing CPython {selected}")
-        managed = root / "managed"
-        cache = root / "cache"
-        env = {
-            **package_install_environment(),
-            "UV_PYTHON_INSTALL_DIR": str(managed),
-            "UV_CACHE_DIR": str(cache),
-            "TMPDIR": str(root),
-            "TEMP": str(root),
-            "TMP": str(root),
-            "UV_CONCURRENT_DOWNLOADS": "1",
-            "UV_CONCURRENT_INSTALLS": "1",
-            "UV_CONCURRENT_BUILDS": "1",
-        }
-        _run_uv(
-            [
-                uv,
-                "python",
-                "install",
-                "--no-config",
-                "--no-bin",
-                "--no-registry",
-                "--install-dir",
-                str(managed),
-                "--cache-dir",
-                str(cache),
-                "cpython@" + selected,
-            ],
-            env=env,
-            cancel=cancel,
-        )
-        # A package executor may traverse/read its interpreter but never write it.
-        if sys.platform != "win32":
-            managed.chmod(0o711)
-        installed = select(requires, selected, default=default, root=root)
-        if progress is not None:
-            progress(f"CPython {installed.version} ready")
-        return installed
+    _require_owned_root(root)
+    # Recheck before installing. uv itself locks its managed directory across
+    # the installed-version check and atomic publication, including races here.
+    chosen = _choose(available(default, root=root), constraint, version)
+    if chosen is not None:
+        return chosen
+    if progress is not None:
+        progress(f"Installing CPython {selected}")
+    managed = root / "managed"
+    cache = root / "cache"
+    env = {
+        **package_install_environment(),
+        "UV_PYTHON_INSTALL_DIR": str(managed),
+        "UV_CACHE_DIR": str(cache),
+        "TMPDIR": str(root),
+        "TEMP": str(root),
+        "TMP": str(root),
+        "UV_CONCURRENT_DOWNLOADS": "1",
+        "UV_CONCURRENT_INSTALLS": "1",
+        "UV_CONCURRENT_BUILDS": "1",
+    }
+    _run_uv(
+        [
+            uv,
+            "python",
+            "install",
+            "--no-config",
+            "--no-bin",
+            "--no-registry",
+            "--install-dir",
+            str(managed),
+            "--cache-dir",
+            str(cache),
+            "cpython@" + selected,
+        ],
+        env=env,
+        cancel=cancel,
+    )
+    # A package executor may traverse/read its interpreter but never write it.
+    if sys.platform != "win32":
+        managed.chmod(0o711)
+    installed = select(requires, selected, default=default, root=root)
+    if progress is not None:
+        progress(f"CPython {installed.version} ready")
+    return installed
 
 
 def _require_owned_root(root: Path) -> None:

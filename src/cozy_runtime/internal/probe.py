@@ -52,6 +52,7 @@ from types import ModuleType
 from typing import Any
 
 import msgspec
+from tensorfs import UnsupportedError
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
@@ -304,8 +305,8 @@ def _numerics_rowwise(torch: Any, provider: Provider, device: Any, dtype: Any) -
         [math.ldexp(1.0, e) for e in exponents], dtype=torch.float32, device=device
     )
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    provider.decode(torch, {"weight": data, "scale": scale}, destination)
-    got = destination.cpu().double().reshape(-1).tolist()
+    provider.decode(torch, {"weight": _across(provider, data), "scale": scale}, destination)
+    got = _across(provider, destination).cpu().double().reshape(-1).tolist()
     return _domain_sweep(
         torch, dtype, got, [(math.ldexp(1.0, e), f"row scale 2**{e}") for e in exponents]
     )
@@ -377,10 +378,15 @@ def _numerics_int8_rowwise(
     scale = torch.pow(2.0, torch.tensor([(r % 60) - 30 for r in range(rows)], dtype=torch.float64))
     truth = data.double() * scale.reshape(rows, 1)
     destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    provider.decode(
-        torch, {"weight": data.to(device), "scale": scale.float().to(device)}, destination
-    )
-    return _exact_sweep(torch, destination.cpu(), truth, dtype)
+    weight = _across(provider, data).to(device)
+    provider.decode(torch, {"weight": weight, "scale": scale.float().to(device)}, destination)
+    return _exact_sweep(torch, _across(provider, destination).cpu(), truth, dtype)
+
+
+def _across(provider: Provider, rows: Tensor) -> Tensor:
+    """A columnwise provider's view of a rowwise fixture: the transpose, its scale per column,
+    so one oracle checks both directions (and a decoder that reads the wrong axis fails it)."""
+    return rows.t().contiguous() if provider.encoding.endswith(".columnwise") else rows
 
 
 def _numerics_int8_tensorwise(
@@ -393,6 +399,71 @@ def _numerics_int8_tensorwise(
     destination = torch.empty(16, 16, dtype=dtype, device=device)
     provider.decode(torch, {"weight": data.to(device), "scale": scale.to(device)}, destination)
     return _exact_sweep(torch, destination.cpu(), data.double() * scale.double(), dtype)
+
+
+def _comfy_fixture(
+    torch: ModuleType, provider: Provider, device: Tensor, shape: tuple[int, int]
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """A valid constant-q carrier with an independent exact logical reference.
+
+    Each default level becomes q8=1. Every H4 row sums to 2, so its normalized
+    Kronecker powers map all-ones to all-ones. The result is each F32 channel
+    scale, repeated across its row; no decoder is used to construct the oracle.
+    General codes, corrections, F8 metadata and stacks remain the mined vectors'.
+    """
+    h4 = ((1, 1, 1, -1), (1, 1, -1, 1), (1, -1, 1, 1), (-1, 1, 1, 1))
+    assert tuple(sum(row) for row in h4) == (2, 2, 2, 2)
+    assert all(
+        sum(a * b for a, b in zip(left, right, strict=True)) == (4 if i == j else 0)
+        for i, left in enumerate(h4)
+        for j, right in enumerate(h4)
+    )
+    params = dict(provider.params)
+    if provider.supports(shape, params):
+        raise AssertionError("the Comfy synthetic fixture must fit its bound descriptor")
+    rotation = params.get("rotation_size")
+    if not isinstance(rotation, int):
+        raise AssertionError("rotation_size must be an integer")
+    exponent = (rotation.bit_length() - 1) // 2
+    assert 4**exponent == rotation and 2**exponent * 2.0**-exponent == 1.0
+    rows, columns = shape
+    channel = torch.linspace(0.5, 1.5, rows, dtype=torch.float32, device=device)
+    truth = channel.reshape(rows, 1).expand(rows, columns)
+    if provider.encoding == "int4.convrot":
+        # Signed nibble 1 decodes to 1.
+        return truth, {
+            "weight": torch.full((rows, columns // 2), 0x11, dtype=torch.int8, device=device),
+            "scale": channel,
+        }
+    group = params.get("group_size")
+    if not isinstance(group, int) or type(group) is not int:
+        raise AssertionError("the Comfy probe must bind its declared group_size")
+    if provider.encoding == "comfy.asym_w4a8_int8":
+        # Unsigned nibble 9 addresses default level 9 - 8 = 1.
+        weight = torch.full((rows, columns // 2), -103, dtype=torch.int8, device=device)
+    elif provider.encoding == "comfy.w6a8_int8":
+        # Split planes: low nibble1 | (high2 << 4) = 33; level33 - 32 = 1.
+        weight = torch.cat(
+            (
+                torch.full((rows, columns // 2), 0x11, dtype=torch.int8, device=device),
+                torch.full((rows, columns // 4), -86, dtype=torch.int8, device=device),
+            ),
+            dim=1,
+        )
+    else:
+        raise AssertionError(f"no Comfy fixture for {provider.encoding}")
+    return truth, {
+        "weight": weight,
+        "group_scale": torch.ones((rows, columns // group), dtype=torch.float32, device=device),
+        "scale": channel,
+    }
+
+
+def _numerics_comfy(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
+    truth, parts = _comfy_fixture(torch, provider, device, (16, 256))
+    destination = torch.empty((16, 256), dtype=dtype, device=device)
+    provider.decode(torch, parts, destination)
+    return _exact_sweep(torch, destination.cpu(), truth.cpu().double(), dtype)
 
 
 def _numerics_mxfp8(torch: ModuleType, provider: Provider, device: Tensor, dtype: Tensor) -> Sweep:
@@ -616,6 +687,8 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     comparable; and quantized by the encoding's OWN equation, so what the routes are then
     compared on is a real carrier rather than random bytes that no producer would emit.
     """
+    if provider.suite == "comfy-decode":
+        return _comfy_fixture(torch, provider, device, BENCH_SHAPE)
     rows, cols = BENCH_SHAPE
     generator = torch.Generator(device="cpu").manual_seed(0x511B)
     if isinstance(provider, CoreDequant):
@@ -626,6 +699,10 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native"):
         scale = (weight.abs().amax(dim=-1) / 448.0).clamp(min=1e-12)
         payload = (weight / scale.unsqueeze(-1)).clamp(-448.0, 448.0)
+        return weight, {"weight": payload.to(torch.float8_e4m3fn), "scale": scale}
+    if provider.suite == "fp8-columnwise-decode":
+        scale = (weight.abs().amax(dim=0) / 448.0).clamp(min=1e-12)
+        payload = (weight / scale.unsqueeze(0)).clamp(-448.0, 448.0)
         return weight, {"weight": payload.to(torch.float8_e4m3fn), "scale": scale}
     if provider.suite in ("int8-convrot-decode", "int8-convrot256-native"):
         rotated = hadamard256(torch, weight.double()) / 16
@@ -650,6 +727,10 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
     if provider.suite == "int8-rowwise-decode":
         scale = (weight.abs().amax(dim=-1) / 127.0).clamp(min=1e-12)
         payload = torch.round(weight / scale.unsqueeze(-1)).clamp(-127, 127)
+        return weight, {"weight": payload.to(torch.int8), "scale": scale}
+    if provider.suite == "int8-columnwise-decode":
+        scale = (weight.abs().amax(dim=0) / 127.0).clamp(min=1e-12)
+        payload = torch.round(weight / scale.unsqueeze(0)).clamp(-127, 127)
         return weight, {"weight": payload.to(torch.int8), "scale": scale}
     if provider.suite in ("mxfp8-decode", "mxfp8-native"):
         blocks = weight.reshape(rows, cols // MX_BLOCK, MX_BLOCK)
@@ -690,6 +771,13 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
             .double()
             .to(next(iter(roles.values())).device)
         )
+    if provider.suite == "comfy-decode":
+        # Only the constant-q fixture above enters this benchmark/route oracle.
+        # Its normalized rotation is identity on all-ones; the independently
+        # stored channel scale is the exact value, not another decoder's output.
+        rows, packed = (int(n) for n in roles["weight"].shape)
+        columns = packed * 4 // 3 if provider.encoding == "comfy.w6a8_int8" else packed * 2
+        return _f64(roles["scale"]).reshape(rows, 1).expand(rows, columns)
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         packed = roles["weight"].cpu()
         rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
@@ -701,6 +789,8 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
     data = _f64(roles["weight"])
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native", "int8-rowwise-decode"):
         return data * _f64(roles["scale"]).reshape(int(data.shape[0]), 1)
+    if provider.suite in ("fp8-columnwise-decode", "int8-columnwise-decode"):
+        return data * _f64(roles["scale"]).reshape(1, int(data.shape[1]))
     if provider.suite in ("mxfp8-decode", "mxfp8-native"):
         mult = _f64(e8m0_multipliers(torch, roles["scale"]))
         return data * mult.repeat_interleave(MX_BLOCK, dim=1)[:, : int(data.shape[1])]
@@ -989,11 +1079,14 @@ def _numerics_cores(torch: ModuleType, provider: Provider, device: Tensor, dtype
 #: same oracle as the first. A suite name in neither table qualifies NOTHING: minting a record
 #: for a decoder no oracle checked is exactly the fabricated evidence the table forbids.
 DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
+    "comfy-decode": _numerics_comfy,
     "fp8-tensorwise-decode": _numerics,
     "fp8-rowwise-decode": _numerics_rowwise,
+    "fp8-columnwise-decode": _numerics_rowwise,
     "int8-convrot-decode": _numerics_int8_convrot,
     "nvfp4-decode": _numerics_nvfp4,
     "int8-rowwise-decode": _numerics_int8_rowwise,
+    "int8-columnwise-decode": _numerics_int8_rowwise,
     "int8-tensorwise-decode": _numerics_int8_tensorwise,
     "mxfp8-decode": _numerics_mxfp8,
     "cores-decode": _numerics_cores,
@@ -1063,11 +1156,16 @@ def qualify(
 #: The params a suite's synthetic operands are written with: the producers' own (ModelOpt's
 #: layouts). The spec's conformance cases cover the other layouts.
 PROBE_PARAMS: dict[str, dict[str, object]] = {
-    "fp8.tensorwise": {"scale_dtype": "F32"},
-    "int8.tensorwise": {"scale_dtype": "F32"},
-    "fp8.rowwise": {"axis": 0, "scale_dtype": "F32"},
-    "int8.rowwise": {"axis": 0, "scale_dtype": "F32"},
-    "int8.convrot": {"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"},
+    "comfy.asym_w4a8_int8": {"group_size": 16, "rotation": "kron_regular_h4", "rotation_size": 256},
+    "comfy.w6a8_int8": {"group_size": 32, "rotation": "kron_regular_h4", "rotation_size": 256},
+    "int4.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
+    "fp8.tensorwise": {},
+    "int8.tensorwise": {},
+    "fp8.rowwise": {},
+    "int8.rowwise": {},
+    "fp8.columnwise": {},
+    "int8.columnwise": {},
+    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
     "mxfp8": {"block_size": MX_BLOCK, "scale_layout": "row_major"},
     "nvfp4": {
         "block_size": NVFP4_BLOCK,
@@ -1081,6 +1179,14 @@ PROBE_PARAMS: dict[str, dict[str, object]] = {
 def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
     mints no record for it: the encoding refuses at bind naming why."""
+    # Qualification considers every provider even for a plain F64/FP8 model.
+    # Those are valid verbatim outputs, not logical Comfy decode destinations.
+    if provider.suite == "comfy-decode" and dtype not in (
+        torch.float32,
+        torch.float16,
+        torch.bfloat16,
+    ):
+        return UnmeasuredEvidence(note="Comfy logical outputs are F32, F16 or BF16")
     if isinstance(provider, CoreDequant):
         params = params_of(provider.adapter.probe_params)
     else:
@@ -1088,7 +1194,7 @@ def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tens
     provider = replace(provider, params=params)  # type: ignore[type-var]
     try:
         return _evidence(torch, provider, target, dtype)
-    except (TypeError, RuntimeError, NotImplementedError) as exc:
+    except (TypeError, RuntimeError, NotImplementedError, UnsupportedError) as exc:
         if target.type == "cuda":
             raise
         return UnmeasuredEvidence(note=f"{type(exc).__name__}: {exc}"[:300])

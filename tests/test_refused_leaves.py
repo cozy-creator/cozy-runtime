@@ -52,8 +52,8 @@ FP8_LEAF = "cozy.fp8-rowwise.native-leaf/1"
 
 
 PARAMS: dict[str, dict[str, object]] = {
-    "fp8.rowwise": {"axis": 0, "scale_dtype": "F32"},
-    "int8.convrot": {"rotation": "hadamard", "rotation_size": 256, "scale_dtype": "F32"},
+    "fp8.rowwise": {},
+    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
 }
 
 

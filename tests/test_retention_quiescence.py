@@ -21,11 +21,11 @@ class Exports:
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def kept(self) -> list[tuple[int, int, int]]:
+    def kept(self, filled: bool = False) -> list[tuple[int, int, int]]:
         self.calls.append("conservative")
         return []
 
-    def kept_quiescent(self) -> list[tuple[int, int, int]]:
+    def kept_quiescent(self, filled: bool = False) -> list[tuple[int, int, int]]:
         self.calls.append("quiescent")
         return []
 

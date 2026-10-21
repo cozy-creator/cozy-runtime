@@ -466,8 +466,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=e6a074fbbf0a13ba6c15feec7a15ee2466eac023" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=e6a074fbbf0a13ba6c15feec7a15ee2466eac023" },
+    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=cd0dfbb5f3ed89fcd29e1a166c7874935991377d" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=cd0dfbb5f3ed89fcd29e1a166c7874935991377d" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.13" },
     { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
@@ -485,7 +485,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "pytest-split", specifier = ">=0.11.0" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=e6a074fbbf0a13ba6c15feec7a15ee2466eac023" },
+    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=cd0dfbb5f3ed89fcd29e1a166c7874935991377d" },
 ]
 diffusers = [
     { name = "diffusers", specifier = ">=0.40.0" },
@@ -1767,8 +1767,8 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.12.0"
-source = { git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=e6a074fbbf0a13ba6c15feec7a15ee2466eac023#e6a074fbbf0a13ba6c15feec7a15ee2466eac023" }
+version = "0.13.0"
+source = { git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=cd0dfbb5f3ed89fcd29e1a166c7874935991377d#cd0dfbb5f3ed89fcd29e1a166c7874935991377d" }
 
 [[package]]
 name = "tokenizers"

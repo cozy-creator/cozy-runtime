@@ -13,7 +13,7 @@ from pathlib import Path
 import msgspec
 import pytest
 
-from cozy_runtime.internal.encoding import RowwiseDequant, launch_providers, params_of
+from cozy_runtime.internal.encoding import RowwiseDequant, launch_providers
 from cozy_runtime.internal.probe import QualificationResult, _spec_vectors, vector_cases
 
 OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
@@ -43,7 +43,7 @@ def test_the_conformance_cases_run_against_the_shipped_decoder() -> None:
     torch = pytest.importorskip("torch")
     report = _spec_vectors(
         torch,
-        RowwiseDequant(params=params_of({"axis": 0, "scale_dtype": "F32"})),
+        RowwiseDequant(),
         torch.device("cpu"),
     )
     assert report.passed and not report.skipped and report.cases, report

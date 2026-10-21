@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable, Mapping
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -78,14 +79,15 @@ def e8m0(scale: Any) -> Any:
     return torch.where(raw == 255, torch.full_like(bits, 0x7FC00000), bits).view(torch.float32)
 
 
-def axis_grid(params: Mapping[str, object]) -> Grid:
-    return cores.ROW if params["axis"] == 0 else cores.COL
-
-
 def fp8(
-    c: Cores, parts: Mapping[str, Any], params: Mapping[str, object], shape: Any, out: Any
+    grid: Grid,
+    c: Cores,
+    parts: Mapping[str, Any],
+    params: Mapping[str, object],
+    shape: Any,
+    out: Any,
 ) -> None:
-    flat = "axis" not in params  # tensorwise: one scale for the tensor
+    flat = grid == cores.TENSOR  # tensorwise: one scale for the tensor
     rows, cols = view(shape, flat)
     weight = parts["weight"]
     c.table(
@@ -95,15 +97,20 @@ def fp8(
         cols,
         element_codes(weight.dtype, weight.device),
         parts["scale"],
-        cores.TENSOR if flat else axis_grid(params),
+        grid,
         out,
     )
 
 
 def int8(
-    c: Cores, parts: Mapping[str, Any], params: Mapping[str, object], shape: Any, out: Any
+    grid: Grid,
+    c: Cores,
+    parts: Mapping[str, Any],
+    params: Mapping[str, object],
+    shape: Any,
+    out: Any,
 ) -> None:
-    flat = "axis" not in params  # tensorwise: one scale for the tensor
+    flat = grid == cores.TENSOR  # tensorwise: one scale for the tensor
     rows, cols = view(shape, flat)
     c.affine(
         parts["weight"].view(torch.uint8),
@@ -111,7 +118,7 @@ def int8(
         rows,
         cols,
         parts["scale"],
-        cores.TENSOR if flat else axis_grid(params),
+        grid,
         out,
     )
 
@@ -134,10 +141,12 @@ def mxfp8(
 
 
 DECODES: dict[str, Decode] = {
-    "fp8.tensorwise": fp8,
-    "fp8.rowwise": fp8,
-    "int8.tensorwise": int8,
-    "int8.rowwise": int8,
+    "fp8.tensorwise": partial(fp8, cores.TENSOR),
+    "fp8.rowwise": partial(fp8, cores.ROW),
+    "fp8.columnwise": partial(fp8, cores.COL),
+    "int8.tensorwise": partial(int8, cores.TENSOR),
+    "int8.rowwise": partial(int8, cores.ROW),
+    "int8.columnwise": partial(int8, cores.COL),
     "mxfp8": mxfp8,
 }
 

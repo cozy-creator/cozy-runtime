@@ -6,20 +6,13 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import cast
-from weakref import WeakValueDictionary
 
 import pytest
 
 from cozy_runtime.author import Artifact, CheckpointUnnormalized, Config, Loader, ModelFitRefused
 from cozy_runtime.author._loader import Backend, Census, Fit
-from cozy_runtime.internal import storage_admission
 
 REMEDY = "stored as-is: re-import it once a TensorFS converter recognizes its layout"
-
-
-@pytest.fixture(autouse=True)
-def isolated_admission(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(storage_admission, "_reclaimers", WeakValueDictionary())
 
 
 def test_a_construction_failing_on_an_as_is_checkpoint_names_the_fix() -> None:
@@ -38,7 +31,7 @@ def test_a_construction_failing_on_an_as_is_checkpoint_names_the_fix() -> None:
         bound = None
 
         def ahead(self) -> None:
-            return None
+            pass
 
         def fit(self, walked: Census, *, encoded_leaves: str) -> Fit:
             return {"ok": False, "code": "missing_tensor", "detail": "unet.conv_in.weight"}

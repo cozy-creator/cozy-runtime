@@ -12,7 +12,7 @@ import os
 import socket
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from typing import Annotated, Literal, Protocol, TypedDict, get_args
+from typing import Annotated, Protocol, TypedDict, get_args
 
 import msgspec
 
@@ -89,6 +89,17 @@ class Publish(_Request, frozen=True, kw_only=True, tag="publish"):
     parts: tuple[PublishPart, ...] = ()
 
 
+class CheckpointItem(_Request, frozen=True, kw_only=True, tag="checkpoint_item"):
+    """A checkpoint output reference: the commit (`revision`, its tree id) and the private tag
+    the Runtime moved there; a later uploaded reference replaces its local one."""
+
+    output: str
+    repo_id: str
+    revision: str
+    tag: str = ""
+    variant: str = ""
+
+
 class StageMemoLookup(_Request, frozen=True, kw_only=True, tag="stage_memo_lookup"):
     """A memoized method's key, before its scope opens: the Worker answers a `MemoEntry`."""
 
@@ -119,28 +130,9 @@ class TreeMember(_Request, frozen=True, kw_only=True, tag="tree_member"):
     media_types: tuple[str, ...] = ()
 
 
-class _Writer(msgspec.Struct, frozen=True, kw_only=True, tag_field="operation"):
-    kind: Literal["weights_writer"] = "weights_writer"
-
-
-class WriterSource(_Writer, frozen=True, kw_only=True, tag="source"):
-    manifest: str
-
-
-class WriterOutput(_Writer, frozen=True, kw_only=True, tag="output"):
-    output_slot: str
-    length: int
-
-
-class WriterAdopt(_Writer, frozen=True, kw_only=True, tag="adopt"):
-    output_slot: str
-    transaction: str
-    length: int
-
-
 class ReadGrant(_Request, frozen=True, kw_only=True, tag="read_grant"):
-    """One weight set's bytes (memory-varena §5.4): `Granted` answers with the host layout
-    deposited for `layout` (`held`), or the manifest's chunk files. TensorD never fills one."""
+    """One weight set's held bytes (memory-varena §5.4): `Granted` answers with the host layout
+    deposited for `layout` (`held`), else nothing. TensorD never fills one."""
 
     manifest: str
     #: what the host layout is kept under: manifest, construction and component, known before
@@ -156,8 +148,6 @@ class Deposit(_Request, frozen=True, kw_only=True, tag="deposit"):
     manifest: str
     name: str
     layout: str
-    #: the chunk objects it was sealed from (`Granted.objects_sha256`)
-    objects_sha256: str
     #: the memfd; never on the wire
     memfd: int = -1
 
@@ -182,27 +172,10 @@ class KeepPages(_Request, frozen=True, kw_only=True, tag="keep_pages"):
     fds: tuple[int, ...] = ()
 
 
-class ModelSource(_Request, frozen=True, kw_only=True, tag="model_source"):
-    """One model file from TensorD (`Load.model_sources`): the CozyTensors header (`name`
-    empty) or one header-declared asset. `SourceBytes` answers, a sealed memfd of exactly
-    those bytes following: the executor reads no store."""
-
-    manifest: str
-    name: str = ""
-
-
-class FetchChannel(_Request, frozen=True, kw_only=True, tag="fetch_channel"):
-    """A fresh fetch channel for the running call (`tensord_channels.Fetch`): a `Handoff`
-    answers, one connected socket following. It names only the call's selected checkpoints,
-    never a hub or credential, and ends with the call."""
-
-
 type _Tagged = (
     ReadGrant
     | Deposit
     | KeepPages
-    | ModelSource
-    | FetchChannel
     | ChildEvents
     | ChildCall
     | ChildPoll
@@ -212,6 +185,7 @@ type _Tagged = (
     | ModelPrefetch
     | TreeMember
     | Publish
+    | CheckpointItem
     | StageMemoLookup
     | StageMemoStore
 )
@@ -219,9 +193,7 @@ type _Tagged = (
 type CallRequest = (
     ChildCall | ChildPoll | ChildCancel | ChildForget | ChildEvents | GpuRelease | ModelPrefetch
 )
-#: One request to the worker's native writer broker, tagged by `operation`.
-type WriterRequest = WriterSource | WriterOutput | WriterAdopt
-type Request = _Tagged | WriterRequest
+type Request = _Tagged
 
 _KINDS = frozenset(str(kind.__struct_config__.tag) for kind in get_args(_Tagged.__value__))
 
@@ -253,22 +225,12 @@ class Tier(Answer, frozen=True, kw_only=True):
 
 class Granted(Tier, frozen=True, kw_only=True):
     """A `ReadGrant`'s answer, its descriptors in `fds`: the one sealed host layout deposited
-    for the layout (`held`), or every chunk file of the manifest's selected components in sha256
-    order, `objects_sha256` naming that list (the sha256 of its `<sha256>:<length>` lines)."""
+    for the layout (`held`)."""
 
-    objects_sha256: str = ""
     fds: tuple[int, ...] = ()
     #: held: GPU pages a gone executor kept of the layout, whose fds follow the layout's
     fingerprint: str = ""
     pages: tuple[Page, ...] = ()
-
-
-class SourceBytes(Tier, frozen=True, kw_only=True):
-    """The machine's answer to `ModelSource`: the sealed memfd follows (`held`), holding
-    `length` bytes whose SHA-256 is `sha256`."""
-
-    sha256: str = ""
-    length: Annotated[int, msgspec.Meta(ge=0)] = 0
 
 
 class CallProgress(msgspec.Struct, frozen=True, kw_only=True):
@@ -347,20 +309,6 @@ class Member(Answer, frozen=True, kw_only=True):
     file_state: FileState | None = None
 
 
-class Opened(Handoff, frozen=True, kw_only=True):
-    """A native source or output channel."""
-
-    length: int = 0
-    transaction: str = ""
-
-
-class Adopted(Answer, frozen=True, kw_only=True):
-    request_id: str = ""
-    manifest: str = ""
-    manifest_length: int = 0
-    receipt_digest: str = ""
-
-
 class Exchange(Protocol):
     """One durable request; blocks until the worker's answer decodes as `into`."""
 
@@ -392,9 +340,6 @@ def decode(frame: Mapping[str, object]) -> Request:
     """The request a frame states; a `CapabilityError` names why it cannot be answered."""
     kind = frame.get("kind")
     try:
-        if kind == "weights_writer":
-            writer: WriterRequest = msgspec.convert(frame, WriterRequest, strict=True)
-            return writer
         if kind not in _KINDS:
             raise CapabilityError(
                 f"{kind!r} is not a durable exchange this worker answers",

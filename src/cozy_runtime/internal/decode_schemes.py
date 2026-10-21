@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -23,7 +23,6 @@ from cozy_runtime.internal.decode_cores import (
     Cores,
     Packing,
     blocks_of,
-    round_into,
     unpack,
 )
 
@@ -38,8 +37,6 @@ try:
 except ImportError:  # the eager reference still runs
     triton = None
 
-#: The spec's dtype names (as a param names a part's dtype) -> the runtime's.
-DTYPES = {"F32": "f32", "BF16": "bf16", "F16": "f16", "F8_E4M3": "f8_e4m3fn", "F8_E8M0": "f8_e8m0"}
 TORCH = {
     "f32": "float32",
     "bf16": "bfloat16",
@@ -93,8 +90,8 @@ class View:
 @dataclass(frozen=True)
 class Part:
     role: str
-    #: runtime dtype names, or the param whose value (a spec dtype name) is the dtype
-    dtypes: tuple[str, ...] | str
+    #: runtime dtype names: the part's own dtype is authoritative
+    dtypes: tuple[str, ...]
     shape: Callable[[View], Shape]
     required: bool = True
 
@@ -127,8 +124,6 @@ class Adapter:
     probe_params: Mapping[str, object]
     #: any shape as one row (else rank 2 or more as [R, C])
     flat: bool = False
-    #: params that come with an optional part: present exactly when it is
-    with_part: Mapping[str, str] = field(default_factory=dict)
     #: conditions across parts: "" or why not
     rule: Callable[[View], str] = _no_rule
     #: makes random parts valid where values matter (tables, indices, shapes)
@@ -152,22 +147,14 @@ def _allowed(rule: Rule, value: object) -> bool:
     return any(type(value) is type(a) and value == a for a in rule)
 
 
-def params_rule(
-    a: Adapter, params: Mapping[str, object], roles: Sequence[str] | None = None
-) -> str:
-    """ "" when `params` are the row's: none unknown, every required one present, each allowed. With
-    `roles`, a param that comes with an optional part is present exactly when the part is."""
+def params_rule(a: Adapter, params: Mapping[str, object]) -> str:
+    """ "" when `params` are the row's: none unknown, every one present, each allowed."""
     unknown = sorted(set(params) - set(a.params))
     if unknown:
         return f"{a.scheme}: unknown params {unknown}"
     for key, rule in a.params.items():
-        part = a.with_part.get(key)
         if key not in params:
-            if part is None or (roles is not None and part in roles):
-                return f"{a.scheme}: param {key} is missing"
-            continue
-        if part is not None and roles is not None and part not in roles:
-            return f"{a.scheme}: param {key} without part {part}"
+            return f"{a.scheme}: param {key} is missing"
         if not _allowed(rule, params[key]):
             return f"{a.scheme}: param {key}={params[key]!r}"
     return ""
@@ -194,7 +181,7 @@ def parts_rule(
     parts: Mapping[str, tuple[str, tuple[int, ...]]],
 ) -> str:
     """ "" when the parts are the row's: roles accounted, dtypes and shapes by its rules."""
-    why = params_rule(a, params, list(parts)) or geometry_rule(a, shape, params)
+    why = params_rule(a, params) or geometry_rule(a, shape, params)
     if why:
         return why
     roles = {p.role for p in a.parts}
@@ -205,7 +192,7 @@ def parts_rule(
         if p.role not in parts:
             continue
         dtype, got = parts[p.role]
-        names = (DTYPES.get(str(params[p.dtypes]), ""),) if isinstance(p.dtypes, str) else p.dtypes
+        names = p.dtypes
         try:
             kind, want = p.shape(view)
         except ValueError as e:
@@ -258,10 +245,9 @@ def sample(
     view = View(stored_shape(params, shape), params, {}, a.flat)
     out: dict[str, Tensor] = {}
     for p in a.parts:
-        param = next((k for k, role in a.with_part.items() if role == p.role), None)
-        if not p.required and (param is None or param not in params):
+        if not p.required:
             continue
-        dtype = DTYPES[str(params[p.dtypes])] if isinstance(p.dtypes, str) else p.dtypes[0]
+        dtype = p.dtypes[0]
         _, want = p.shape(view)
         extents = want if isinstance(want, tuple) else (want,)
         out[p.role] = _random(torch, dtype, extents, generator)
@@ -420,7 +406,6 @@ NVFP4 = Adapter(
         "global_scale": ("multiply", "divide"),
         "nibble_order": ("low_first", "high_first"),
         "scale_layout": SCALE_LAYOUTS,
-        "pre_quant_scale_dtype": ("F32", "BF16", "F16"),
     },
     (
         Part("weight", ("u8",), _f4),
@@ -428,7 +413,7 @@ NVFP4 = Adapter(
         Part("scale_2", ("f32",), _one_or_per_matrix("scale_2")),
         Part("input_scale", ("f32",), _one_or_per_matrix("input_scale"), required=False),
         Part(
-            "pre_quant_scale", "pre_quant_scale_dtype", lambda v: ("count", v.cols), required=False
+            "pre_quant_scale", ("f32", "bf16", "f16"), lambda v: ("count", v.cols), required=False
         ),
     ),
     _nvfp4,
@@ -438,7 +423,6 @@ NVFP4 = Adapter(
         "nibble_order": "high_first",
         "scale_layout": "cublas_128x4",
     },
-    with_part={"pre_quant_scale_dtype": "pre_quant_scale"},
     rule=_nvfp4_rule,
 )
 
@@ -549,10 +533,13 @@ def _fp8_blockwise(
 
 FP8_BLOCKWISE = Adapter(
     "fp8.blockwise",
-    {"block_size": _block_size, "scale_dtype": ("F32", "BF16", "F16", "F8_E8M0")},
-    (Part("weight", ("f8_e4m3fn",), _logical), Part("scale", "scale_dtype", _tiles)),
+    {"block_size": _block_size},
+    (
+        Part("weight", ("f8_e4m3fn",), _logical),
+        Part("scale", ("f8_e8m0", "f32", "bf16", "f16"), _tiles),
+    ),
     _fp8_blockwise,
-    {"block_size": [128, 128], "scale_dtype": "F8_E8M0"},
+    {"block_size": [128, 128]},
 )
 
 
@@ -1334,169 +1321,6 @@ def _ct(bits: int) -> Adapter:
     )
 
 
-# ------------------------------------------------------------------------------- comfy.*
-
-ROTATION = tuple(4**k for k in range(1, 9))
-
-
-def _comfy_packed(bits: int, group: bool = True) -> Callable[[View], Shape]:
-    def shape(v: View) -> Shape:
-        b = _intp(v.params, "rotation_size")
-        g = _intp(v.params, "group_size") if group else 1
-        if v.cols % b or v.cols % g:
-            raise ValueError(f"{v.cols} columns in blocks of {b} and groups of {g}")
-        return "exact", (*v.lead, v.cols * bits // 8)
-
-    return shape
-
-
-def _hadamard(torch: ModuleType, x: Tensor, k: int) -> Tensor:
-    """Rows of `x` (int32, last axis 4^k) times H4 (x) ... (x) H4, unnormalized and exact."""
-    shape = x.shape
-    x = x.reshape(-1, *([4] * k))
-    for axis in range(1, k + 1):
-        a, b, c, d = (x.select(axis, i) for i in range(4))
-        x = torch.stack((a + b + c - d, a + b - c + d, a - b + c + d, b + c + d - a), dim=axis)
-    return x.reshape(shape)
-
-
-def _comfy_rotate(
-    torch: ModuleType,
-    q8: Tensor,
-    s: Tensor,
-    b: int,
-    out: Tensor,
-    corr: Tensor | None = None,
-    g: int = 1,
-) -> None:
-    """((y x s[i]) + z) x 2^-k per block of b, y = q8 . H_b exact; z = sum_g corr(i, g) x M_g, left
-    to right, M_g the block's group indicator times H_b (spec §6 `comfy.*`)."""
-    rows, cols = q8.shape
-    k = b.bit_length() // 2
-    y = _hadamard(torch, q8.reshape(rows, cols // b, b), k).to(torch.float32)
-    v = y * s.reshape(rows, 1, 1)
-    if corr is not None:
-        cg = corr.reshape(-1, rows).t()  # [R, C/g]
-        z = torch.zeros_like(v)
-        span = torch.arange(b, device=v.device)
-        for blk in range(cols // b):
-            for n, grp in enumerate(range(blk * b // g, -(-(blk + 1) * b // g))):
-                inside = ((span + blk * b) // g == grp).to(torch.int32)
-                m = _hadamard(torch, inside.reshape(1, b), k)[0].to(torch.float32)
-                t = cg[:, grp : grp + 1] * m.reshape(1, b)
-                z[:, blk] = t if n == 0 else z[:, blk] + t
-        v = v + z
-    round_into(torch, (v * 2.0**-k).reshape(-1), out)
-
-
-def _comfy_grouped(bits: int) -> Decode:
-    """asym_w4a8 (4) and w6a8 (6): q8 = clip(round(T[q] x s_rel), +-127) by the table core,
-    then rotated back."""
-
-    def decode(
-        c: Cores,
-        parts: Mapping[str, Tensor],
-        params: Mapping[str, object],
-        shape: tuple[int, ...],
-        out: Tensor,
-    ) -> None:
-        torch = c.torch
-        cols = shape[-1]
-        rows = math.prod(shape) // cols
-        g, b = _intp(params, "group_size"), _intp(params, "rotation_size")
-        w = _u8(torch, parts["weight"]).reshape(rows, cols * bits // 8)
-        if bits == 4:
-            words, pack = w, Packing(4, 8)
-        else:  # a nibble plane, then high 2 bits: column t at bits 2(t mod 4) of byte t // 4
-            low = unpack(torch, w[:, : cols // 2].contiguous(), Packing(4, 8), rows, cols)
-            high = unpack(torch, w[:, cols // 2 :].contiguous(), Packing(2, 8), rows, cols)
-            words, pack = (low | (high << 4)).to(torch.uint8), Packing(8, 8)
-        if "weight_codebook" in parts:
-            levels = _f32(torch, parts["weight_codebook"])
-        else:
-            levels = torch.arange(1 << bits, dtype=torch.float32, device=out.device) - (
-                1 << (bits - 1)
-            )
-        scaled = torch.empty(rows * cols, dtype=torch.float32, device=out.device)
-        c.table(words, pack, rows, cols, levels, parts["weight_s_rel"], blocks_of(g), scaled)
-        x = torch.round(scaled)
-        if bool(x.isnan().any()):
-            raise ValueError("comfy: a level scales to NaN")
-        q8 = x.clamp(-127, 127).to(torch.int32).reshape(rows, cols)
-        corr = _f32(torch, parts["weight_correction"]) if "weight_correction" in parts else None
-        _comfy_rotate(torch, q8, _f32(torch, parts["weight_s_channel"]), b, out, corr, g)
-
-    return decode
-
-
-def _convrot_w4a4(
-    c: Cores,
-    parts: Mapping[str, Tensor],
-    params: Mapping[str, object],
-    shape: tuple[int, ...],
-    out: Tensor,
-) -> None:
-    torch = c.torch
-    cols = shape[-1]
-    rows = math.prod(shape) // cols
-    q = unpack(torch, _u8(torch, parts["weight"]), Packing(4, 8, signed=True), rows, cols)
-    b = _intp(params, "rotation_size")
-    _comfy_rotate(torch, q.to(torch.int32), _f32(torch, parts["weight_scale"]), b, out)
-
-
-def _w4_group(g: object) -> bool:
-    return type(g) is int and g >= 4 and (16 % g == 0 or g % 16 == 0)
-
-
-def _w6_group(g: object) -> bool:
-    return type(g) is int and g >= 16 and g % 16 == 0
-
-
-def _s_rel(v: View) -> Shape:
-    return "exact", (*v.lead, v.cols // _intp(v.params, "group_size"))
-
-
-COMFY_W4A8 = Adapter(
-    "comfy.asym_w4a8_int8",
-    {"group_size": _w4_group, "rotation_size": ROTATION},
-    (
-        Part("weight", ("i8",), _comfy_packed(4)),
-        Part("weight_s_rel", ("f8_e4m3fn", "f32"), _s_rel),
-        Part("weight_s_channel", ("f32",), lambda v: ("count", v.rows)),
-        Part("weight_codebook", ("f32",), _count(16), required=False),
-        Part(
-            "weight_correction",
-            ("f32", "bf16", "f16"),
-            lambda v: ("exact", (v.cols // _intp(v.params, "group_size"), v.rows)),
-            required=False,
-        ),
-    ),
-    _comfy_grouped(4),
-    {"group_size": 16, "rotation_size": 256},
-)
-COMFY_W6A8 = Adapter(
-    "comfy.w6a8_int8",
-    {"group_size": _w6_group, "rotation_size": ROTATION},
-    (
-        Part("weight", ("i8",), _comfy_packed(6)),
-        Part("weight_s_rel", ("f8_e4m3fn", "f32"), _s_rel),
-        Part("weight_s_channel", ("f32",), lambda v: ("count", v.rows)),
-    ),
-    _comfy_grouped(6),
-    {"group_size": 32, "rotation_size": 256},
-)
-COMFY_W4A4 = Adapter(
-    "comfy.convrot_w4a4",
-    {"rotation_size": ROTATION},
-    (
-        Part("weight", ("i8",), _comfy_packed(4, group=False)),
-        Part("weight_scale", ("f32",), lambda v: ("count", v.rows)),
-    ),
-    _convrot_w4a4,
-    {"rotation_size": 256},
-)
-
-
 #: Every scheme the cores decode, one row each.
 ADAPTERS: tuple[Adapter, ...] = (
     NVFP4,
@@ -1510,8 +1334,5 @@ ADAPTERS: tuple[Adapter, ...] = (
     _bnb_four_bit("bnb.nf4", NF4),
     _bnb_four_bit("bnb.fp4", FP4),
     BNB_INT8,
-    COMFY_W4A8,
-    COMFY_W6A8,
-    COMFY_W4A4,
 )
 BY_SCHEME = {a.scheme: a for a in ADAPTERS}

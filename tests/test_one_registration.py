@@ -156,7 +156,7 @@ def test_a_document_with_a_memoized_writer_is_malformed() -> None:
 def test_unbound_weights_refuse_reads_and_canonical_identity() -> None:
     with pytest.raises(ConformanceError) as invalid:
         Weights("sha256:" + "A" * 64)
-    assert invalid.value.code == "weights_manifest_invalid"
+    assert invalid.value.code == "weights_ref_invalid"
     weights: Weights[typing.Any] = Weights("sha256:" + "a" * 64)
     with pytest.raises(CapabilityError) as unbound:
         weights.components()

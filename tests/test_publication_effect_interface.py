@@ -32,9 +32,7 @@ class Empty(msgspec.Struct):
 
 
 def test_publication_requires_admitted_call_broker() -> None:
-    model = ModelArtifact(
-        "producer", "model", ObjectRef("sha256:" + "1" * 64, 100), "sha256:" + "2" * 64
-    )
+    model = ModelArtifact("producer", "model", "sha256:" + "1" * 64, "sha256:" + "2" * 64)
     with pytest.raises(CapabilityError, match="no admitted attempt"):
         upload_checkpoint(model, destination="alice/model")
     with pytest.raises(CapabilityError, match="no admitted attempt"):
@@ -45,9 +43,7 @@ def test_effect_reservations_use_existing_parent_index_and_refuse_unknown_inputs
     tmp_path: Path,
 ) -> None:
     app = App()
-    model = ModelArtifact(
-        "producer", "model", ObjectRef("sha256:" + "1" * 64, 100), "sha256:" + "2" * 64
-    )
+    model = ModelArtifact("producer", "model", "sha256:" + "1" * 64, "sha256:" + "2" * 64)
 
     @app.entrypoint(accelerator=False)
     async def script(ctx: Context, payload: Empty) -> Empty:

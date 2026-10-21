@@ -1,20 +1,20 @@
-"""A cozytensors/1 checkpoint read through the wheel: rows in construction order with their
-scheme and parts, the census fit, configs from files, and the chunks a fetch plan names."""
+"""A D10 checkpoint opened from the store through the wheel: rows in construction order with their
+scheme and parts, configs from its components, assets at their Diffusers/Transformers paths, and
+the census fit."""
 
 from __future__ import annotations
 
+import json
 import socket
-import threading
 from pathlib import Path
 
 import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import fetch_plan, model_config
+from cozy_runtime.internal import model_config
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.fill import (
-    HEADER,
     Checkpoint,
     FillRefusal,
     TensorRequirement,
@@ -23,45 +23,53 @@ from cozy_runtime.internal.fill import (
     tensorfs_requirement_dtype,
 )
 from cozy_runtime.internal.seam import Channel
-from tensord_peer import answer_model_sources
+from store_fixtures import checkpoint, home
+
+UNET = {"in": 4, "eps": 1e-05, "act": None}
+SCHEDULER = {"steps": 2, "beta": 0.00085}
+TOKENIZER = {"model_max_length": 77}
+VOCAB = b'{"a": 0}'
+MERGES = b"#version: 0.2\na b\n"
+INDEX = {"_class_name": "StableDiffusionPipeline", "unet": ["diffusers", "UNet2DConditionModel"]}
 
 
-def _store(root: Path) -> tuple[tensorfs.Store, Checkpoint]:
-    store = tensorfs.Store(root)
-    writer = store.writer()
-    writer.put("unet", "conv_in.weight", "F16", [8, 4], np.ones((8, 4), np.float16))
+def _pipeline(root: Path, monkeypatch: pytest.MonkeyPatch) -> tensorfs.Checkpoint:
+    store = home(root, monkeypatch)
+    writer = tensorfs.Writer(cache_dir=store)
+    writer.pipeline(("diffusers", "", "StableDiffusionPipeline"), INDEX)
+    unet = writer.component("unet", cls=("diffusers", "", "UNet2DConditionModel"), config=UNET)
+    unet.put("conv_in.weight", np.ones((8, 4), np.float16), dtype="F16", shape=[8, 4])
     big = np.arange(20 << 18, dtype=np.float32)  # 20 MiB: chunks of its own
-    writer.put("unet", "mid.weight", "F32", [20 << 18], big)
-    writer.put_encoded(
-        "unet",
-        "proj.weight",
-        "BF16",
-        [4, 32],
-        "fp8.rowwise",
-        {
-            "weight": ("F8_E4M3", [4, 32], np.full((4, 32), 0x38, np.uint8)),
-            "scale": ("F32", [4], np.ones(4, np.float32)),
-        },  # fmt: skip
-        {"axis": 0, "scale_dtype": "F32"},
-    )
-    writer.put("vae", "decoder.weight", "F32", [3], np.ones(3, np.float32))
-    writer.file("unet/config.json", b'{"in": 4}')
-    writer.file("scheduler/scheduler_config.json", b'{"steps": 2}')
-    writer.file("tokenizer/vocab.json", b'{"a": 0}')
-    writer.file("tokenizer/merges.txt", b"#version: 0.2\na b\n")
-    writer.file("assets/palette.bin", bytes(range(256)))
-    writer.file("vae_1_0/config.json", b'{"stray": true}')
-    return store, Checkpoint.from_store(store, f"sha256:{writer.commit().sha256}")
+    unet.put("mid.weight", big, dtype="F32", shape=[20 << 18])
+    unet.put_encoded(
+        "proj.weight", dtype="BF16", shape=[4, 32], scheme="fp8.rowwise",
+        parts={"weight": ("F8_E4M3", [4, 32], np.full((4, 32), 0x38, np.uint8)),
+         "scale": ("F32", [4], np.ones(4, np.float32))},
+        params={},
+    )  # fmt: skip
+    writer.component(
+        "scheduler", cls=("diffusers", "", "EulerDiscreteScheduler"), config=SCHEDULER,
+    )  # fmt: skip
+    tokenizer = writer.component(
+        "tokenizer", cls=("transformers", "", "CLIPTokenizer"), config=TOKENIZER,
+    )  # fmt: skip
+    tokenizer.asset("vocab.json", VOCAB)
+    tokenizer.asset("merges.txt", MERGES)
+    vae = writer.component("vae", cls=("diffusers", "", "AutoencoderKL"), config={"z": 4})
+    vae.put("decoder.weight", np.ones(3, np.float32), dtype="F32", shape=[3])
+    return writer.commit()
 
 
-def test_rows_carry_order_scheme_params_and_parts(tmp_path: Path) -> None:
-    _, ck = _store(tmp_path)
+def test_rows_carry_order_scheme_params_and_parts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ck = Checkpoint(_pipeline(tmp_path, monkeypatch))
     rows = ck.rows("unet")
-    assert [r.name for r in rows] == list(ck.ck.tensors["unet"])
+    assert [r.name for r in rows] == list(ck.tensors("unet"))
     encoded = next(r for r in rows if r.name == "proj.weight")
     assert (encoded.encoded.scheme, dict(encoded.encoded.params)) == (
         "fp8.rowwise",
-        {"axis": 0, "scale_dtype": "F32"},
+        {},
     )
     assert {p.role: (p.dtype, p.shape) for p in encoded.encoded.parts} == {
         "weight": ("f8_e4m3fn", (4, 32)),
@@ -70,51 +78,81 @@ def test_rows_carry_order_scheme_params_and_parts(tmp_path: Path) -> None:
     assert (encoded.dtype, encoded.nbytes) == ("bf16", 4 * 32 * 2)
     plain = next(r for r in rows if r.name == "conv_in.weight")
     assert plain.encoded.scheme == "plain" and plain.encoded.parts[0].role == "value"
+    assert ck.rows("tokenizer") == [], "a component without tensors has no rows"
     with pytest.raises(FillRefusal) as refused:
         ck.rows("text_encoder")
     assert refused.value.code == "destination_absent"
+    held = set(ck.ck.chunks)
+    for table in ck.table("unet").values():
+        parts = table[4]
+        assert isinstance(parts, list)
+        for part in parts:
+            assert isinstance(part, list)
+            assert part[3] in {sha for sha, _ in held}
 
 
-def test_an_executor_gets_every_manifest_file_through_model_source(tmp_path: Path) -> None:
-    """Through TensorD (`ModelSource`) an executor reads the header and every file the manifest
-    lists (configs, tokenizer, assets), byte for byte, each asked once."""
-    store, ck = _store(tmp_path / "store")
+def test_an_executor_opens_a_checkpoint_from_the_store_with_its_configs_and_assets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An executor opens a request's checkpoint by its header ref from the shared store: configs
+    directly from its components, exact supporting bytes without filename export, and
+    the same immutable identity for every later load."""
+    ref = _pipeline(tmp_path / "tensorfs", monkeypatch).id
+    assert ref is not None
+    redirected = tmp_path / "package-changed-store"
+    monkeypatch.setenv("TENSORFS_HOME", str(redirected))
     left, right = socket.socketpair()
-    asked: list[str] = []
-    machine = Channel(right)
-    serving = threading.Thread(target=answer_model_sources, args=(machine, store, asked))
-    serving.start()
     try:
-        granted = Executor(Channel(left), tmp_path)._checkpoint(ck.manifest_id)
-        stored = {path: ck.file(path) for path in ck.files if path != HEADER}
-        assert granted.files == ck.files and len(stored) == 6
-        assert granted.model_assets() == stored
-        assert (
-            granted.configs()
-            == ck.configs()
-            == {
-                "unet": b'{"in": 4}',
-                "scheduler": b'{"steps": 2}',
-            }
-        )
-        assert [r.key for r in granted.rows("unet")] == [r.key for r in ck.rows("unet")]
-        assert granted.ck.chunks == ck.ck.chunks
-        granted.model_assets()
-        assert sorted(asked) == sorted(["", ".", *stored]), "each name asked once, never by HEADER"
+        executor = Executor(Channel(left), tmp_path)
+        ck = executor._checkpoint(ref)
+        assert executor._checkpoint(ref).id == ck.id == ref
+        assert not redirected.exists(), "the executor uses its sealed store root"
+        assert ck.configs() == {
+            "unet": UNET,
+            "scheduler": SCHEDULER,
+            "tokenizer": TOKENIZER,
+            "vae": {"z": 4},
+        }
+        assets = ck.assets()
+        assert sorted(assets) == ["tokenizer/merges.txt", "tokenizer/vocab.json"]
+        assert (assets["tokenizer/vocab.json"], assets["tokenizer/merges.txt"]) == (VOCAB, MERGES)
+        assert ck.ck.pipeline is not None and ck.ck.pipeline.config == INDEX
+        assert not list((tmp_path / "tensorfs").rglob("config.json")), "loading exported files"
+        assert set(ck.asset_digests()) == {"tokenizer/vocab.json", "tokenizer/merges.txt"}
     finally:
         left.close()
-        serving.join()
         right.close()
 
 
-def test_configs_come_from_files_and_the_fit_judges_the_census(tmp_path: Path) -> None:
-    _, ck = _store(tmp_path)
-    # `vae_1_0` is no header component: its config is a file, not a section.
-    assert ck.configs() == {"unet": b'{"in": 4}', "scheduler": b'{"steps": 2}'}
-    assert "vae_1_0/config.json" in ck.model_assets()
-    assert (
-        model_config.construction_config(ck.configs())
-        == b'{"scheduler":{"steps":2},"unet":{"in":4}}'
+def test_a_model_without_a_pipeline_is_its_root_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path, monkeypatch)
+    ref = checkpoint(
+        store,
+        {"model": {"w": np.ones(2, np.float32)}},
+        classes={"model": ("transformers", "", "Qwen3ForCausalLM")},
+        configs={"model": {"hidden_size": 2}},
+        assets={"model": {"tokenizer.json": b"{}", "tokenizer_config.json": b'{"x": 1}'}},
+    )
+    assets = Checkpoint(tensorfs.open(ref, cache_dir=store, local_files_only=True)).assets()
+    assert sorted(assets) == ["tokenizer.json", "tokenizer_config.json"]
+    assert assets["tokenizer_config.json"] == b'{"x": 1}'
+
+
+def test_configs_construct_and_the_fit_judges_the_census(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ck = Checkpoint(_pipeline(tmp_path, monkeypatch))
+    document = json.loads(model_config.construction_config(ck.configs()))
+    assert document == {
+        "scheduler": SCHEDULER,
+        "tokenizer": TOKENIZER,
+        "unet": UNET,
+        "vae": {"z": 4},
+    }
+    assert model_config.construction_config({"unet": UNET}) == (
+        b'{"act":null,"eps":0.00001,"in":4}'
     )
     assert normalized(ck) == ""
     built = [
@@ -143,45 +181,12 @@ def test_configs_come_from_files_and_the_fit_judges_the_census(tmp_path: Path) -
     )
 
 
-def test_a_model_index_names_the_config_sections(tmp_path: Path) -> None:
-    """With a `model_index.json`, its components are the sections: a header component it does
-    not list, and a folder it does not list, are files only."""
-    store = tensorfs.Store(tmp_path)
-    writer = store.writer()
-    writer.put("unet", "w", "F32", [2], np.ones(2, np.float32))
-    writer.put("vae", "w", "F32", [2], np.ones(2, np.float32))
-    index = b'{"_class_name": "P", "scheduler": [], "tokenizer": [], "unet": []}'
-    writer.file("model_index.json", index)
-    writer.file("unet/config.json", b'{"in": 4}')
-    writer.file("vae/config.json", b'{"z": 4}')
-    writer.file("vae_1_0/config.json", b'{"stray": true}')
-    writer.file("scheduler/scheduler_config.json", b'{"steps": 2}')
-    writer.file("tokenizer/vocab.json", b"{}")
-    ck = Checkpoint.from_store(store, f"sha256:{writer.commit().sha256}")
-    assert ck.sections() == {"scheduler", "tokenizer", "unet"}
-    assert ck.configs() == {"unet": b'{"in": 4}', "scheduler": b'{"steps": 2}'}
-
-
-def test_fetch_plans_name_each_tensors_chunks(tmp_path: Path) -> None:
-    store, ck = _store(tmp_path)
-    keys = list(ck.ck.tensors["unet"])
-    every = fetch_plan.component_objects(ck.ck, "unet", keys)
-    big = fetch_plan.tensor_chunks(ck.ck, "unet", "mid.weight")
-    assert len(big) == 1 and big[0] in every
-    assert set(every) <= set(ck.ck.chunks)
-    regions = fetch_plan.region_objects(ck.ck, [["unet/conv_in.weight"], ["unet/mid.weight"]])
-    assert regions[1] == big
-    tail = fetch_plan.component_objects(ck.ck, "unet", keys, keys.index("proj.weight"))
-    assert set(tail) <= set(every)
-    for sha, length in every:
-        assert Path(store.root, "blobs", sha[:2], sha[2:4], sha).stat().st_size == length
-
-
 def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapping(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     torch = pytest.importorskip("torch")
     transformers = pytest.importorskip("transformers")
+    store = home(tmp_path, monkeypatch)
     config = transformers.CLIPTextConfig(
         vocab_size=64, hidden_size=16, intermediate_size=32, num_hidden_layers=1,
         num_attention_heads=2, max_position_embeddings=8, projection_dim=8,
@@ -190,18 +195,21 @@ def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapp
         "text_encoder": transformers.CLIPTextModel(config),
         "text_encoder_2": transformers.CLIPTextModelWithProjection(config),
     }
-    store = tensorfs.Store(tmp_path)
-    writer = store.writer()
+    writer = tensorfs.Writer(cache_dir=store)
     for component, model in built.items():
         model.config.architectures = [type(model).__name__]  # as `save_pretrained` writes it
+        held = writer.component(
+            component,
+            cls=("transformers", "", type(model).__name__),
+            config=json.loads(model.config.to_json_string()),
+        )
         for key, value in model.state_dict().items():  # upstream on-disk names
             stored = (
                 key if key.startswith(("text_model.", "text_projection.")) else f"text_model.{key}"
             )
-            writer.put(component, stored, "F32", list(value.shape), value.numpy())
-        writer.file(f"{component}/config.json", model.config.to_json_string().encode())
-    ck = Checkpoint.from_store(store, f"sha256:{writer.commit().sha256}")
-    assert next(iter(ck.ck.tensors["text_encoder"])).startswith("text_model.")
+            held.put(stored, value.numpy(), dtype="F32", shape=list(value.shape))
+    ck = Checkpoint(writer.commit())
+    assert next(iter(ck.tensors("text_encoder"))).startswith("text_model.")
     for component, model in built.items():
         keys = list(model.state_dict())
         rows = ck.rows(component)
@@ -214,9 +222,9 @@ def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapp
     ]
     verdict = fit(requirements, ck, encoded_leaves=False)
     assert verdict["ok"] and verdict["ignored"] == [], verdict
+    stored = ck.ck.components["text_encoder"].tensors.read("text_model.final_layer_norm.weight")
     assert torch.equal(
-        torch.from_dlpack(ck.ck.read("text_encoder", "text_model.final_layer_norm.weight")),
-        built["text_encoder"].final_layer_norm.weight.detach(),
+        torch.from_dlpack(stored), built["text_encoder"].final_layer_norm.weight.detach()
     )
 
 
@@ -225,18 +233,15 @@ def test_a_transformers_model_binds_its_stored_names_through_its_conversion_mapp
     [("torch.bfloat16", "BF16"), ("torch.float16", "F16"), ("torch.float32", "F32")],
 )
 def test_the_census_dtype_a_fit_pins_is_the_runtimes_name(
-    tmp_path: Path, torch_spelling: str, stored: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, torch_spelling: str, stored: str
 ) -> None:
-    store = tensorfs.Store(tmp_path)
-    writer = store.writer()
-    writer.put(
-        "unet",
-        "weight",
-        stored,
-        [1],
-        np.zeros(1, {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}[stored]),
+    store = home(tmp_path, monkeypatch)
+    writer = tensorfs.Writer(cache_dir=store)
+    value = np.zeros(1, {"BF16": np.uint16, "F16": np.float16, "F32": np.float32}[stored])
+    writer.component("unet", cls=("", "", ""), config={}).put(
+        "weight", memoryview(value), dtype=stored, shape=[1]
     )
-    ck = Checkpoint.from_store(store, f"sha256:{writer.commit().sha256}")
+    ck = Checkpoint(writer.commit())
     pinned = tensorfs_requirement_dtype(torch_spelling)
     assert pinned == (None if stored != "F32" else "f32"), "bf16 and f16 stay convertible"
     assert fit([TensorRequirement("unet", "weight", (1,), pinned)], ck, encoded_leaves=False)["ok"]

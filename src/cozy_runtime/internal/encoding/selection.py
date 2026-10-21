@@ -33,6 +33,7 @@ from typing import Any, NoReturn
 
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding.adapters import CoreDequant
+from cozy_runtime.internal.encoding.comfy import ComfyDequant
 from cozy_runtime.internal.encoding.formats import (
     Encoded,
     Int8ConvRotDequant,
@@ -42,6 +43,7 @@ from cozy_runtime.internal.encoding.formats import (
     RowwiseDequant,
     TensorwiseDequant,
     Verbatim,
+    columnwise,
     refuse,
 )
 from cozy_runtime.internal.encoding.leaves import (
@@ -248,6 +250,8 @@ class RuntimeIdentity:
 #: decode, a leaf forward, a swizzle, an oracle or the admission arithmetic is here; the CLI,
 #: the worker and the author surface are not, because they cannot change a measurement.
 IDENTITY_SOURCES = (
+    "internal/encoding/comfy.py",
+    "internal/encoding/vectors/cases/comfy.json",
     "internal/encoding/formats.py",
     "internal/encoding/leaves.py",
     "internal/encoding/selection.py",
@@ -539,6 +543,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Verbatim,
         TensorwiseDequant,
         RowwiseDequant,
+        columnwise,
         RowwiseNativeLeaf,
         Int8ConvRotDequant,
         Int8ConvRotNativeLeaf,
@@ -547,6 +552,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         MicroScaledDequant,
         MicroScaledNativeLeaf,
         CoreDequant,
+        ComfyDequant,
     )
     for build in builds:
         for scheme in sorted(build("").schemes):

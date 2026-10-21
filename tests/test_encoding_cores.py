@@ -48,7 +48,7 @@ def test_a_row_is_a_provider_with_the_schemes_rules() -> None:
         "any",
     )
     assert provider.suite in probe.DECODE_SUITES
-    good = {"block_size": [128, 128], "scale_dtype": "F32"}
+    good = {"block_size": [128, 128]}
     assert provider.supports((256, 512), good) == ""
     assert "block_size" in provider.supports((256, 512), {**good, "block_size": [0, 128]})
     assert "unknown" in provider.supports((256, 512), {**good, "scale_fmt": "ue8m0"})

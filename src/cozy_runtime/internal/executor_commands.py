@@ -14,6 +14,7 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime.author._assets import FileState, GrantedInput, InputMetadata
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
+from cozy_runtime.internal.attention import Choice
 from cozy_runtime.internal.canonical import Json
 
 _MANIFEST = Annotated[str, msgspec.Meta(pattern="^sha256:[0-9a-f]{64}$")]
@@ -23,6 +24,27 @@ type Custody = Literal["canonical", "local"]
 
 class Command(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True, tag_field="cmd"):
     """One worker command; `cmd` names it."""
+
+
+class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """Ordinary endpoint settings and an already supplied bearer credential."""
+
+    endpoint: str
+    token: str | None = None
+    #: when `token` expires (0: unknown)
+    expires_unix_ms: int = 0
+    ca_der: str | None = None
+
+    def __repr__(self) -> str:
+        return f"TensorFSOptions(endpoint={self.endpoint!r}, token=<redacted>)"
+
+
+class Supplied(msgspec.Struct, frozen=True, kw_only=True):
+    """A signer's bearer for one endpoint, read off the seam in order (`Mux`): a `bearer` frame
+    (TensorD's newer one, unanswered) or what a Load or Invoke carries."""
+
+    actor: str = ""
+    tensorfs: TensorFSOptions | None = None
 
 
 class Hello(Command, frozen=True, kw_only=True, tag="hello"):
@@ -93,12 +115,23 @@ class Activate(Command, frozen=True, kw_only=True, tag="activate"):
 
 
 class Attention(Command, frozen=True, kw_only=True, tag="attention"):
-    """A follower's attention: adopt rank 0's kernels, hold a `pin`, or restore (neither)."""
+    """A follower's attention: install rank 0's whole selection (`adopt`), hold a `pin`, or
+    restore (neither)."""
 
     construction: str = ""
     pin: str | UnsetType = UNSET
     model_key: str | None = None
-    adopt: dict[str, str] | UnsetType = UNSET
+    adopt: Choice | UnsetType = UNSET
+
+
+class Kernels(Command, frozen=True, kw_only=True, tag="kernels"):
+    """A follower's deferred kernel installs (`Plan.when_ready`) at rank 0's boundary: which
+    of `sets` this GPU has built, or, with `install`, install those rank 0 installed."""
+
+    construction: str = ""
+    model_key: str | None = None
+    sets: tuple[str, ...] = ()
+    install: bool = False
 
 
 class Release(msgspec.Struct, frozen=True, kw_only=True):
@@ -226,9 +259,12 @@ LOAD_ATTENTION_PIN = "attention.load_pin/1"
 
 class Load(Command, frozen=True, kw_only=True, tag="load"):
     """Ask Runtime to construct models and register their weights with its memory, read through
-    TensorD's grants. The command names one model (`binding`) or several (`models`)."""
+    TensorFS. The command names one model (`binding`) or several (`models`)."""
 
     construction: str
+    tensorfs: TensorFSOptions | None = None
+    #: the signer whose bearer `tensorfs` carries
+    actor: str = ""
     devices: str = ""
     sequence_parallel_degree: int = 1
     #: the pin of the request this executor loads for (`LOAD_ATTENTION_PIN`)
@@ -288,6 +324,7 @@ class PrepareRequest(_Attempt, frozen=True, kw_only=True, tag="prepare_request")
 
 class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
+    tensorfs: TensorFSOptions | None = None
     spool: str
     deadline_s: float | None
     inputs: dict[str, InputFile] = {}
@@ -299,10 +336,13 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     construction: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
-    #: Each `Weights[M]` parameter's checkpoint, read through the owner's source channel.
+    #: Each `Weights[M]` parameter's checkpoint, opened directly through TensorFS.
     sources: dict[str, _MANIFEST] = {}
     #: The weights outputs this attempt may write, and each one's granted new bytes.
     weights: dict[str, int] = {}
+    destination: str = ""
+    actor: str = ""
+    operation: str = ""
 
 
 type KnownCommand = (
@@ -317,6 +357,7 @@ type KnownCommand = (
     | RequestMemory
     | Activate
     | Attention
+    | Kernels
     | Start
     | Load
     | PrepareRequest

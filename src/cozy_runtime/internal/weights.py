@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 from tensorfs.varena.torch import (
     Cache,
     Declared,
-    LayoutChanged,
     Memory,
     Model,
     Shrink,
@@ -70,19 +69,16 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.nn import Module
 
-#: A weight set's bytes from TensorD (`ReadGrant`), by manifest and layout digest: the host
-#: layout deposited for it with the GPU pages kept of it `(region, fd)` and their fingerprint,
-#: or the chunk files of the `(sha256, length)` objects asked, each `(sha256, length, fd)`.
-type Grant = Callable[
-    [str, str, list[tuple[str, int]]],
-    tuple[int | None, list[tuple[str, int, int]], list[tuple[int, int]], str],
-]
+#: A weight set's held bytes from TensorD (`ReadGrant`), by manifest and layout digest: the host
+#: layout deposited for it, the GPU pages kept of it `(region, fd)` and their fingerprint;
+#: `(None, [], "")` when it holds none, and varena reads the checkpoint.
+type Grant = Callable[[str, str], tuple[int | None, list[tuple[int, int]], str]]
 #: GPU pages varena kept, given to TensorD (`KeepPages`): layout digest, fingerprint, and
 #: `(region, span, fd)` each (the callee's to close).
 type Keep = Callable[[str, str, list[tuple[int, int, int]]], None]
 #: A host layout varena sealed, deposited with TensorD (`Deposit`): manifest, name, layout
-#: digest, the chunk objects it was sealed from, the memfd (the callee's to close).
-type Deposit = Callable[[str, str, str, list[tuple[str, int]], int], None]
+#: digest, the memfd (the callee's to close).
+type Deposit = Callable[[str, str, str, int], None]
 
 
 # ---------------------------------------------------------------------------- the backend
@@ -185,8 +181,8 @@ class Backend:
             components=sorted({row.component for row in rows}),
             release=release,
             store="script",
-            snapshot=next(iter(checkpoints.values())).manifest_id,
-            snapshots={name: book.manifest_id for name, book in checkpoints.items()},
+            snapshot=next(iter(checkpoints.values())).id,
+            snapshots={name: book.id for name, book in checkpoints.items()},
             providers=providers,
             capabilities=qualification.capabilities,
             device=facts,
@@ -267,8 +263,8 @@ class Backend:
         return frozenset(self.checkpoints)
 
     def ahead(self) -> None:
-        """Before the factory runs, each bound component's grant: its objects fetched while the
-        module is built. The load registers it, held or sealed, the one way it loads any time."""
+        """Before the factory runs, each bound component's grant, asked once. The load registers
+        it, held or sealed, the one way it loads any time."""
         started = time.perf_counter()
         for name in self.checkpoints:
             self._granted(name)
@@ -290,7 +286,7 @@ class Backend:
                     f"no checkpoint for it (bound: {', '.join(sorted(self.checkpoints))})",
                     [component],
                 )
-            by_checkpoint.setdefault(checkpoint.manifest_id, (checkpoint, []))[1].append(component)
+            by_checkpoint.setdefault(checkpoint.id, (checkpoint, []))[1].append(component)
         verdict: dict[str, object] | None = None
         ignored: list[str] = []
         warnings: list[str] = []
@@ -450,9 +446,9 @@ class Backend:
 
     def _register(self, name: str, root: Module, keys: list[str]) -> Model:
         """One component loaded into the memory: its stored tensors, bound through their
-        routes, its LoRAs baked on page-in, its bytes from TensorD's grant: the host layout
-        deposited for it, else the chunk files, which varena seals and the layout goes to
-        TensorD for the next load."""
+        routes, its LoRAs baked on page-in, its bytes the host layout TensorD holds for it, else
+        read from the checkpoint by varena, which seals them and deposits the layout with TensorD
+        for the next load."""
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
         grant = replace(self._granted(name), keys=tuple(rows))
@@ -463,23 +459,15 @@ class Backend:
             bind=_Routes(self, rows),
         )
         try:
-            try:
-                model = self.memory.load(root)
-            except LayoutChanged:
-                if self.grant is None:
-                    raise
-                fresh = replace(self._granted(name, chunks=True), keys=tuple(rows))
-                vars(root)["_varena"] = replace(vars(root)["_varena"], weights=fresh)
-                model = self.memory.load(root)
+            model = self.memory.load(root)
         finally:
             remaining = self.grants.pop(name, None)
             if remaining is not None:
                 _close(remaining)
         for _, sealed in self.memory.sealed():
             if self.deposit is not None:
-                objects = self._objects(self.checkpoints[name])
                 label = f"{self.construction}/{name}"
-                self.deposit(grant.manifest, label, self._layout(name), objects, sealed)
+                self.deposit(grant.manifest, label, self._layout(name), sealed)
             else:
                 os.close(sealed)
         return model
@@ -490,30 +478,22 @@ class Backend:
         module exists; a held tier of other regions is a miss (`Memory.load`)."""
         return canonical.digest(
             {
-                "manifest": self.checkpoints[name].manifest_id,
+                "manifest": self.checkpoints[name].id,
                 "construction": self.execution.construction.document(),
                 "component": name,
             }
         )
 
-    def _granted(self, name: str, *, chunks: bool = False) -> WeightGrant:
-        """A component's grant, asked of TensorD once: its sealed host tier, else its chunk
-        files."""
-        if chunks and name in self.grants:
-            _close(self.grants.pop(name))
+    def _granted(self, name: str) -> WeightGrant:
+        """A component's grant, asked of TensorD once: the sealed host tier it holds for the
+        layout, registered by the load; without one, varena reads the checkpoint."""
         grant = self.grants.get(name)
         if grant is None:
             checkpoint = self.checkpoints[name]
-            grant = WeightGrant(checkpoint.ck, name, checkpoint.manifest_id)
+            grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
             if self.grant is not None:
-                objects = self._objects(checkpoint)
-                fd, files, pages, fingerprint = self.grant(
-                    grant.manifest, "" if chunks else self._layout(name), objects
-                )
-                grant = replace(
-                    grant, host_fd=fd, files=tuple(files),
-                    pages=tuple(pages), fingerprint=fingerprint,
-                )
+                fd, pages, fingerprint = self.grant(grant.manifest, self._layout(name))
+                grant = replace(grant, host_fd=fd, pages=tuple(pages), fingerprint=fingerprint)
             self.grants[name] = grant
         return grant
 
@@ -532,23 +512,6 @@ class Backend:
         """Grants no registration took."""
         for name in list(self.grants):
             _close(self.grants.pop(name))
-
-    def _objects(self, checkpoint: Checkpoint) -> list[tuple[str, int]]:
-        """Every chunk of the manifest's selected components, `(sha256, length)` in sha256
-        order: what a grant without a sealed layout hands over."""
-        selected = [
-            c for c, ck in self.checkpoints.items() if ck.manifest_id == checkpoint.manifest_id
-        ]
-        tensors, chunks = checkpoint.ck.tensors, checkpoint.ck.chunks
-        used: set[int] = set()
-        parts = (p for c in selected for t in tensors.get(c, {}).values() for p in t.parts.values())
-        for part in parts:
-            at, offset, left = part.chunk, part.offset, part.length
-            while left > 0:  # a part of 16 MiB or more runs on through the next chunks
-                used.add(at)
-                left -= chunks[at][1] - offset
-                at, offset = at + 1, 0
-        return sorted((chunks[i][0], chunks[i][1]) for i in used)
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
@@ -606,7 +569,7 @@ class Backend:
 
 def _close(grant: WeightGrant) -> None:
     held = [] if grant.host_fd is None else [grant.host_fd]
-    for fd in held + [f for _, _, f in grant.files] + [f for _, f in grant.pages]:
+    for fd in held + [f for _, f in grant.pages]:
         os.close(fd)
 
 

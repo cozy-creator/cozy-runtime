@@ -117,11 +117,11 @@ class Plan:
     """Wait for this machine's build of the set for `device` (started when the executor did)
     and return its launcher. Raises `KernelsUnavailable`."""
     when_ready: Callable[[TritonKernels, Callable[[Launch], None]], bool] | None = None
-    """`install(launch)` now when the build is done (True), else at the start of the first
-    request after it is (False): a construction serves while its kernels compile, and a run
-    never waits for one. A group installs now. Raises `KernelsUnavailable` as `load` does;
-    a deferred install that fails leaves the construction as it was. None: `load`, then
-    install."""
+    """`install(launch)` once the set is built for every GPU of the construction, on each at
+    the same boundary: the end of its preparation, else the start of the first request after.
+    A construction serves while its kernels compile, and a run never waits for one. True when
+    this GPU's build is done now. Raises `KernelsUnavailable` as `load` does; an install that
+    fails leaves the construction as it was. None: `load`, then install."""
 
 
 @dataclass(frozen=True, slots=True)

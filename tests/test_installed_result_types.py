@@ -152,8 +152,8 @@ def test_plain_script_returns_installed_public_struct_after_managed_call(
     artifact: dict[str, Any] = {
         "producer_request_id": "child",
         "output_slot": "model",
-        "manifest": {"digest": "sha256:" + "1" * 64, "length": 163},
-        "tensorfs_receipt_digest": "sha256:" + "2" * 64,
+        "checkpoint": "sha256:" + "1" * 64,
+        "transaction": "sha256:" + "2" * 64,
     }
 
     def exchange(kind: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -175,7 +175,7 @@ def test_plain_script_returns_installed_public_struct_after_managed_call(
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and type(result.result.value) is imported.Selection
     assert isinstance(result.result.value.projection, ModelArtifact)
-    assert result.result.value.projection.manifest.digest == artifact["manifest"]["digest"]
+    assert result.result.value.projection.checkpoint == artifact["checkpoint"]
 
 
 @pytest.mark.parametrize(
