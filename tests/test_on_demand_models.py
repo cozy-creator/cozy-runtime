@@ -34,6 +34,7 @@ import tensorfs  # noqa: E402
 from tensorfs import Store  # noqa: E402
 from tensorfs import varena as tfs_plane  # noqa: E402
 from tensorfs.fetch import Fetch  # noqa: E402
+from tensorfs.records import ObjectRef  # noqa: E402
 
 from cozy_runtime.author._errors import ConformanceError  # noqa: E402
 from cozy_runtime.author._executor_requests import SealedPlan  # noqa: E402
@@ -221,7 +222,9 @@ def owner(channel: Channel, hub: Hub, store: Store, sealed: list[str]) -> None:
                     if item["source"] == "object"
                 }.items()
             )
-            wire = [{"sha256": sha, "length": length} for sha, length in refs]
+            wire: list[ObjectRef] = [
+                {"sha256": sha, "length": length} for sha, length in refs
+            ]
             with Fetch.from_fd(hub.channel(store)) as fetch:
                 fetch.wait(doc.manifest, wire)
             lease = store.acquire(doc.manifest, [(f"sha256:{sha}", n) for sha, n in refs])

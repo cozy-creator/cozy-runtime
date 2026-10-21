@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+from enum import IntEnum
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -194,3 +195,33 @@ def test_an_invocable_payload_carries_its_segment_length_into_the_cell(tmp_path:
     twelve = _cell(tmp_path, seconds=12, references=5, entrypoint="motion_segment_turbo")
     assert six == f"assets=5,frames={FRAMES[6]},steps=8"
     assert twelve == f"assets=5,frames={FRAMES[12]},steps=8"
+
+
+class Megapixels(IntEnum):
+    MP1 = 1
+    MP4 = 4
+
+
+#: None derives the tier from the references (qwen-image-2); admission sizes it at the largest.
+TIERS = {Megapixels.MP1: (1024, 1024), Megapixels.MP4: (2048, 2048), None: (2048, 2048)}
+
+
+class Tiered(msgspec.Struct):
+    prompt: str
+    megapixels: Annotated[Megapixels | None, Shape(pixels=TIERS)] = None
+
+
+def test_an_omitted_shape_field_resolves_through_its_none_entry() -> None:
+    local = App()
+
+    @local.entrypoint
+    def render(payload: Tiered) -> Output:
+        raise AssertionError("prepare only")
+
+    describe(local)
+
+    def cell(wire: dict[str, Any]) -> str:
+        return shape_cell(prepare(local.get("render"), wire).features.values)
+
+    assert cell({"prompt": "x"}) == f"height=2048,pixels={2048 * 2048},width=2048"
+    assert cell({"prompt": "x", "megapixels": 1}) == f"height=1024,pixels={1024 * 1024},width=1024"

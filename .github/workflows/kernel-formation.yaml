@@ -34,6 +34,10 @@ run-name: kernel-formation ${{ inputs.ref || github.head_ref }}
 permissions:
   contents: read
 
+concurrency:
+  group: kernel-formation-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   form:
     # Every card in one process: one image pull, one cache, and the compile manager admits

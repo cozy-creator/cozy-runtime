@@ -22,11 +22,12 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 from numbers import Integral
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from PIL.Image import DecompressionBombError, Resampling, Transpose
 from PIL.Image import Image as PILImage
 from PIL.Image import frombytes as pil_frombytes
+from PIL.Image import new as pil_new
 from PIL.Image import open as pil_open
 from PIL.ImageOps import exif_transpose
 
@@ -1056,17 +1057,19 @@ class MediaReads:
         """Bytes every `read()` of this attempt has retained so far."""
         return self._budget.used
 
-    def image(self, asset: ImageAsset) -> PILImage:
+    def image(self, asset: ImageAsset, mode: Literal["RGB", "RGBA"]) -> PILImage:
+        if mode not in ("RGB", "RGBA"):
+            raise ValueError(f"image mode must be RGB or RGBA, not {mode!r}")
         budget, path = self._start(asset, "ImageAsset.read")
         try:
             with _reading(asset, None, "image"):
-                prepared = _image(path, self._limits, budget, _image_preparation(asset))
+                prepared = _image(path, self._limits, budget, _image_preparation(asset), mode)
         except BaseException:
             budget.refund()
             raise
-        # A fresh RGB image of those pixels: no source metadata (a palette's `transparency`,
-        # EXIF, ICC) reaches the package, so a later `convert("RGBA")` stays opaque.
-        return pil_frombytes("RGB", prepared.size, prepared.tobytes())
+        # A fresh image of those pixels: no source metadata (a palette's `transparency`,
+        # EXIF, ICC) reaches the package.
+        return pil_frombytes(mode, prepared.size, prepared.tobytes())
 
     def video(self, asset: VideoAsset, *, end: object, fps: object, audio: bool) -> DecodedVideo:
         cut = _effective_end(end, asset._end)
@@ -1459,10 +1462,6 @@ def _probe_image(path: Path, limits: DecodeLimits) -> ImageProbe:
     with _pillow(), pil_open(path) as header:
         width, height = header.size
         _check_pixels(width, height, limits)
-        if getattr(header, "n_frames", 1) != 1:
-            raise MediaDecodeError(
-                "image asset contains more than one frame", code="animated_image"
-            )
         # The base reader parses header metadata only; a PNG `eXIf` after its pixels
         # would need a decode and is not consulted here.
         orientation = PILImage.getexif(header).get(0x0112, 1)
@@ -1544,31 +1543,39 @@ def image_source_geometry(
 
 
 def _image(
-    path: Path, limits: DecodeLimits, budget: _Budget, preparation: ImagePreparation | None
+    path: Path,
+    limits: DecodeLimits,
+    budget: _Budget,
+    preparation: ImagePreparation | None,
+    mode: Literal["RGB", "RGBA"] = "RGB",
 ) -> PILImage:
     """Decode a still image with Pillow; CLI preparation and Runtime use this one core.
 
     Resource ceilings are application policy. Pillow owns image formats, EXIF
-    orientation (including mirrors), RGB conversion and resampling.
+    orientation (including mirrors), mode conversion and resampling. A multi-frame
+    file (an iPhone MPO's gain map, APNG, GIF, TIFF pages) reads as its first frame,
+    the picture every viewer shows; Pillow opens there. An RGB read composites any
+    transparency over white, as upstream Qwen's checkpoints were trained; RGBA keeps it.
     """
     with _pillow():
         source_geometry = image_source_geometry(path, limits, preparation)
         with pil_open(path) as image:
             if image.size != source_geometry:
                 raise MediaDecodeError("image header geometry changed", code="media_geometry")
-            if getattr(image, "n_frames", 1) != 1:
-                raise MediaDecodeError(
-                    "image asset contains more than one frame", code="animated_image"
-                )
             width, height = image_target_size(*source_geometry, preparation)
-            budget.claim(width * height * 3, "image RGB")
+            budget.claim(width * height * len(mode), f"image {mode}")
             # in_place avoids an extra full-size copy for the common upright case.
             exif_transpose(image, in_place=True)
-            rgb = image.convert("RGB")
-            size = image_target_size(*rgb.size, preparation)
-            if rgb.size != size:
-                rgb = rgb.resize(size, Resampling.LANCZOS)
-            return rgb
+            if mode == "RGB" and image.has_transparency_data:
+                rgba = image.convert("RGBA")
+                pixels = pil_new("RGB", rgba.size, (255, 255, 255))
+                pixels.paste(rgba, mask=rgba)
+            else:
+                pixels = image.convert(mode)
+            size = image_target_size(*pixels.size, preparation)
+            if pixels.size != size:
+                pixels = pixels.resize(size, Resampling.LANCZOS)
+            return pixels
 
 
 def decode_image_path(

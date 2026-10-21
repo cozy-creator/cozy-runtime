@@ -247,18 +247,22 @@ class _Bound:
 
 @dataclass(frozen=True, slots=True)
 class ImageFrame:
-    """Raw RGB pixels — the SDK's own encoder input, so no imaging library is required."""
+    """Raw 8-bit RGB or RGBA pixels — the SDK's own encoder input, so no imaging library
+    is required. RGBA saves keep their alpha in PNG and WebP."""
 
     width: int
     height: int
-    rgb: bytes
+    pixels: bytes
+    mode: Literal["RGB", "RGBA"] = "RGB"
 
     def __post_init__(self) -> None:
-        expect = self.width * self.height * 3
-        if len(self.rgb) != expect:
+        if self.mode not in ("RGB", "RGBA"):
+            raise OutputError(f"image mode {self.mode!r} is not RGB or RGBA", code="frame_mode")
+        expect = self.width * self.height * len(self.mode)
+        if len(self.pixels) != expect:
             raise OutputError(
-                f"image frame is {len(self.rgb)} bytes, expected {expect} "
-                f"for {self.width}x{self.height} RGB",
+                f"image frame is {len(self.pixels)} bytes, expected {expect} "
+                f"for {self.width}x{self.height} {self.mode}",
                 code="frame_shape",
             )
 
@@ -301,28 +305,35 @@ class _PilLike(Protocol):
 
     mode: str
     size: tuple[int, int]
+    has_transparency_data: bool
 
     def tobytes(self) -> bytes: ...
 
+    def convert(self, mode: str) -> _PilLike: ...
+
 
 def as_frame(image: object) -> ImageFrame:
+    """A PIL image of any mode saves as RGBA when it carries transparency, else as RGB."""
     if isinstance(image, ImageFrame):
         return image
     if isinstance(image, _PilLike):
-        if image.mode != "RGB":
-            raise OutputError(f"image mode {image.mode!r} is not RGB", code="frame_mode")
-        width, height = image.size
-        return ImageFrame(width, height, image.tobytes())
+        mode: Literal["RGB", "RGBA"] = "RGBA" if image.has_transparency_data else "RGB"
+        try:
+            pixels = image if image.mode == mode else image.convert(mode)
+        except ValueError as exc:
+            raise OutputError(f"image mode {image.mode!r}: {exc}", code="frame_mode") from exc
+        width, height = pixels.size
+        return ImageFrame(width, height, pixels.tobytes(), mode)
     raise OutputError(
-        f"cannot encode {type(image).__name__}: pass an ImageFrame or an RGB image",
+        f"cannot encode {type(image).__name__}: pass an ImageFrame or a PIL image",
         code="frame_type",
     )
 
 
 def encode_png(frame: ImageFrame) -> bytes:
-    """Encode exact RGB pixels as maximum-compression lossless PNG."""
+    """Encode exact RGB or RGBA pixels as lossless PNG."""
 
-    return _codec.encode_png(frame.width, frame.height, frame.rgb)
+    return _codec.encode_png(frame.width, frame.height, frame.pixels, frame.mode)
 
 
 def settle_frame(attempt: Attempt, handle: str) -> Asset:
@@ -395,9 +406,9 @@ class Outputs(_Bound):
         return self._register_frame(
             ImageAsset,
             format,
-            (frame.rgb,),
-            {"width": frame.width, "height": frame.height},
-            charge=len(frame.rgb),
+            (frame.pixels,),
+            {"width": frame.width, "height": frame.height, "mode": frame.mode},
+            charge=len(frame.pixels),
         )
 
     def save_audio(self, waveform: object, *, sample_rate: int, format: str = "flac") -> AudioAsset:

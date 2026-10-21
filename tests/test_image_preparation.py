@@ -10,7 +10,7 @@ from typing import Annotated
 
 import msgspec
 import pytest
-from PIL import Image
+from PIL import Image, ImageOps
 
 from cozy_runtime.author import (
     App,
@@ -20,6 +20,7 @@ from cozy_runtime.author import (
     ImageAsset,
     ImagePreparation,
     describe,
+    fakes,
 )
 from cozy_runtime.author._decode import (
     DEFAULT_DECODE_LIMITS,
@@ -179,19 +180,46 @@ def test_exif_images_decode_to_expected_pixels(
     assert source.read_bytes() == original
 
 
-@pytest.mark.parametrize("format", ["WEBP", "TIFF"], ids=["animation", "multipage"])
-def test_still_image_refuses_animation(tmp_path: Path, format: str) -> None:
-    source = tmp_path / ("animated." + format.lower())
-    Image.new("RGB", (7, 5), "red").save(
-        source,
-        format=format,
-        save_all=True,
-        append_images=[Image.new("RGB", (7, 5), "blue")],
-        duration=100,
+@pytest.mark.parametrize(
+    ("format", "options"),
+    [
+        ("MPO", {}),
+        ("PNG", {}),
+        ("PNG", {"default_image": True}),
+        ("GIF", {}),
+        ("WEBP", {"lossless": True}),
+        ("TIFF", {}),
+    ],
+    ids=["iphone-mpo", "apng", "apng-default-image", "gif", "webp", "tiff-pages"],
+)
+def test_multi_frame_image_reads_its_first_frame(
+    tmp_path: Path, format: str, options: dict[str, object]
+) -> None:
+    source = tmp_path / ("frames." + format.lower())
+    first = Image.frombytes("RGB", (8, 6), bytes(range(144)))
+    if format == "MPO":  # An iPhone JPEG: the rotated photo, then a half-size gray gain map.
+        exif = Image.Exif()
+        exif[274] = 6
+        options, second = {"exif": exif}, Image.new("L", (4, 3), 128)
+    else:
+        second = Image.new("RGB", (8, 6), "blue")
+    first.save(
+        source, format=format, save_all=True, append_images=[second], duration=100, **options
     )
-    with pytest.raises(MediaDecodeError) as error:
-        decode(source)
-    assert error.value.code == "animated_image"
+    with Image.open(source) as saved:
+        assert getattr(saved, "n_frames", 1) == 2
+        expected = ImageOps.exif_transpose(saved).convert("RGB")
+    asset = fakes.file_input(ImageAsset, source)
+    assert (asset.probe().width, asset.probe().height) == expected.size
+    assert asset.read().tobytes() == decode(source).rgb == expected.tobytes()
+    if format == "MPO":
+        assert expected.size == (6, 8)  # The rotated primary, not the 4x3 gain map.
+    else:
+        assert expected.tobytes() == first.tobytes()
+    claim = 8 * 6 * 3  # The retained budget is the decoded frame's, nothing more.
+    decode_image_path(source, DEFAULT_DECODE_LIMITS, _Budget(claim))
+    with pytest.raises(MediaDecodeError, match="decoded"):
+        decode_image_path(source, DEFAULT_DECODE_LIMITS, _Budget(claim - 1))
 
 
 def test_still_image_refuses_truncated_pixels(tmp_path: Path) -> None:
@@ -209,3 +237,60 @@ def test_still_image_retained_budget_precedes_pixel_decode(tmp_path: Path) -> No
     source.write_bytes(source.read_bytes()[:45])  # Header fits, but pixel loading would fail.
     with pytest.raises(MediaDecodeError, match="decoded"):
         decode_image_path(source, DEFAULT_DECODE_LIMITS, _Budget(104))
+
+
+def _rgba() -> Image.Image:
+    """Opaque red, transparent green, half-transparent blue and a clear pixel over black."""
+    return Image.frombytes(
+        "RGBA", (2, 2), bytes([255, 0, 0, 255, 0, 255, 0, 0, 0, 0, 255, 128, 0, 0, 0, 0])
+    )
+
+
+@pytest.mark.parametrize("format", ["png", "webp"])
+def test_rgba_saves_and_reads_with_its_alpha(tmp_path: Path, format: str) -> None:
+    source = _rgba()
+    saved = fakes.fake_outputs().save_image(source, format=format)
+    assert saved._local is not None
+    with Image.open(saved._local) as encoded:
+        assert encoded.mode == "RGBA"
+        assert encoded.tobytes() == source.tobytes()  # Exact, colour under alpha 0 included.
+    asset = fakes.fake_input(saved)
+    rgba = asset.read(mode="RGBA")
+    assert rgba.mode == "RGBA" and rgba.tobytes() == source.tobytes()
+    rgb = asset.read()
+    assert rgb.mode == "RGB"
+    # Over white: opaque stays, transparent is white, half-transparent blends.
+    assert rgb.tobytes() == bytes([255, 0, 0, 255, 255, 255, 127, 127, 255, 255, 255, 255])
+
+
+def test_save_image_converts_every_mode(tmp_path: Path) -> None:
+    out = fakes.fake_outputs()
+    gray = Image.frombytes("L", (2, 1), bytes([10, 200]))
+    shaded = Image.frombytes("LA", (2, 1), bytes([10, 255, 200, 0]))
+    keyed = Image.new("P", (2, 1))
+    keyed.putpalette([0, 0, 0, 9, 8, 7])
+    keyed.putpixel((1, 0), 1)
+    keyed.info["transparency"] = 1
+    expected = [
+        ("RGB", bytes([10, 10, 10, 200, 200, 200])),
+        ("RGBA", bytes([10, 10, 10, 255, 200, 200, 200, 0])),
+        ("RGBA", bytes([0, 0, 0, 255, 9, 8, 7, 0])),
+    ]
+    for image, (mode, pixels) in zip((gray, shaded, keyed), expected, strict=True):
+        saved = out.save_image(image)
+        assert saved._local is not None
+        with Image.open(saved._local) as encoded:
+            assert (encoded.mode, encoded.tobytes()) == (mode, pixels)
+
+
+def test_rgba_read_is_prepared_and_charged_four_bytes_a_pixel(tmp_path: Path) -> None:
+    source = tmp_path / "large.png"
+    Image.new("RGBA", (64, 32), (0, 0, 255, 0)).save(source)
+    asset = fakes.file_input(ImageAsset, source, preparation=ImagePreparation(max_edge=16))
+    image = asset.read(mode="RGBA")
+    assert (image.mode, image.size) == ("RGBA", (16, 8))
+    assert image.tobytes()[3::4] == bytes(16 * 8)
+    assert asset.read().tobytes() == b"\xff" * (16 * 8 * 3)
+    assert asset._media is not None and asset._media.retained_bytes == 16 * 8 * (4 + 3)
+    with pytest.raises(ValueError, match="RGB or RGBA"):
+        asset.read(mode="CMYK")  # type: ignore[arg-type]

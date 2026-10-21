@@ -119,14 +119,14 @@ def require_encoder() -> None:
     _av()
 
 
-def _image(width: int, height: int, rgb: bytes) -> Any:
+def _image(width: int, height: int, pixels: bytes, mode: str) -> Any:
     from PIL import Image
 
-    return Image.frombytes("RGB", (width, height), rgb)
+    return Image.frombytes(mode, (width, height), pixels)
 
 
-def encode_png(width: int, height: int, rgb: bytes) -> bytes:
-    """Encode exact RGB pixels losslessly at zlib's fastest level.
+def encode_png(width: int, height: int, pixels: bytes, mode: str = "RGB") -> bytes:
+    """Encode exact RGB or RGBA pixels losslessly at zlib's fastest level.
 
     The worker encodes a registered frame at the attempt's tail, before its outcome. On
     1344x768 and 1024x1024 frames, level 9 with `optimize` took 1.1-2.0 s here and 2.9 s
@@ -134,15 +134,15 @@ def encode_png(width: int, height: int, rgb: bytes) -> bytes:
     """
 
     encoded = io.BytesIO()
-    _image(width, height, rgb).save(encoded, format="PNG", compress_level=1)
+    _image(width, height, pixels, mode).save(encoded, format="PNG", compress_level=1)
     body = encoded.getvalue()
     if body[:8] != b"\x89PNG\r\n\x1a\n":
         raise OutputError("the lossless PNG encoder returned a malformed container", code="encode")
     return body
 
 
-def encode_webp(width: int, height: int, rgb: bytes) -> bytes:
-    """Encode exact RGB pixels as lossless WebP at its fastest effort.
+def encode_webp(width: int, height: int, pixels: bytes, mode: str = "RGB") -> bytes:
+    """Encode exact RGB or RGBA pixels as lossless WebP at its fastest effort.
 
     Lossless and exact at every setting: effort trades only bytes for time. On three
     1024px SDXL outputs, method 5 at quality 100 took 1.15 s for 1.07 MB; method 0 at
@@ -150,7 +150,7 @@ def encode_webp(width: int, height: int, rgb: bytes) -> bytes:
     """
 
     encoded = io.BytesIO()
-    _image(width, height, rgb).save(
+    _image(width, height, pixels, mode).save(
         encoded, format="WEBP", lossless=True, method=0, quality=50, exact=True
     )
     body = encoded.getvalue()
@@ -423,10 +423,9 @@ def encode_frame(codec: str, facts: Mapping[str, Any], raw: bytes) -> bytes:
     — so the bytes an author's test sees are the bytes the worker writes. Every shape here
     was validated at registration; this only encodes.
     """
-    if codec == "png":
-        return encode_png(int(facts["width"]), int(facts["height"]), raw)
-    if codec == "webp":
-        return encode_webp(int(facts["width"]), int(facts["height"]), raw)
+    if codec in ("png", "webp"):
+        encode = encode_png if codec == "png" else encode_webp
+        return encode(int(facts["width"]), int(facts["height"]), raw, str(facts["mode"]))
     if codec == "flac":
         planar = Planar(raw, (int(facts["channels"]), int(facts["samples"])))
         return encode_flac(planar, int(facts["sample_rate"]))
