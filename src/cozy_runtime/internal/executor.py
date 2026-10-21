@@ -984,10 +984,11 @@ class Executor:
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
-            #: commands beyond the floor's (`memory` is the invoke reply's own object)
+            #: commands beyond the floor's (`memory` is the invoke reply's own object); `fork/1`
+            #: only where the OS forks (a Windows executor is always spawned)
             "capabilities": [
                 "import_only",
-                zygote.CAPABILITY,
+                *([zygote.CAPABILITY] if hasattr(os, "fork") else []),
                 LOAD_ATTENTION_PIN,
             ],
             "memo": [stage_memo.CAPABILITY],
