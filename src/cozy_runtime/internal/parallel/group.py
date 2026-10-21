@@ -19,6 +19,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
+from types import ModuleType
 from typing import Annotated, Any, Protocol, TypedDict
 
 import msgspec
@@ -229,14 +230,14 @@ def join_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     return dist.group.WORLD
 
 
-def _device(torch: Any, backend: str) -> Any:
+def _device(torch: ModuleType, backend: str) -> object:
     """NCCL's device, which makes its communicator eager: its buffers are allocated as the group
     forms, before weights fill the GPU, never inside a request where no rung can make room
     for the driver (12298, 12379: "NCCL Error 1: unhandled cuda error")."""
     return torch.device("cuda", torch.cuda.current_device()) if "nccl" in backend else None
 
 
-def warm(torch: Any, backend: str, rank: int, world: int) -> None:
+def warm(torch: ModuleType, backend: str, rank: int, world: int) -> None:
     """GPU 0 and each follower exchange one element, so the pair's point-to-point communicator
     (a request's broadcasts and results ride it) exists from the group's start too."""
     if "nccl" not in backend:
