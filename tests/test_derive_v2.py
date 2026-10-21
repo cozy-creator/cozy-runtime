@@ -152,6 +152,37 @@ def test_a_selection_keeps_only_its_weights_and_every_component(store: Path, sou
         )  # fmt: skip
 
 
+def test_a_derived_output_writes_its_own_component_config(store: Path, source: str) -> None:
+    pruned = {**CONFIG, "hidden": 128}
+    for request in ("based", "sourced"):
+        ctx = context(store, request)
+        base = ctx.tensorfs_source(Weights(source))
+        derivation = (
+            weights_store.Derivation(base=base)
+            if request == "based"
+            else weights_store.Derivation(base=None, sources=(base,))
+        )
+        with ctx.output("model", derivation) as out:
+            out.config("unet", pruned)
+            out.copy("unet", "norm.weight", base)
+            with pytest.raises(CapabilityError) as late:
+                out.config("unet", CONFIG)
+            assert late.value.code == "weights_output_config"
+            with pytest.raises(CapabilityError) as undeclared:
+                out.copy("adapter", "norm.weight", base, from_component="unet")
+            assert undeclared.value.code == "weights_output_component"
+            out.config("adapter", {"rank": 4})
+            out.copy("adapter", "norm.weight", base, from_component="unet")
+            out.commit()
+        written = weights_store.finished(store, out.transaction)
+        assert written is not None and written.components["unet"].config == pruned, request
+        assert written.components["unet"].cls == base.components["unet"].cls
+        assert written.components["adapter"].config == {"rank": 4}
+        with context(store, request).output("model", derivation) as replayed:
+            replayed.config("unet", CONFIG)
+            assert replayed.commit().components["unet"].config == pruned
+
+
 def test_values_read_from_plain_and_rowwise_sources(store: Path, source: str) -> None:
     ctx = context(store)
     lane = quantize(Weights(source), plan(["unet"], "fp8.rowwise"), ctx=ctx, tel=fake_telemetry())

@@ -262,20 +262,33 @@ class Output:
     def component(self, name: str) -> tensorfs.ComponentWriter:
         """Component `name`, with inherited class/config or empty metadata for a fresh output."""
         writer = self._components.get(name)
-        if writer is not None:
-            return writer
+        return writer if writer is not None else self._open(name, None)
+
+    def config(self, component: str, config: Mapping[str, object]) -> None:
+        """`component`'s own config in place of the one it inherits, or a new component's:
+        set before anything is written to it."""
+        if self.done is not None:
+            return
+        if component in self._components:
+            raise CapabilityError(
+                f"component {component!r} is already open; set its config first",
+                code="weights_output_config",
+            )
+        self._open(component, config)
+
+    def _open(self, name: str, config: Mapping[str, object] | None) -> tensorfs.ComponentWriter:
         if self._writer is None:
             raise CapabilityError("the output is committed or closed", code="weights_writer_closed")
         declared = self.declared.get(name)
-        if declared is None and not self._fresh:
+        if declared is None and not self._fresh and config is None:
             raise CapabilityError(
                 f"no checkpoint this output derives from has a component {name!r}",
                 code="weights_output_component",
             )
-        writer = (
-            self._writer.component(name, cls=UNKNOWN_CLASS, config={})
-            if declared is None
-            else self._writer.component(name, cls=declared.cls, config=declared.config)
+        writer = self._writer.component(
+            name,
+            cls=UNKNOWN_CLASS if declared is None else declared.cls,
+            config=config if config is not None else ({} if declared is None else declared.config),
         )
         self._components[name] = writer
         return writer
