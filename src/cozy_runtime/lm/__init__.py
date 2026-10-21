@@ -815,6 +815,18 @@ def _slot_bytes(fresh: _Prefill, capacity: int, drafted: bool, text: Any) -> int
     return total + capacity * 18 + 4 * int(getattr(text, "vocab_size", 0) or 0)
 
 
+def _held(holder: object) -> list[Any]:
+    """The tensors an object holds as attributes, its dicts' and lists' values included."""
+    found: list[Any] = []
+    for value in vars(holder).values():
+        if isinstance(value, dict):
+            items = list(value.values())
+        else:
+            items = list(value) if isinstance(value, list | tuple) else [value]
+        found += [v for v in items if type(v).__name__ in ("Tensor", "Parameter")]
+    return found
+
+
 def _derived(models: Iterable[Any]) -> list[Any]:
     """The non-persistent buffers of `models` on a device: built from config (a rotary table),
     never a checkpoint's, so the plane neither places nor pins them."""
@@ -1478,6 +1490,10 @@ class _Engine:
         self.cache, self.capacity, self.cache_device = cache, capacity, device
         for name, tensor in fields.items():
             setattr(self, name, tensor)
+        placed = PLACED.get(self.model)
+        if placed is not None:  # the decode graphs read these at their addresses: never parked
+            holders = [*cache.layers, draft] if self.draft is not None else cache.layers
+            placed[0].keep(*fields.values(), *(t for h in holders for t in _held(h)))
         if self.draft is not None:
             self.dkeys = draft
             self.dcache = Cache(layers=[draft])

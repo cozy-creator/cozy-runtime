@@ -183,19 +183,33 @@ _CUDA_OOM = 2
 #: address, launch timeout, context destroyed, device assert, hardware stack, illegal
 #: instruction, misaligned address, invalid address space, invalid PC, launch failure.
 _STICKY = frozenset({214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719})
-#: The libraries name their allocation status (their code) in torch's message.
-_ALLOC_FAILED = ("CUBLAS_STATUS_ALLOC_FAILED", "CUDNN_STATUS_ALLOC_FAILED")
+#: The one documented list of how libraries that raise no typed error name running out of
+#: memory. The CUDA libraries name their allocation status (their code) in torch's message.
+_ALLOC_FAILED = (
+    "CUBLAS_STATUS_ALLOC_FAILED",
+    "CUDNN_STATUS_ALLOC_FAILED",
+    "CUFFT_ALLOC_FAILED",
+    "CUSOLVER_STATUS_ALLOC_FAILED",
+    "CUSPARSE_STATUS_ALLOC_FAILED",
+)
+#: NCCL reports the CUDA code its own allocation returned.
+_NCCL_OOM = "Cuda failure 2 'out of memory'"
 #: The libraries that give no code, by their message's prefix: Triton's launcher, and torch's
-#: MPS allocator (a pool past its limit raises a plain RuntimeError).
-_OOM_PREFIXES = ("Triton Error [CUDA]: out of memory", "MPS backend out of memory")
+#: MPS allocator (a pool past its limit, and one buffer larger than Metal allows).
+_OOM_PREFIXES = (
+    "Triton Error [CUDA]: out of memory",
+    "MPS backend out of memory",
+    "Invalid buffer size",
+)
 
 
 def fault(exc: BaseException) -> Fault:
     """THE classifier, structural so it needs no torch: torch's `OutOfMemoryError`, an
     `AcceleratorError` by its CUDA code (2: out of memory; sticky codes; any other), a CUDA
     library's alloc-failed status, the prefixes of the libraries that give no code (Triton's
-    launch, MPS's allocator), NCCL's `DistBackendError`, and varena's `Exhausted` and device
-    errors."""
+    launch, MPS's allocator), NCCL's `DistBackendError` (out of memory by the CUDA code it
+    reports, else a device error), and varena's `Exhausted` and device errors (out of memory
+    by their CUDA code)."""
     kind, module = type(exc).__name__, type(exc).__module__
     if module.partition(".")[0] == "torch":
         if kind == "OutOfMemoryError":
@@ -206,11 +220,13 @@ def fault(exc: BaseException) -> Fault:
                 return Fault.OOM
             return Fault.STICKY if code in _STICKY else Fault.DEVICE
         if kind == "DistBackendError":
-            return Fault.DEVICE
+            return Fault.OOM if _NCCL_OOM in str(exc) else Fault.DEVICE
     if module.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):  # varena's errors
         if kind == "Exhausted":
             return Fault.EXHAUSTED
         if getattr(exc, "code", "") == "DEVICE":
+            if getattr(exc, "cuda_code", None) == _CUDA_OOM:
+                return Fault.OOM
             return Fault.STICKY if exc.sticky else Fault.DEVICE
         return Fault.OTHER
     if isinstance(exc, RuntimeError):

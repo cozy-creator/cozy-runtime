@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypedDict
 
 if TYPE_CHECKING:
+    import torch
     from diffusers.models.attention_dispatch import AttentionBackendName
     from torch import Tensor
     from torch.distributed import ProcessGroup
@@ -88,7 +89,9 @@ class Execution(Protocol):
 
     def agreed(self) -> int: ...
 
-    def collective(self, site: str) -> AbstractContextManager[None]: ...
+    def sizes(self, gather: Callable[[], list[int]]) -> list[int]: ...
+
+    def collective(self, site: str, finest: int) -> AbstractContextManager[None]: ...
 
 
 _EXECUTION: Execution | None = None
@@ -218,21 +221,36 @@ def exchange(
     across GPUs (packed H3 lengths do not divide), over NCCL or the group's copy engines when it
     formed over them (`copy_engine`). Heads cross in the groups of the level the pass agreed
     (`Execution.agreed`: all at once at 0, then ever smaller groups of whole heads per GPU),
-    each group's output back before the next group's Q/K/V cross."""
-    heads, world = int(query.shape[2]), handle.size()
+    each group's output back before the next group's Q/K/V cross. Every GPU's rows are
+    gathered once (`Execution.sizes`: in the first pass at these shapes) for all its groups."""
+    heads, world, rows = int(query.shape[2]), handle.size(), int(query.shape[1])
     groups = sorted({heads, *(s for s in range(world, heads, world) if heads % s == 0)})[::-1]
-    level = _EXECUTION.agreed() if _EXECUTION is not None else 0
-    step = groups[min(level, len(groups) - 1)]
-    with nullcontext() if _EXECUTION is None else _EXECUTION.collective(SITE):
+    if _EXECUTION is None:
+        level, sizes = 0, _gather(rows, handle, query.device)
+    else:
+        level = _EXECUTION.agreed()
+        sizes = _EXECUTION.sizes(lambda: _gather(rows, handle, query.device))
+    step = groups[level]
+    with nullcontext() if _EXECUTION is None else _EXECUTION.collective(SITE, len(groups) - 1):
         if step == heads:
-            return _exchange(query, key, value, handle, compute)
+            return _exchange(query, key, value, handle, compute, sizes)
         out = query.new_empty(query.shape)
         for at in range(0, heads, step):
             part = slice(at, at + step)
             out[:, :, part] = _exchange(
-                query[:, :, part], key[:, :, part], value[:, :, part], handle, compute
+                query[:, :, part], key[:, :, part], value[:, :, part], handle, compute, sizes
             )
     return out
+
+
+def _gather(rows: int, handle: ProcessGroup, device: torch.device) -> list[int]:
+    """Every GPU's rows, in group order."""
+    import torch
+    import torch.distributed as dist
+
+    gathered = torch.empty(handle.size(), dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(gathered, torch.tensor([rows], device=device), group=handle)
+    return [int(n) for n in gathered.tolist()]
 
 
 def _exchange(
@@ -241,22 +259,19 @@ def _exchange(
     value: Tensor,
     handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+    sizes: list[int],
 ) -> Tensor:
-    import torch
     import torch.distributed as dist
 
     engines = copy_engine.for_group(handle)
     if engines is not None:
-        result = _copy_engine_exchange(engines, query, key, value, handle, compute)
+        result = _copy_engine_exchange(engines, query, key, value, compute, sizes)
         if result.shape != query.shape or result.dtype != query.dtype:
             raise ValueError("Ulysses attention returned incompatible output")
         return result
     batch, rows, heads, dim = (int(n) for n in query.shape)
     world = handle.size()
-    local = heads // world
-    gathered = torch.empty(world, dtype=torch.int64, device=query.device)
-    dist.all_gather_into_tensor(gathered, torch.tensor([rows], device=query.device), group=handle)
-    sizes, mine = [int(n) for n in gathered.tolist()], [rows] * world
+    local, mine = heads // world, [rows] * world
     # Every buffer the exchanges cross through, before the first: out of memory, this GPU
     # recovers (or fails) before its peers wait on it. Q's send buffer takes the output back
     # and K's receive buffer sends it, so the peak is the exchange's, not more.
@@ -288,20 +303,14 @@ def _copy_engine_exchange(
     query: Tensor,
     key: Tensor,
     value: Tensor,
-    handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+    sizes: list[int],
 ) -> Tensor:
     """Diffusers' two exchanges with Q, K and V in one: GPU s holds `sizes[s]` rows of every
     head and sends each GPU its head group; the output returns each GPU its rows."""
-    import torch
-    import torch.distributed as dist
-
     batch, rows, heads, dim = (int(size) for size in query.shape)
     world = engines.world
     local = heads // world
-    gathered = torch.empty(world, dtype=torch.int64, device=query.device)
-    dist.all_gather_into_tensor(gathered, torch.tensor([rows], device=query.device), group=handle)
-    sizes = [int(size) for size in gathered.tolist()]
 
     def heads_first(tensor: Tensor) -> Tensor:
         # (B, S, W, H/W, D) -> (W, S, B, H/W, D): rows for GPU p are block p

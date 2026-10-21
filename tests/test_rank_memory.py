@@ -88,8 +88,8 @@ def test_a_followers_request_begins_plans_and_ends_with_its_record(tmp_path: Pat
             reply = command(peer, "end", request_id)
             assert reply.ok and reply.rank == 1 and reply.request_id == request_id
             assert reply.memory is not None and reply.memory.gpu == -1  # a CPU names no GPU
-            assert reply.memory.stats["request"] == request_id
-            assert reply.memory.stats["leftover"] == 0
+            assert reply.memory.stats.request == request_id
+            assert reply.memory.stats.leftover == 0
             assert not worker.requests and worker._rank_request is None
 
 
@@ -123,7 +123,7 @@ def test_one_rank_plans_its_own_request_and_records_it(tmp_path: Path) -> None:
             executor._plan_request("single", ["local"])
             assert list(executor.requests) == ["single"]
         assert not ranks and not executor.requests
-        assert len(rows) == 1 and rows[0].stats["request"] == "single"
+        assert len(rows) == 1 and rows[0].stats.request == "single"
     finally:
         left.close()
         right.close()
@@ -204,7 +204,7 @@ def test_a_group_plans_every_rank_and_closes_every_request_after_a_failure(
                     ),
                 )
                 assert outcome.terminal == "failed" and "request failure" in outcome.message
-            assert [row.stats["request"] for row in (*own, *ranks)] == [request_id] * 2
+            assert [row.stats.request for row in (*own, *ranks)] == [request_id] * 2
             assert not leader.requests
     finally:
         group.close()

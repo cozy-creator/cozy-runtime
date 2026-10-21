@@ -7,7 +7,8 @@ layer), one rank's exchange runs out of memory allocating its buffers: Rust answ
 heads in the same smaller groups. Measured, the second and third run their collective block
 bare. In the fourth every rank runs out in its bare exchange: no rank runs it again, each fails
 typed, and the fifth (the same shapes) runs under the layer. Every pass that completes equals
-degree 1, byte for byte. One JSON report per rank.
+degree 1, byte for byte. The ranks' rows are gathered once, in the first pass: every later
+pass has the same shapes. One JSON report per rank.
 """
 
 from __future__ import annotations
@@ -104,6 +105,14 @@ def rank_main(rank: int, degree: int, root: Path, short: int) -> None:
             return counted(query, *rest)
 
         attention_ulysses._exchange = counting
+        gathers: list[int] = []
+        gather = attention_ulysses._gather
+
+        def gathering(rows: int, *rest: Any) -> list[int]:
+            gathers.append(rows)
+            return gather(rows, *rest)
+
+        attention_ulysses._gather = gathering
         torch.manual_seed(0)
         plain = Sharded().to(torch.bfloat16).eval()
         writer = tensorfs.Writer(cache_dir=root / f"store-{rank}")
@@ -131,6 +140,7 @@ def rank_main(rank: int, degree: int, root: Path, short: int) -> None:
                 for n in range(5):
                     injector.armed = (rank == short and n == 0) or n == 3
                     exchanged.clear()
+                    gathers.clear()
                     row: dict[str, Any] = {}
                     try:
                         got = model(mine, config)
@@ -138,6 +148,7 @@ def rank_main(rank: int, degree: int, root: Path, short: int) -> None:
                     except Exception as exc:
                         row["failed"] = classify(exc).code
                     row |= {"exchanged_heads": list(exchanged), "layered": LAYERED[-1]}
+                    row["gathered"] = len(gathers)
                     passes.append(row)
         report = {"rank": rank, "refused": injector.refused, "passes": passes}
         (root / f"rank-{rank}.json").write_text(json.dumps(report))

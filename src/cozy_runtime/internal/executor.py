@@ -67,6 +67,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import tensorfs
 from msgspec import UNSET, UnsetType
+from tensorfs.varena import Grant
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -1023,7 +1024,6 @@ class Executor:
     def _open_memory(self, torch: Any) -> None:
         """This process's memory (`tensorfs.varena.torch`), on its grant from TensorD, and the
         execution layer that runs torch under it."""
-        from tensorfs.varena import Grant
         from tensorfs.varena.torch import Memory
 
         from cozy_runtime.internal import execution
@@ -1032,9 +1032,9 @@ class Executor:
         if host.memory is not None:
             return
         device, ledgers = self._rank_device(torch), host.ledgers
-        grant = Grant(*ledgers[:2]) if device.type == "cuda" and len(ledgers) >= 2 else None
+        grant = Grant(*ledgers[:2]) if device.type == "cuda" and ledgers else None
         host.memory, host.execution = Memory.open(device, grant), execution
-        _split.install(execution.split)
+        _split.install(execution)
         attention_ulysses.install(execution)
 
     def _rank_identity(self) -> dict[str, Any]:
@@ -1112,13 +1112,13 @@ class Executor:
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
         if command.ledger:
-            # Its ledger and eventfd follow the frame: taken first, whatever this join answers.
+            # Its grant follows the frame: taken first, whatever this join answers.
             fds = self.channel.recv_ledger()
             if self.host.ledgers:
                 for fd in fds:
                     os.close(fd)
             else:
-                self.host.ledgers = fds
+                self.host.ledgers = list(fds)
         if command.abort:
             watcher = socket.socket(fileno=self.channel.recv_descriptor())
             threading.Thread(
@@ -4257,7 +4257,7 @@ class Executor:
             functools.partial(self._yielding, request_id),
         )
 
-    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
+    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[object]:
         """While the attempt waits on a child call, its request yields its reserved room to the
         child; its allocated tensors stay counted (`r.yielding`)."""
         request = self.host.requests.get(request_id)
@@ -4489,8 +4489,7 @@ class Executor:
                 cuda = host.memory.cuda
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
                 device = host.memory.device.index if cuda else None
-                row = host.execution.record(request.stats(), gpu, device, self._store())
-                rows.append(msgspec.convert(row, GpuMemory))
+                rows.append(host.execution.record(request.stats(), gpu, device, self._store()))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is

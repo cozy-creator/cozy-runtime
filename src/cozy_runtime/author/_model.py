@@ -278,6 +278,11 @@ class Residency(Protocol):
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
 
+    def keep(self, *held: Any) -> None:
+        """Tensors a cache or a hold owns (KV slots, a graph's static inputs): memory never
+        parks them."""
+        ...
+
     #: How many attempts (requests) it has opened.
     attempts: int
 

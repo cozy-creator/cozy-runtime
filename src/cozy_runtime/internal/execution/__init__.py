@@ -7,20 +7,34 @@ the catch on every model it loads (`install`); nothing else here is the executor
 
 from __future__ import annotations
 
-import json
 from collections.abc import Sequence
 from pathlib import Path
 
+import msgspec
 import tensorfs
 from tensorfs.varena.torch import Stats, blocks_of
 from torch import nn
 
 from cozy_runtime.internal.execution import agree, catch, cuts
-from cozy_runtime.internal.execution.agree import agreed
-from cozy_runtime.internal.execution.catch import collective, serving
+from cozy_runtime.internal.execution.agree import agreed, sizes
+from cozy_runtime.internal.execution.catch import collective, keep, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, launch, split
+from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
+from cozy_runtime.internal.executor_replies import Stats as Record
 
-__all__ = ["agreed", "attend", "collective", "install", "launch", "record", "serving", "split"]
+__all__ = [
+    "agreed",
+    "attend",
+    "collective",
+    "install",
+    "keep",
+    "launch",
+    "piece",
+    "record",
+    "serving",
+    "sizes",
+    "split",
+]
 
 
 def install(module: nn.Module, state: Sequence[str] = ()) -> None:
@@ -39,18 +53,21 @@ def install(module: nn.Module, state: Sequence[str] = ()) -> None:
     cuts.install(module)
 
 
-def record(stats: Stats, gpu: int, device: int | None, store: Path) -> dict[str, object]:
+def record(stats: Stats, gpu: int, device: int | None, store: Path) -> GpuMemory:
     """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`: TensorFS's fill
-    ceilings for CUDA `device` (None: no GPU) and `store`, and varena's record of the request
-    as its core writes it."""
-    return {"gpu": gpu, "ceiling": _ceiling(device, store), "stats": json.loads(stats.json())}
+    ceilings for CUDA `device` (None: no GPU) and `store`, and varena's record of the request."""
+    return GpuMemory(
+        gpu=gpu,
+        ceiling=_ceiling(device, store),
+        stats=msgspec.json.decode(stats.json(), type=Record),
+    )
 
 
 #: each (device, store)'s measured ceilings, once per executor
-_CEILINGS: dict[tuple[int | None, Path], dict[str, float | None]] = {}
+_CEILINGS: dict[tuple[int | None, Path], Ceiling] = {}
 
 
-def _ceiling(device: int | None, store: Path) -> dict[str, float | None] | None:
+def _ceiling(device: int | None, store: Path) -> Ceiling | None:
     """TensorFS times the copies once (no GPU has no H2D); None while it cannot (a store with
     no bytes to read yet), measured again at the next record."""
     found = _CEILINGS.get((device, store))
@@ -59,6 +76,6 @@ def _ceiling(device: int | None, store: Path) -> dict[str, float | None] | None:
             measured = tensorfs.ceiling(device=device, path=store)
         except tensorfs.Error:
             return None
-        found = {"h2d_gbps": measured.h2d_gbps, "disk_gbps": measured.disk_gbps}
+        found = Ceiling(h2d_gbps=measured.h2d_gbps, disk_gbps=measured.disk_gbps)
         _CEILINGS[(device, store)] = found
     return found

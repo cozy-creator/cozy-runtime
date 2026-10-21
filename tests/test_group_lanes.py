@@ -284,7 +284,7 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
 
 
 def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one ledger memfd and eventfd per GPU after its Start; rank 0
+    """TensorD hands rank 0 one grant per GPU after its Start; rank 0
     forwards the Start to its followers, which take their own ledger at join. A follower
     handed the Start as TensorD sent it waited in `start` for descriptors nobody sends, and
     the group wedged there (runs 11824, 11829). Real follower processes take rank 0's
@@ -317,11 +317,11 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
 
 @needs_torch
 @pytest.mark.skipif(sys.platform != "linux", reason="varena's ledger is Linux's")
-def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one grant (a table memfd and an eventfd) per GPU; rank 0 relays
-    each follower's pair at join, and the follower opens its memory on it. A real memfd and
-    eventfd cross the real seam to a real follower process, and the group forms past join:
-    run 11905 broke there, its eventfd refused as a memfd ("cannot take a host tier")."""
+def test_a_group_forms_with_each_followers_grant(tmp_path: Path) -> None:
+    """TensorD hands rank 0 one grant (the table and a description for the row's lock) per
+    GPU; rank 0 relays each follower's at join, and the follower opens its memory on it. Both
+    cross the real seam to a real follower process, and the group forms past join (run 11905
+    broke there, a descriptor refused as the wrong kind)."""
     import torch
 
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
@@ -334,16 +334,17 @@ def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Pa
         launch=_launcher(env),
         devices=("4", "5"),
     )
-    table, events = seam.anonymous("cozy-test-table"), os.eventfd(0)
+    table = seam.anonymous("cozy-test-table")
+    row = os.open(f"/proc/self/fd/{table}", os.O_RDWR | os.O_CLOEXEC)
     try:
         group.spawn()
         group.dial_back(seal_snapshot(env))
-        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[table, events])
+        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[table, row])
         assert group.formed and torch.distributed.get_world_size() == 2
     finally:
         group.close()
         os.close(table)
-        os.close(events)
+        os.close(row)
     assert not torch.distributed.is_initialized()
 
 
