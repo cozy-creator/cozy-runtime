@@ -296,7 +296,7 @@ def attempt[T](run: Callable[[], T], operands: object) -> T:
     runs again as an op does. A block whose first run launches it writes what its operands are,
     as far as the layer can tell: one it did not make keeps the block from running bare."""
     for journal in _local.layer.journals if _local.layer is not None else ():
-        journal.wrote |= any(p not in journal.made for p in map(_storage, tensors(operands)))
+        journal.wrote |= any(journal.key(p) not in journal.made for p in _storages(operands))
     return settle(run, None, operands)
 
 
@@ -633,6 +633,11 @@ _IN_PLACE = {torch.ops.aten.silu.default: torch.ops.aten.silu_.default}
 _IN_PLACE[torch.ops.aten.gelu.default] = torch.ops.aten.gelu_.default
 
 
+#: a storage as a journal tells them apart: its address, and how many storages its ops made there
+#: (an allocator gives a freed address to the next result)
+type _Key = tuple[int, int]
+
+
 @dataclass(eq=False, slots=True)
 class _Journal:
     """A block's first run (`run`): the storages its ops made, whether one wrote into any other,
@@ -640,15 +645,20 @@ class _Journal:
     last read, for the in-place ops whose input is dead after them."""
 
     run: _Run
-    made: set[int] = field(default_factory=set)
+    made: set[_Key] = field(default_factory=set)
+    births: dict[int, int] = field(default_factory=dict)
     wrote: bool = False
     joined: bool = False
     generators: dict[int, torch.Generator] = field(default_factory=dict)
     #: ops it saw, the last op that read each storage, and its own in-place candidates: the
     #: op it saw as which, its index in its run, and the storage of its input
     seen: int = 0
-    last: dict[int, int] = field(default_factory=dict)
-    candidates: list[tuple[int, int, int]] = field(default_factory=list)
+    last: dict[_Key, int] = field(default_factory=dict)
+    candidates: list[tuple[int, int, _Key]] = field(default_factory=list)
+
+    def key(self, at: int) -> _Key:
+        """The storage at address `at` now."""
+        return at, self.births.get(at, 0)
 
     def before(self, func: OpOverload, args: Args, kwargs: Kwargs, index: int) -> None:
         writes, seeded, _, _ = _trait(func)
@@ -660,26 +670,28 @@ class _Journal:
                 for i, a in enumerate(schema)
                 if a.alias_info is not None and a.alias_info.is_write
             ]
-            self.wrote = any(p not in self.made for p in map(_storage, tensors(written)))
+            self.wrote = any(self.key(p) not in self.made for p in _storages(written))
         if seeded:
             self.generators.update((id(g), g) for g in _generators(func, args, kwargs))
         self.seen += 1
-        self.last.update((p, self.seen) for p in map(_storage, tensors((args, kwargs))))
+        self.last.update((self.key(p), self.seen) for p in _storages((args, kwargs)))
         if func in _IN_PLACE and _local.run is self.run and args:
-            self.candidates.append((self.seen, index, _storage(tensors(args[0])[0])))
+            self.candidates.append((self.seen, index, self.key(_storage(tensors(args[0])[0]))))
 
     def after(self, func: OpOverload, out: object) -> None:
         if _trait(func)[2]:
-            self.made.update(map(_storage, tensors(out)))
+            for p in _storages(out):
+                self.births[p] = self.births.get(p, 0) + 1
+                self.made.add(self.key(p))
 
     def dead(self, escaped: object) -> frozenset[int]:
         """The in-place candidates whose input the block made and nothing read after them, nor
         holds once it returns (its result, its arguments, its modules' attributes)."""
-        kept = set(map(_storage, tensors(escaped, depth=4)))
+        kept = {self.key(p) for p in _storages(escaped, depth=4)}
         return frozenset(
             index
             for seen, index, p in self.candidates
-            if p and p in self.made and self.last.get(p) == seen and p not in kept
+            if p[0] and p in self.made and self.last.get(p) == seen and p not in kept
         )
 
 
@@ -775,6 +787,11 @@ def tensors(value: object, depth: int = 3) -> list[Tensor]:
         items = value.values() if isinstance(value, Mapping) else value
         return [t for item in items for t in tensors(item, depth - 1)]
     return []
+
+
+def _storages(value: object, depth: int = 3) -> set[int]:
+    """The data addresses of the storages of the tensors in `value` (`tensors`)."""
+    return {_storage(t) for t in tensors(value, depth)}
 
 
 def _storage(t: Tensor) -> int:
