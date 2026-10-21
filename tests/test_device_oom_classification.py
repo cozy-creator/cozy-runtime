@@ -1,7 +1,7 @@
 """One classifier (`author._errors.fault`): an allocation failure is OOM by torch's type, its CUDA
-code, a CUDA library's alloc status or Triton's prefix; a sticky CUDA error ends the process;
-any other CUDA or NCCL error ends the executor. varena's `Exhausted` is capacity
-(`test_execution.py` raises a real one)."""
+code, a CUDA library's alloc status or the prefix of a library that gives no code (Triton, MPS);
+a sticky CUDA error ends the process; any other CUDA or NCCL error ends the executor. varena's
+`Exhausted` is capacity (`test_execution.py` raises a real one)."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ from cozy_runtime.internal.parallel.mirror import ending
         "CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`",
         "cuDNN error: CUDNN_STATUS_ALLOC_FAILED",
         "Triton Error [CUDA]: out of memory",
+        "MPS backend out of memory (MPS allocated: 17.94 GB, other allocations: 1.02 GB)",
     ],
 )
 def test_a_library_allocation_status_is_a_runtime_device_oom(message: str) -> None:

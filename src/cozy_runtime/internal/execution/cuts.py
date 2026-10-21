@@ -2,7 +2,9 @@
 the level Rust holds for its site (`r.cut`). Level L is 2^L pieces, down to the finest.
 
 Op bands (the layer's, `catch.RULES`): conv, constant pad, nearest upsampling and group norm in
-row bands with halos and two-pass statistics, and the elementwise SiLU, GELU, add and mul.
+row bands with halos and two-pass statistics. An elementwise op whose one allocation is its result
+has no band that saves room; SiLU and GELU run in place when their input is dead (`catch`), else
+Rust parks.
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
 """
@@ -137,33 +139,6 @@ def _each(value: object, n: int, default: int) -> list[int]:
     return [int(cast(int, v)) for v in values] * (n if len(values) == 1 else 1)
 
 
-def _pointwise(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """SiLU, GELU, add, mul: any rows of the result read the same rows of each operand that
-    spans them (a broadcast operand whole), so bands along the result's longest axis."""
-    if func not in (aten.silu.default, aten.gelu.default, aten.add.Tensor, aten.mul.Tensor):
-        return None
-    made = _meta(func, args, kwargs)
-    if len(made) != 1 or made[0].dim() == 0:
-        return None
-    out = made[0]
-    axis = max(range(out.dim()), key=lambda i: out.shape[i])
-    height = int(out.shape[axis])
-
-    def rows(v: object, lo: int, hi: int) -> object:
-        if not isinstance(v, Tensor):
-            return v
-        at = axis - (out.dim() - v.dim())  # broadcasting aligns trailing dims
-        return v.narrow(at, lo, hi - lo) if at >= 0 and v.shape[at] == height else v
-
-    def band(lo: int, hi: int) -> Tensor:
-        return func(
-            *(rows(a, lo, hi) for a in args), **{k: rows(v, lo, hi) for k, v in kwargs.items()}
-        )
-
-    x = next(t for t in catch.tensors(args) if isinstance(t, Tensor))
-    return _plan(made, x, axis, band)
-
-
 def _conv(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
     """Output rows [a, b) read input rows [a*s - p, (b-1)*s - p + d*(k-1) + 1), zeros past the
     edges."""
@@ -264,7 +239,6 @@ def _group_norm(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
 
 _UPSAMPLES = [f"{p}{d}d" for p in ("upsample_nearest", "_upsample_nearest_exact") for d in "123"]
 _SPEC = {
-    _pointwise: "silu gelu add mul",
     _conv: "convolution conv1d conv2d conv3d",
     _pad: "constant_pad_nd pad",
     _upsample: " ".join(_UPSAMPLES),

@@ -185,15 +185,17 @@ _CUDA_OOM = 2
 _STICKY = frozenset({214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719})
 #: The libraries name their allocation status (their code) in torch's message.
 _ALLOC_FAILED = ("CUBLAS_STATUS_ALLOC_FAILED", "CUDNN_STATUS_ALLOC_FAILED")
-#: Triton's launcher passes no code: its prefix is the one text match.
-_TRITON_OOM = "Triton Error [CUDA]: out of memory"
+#: The libraries that give no code, by their message's prefix: Triton's launcher, and torch's
+#: MPS allocator (a pool past its limit raises a plain RuntimeError).
+_OOM_PREFIXES = ("Triton Error [CUDA]: out of memory", "MPS backend out of memory")
 
 
 def fault(exc: BaseException) -> Fault:
     """THE classifier, structural so it needs no torch: torch's `OutOfMemoryError`, an
     `AcceleratorError` by its CUDA code (2: out of memory; sticky codes; any other), a CUDA
-    library's alloc-failed status, Triton's launch OOM, NCCL's `DistBackendError`, and varena's
-    `Exhausted` and device errors."""
+    library's alloc-failed status, the prefixes of the libraries that give no code (Triton's
+    launch, MPS's allocator), NCCL's `DistBackendError`, and varena's `Exhausted` and device
+    errors."""
     kind, module = type(exc).__name__, type(exc).__module__
     if module.partition(".")[0] == "torch":
         if kind == "OutOfMemoryError":
@@ -213,7 +215,7 @@ def fault(exc: BaseException) -> Fault:
         return Fault.OTHER
     if isinstance(exc, RuntimeError):
         text = str(exc)
-        if text.startswith(_TRITON_OOM) or any(status in text for status in _ALLOC_FAILED):
+        if text.startswith(_OOM_PREFIXES) or any(status in text for status in _ALLOC_FAILED):
             return Fault.OOM
     return Fault.OTHER
 

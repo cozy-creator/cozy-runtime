@@ -6,9 +6,13 @@ its own bands), Park moves idle tensors to page-locked host memory, Exhausted ra
 keeps no rung order, room arithmetic, retry count or size memo: progress is Rust's to judge.
 
 The catch wraps blocks. A block runs bare unless its first run wrote a tensor that existed
-before it, joined a collective or changed its attributes, or it once ran short; bare and out of
-memory, it gets its generators and declared state back and runs again under the per-op layer,
-which catches each op at itself (a dispatch mode on every op costs CPU, so only those blocks).
+before it or changed its attributes, or it once ran short; bare and out of memory, it gets its
+generators and declared state back and runs again under the per-op layer, which catches each op
+at itself (a dispatch mode on every op costs CPU, so only those blocks). A block that joins a
+collective is never run again on one GPU alone: it runs bare in a pass whose room was measured
+(`r.measured`), and out of memory there it fails typed and runs under the layer at those shapes
+from then on. Ops outside every block (a package's code between passes) run under the request's
+layer, which no block's bare run sees.
 """
 
 from __future__ import annotations
@@ -51,6 +55,7 @@ class Request(Protocol):
 
     def oom(self, need: int | None, site: str | None, collective: bool = False) -> Next: ...
     def cut(self, site: str) -> int: ...
+    def measured(self) -> bool: ...
     def levels(self) -> list[tuple[str, int]]: ...
     def agree(self, levels: list[tuple[str, int]]) -> None: ...
     def parked(self, nbytes: int) -> None: ...
@@ -82,14 +87,16 @@ class Scope:
 
 @dataclass(eq=False, slots=True)
 class _Run:
-    """A block running: its name, and how many ops of each kind it ran (their cut sites)."""
+    """A block running: how many ops of each kind it ran under the layer (their cut sites) and
+    how many ops in all (each op's index: the same in every run of the block)."""
 
-    name: str
+    block: Block
     ordinals: dict[str, int] = field(default_factory=dict)
+    ops: int = 0
 
     def site(self, kind: str) -> str:
         n = self.ordinals[kind] = self.ordinals.get(kind, 0) + 1
-        return f"{self.name}/{kind}#{n}"
+        return f"{self.block.name}/{kind}#{n}"
 
 
 class _Local(threading.local):
@@ -107,12 +114,14 @@ _observed: set[int] = set()
 
 @contextmanager
 def serving(request: Request) -> Iterator[None]:
-    """The attempt's ops answer to `request` while it runs."""
+    """The attempt's ops answer to `request` while it runs: a model's in its blocks, and the
+    rest (a package's code between passes) under the request's layer."""
     if torch.cuda.is_initialized():
         observe(torch.cuda.current_device())
     token = CURRENT.set(request)
     try:
-        yield
+        with _layer():
+            yield
     finally:
         CURRENT.reset(token)
         reclaim()
@@ -237,7 +246,7 @@ def collective(site: str) -> Iterator[None]:
     scope = Scope(site, 0, 0, collective=True)
     _local.scopes.append(scope)
     for journal in _local.layer.journals if _local.layer is not None else ():
-        journal.wrote = True  # its block never runs again on this GPU alone
+        journal.joined = True  # its block never runs again on this GPU alone
     try:
         yield
     finally:
@@ -324,13 +333,18 @@ def reclaim() -> None:
 @dataclass(eq=False, slots=True)
 class Block:
     """A block for the catch: its site name, the model root its declared `state` paths are
-    under, and what its first run showed (None: not run yet)."""
+    under, and what its first run showed (`bare` None: not run yet): whether it may run bare,
+    whether it joins a collective, the generators it draws from, the ops whose first input is
+    dead after them, and the input shapes at which it ran out bare in a collective."""
 
     name: str
     root: nn.Module
     state: tuple[str, ...] = ()
     bare: bool | None = None
+    joined: bool = False
     generators: tuple[torch.Generator, ...] = ()
+    dead: frozenset[int] = frozenset()
+    short: set[tuple[object, ...]] = field(default_factory=set)
 
 
 def wrap(
@@ -344,26 +358,37 @@ def wrap(
     @functools.wraps(forward)
     def caught(*args: object, **kwargs: object) -> object:
         with nullcontext() if around is None else around(module):
-            if CURRENT.get() is None:
+            request = CURRENT.get()
+            if request is None:
                 return forward(*args, **kwargs)
-            return run(block, module, forward, args, kwargs)
+            return run(block, module, forward, args, kwargs, request)
 
     module.forward = caught
 
 
 def run[T](
-    block: Block, module: nn.Module, forward: Callable[..., T], args: Args, kwargs: Kwargs
+    block: Block,
+    module: nn.Module,
+    forward: Callable[..., T],
+    args: Args,
+    kwargs: Kwargs,
+    request: Request,
 ) -> T:
     """A block's forward: observed under the layer on its first run, then bare when that showed
     it may run again, else under the layer."""
-    outer, _local.run = _local.run, _Run(block.name)
+    outer, _local.run = _local.run, _Run(block)
     try:
-        if block.bare:
+        if block.joined:
+            shapes = _shapes((args, kwargs))
+            if request.measured() and shapes not in block.short:
+                return _collective(block, shapes, forward, args, kwargs)
+        elif block.bare:
             return _bare(block, forward, args, kwargs)
         with _layer() as layer:
-            if block.bare is False:
+            if block.bare is not None:
                 return forward(*args, **kwargs)
-            journal, before, short_before = _Journal(), _attributes(module), layer.short
+            journal = _Journal(_local.run)
+            before, short_before = _attributes(module), layer.short
             layer.journals.append(journal)
             try:
                 out = forward(*args, **kwargs)
@@ -371,7 +396,8 @@ def run[T](
                 layer.journals.remove(journal)
         same = before == _attributes(module)
         block.bare = not journal.wrote and same and layer.short == short_before
-        block.generators = tuple(journal.generators.values())
+        block.joined, block.generators = journal.joined, tuple(journal.generators.values())
+        block.dead = journal.dead((out, args, kwargs, _held(module)))
         return out
     finally:
         _local.run = outer
@@ -380,25 +406,57 @@ def run[T](
 def _bare[T](block: Block, forward: Callable[..., T], args: Args, kwargs: Kwargs) -> T:
     states = [(g, g.get_state()) for g in block.generators]
     put = _kept(block.root, block.state)
-    layer = _local.layer
-    pop = layer is not None and _get_current_dispatch_mode() is layer  # else it runs under it
     try:
-        with _pop_mode_temporarily() if pop else nullcontext():
-            _local.layer = None if pop else layer
+        with _unlayered():
             return forward(*args, **kwargs)
     except Exception as exc:
         if not short(exc):
             raise
         _clear(exc)
-    finally:
-        _local.layer = layer
     for generator, state in states:
         generator.set_state(state)
     put()
     block.bare = False  # it ran short once: under the layer from now on
-    _local.run = _Run(block.name)
+    _local.run = _Run(block)
     with _layer():
         return forward(*args, **kwargs)
+
+
+def _collective[T](
+    block: Block, shapes: tuple[object, ...], forward: Callable[..., T], args: Args, kwargs: Kwargs
+) -> T:
+    """A collective block in a measured pass: bare, its peers waiting on it in its collectives,
+    so it never runs again here. Out of memory (a misstated room) the request fails typed, and
+    at these shapes the block runs under the layer from now on."""
+    try:
+        with _unlayered():
+            return forward(*args, **kwargs)
+    except Exception as exc:
+        if short(exc):
+            block.short.add(shapes)
+        raise
+
+
+@contextmanager
+def _unlayered() -> Iterator[None]:
+    """No layer while a bare block runs: the request's (or an outer block's) is set aside."""
+    layer = _local.layer
+    pop = layer is not None and _get_current_dispatch_mode() is layer  # else it runs under it
+    try:
+        with _pop_mode_temporarily() if pop else nullcontext():
+            _local.layer = None if pop else layer
+            yield
+    finally:
+        _local.layer = layer
+
+
+def _shapes(value: object) -> tuple[object, ...]:
+    return tuple((tuple(t.shape), t.dtype) for t in tensors(value))
+
+
+def _held(module: nn.Module) -> list[object]:
+    """The tensors a module tree holds as attributes after a run, lists and dicts included."""
+    return [v for m in module.modules() for v in vars(m).values()]
 
 
 @contextmanager
@@ -484,18 +542,31 @@ def _trait(func: OpOverload) -> tuple[bool, bool, bool, Rule | None]:
     return writes, seeded, fresh, RULES.get(func.overloadpacket)
 
 
+#: elementwise ops with an in-place form: run in place when their input is dead after them
+_IN_PLACE = {torch.ops.aten.silu.default: torch.ops.aten.silu_.default}
+_IN_PLACE[torch.ops.aten.gelu.default] = torch.ops.aten.gelu_.default
+
+
 @dataclass(eq=False, slots=True)
 class _Journal:
-    """A block's first run: the storages its ops made, whether one wrote into any other or
-    joined a collective, and the generators its seeded ops drew from."""
+    """A block's first run (`run`): the storages its ops made, whether one wrote into any other,
+    whether it joined a collective, the generators its seeded ops drew from, and each storage's
+    last read, for the in-place ops whose input is dead after them."""
 
+    run: _Run
     made: set[int] = field(default_factory=set)
     wrote: bool = False
+    joined: bool = False
     generators: dict[int, torch.Generator] = field(default_factory=dict)
+    #: ops it saw, the last op that read each storage, and its own in-place candidates: the
+    #: op it saw as which, its index in its run, and the storage of its input
+    seen: int = 0
+    last: dict[int, int] = field(default_factory=dict)
+    candidates: list[tuple[int, int, int]] = field(default_factory=list)
 
-    def before(self, func: OpOverload, args: Args, kwargs: Kwargs) -> None:
+    def before(self, func: OpOverload, args: Args, kwargs: Kwargs, index: int) -> None:
         writes, seeded, _, _ = _trait(func)
-        self.wrote |= func.namespace in _COLLECTIVES
+        self.joined |= func.namespace in _COLLECTIVES
         if writes and not self.wrote:
             schema = func._schema.arguments
             written = [
@@ -506,10 +577,24 @@ class _Journal:
             self.wrote = any(p not in self.made for p in map(_storage, tensors(written)))
         if seeded:
             self.generators.update((id(g), g) for g in _generators(func, args, kwargs))
+        self.seen += 1
+        self.last.update((p, self.seen) for p in map(_storage, tensors((args, kwargs))))
+        if func in _IN_PLACE and _local.run is self.run and args:
+            self.candidates.append((self.seen, index, _storage(tensors(args[0])[0])))
 
     def after(self, func: OpOverload, out: object) -> None:
         if _trait(func)[2]:
             self.made.update(map(_storage, tensors(out)))
+
+    def dead(self, escaped: object) -> frozenset[int]:
+        """The in-place candidates whose input the block made and nothing read after them, nor
+        holds once it returns (its result, its arguments, its modules' attributes)."""
+        kept = set(map(_storage, tensors(escaped, depth=4)))
+        return frozenset(
+            index
+            for seen, index, p in self.candidates
+            if p and p in self.made and self.last.get(p) == seen and p not in kept
+        )
 
 
 class Layer(TorchDispatchMode):  # type: ignore[misc]
@@ -529,16 +614,31 @@ class Layer(TorchDispatchMode):  # type: ignore[misc]
         self, func: OpOverload, types: object, args: Args = (), kwargs: Kwargs | None = None
     ) -> object:
         kwargs = kwargs or {}
+        run = _local.run
+        index = -1 if run is None else run.ops
+        if run is not None:
+            run.ops += 1
         for journal in self.journals:
-            journal.before(func, args, kwargs)
-        out = self._run(func, args, kwargs)
+            journal.before(func, args, kwargs, index)
+        out = self._run(func, args, kwargs, index)
         for journal in self.journals:
             journal.after(func, out)
         return out
 
-    def _run(self, func: OpOverload, args: Args, kwargs: Kwargs) -> object:
+    def _run(self, func: OpOverload, args: Args, kwargs: Kwargs, index: int) -> object:
         writes, draws, _, rule = _trait(func)
         request = CURRENT.get()
+        run = _local.run
+        if (
+            run is not None
+            and func in _IN_PLACE
+            and index in run.block.dead
+            and not _local.scopes  # no cut around it runs again and reads its input
+            and not torch.is_grad_enabled()
+        ):
+            in_place = _IN_PLACE[func]
+            in_place(args[0], *args[1:], **kwargs)
+            return args[0]
         if writes or func.namespace in _COLLECTIVES or request is None:
             try:
                 return func(*args, **kwargs)

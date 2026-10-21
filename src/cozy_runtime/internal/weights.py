@@ -711,10 +711,11 @@ class Placement:
             cache.close()
             return shed()
 
+        # its pins are already pinned pages: the cache counts nothing, and its shrink drops the
+        # graphs and the hold
         cache = self.memory.cache(owner, give)
         token = _Pin()
         weakref.finalize(token, hold.release)
-        cache.cached(sum(model.set.spans))
         self.pins[(component, owner)] = (token, cache)
         return token
 
