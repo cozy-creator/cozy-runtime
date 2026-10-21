@@ -782,7 +782,7 @@ class Executor:
         self.mux: Mux = (
             host.mux
             if host is not None
-            else Mux(channel, functools.partial(_supplied, self.bearers))
+            else Mux(channel, functools.partial(_supplied, self.bearers), self._discard)
         )
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
         #: the construction key this generation was loaded under; "" on the host
@@ -3094,6 +3094,12 @@ class Executor:
             }
         return child
 
+    def _discard(self, request_id: str) -> None:
+        """A request cancelled before its invoke (waiting for admission): what its prepare
+        retained goes, so the executor returns to the pool holding nothing of it."""
+        for construction in (self, *self.constructions.values()):
+            construction.prepared.pop(request_id, None)
+
     def serve_request(self, command: PrepareRequest) -> dict[str, Any]:
         target = self._target(command, attempt=False)
         if isinstance(target, dict):
@@ -4244,8 +4250,18 @@ class Executor:
             self._bound_calls = (rows, self._call_bindings(rows))
         exchange = self._exchange(request_id)
         return _Broker(
-            request_id, self._bound_calls[1], exchange, lambda: self._child_events(exchange)
+            request_id,
+            self._bound_calls[1],
+            exchange,
+            lambda: self._child_events(exchange),
+            functools.partial(self._yielding, request_id),
         )
+
+    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
+        """While the attempt waits on a child call, its request yields its reserved room to the
+        child; its allocated tensors stay counted (`r.yielding`)."""
+        request = self.host.requests.get(request_id)
+        return contextlib.nullcontext() if request is None else request.yielding()
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
@@ -4482,7 +4498,8 @@ class Executor:
         return accel.streams_idle(self.torch, self.device_kind)
 
     def map(self, command: Map) -> dict[str, Any]:
-        """TensorD's warming: one loaded construction's models at `command.level`."""
+        """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
+        of a group."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         child = self.constructions.get(command.construction)
@@ -4490,11 +4507,24 @@ class Executor:
             return self._refusal(
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
-        if self.memory is not None:
-            for member in child.model_executors or [child]:
-                if member.backend is not None:
-                    for model in member.backend.models.values():
-                        self.memory.load(model.module, command.level)
+        group = self.group if self.rank == 0 else None
+        try:
+            if group is not None:
+                group.broadcast(executor_commands.encode(command))
+            if self.memory is not None:
+                for member in child.model_executors or [child]:
+                    if member.backend is not None:
+                        for model in member.backend.models.values():
+                            self.memory.load(model.module, command.level)
+            for reply in group.collect("map") if group is not None else ():
+                if not reply.get("ok"):
+                    raise GroupRefusal(
+                        f"a follower refused to map: {reply.get('code')}: "
+                        f"{reply.get('detail', '')}"[:600],
+                        code="group_broken",
+                    )
+        except GroupRefusal as exc:
+            return self._group_refusal(exc, closing=False)
         return {"ok": True}
 
     def _active_residency(self) -> dict[str, Any]:
@@ -4697,6 +4727,7 @@ _FOLLOWER_COMMANDS = frozenset(
         "load",
         "activate",
         "unload",
+        "map",
         "run",
         "attention",
         "kernels",

@@ -13,6 +13,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, cast
 
 import msgspec
 import pytest
@@ -23,6 +24,7 @@ from cozy_runtime.author import App, Context  # noqa: E402
 from cozy_runtime.author._invoke import Invocation, prepare, run_prepared  # noqa: E402
 from cozy_runtime.internal import execution, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor, serve  # noqa: E402
+from cozy_runtime.internal.executor_commands import Map  # noqa: E402
 from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
@@ -127,24 +129,54 @@ def test_one_rank_plans_its_own_request_and_records_it(tmp_path: Path) -> None:
         right.close()
 
 
+def launch(argv: list[str], fd: int) -> spawn.Child:
+    """A real follower process (`testdata/request_memory_follower.py`)."""
+    return spawn.spawn_follower(
+        python=sys.executable,
+        module_argv=[str(Path(__file__).parent / "testdata/request_memory_follower.py"), *argv[2:]],
+        inherit_fd=fd,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    )
+
+
+def test_a_request_cancelled_before_its_invoke_leaves_nothing(tmp_path: Path) -> None:
+    """Cancelled while it waited for admission, a prepared request is never invoked: what its
+    prepare retained goes as the cancel is read, and the executor returns to the pool empty."""
+    left, right = socket.socketpair()
+    executor, peer = Executor(Channel(left), tmp_path), Channel(right)
+    construction = executor.constructions["construction"] = executor._construction_child("c")
+    construction.prepared["waiting"] = construction.prepared["next"] = cast(Any, object())
+    try:
+        peer.send({"cmd": "cancel", "request_id": "waiting"})
+        peer.send({"cmd": "hello"})
+        assert executor.mux.command() == {"cmd": "hello"}
+        assert list(construction.prepared) == ["next"]
+    finally:
+        left.close()
+        right.close()
+
+
+def test_a_group_maps_on_every_rank(tmp_path: Path) -> None:
+    """TensorD's `Map` at any degree: rank 0 maps its models and every follower its own."""
+    group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    left, right = socket.socketpair()
+    leader = Executor(Channel(left), tmp_path, world=2)
+    leader.constructions["construction"] = leader._construction_child("construction")
+    placed(leader, tmp_path / "store").group = group
+    group.spawn()
+    try:
+        assert leader.map(Map(construction="construction", level="ram")) == {"ok": True}
+        refused = leader.map(Map(construction="absent"))
+        assert refused["code"] == "construction_not_loaded"
+    finally:
+        group.close()
+        left.close()
+        right.close()
+
+
 def test_a_group_plans_every_rank_and_closes_every_request_after_a_failure(
     tmp_path: Path,
 ) -> None:
-    fixture = Path(__file__).parent / "testdata/request_memory_follower.py"
-
-    def launch(argv: list[str], fd: int) -> spawn.Child:
-        return spawn.spawn_follower(
-            python=sys.executable,
-            module_argv=[str(fixture), *argv[2:]],
-            inherit_fd=fd,
-            env={
-                **os.environ,
-                "CUDA_VISIBLE_DEVICES": "",
-                "OMP_NUM_THREADS": "1",
-                "MKL_NUM_THREADS": "1",
-            },
-        )
-
     group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
     left, right = socket.socketpair()
     leader = Executor(Channel(left), tmp_path, world=2, construction="construction")

@@ -7,7 +7,6 @@ the catch on every model it loads (`install`); nothing else here is the executor
 
 from __future__ import annotations
 
-import functools
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -44,16 +43,22 @@ def record(stats: Stats, gpu: int, device: int | None, store: Path) -> dict[str,
     """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`: TensorFS's fill
     ceilings for CUDA `device` (None: no GPU) and `store`, and varena's record of the request
     as its core writes it."""
-    h2d, disk = _ceiling(device, store)
-    return {
-        "gpu": gpu,
-        "ceiling": {"h2d_gbps": h2d, "disk_gbps": disk},
-        "stats": json.loads(stats.json()),
-    }
+    return {"gpu": gpu, "ceiling": _ceiling(device, store), "stats": json.loads(stats.json())}
 
 
-@functools.cache
-def _ceiling(device: int | None, store: Path) -> tuple[float | None, float]:
-    """Measured once per executor (TensorFS times the copies); no GPU has no H2D."""
-    found = tensorfs.ceiling(device=device, path=store)
-    return found.h2d_gbps, found.disk_gbps
+#: each (device, store)'s measured ceilings, once per executor
+_CEILINGS: dict[tuple[int | None, Path], dict[str, float | None]] = {}
+
+
+def _ceiling(device: int | None, store: Path) -> dict[str, float | None] | None:
+    """TensorFS times the copies once (no GPU has no H2D); None while it cannot (a store with
+    no bytes to read yet), measured again at the next record."""
+    found = _CEILINGS.get((device, store))
+    if found is None:
+        try:
+            measured = tensorfs.ceiling(device=device, path=store)
+        except tensorfs.Error:
+            return None
+        found = {"h2d_gbps": measured.h2d_gbps, "disk_gbps": measured.disk_gbps}
+        _CEILINGS[(device, store)] = found
+    return found

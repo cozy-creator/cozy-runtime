@@ -16,11 +16,12 @@ class Ceiling(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
-    """One GPU's part of a request: its physical number, the fill ceilings there, and varena's
-    record of the request (its `Stats`, as varena's core writes it)."""
+    """One GPU's part of a request: its physical number, the fill ceilings there (None: not
+    measured yet), and varena's record of the request (its `Stats`, as varena's core writes
+    it)."""
 
     gpu: int
-    ceiling: Ceiling
+    ceiling: Ceiling | None
     stats: dict[str, Any]
 
 

@@ -444,13 +444,19 @@ class _Asked:
 class Mux:
     """One seam shared by every thread of the process. Whoever needs a frame reads the next
     one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
-    mark, a frame that may carry a bearer (`SUPPLYING`) to `bearer` as it is read (a `bearer`
-    frame goes nowhere else), anything else to the commands, in order. No reader thread exists,
-    so a process that has served no call stays single-threaded and forkable (`zygote`)."""
+    mark and to `cancelled`, a frame that may carry a bearer (`SUPPLYING`) to `bearer` as it is
+    read (a `bearer` frame goes nowhere else), anything else to the commands, in order. No
+    reader thread exists, so a process that has served no call stays single-threaded and
+    forkable (`zygote`)."""
 
-    def __init__(self, channel: Channel, bearer: Callable[[Frame], None] = _nothing) -> None:
+    def __init__(
+        self,
+        channel: Channel,
+        bearer: Callable[[Frame], None] = _nothing,
+        cancelled: Callable[[str], None] = _nothing,
+    ) -> None:
         self.channel = channel
-        self._bearer = bearer
+        self._bearer, self._cancelled = bearer, cancelled
         self._seq = 0
         self._asked: dict[int, _Asked] = {}
         self._commands: deque[Frame] = deque()
@@ -556,6 +562,7 @@ class Mux:
                 asked.answer = frame
         elif frame.get("cmd") == "cancel":
             self.cancel(str(frame.get("request_id", "")))
+            self._cancelled(str(frame.get("request_id", "")))
         elif frame.get("cmd") == "bearer":
             self._bearer(frame)
         else:
