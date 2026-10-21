@@ -1,94 +1,143 @@
-"""The executor's weight-plane facts, as each reply and probe states them."""
+"""One request's memory, as its invoke reply states it (memory-varena §5.8, xs-046 B4's wire)."""
 
 from __future__ import annotations
 
 import msgspec
 
 
-class Streamed(msgspec.Struct, frozen=True, kw_only=True):
-    """One component's streamed tail at its last stage: regions, resident prefix, window."""
+class Step(msgspec.Struct, frozen=True, kw_only=True):
+    """One pass of a model: bytes at home and resident, copied home and streamed through slots,
+    the GPU-timed prefetch stall, torch's allocated peak above the pass's start, and torch's
+    allocated bytes at that start (a leak shows as their growth)."""
 
-    blocks: int = 0
-    resident_blocks: int = 0
-    window: int = 0
+    model: str
+    gpu: int
+    step: int
+    home: int
+    resident: int
+    paged_in: int
+    streamed: int
+    stall_ns: int
+    activations: int
+    allocated: int = 0
 
 
-class PlaneFacts(msgspec.Struct, frozen=True, kw_only=True):
-    """The executor's weight plane (`weight_plane/1`), as exact counters. Bytes are per device
-    of this rank; `-1` is unreadable, never zero."""
+class Eviction(msgspec.Struct, frozen=True, kw_only=True):
+    model: str
+    gpu: int
+    rung: int
+    reason: str
+    nbytes: int
 
-    budget_bytes: int = -1
-    committed_bytes: int = -1
-    leased_bytes: int = -1
-    pinned_budget_bytes: int = -1
-    pinned_bytes: int = -1
-    #: CUDA context and runtime workspaces outside torch and the plane, measured at load
-    context_bytes: int = -1
-    #: torch's reserved bytes, and the process's device bytes (context + reserved + mapped)
-    reserved_bytes: int = -1
-    process_bytes: int = -1
-    #: the owner's process cap in force (`process_cap/1`); -1: none
-    cap_bytes: int = -1
-    #: torch's peak above its bytes at the attempt's start: activations and derived weights
-    activation_peak_bytes: int = -1
-    resident: dict[str, int] = {}
-    streamed: dict[str, Streamed] = {}
-    h2d_bytes: int = 0
-    h2d_gbps: float = 0.0
-    #: of those, copied to the device straight from disk (the pinned tier did not hold them)
-    #: and straight from the page cache (it did not either)
-    disk_copy_bytes: int = 0
-    mapped_copy_bytes: int = 0
-    #: of those, host memory this process could not page-lock, through the staging buffers;
-    #: the rest of the host bytes were one DMA each. Each path's own rate (bytes / ns)
-    bounce_copy_bytes: int = 0
-    host_gbps: float = 0.0
-    bounce_gbps: float = 0.0
-    disk_gbps: float = 0.0
-    #: page locks the driver refused (a sealed layout counts once)
-    register_failed: int = 0
-    #: per stage method, its last plan's inputs, bytes: driver free, torch reserved and
-    #: allocated, the plane's committed and the bound weights' decoded copies, the stage's
-    #: activation growth and the budget that came out (`Weights.driver_budget`)
-    plan_inputs: dict[str, dict[str, int]] = {}
-    #: GPU regions mapped from the machine's custody (`weights.attach/1`): outside
-    #: `committed_bytes`, counted once by the machine
-    shared_bytes: int = 0
-    #: bytes this executor process read from storage since it started (`/proc/self/io`;
-    #: TensorFS 0.3.92): a gate compares a delta across a return. -1: not counted
-    disk_read_bytes: int = -1
-    #: RAM of the machine's sealed layouts this executor maps (theirs, never its own)
-    sealed_bytes: int = 0
-    #: LoRA'd weights baked into device bytes since the process started (a streamed copy counts
-    #: at every acquire), and the milliseconds its resident bakes took
-    lora_baked: int = 0
-    lora_bake_ms: float = 0.0
-    #: LoRA'd weights whose bytes arrived baked from the machine's custody: no bake here
-    lora_attached: int = 0
-    late: int = 0
-    stall_ns: int = 0
-    misses: int = 0
-    evictions: int = 0
-    oom_retries: int = 0
-    #: torch's allocator short of room: times it dropped its whole cache to place one
-    #: allocation, and out-of-memory errors it raised; then this process's own cache releases
-    #: that returned something, their bytes, and both by the function that asked. A stage
-    #: with room shows none of the first two.
-    alloc_retries: int = 0
-    alloc_ooms: int = 0
-    cache_releases: int = 0
-    cache_released_bytes: int = 0
-    cache_released_by: dict[str, tuple[int, int]] = {}
-    #: Per stage method, the most room torch had at an entry of this request in which it
-    #: dropped its cache more than once: the owner keeps it for the request's shape and
-    #: gives it to later executors (`Invoke.squeezed_bytes`)
-    squeezed: dict[str, int] = {}
-    #: components given back to make torch room since the process began, and their bytes
-    paged_out: int = 0
-    paged_out_bytes: int = 0
-    #: times this process's own tensors moved to host memory for an op since it began, and
-    #: their bytes (`spill`)
-    spilled: int = 0
-    spilled_bytes: int = 0
-    #: What memory made the call do, e.g. {"bands": "12 ops, 805306368 B of results in host memory"}
-    modes: dict[str, str] = {}
+
+class Peak(msgspec.Struct, frozen=True, kw_only=True):
+    """A model's measured activation peak at one shape key, and the cuts in force there (B3)."""
+
+    model: str
+    shape: str
+    peak: int
+    cuts: list[str] = []
+
+
+class Copy(msgspec.Struct, frozen=True, kw_only=True):
+    """A run of weight copies since the last request (`tensorfs.varena.torch.Copy`): to a GPU
+    (`h2d`: a restore, refill or fill) or a host layout read from disk (`disk`), in GB/s and %
+    of its measured ceiling (None while unmeasured), with the PCIe link, GPU copy and page-lock
+    seconds."""
+
+    kind: str
+    gpu: int
+    bytes: int
+    seconds: float
+    gbps: float
+    ceiling: float
+    pct: float | None
+    link: str = ""
+    busy_s: float = 0.0
+    pin_s: float = 0.0
+    staged: int = 0
+    cached: int = 0
+
+
+class FillResult(msgspec.Struct, frozen=True, kw_only=True):
+    phase: str
+    outcome: str
+    error: str | None
+    io_runs: int
+
+
+class TraceEvent(msgspec.Struct, frozen=True, kw_only=True):
+    """An actual native placement decision, with the state before its action."""
+
+    sequence: int
+    request: str
+    step: int
+    page: int
+    gpu: int
+    rank: int
+    kind: str
+    reason: str
+    bytes: int
+    capacity: int
+    resident: int
+    orphan_bytes: int
+    model: str | None = None
+    class_: str = msgspec.field(name="class", default="free")
+    working_set: int | None = None
+    speculative_budget: int | None = None
+    pass_index: int = 0
+    fill: FillResult | None = None
+
+
+class ProofPage(msgspec.Struct, frozen=True, kw_only=True):
+    page: int
+    content: str
+    payload: int
+    mapped: int
+
+
+class TransferProof(msgspec.Struct, frozen=True, kw_only=True):
+    """A complete content catalog and initial residency for a scoped H2D lower bound."""
+
+    request: str
+    gpu: int
+    rank: int
+    version: int
+    complete: bool
+    isolated: bool
+    capacity: int
+    pages: list[ProofPage]
+    initial: list[int]
+    invalid: list[str]
+
+
+class Memory(msgspec.Struct, frozen=True, kw_only=True):
+    """The invoke reply's `memory`, which `cozy run show` states as `measurements.memory.stats`
+    and the merge gate reads: torch bytes package state still held at the request's end
+    (`leftover`), weight bytes copied to the device while it ran (`paged_in`, home or through
+    slots), and each model's bytes copied per step (`steps`). Then the detail: every step's
+    row, the evictions it made, the peaks and cuts per shape key, its out-of-memory retries,
+    `leftover` by GPU, and the copy runs against their ceilings."""
+
+    leftover: int = 0
+    paged_in: int = 0
+    steps: dict[str, list[int]] = {}
+    rows: list[Step] = []
+    evictions: list[Eviction] = []
+    peaks: list[Peak] = []
+    retries: int = 0
+    leftover_by_gpu: list[tuple[int, int]] = []
+    #: the declared plan (`Context.plan`), each step's components
+    plan: list[list[str]] = []
+    copies: list[Copy] = []
+    trace: list[TraceEvent] = []
+    proofs: list[TransferProof] = []
+
+
+class RankMemory(msgspec.Struct, frozen=True, kw_only=True):
+    ok: bool
+    rank: int
+    request_id: str
+    memory: Memory | None = None
+    code: str = ""
+    detail: str = ""

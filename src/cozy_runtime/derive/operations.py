@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 import msgspec
-from tensorfs.derived import Config, Derivation, Target, derive
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import (
@@ -22,13 +21,17 @@ from cozy_runtime.author import (
     WeightsOutput,
     invocable,
 )
+from cozy_runtime.weights_store import Checkpoint, Derivation
 
 from . import facade
-
-if TYPE_CHECKING:
-    from tensorfs.derived import SourceInspection
-
-    from .quantization import ArtifactQuantizationPlan
+from .quantization import (
+    _ENCODINGS,
+    ArtifactQuantizationPlan,
+    QuantizationTensor,
+    column_block,
+    prepare_source_quantization,
+    source_rows,
+)
 
 
 class EncodingRule(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -63,19 +66,8 @@ app = App()
 
 
 def _selection(
-    structure: SourceInspection, plan: QuantizationPlan, encoding: str | None = None
+    source: Checkpoint, plan: QuantizationPlan, encoding: str | None = None
 ) -> ArtifactQuantizationPlan:
-    from .quantization import (
-        _ENCODINGS,
-        PLAIN_SPEC,
-        ArtifactQuantizationPlan,
-        QuantizationTensor,
-        column_block,
-        prepare_source_quantization,
-        source_parts,
-        source_rows,
-    )
-
     if (
         not 1 <= len(plan.components) <= 64
         or len(set(plan.components)) != len(plan.components)
@@ -100,7 +92,7 @@ def _selection(
         raise UnsupportedInput(
             "quantization plan requires canonical digests", code="quantization_plan"
         )
-    rows = list(source_rows(structure))
+    rows = list(source_rows(source))
     by_key = {(component, key): tensor for component, key, tensor in rows}
     if len(by_key) != len(rows):
         raise UnsupportedInput("quantization source repeats a tensor", code="quantization_source")
@@ -160,6 +152,7 @@ def _selection(
             block = column_block(chosen or encoding)
             if row is None or (
                 not key.endswith(".weight")
+                or not row.plain
                 or row.logical_dtype not in {"f16", "bf16", "f32"}
                 or len(row.shape) != 2
                 or row.shape[0] <= 0
@@ -179,39 +172,21 @@ def _selection(
                     encoding=chosen,
                 )
             )
-        selection = ArtifactQuantizationPlan(
-            list(plan.components), list(structure.configs), list(by_key), selected
-        )
+        selection = ArtifactQuantizationPlan(list(plan.components), list(by_key), selected)
     else:
         selection = prepare_source_quantization(
-            structure, components=plan.components, block=column_block(encoding)
+            source, components=plan.components, block=column_block(encoding)
         )
         selection.tensors.sort(key=lambda row: plan.components.index(row.component))
     schema = []
     for item in selection.tensors:
         tensor = by_key[item.component, item.key]
-        parts = source_parts(tensor)
-        plain = parts.get("value")
-        if (
-            tensor.encoding != PLAIN_SPEC
-            or len(parts) != 1
-            or plain is None
-            or plain.dtype != tensor.logical_dtype
-            or tuple(plain.shape) != tuple(tensor.shape)
-        ):
+        if not tensor.plain:
             raise UnsupportedInput(
                 f"quantization source {item.component}.{item.key} is not plain",
                 code="quantization_source",
             )
-        schema.append(
-            [
-                item.component,
-                item.key,
-                tensor.logical_dtype,
-                list(tensor.shape),
-                [[role, part.dtype, list(part.shape)] for role, part in parts.items()],
-            ]
-        )
+        schema.append([item.component, item.key, tensor.logical_dtype, list(tensor.shape)])
     if (
         plan.selected_schema_digest is not None
         and canonical_json.digest(schema) != plan.selected_schema_digest
@@ -230,7 +205,7 @@ def _selection(
         "cozy_runtime.derive.quantization",
         "cozy_runtime.derive.microscale",
         "cozy_runtime.derive.safetensors_io",
-        "tensorfs.derived",
+        "cozy_runtime.weights_store",
         MemoDistribution("tensorfs"),
         MemoDistribution("numpy"),
         MemoDistribution("msgspec"),
@@ -271,26 +246,24 @@ def quantize_into(
     own lane job (`cozy model quantize --int8` runs one) is this with its recipe as `plan`."""
     ctx.raise_if_cancelled()
     intent = facade.plan(plan.components, encoding, max_relative_frobenius=max_relative_frobenius)
-    structure = ctx.tensorfs_source(source).inspect()
-    selected = _selection(structure, plan, encoding)
-    result, receipt = facade._quantize(
-        source,
+    opened = ctx.tensorfs_source(source)
+    result, artifact = facade._quantize(
+        opened,
         intent,
         ctx=ctx,
         tel=tel,
         output=output,
-        selection=selected,
-        source_view=structure,
+        selection=_selection(opened, plan, encoding),
         preserve_precision=plan.output_precision == "preserve",
     )
-    return facade._artifact_result(result, receipt, tel, output)
+    return facade._artifact_result(result, artifact, tel, output)
 
 
 class SelectionPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
     """The weights a lane keeps: those whose `component.key` matches one of `include`'s fnmatch
-    patterns, each of which must match one. Every other tensor is dropped; the kept ones are the
-    source's own objects (nothing is read or copied) and every config comes along. A small lane
-    of a big checkpoint's part, such as its multi-token-prediction head."""
+    patterns, each of which must match one. Every other tensor is dropped; the kept ones keep the
+    source's objects, and the pipeline, every component's config and its assets come along. A
+    small lane of a big checkpoint's part, such as its multi-token-prediction head."""
 
     include: tuple[str, ...]
 
@@ -300,9 +273,8 @@ def select_into(
 ) -> ModelArtifact:
     """`plan`'s weights of `source`, written into the CALLING job's weights output `output`."""
     ctx.raise_if_cancelled()
-    capability = ctx.tensorfs_source(source)
-    structure = capability.inspect()
-    rows = [(c, key) for c, tensors in structure.components.items() for key in tensors]
+    opened = ctx.tensorfs_source(source)
+    rows = [(c, key) for c, key, _ in source_rows(opened)]
 
     def kept(component: str, key: str) -> bool:
         return any(fnmatch.fnmatchcase(f"{component}.{key}", rule) for rule in plan.include)
@@ -318,22 +290,12 @@ def select_into(
             f"selection patterns match no weight: {unused or list(plan.include)}",
             code="selection_plan",
         )
-    targets = {
-        component: Target(
-            source="source",
-            source_component=component,
-            drop=tuple(key for c, key in rows if c == component and not kept(c, key)),
-        )
-        for component in dict.fromkeys(c for c, _ in order)
-    }
-    configs = {
-        name: Config("copy", source="source", source_config=name) for name in structure.configs
-    }
-    with derive(
-        ctx.output(output), Derivation({"source": capability}, targets, configs, order)
-    ) as transaction:
-        receipt = transaction.receipt if transaction.receipt is not None else transaction.commit()
-        artifact = ctx.adopt_model(receipt)
+    with ctx.output(output, Derivation(base=None, sources=(opened,), order=order)) as out:
+        out.inherit(opened)
+        for component, key in order:
+            if not out.has(component, key):
+                out.copy(component, key, opened)
+        artifact = ctx.adopt_model(out)
     tel.log("selection", output=output, kept_keys=len(order), dropped_keys=len(rows) - len(order))
     return artifact
 

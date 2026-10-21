@@ -7,7 +7,6 @@ import io
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import tarfile
@@ -21,10 +20,9 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_sources, storage_admission
+from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_sources
 from cozy_runtime.internal.package_environment import EnvironmentRefusal
 from test_kernel_compile import _wait
-from test_storage_admission import operation
 
 
 def _wheel() -> bytes:
@@ -236,33 +234,3 @@ def test_a_private_redirect_is_refused_before_any_source_write(
         source = Path(row["file"])
         assert requests == ["/private-redirect.whl"] and not source.exists()
         assert not list(source.parent.glob("*.partial"))
-
-
-def test_source_acquisition_obeys_the_existing_storage_owner_refusal(
-    store: kernel_cache.Store, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    body = _wheel()
-    host, worker = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    monkeypatch.setattr(storage_admission, "_channel", worker)
-    with host, worker, _http({"/tiny.whl": body}) as (url, _):
-        monkeypatch.setattr(kernel_sources, "PINS", (_pin("tiny", url + "/tiny.whl", body),))
-        row = _source()
-        received: list[dict[str, Any]] = []
-
-        def refuse() -> None:
-            rows, connection = operation(host)
-            received.extend(rows)
-            with connection:
-                connection.sendall(
-                    b'{"ok":false,"code":"insufficient_storage","reason":"fixture budget"}\n'
-                )
-
-        thread = threading.Thread(target=refuse)
-        thread.start()
-        with pytest.raises(storage_admission.StorageRefusal, match="fixture budget"):
-            kernel_sources._verified(row)
-        thread.join(2)
-        assert not thread.is_alive()
-        source = Path(row["file"])
-        assert received == [{"path": str(source.parent), "bytes": len(body), "inodes": 16}]
-        assert not source.exists() and not list(source.parent.glob("*.partial"))

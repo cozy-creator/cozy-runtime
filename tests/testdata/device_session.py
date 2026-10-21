@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import msgspec
-import tensorfs
 
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover
@@ -110,9 +109,6 @@ def compute(payload: Request, ctx: Context) -> Result:
         assert not reader.is_alive()
     assert reply["outcome"]["terminal"] == "succeeded", reply
     result_bytes = (spool / RESULT_DOCUMENT).read_bytes()
-    store = tensorfs.Store.init(root / "store")
-    saved = store.put_file(spool / RESULT_DOCUMENT)
-    assert store.document(saved["id"], len(result_bytes)) == result_bytes
     result: dict[str, Any] = {
         "result": json.loads(result_bytes),
         "torch_imported": "torch" in sys.modules,

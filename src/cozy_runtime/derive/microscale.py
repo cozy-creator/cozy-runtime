@@ -323,7 +323,7 @@ def encode_nvfp4(key: str, values: np.ndarray, amax: float | None = None) -> Enc
 
 
 def encode_fp8_rowwise(key: str, values: np.ndarray) -> Encoded:
-    """`fp8-rowwise/1`, rank-1 scale variant: continuous per-output-row f32 scale
+    """`fp8.rowwise`, rank-1 scale variant: continuous per-output-row f32 scale
     `clamp(rowmax|v|/448, min 1e-12)`, RNE payload, clamp BEFORE the cast."""
     rows, cols = _require_2d(key, values, 1)
     payload = np.empty((rows, cols), dtype=np.uint8)

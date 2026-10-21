@@ -22,18 +22,14 @@ from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8
 from cozy_runtime.derive.microscale import encode_int8_convrot256
 from cozy_runtime.internal import fp8_linear, int8_linear, prebuilt, probe, qualification
 from cozy_runtime.internal.encoding import (
-    SPEC_INT8_CONVROT256,
-    SPEC_NVFP4,
-    SPEC_ROWWISE,
-    SPEC_ROWWISE_KEEPDIM,
     Capabilities,
     DeviceFacts,
     Encoded,
     Int8ConvRotNativeLeaf,
     Nvfp4NativeLeaf,
     RolePart,
-    aliases,
     launch_providers,
+    params_of,
 )
 from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
@@ -49,20 +45,26 @@ from cozy_runtime.internal.resolution import (
     resolve,
 )
 from test_int8_convrot import weight
-from test_leaf_speedup_record import rekeyed
+from test_leaf_speedup_record import rekeyed, sm86
 from test_nvfp4 import roles
 
 FP8_LEAF = "cozy.fp8-rowwise.native-leaf/1"
 
 
-def row(key: str, spec: str, dtype: str, shape: tuple[int, int]) -> PlanRow:
-    data = "i8" if spec == SPEC_INT8_CONVROT256 else "f8_e4m3fn"
+PARAMS: dict[str, dict[str, object]] = {
+    "fp8.rowwise": {"axis": 0},
+    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
+}
+
+
+def row(key: str, scheme: str, dtype: str, shape: tuple[int, int]) -> PlanRow:
+    weight = "i8" if scheme == "int8.convrot" else "f8_e4m3fn"
     parts = (
-        RolePart("data", data, shape, shape[0] * shape[1]),
-        RolePart("scale", "f32", (shape[0], 1), 4 * shape[0]),
+        RolePart("weight", weight, shape, shape[0] * shape[1]),
+        RolePart("scale", "f32", (shape[0],), 4 * shape[0]),
     )
     component, _, name = key.partition(".")
-    encoded = Encoded(spec, aliases()[spec], parts)
+    encoded = Encoded(scheme, params_of(PARAMS[scheme]), parts)
     return PlanRow(key, name, component, dtype, shape, 2 * shape[0] * shape[1], encoded)
 
 
@@ -84,21 +86,16 @@ def plan(
 
 
 def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not() -> None:
-    path = next(qualification.SHIPPED.glob("cuda.sm86-*.json"))
-    table = msgspec.convert(json.loads(path.read_bytes()), QualificationResult)
-    providers = launch_providers()
-    cells = {s: providers[s] for s in (SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM, SPEC_INT8_CONVROT256)}
-    admitted = qualification.qualified(
-        object(), cells, table.device, ("bfloat16",), release="t/1", runtime=table.runtime
-    )
+    table = sm86()
+    capabilities = probe.admission_table(table)
     rows = [
-        row("unet.a.weight", SPEC_ROWWISE, "bf16", (64, 256)),
-        row("unet.b.weight", SPEC_ROWWISE, "bf16", (128, 256)),
-        row("te.c.weight", SPEC_INT8_CONVROT256, "bf16", (64, 256)),
+        row("unet.a.weight", "fp8.rowwise", "bf16", (64, 256)),
+        row("unet.b.weight", "fp8.rowwise", "bf16", (128, 256)),
+        row("te.c.weight", "int8.convrot", "bf16", (64, 256)),
         # The int8 GEMM needs N % 8 == 0: decoded by the format's rule, not refused.
-        row("te.d.weight", SPEC_INT8_CONVROT256, "bf16", (60, 256)),
+        row("te.d.weight", "int8.convrot", "bf16", (60, 256)),
     ]
-    served = plan(rows, admitted.capabilities, table.device)
+    served = plan(rows, capabilities, table.device)
     assert {t.key: t.route for t in served.tensors} == {
         "unet.a.weight": "decoded_float",
         "unet.b.weight": "decoded_float",
@@ -108,23 +105,23 @@ def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not
     assert served.refused_leaves() == (
         RefusedLeaves(
             "unet",
-            "fp8-rowwise/1",
+            "fp8.rowwise",
             FP8_LEAF,
             "its kernel needs cuda.sm89+ and this device is cuda.sm86",
             "bfloat16",
             2,
         ),
     )
-    assert plan(rows, admitted.capabilities, table.device, "refuse").refused_leaves() == ()
+    assert plan(rows, capabilities, table.device, "refuse").refused_leaves() == ()
 
 
 def test_a_leaf_that_failed_or_raised_in_qualification_warns_once_per_reason() -> None:
     result = rekeyed()
     rows = [
-        row("unet.a.weight", SPEC_ROWWISE, "f16", (64, 256)),
-        row("unet.b.weight", SPEC_ROWWISE, "f32", (64, 256)),
-        row("unet.c.weight", SPEC_ROWWISE, "f32", (128, 256)),
-        row("unet.d.weight", SPEC_ROWWISE, "bf16", (64, 256)),
+        row("unet.a.weight", "fp8.rowwise", "f16", (64, 256)),
+        row("unet.b.weight", "fp8.rowwise", "f32", (64, 256)),
+        row("unet.c.weight", "fp8.rowwise", "f32", (128, 256)),
+        row("unet.d.weight", "fp8.rowwise", "bf16", (64, 256)),
     ]
     served = plan(rows, probe.admission_table(result), result.device)
     assert served.by_key()["unet.d.weight"].route == "encoded_gemm"
@@ -149,16 +146,25 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
     torch = pytest.importorskip("torch")
     encoded = encode_int8_convrot256("w", weight(64, 512, 5))
     int8_roles = {
-        "data": torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).reshape(64, 512),
+        "weight": torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).reshape(64, 512),
         "scale": torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32),
     }
     stand_in = probe._StandIn(512, 64)
-    int8 = Int8ConvRotNativeLeaf(SPEC_INT8_CONVROT256)
+    int8 = Int8ConvRotNativeLeaf(params=params_of(PARAMS["int8.convrot"]))
     leaves = {
         key: (int8.leaf(torch, int8_roles, stand_in, torch.bfloat16), None, ())
         for key in ("transformer.a.weight", "transformer.b.weight", "text_encoder.c.weight")
     }
-    nvfp4 = Nvfp4NativeLeaf(SPEC_NVFP4).leaf(
+    nvfp4 = Nvfp4NativeLeaf(
+        params=params_of(
+            {
+                "block_size": 16,
+                "global_scale": "multiply",
+                "nibble_order": "low_first",
+                "scale_layout": "row_major",
+            }
+        )
+    ).leaf(
         torch, roles(torch, weight(256, 512, 6), "cpu"), probe._StandIn(512, 256), torch.bfloat16
     )
     leaves["transformer.d.weight"] = (nvfp4, None, ())
@@ -166,20 +172,14 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
     nvfp4(torch.randn(40, 512, dtype=torch.bfloat16))
     assert set(vars(nvfp4)) == before  # nothing written per call
 
-    table = msgspec.convert(
-        json.loads(next(qualification.SHIPPED.glob("cuda.sm86-*.json")).read_bytes()),
-        QualificationResult,
-    )
-    providers = launch_providers()
-    cells = {s: providers[s] for s in (SPEC_ROWWISE, SPEC_ROWWISE_KEEPDIM)}
-    admitted = qualification.qualified(
-        object(), cells, table.device, ("bfloat16",), release="t/1", runtime=table.runtime
-    )
-    rows = [row(f"unet.{n}.weight", SPEC_ROWWISE, "bf16", (64, 256)) for n in "ab"]
+    table = sm86()
+    rows = [row(f"unet.{n}.weight", "fp8.rowwise", "bf16", (64, 256)) for n in "ab"]
     executor = Executor(None, tmp_path)  # type: ignore[arg-type]
     executor.backend = SimpleNamespace(gemm_sites=leaf_sites(leaves))
     executor.models = {"klein": object()}
-    executor.refused_leaves = plan(rows, admitted.capabilities, table.device).refused_leaves()
+    executor.refused_leaves = plan(
+        rows, probe.admission_table(table), table.device
+    ).refused_leaves()
 
     def emitted() -> list[tuple[object, ...]]:
         record = Attempt("gemm", tmp_path, 0)

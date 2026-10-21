@@ -6,10 +6,27 @@ import atexit
 import functools
 import os
 import shutil
+import subprocess
 import tempfile
+import tomllib
 from pathlib import Path
 
 import pytest
+
+
+def runtime_test_dependencies() -> tuple[str, ...]:
+    """Install the real development cohort alongside an isolated Runtime wheel.
+
+    A wheel deliberately carries the release range; the matching TensorFS may still
+    be unpublished. Only test setup uses the project's explicit source pin.
+    """
+    project = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())
+    source = project.get("tool", {}).get("uv", {}).get("sources", {}).get("tensorfs")
+    if source is None:
+        return ()
+    return (
+        f"tensorfs @ git+{source['git']}@{source['rev']}#subdirectory={source['subdirectory']}",
+    )
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -44,6 +61,24 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     for item in items:
         if "real_gpu" in item.keywords:
             item.add_marker(skip)
+
+
+@functools.cache
+def locked() -> Path:
+    """The lock's pins as constraints, so an installed wheel gets the locked TensorFS (an
+    unreleased one is a git source), not whatever an index offers."""
+    uv = shutil.which("uv")
+    assert uv is not None
+    root = Path(tempfile.mkdtemp(prefix="cozy-locked."))
+    atexit.register(shutil.rmtree, root, ignore_errors=True)
+    out = root / "locked.txt"
+    subprocess.run(
+        [uv, "export", "--frozen", "--no-dev", "--no-emit-project", "--no-hashes"]
+        + ["--project", str(Path(__file__).parent.parent), "-o", str(out)],
+        check=True,
+        capture_output=True,
+    )
+    return out
 
 
 @functools.cache
@@ -84,7 +119,17 @@ def image_python() -> Path:
     )
     runtime_wheel = next(wheels.glob("cozy_runtime-*.whl"))
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(runtime_wheel)],
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "-c",
+            str(locked()),
+            str(runtime_wheel),
+            *runtime_test_dependencies(),
+        ],
         check=True,
         capture_output=True,
     )
@@ -106,7 +151,9 @@ def authored_python() -> Path:
     wheel = next((root / "wheels").glob("cozy_runtime-*.whl"))
     python = sdk / "bin/python"
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(wheel)], check=True, capture_output=True
+        [uv, "pip", "install", "--python", str(python), "-c", str(locked()), str(wheel), *runtime_test_dependencies()],
+        check=True,
+        capture_output=True,
     )
     return python
 
@@ -127,7 +174,18 @@ def sample_python() -> Path:
     python = sdk / "bin/python"
     project = Path(__file__).parent.parent / "examples/marco-polo"
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(wheel), str(project)],
+        [
+            uv,
+            "pip",
+            "install",
+            "--python",
+            str(python),
+            "-c",
+            str(locked()),
+            str(wheel),
+            str(project),
+            *runtime_test_dependencies(),
+        ],
         check=True,
         capture_output=True,
     )

@@ -319,11 +319,11 @@ def test_encoded_projection_output_contract_wins_over_norm_and_storage_dtype() -
     from cozy_runtime.internal.encoding import RowwiseNativeLeaf
 
     module = _roots()["dit"][0]
-    provider = RowwiseNativeLeaf(encoding="fp8-rowwise/1")
+    provider = RowwiseNativeLeaf()
     for name in ("to_q", "to_k", "to_v"):
         linear = getattr(module, name).to(dtype=torch.bfloat16)
         parts = {
-            "data": torch.zeros_like(linear.weight, dtype=torch.float8_e4m3fn),
+            "weight": torch.zeros_like(linear.weight, dtype=torch.float8_e4m3fn),
             "scale": torch.ones(linear.out_features, dtype=torch.float32),
         }
         setattr(module, name, provider.leaf(torch, parts, linear, torch.bfloat16))

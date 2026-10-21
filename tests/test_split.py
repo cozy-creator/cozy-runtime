@@ -1,14 +1,14 @@
-"""`author.split`: an op the package declares splittable runs whole, or in the pieces the
-Runtime's memory allows, and the pieces put together are the whole op's result.
+"""`author.split`: an op the package declares splittable runs whole, or in the windows the
+memory allows, and the windows put together are the whole op's result.
 
-Real torch modules on the CPU. The device is a `Card`: it holds `limit` input elements of a
-piece at once and runs out of memory past that, as a GPU does, so the piece count follows it.
+Real torch modules on the CPU. The memory is `Sizes`: it runs the split at each window size it
+is given, as varena's `cuts.split` does after each out-of-memory (its lattice is varena's own
+test, `scripts/varena-cuts.py`).
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import pytest
@@ -16,36 +16,30 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cozy_runtime.author import Cut, split  # noqa: E402
-from cozy_runtime.author._errors import RuntimeFailure  # noqa: E402
 from cozy_runtime.author._split import install  # noqa: E402
 
 
-class Card:
-    def __init__(self, limit: int, ratio: float | None = None, room: int = 0) -> None:
-        self.limit, self.ratio, self.free = limit, ratio, room
+class Sizes:
+    """Runs a split in windows of at most `most` elements, recording what it was asked."""
+
+    def __init__(self, most: int) -> None:
+        self.most = most
+        self.asked: list[tuple[str, int, int]] = []
         self.pieces: list[int] = []
-        self.runs: list[int] = []
 
-    def room(self, key: str) -> tuple[float | None, int]:
-        return self.ratio, self.free
-
-    @contextmanager
-    def piece(self, key: str, elements: int, need: int, least: int = 0) -> Iterator[None]:
-        self.least = least
-        if elements > self.limit:
-            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB")
-        self.pieces.append(elements)
-        yield
-
-    def ran(self, name: str, pieces: int) -> None:
-        self.runs.append(pieces)
+    def __call__(
+        self, name: str, key: str, device: Any, total: int, finest: int, run: Callable[[int], Any]
+    ) -> Any:
+        self.asked.append((name, total, finest))
+        return run(self.most)
 
 
 @pytest.fixture
-def card() -> Iterator[Any]:
-    def plug(device: Card) -> Card:
-        install(device)
-        return device
+def sizes() -> Iterator[Callable[[int], Sizes]]:
+    def plug(most: int) -> Sizes:
+        memory = Sizes(most)
+        install(memory)
+        return memory
 
     yield plug
     install(None)
@@ -63,45 +57,56 @@ def decoder() -> Any:
     ).double()
 
 
-def test_without_a_runtime_the_op_runs_whole() -> None:
-    calls: list[tuple[int, ...]] = []
+def counted(fn: Callable[[Any], Any], seen: list[tuple[int, ...]]) -> Callable[[Any], Any]:
+    def call(t: Any) -> Any:
+        seen.append(tuple(t.shape))
+        return fn(t)
+
+    return call
+
+
+def test_without_a_memory_the_op_runs_whole() -> None:
+    seen: list[tuple[int, ...]] = []
     x = torch.randn(3, 4)
-    def twice(value: Any) -> Any:
-        calls.append(tuple(value.shape))
-        return value * 2
-
-    assert torch.equal(split(twice, x, Cut(0)), x * 2)
-    assert calls == [(3, 4)]
+    assert torch.equal(split(counted(lambda t: t * 2, seen), x, Cut(0)), x * 2)
+    assert seen == [(3, 4)]
 
 
-def test_a_batch_cut_runs_in_pieces_that_join_exactly(card: Any) -> None:
-    device = card(Card(limit=10**9, ratio=1.0, room=2 * 4 * 6 * 6))
+def test_a_batch_cut_runs_in_windows_that_join_exactly(sizes: Any) -> None:
+    memory = sizes(2 * 4 * 36)
     net, x = decoder(), torch.randn(5, 4, 6, 6, dtype=torch.float64)
+    seen: list[tuple[int, ...]] = []
     with torch.inference_mode():
-        assert torch.equal(split(net, x, Cut(0)), net(x))
-    assert device.pieces == [2 * 4 * 36] * 2 + [4 * 36] and device.runs == [3]
+        assert torch.equal(split(counted(net, seen), x, Cut(0)), net(x))
+    assert [s[0] for s in seen] == [2, 2, 1]
+    assert memory.asked[0][1:] == (5 * 4 * 36, 4 * 36)
 
 
-def test_an_unmeasured_op_runs_in_small_pieces_first(card: Any) -> None:
-    device = card(Card(limit=10**9))
-    split(lambda t: t, torch.zeros(16, 3), Cut(0))
-    assert device.pieces == [2 * 3] * 8
+def test_whole_when_the_memory_says_it_fits(sizes: Any) -> None:
+    sizes(10**9)
+    seen: list[tuple[int, ...]] = []
+    split(counted(lambda t: t, seen), torch.zeros(16, 3), Cut(0))
+    assert seen == [(16, 3)]
 
 
-@pytest.mark.parametrize("limit", [10**9, 4 * 20 * 14, 4 * 12 * 12])
-def test_overlapping_tiles_cross_fade_into_the_whole_result(card: Any, limit: int) -> None:
-    device = card(Card(limit=limit, ratio=1.0, room=10**9))
+@pytest.mark.parametrize("most", [10**9, 4 * 20 * 14, 4 * 12 * 12])
+def test_overlapping_tiles_cross_fade_into_the_whole_result(sizes: Any, most: int) -> None:
+    sizes(most)
     net, z = decoder(), torch.randn(1, 4, 37, 29, dtype=torch.float64)
+    seen: list[tuple[int, ...]] = []
     with torch.inference_mode():
-        tiled = split(net, z, Cut(-2, scale=2, overlap=6), Cut(-1, scale=2, overlap=6))
+        tiled = split(
+            counted(net, seen), z, Cut(-2, scale=2, overlap=6), Cut(-1, scale=2, overlap=6)
+        )
         whole = net(z)
     assert tiled.shape == whole.shape
     torch.testing.assert_close(tiled, whole, rtol=1e-9, atol=1e-9)
-    assert max(device.pieces) <= limit and (len(device.pieces) > 1) == (limit < z.numel())
+    elements = [s[1] * s[2] * s[3] for s in seen]
+    assert max(elements) <= most and (len(seen) > 1) == (most < z.numel())
 
 
-def test_an_encode_cuts_on_aligned_pixels(card: Any) -> None:
-    card(Card(limit=3 * 24 * 24, ratio=1.0, room=10**9))
+def test_an_encode_cuts_on_aligned_pixels(sizes: Any) -> None:
+    sizes(3 * 24 * 24)
     torch.manual_seed(5)
     net = torch.nn.Sequential(
         torch.nn.Conv2d(3, 6, 1), torch.nn.SiLU(), torch.nn.Conv2d(6, 4, 2, stride=2)
@@ -112,52 +117,9 @@ def test_an_encode_cuts_on_aligned_pixels(card: Any) -> None:
         torch.testing.assert_close(tiled, net(x), rtol=1e-9, atol=1e-9)
 
 
-def test_an_unmeasured_op_with_its_own_estimate_starts_at_the_pieces_that_fit(card: Any) -> None:
-    """The op's `per_element` sizes its first pieces; the Runtime's measurement replaces it."""
-    device = card(Card(limit=10**9, room=100 * 8 * 3))
-    split(lambda t: t, torch.zeros(16, 3), Cut(0), per_element=100.0)
-    assert device.pieces == [8 * 3] * 2
-    device.ratio, device.pieces = 50.0, []
-    split(lambda t: t, torch.zeros(16, 3), Cut(0), per_element=100.0)
-    assert device.pieces == [16 * 3]
-
-
-def test_each_piece_tells_the_runtime_what_the_finest_piece_needs(card: Any) -> None:
-    """The room a stage must keep beside its weights for an op that cannot cut finer: twelve
-    latent frames cut on time need one frame's bytes at least (SeedVR2's DiT at 1080p)."""
-    device = card(Card(limit=10**9, ratio=100.0, room=10**9))
-    split(lambda t: t, torch.zeros(12, 6, 10, 3), Cut(0))
-    assert device.pieces == [12 * 6 * 10 * 3] and device.least == 100 * 6 * 10 * 3
-    split(lambda t: t, torch.zeros(1, 3, 64, 48), Cut(-2, 0.5, overlap=12, align=2))
-    assert device.least < 100 * 3 * 64 * 48
-
-
-def test_a_measured_op_starts_at_the_pieces_that_fit(card: Any) -> None:
-    """Bytes per element times the largest piece within the room: no failed attempt first."""
-    device = card(Card(limit=10**9, ratio=100.0, room=100 * 2 * 4 * 36))
-    x = torch.randn(8, 4, 6, 6)
-    split(lambda t: t, x, Cut(0))
-    assert device.pieces == [2 * 4 * 36] * 4
-
-
-def test_a_refusal_is_a_reason_to_cut_finer_and_other_failures_are_not(card: Any) -> None:
-    class Refusing(Card):
-        @contextmanager
-        def piece(self, key: str, elements: int, need: int, least: int = 0) -> Iterator[None]:
-            if elements > self.limit:
-                raise RuntimeFailure("no room", code="memory_exhausted")
-            self.pieces.append(elements)
-            yield
-
-    device = card(Refusing(limit=8, ratio=1.0, room=16))
-    assert torch.equal(split(lambda t: t + 1, torch.zeros(4, 4), Cut(0)), torch.ones(4, 4))
-    assert device.pieces == [8, 8]
-
-    def broken(t: Any) -> Any:
-        raise ValueError("not memory")
-
-    with pytest.raises(ValueError):
-        split(broken, torch.zeros(4, 4), Cut(0))
-    card(Card(limit=1, ratio=1.0, room=16))
-    with pytest.raises(torch.OutOfMemoryError):  # one row is the finest it cuts
-        split(lambda t: t, torch.zeros(4, 4), Cut(0))
+def test_the_finest_window_is_the_memory_s_floor(sizes: Any) -> None:
+    """Twelve latent frames cut on time: one frame is the least a window takes."""
+    memory = sizes(1)
+    seen: list[tuple[int, ...]] = []
+    split(counted(lambda t: t, seen), torch.zeros(12, 6, 10, 3), Cut(0))
+    assert memory.asked[0][2] == 6 * 10 * 3 and seen == [(1, 6, 10, 3)] * 12

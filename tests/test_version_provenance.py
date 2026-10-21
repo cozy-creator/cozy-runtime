@@ -9,6 +9,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+from conftest import locked, runtime_test_dependencies
+
 ROOT = Path(__file__).resolve().parents[1]
 STAMP = "a" * 40
 PROJECT_VERSION = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
@@ -44,7 +46,7 @@ def test_installed_wheel_version_is_independent_of_caller_repository(tmp_path: P
     )
     python = environment / "bin" / "python"
     subprocess.run(
-        [uv, "pip", "install", "--python", str(python), str(wheel)],
+        [uv, "pip", "install", "--python", str(python), "-c", str(locked()), str(wheel), *runtime_test_dependencies()],
         check=True,
         capture_output=True,
     )
@@ -58,9 +60,9 @@ def test_installed_wheel_version_is_independent_of_caller_repository(tmp_path: P
         [
             git,
             "-c",
-            "user.name=Caller",
+            "user.name=Paul Fidika",
             "-c",
-            "user.email=caller@example.invalid",
+            "user.email=paul@fidika.com",
             "commit",
             "-qm",
             "caller",

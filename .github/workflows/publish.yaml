@@ -171,9 +171,6 @@ jobs:
       - run: uv python install 3.12
       - id: release
         run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }}
-      - env:
-          TENSORFS_KEY: ${{ secrets.TENSORFS_READ_KEY }}
-        run: bash release-tools/scripts/prepare-release-source-access.sh
       - run: uv sync --locked
         working-directory: source
       - uses: actions/download-artifact@v4

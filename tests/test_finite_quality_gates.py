@@ -8,6 +8,7 @@ ones; numpy's `finfo` stands in for torch's (same fields), which is all they rea
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import numpy as np
 import pytest
@@ -28,29 +29,36 @@ def test_helpers_pass_only_finite_values_within_their_bound() -> None:
     assert worst_of({"first": 0.1, "edge": 0.4})[0] == "edge"
 
 
-SCALE = 0.013671875
-EPS16 = float(np.finfo(np.float16).eps)
+SCALE = 0.0123
 
 
-def _scaled() -> list[float]:
-    return [e4m3_value(byte) * SCALE for byte in range(256)]
+def _exact(torch: Any) -> tuple[Any, Any]:
+    """All 256 E4M3 patterns under one scale: the decode's truth, and an exact decode of it."""
+    data = torch.frombuffer(bytearray(bytes(range(256))), dtype=torch.uint8)
+    truth = data.view(torch.float8_e4m3fn).double() * SCALE
+    return truth, truth.to(torch.float16)
 
 
-def test_scaled_fp8_grading_refuses_poison_and_nonzero_zeros() -> None:
-    assert probe._grade_scaled(EPS16, _scaled(), SCALE).passed
+def test_exact_grading_refuses_poison_and_nonzero_zeros() -> None:
+    torch = pytest.importorskip("torch")
+    truth, got = _exact(torch)
+    assert probe._exact_sweep(torch, got, truth, torch.float16).passed
     normal = 0x38  # e4m3 1.0
     for value in POISON:
-        got = _scaled()
-        got[normal] = value
-        assert not probe._grade_scaled(EPS16, got, SCALE).passed, value
-    garbage_zero = _scaled()
+        poisoned = got.clone()
+        poisoned[normal] = value
+        assert not probe._exact_sweep(torch, poisoned, truth, torch.float16).passed, value
+    garbage_zero = got.clone()
     garbage_zero[0x00] = 1e-3
-    assert not probe._grade_scaled(EPS16, garbage_zero, SCALE).passed
+    assert not probe._exact_sweep(torch, garbage_zero, truth, torch.float16).passed
 
 
 def test_an_all_nan_decoder_fails_both_decode_checks() -> None:
+    torch = pytest.importorskip("torch")
+    truth, _ = _exact(torch)
+    nan = torch.full((256,), math.nan, dtype=torch.float16)
+    assert not probe._exact_sweep(torch, nan, truth, torch.float16).passed
     everywhere = [math.nan] * 256
-    assert not probe._grade_scaled(EPS16, everywhere, SCALE).passed
     sweep = probe._domain_sweep(np, np.float32, everywhere, [(1.0, "s")])
     assert not sweep.passed and sweep.wrong is not None and sweep.wrong["normal"] > 0
 

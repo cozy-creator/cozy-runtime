@@ -14,5 +14,16 @@ from cozy_runtime.derive.facade import (
     quantize,
     quantize_artifact,
 )
+from cozy_runtime.weights_store import Checkpoint, Derivation, Output, read_into
 
-__all__ = ["QuantizePlan", "QuantizeResult", "plan", "quantize", "quantize_artifact"]
+__all__ = [
+    "Checkpoint",
+    "Derivation",
+    "Output",
+    "QuantizePlan",
+    "QuantizeResult",
+    "plan",
+    "quantize",
+    "quantize_artifact",
+    "read_into",
+]

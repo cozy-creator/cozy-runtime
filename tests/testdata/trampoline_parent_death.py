@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 import os
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 SOURCE = Path(__file__).resolve().parents[2] / "src"
@@ -77,31 +75,6 @@ def death(uid: int, gid: int) -> None:
     print(json.dumps({"returncode": os.waitstatus_to_exitcode(status)}), flush=True)
 
 
-def filesystem_identity() -> None:
-    import tensorfs
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    with tempfile.TemporaryDirectory(prefix="cozy-pdeath-store.") as directory:
-        # Scoped native I/O uses the Store owner's fsUID and must traverse this fixture.
-        Path(directory).chmod(0o755)
-        root = Path(directory) / "store"
-        tensorfs.Store.init(root)
-        for current, directories, files in os.walk(root):
-            os.chown(current, 65532, 65532)
-            for name in (*directories, *files):
-                os.chown(Path(current) / name, 65532, 65532)
-        assert libc.prctl(1, signal.SIGKILL, 0, 0, 0) == 0
-        before = ctypes.c_int()
-        assert libc.prctl(2, ctypes.byref(before), 0, 0, 0) == 0
-        tensorfs.Store.open(root)
-        after = ctypes.c_int()
-        assert libc.prctl(2, ctypes.byref(after), 0, 0, 0) == 0
-        print(
-            json.dumps({"before": before.value, "after": after.value, "uid": os.geteuid()}),
-            flush=True,
-        )
-
-
 if __name__ == "__main__":
     match sys.argv[1]:
         case "report":
@@ -112,5 +85,3 @@ if __name__ == "__main__":
             death(int(sys.argv[2]), int(sys.argv[3]))
         case "orphan":
             raise SystemExit(subprocess.call(command(-1, -1, "report", os.getpid() + 1)))
-        case "filesystem_identity":
-            filesystem_identity()

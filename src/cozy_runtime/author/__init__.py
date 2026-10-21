@@ -162,7 +162,6 @@ from cozy_runtime.author._weights import (
     MAX_WEIGHTS_NEW_BYTES,
     Weights,
     WeightsOutput,
-    WeightsReceipt,
 )
 from cozy_runtime.author.publication import (
     AssessmentRef,
@@ -290,7 +289,6 @@ __all__ = [
     "VideoProbe",
     "Weights",
     "WeightsOutput",
-    "WeightsReceipt",
     "active_attention_layout",
     "assert_declaration_shape",
     "attach_assessment",

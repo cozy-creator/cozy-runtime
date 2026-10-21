@@ -29,7 +29,7 @@ class ProducerCall:
     original: Callable[..., Any]
     """The site's own processor: dense steps and dense paths, served by the base backend."""
     quantize: Callable[[Any], PreQuantized]
-    """The `fp8-rowwise` leaf's activation quantizer: one operand all three projections share."""
+    """The `fp8.rowwise` leaf's activation quantizer: one operand all three projections share."""
     exchange: Callable[[Any, Any, Any, Callable[[Any, Any, Any], Any]], Any]
     """`exchange(q, k, v, compute)`: the Ulysses all-to-all to whole sequences per head
     subset, `compute` there, and back."""

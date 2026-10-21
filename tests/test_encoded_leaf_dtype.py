@@ -12,6 +12,7 @@ except ImportError as exc:
 
 from cozy_runtime.derive.microscale import encode_int8_convrot256
 from cozy_runtime.internal import accel
+from cozy_runtime.internal.encoding import params_of
 from cozy_runtime.internal.encoding.leaves import Int8ConvRotNativeLeaf, RowwiseNativeLeaf
 from cozy_runtime.internal.fp8_linear import eager_quantize
 
@@ -23,11 +24,11 @@ class EncodedLeafDtypeTest(unittest.TestCase):
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 original = torch.nn.Linear(4, 2, bias=False, dtype=dtype)
-                leaf = RowwiseNativeLeaf("fp8-rowwise/1").leaf(
-                    torch, {"data": payload, "scale": scales}, original, dtype
+                leaf = RowwiseNativeLeaf().leaf(
+                    torch, {"weight": payload, "scale": scales}, original, dtype
                 )
                 self.assertEqual(get_parameter_dtype(leaf), dtype)
-                self.assertIs(leaf.roles()["data"], payload)
+                self.assertIs(leaf.roles()["weight"], payload)
                 self.assertIs(leaf.roles()["scale"], scales)
                 self.assertEqual(set(leaf.state_dict()), {"data", "scale"})
                 self.assertEqual(list(leaf.parameters()), [])
@@ -55,9 +56,9 @@ class EncodedLeafDtypeTest(unittest.TestCase):
         scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32)
         original = torch.nn.Linear(256, 16, dtype=torch.float16)
         original.weight.data.copy_(weight)
-        leaf = Int8ConvRotNativeLeaf("int8-convrot256/1").leaf(
-            torch, {"data": data, "scale": scale}, original, torch.float16
-        )
+        leaf = Int8ConvRotNativeLeaf(
+            params=params_of({"rotation": "kron_regular_h4", "rotation_size": 256})
+        ).leaf(torch, {"weight": data, "scale": scale}, original, torch.float16)
         x = torch.randn(4, 256, generator=generator)
         expected = original.to(torch.float32)(x)
         with torch.autocast("cpu", dtype=torch.bfloat16):
@@ -79,8 +80,8 @@ class EncodedLeafDtypeTest(unittest.TestCase):
         for dtype in (torch.float32, torch.bfloat16):
             with self.subTest(dtype=dtype):
                 original = torch.nn.Linear(32, 32, bias=False, dtype=dtype, device=device)
-                leaf = RowwiseNativeLeaf("fp8-rowwise/1").leaf(
-                    torch, {"data": payload, "scale": scales}, original, dtype
+                leaf = RowwiseNativeLeaf().leaf(
+                    torch, {"weight": payload, "scale": scales}, original, dtype
                 )
                 self.assertEqual(get_parameter_dtype(leaf), dtype)
                 activation = logical.to(get_parameter_dtype(leaf))
@@ -91,7 +92,7 @@ class EncodedLeafDtypeTest(unittest.TestCase):
                 torch.testing.assert_close(
                     leaf(activation).float(), expected.to(dtype).float(), rtol=0.015, atol=0.025
                 )
-                self.assertIs(leaf.roles()["data"], payload)
+                self.assertIs(leaf.roles()["weight"], payload)
                 self.assertIs(leaf.roles()["scale"], scales)
 
 

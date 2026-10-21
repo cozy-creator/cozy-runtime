@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import contextlib
 import functools
-import sys
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
@@ -16,10 +15,9 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
-from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED, Cancelled
+from cozy_runtime.author._errors import MEMORY_EXHAUSTED, Cancelled, classify
 from cozy_runtime.author._model import remote_scope
 from cozy_runtime.internal import attention_sol, execution_evidence
-from cozy_runtime.internal.memory import collective, shortage
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import ENDED, SHORT, RankGroup, SpreadLog
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -31,13 +29,11 @@ def _failed(what: str, exc: BaseException) -> str:
 
 
 def ending(exc: BaseException) -> str | None:
-    """How one GPU's part of a group call ended short of memory: `DEVICE_OOM` in a collective
-    (the group runs the call again), `MEMORY_EXHAUSTED` when its own ladder ran out (the
-    attempt ends and the group stays whole), `ENDED` when another GPU ended the collective it
-    waited in; None for a fault, which breaks the group."""
-    if collective(exc):
-        return DEVICE_OOM
-    if shortage(exc) is not None or getattr(exc, "code", None) in SHORT:
+    """How one GPU's part of a group call ended short of memory (`DEVICE_OOM` or
+    `MEMORY_EXHAUSTED`: the attempt ends and the group stays whole), or `ENDED` when another GPU
+    ended the collective it waited in; None for a fault, which breaks the group."""
+    code = classify(exc).code
+    if code in SHORT or getattr(exc, "code", None) in SHORT:
         return MEMORY_EXHAUSTED
     return ENDED if type(exc).__name__ == "DistBackendError" else None
 
@@ -50,8 +46,8 @@ def mirror_component(
     group: RankGroup,
     spool: Callable[[], Path | None],
     cancelled: Callable[[], bool] = lambda: False,
-    rerun: Callable[[Mapping[int, int]], Mapping[int, int]] | None = None,
-    journaled: Callable[[], contextlib.AbstractContextManager[Any]] = contextlib.nullcontext,
+    reform: Callable[[], None] | None = None,
+    progress: Callable[[], int] = lambda: 0,
     device: Any = None,
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
@@ -63,12 +59,9 @@ def mirror_component(
     Scope admission has already happened on the leader. Followers receive that same
     complete scope, including any overlay weights used by component hooks.
 
-    Every GPU recovers its own ops; the others wait at the next collective. When a GPU's part
-    ends short of memory (`ending`), every GPU ends the call and puts back what it changed
-    (`journaled`: this GPU's call journal) and the group forms again (`rerun`: GPU -> the room
-    its last run had, for each that ran out in a collective; it answers the room each runs
-    again with, -1 when it found no more). A collective that ran out runs the call again while
-    its GPU finds more room; anything else ends the attempt `memory_exhausted`, the group whole.
+    When a GPU's part ends short of memory (`ending`), every GPU ends the call, the group forms
+    again (`reform`) and the attempt ends `memory_exhausted` with the group whole (memory-varena
+    §5.5): a typed failure on one GPU ends the request on all of them.
     """
     if component._compiled_call_impl is not None:
         raise cp.ContextParallelUnavailable(
@@ -86,85 +79,51 @@ def mirror_component(
         try:
             # Every follower joins the collective: none may be answering an overlapped call.
             with group.hold(range(1, group.degree)):
-                seen: dict[int, int] = {}  # GPU -> the room its last run had
                 kept = False  # the group formed again: whole, whatever the attempt does
                 try:
-                    while True:
-                        group.rerunnable = rerun is not None
-                        group.broadcast(msgspec.to_builtins(command))
-                        failure: Exception | None = None
-                        ended: list[tuple[int, str, str]] = []  # (GPU, `ending`, detail)
-                        with (
-                            journaled() as journal,
-                            group.watched(name[1], journal.progress if journal else lambda: 0),
-                        ):
-                            try:
-                                assert isinstance(payloads, wire.Broadcast)
-                                payloads.send(group.pg, device)
-                                with cp.gated_call():
-                                    result = call(*args, **kwargs)
-                            except Exception as exc:
-                                code = ending(exc) if group.rerunnable else None
-                                if code is None and not group.interrupted:
-                                    if journal is not None:  # the state its blocks found
-                                        journal.rewind()
-                                    raise
-                                failure = exc
-                                ended.append((0, code or ENDED, f"{type(exc).__name__}: {exc}"))
-                                group.interrupt()  # the followers wait on GPU 0 in a collective
-                            frames = list(zip(group.followers, group.collect("run"), strict=True))
-                            ended += [
-                                (follower.rank, str(frame["code"]), str(frame.get("detail", "")))
-                                for follower, frame in frames
-                                if "rerun" in frame
-                            ]
-                            for follower, frame in frames:
-                                if not ended or not (frame.get("ok") or "rerun" in frame):
-                                    reply = _accept(name, group, follower.rank, frame)
-                                    attention_sol.record_rank(follower.rank, reply.sol_calls)
-                            if not ended:
-                                return result
-                            group.interrupt()
-                            if journal is not None:  # the call runs again from what it found
-                                journal.rewind()
-                        causes = [row for row in ended if row[1] != ENDED]
-                        if rerun is None or not causes:
-                            raise GroupRefusal(
-                                f"{name[1]!r} ended: "
-                                + "; ".join(f"{group.gpu(g)}: {d}" for g, _, d in ended),
-                                code="group_broken",
-                            )
-                        exhausted = [row for row in causes if row[1] == MEMORY_EXHAUSTED]
-                        if exhausted:
-                            rerun({})  # this attempt ends; the group serves the next one
-                            kept = True
-                            gpu, _, detail = exhausted[0]
-                            if gpu == 0 and failure is not None:
-                                raise failure
-                            raise GroupRefusal(
-                                f"{group.gpu(gpu)}: {detail}"[:1200], code=MEMORY_EXHAUSTED
-                            )
-                        if failure is not None:
-                            failure.__traceback__ = None  # its frames free their tensors
-                        short = {gpu: seen.get(gpu, -1) for gpu, _, _ in causes}
-                        rooms = rerun(short)
-                        kept = True
-                        now = {gpu: rooms.get(gpu, -1) for gpu in short}
-                        gpus = ", ".join(group.gpu(gpu) for gpu in short)
-                        if any(room < 0 for room in now.values()):
-                            raise GroupRefusal(
-                                f"{gpus} ran out of device memory in a collective of "
-                                f"{name[1]!r}, and found no more room to run it again",
-                                code=MEMORY_EXHAUSTED,
-                            )
-                        seen |= now
-                        kept = False
-                        print(
-                            f"[group] {gpus} ran out of device memory in a collective of "
-                            f"{name[1]!r}; the group runs it again with {now} B free",
-                            file=sys.stderr,
-                            flush=True,
+                    group.rerunnable = reform is not None
+                    group.broadcast(msgspec.to_builtins(command))
+                    failure: Exception | None = None
+                    ended: list[tuple[int, str, str]] = []  # (GPU, `ending`, detail)
+                    with group.watched(name[1], progress):
+                        try:
+                            assert isinstance(payloads, wire.Broadcast)
+                            payloads.send(group.pg, device)
+                            with cp.gated_call():
+                                result = call(*args, **kwargs)
+                        except Exception as exc:
+                            code = ending(exc) if group.rerunnable else None
+                            if code is None and not group.interrupted:
+                                raise
+                            failure = exc
+                            ended.append((0, code or ENDED, f"{type(exc).__name__}: {exc}"))
+                            group.interrupt()  # the followers wait on GPU 0 in a collective
+                        frames = list(zip(group.followers, group.collect("run"), strict=True))
+                        ended += [
+                            (follower.rank, str(frame["code"]), str(frame.get("detail", "")))
+                            for follower, frame in frames
+                            if "rerun" in frame
+                        ]
+                        for follower, frame in frames:
+                            if not ended or not (frame.get("ok") or "rerun" in frame):
+                                reply = _accept(name, group, follower.rank, frame)
+                                attention_sol.record_rank(follower.rank, reply.sol_calls)
+                        if not ended:
+                            return result
+                        group.interrupt()
+                    causes = [row for row in ended if row[1] != ENDED]
+                    if reform is None or not causes:
+                        raise GroupRefusal(
+                            f"{name[1]!r} ended: "
+                            + "; ".join(f"{group.gpu(g)}: {d}" for g, _, d in ended),
+                            code="group_broken",
                         )
+                    reform()  # this attempt ends; the group serves the next one
+                    kept = True
+                    gpu, _, detail = causes[0]
+                    if gpu == 0 and failure is not None:
+                        raise failure
+                    raise GroupRefusal(f"{group.gpu(gpu)}: {detail}"[:1200], code=MEMORY_EXHAUSTED)
                 except BaseException as exc:
                     first = group.broken
                     if not kept:
@@ -227,10 +186,6 @@ def _hosted(
                 if getattr(exc, "code", None) not in SHORT:  # short of memory: not a fault
                     group._break(_failed(f"hosted component {name!r}", exc))
                 raise
-            residency = prepared[name][0]._cozy_residency
-            if residency is not None:
-                (scope,) = command.scopes
-                residency.observe_remote(scope.method, reply.working_peak_bytes)
             return wire.unmarshal(reply.result, results, device=device)
         finally:
             payloads.clear()
@@ -263,7 +218,7 @@ def install_spread(
         local = getattr(component, method)
         if prepared[name][0]._cozy_active is None:
             # Outside a component scope no follower may stage it: run here.
-            yield from (local(*args) for args in arguments)
+            yield from (_one_tensor(local(*args)) for args in arguments)
             return
         # This call's decliners sit out its remaining rounds; the attempt's log sums calls.
         declined: dict[str, str] = {}
@@ -318,7 +273,7 @@ def install_spread(
                 spread = msgspec.structs.replace(command, method=method, p2p=True, spare=spare)
                 group.send_one(rank, msgspec.to_builtins(spread))
             index, args = batch[0]
-            finished[index] = getattr(component, method)(*args)
+            finished[index] = _one_tensor(getattr(component, method)(*args))
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
@@ -338,6 +293,12 @@ def install_spread(
                 payloads.clear()
 
     object.__setattr__(component, "_cozy_spread", spread)
+
+
+def _one_tensor[T](result: T) -> T:
+    """A spread call's result here, held to the contract a follower's crosses under."""
+    wire.p2p_head(result)
+    return result
 
 
 class GroupPlacement:

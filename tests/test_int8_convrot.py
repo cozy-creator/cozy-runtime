@@ -1,4 +1,4 @@
-"""`int8-convrot256/1`: producer, recipe selection over real TensorFS channels, decode and leaf."""
+"""`int8-convrot`: producer, recipe selection into the store, decode and leaf."""
 
 from __future__ import annotations
 
@@ -7,18 +7,16 @@ from typing import Any
 
 import numpy as np
 import pytest
-import tensorfs
+from tensorfs import raw
 
 from cozy_runtime.author import UnsupportedInput, Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
-from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.derive.microscale import decode_int8_convrot256, encode_int8_convrot256
 from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
-from cozy_runtime.internal.encoding import SPEC_INT8_CONVROT256
-from native_weights import NativeExecution
-from test_derive_quantize_facade import BOUND, header, mint
+from cozy_runtime.internal.encoding import params_of
+from store_fixtures import Shown, adopted, checkpoint, context, home
 
-ENCODING = "int8-convrot256/1"
+ENCODING = "int8.convrot"
 
 
 def weight(rows: int, cols: int, seed: int) -> np.ndarray:
@@ -43,65 +41,53 @@ def test_producer_round_trip_and_scale_floor() -> None:
         encode_int8_convrot256("w", weight(4, 320, 1))
 
 
-@pytest.mark.skipif(
-    ENCODING not in dict(tensorfs.seed_digests()), reason="TensorFS before 0.9.2 lacks the spec"
-)
-def test_include_recipe_encodes_exactly_its_weights(tmp_path: Path) -> None:
-    def row(shape: tuple[int, int], seed: int) -> tuple[str, tuple[int, ...], bytes]:
-        return "bf16", shape, st.from_f32(weight(*shape, seed), "BF16")
-
-    rows = {
-        "transformer": {
-            "blocks.0.attn.to_q.weight": row((8, 256), 1),
-            "blocks.0.mlp.out.weight": row((16, 512), 2),
-            "proj_out.weight": row((8, 256), 3),
+def test_include_recipe_encodes_exactly_its_weights(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    shown: Shown = []
+    source = checkpoint(
+        store,
+        {
+            "transformer": {
+                "blocks.0.attn.to_q.weight": weight(8, 256, 1),
+                "blocks.0.mlp.out.weight": weight(16, 512, 2),
+                "proj_out.weight": weight(8, 256, 3),
+            },
+            "vae": {"conv.weight": weight(8, 256, 4)},
         },
-        "vae": {"conv.weight": row((8, 256), 4)},
-    }
-    store, source = mint(tmp_path, rows)
+    )
     plan = QuantizationPlan(
         components=("transformer",),
         include=("transformer.blocks.*.weight",),
         output_precision="preserve",
     )
-    with NativeExecution(store, tmp_path, "int8", {"source": source}, {"model": BOUND}) as owner:
-        ctx = owner.context()
-        artifact = quantize_into(
-            ctx,
-            fake_telemetry(fake_attempt("int8")),
-            source=Weights(source.manifest.digest),
-            plan=plan,
-            encoding=ENCODING,
-            output="model",
-        )
-    parsed = header(store, artifact)
-    spec = dict(tensorfs.seed_digests())[ENCODING]
-    assert spec == SPEC_INT8_CONVROT256
+    quantize_into(
+        context(store, shown=shown), fake_telemetry(fake_attempt("int8")), source=Weights(source),
+        plan=plan, encoding=ENCODING, output="model",
+    )  # fmt: skip
+    out = adopted(store, shown)
     encoded = {
         (component, key)
-        for component, tensors in parsed["components"].items()
-        for key, tensor in tensors.items()
-        if tensor["encoding"] == spec
+        for component, held in out.components.items()
+        for key, info in held.tensors.items()
+        if info.encoding is not None
     }
-    to_q = parsed["components"]["transformer"]["blocks.0.attn.to_q.weight"]["parts"]
-    assert (to_q["data"]["dtype"], to_q["scale"]["shape"]) == ("i8", [8])
     assert encoded == {
         ("transformer", "blocks.0.attn.to_q.weight"),
         ("transformer", "blocks.0.mlp.out.weight"),
     }
+    to_q = out.components["transformer"].tensors["blocks.0.attn.to_q.weight"]
+    assert to_q.encoding is not None and to_q.encoding.scheme == ENCODING
+    parts = raw.parts(out, "transformer", "blocks.0.attn.to_q.weight")
+    assert (parts["weight"].dtype, parts["scale"].shape) == ("I8", (8,))
+    assert out.components["transformer"].tensors["proj_out.weight"].dtype == "F32", "preserved"
     typo = QuantizationPlan(components=("transformer",), include=("transformer.nope.*",))
-    with (
-        pytest.raises(UnsupportedInput, match="match no weight"),
-        NativeExecution(store, tmp_path, "typo", {"source": source}, {"model": BOUND}) as owner,
-    ):
+    with pytest.raises(UnsupportedInput, match="match no weight"):
         quantize_into(
-            owner.context(),
-            fake_telemetry(fake_attempt("typo")),
-            source=Weights(source.manifest.digest),
-            plan=typo,
-            encoding=ENCODING,
-            output="model",
-        )
+            context(store, "typo"), fake_telemetry(fake_attempt("typo")), source=Weights(source),
+            plan=typo, encoding=ENCODING, output="model",
+        )  # fmt: skip
 
 
 torch: Any = pytest.importorskip("torch")
@@ -111,9 +97,11 @@ def test_decode_is_the_spec_law_and_the_mined_vectors() -> None:
     from cozy_runtime.internal import probe
     from cozy_runtime.internal.encoding import Int8ConvRotDequant
 
-    provider = Int8ConvRotDequant(SPEC_INT8_CONVROT256)
+    provider = Int8ConvRotDequant(
+        params=params_of({"rotation": "kron_regular_h4", "rotation_size": 256})
+    )
     vectors = probe._spec_vectors(torch, provider, torch.device("cpu"))
-    assert vectors.passed and len(vectors.cases) == 3
+    assert vectors.passed and len(vectors.cases) == 4
     for dtype in (torch.float32, torch.bfloat16, torch.float16):
         assert probe._numerics_int8_convrot(torch, provider, torch.device("cpu"), dtype).passed
 

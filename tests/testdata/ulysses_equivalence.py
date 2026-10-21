@@ -3,15 +3,12 @@
 `--plant` replaces the exchange with the rank's own shard only, the silent-corruption shape the
 wrapper exists to prevent: right shape, no error, wrong attention. `--cuda` runs the ranks on
 NCCL, one GPU each, and also through the copy-engine exchange, which must give the NCCL bytes.
-`--recovery` runs the degree-N call under the modes a group GPU's package call runs its ops
-under: the call's recovery, its journal and a block's journaled recovery, bands included.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,11 +20,10 @@ from torch.distributed import _symmetric_memory as symm
 from torch.multiprocessing.spawn import spawn
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from cozy_runtime.internal import attention, attention_ulysses, bands
+from cozy_runtime.internal import attention, attention_ulysses
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.parallel import copy_engine
 from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
-from cozy_runtime.internal.weights import Journal, Weights, journaling
 
 
 class Writes(TorchDispatchMode):
@@ -59,19 +55,6 @@ class Wrapped(TorchDispatchMode):
         return out
 
 
-def package_call(device: torch.device) -> ExitStack:
-    """`Executor`'s call recovery, then the group call's journal, then a block's journaled
-    recovery (`Weights.recovering`), on a real plane with bands."""
-    weights = Weights(torch, device, device.type)
-    weights.host_only = False
-    weights.bands = bands.Bands(weights)
-    stack = ExitStack()
-    stack.enter_context(weights.recovering())
-    stack.enter_context(journaling(torch, Journal()))
-    stack.enter_context(weights.recovering(Journal()))
-    return stack
-
-
 def rank_main(
     rank: int,
     degree: int,
@@ -79,7 +62,6 @@ def rank_main(
     shape: tuple[int, ...],
     plant: bool,
     cuda: bool,
-    recovery: bool,
 ) -> None:
     torch.set_num_threads(1)
     if plant:
@@ -121,7 +103,7 @@ def rank_main(
             q, k, v = (t.to(torch.bfloat16) for t in (q, k, v))
         shards = [t.tensor_split(degree, dim=1)[rank].contiguous() for t in (q, k, v)]
         with torch.no_grad(), attention_ulysses.observing() as seen:
-            with package_call(device) if recovery else ExitStack(), Wrapped() as wrapped:
+            with Wrapped() as wrapped:
                 got = backend(
                     query=shards[0], key=shards[1], value=shards[2], _parallel_config=config
                 )
@@ -166,13 +148,12 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=56)
     parser.add_argument("--plant", action="store_true")
     parser.add_argument("--cuda", action="store_true")
-    parser.add_argument("--recovery", action="store_true")
     args = parser.parse_args()
     shape = (1, args.rows, args.heads, 128)
     start: Any = spawn
     start(
         rank_main,
-        args=(args.degree, args.root, shape, args.plant, args.cuda, args.recovery),
+        args=(args.degree, args.root, shape, args.plant, args.cuda),
         nprocs=args.degree,
         join=True,
     )

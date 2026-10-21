@@ -1,8 +1,9 @@
-"""Carrier-free FP8 and INT8 model derivations.
+"""Lane derivations: normalize floats to bf16 and encode selected weights, in the store.
 
-The worker receives one exact TensorFS Manifest capability and returns another through
-TensorFS scoped derivation handles. It receives no Store or filesystem access.
-Publication belongs to Tensorhub's production transaction.
+A derivation reads one source checkpoint and writes one output (`weights_store.Output`) whose
+base is that source: every component and tensor it does not write again carries over, in the
+source's construction order. Writes are resumable: a tensor an interrupted attempt wrote
+(`has`) is not computed again.
 """
 
 from __future__ import annotations
@@ -13,21 +14,17 @@ import math
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import IO, Any, NamedTuple
+from typing import IO, NamedTuple
 
 import msgspec
 import numpy as np
-from tensorfs.derived import Config, DerivedTransaction, Part, SourceInspection, Target, Tensor
 
 from cozy_runtime._cpus import cpus
-from cozy_runtime.author import (
-    Context,
-    Telemetry,
-    UnsupportedInput,
-    _numeric,
-)
+from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
+from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
+from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
 from . import safetensors_io as st
 from .microscale import (
@@ -41,33 +38,24 @@ from .microscale import (
 
 
 class _Encoding(NamedTuple):
-    """The encoder, its maximum reconstruction error as a multiple of tensor amax, the data
-    role's carrier, the column multiple it needs, and its roles: the data role, then each
-    companion's (role, dtype, shape) for a `[rows, cols]` tensor. A companion shaped `()` is one
-    per tensor (nvfp4's second level), so the tensor's amax is read before any chunk is encoded
-    and every chunk is encoded against it; every other companion leads with `rows`."""
+    """A scheme's encoder: its round-trip bound (a multiple of tensor amax), the column multiple
+    it needs, its params, and its parts after `weight`, each `(role, dtype, shape)` for an
+    `[rows, cols]` tensor. A part shaped `()` is one per tensor (nvfp4's second level), so the
+    tensor's amax is read before any chunk is encoded and every chunk encodes against it."""
 
     round_trip_bound: float
     encode: Callable[[str, np.ndarray, float], Encoded]
-    payload: str
-    data_dtype: str
+    weight_dtype: str
     block: int
+    params: dict[str, object]
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
-    data_role: str = "data"
-    packed: int = 1
-
-    def data_shape(self, rows: int, cols: int) -> tuple[int, int]:
-        return rows, cols // self.packed
-
-    def roles(self) -> tuple[str, ...]:
-        return (self.data_role, *(role for role, _, _ in self.companions(1, self.block)))
 
     def tensor_scaled(self) -> bool:
         return any(not shape for _, _, shape in self.companions(1, self.block))
 
 
 def _row_scale(rows: int, cols: int) -> tuple[tuple[str, str, tuple[int, ...]], ...]:
-    return (("scale", "f32", (rows,)),)
+    return (("scale", "F32", (rows,)),)
 
 
 def _rowwise(
@@ -77,44 +65,64 @@ def _rowwise(
 
 
 _ENCODINGS: dict[str, _Encoding] = {
-    "fp8-rowwise/1": _Encoding(
-        round_trip_bound=2.0**-3,
-        encode=_rowwise(encode_fp8_rowwise),
-        payload="F8_E4M3",
-        data_dtype="f8_e4m3fn",
-        block=32,
-        companions=_row_scale,
+    "fp8.rowwise": _Encoding(
+        2.0**-3,
+        _rowwise(encode_fp8_rowwise),
+        "F8_E4M3",
+        32,
+        {"axis": 0},
+        _row_scale,
     ),
-    # Measured worst on Qwen-Image-2.1 and Qwen3-VL weights is far inside this; the bound is
-    # a tripwire for a broken encoder, not a quality gate.
-    "int8-convrot256/1": _Encoding(
-        round_trip_bound=2.0**-4,
-        encode=_rowwise(encode_int8_convrot256),
-        payload="I8",
-        data_dtype="i8",
-        block=CONVROT_GROUP,
-        companions=_row_scale,
+    # The bound is a tripwire for a broken encoder, not a quality gate.
+    "int8.convrot": _Encoding(
+        2.0**-4,
+        _rowwise(encode_int8_convrot256),
+        "I8",
+        CONVROT_GROUP,
+        {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
+        _row_scale,
     ),
     # A block's error is at most half its largest E2M1 step (2 of 6) times its scale, and a
     # clipped candidate gives up at most one E4M3 step on the block max: well inside amax / 4.
-    "nvfp4-w4a4/1": _Encoding(
-        round_trip_bound=2.0**-2,
-        encode=encode_nvfp4,
-        payload="U8",
-        data_dtype="u8",
-        block=NVFP4_BLOCK,
-        companions=lambda rows, cols: (
-            ("weight_scale", "f8_e4m3fn", (rows, cols // NVFP4_BLOCK)),
-            ("weight_scale_2", "f32", ()),
+    "nvfp4": _Encoding(
+        2.0**-2,
+        encode_nvfp4,
+        "F4",
+        NVFP4_BLOCK,
+        {
+            "block_size": NVFP4_BLOCK,
+            "global_scale": "multiply",
+            "nibble_order": "low_first",
+            "scale_layout": "row_major",
+        },
+        lambda rows, cols: (
+            ("scale", "F8_E4M3", (rows, cols // NVFP4_BLOCK)),
+            ("scale_2", "F32", ()),
         ),
-        data_role="weight",
-        packed=2,
     ),
 }
 
 #: RNE fp32->bf16 keeps every element within amax * 2^-8 (8-bit significand, half-ulp).
-#: The normalization's own tier-1 bound — enforced on every cut, stats recorded (#695).
 BF16_ROUND_TRIP_BOUND = 2.0**-8
+_SOURCE_READ_CHUNK = 8 << 20
+_WIDTH = {"bf16": 2, "f16": 2, "f32": 4}
+
+
+class SourceTensor(NamedTuple):
+    """A source tensor as a derivation plans on it: its Runtime dtype, shape, and whether it is
+    stored plain."""
+
+    logical_dtype: str
+    shape: tuple[int, ...]
+    plain: bool
+
+
+def source_rows(source: Checkpoint) -> Iterator[tuple[str, str, SourceTensor]]:
+    """The source's tensors in construction order."""
+    for component, held in source.components.items():
+        for key, info in held.tensors.items():
+            dtype = TENSORFS_DTYPES.get(info.dtype, info.dtype)
+            yield component, key, SourceTensor(dtype, tuple(info.shape), info.encoding is None)
 
 
 class QuantizationTensor(msgspec.Struct, forbid_unknown_fields=True):
@@ -124,16 +132,14 @@ class QuantizationTensor(msgspec.Struct, forbid_unknown_fields=True):
     key: str
     logical_dtype: str
     shape: tuple[int, int]
-    source_role: str = "value"
-    #: This weight's own encoding, when it is not the lane's.
+    #: This weight's own scheme, when it is not the lane's.
     encoding: str | None = None
 
 
 class ArtifactQuantizationPlan(msgspec.Struct, forbid_unknown_fields=True):
-    """Bounded source structure, kept separate from model-sized source bytes."""
+    """The selected tensors, kept separate from model-sized source bytes."""
 
     components: list[str]
-    configs: list[str]
     order: list[tuple[str, str]]
     tensors: list[QuantizationTensor]
 
@@ -156,220 +162,117 @@ class Bf16Tensor(msgspec.Struct):
     key: str
     source_dtype: str
     shape: tuple[int, ...]
-    source_role: str
 
 
 class Bf16Plan(msgspec.Struct):
     components: list[str]
-    configs: list[str]
     order: list[tuple[str, str]]
     tensors: list[Bf16Tensor]
-    #: f32 tensors a keep-listed component holds at source precision (#695).
+    #: float tensors a keep-listed component holds at source precision (#695)
     kept: list[tuple[str, str]]
 
 
 class Bf16Stats(msgspec.Struct):
-    """What one normalization cut recorded — the tier-1 round-trip stats of #695."""
+    """What one normalization cut recorded: the round-trip stats of #695."""
 
     converted_keys: int
+    reused_keys: int
     source_bytes_read: int
     new_bytes_written: int
     worst_relative_frobenius: float | None
-
-
-_ARTIFACT_SPECS = {
-    # TensorFS 0.3's exact, vector-backed platform specs. Aliases are display;
-    # Tensor always carries the immutable spec identity.
-    "fp8-rowwise/1": "sha256:c4be0120fb4548306b134f6ee07eb2545a363bc140a005af1ef6543c790cf890",
-    "int8-convrot256/1": "sha256:ac25d323baebfdf1fd0ce3fdfd9f26400ce57914fdc442d0ade8cb187aef183f",
-    "nvfp4-w4a4/1": "sha256:f2e718c521634876830f9c2647bddfbbccafc744decc88adb345d33d73bf5b1a",
-}
-PLAIN_SPEC = "sha256:1fb882a7e46d0aff520f9d8a28cefd643954c19371737443101ba3c5fcc3613f"
-_MAX_ARTIFACT_PLAN_BYTES = 8 << 20
-_SOURCE_READ_CHUNK = 8 << 20
-MAX_OUTPUT_BYTES = 32 << 30
-
-
-def prepare_quantization(plan_bytes: bytes) -> ArtifactQuantizationPlan:
-    """Validate one closed structural plan for caller-owned transactions."""
-    return _artifact_plan(plan_bytes)
-
-
-def source_rows(structure: SourceInspection) -> Iterator[tuple[str, str, Tensor]]:
-    """Traverse the native header's construction order."""
-    for component, tensors in structure.components.items():
-        for key, tensor in tensors.items():
-            yield component, key, tensor
-
-
-def source_parts(tensor: Tensor) -> Mapping[str, Part]:
-    return tensor.parts
-
-
-def completed_parts(transaction: DerivedTransaction) -> set[tuple[str, str, str]]:
-    return set(transaction.completed_parts())
 
 
 def bf16_source_dtypes(sources: Sequence[str]) -> tuple[str, ...]:
     """Validate the explicit floating-point source cut; ordering has no meaning."""
     if not sources or len(set(sources)) != len(sources) or set(sources) - {"f16", "f32"}:
         raise UnsupportedInput(
-            "bf16_sources must contain unique f16 or f32 source dtypes",
-            code="quantization_plan",
+            "bf16_sources must contain unique f16 or f32 source dtypes", code="quantization_plan"
         )
     return tuple(sorted(sources))
 
 
 def prepare_bf16(
-    structure: SourceInspection,
-    *,
-    keep: tuple[str, ...] = (),
-    source_dtypes: tuple[str, ...] = ("f32",),
+    source: Checkpoint, *, keep: tuple[str, ...] = (), source_dtypes: tuple[str, ...] = ("f32",)
 ) -> Bf16Plan:
-    """Normalize selected plain floats; other source dtypes inherit unchanged."""
+    """Normalize selected plain floats; other tensors carry over unchanged."""
     source_dtypes = bf16_source_dtypes(source_dtypes)
     keep_set = set(keep)
     if len(keep_set) != len(keep):
         raise UnsupportedInput("keep list repeats a component")
-    rows = list(source_rows(structure))
+    rows = list(source_rows(source))
     components = list(dict.fromkeys(component for component, _, _ in rows))
     missing = sorted(keep_set - set(components))
     if missing:
         raise UnsupportedInput(f"keep list names absent components {missing}")
     tensors: list[Bf16Tensor] = []
     kept: list[tuple[str, str]] = []
-    order = [(component, key) for component, key, _ in rows]
     for component, key, tensor in rows:
-        if tensor.logical_dtype not in source_dtypes:
+        if not tensor.plain or tensor.logical_dtype not in source_dtypes:
             continue
         if component in keep_set:
             kept.append((component, key))
             continue
-        tensors.append(
-            Bf16Tensor(
-                component,
-                key,
-                tensor.logical_dtype,
-                tuple(tensor.shape),
-                _plain_source_role(tensor),
-            )
-        )
-    if not components or not order:
+        tensors.append(Bf16Tensor(component, key, tensor.logical_dtype, tensor.shape))
+    if not rows:
         raise UnsupportedInput("weights source structure contains no tensors")
-    return Bf16Plan(components, list(structure.configs), order, tensors, kept)
+    return Bf16Plan(components, [(c, k) for c, k, _ in rows], tensors, kept)
 
 
 def column_block(encoding: str | None) -> int:
-    """The column multiple an encoding's tensors need; 32 is fp8-rowwise's."""
+    """The column multiple a scheme's tensors need; 32 is fp8.rowwise's."""
     found = _ENCODINGS.get(encoding or "")
     return found.block if found is not None else 32
 
 
 def prepare_source_quantization(
-    structure: SourceInspection, *, components: tuple[str, ...], block: int = 32
+    source: Checkpoint, *, components: tuple[str, ...], block: int = 32
 ) -> ArtifactQuantizationPlan:
-    """Select plain rank-2 weights whose columns are a multiple of the encoding's `block`."""
-    rows = list(source_rows(structure))
+    """Select plain rank-2 float weights whose columns are a multiple of the scheme's `block`."""
+    rows = list(source_rows(source))
     missing = sorted(set(components) - {component for component, _, _ in rows})
     if missing:
         raise UnsupportedInput(f"weights source has no components {missing}")
-    selected: list[QuantizationTensor] = []
-    for component, key, tensor in rows:
-        if (
-            component not in components
-            or not key.endswith(".weight")
-            or tensor.logical_dtype not in {"f16", "bf16", "f32"}
-            or len(tensor.shape) != 2
-            or tensor.shape[1] % block
-        ):
-            continue
-        selected.append(
-            QuantizationTensor(
-                component=component,
-                key=key,
-                logical_dtype=tensor.logical_dtype,
-                shape=(tensor.shape[0], tensor.shape[1]),
-                source_role=_plain_source_role(tensor),
-            )
-        )
+    selected = [
+        QuantizationTensor(component, key, tensor.logical_dtype, (tensor.shape[0], tensor.shape[1]))
+        for component, key, tensor in rows
+        if component in components
+        and key.endswith(".weight")
+        and tensor.plain
+        and tensor.logical_dtype in _WIDTH
+        and len(tensor.shape) == 2
+        and tensor.shape[1] % block == 0
+    ]
     if not selected:
         raise UnsupportedInput("weights source has no block-aligned rank-2 float weights")
-    return ArtifactQuantizationPlan(
-        list(components),
-        list(structure.configs),
-        [(component, key) for component, key, _ in rows],
-        selected,
-    )
-
-
-def bf16_targets(
-    plan: Bf16Plan,
-    *,
-    source: str,
-    excluded: set[tuple[str, str]] | None = None,
-) -> dict[str, Target]:
-    """Declare BF16 replacements for the selected float cut; everything else inherits."""
-    omitted = excluded or set()
-    targets: dict[str, Target] = {}
-    for component in plan.components:
-        additions = {
-            tensor.key: Tensor(
-                logical_dtype="bf16",
-                shape=tensor.shape,
-                encoding=PLAIN_SPEC,
-                parts={"value": Part("bf16", tensor.shape)},
-            )
-            for tensor in plan.tensors
-            if tensor.component == component and (tensor.component, tensor.key) not in omitted
-        }
-        targets[component] = Target(
-            source=source,
-            source_component=component,
-            drop=tuple(sorted(additions)),
-            add=additions,
-        )
-    return targets
+    return ArtifactQuantizationPlan(list(components), [(c, k) for c, k, _ in rows], selected)
 
 
 def write_bf16(
-    transaction: DerivedTransaction,
+    source: Checkpoint,
+    output: Output,
     ctx: Context,
     tel: Telemetry,
     *,
     plan: Bf16Plan,
-    source: str,
     excluded: set[tuple[str, str]] | None = None,
 ) -> Bf16Stats:
-    """Stream the selected float cut through one bounded RNE conversion, stats recorded.
-
-    Every converted tensor's round trip is measured against the bf16 representational
-    bound (``BF16_ROUND_TRIP_BOUND`` of its amax) and logged per tensor; the worst
-    relative Frobenius rides the returned stats — the recorded derivation of #695,
-    never a silent cast.
-    """
+    """Stream the selected float cut through one bounded RNE conversion, stats recorded: each
+    tensor's round trip is held to `BF16_ROUND_TRIP_BOUND` of its amax and logged."""
     omitted = excluded or set()
-    selected = [tensor for tensor in plan.tensors if (tensor.component, tensor.key) not in omitted]
-    read = 0
-    written = 0
+    selected = [t for t in plan.tensors if (t.component, t.key) not in omitted]
+    read = written = reused = 0
     worst: float | None = 0.0
-    completed = completed_parts(transaction)
     for done, tensor in enumerate(selected, 1):
         ctx.raise_if_cancelled()
-        if (tensor.component, tensor.key, "value") in completed:
+        if output.has(tensor.component, tensor.key):
+            reused += 1
             worst = None
             tel.progress(done / len(selected), stage="bf16")
             continue
         amax = max_error = sse = energy = 0.0
-        length = size = 0
         with tempfile.TemporaryFile() as spill:
             for values in _read_chunks(
-                transaction,
-                source=source,
-                component=tensor.component,
-                key=tensor.key,
-                role=tensor.source_role,
-                logical_dtype=tensor.source_dtype,
-                shape=tensor.shape,
+                source, tensor.component, tensor.key, tensor.source_dtype, tensor.shape
             ):
                 raw = st.from_f32(values, "BF16")
                 error = np.abs(values - st.to_f32(raw, "BF16", list(values.shape)))
@@ -378,22 +281,20 @@ def write_bf16(
                     max_error = _numeric.worst(max_error, float(np.max(error)))
                 sse += float(np.sum(error.astype(np.float64) ** 2))
                 energy += float(np.sum(values.astype(np.float64) ** 2))
-                length += values.size * {"bf16": 2, "f16": 2, "f32": 4}[tensor.source_dtype]
-                size += spill.write(raw)
+                read += values.size * _WIDTH[tensor.source_dtype]
+                spill.write(raw)
             bound = amax * BF16_ROUND_TRIP_BOUND
             if not _numeric.within(max_error, bound):
                 raise UnsupportedInput(
-                    f"{tensor.component}.{tensor.key}: bf16 round-trip error "
-                    f"{max_error:.4g} exceeds the representational bound {bound:.4g}",
+                    f"{tensor.component}.{tensor.key}: bf16 round-trip error {max_error:.4g} "
+                    f"exceeds the representational bound {bound:.4g}",
                     code="quantization_tripwire",
                 )
             relative = math.sqrt(sse / energy) if energy else 0.0
             worst = _numeric.worst(worst, relative) if worst is not None else None
+            written += spill.tell()
             spill.seek(0)
-            transaction.add_part(tensor.component, tensor.key, "value", spill)
-        transaction.checkpoint()
-        read += length
-        written += size
+            output.put(tensor.component, tensor.key, "BF16", tensor.shape, spill)
         tel.log(
             "normalized tensor",
             level="info",
@@ -405,43 +306,12 @@ def write_bf16(
             total=len(selected),
         )
         tel.progress(done / len(selected), stage="bf16")
-    return Bf16Stats(
-        converted_keys=len(selected),
-        source_bytes_read=read,
-        new_bytes_written=written,
-        worst_relative_frobenius=worst,
-    )
-
-
-def inherited_configs(plan: Bf16Plan, *, source: str) -> dict[str, Config]:
-    return {name: Config("copy", source=source, source_config=name) for name in plan.configs}
-
-
-def quantization_additions(
-    encoding: str,
-    plan: ArtifactQuantizationPlan,
-    component: str,
-    *,
-    target_logical_dtype: str | None = None,
-) -> dict[str, Tensor]:
-    """Declare the encoded tensor replacements for one plan component."""
-    if encoding not in _ENCODINGS:
-        raise UnsupportedInput(f"unsupported quantization encoding {encoding!r}")
-    if component not in plan.components:
-        raise UnsupportedInput(f"quantization plan has no component {component!r}")
-    return {
-        tensor.key: _artifact_tensor(
-            tensor.encoding or encoding,
-            tensor,
-            target_logical_dtype=target_logical_dtype,
-        )
-        for tensor in plan.tensors
-        if tensor.component == component
-    }
+    return Bf16Stats(len(selected), reused, read, written, worst)
 
 
 def quantize_component_into(
-    transaction: DerivedTransaction,
+    source: Checkpoint,
+    output: Output,
     ctx: Context,
     payload: ArtifactQuantizationRequest,
     tel: Telemetry,
@@ -449,111 +319,77 @@ def quantize_component_into(
     encoding: str,
     plan: ArtifactQuantizationPlan,
     component: str,
-    source: str,
-    source_component: str,
-    target_component: str,
+    logical_dtype: Callable[[QuantizationTensor], str],
 ) -> QuantizationStats:
-    """Write one plan component into an already-open caller-owned transaction.
-
-    Tensors encode ahead on the shared pool; their roles are added and checkpointed here,
-    one tensor at a time and in plan order, exactly as a serial encoder would.
-    """
+    """Encode one plan component into the output. Tensors encode ahead on the shared pool and
+    are written here, one at a time and in plan order, as a serial encoder would."""
     _validate_request(payload)
     if encoding not in _ENCODINGS or any(
-        tensor.encoding not in (None, *_ENCODINGS) for tensor in plan.tensors
+        t.encoding not in (None, *_ENCODINGS) for t in plan.tensors
     ):
         raise UnsupportedInput(f"unsupported quantization encoding {encoding!r}")
     if component not in plan.components:
         raise UnsupportedInput(f"quantization plan has no component {component!r}")
-    tensors = [tensor for tensor in plan.tensors if tensor.component == component]
-
-    source_bytes = 0
-    new_bytes = 0
-    saturated = 0
+    tensors = [t for t in plan.tensors if t.component == component]
+    pending = [t for t in tensors if not output.has(t.component, t.key)]
+    source_bytes = new_bytes = saturated = 0
     worst = 0.0
-    total = len(tensors)
-    completed = completed_parts(transaction)
-    reused = 0
+    total, reused = len(tensors), len(tensors) - len(pending)
 
-    def encoding_of(tensor: QuantizationTensor) -> str:
+    def scheme(tensor: QuantizationTensor) -> str:
         return tensor.encoding or encoding
 
-    def finished(tensor: QuantizationTensor) -> bool:
-        roles = _ENCODINGS[encoding_of(tensor)].roles()
-        return all((target_component, tensor.key, role) in completed for role in roles)
-
-    def encode(tensor: QuantizationTensor, stop: threading.Event) -> _Encoded:
-        return _encode_tensor(
-            transaction,
-            encoding_of(tensor),
-            tensor,
-            stop,
-            source=source,
-            source_component=source_component,
-        )
-
-    results = _in_order([tensor for tensor in tensors if not finished(tensor)], encode)
+    results = _in_order(
+        pending, lambda tensor, stop: _encode_tensor(source, scheme(tensor), tensor, stop)
+    )
     with contextlib.closing(results):
-        for done, tensor in enumerate(tensors, 1):
+        for done, tensor in enumerate(pending, 1 + reused):
             ctx.raise_if_cancelled()
-            if finished(tensor):
-                reused += 1
-                tel.progress(done / total, stage=f"{encoding}-{target_component}")
-                continue
             result = next(results)
-            name = encoding_of(tensor)
-            roles = _ENCODINGS[name].roles()
+            name = scheme(tensor)
+            encoder = _ENCODINGS[name]
             with result.spill as spill:
-                bound = result.amax * _ENCODINGS[name].round_trip_bound
+                bound = result.amax * encoder.round_trip_bound
                 if not _numeric.within(result.max_error, bound):
                     raise UnsupportedInput(
-                        f"{source_component}.{tensor.key}: round-trip error "
-                        f"{result.max_error:.4g} exceeds the {name} bound {bound:.4g}",
+                        f"{component}.{tensor.key}: round-trip error {result.max_error:.4g} "
+                        f"exceeds the {name} bound {bound:.4g}",
                         code="quantization_tripwire",
                     )
-                if result.rows != tensor.shape[0]:
-                    raise UnsupportedInput(f"{name} changed its declared TensorFS geometry")
                 relative = math.sqrt(result.sse / result.energy) if result.energy > 0 else 0.0
                 if payload.max_relative_frobenius is not None and not _numeric.within(
                     relative, payload.max_relative_frobenius
                 ):
                     raise UnsupportedInput(
-                        f"{source_component}.{tensor.key}: relative Frobenius {relative:.6f} "
-                        f"exceeds the declared tripwire {payload.max_relative_frobenius}",
+                        f"{component}.{tensor.key}: relative Frobenius {relative:.6f} exceeds "
+                        f"the declared tripwire {payload.max_relative_frobenius}",
                         code="quantization_tripwire",
                     )
-                # A role becomes resumable only after every numerical acceptance check. A
-                # half-written group is recomputed; TensorFS accepts only identical role replay.
-                written = 0
-                data_bytes = spill.tell()
+                rows, cols = tensor.shape
+                spill_bytes = spill.tell()
                 spill.seek(0)
-                parts: list[tuple[str, IO[bytes] | bytes, int]] = [(roles[0], spill, data_bytes)]
-                parts.extend(
-                    (role, raw, len(raw))
-                    for role, raw in zip(roles[1:], result.scales, strict=True)
-                )
-                for role, part, part_bytes in parts:
-                    transaction.add_part(target_component, tensor.key, role, part)
-                    if (target_component, tensor.key, role) not in completed:
-                        written += part_bytes
-            transaction.checkpoint()
+                parts: list[PartData] = [
+                    ("weight", encoder.weight_dtype, (rows, cols), spill),
+                    *(
+                        (role, dtype, shape, raw)
+                        for (role, dtype, shape), raw in zip(
+                            encoder.companions(rows, cols), result.scales, strict=True
+                        )
+                    ),
+                ]
+                output.put_encoded(
+                    component, tensor.key, TENSORFS_NAMES[logical_dtype(tensor)], tensor.shape,
+                    name, encoder.params, parts,
+                )  # fmt: skip
+                new_bytes += spill_bytes + sum(len(raw) for raw in result.scales)
             worst = _numeric.worst(worst, relative)
             source_bytes += result.read
-            new_bytes += written
             saturated += result.saturated
-            tel.log(
-                "quantized tensor",
-                level="info",
-                encoding=name,
-                component=target_component,
-                key=tensor.key,
-                done=done,
-                total=total,
-            )
-            tel.progress(done / total, stage=f"{encoding}-{target_component}")
-
+            tel.log("quantized tensor", level="info", encoding=name, component=component,
+                    key=tensor.key, done=done, total=total)  # fmt: skip
+            tel.progress(done / total, stage=f"{encoding}-{component}")
     return QuantizationStats(
-        encoded_keys=total - reused,
+        encoded_keys=len(pending),
         reused_keys=reused,
         source_bytes_read=source_bytes,
         new_bytes_written=new_bytes,
@@ -573,29 +409,15 @@ class _Encoded(NamedTuple):
     energy: float
     saturated: int
     read: int
-    rows: int
 
 
 def _encode_tensor(
-    transaction: DerivedTransaction,
-    encoding: str,
-    tensor: QuantizationTensor,
-    stop: threading.Event,
-    *,
-    source: str,
-    source_component: str,
+    source: Checkpoint, encoding: str, tensor: QuantizationTensor, stop: threading.Event
 ) -> _Encoded:
     encoder = _ENCODINGS[encoding]
     expected = encoder.companions(*tensor.shape)
     read_chunks = functools.partial(
-        _read_chunks,
-        transaction,
-        source=source,
-        component=source_component,
-        key=tensor.key,
-        role=tensor.source_role,
-        logical_dtype=tensor.logical_dtype,
-        shape=tensor.shape,
+        _read_chunks, source, tensor.component, tensor.key, tensor.logical_dtype, tensor.shape
     )
     amax = max_error = sse = energy = 0.0
     if encoder.tensor_scaled():
@@ -613,20 +435,15 @@ def _encode_tensor(
                 raise _Stopped
             encoded = encoder.encode(tensor.key, values, amax)
             count = values.shape[0]
-            if (
-                encoded.payload_dtype != encoder.payload
-                or encoded.payload_shape != list(encoder.data_shape(count, tensor.shape[1]))
-                or len(encoded.companions) != len(expected)
-            ):
-                raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
+            if len(encoded.companions) != len(expected):
+                raise UnsupportedInput(f"{encoding} changed its declared geometry")
             for got, (_, dtype, shape), chunks in zip(
                 encoded.companions, expected, scales, strict=True
             ):
-                row_shaped = bool(shape)
-                want = [count, *shape[1:]] if row_shaped else []
-                if (got.dtype, got.shape) != (_SAFETENSORS_DTYPES[dtype], want):
-                    raise UnsupportedInput(f"{encoding} changed its declared TensorFS geometry")
-                if row_shaped or not chunks:
+                want = [count, *shape[1:]] if shape else []
+                if (got.dtype, got.shape) != (dtype, want):
+                    raise UnsupportedInput(f"{encoding} changed its declared geometry")
+                if shape or not chunks:
                     chunks.append(got.raw)
                 elif got.raw != chunks[0]:
                     raise UnsupportedInput(f"{encoding} encoded one tensor scale two ways")
@@ -636,28 +453,19 @@ def _encode_tensor(
             sse += encoded.sse
             energy += encoded.energy
             saturated += encoded.saturated
-            read += values.size * {"bf16": 2, "f16": 2, "f32": 4}[tensor.logical_dtype]
+            read += values.size * _WIDTH[tensor.logical_dtype]
             rows += count
             spill.write(encoded.payload)
             del values, encoded
+        if rows != tensor.shape[0]:
+            raise UnsupportedInput(f"{encoding} changed its declared geometry")
         return _Encoded(
-            spill,
-            tuple(b"".join(chunks) for chunks in scales),
-            amax,
-            max_error,
-            sse,
-            energy,
-            saturated,
-            read,
-            rows,
-        )
+            spill, tuple(b"".join(chunks) for chunks in scales), amax, max_error, sse, energy,
+            saturated, read,
+        )  # fmt: skip
     except BaseException:
         spill.close()
         raise
-
-
-#: TensorFS part dtype -> the safetensors dtype an encoder's companion declares.
-_SAFETENSORS_DTYPES = {"f32": "F32", "u8": "U8", "f8_e4m3fn": "F8_E4M3"}
 
 
 class _Stopped(Exception):
@@ -669,9 +477,7 @@ def _in_order(
     produce: Callable[[QuantizationTensor, threading.Event], _Encoded],
 ) -> Generator[_Encoded, None, None]:
     """`produce` over `items` on the shared pool, a bounded window ahead, yielded in order.
-
-    Closing the iterator stops the producers and releases every result nobody consumed.
-    """
+    Closing the iterator stops the producers and releases every result nobody consumed."""
     stop = threading.Event()
     window: deque[Future[_Encoded]] = deque()
     pending = iter(items)
@@ -694,124 +500,22 @@ def _pool() -> ThreadPoolExecutor:
     return ThreadPoolExecutor(cpus(), thread_name_prefix="cozy-quantize")
 
 
-def _artifact_plan(raw: bytes) -> ArtifactQuantizationPlan:
-    try:
-        length = len(raw)
-        if not 0 < length <= _MAX_ARTIFACT_PLAN_BYTES:
-            raise UnsupportedInput(
-                f"quantization plan is {length} bytes; expected 1..{_MAX_ARTIFACT_PLAN_BYTES}"
-            )
-        plan = msgspec.json.decode(raw, type=ArtifactQuantizationPlan)
-    except (OSError, msgspec.ValidationError) as exc:
-        raise UnsupportedInput(f"quantization plan is not the closed schema: {exc}") from exc
-    if not plan.components or len(plan.components) > 64:
-        raise UnsupportedInput("quantization plan needs 1..64 target components")
-    if len(set(plan.components)) != len(plan.components):
-        raise UnsupportedInput("quantization plan repeats a target component")
-    if len(set(plan.configs)) != len(plan.configs) or len(plan.configs) > 64:
-        raise UnsupportedInput("quantization plan repeats or exceeds 64 copied configs")
-    if not plan.order or len(plan.order) > 100_000 or len(set(plan.order)) != len(plan.order):
-        raise UnsupportedInput("quantization plan order must contain 1..100000 unique rows")
-    if any(component not in plan.components for component, _ in plan.order):
-        raise UnsupportedInput("quantization plan order names an undeclared component")
-    selected = {(tensor.component, tensor.key) for tensor in plan.tensors}
-    if not selected or len(selected) != len(plan.tensors) or len(selected) > 65_536:
-        raise UnsupportedInput("quantization plan tensors must contain 1..65536 unique keys")
-    if not selected <= set(plan.order):
-        raise UnsupportedInput("quantization plan selects a tensor outside its exact order")
-    for tensor in plan.tensors:
-        rows, cols = tensor.shape
-        if (
-            tensor.component not in plan.components
-            or not tensor.key.endswith(".weight")
-            or tensor.logical_dtype not in {"bf16", "f16", "f32"}
-            or tensor.source_role != "value"
-            or tensor.encoding not in (None, *_ENCODINGS)
-            or rows <= 0
-            or cols <= 0
-        ):
-            raise UnsupportedInput(
-                f"quantization plan tensor {tensor.component}.{tensor.key} is not one "
-                "positive rank-2 float weight in the exact value role"
-            )
-    return plan
-
-
-def _artifact_tensor(
-    encoding: str,
-    tensor: QuantizationTensor,
-    *,
-    target_logical_dtype: str | None = None,
-) -> Tensor:
-    rows, cols = tensor.shape
-    encoder = _ENCODINGS[encoding]
-    if cols % encoder.block:
-        raise UnsupportedInput(
-            f"{tensor.component}.{tensor.key} has {cols} columns, not a multiple of "
-            f"{encoding}'s {encoder.block}"
-        )
-    parts = {encoder.data_role: Part(encoder.data_dtype, encoder.data_shape(rows, cols))}
-    parts.update(
-        {role: Part(dtype, shape) for role, dtype, shape in encoder.companions(rows, cols)}
-    )
-    return Tensor(
-        logical_dtype=target_logical_dtype or tensor.logical_dtype,
-        shape=tensor.shape,
-        encoding=_ARTIFACT_SPECS[encoding],
-        parts=parts,
-    )
-
-
 def _read_chunks(
-    transaction: DerivedTransaction,
-    *,
-    source: str,
-    component: str,
-    key: str,
-    role: str,
-    logical_dtype: str,
-    shape: tuple[int, ...],
+    source: Checkpoint, component: str, key: str, logical_dtype: str, shape: tuple[int, ...]
 ) -> Iterator[np.ndarray]:
-    """Whole rows of float32 values, about `_SOURCE_READ_CHUNK` source bytes at a time.
-
-    Host memory stays one chunk whatever the tensor's size; one row is the smallest unit.
-    """
-    itemsize = {"bf16": 2, "f16": 2, "f32": 4}[logical_dtype]
+    """Whole rows of float32 values, about `_SOURCE_READ_CHUNK` source bytes at a time."""
+    itemsize = _WIDTH[logical_dtype]
     rows, tail = (shape[0], shape[1:]) if shape else (1, ())
     row_bytes = math.prod(tail) * itemsize
     step = max(1, _SOURCE_READ_CHUNK // max(row_bytes, 1))
     for first in range(0, rows, step):
         count = min(step, rows - first)
         raw = bytearray(count * row_bytes)
-        view = memoryview(raw)
-        base = first * row_bytes
-        for offset in range(0, len(raw), _SOURCE_READ_CHUNK):
-            transaction.source_read_into(
-                source,
-                component,
-                key,
-                role,
-                base + offset,
-                view[offset : min(offset + _SOURCE_READ_CHUNK, len(raw))],
-            )
-        chunk_shape = [count, *tail] if shape else []
-        values = st.to_f32(raw, logical_dtype.upper(), chunk_shape)
+        read_into(source, component, key, "", first * row_bytes, raw)
+        values = st.to_f32(raw, TENSORFS_NAMES[logical_dtype], [count, *tail] if shape else [])
         if not bool(np.isfinite(values).all()):
             raise UnsupportedInput(f"source {component}.{key} contains non-finite weights")
         yield values
-
-
-def _plain_source_role(tensor: Any) -> str:
-    parts = source_parts(tensor)
-    value = parts.get("value")
-    if (
-        len(parts) != 1
-        or value is None
-        or value.dtype != tensor.logical_dtype
-        or tuple(value.shape) != tuple(tensor.shape)
-    ):
-        raise UnsupportedInput("source tensor is not one plain value role")
-    return "value"
 
 
 def _validate_request(payload: ArtifactQuantizationRequest) -> None:
