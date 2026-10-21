@@ -12,6 +12,7 @@ from pathlib import Path
 
 import msgspec
 import tensorfs
+import torch
 from tensorfs.varena.torch import Stats, blocks_of
 from torch import nn
 
@@ -19,13 +20,14 @@ from cozy_runtime.internal.execution import agree, catch, cuts
 from cozy_runtime.internal.execution.agree import agreed, sizes
 from cozy_runtime.internal.execution.catch import collective, keep, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, launch, split
-from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
+from cozy_runtime.internal.executor_replies import Allocator, Ceiling, GpuMemory
 from cozy_runtime.internal.executor_replies import Stats as Record
 
 __all__ = [
     "agreed",
     "attend",
     "collective",
+    "counters",
     "install",
     "keep",
     "launch",
@@ -53,14 +55,32 @@ def install(module: nn.Module, state: Sequence[str] = ()) -> None:
     cuts.install(module)
 
 
-def record(stats: Stats, gpu: int, device: int | None, store: Path) -> GpuMemory:
+def record(
+    stats: Stats, gpu: int, device: int | None, store: Path, since: Allocator | None
+) -> GpuMemory:
     """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`: TensorFS's fill
-    ceilings for CUDA `device` (None: no GPU) and `store`, and varena's record of the request."""
+    ceilings for CUDA `device` (None: no GPU) and `store`, varena's record of the request, and
+    torch's allocator since its start (`counters`)."""
+    now = counters(device)
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
         stats=msgspec.json.decode(stats.json(), type=Record),
+        torch=None if now is None or since is None else _delta(now, since),
     )
+
+
+def counters(device: int | None) -> Allocator | None:
+    """torch's allocator counters on CUDA `device` now (None: no GPU)."""
+    if device is None:
+        return None
+    found = torch.cuda.memory_stats(device)
+    return Allocator(**{name: int(found.get(name, 0)) for name in Allocator.__struct_fields__})
+
+
+def _delta(now: Allocator, since: Allocator) -> Allocator:
+    fields = Allocator.__struct_fields__
+    return Allocator(**{f: getattr(now, f) - getattr(since, f) for f in fields})
 
 
 #: each (device, store)'s measured ceilings, once per executor

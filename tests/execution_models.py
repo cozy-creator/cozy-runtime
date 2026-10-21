@@ -19,7 +19,7 @@ from typing import Any
 
 import tensorfs
 import torch
-from diffusers import AutoencoderKL
+from diffusers import AutoencoderKL, UNet2DConditionModel
 from diffusers.models.attention import FeedForward
 from diffusers.models.attention_dispatch import AttentionBackendName, dispatch_attention_fn
 from tensorfs.varena import GpuId
@@ -169,3 +169,41 @@ VAE = dict(
 def vae() -> nn.Module:
     torch.manual_seed(1)
     return AutoencoderKL(**VAE).to(torch.bfloat16).eval()
+
+
+# ------------------------------------------------------------- SDXL's UNet, narrow
+
+
+#: SDXL's UNet topology (its blocks, its 70 transformer layers, its op count) at narrow widths
+SDXL = dict(
+    sample_size=16,
+    layers_per_block=2,
+    block_out_channels=(64, 128, 256),
+    down_block_types=("DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"),
+    up_block_types=("CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"),
+    transformer_layers_per_block=(1, 2, 10),
+    attention_head_dim=(2, 4, 8),
+    cross_attention_dim=64,
+    use_linear_projection=True,
+    addition_embed_type="text_time",
+    addition_time_embed_dim=8,
+    projection_class_embeddings_input_dim=32 + 6 * 8,
+)
+
+
+def unet() -> nn.Module:
+    torch.manual_seed(5)
+    return UNet2DConditionModel(**SDXL).eval()
+
+
+def unet_inputs() -> dict[str, Any]:
+    gen = torch.Generator().manual_seed(6)
+    return dict(
+        sample=torch.randn(1, 4, 16, 16, generator=gen),
+        timestep=torch.tensor(500),
+        encoder_hidden_states=torch.randn(1, 77, 64, generator=gen),
+        added_cond_kwargs={
+            "text_embeds": torch.randn(1, 32, generator=gen),
+            "time_ids": torch.randn(1, 6, generator=gen),
+        },
+    )

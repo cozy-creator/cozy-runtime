@@ -36,6 +36,8 @@ from execution_models import (  # noqa: E402
     placed,
     scores,
     transformer,
+    unet,
+    unet_inputs,
     vae,
 )
 
@@ -55,6 +57,22 @@ def installed() -> Iterator[None]:
 
 def tokens(seed: int, rows: int = 96) -> Any:
     return torch.randn(1, rows, 16, generator=torch.Generator().manual_seed(seed)).to(BF16)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="torch's allocator counts a GPU's")
+def test_a_record_carries_torch_s_allocator_over_its_request(tmp_path: Path) -> None:
+    """A request's row counts the cudaMalloc and cudaFree calls torch's allocator made while it
+    ran: here one block it had to map, given back."""
+    mem = memory()
+    since = execution.counters(0)
+    with mem.request("counted") as r:
+        torch.cuda.empty_cache()
+        held = torch.empty(64 << 20, dtype=torch.uint8, device="cuda")
+        del held
+        torch.cuda.empty_cache()
+    row = execution.record(r.stats(), 0, 0, tmp_path, since)
+    assert row.torch is not None, row
+    assert row.torch.num_device_alloc >= 1 and row.torch.num_device_free >= 1, row.torch
 
 
 def test_varena_s_exhausted_is_the_one_memory_error() -> None:
@@ -267,6 +285,35 @@ def test_a_package_split_runs_in_the_windows_rust_cuts(tmp_path: Path) -> None:
             got = model(x)
     assert card.refused and r.stats().cuts >= 1
     assert torch.equal(got, want)
+
+
+def test_a_warm_unet_s_bare_blocks_send_no_op_through_the_request_s_layer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SDXL's UNet topology, warm: every block runs bare, so no op of its forward passes the
+    request's layer. The only ops it sees are views varena's binds make of their pages before a
+    block runs (no compute, no allocation): a few microseconds each."""
+    plain = unet()
+    mem = memory()
+    model = placed(mem, checkpoint(tmp_path, "unet", plain), "unet", unet)
+    seen: list[Any] = []
+    dispatch = catch.Layer.__torch_dispatch__
+
+    def counted(self: Any, func: Any, *rest: Any) -> Any:
+        seen.append(func)
+        return dispatch(self, func, *rest)
+
+    x = unet_inputs()
+    with torch.no_grad():
+        want = plain(**x).sample
+        with mem.request("warm") as r, execution.serving(r):
+            model(**x)  # the first run journals each block
+            monkeypatch.setattr(catch.Layer, "__torch_dispatch__", counted)
+            got = model(**x).sample
+    assert torch.equal(got, want)
+    computed = {str(f) for f in seen if all(a.alias_info is None for a in f._schema.returns)}
+    print(f"warm SDXL-topology forward: {len(seen)} ops through the request's layer, all views")
+    assert not computed, computed
 
 
 # ------------------------------------------------------------------- mutation-safe replay
