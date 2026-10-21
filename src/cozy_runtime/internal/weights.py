@@ -59,6 +59,7 @@ from cozy_runtime.internal.fill import (
     tensorfs_requirement_dtype,
 )
 from cozy_runtime.internal.fill import fit as fill_fit
+from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (Ulysses' torch side, served)
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.probe import QualificationResult
 from cozy_runtime.internal.qualification import qualified

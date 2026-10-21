@@ -32,7 +32,6 @@ if TYPE_CHECKING:
 
 
 from cozy_runtime.internal.attention_registry import register
-from cozy_runtime.internal.parallel import copy_engine
 
 
 class Options(TypedDict):
@@ -70,16 +69,20 @@ _SEEN: ContextVar[tuple[dict[str, set[str]], set[object]] | None] = ContextVar(
 _MEMBERS: dict[str, AttentionBackendName] = {}
 #: the memory's attention cut (`tensorfs.varena.cuts.attend`), installed with the memory
 _CUT: Callable[..., Tensor] | None = None
-#: what one allocation on a device may take now (`tensorfs.varena.cuts.available`; 0 unknown)
-_ROOM: Callable[[object], int] | None = None
-#: an exchange's buffers at their most, in GPU shares of the heads crossing: Q, K and V in
-#: flight, each in its exchange's layout and its result (6), and the next one being laid out
-_BUFFERS = 7
+#: the torch side (`internal.parallel.ulysses`), which serves itself here once imported
+_GROUP: Callable[[object], ProcessGroup] | None = None
+_EXCHANGE: Callable[..., Tensor] | None = None
 
 
-def install(cut: Callable[..., Tensor] | None, room: Callable[[object], int] | None = None) -> None:
-    global _CUT, _ROOM
-    _CUT, _ROOM = cut, room
+def install(cut: Callable[..., Tensor] | None) -> None:
+    global _CUT
+    _CUT = cut
+
+
+def serve(group_of: Callable[[object], ProcessGroup], exchange_of: Callable[..., Tensor]) -> None:
+    """The process group and the exchange of Ulysses, from the module that runs torch."""
+    global _GROUP, _EXCHANGE
+    _GROUP, _EXCHANGE = group_of, exchange_of
 
 
 @contextmanager
@@ -172,21 +175,9 @@ def _call(
 
 def group(config: object) -> ProcessGroup:
     """The process group of Runtime's initialized Ulysses configuration; ring is refused."""
-    import torch.distributed as dist
-    from diffusers.models._modeling_parallel import ParallelConfig
-
-    if not isinstance(config, ParallelConfig) or config.context_parallel_config is None:
-        raise ValueError("context parallelism requires an initialized Ulysses configuration")
-    cp = config.context_parallel_config
-    if cp.ring_degree != 1:
-        raise ValueError("ring attention needs LSE merging; only Ulysses is served")
-    mesh = cp._ulysses_mesh
-    handle = None if mesh is None else mesh.get_group()
-    if handle is None or not dist.is_initialized():
-        raise ValueError("the Ulysses configuration is not initialized")
-    if dist.get_world_size(handle) != cp.ulysses_degree:
-        raise ValueError("the Ulysses group does not match its declared degree")
-    return handle
+    if _GROUP is None:
+        raise ValueError(_UNSERVED)
+    return _GROUP(config)
 
 
 def exchange(
@@ -196,110 +187,14 @@ def exchange(
     handle: ProcessGroup,
     compute: Callable[[Tensor, Tensor, Tensor], Tensor],
 ) -> Tensor:
-    """Sequence shards -> full sequence per head subset -> `compute` -> back, using Diffusers'
-    unequal-length exchange in both directions (packed H3 lengths do not divide), or the
-    group's copy engines when it formed over them (`copy_engine`). Heads cross all at once when
-    their buffers fit the room every GPU of the group has, else in the largest groups that do
-    (`_heads`), each group's output back before the next group's Q/K/V cross."""
-    import torch
-    import torch.distributed as dist
-
-    heads, world = int(query.shape[2]), handle.size()
-    room = _ROOM(query.device) if _ROOM is not None else 0
-    mine = torch.tensor([int(query.shape[1]), room or 1 << 62], device=query.device)
-    every = [torch.empty_like(mine) for _ in range(world)]
-    dist.all_gather(every, mine, group=handle)  # every GPU sizes its groups from the same facts
-    rows, room = sum(int(e[0]) for e in every), min(int(e[1]) for e in every)
-    step = _heads(heads, world, rows * int(query.shape[3]) * query.element_size(), room)
-    if step == heads:
-        return _exchange(query, key, value, handle, compute)
-    out = query.new_empty(query.shape)
-    for at in range(0, heads, step):
-        part = slice(at, at + step)
-        out[:, :, part] = _exchange(
-            query[:, :, part], key[:, :, part], value[:, :, part], handle, compute
-        )
-    return out
+    """Sequence shards -> full sequence per head subset -> `compute` -> back
+    (`internal.parallel.ulysses.exchange`)."""
+    if _EXCHANGE is None:
+        raise ValueError(_UNSERVED)
+    return _EXCHANGE(query, key, value, handle, compute)
 
 
-def _heads(heads: int, world: int, per_head: int, room: int) -> int:
-    """Heads one exchange moves: all of them when their buffers (`_BUFFERS` GPU shares of
-    `per_head` bytes a head, every row) fit `room`, else the largest group of whole heads on
-    each GPU, dividing them, whose buffers fit beside the output the groups fill, else the
-    smallest such group."""
-    whole = heads // world * per_head
-    groups = [s for s in range(world, heads, world) if heads % s == 0]
-    if not groups or _BUFFERS * whole <= room:
-        return heads
-    fits = (s for s in groups if whole + _BUFFERS * (s // world) * per_head <= room)
-    return max(fits, default=groups[0])
-
-
-def _exchange(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    handle: ProcessGroup,
-    compute: Callable[[Tensor, Tensor, Tensor], Tensor],
-) -> Tensor:
-    from diffusers.models.attention_dispatch import (
-        all_to_all_single_any_o_async,
-        all_to_all_single_any_qkv_async,
-        ulysses_anything_metadata,
-    )
-
-    engines = copy_engine.for_group(handle)
-    if engines is not None:
-        result = _copy_engine_exchange(engines, query, key, value, handle, compute)
-        if result.shape != query.shape or result.dtype != query.dtype:
-            raise ValueError("Ulysses attention returned incompatible output")
-        return result
-    metadata = ulysses_anything_metadata(query)
-    waits = [all_to_all_single_any_qkv_async(t, handle, **metadata) for t in (query, key, value)]
-    q, k, v = (wait() for wait in waits)
-    output = compute(q, k, v)
-    del q, k, v  # not live through the output's exchange
-    result = all_to_all_single_any_o_async(output, handle, **metadata)()
-    if result.shape != query.shape or result.dtype != query.dtype:
-        raise ValueError("Ulysses attention returned incompatible output")
-    return result
-
-
-def _copy_engine_exchange(
-    engines: copy_engine.CopyEngineExchange,
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    handle: ProcessGroup,
-    compute: Callable[[Tensor, Tensor, Tensor], Tensor],
-) -> Tensor:
-    """Diffusers' two exchanges with Q, K and V in one: GPU s holds `sizes[s]` rows of every
-    head and sends each GPU its head group; the output returns each GPU its rows."""
-    import torch
-    import torch.distributed as dist
-
-    batch, rows, heads, dim = (int(size) for size in query.shape)
-    world = engines.world
-    local = heads // world
-    gathered = torch.empty(world, dtype=torch.int64, device=query.device)
-    dist.all_gather_into_tensor(gathered, torch.tensor([rows], device=query.device), group=handle)
-    sizes = [int(size) for size in gathered.tolist()]
-
-    def heads_first(tensor: Tensor) -> Tensor:
-        # (B, S, W, H/W, D) -> (W, S, B, H/W, D): rows for GPU p are block p
-        grouped = tensor.reshape(batch, rows, world, local, dim).permute(2, 1, 0, 3, 4)
-        return grouped.reshape(world * rows, batch, local, dim).contiguous()
-
-    sent = [[sizes[s]] * world for s in range(world)]
-    q, k, v = (
-        part.permute(1, 0, 2, 3).contiguous()
-        for part in engines.all_to_all([heads_first(t) for t in (query, key, value)], sent)
-    )
-    output = compute(q, k, v)
-    back = [[sizes[p] for p in range(world)] for _ in range(world)]
-    (returned,) = engines.all_to_all([output.permute(1, 0, 2, 3).contiguous()], back)
-    merged = returned.reshape(world, rows, batch, local, dim).permute(2, 1, 0, 3, 4)
-    return merged.reshape(batch, rows, heads, dim).contiguous()
+_UNSERVED = "Ulysses runs where torch does: nothing imported internal.parallel.ulysses"
 
 
 def describe(seen: dict[str, set[str]], names: dict[str, str]) -> str:

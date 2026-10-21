@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,7 +23,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from cozy_runtime.internal import attention, attention_ulysses
 from cozy_runtime.internal.encoding import DeviceFacts
-from cozy_runtime.internal.parallel import copy_engine
+from cozy_runtime.internal.parallel import copy_engine, ulysses
 from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
 
 
@@ -66,15 +67,23 @@ def rank_main(
 ) -> None:
     torch.set_num_threads(1)
     if room:  # GPU r has r bytes more room: the group sizes from the least of them
-        attention_ulysses.install(attention_ulysses._CUT, lambda device: room + rank)
-    counted = attention_ulysses._exchange
+        ulysses._ROOM = lambda device: room + rank
+    counted = ulysses._cross
     calls: list[int] = []
 
-    def counting(query: Any, *rest: Any) -> Any:
+    def counting(
+        engines: Any,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        handle: Any,
+        sizes: Sequence[int],
+        compute: Any,
+    ) -> torch.Tensor:
         calls.append(int(query.shape[2]))
-        return counted(query, *rest)
+        return counted(engines, query, key, value, handle, sizes, compute)
 
-    attention_ulysses._exchange = counting
+    ulysses._cross = counting
     if plant:
         attention_ulysses.exchange = lambda query, key, value, handle, compute: compute(
             query, key, value

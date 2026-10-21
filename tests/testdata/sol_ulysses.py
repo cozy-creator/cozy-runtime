@@ -16,6 +16,7 @@ from torch.multiprocessing.spawn import spawn
 
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope
 from cozy_runtime.internal import attention, attention_sol, attention_ulysses, kernel_cache
+from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (serves the exchange)
 from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
 
 
