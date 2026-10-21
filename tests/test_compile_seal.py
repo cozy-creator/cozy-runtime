@@ -31,7 +31,7 @@ from typing import Any
 
 import pytest
 
-from cozy_runtime.internal import child_env, jit_cache
+from cozy_runtime.internal import child_env
 
 
 def _torch_here() -> str:
@@ -103,15 +103,11 @@ def test_compile_leaves_the_seal_intact_under_the_imposed_jit_scope(
     tmp_path: Path, restore_env: None
 ) -> None:
     """ARM: the environment a worker actually seals today survives a real compile."""
-    scope = jit_cache.scope(
-        tmp_path,
-        "local-cr-086-arm",
-        pod_scope="cr-086-arm",
-    )
-    assert set(scope.environment) == set(JIT_NAMES)
-    assert all(Path(value).is_absolute() for value in scope.environment.values())
+    scope = child_env.jit_environment(tmp_path)
+    assert set(scope) == set(JIT_NAMES)
+    assert all(Path(value).is_absolute() for value in scope.values())
 
-    verdict = _seal_under(dict(scope.environment))
+    verdict = _seal_under(scope)
 
     assert verdict == {"env_intact": True, "env_changed": []}
 

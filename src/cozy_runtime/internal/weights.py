@@ -410,7 +410,7 @@ class Backend:
             raise _refuse(
                 "incomplete_fill",
                 f"{len(missing)} destination(s) never reached the fill plane "
-                f"({', '.join(missing[:4])}): a DestinationSet is complete or nothing commits",
+                f"({', '.join(missing[:4])}): a component's destinations all fill or none commits",
                 missing[:6],
             )
         started = time.perf_counter()

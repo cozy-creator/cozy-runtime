@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 from cozy_runtime.internal.exits import Exit
 
@@ -96,6 +97,18 @@ JIT_CACHE_ENV: tuple[tuple[str, str], ...] = (
 #: spelling, not a behaviour flag of ours: nothing in this runtime reads it, and with it unset
 #: the only difference is that a re-prepared model compiles again.
 FLASH_ATTENTION_CACHE_ENABLED_ENV = "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"
+
+
+def jit_environment(root: Path) -> dict[str, str]:
+    """`JIT_CACHE_ENV` and TMPDIR under `root`, each directory made: what the machine imposes
+    on an executor (TensorD's JIT scope), for a process the Runtime starts itself."""
+    for _name, directory in JIT_CACHE_ENV:
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    return {
+        **{name: str(root / directory) for name, directory in JIT_CACHE_ENV},
+        "TMPDIR": str(root),
+    }
+
 
 # IMPOSE pass: the complete reviewed allowlist. Adding a row is a reviewed change; the
 # runtime refuses to project anything not listed here. Class-B impose vocabulary
