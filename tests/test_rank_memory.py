@@ -34,7 +34,8 @@ class Empty(msgspec.Struct):
 
 
 def placed(executor: Executor, store: Path) -> Executor:
-    """`executor` with a memory over host pages and the execution layer."""
+    """`executor` with a memory over host pages, the execution layer and a TensorFS store."""
+    store.mkdir(parents=True, exist_ok=True)
     executor.memory, executor.execution, executor.store = memory(), execution, store
     return executor
 

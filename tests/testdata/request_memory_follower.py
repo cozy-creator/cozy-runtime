@@ -23,6 +23,7 @@ channel = Channel(socket.socket(fileno=args.rank_fd))
 worker = Executor(channel, args.root, rank=args.rank, world=args.world)
 worker.memory = Memory.open(GpuId(f"cozy-follower-{os.getpid()}", "cpu", 1 << 30))
 worker.execution, worker.store = execution, args.root / "store"
+worker.store.mkdir(parents=True, exist_ok=True)
 worker.device_kind, worker.ready = "cpu", True
 construction = worker._construction_child("construction")
 construction.ready = True
