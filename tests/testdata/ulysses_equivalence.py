@@ -62,8 +62,19 @@ def rank_main(
     shape: tuple[int, ...],
     plant: bool,
     cuda: bool,
+    room: int,
 ) -> None:
     torch.set_num_threads(1)
+    if room:  # GPU r has r bytes more room: the group sizes from the least of them
+        attention_ulysses.install(attention_ulysses._CUT, lambda device: room + rank)
+    counted = attention_ulysses._exchange
+    calls: list[int] = []
+
+    def counting(query: Any, *rest: Any) -> Any:
+        calls.append(int(query.shape[2]))
+        return counted(query, *rest)
+
+    attention_ulysses._exchange = counting
     if plant:
         attention_ulysses.exchange = lambda query, key, value, handle, compute: compute(
             query, key, value
@@ -130,6 +141,7 @@ def rank_main(
             "byte_equal": bool(torch.equal(got.contiguous(), one.contiguous())),
             "rel_l2_to_degree1": float((got.double() - one.double()).norm() / one.double().norm()),
             "wrapped_ops": wrapped.seen,
+            "exchanged_heads": calls[: len(calls) // (2 if cuda else 1)],
         }
         if engines is not None:
             report["copy_engine_equal_nccl"] = bool(torch.equal(engined, got))
@@ -148,12 +160,13 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=56)
     parser.add_argument("--plant", action="store_true")
     parser.add_argument("--cuda", action="store_true")
+    parser.add_argument("--room", type=int, default=0)
     args = parser.parse_args()
     shape = (1, args.rows, args.heads, 128)
     start: Any = spawn
     start(
         rank_main,
-        args=(args.degree, args.root, shape, args.plant, args.cuda),
+        args=(args.degree, args.root, shape, args.plant, args.cuda, args.room),
         nprocs=args.degree,
         join=True,
     )
