@@ -223,7 +223,8 @@ class _Launcher:
             for i, value in zip(at, real, strict=True):
                 operands[i] = value
             # out of memory, a launch did not run: it runs again with room made (12586)
-            device = operands[at[0]].device if at else torch.device("cuda")
+            first = operands[at[0]] if at else None
+            device = first.device if isinstance(first, torch.Tensor) else torch.device("cuda")
             cuts.launch(device, kernel.__name__, lambda: found[grid](*operands))
 
 
