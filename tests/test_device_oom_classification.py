@@ -87,3 +87,18 @@ def test_a_gpu_short_of_memory_ends_the_group_call_whole() -> None:
     assert ending(RuntimeFailure("it did not fit", code=MEMORY_EXHAUSTED)) == MEMORY_EXHAUSTED
     assert ending(torch.distributed.DistBackendError("NCCL communicator was aborted")) == ENDED
     assert ending(ValueError("a fault")) is None
+
+
+def test_varena_s_device_errors_by_their_cuda_code() -> None:
+    """varena's device error carries the CUDA code its driver call returned: 2 is the device
+    out of memory (a foreign allocation landed first), as torch's own."""
+    varena = pytest.importorskip("tensorfs.varena")
+
+    def device(cuda_code: int, sticky: bool = False) -> Any:
+        exc = varena.VarenaError("cuMemCreate failed")
+        exc.code, exc.cuda_code, exc.sticky = "DEVICE", cuda_code, sticky
+        return exc
+
+    assert fault(device(2)) is Fault.OOM
+    assert fault(device(700, sticky=True)) is Fault.STICKY
+    assert fault(device(999)) is Fault.DEVICE

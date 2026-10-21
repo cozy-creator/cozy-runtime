@@ -208,7 +208,8 @@ def fault(exc: BaseException) -> Fault:
     `AcceleratorError` by its CUDA code (2: out of memory; sticky codes; any other), a CUDA
     library's alloc-failed status, the prefixes of the libraries that give no code (Triton's
     launch, MPS's allocator), NCCL's `DistBackendError` (out of memory by the CUDA code it
-    reports, else a device error), and varena's `Exhausted` and device errors."""
+    reports, else a device error), and varena's `Exhausted` and device errors (out of memory
+    by their CUDA code)."""
     kind, module = type(exc).__name__, type(exc).__module__
     if module.partition(".")[0] == "torch":
         if kind == "OutOfMemoryError":
@@ -224,6 +225,8 @@ def fault(exc: BaseException) -> Fault:
         if kind == "Exhausted":
             return Fault.EXHAUSTED
         if getattr(exc, "code", "") == "DEVICE":
+            if getattr(exc, "cuda_code", None) == _CUDA_OOM:
+                return Fault.OOM
             return Fault.STICKY if exc.sticky else Fault.DEVICE
         return Fault.OTHER
     if isinstance(exc, RuntimeError):
