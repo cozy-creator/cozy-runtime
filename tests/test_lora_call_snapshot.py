@@ -137,14 +137,14 @@ class Root(module_type):  # type: ignore[misc]
 
 def fixture(folder: Path, device: str = "cpu") -> tuple[Any, ...]:
     writer = tensorfs.Writer(cache_dir=folder)
-    writer.component("net", cls="", config={}).put(
+    writer.component("net", config={}).put(
         "block.linear.weight", torch.tensor(BASE).numpy(), dtype="F32", shape=[2, 2]
     )
     for name, down, up in (
         ("A", [[1.0, 0.0]], [[2.0], [3.0]]),
         ("B", [[0.0, 1.0]], [[5.0], [7.0]]),
     ):
-        component = writer.component(name, cls="", config={})
+        component = writer.component(name, config={})
         component.put("down", torch.tensor(down).numpy(), dtype="F32", shape=[1, 2])
         component.put("up", torch.tensor(up).numpy(), dtype="F32", shape=[2, 1])
     checkpoint = writer.commit()
@@ -158,7 +158,7 @@ def fixture(folder: Path, device: str = "cpu") -> tuple[Any, ...]:
     root = Root(hook)
     rows = {row.name: row for row in Checkpoint(checkpoint).rows("net")}
     bakes = _Bakes(torch, root, rows, {"block"})
-    root._varena = Declared(fill=bakes.snapshot({}))
+    root._varena = Declared(fill=bakes.pending())
     model = memory.load(root, ck=checkpoint, component="net", level="gpu")
     return root, hook, bakes, model, factor_models, memory, checkpoint
 
@@ -193,6 +193,92 @@ def test_selected_bytes_and_fingerprint_base_a_same_a_b_base(tmp_path: Path) -> 
         assert torch.equal(fill_bytes(frozen, checkpoint), torch.tensor(EXPECTED["A"]))
     finally:
         memory.close()
+        checkpoint.close()
+
+
+def test_real_call_selection_waits_for_each_attempt_and_same_a_keeps_content_identity(
+    tmp_path: Path,
+) -> None:
+    root, _, bakes, model, fixed, memory, checkpoint = fixture(tmp_path)
+    placed = residency(memory, model)
+    placed.bakes["net"] = bakes
+    bakes.install_call(model)
+    seen: list[object] = []
+
+    def selected_before_prehooks(_: Any, args: Any, kwargs: Any) -> None:
+        selected = model.fill
+        assert selected is not None and selected.prefetch_ready
+        # The real immutable Fill reads the real checkpoint and selects before
+        # the mutable hook arming that follows this prepended observer.
+        value = fill_bytes(selected, checkpoint)
+        with torch.no_grad():
+            root.block.linear.weight.copy_(value)
+        seen.append(selected.prepare())
+
+    handle = root.register_forward_pre_hook(
+        selected_before_prehooks, with_kwargs=True, prepend=True
+    )
+    try:
+        for attempt, adapters in enumerate((("A", "B", None, "A"), ("A",)), 1):
+            placed.open_attempt()
+            assert model.fill is not None and not model.fill.prefetch_ready
+            assert all(current.fill is None for current in fixed)
+            raw = (fixed[0], (model, fixed[1]), (model, fixed[1]))
+            with memory.request(f"attempt-{attempt}", plan=raw) as request:
+                assert request.declared == (("A",), ("B", "net"), ("B", "net"))
+                for adapter in adapters:
+                    result = root(torch.eye(2), adapter=adapter)
+                    assert torch.equal(result, torch.tensor(EXPECTED[adapter]).t())
+        assert seen[0] == seen[-2] == seen[-1], "same A changed immutable content identity"
+        assert len(set(seen)) == 3, "A/B/inactive selections were conflated"
+    finally:
+        handle.remove()
+        memory.close()
+        checkpoint.close()
+
+
+def test_fixed_stored_lora_transform_is_ready_without_call_arguments(tmp_path: Path) -> None:
+    class FixedLayer(module_type):  # type: ignore[misc]
+        """The ordinary stored PEFT layer contract, with no external selector."""
+
+        _cozy_baked = False
+
+        def __init__(self, base: Any) -> None:
+            super().__init__()
+            self.base_layer = base
+            self.lora_A = torch.nn.ModuleDict({"fixed": torch.nn.Linear(2, 1, bias=False)})
+            self.lora_B = torch.nn.ModuleDict({"fixed": torch.nn.Linear(1, 2, bias=False)})
+            self.active_adapters = ["fixed"]
+            self.scaling = {"fixed": 1.0}
+
+    root = torch.nn.Module()
+    root.block = Block()
+    root.block.linear = FixedLayer(root.block.linear)
+    values = {
+        "block.linear.base_layer.weight": BASE,
+        "block.linear.lora_A.fixed.weight": [[1.0, 0.0]],
+        "block.linear.lora_B.fixed.weight": [[2.0], [3.0]],
+    }
+    writer = tensorfs.Writer(cache_dir=tmp_path)
+    component = writer.component("net", config={})
+    for key, value in values.items():
+        tensor = torch.tensor(value)
+        component.put(key, tensor.numpy(), dtype="F32", shape=list(tensor.shape))
+    checkpoint = writer.commit()
+    try:
+        rows = {row.name: row for row in Checkpoint(checkpoint).rows("net")}
+        bakes = _Bakes(torch, root, rows, {"block"})
+        assert bakes.bakes and not bakes.call_selected
+        pending = bakes.pending()
+        assert pending.prefetch_ready
+        assert pending.prepare() == bakes.snapshot({}).prepare()
+        parts = {
+            key: {"value": torch.from_dlpack(checkpoint.components["net"].tensors.read(key)).clone()}
+            for key in values
+        }
+        pending(None, parts)
+        assert torch.equal(parts["block.linear.base_layer.weight"]["value"], torch.tensor(EXPECTED["A"]))
+    finally:
         checkpoint.close()
 
 
@@ -278,6 +364,7 @@ def test_real_page_in_switches_before_prehooks_and_reuses_only_same_fingerprint(
     root, hook, bakes, model, factors, memory, checkpoint = fixture(tmp_path, "cuda:0")
     registrations, versions, copied = [], [], []
     placed = residency(memory, model)
+    placed.bakes["net"] = bakes
     try:
         graphs.install(torch, object(), {"net": root})
         bakes.install_call(model)
@@ -297,6 +384,21 @@ def test_real_page_in_switches_before_prehooks_and_reuses_only_same_fingerprint(
             assert versions[0] == versions[-1]
             assert versions[1] == versions[2] == versions[3]
             assert len(set(versions)) == 3
+        warm_id = None
+        for attempt in range(2):
+            placed.open_attempt()
+            assert model.fill is not None and not model.fill.prefetch_ready
+            with memory.request(f"warm-A-{attempt}", plan=[(model, *factors)]) as request:
+                assert model in request._pending
+                result = root(torch.eye(2, device="cuda"), adapter="A")
+                assert torch.equal(result.cpu(), torch.tensor(EXPECTED["A"]).t())
+                assert not request._pending
+                if warm_id is not None:
+                    assert model.ws.id == warm_id
+                    assert not memory.native.stats(request.native_id)["copies"], (
+                        "readiness-only activation refilled unchanged warm A"
+                    )
+                warm_id = model.ws.id
     finally:
         for token in placed.pins.values():
             token.cache.close()
