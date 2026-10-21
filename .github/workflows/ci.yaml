@@ -42,6 +42,18 @@ jobs:
           --exclude '^tests/testdata/'
       - if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: uv run python checks/architecture.py
+      # The built wheel and the TensorFS the lock pins, alone in a fresh venv: every module
+      # imports and every TensorFS name the Runtime spells resolves, or the pair is refused.
+      - name: Import smoke
+        if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          smoke=$(mktemp -d)
+          uv build --wheel --out-dir "$smoke/dist"
+          uv export --frozen --no-dev --no-emit-project --no-hashes -o "$smoke/locked.txt"
+          uv venv --python 3.12 "$smoke/venv"
+          uv pip install --python "$smoke/venv/bin/python" -c "$smoke/locked.txt" "$smoke"/dist/*.whl
+          "$smoke/venv/bin/python" -I checks/import_smoke.py
       - name: Reproducible wheel
         if: ${{ !cancelled() && steps.sync.outcome == 'success' }}
         run: |
