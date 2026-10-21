@@ -495,6 +495,15 @@ def warm(device: int) -> None:
         _BUILD = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log), log
 
 
+def recipe(device: int) -> str:
+    """What names the bytes a bake writes on `device` to other executors: `VARIANT`, the path
+    this process bakes by (fused, once its build ended well, else the eager reference) and
+    what that path's numerics come from."""
+    if _ready(device):
+        return f"{VARIANT} fused triton {triton.__version__}"
+    return f"{VARIANT} eager"
+
+
 def _ready(device: int, wait: bool = True) -> bool:
     """Whether this process bakes fused: the build `warm` started (now, when none did) ended
     well. Waits for it unless `wait` is False."""
