@@ -887,8 +887,9 @@ class Outputs(_Bound):
         try:
             for directory, dirs, files in os.walk(source, followlinks=False):
                 current = Path(directory)
-                if any((current / name).is_symlink() for name in (*dirs, *files)):
-                    raise OutputError("output tree cannot contain symlinks", code="output_tree")
+                linked = [current / name for name in (*dirs, *files)]
+                if any(path.is_symlink() or path.is_junction() for path in linked):
+                    raise OutputError("output tree cannot contain links", code="output_tree")
                 for name in sorted(files):
                     count += 1
                     if count > 8192:

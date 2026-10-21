@@ -217,9 +217,7 @@ def compute_processes(device: str) -> dict[int, int] | None:
     None where the driver will not say."""
     library = _nvml_library()
     handle = _nvml_handle(library, device) if library is not None and device else None
-    if library is None or handle is None:
-        return None
-    return _nvml_device_compute_table(library, handle)
+    return _nvml_device_compute_table(library, handle) if library is not None and handle is not None else None
 
 
 def _table_rows(pids: set[int], table: dict[int, int]) -> dict[int, ProcessMemory]:
@@ -351,9 +349,9 @@ def device_capability(device: str) -> int:
 
 
 def driver_version() -> str:
-    """The NVIDIA driver's version, which a compiled kernel's key and a kernel's verdict carry;
-    empty where NVML is absent. NVML leaves a driver thread: a process that will fork does not
-    ask (`zygote`)."""
+    """The NVIDIA driver's version, which a kernel's verdict (`verify`) and Sol's learned layouts
+    carry; empty where NVML is absent. NVML leaves a driver thread: a process that will fork does
+    not ask (`zygote`)."""
     library = _nvml_library()
     version = ctypes.create_string_buffer(80)  # NVML_SYSTEM_DRIVER_VERSION_BUFFER_SIZE
     if library is None or library.nvmlSystemGetDriverVersion(version, 80) != _NVML_SUCCESS:

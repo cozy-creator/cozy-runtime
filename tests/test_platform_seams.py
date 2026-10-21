@@ -1,11 +1,12 @@
 """The OS seams under the executor's GPU path, on real calls: the CPUs a process may use, every
-byte of a directory output and of a kernel store entry, each NVML query where the host has no
-NVIDIA driver, and a kernel build where the OS cannot end its tree. Windows runs this file on
-windows-2025 (`platforms.yaml`)."""
+byte of a directory output and of a kernel store entry, a link out of a directory output, each
+NVML query where the host has no NVIDIA driver, and a kernel build where the OS cannot end its
+tree. Windows runs this file on windows-2025 (`platforms.yaml`)."""
 
 from __future__ import annotations
 
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -13,8 +14,11 @@ import msgspec
 import pytest
 
 from cozy_runtime._cpus import cpus
-from cozy_runtime.author import App, Invocation, Outputs, Tree, attempt
+from cozy_runtime.author import App, Invocation, InvocationResult, Outcome, Outputs, Tree, attempt
 from cozy_runtime.internal import accel, kernel_cache, kernel_compile
+
+if sys.platform == "win32":
+    import _winapi
 
 #: What a text-mode descriptor rewrites: CRLF, LF and Ctrl-Z.
 BYTES = b"a\r\nb\nc\x1ad\x00"
@@ -32,10 +36,7 @@ def test_a_process_may_use_at_least_one_cpu_and_never_more_than_the_host_has() -
     assert 1 <= cpus() <= (os.cpu_count() or 1)
 
 
-def test_a_directory_output_keeps_every_byte(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    (source / "nested").mkdir(parents=True)
-    (source / "nested" / "raw.bin").write_bytes(BYTES)
+def _save_tree(source: Path, spool: Path) -> tuple[InvocationResult | None, Outcome]:
     app = App()
 
     @app.entrypoint(accelerator=False)
@@ -43,10 +44,31 @@ def test_a_directory_output_keeps_every_byte(tmp_path: Path) -> None:
         return Result(out.save_tree(source))
 
     deadline = time.monotonic() + 30
-    result, outcome, _ = attempt(app.get("main"), {}, Invocation("seams", tmp_path, deadline))
+    result, outcome, _ = attempt(app.get("main"), {}, Invocation("seams", spool, deadline))
+    return result, outcome
+
+
+def test_a_directory_output_keeps_every_byte(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "raw.bin").write_bytes(BYTES)
+    result, outcome = _save_tree(source, tmp_path)
     assert outcome.terminal == "succeeded", outcome
     assert result is not None and isinstance(result.result, Result)
     assert (result.result.files.path / "nested" / "raw.bin").read_bytes() == BYTES
+
+
+def test_a_directory_output_refuses_a_link_out_of_its_tree(tmp_path: Path) -> None:
+    source, outside = tmp_path / "source", tmp_path / "outside"
+    source.mkdir()
+    outside.mkdir()
+    (outside / "secret.bin").write_bytes(BYTES)
+    if sys.platform == "win32":  # a junction: no privilege needed, and not a symlink
+        _winapi.CreateJunction(str(outside), str(source / "escape"))
+    else:
+        (source / "escape").symlink_to(outside)
+    result, outcome = _save_tree(source, tmp_path)
+    assert result is None and outcome.code == "output_tree", outcome
 
 
 def test_a_kernel_store_entry_is_published_whole_and_read_back_exactly(tmp_path: Path) -> None:
