@@ -443,8 +443,9 @@ class Backend:
 
     def _owner(self, module: object) -> tuple[str, str] | None:
         """The checkpoint component (its content id) and module path that hold `module`, when
-        a loaded component does."""
-        for model in self.models.values():
+        a component this process loaded does, of any construction (H3's turbo overlay is its
+        own)."""
+        for model in list(self.memory.models.values()):
             for path, sub in model.module.named_modules():
                 if sub is module:
                     return model.key, path
