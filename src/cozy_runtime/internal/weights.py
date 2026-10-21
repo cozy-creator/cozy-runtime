@@ -441,6 +441,15 @@ class Backend:
 
     # -- construction internals
 
+    def _owner(self, module: object) -> tuple[str, str] | None:
+        """The checkpoint component (its content id) and module path that hold `module`, when
+        a loaded component does."""
+        for model in self.models.values():
+            for path, sub in model.module.named_modules():
+                if sub is module:
+                    return model.key, path
+        return None
+
     def _route(self, key: str) -> str:
         return str(self.selected[key].provider.route)
 
@@ -450,7 +459,9 @@ class Backend:
         read from the checkpoint by varena, which seals them and deposits the layout with TensorD
         for the next load."""
         rows = {self.plan[key].name: self.plan[key] for key in keys}
-        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)))
+        bakes = self.bakes[name] = _Bakes(
+            self.torch, root, rows, set(blocks_of(root)), self._owner
+        )
         grant = replace(self._granted(name), keys=tuple(rows))
         vars(root)["_varena"] = Declared(  # `_cozy_state`: what the package's forward changes
             grant,
@@ -636,6 +647,7 @@ class _Bake:
     (stored keys and scale), and the model's own hooks."""
 
     weight: str
+    encoding: str = ""
     layer: LoRALayer | None = None
     factors: list[tuple[str, str, float]] = field(default_factory=list)
     hooks: list[LoRASource] = field(default_factory=list)
@@ -647,9 +659,14 @@ class _Bakes:
     its refault. Each weight's own seed makes every bake of it the same bytes."""
 
     def __init__(
-        self, torch: ModuleType, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
+        self,
+        torch: ModuleType,
+        root: Module,
+        rows: Mapping[str, PlanRow],
+        blocks: set[str],
+        owner: Callable[[object], tuple[str, str] | None],
     ) -> None:
-        self.torch = torch
+        self.torch, self.owner = torch, owner
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
         self.baked = 0
@@ -660,7 +677,7 @@ class _Bakes:
             roles = {p.role: p.dtype for p in encoded.parts}
             if site == local or not lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles):
                 continue
-            bake = _Bake(stored)
+            bake = _Bake(stored, repr((encoded.scheme, encoded.params)))
             try:
                 hooks = list(root.get_submodule(site)._forward_hooks.values())
             except AttributeError:  # a tensor named `.weight` on no module of its own
@@ -695,6 +712,30 @@ class _Bakes:
             hooks = (hook.lora_factors() for hook in bake.hooks)
             rows.append((bake.layer is not None, *(g and (g[0], g[3]) for g in hooks)))
         return (self.strategy, *rows)
+
+    def identity(self) -> str | None:
+        """What `prepare()` just named, the same in every process (`Fill.identity`): the
+        recipe, and each baked weight's stored name and encoding with each delta's content (a
+        stored factor pair of this checkpoint, or an overlay checkpoint's component and module
+        path), dtypes and scale. None when an overlay's checkpoint cannot be named."""
+        torch = self.torch
+        if self.strategy != "bake":
+            return repr((self.strategy,))
+        device = torch.cuda.current_device()
+        held: list[object] = [lora_bake.recipe(device), torch.__version__]
+        held.append(torch.cuda.get_device_capability(device))
+        for stored, bake in sorted(self.bakes.items()):
+            deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
+            for hook in bake.hooks:
+                got = hook.lora_factors()
+                if got is None:
+                    continue
+                named = self.owner(got[0])
+                if named is None:
+                    return None
+                deltas.append((*named, str(got[1].dtype), str(got[2].dtype), repr(float(got[3]))))
+            held.append((stored, bake.encoding, deltas))
+        return repr(held)
 
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
         if self.strategy != "bake":
