@@ -88,7 +88,7 @@ conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 # TensorFS 0.13 is unreleased: an exact cozy-creator commit (xs053/tfs013-integration) until the
 # cohort publishes it (never a test publish). The release replaces this with the version.
 [tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "d0b37eff97fc9e9ec4f62c54c6a1ff4f9a651d20", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "e98e4ed232683ef1cff530c72e94572635152ea5", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
