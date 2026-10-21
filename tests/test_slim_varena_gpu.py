@@ -34,7 +34,7 @@ def burst(nbytes: int, child: Callable[[], object] | None = None) -> nn.Module:
 def weights(folder: Path, names: tuple[str, ...]) -> tensorfs.Checkpoint:
     writer = tensorfs.Writer(cache_dir=folder)
     for name in names:
-        writer.component(name, cls="", config={}).put("weight", torch.ones(()))
+        writer.component(name, cls=("", "", ""), config={}).put("weight", torch.ones(()))
     return writer.commit()
 
 
@@ -122,7 +122,7 @@ def test_refused_capture_preserves_cache_held_common_for_eager_fallback(tmp_path
         return layer
 
     writer = tensorfs.Writer(cache_dir=tmp_path)
-    component = writer.component("nested", cls="", config={})
+    component = writer.component("nested", cls=("", "", ""), config={})
     component.put("bias", torch.tensor([1.0, 2.0]))
     component.put("body.0.weight", 2 * torch.eye(2))
     component.put("body.1.weight", 3 * torch.eye(2))
@@ -208,7 +208,7 @@ def test_overlapping_streams_wait_for_common_binding_and_join_before_release(tmp
     """A second forward shares the common conversion and hands its GPU work back."""
     assert torch.cuda.device_count() == 1
     writer = tensorfs.Writer(cache_dir=tmp_path)
-    writer.component("shared", cls="", config={}).put(
+    writer.component("shared", cls=("", "", ""), config={}).put(
         "body.weight", torch.tensor([3.0, 5.0], dtype=torch.bfloat16)
     )
     ck = writer.commit()

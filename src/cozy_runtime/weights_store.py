@@ -35,6 +35,17 @@ from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 DEFAULT_HOME = "~/.cache/tensorfs"
 #: The local repo of finished derivations, one private tag per replay key.
 DERIVED = "local/derived"
+#: TensorFS's library-neutral class record; an empty library is an unknown class.
+UNKNOWN_CLASS = ("", "", "")
+
+type Class = tensorfs.ClassRef | tuple[str, str, str]
+
+
+def _class_key(value: Class) -> tuple[str, str, str]:
+    """Compare native records and their public tuple form by the same immutable fields."""
+    if isinstance(value, tuple):
+        return value
+    return value.library, value.version, value.name
 
 #: Bytes to write: a buffer, or a file read from its position to its end.
 type Data = Buffer | IO[bytes]
@@ -280,7 +291,7 @@ class Output:
             )
         )
         self._components: dict[str, tensorfs.ComponentWriter] = {}
-        self._metadata: dict[str, tuple[str, dict[str, object]]] = {}
+        self._metadata: dict[str, tuple[tuple[str, str, str], dict[str, object]]] = {}
 
     def close(self) -> None:
         """Let the writer go; what it wrote stays for an attempt that resumes it."""
@@ -295,14 +306,17 @@ class Output:
         self.close()
 
     def component(
-        self, name: str, *, cls: str | None = None, config: Mapping[str, object] | None = None
+        self, name: str, *, cls: Class | None = None, config: Mapping[str, object] | None = None
     ) -> tensorfs.ComponentWriter:
         """Component `name`, inheriting class/config unless explicitly supplied. Explicit
         metadata also declares a new or renamed component of a derived output. Set it before
         writing the component; changing metadata after a write is refused."""
         declared = self.declared.get(name)
+        selected_class = (
+            cls if cls is not None else declared.cls if declared is not None else UNKNOWN_CLASS
+        )
         metadata = (
-            cls if cls is not None else declared.cls if declared is not None else "",
+            _class_key(selected_class),
             dict(config if config is not None else declared.config if declared is not None else {}),
         )
         writer = self._components.get(name)
@@ -320,7 +334,7 @@ class Output:
                 f"no checkpoint this output derives from has a component {name!r}",
                 code="weights_output_component",
             )
-        writer = self._writer.component(name, cls=metadata[0], config=metadata[1])
+        writer = self._writer.component(name, cls=selected_class, config=metadata[1])
         self._components[name] = writer
         self._metadata[name] = metadata
         return writer

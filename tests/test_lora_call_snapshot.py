@@ -137,14 +137,14 @@ class Root(module_type):  # type: ignore[misc]
 
 def fixture(folder: Path, device: str = "cpu") -> tuple[Any, ...]:
     writer = tensorfs.Writer(cache_dir=folder)
-    writer.component("net", cls="", config={}).put(
+    writer.component("net", cls=("", "", ""), config={}).put(
         "block.linear.weight", torch.tensor(BASE).numpy(), dtype="F32", shape=[2, 2]
     )
     for name, down, up in (
         ("A", [[1.0, 0.0]], [[2.0], [3.0]]),
         ("B", [[0.0, 1.0]], [[5.0], [7.0]]),
     ):
-        component = writer.component(name, cls="", config={})
+        component = writer.component(name, cls=("", "", ""), config={})
         component.put("down", torch.tensor(down).numpy(), dtype="F32", shape=[1, 2])
         component.put("up", torch.tensor(up).numpy(), dtype="F32", shape=[2, 1])
     checkpoint = writer.commit()

@@ -33,7 +33,7 @@ def loaded_model(
         torch.nn.Linear(64, 128), torch.nn.GELU(), torch.nn.Linear(128, 64)
     )
     writer = tensorfs.Writer(cache_dir=folder)
-    component = writer.component("net", cls="", config={})
+    component = writer.component("net", cls=("", "", ""), config={})
     for key, value in reference.state_dict().items():
         component.put(key, value.detach().numpy(), dtype="F32", shape=list(value.shape))
     checkpoint = writer.commit()

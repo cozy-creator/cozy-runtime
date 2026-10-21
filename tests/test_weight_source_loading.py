@@ -35,7 +35,7 @@ def network() -> nn.Module:
 
 def checkpoint(reference: nn.Module, folder: Path) -> tensorfs.Checkpoint:
     writer = tensorfs.Writer(cache_dir=folder)
-    component = writer.component("net", cls="", config={})
+    component = writer.component("net", cls=("", "", ""), config={})
     for key, tensor in reference.state_dict().items():
         component.put(
             key, tensor.detach().contiguous().numpy(), dtype="F32", shape=list(tensor.shape)

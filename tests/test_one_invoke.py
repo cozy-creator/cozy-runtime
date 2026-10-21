@@ -88,7 +88,9 @@ def _source(root: Path, monkeypatch: pytest.MonkeyPatch) -> str:
         for index, key in enumerate(("z.weight", "a.weight", "bias"))
     }
     writer = tensorfs.Writer(cache_dir=store)
-    unet = writer.component("unet", cls="diffusers.UNet2DConditionModel", config={"in": 64})
+    unet = writer.component(
+        "unet", cls=("diffusers", "", "UNet2DConditionModel"), config={"in": 64}
+    )
     for key, value in bf16.items():
         unet.put(key, memoryview(value), dtype="BF16", shape=[8, 64])
     ref = writer.commit().id

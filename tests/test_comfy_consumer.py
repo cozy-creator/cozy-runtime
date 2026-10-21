@@ -98,7 +98,7 @@ def test_real_backend_serves_original_logical_dtype_from_resident_parts(tmp_path
 
     case = POSITIVE[0]
     writer = tensorfs.Writer(cache_dir=tmp_path / "store")
-    component = writer.component("net", cls="torch.nn.Linear", config={"bias": False})
+    component = writer.component("net", cls=("torch", "", "Linear"), config={"bias": False})
     component.put_encoded(
         "weight",
         dtype=case.dtype,

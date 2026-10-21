@@ -34,10 +34,10 @@ def checkpoint(
     store: Path,
     components: Mapping[str, Mapping[str, Any]],
     *,
-    classes: Mapping[str, str] = {},
+    classes: Mapping[str, weights_store.Class] = {},
     configs: Mapping[str, Mapping[str, object]] = {},
     assets: Mapping[str, Mapping[str, bytes]] = {},
-    pipeline: tuple[str, Mapping[str, object]] | None = None,
+    pipeline: tuple[weights_store.Class, Mapping[str, object]] | None = None,
 ) -> str:
     """`components`' numpy arrays (a uint16 one is bf16) as one checkpoint in `store`, each
     component's in insertion order, with their classes, configs and assets: its header ref."""
@@ -47,7 +47,7 @@ def checkpoint(
     for name in dict.fromkeys([*components, *assets]):
         component = writer.component(
             name,
-            cls=classes.get(name, ""),
+            cls=classes.get(name, weights_store.UNKNOWN_CLASS),
             config=dict(configs.get(name, {})),
         )
         for key, value in components.get(name, {}).items():

@@ -46,12 +46,14 @@ def source(store: Path) -> str:
         store,
         {"unet": TENSORS},
         classes={
-            "unet": "diffusers.UNet2DConditionModel", "tokenizer": "transformers.CLIPTokenizer"
+            "unet": ("diffusers", "", "UNet2DConditionModel"),
+            "tokenizer": ("transformers", "", "CLIPTokenizer"),
         },
         configs={"unet": CONFIG},
         assets={"tokenizer": {"vocab.json": VOCAB}},
         pipeline=(
-            "diffusers.StableDiffusionPipeline", {"unet": ["diffusers", "UNet2DConditionModel"]}
+            ("diffusers", "", "StableDiffusionPipeline"),
+            {"unet": ["diffusers", "UNet2DConditionModel"]},
         ),
     )  # fmt: skip
 
@@ -101,9 +103,10 @@ def test_a_lane_encodes_by_scheme_and_decodes_through_the_reference(
         assert float(np.linalg.norm(_read(out, key) - want) / np.linalg.norm(want)) < bound, key
     assert unet.tensors["blocks.0.proj.bias"].dtype == "BF16"
     assert unet.tensors["norm.weight"].dtype == "F16", "f16 is not a bf16 source here"
-    assert (unet.cls, unet.config) == ("diffusers.UNet2DConditionModel", CONFIG)
+    assert (tuple(unet.cls), unet.config) == (("diffusers", "", "UNet2DConditionModel"), CONFIG)
     assert out.components["tokenizer"].asset("vocab.json") == VOCAB, "the base's assets carry over"
-    assert out.pipeline is not None and out.pipeline.cls == "diffusers.StableDiffusionPipeline"
+    assert out.pipeline is not None
+    assert tuple(out.pipeline.cls) == ("diffusers", "", "StableDiffusionPipeline")
 
 
 def test_a_committed_output_replays_and_an_interrupted_one_resumes(
@@ -220,7 +223,7 @@ def test_values_read_a_rowwise_scale_in_its_stored_dtype(store: Path) -> None:
     payload = torch.linspace(-2, 2, 4 * 32).reshape(4, 32).to(torch.float8_e4m3fn)
     scale = torch.tensor([0.5, 0.25, 3.0, 0.0078125], dtype=torch.bfloat16)
     writer = tensorfs.Writer(cache_dir=store)
-    writer.component("unet", cls="", config={}).put_encoded(
+    writer.component("unet", cls=("", "", ""), config={}).put_encoded(
         "w", dtype="BF16", shape=[4, 32], scheme="fp8.rowwise",
         parts={"weight": ("F8_E4M3", [4, 32], payload.view(torch.uint8).numpy()),
          "scale": ("BF16", [4], scale.view(torch.uint16).numpy())},

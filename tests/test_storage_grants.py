@@ -237,7 +237,7 @@ def test_a_fresh_output_creates_its_component_and_replays_without_a_source(
         output.put("model", "table", "U8", [4], b"data")
         first = ctx.adopt_model(output)
     ck = tensorfs.open(first.checkpoint, cache_dir=store, local_files_only=True)
-    assert ck.components["model"].cls == "" and ck.components["model"].config == {}
+    assert tuple(ck.components["model"].cls) == ("", "", "") and ck.components["model"].config == {}
     data = bytearray(4)
     ck.components["model"].tensors.read_into("table", data, role="")
     assert data == b"data"
@@ -284,27 +284,31 @@ def test_explicit_output_metadata_overrides_and_adds_components_without_rewritin
 
     store = home(tmp_path / "tensorfs", monkeypatch)
     base = tensorfs.open(
-        checkpoint(store, {"model": {"w": np.arange(4, dtype=np.uint8)}},
-                   classes={"model": "Original"}, configs={"model": {"old": True}}),
+        checkpoint(
+            store, {"model": {"w": np.arange(4, dtype=np.uint8)}},
+            classes={"model": ("tests", "1.0", "Original")}, configs={"model": {"old": True}},
+        ),
         cache_dir=store, local_files_only=True,
     )  # fmt: skip
     definition = Derivation(None, sources=(base,), order=(("renamed", "w"),))
     ctx = context(store, "metadata", outputs={"model": 4})
     with ctx.output("model", definition) as output:
         assert isinstance(output, Output)
-        output.component("renamed", cls="Prepared", config={"architecture": "Example"})
+        output.component(
+            "renamed", cls=("tests", "2.0", "Prepared"), config={"architecture": "Example"}
+        )
         output.copy("renamed", "w", base, from_component="model")
         output.component("model", config={"normalized": True})
-        output.component("conditioning", cls="", config={})
+        output.component("conditioning", cls=("", "", ""), config={})
         output.put("conditioning", "constant", "U8", [4], b"data")
         assert output.written == 4
         with pytest.raises(CapabilityError, match="before writing"):
             output.component("renamed", config={"changed": True})
         artifact = ctx.adopt_model(output)
     with tensorfs.open(artifact.checkpoint, cache_dir=store, local_files_only=True) as got:
-        assert got.components["renamed"].cls == "Prepared"
+        assert tuple(got.components["renamed"].cls) == ("tests", "2.0", "Prepared")
         assert got.components["renamed"].config == {"architecture": "Example"}
-        assert got.components["model"].cls == "Original"
+        assert tuple(got.components["model"].cls) == ("tests", "1.0", "Original")
         assert got.components["model"].config == {"normalized": True}
         before = tensorfs.raw.parts(base, "model", "w")[""]
         after = tensorfs.raw.parts(got, "renamed", "w")[""]
@@ -322,6 +326,55 @@ def test_explicit_output_metadata_overrides_and_adds_components_without_rewritin
         assert replay.written == 0 and ctx.adopt_model(replay) == artifact
 
 
+def test_class_records_preserve_versions_and_compare_native_and_tuple_forms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real Writer sees the selected record; equivalent public forms share its guard."""
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    original = tensorfs.ClassRef("tests", "1.0", "Original")
+    prepared = tensorfs.ClassRef("tests", "2.0", "Prepared")
+    base = tensorfs.open(
+        checkpoint(store, {"model": {"w": np.arange(4, dtype=np.uint8)}},
+                   classes={"model": original}, pipeline=(
+                       tensorfs.ClassRef("tests", "3.0", "Pipeline"), {"enabled": True})),
+        cache_dir=store, local_files_only=True,
+    )  # fmt: skip
+    definition = weights_store.Derivation(base)
+    ctx = context(store, "class-record", outputs={"model": 4})
+    with ctx.output("model", definition) as output:
+        selected = output.component("renamed", cls=prepared, config={"state": "prepared"})
+        output.put("renamed", "w", "U8", [4], b"data")
+        assert output.component(
+            "renamed", cls=("tests", "2.0", "Prepared"), config={"state": "prepared"}
+        ) is selected
+        for changed in (
+            ("other", "2.0", "Prepared"),
+            ("tests", "2.1", "Prepared"),
+            ("tests", "2.0", "Other"),
+        ):
+            with pytest.raises(CapabilityError, match="before writing"):
+                output.component("renamed", cls=changed, config={"state": "prepared"})
+        inherited = output.component("model")
+        assert output.component("model", cls=("tests", "1.0", "Original")) is inherited
+        artifact = ctx.adopt_model(output)
+    with tensorfs.open(artifact.checkpoint, cache_dir=store, local_files_only=True) as got:
+        assert got.components["renamed"].cls == prepared
+        assert got.components["model"].cls == original
+        assert got.pipeline is not None and base.pipeline is not None
+        assert got.pipeline.cls == base.pipeline.cls
+        data = got.components["renamed"].tensors.read("w")
+        assert isinstance(data, tensorfs.Array) and data.tobytes() == b"data"
+        before = tensorfs.raw.parts(base, "model", "w")[""]
+        after = tensorfs.raw.parts(got, "model", "w")[""]
+        assert (before.chunk, before.offset, before.length) == (
+            after.chunk, after.offset, after.length,
+        )
+    with ctx.output("model", definition) as replay:
+        assert replay.done is not None
+        assert replay.written == 0 and ctx.adopt_model(replay) == artifact
+    assert base.components["model"].cls == original
+
+
 def test_output_assets_share_the_tensor_byte_bound_and_replay(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -329,7 +382,7 @@ def test_output_assets_share_the_tensor_byte_bound_and_replay(
     ctx = context(store, "asset", outputs={"model": 7})
     definition = weights_store.Derivation(None)
     with ctx.output("model", definition) as output:
-        output.component("model", cls="Prepared", config={})
+        output.component("model", cls=("tests", "2.0", "Prepared"), config={})
         output.asset("model", "LICENSE", b"abc")
         output.put("model", "w", "U8", [4], b"data")
         assert output.written == 7
@@ -449,7 +502,7 @@ def test_private_replay_retains_the_exact_tree_and_refuses_another_commit(
     assert endpoint.repo(weights_store.DERIVED) == (before, etag), "same-tree CAS is a no-op"
 
     writer = tensorfs.Writer(cache_dir=store)
-    writer.component("model", cls="", config={}).put("w", b"two", dtype="U8", shape=[3])
+    writer.component("model", cls=("", "", ""), config={}).put("w", b"two", dtype="U8", shape=[3])
     with writer.commit() as other:
         assert other.tree is not None
         with weights_store._thin(store, other) as folder:
