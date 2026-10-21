@@ -6,6 +6,7 @@ exists. The machine's kernel store and a card's attention kernels need CUDA; the
 stand in for the store, everything else is the executor's own path."""
 
 import argparse
+import functools
 import socket
 from pathlib import Path
 from types import SimpleNamespace
@@ -65,7 +66,10 @@ def construction(worker: Executor, root: Path) -> Executor:
     site = Attention(query_dim=32, heads=2, dim_head=16)
     child.backend = SimpleNamespace(roots={"dit": site})
     child.device_facts = FACTS
-    attention.adopt(child.backend.roots)
+    child._reselect = functools.partial(
+        attention.select, FACTS, child.backend.roots, degree=worker.world
+    )
+    child.attention = child._reselect()
     return child
 
 

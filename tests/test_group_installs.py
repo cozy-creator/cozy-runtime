@@ -103,24 +103,28 @@ def test_an_install_rank_0_refuses_is_dropped_and_the_group_stays_whole(tmp_path
         assert not leader.poisoned
 
 
-def test_a_follower_serves_rank_0s_whole_selection_or_refuses(tmp_path: Path) -> None:
+def test_a_follower_serves_rank_0s_whole_selection(tmp_path: Path) -> None:
     with group_of_two(tmp_path) as leader:
-        assert leader.backend is not None
         roots = leader.backend.roots
         # GPU 1 starts on flash-attn3; GPU 0 serves SDPA, which GPU 1 then serves too.
-        attention.select(HELD["FACTS"], roots, degree=2)
         assert attention.chosen(roots).sites == (("dit", "", "sdpa"),)
         assert leader._agree_attention() is None
-        # GPU 0 moves to a kernel GPU 1 cannot serve: the upgrade is refused for the group.
+        assert not leader.poisoned
+
+
+def test_a_kernel_one_gpu_lacks_keeps_the_group_on_what_every_gpu_has(tmp_path: Path) -> None:
+    with group_of_two(tmp_path) as leader:
+        roots = leader.backend.roots
+        assert leader._agree_attention() is None
+        # GPU 0 moves to a kernel GPU 1 cannot serve now: GPU 1 says so instead of waiting
+        # for a build, and the group stays on SDPA, which every GPU has.
         roots["dit"].processor._attention_backend = attention._member(
             attention.known()["flash-attn3"]
         )
-        refused = leader._agree_attention(poison=False)
-        assert refused is not None and refused["code"] == "gpu_divergence"
-        assert "flash-attn3" in str(refused["detail"]) and not leader.poisoned
-        # Prepared that way, the group does not form.
-        refused = leader._agree_attention()
-        assert refused is not None and leader.poisoned == "group: gpu_divergence"
+        assert leader._agree_attention(poison=False) is None
+        assert attention.chosen(roots).sites == (("dit", "", "sdpa"),)
+        assert "GPU 1" in leader.attention.skipped["flash-attn3"]
+        assert not leader.poisoned
 
 
 def test_the_selection_carries_sols_dense_reference_and_restores_it() -> None:

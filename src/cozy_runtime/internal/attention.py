@@ -68,6 +68,18 @@ class AttentionRefusal(RuntimeError):
         self.code = code
 
 
+class Lacking(AttentionRefusal):
+    """Another GPU's choice names kernels this one cannot serve now: each one's refusal
+    code (`attention_kernel_compiling`: not yet). Nothing changed here."""
+
+    def __init__(self, kernels: dict[str, str]) -> None:
+        super().__init__(
+            "attention_kernel_lacking",
+            "; ".join(f"{name}: {code}" for name, code in sorted(kernels.items())),
+        )
+        self.kernels = kernels
+
+
 @dataclass(frozen=True, slots=True)
 class Candidate:
     """One attention kernel the runtime knows how to reach, and what it needs to run."""
@@ -719,6 +731,7 @@ def _sol_dense(
             or _off_row(candidate, row)
             or not _admits(candidate, "bfloat16", 128)
             or (dense is not None and not candidate.exact)
+            or name in refused
         ):
             continue
         if name not in resolved:
@@ -751,9 +764,10 @@ def _bind_sol_dense(chosen: tuple[Ready, Ready | None]) -> None:
     )
 
 
-def pinned(name: str, device: DeviceFacts) -> list[Ready]:
+def pinned(name: str, device: DeviceFacts, wait: bool = True) -> list[Ready]:
     """The single kernel the execution-path override names, or a typed refusal (cr-125).
-    A request's `plan` turns a refusal into a visible fallback, never a silent one."""
+    A request's `plan` turns a refusal into a visible fallback, never a silent one. Not
+    `wait`: one still compiling refuses (`attention_kernel_compiling`) instead."""
     candidate = known().get(name)
     if candidate is None:
         raise AttentionRefusal(
@@ -768,7 +782,7 @@ def pinned(name: str, device: DeviceFacts) -> list[Ready]:
             f"{unsupported}, sm{device.sm}. This environment runs {image_kernels(device)} on "
             f"{device.name}",
         )
-    return [_resolve(candidate, device)]
+    return [_resolve(candidate, device, wait)]
 
 
 # ------------------------------------------------------------------------------ the pin
@@ -1305,8 +1319,14 @@ def install(
     if choice is not None:
         if device is None:
             raise AttentionRefusal("attention_kernel_unsupported", "a choice installs on a device")
+        lacking: dict[str, str] = {}
         for kernel in sorted({*taken.values(), choice.dense, choice.exact} - {""}):
-            resolved[kernel] = pinned(kernel, device)[0]
+            try:
+                resolved[kernel] = pinned(kernel, device, wait=False)[0]
+            except AttentionRefusal as exc:
+                lacking[kernel] = exc.code
+        if lacking:
+            raise Lacking(lacking)
     refused: dict[str, str] = dict(skipped or {})
     matched = False
     sol_order: list[str] | None = None
@@ -1739,12 +1759,14 @@ def select(
     *,
     bits: int | Mapping[str, int] = 16,
     row: arch.Row | None = None,
+    passed: Mapping[str, str] | None = None,
 ) -> Applied:
-    """Select once at preparation: each site's walk at the model's `bits`, or the pin."""
+    """Select once at preparation: each site's walk at the model's `bits`, or the pin. Every
+    kernel in `passed` is passed over, with why (another GPU of the group lacks it)."""
     adopt(roots)
     _, name = _pin_parts(pin)
     ready = pinned(name, device) if name and name != EXACT else []
-    skipped: dict[str, str] = {}
+    skipped: dict[str, str] = dict(passed or {})
     applied = install(ready, roots, pin, degree, device=device, bits=bits, row=row, skipped=skipped)
     return replace(applied, skipped=skipped or None)
 

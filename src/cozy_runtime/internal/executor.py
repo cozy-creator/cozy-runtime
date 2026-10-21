@@ -899,8 +899,9 @@ class Executor:
         #: line, not a per-attempt record: the choice is a function of device and image.
         self.attention: attention.Applied | None = None
         self.attention_defaults = attention.Snapshot(())
-        #: this construction's selection, made again between requests (`_upgrade_attention`)
-        self._reselect: Callable[[], attention.Applied] | None = None
+        #: this construction's selection, made again between requests (`_upgrade_attention`),
+        #: passing over what `passed` names
+        self._reselect: Callable[..., attention.Applied] | None = None
         #: kernel installs waiting for their build on every GPU (`Plan.when_ready`), by set name
         self._installs: list[tuple[str, Callable[[], Launch | None], Callable[[Launch], None]]] = []
         #: Device facts for this prepared generation, reused for per-request pin checks.
@@ -2817,6 +2818,7 @@ class Executor:
         if refused is not None:
             return refused
         stage("install")
+        applied = self.attention  # the group may have selected again (`_agree_attention`)
         if attention.sparse_names(applied.totals()):
             frozen = attention._baked_in(dict(backend.roots))
             if frozen:
@@ -3949,41 +3951,66 @@ class Executor:
             executor.attention_defaults.restore()
             executor.attention = replace(applied, waiting=())
             return False
+        executor.attention = fresh
         if executor.group is not None:
             with executor.group.hold(range(1, executor.group.degree)):
                 if executor._agree_attention(poison=False):
                     # Every GPU back on the prepared selection; one that cannot take it back
                     # leaves a divergent group, refused.
                     executor.attention_defaults.restore()
+                    executor.attention = applied
                     executor._agree_attention()
                     executor.attention = replace(applied, waiting=())
                     return False
         assert executor.backend is not None
-        executor.attention = fresh
         executor.attention_defaults = attention.snapshot(dict(executor.backend.roots))
         return True
 
     def _agree_attention(self, *, poison: bool = True) -> dict[str, Any] | None:
-        """THE GROUP SERVES RANK 0'S SELECTION, WHOLE: each site's kernel and Sol's dense
-        reference. Every follower installs it through the `attention.install` rank 0 selected
-        with and answers what it then serves; one that serves anything else refuses the group
+        """THE GROUP SERVES ONE SELECTION, WHOLE, THAT EVERY GPU HAS READY: each site's kernel
+        and Sol's dense reference. Every follower installs rank 0's through the
+        `attention.install` rank 0 selected with, never waiting for a build, and answers what
+        it then serves. A kernel a follower lacks, rank 0 selects again without, and one still
+        compiling there waits for a later boundary (`_upgrade_attention`), as kernel sets do
+        (`_install_ready_kernels`). A follower that serves anything else refuses the group
         instead of serving a mixed selection. Not `poison`: an upgrade a follower did not take
         is refused for this group alone, which stays whole."""
-        assert self.group is not None and self.backend is not None
-        mine = attention.chosen(self.backend.roots)
-        try:
-            self.group.broadcast(
-                executor_commands.encode(
-                    Attention(
-                        construction=self.construction,
-                        model_key=self._group_model_key,
-                        adopt=mine,
+        assert self.group is not None and self.backend is not None and self.attention is not None
+        passed: dict[str, str] = {}
+        later: set[str] = set()
+        while True:
+            mine = attention.chosen(self.backend.roots)
+            try:
+                self.group.broadcast(
+                    executor_commands.encode(
+                        Attention(
+                            construction=self.construction,
+                            model_key=self._group_model_key,
+                            adopt=mine,
+                        )
                     )
                 )
-            )
-            replies = self.group.collect("attention")
-        except GroupRefusal as exc:
-            return self._group_refusal(exc)
+                replies = self.group.collect("attention")
+            except GroupRefusal as exc:
+                return self._group_refusal(exc)
+            lacking = {
+                (name, follower.gpu, code)
+                for follower, reply in zip(self.group.followers, replies, strict=True)
+                for name, code in dict(reply.get("lacking") or {}).items()
+            }
+            if not {name for name, _, _ in lacking} - set(passed):
+                break
+            passed.update({name: f"{gpu}: {code}" for name, gpu, code in lacking})
+            later.update(n for n, _, code in lacking if code == "attention_kernel_compiling")
+            assert self._reselect is not None
+            try:
+                self.attention = self._reselect(passed=passed)
+            except attention.AttentionRefusal as exc:
+                replies = [{"ok": False, "code": exc.code, "detail": str(exc)}] * len(replies)
+                break
+        if later:
+            waiting = tuple(sorted({*self.attention.waiting, *later}))
+            self.attention = replace(self.attention, waiting=waiting)
         for follower, reply in zip(self.group.followers, replies, strict=True):
             why = _attention_divergence(mine, reply)
             if why:
@@ -4007,7 +4034,15 @@ class Executor:
                 [], roots, degree=self.world, device=target.device_facts, choice=choice
             )
         except attention.AttentionRefusal as exc:
-            return {"ok": False, "code": exc.code, "detail": str(exc)[:900], "rank": self.rank}
+            lacking = exc.kernels if isinstance(exc, attention.Lacking) else {}
+            detail = str(exc)[:900]
+            return {
+                "ok": False,
+                "code": exc.code,
+                "detail": detail,
+                "rank": self.rank,
+                "lacking": lacking,
+            }
         took = attention.difference(choice, held)
         if took:
             print(
