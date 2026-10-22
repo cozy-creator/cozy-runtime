@@ -812,12 +812,12 @@ if triton is not None:
         scaled = scaled.to(tl.int32)
         level = tl.load(second)
         target = _e2m1_value(code) * (_decode_e4m3(scaled) * level) + delta
-        shape = (TILE, TILE // 16, 16)
-        need = tl.max(tl.reshape(tl.abs(target), shape), axis=2) / (6.0 * level)
-        kept = tl.max(tl.reshape(scaled, shape), axis=2)
+        need = tl.max(tl.reshape(tl.abs(target), (TILE, TILE // 16, 16)), axis=2) / (6.0 * level)
+        kept = tl.max(tl.reshape(scaled, (TILE, TILE // 16, 16)), axis=2)
         grown = need * 6.0 > _decode_e4m3(kept) * 7.0  # `E2M1_OUTGROWN`
         block = tl.where(grown, _e4m3_at_least(need), kept)
-        unit = tl.reshape(tl.broadcast_to((_decode_e4m3(block) * level)[:, :, None], shape), (TILE, TILE))
+        unit = (_decode_e4m3(block) * level)[:, :, None]
+        unit = tl.reshape(tl.broadcast_to(unit, (TILE, TILE // 16, 16)), (TILE, TILE))
         payload = target / tl.where(unit > 0, unit, 1.0)
         at = row[:, None] * cols + col[None, :]
         nibble = _stochastic_e2m1(payload, tl.rand(seed, at.to(tl.uint32)))
