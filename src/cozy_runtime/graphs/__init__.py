@@ -389,15 +389,16 @@ def _placed(module: Any) -> tuple[Any, str] | None:
     return PLACED.get(region[0]()) if region is not None else PLACED.get(module)
 
 
-def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> tuple[int, int]:
+def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> int:
     """Varena's ask: every graph on the device goes, with their shared pool (it never asks while
     a call holds the pool). A region call in flight on another thread holds the locks, and may
-    wait on varena: the drop runs when it lets them go, its bytes coming. (freed, coming)."""
+    wait on varena: the drop runs when it lets them go (its bytes arrive as the cache closes;
+    they are reported coming once the core's shrink answer carries them)."""
     nbytes = owner.capture_bytes()
     if not _drop(torch, owner):
         owner.deferred = functools.partial(_drop, torch, owner)
-        return 0, nbytes
-    return nbytes, 0
+        return 0
+    return nbytes
 
 
 def _drop(torch: Any, owner: domain.Domain) -> bool:
