@@ -437,16 +437,19 @@ def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
     )  # left in training mode, as Runtime constructs it: no gradients, inert dropouts
     blocks = blocks_of(unet)
     found = [path for path, _ in segments(torch, unet, blocks)]
-    top = [p for p in found if not any(p.startswith(f"{q}.") for q in found)]
+    # The whole UNet first, then its containers: one replay a call while it can be prepared.
+    assert found[0] == ""
+    below = [p for p in found if p and "." not in p.replace("_blocks.", "_blocks:")]
     expected = ["mid_block", *(f"{n}_blocks.{i}" for n in ("down", "up") for i in range(3))]
-    assert sorted(top) == sorted(expected)
+    assert sorted(below) == sorted(expected)
     # Every block is a finer region too, and no single op is a region of its own.
     assert set(blocks) <= set(found)
-    assert all(any(b == p or b.startswith(f"{p}.") for b in blocks) for p in found)
+    assert all(not p or any(b == p or b.startswith(f"{p}.") for b in blocks) for p in found)
     # A package hook on one block: the containers above it run as written, its siblings replay.
     hooked = "down_blocks.1.attentions.0.transformer_blocks.0"
     unet.get_submodule(hooked).register_forward_pre_hook(lambda *_: None)
     for path, pure in (
+        ("", False),
         ("down_blocks.1", False),
         ("down_blocks.1.attentions.0", False),
         (hooked, False),
@@ -469,3 +472,61 @@ def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
     unet.get_submodule("up_blocks.0.resnets.0.dropout").p = 0.1
     assert not safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
     assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0").eval())
+
+
+def test_a_package_subclass_takes_its_base_s_contract_only_by_declaring_it() -> None:
+    diffusers = pytest.importorskip("diffusers")
+    from cozy_runtime.graphs.regions import safe
+
+    base: Any = diffusers.UNet2DConditionModel
+    config = {
+        "sample_size": 8,
+        "block_out_channels": (16, 32),
+        "layers_per_block": 1,
+        "down_block_types": ("DownBlock2D", "CrossAttnDownBlock2D"),
+        "up_block_types": ("CrossAttnUpBlock2D", "UpBlock2D"),
+        "attention_head_dim": (2, 4),
+        "cross_attention_dim": 16,
+        "norm_num_groups": 8,
+    }
+
+    class Silent(base):  # type: ignore[misc]
+        steps = 0
+
+        def begin(self) -> None:
+            self.steps = 0
+
+    class Declared(Silent):
+        __cozy_graph_contract__ = base  # adds nothing of its own; declares its base's calls
+
+    class Overriding(base):  # type: ignore[misc]
+        def get_time_embed(self, sample: Any, timestep: Any) -> Any:  # a method forward calls
+            return super().get_time_embed(sample, timestep)
+
+    Overriding.__cozy_graph_contract__ = base
+    assert not safe(torch, Silent.from_config(config))  # undeclared: its own code, eager
+    declared = Declared.from_config(config)
+    assert safe(torch, declared)
+    assert not safe(torch, Overriding.from_config(config))  # overrides the base: refused
+    declared.register_forward_pre_hook(lambda *_: None)  # HiDiffusion's size hook
+    assert not safe(torch, declared)
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
+def test_a_component_root_copies_its_results_out() -> None:
+    """Its results leave the component (a package loop keeps them past its next call): a root
+    region copies them out, so a held result neither blocks the next replay nor changes."""
+    module = _mlp("cuda")
+    with torch.inference_mode():
+        x = torch.randn(4, 64, device="cuda")
+        module(x)
+        held = module(x)  # recorded and replayed
+        kept = held.clone()
+        recorder = graphs._RECORDERS[module]
+        other = torch.randn(4, 64, device="cuda")
+        torch.testing.assert_close(module(other), _as_written(module, other))
+        assert recorder.replays == 2 and recorder.held == 0 and torch.equal(held, kept)
+        entry = next(iter(recorder.recordings.values()))
+        assert held.data_ptr() not in {t.data_ptr() for t in entry.statics}
+        assert recorder.copy_bytes == 2 * (x.nbytes + held.nbytes)
+    graphs.release(torch, module)
