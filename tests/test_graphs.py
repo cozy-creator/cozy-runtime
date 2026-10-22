@@ -242,8 +242,8 @@ def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
 @pytest.mark.skipif(not CUDA, reason="graph retirement needs real completion events")
 def test_a_drop_asked_while_a_call_holds_the_domain_runs_when_it_lets_go() -> None:
     """Varena's shrink runs on its own thread; a region call in flight holds the domain (and may
-    wait on varena), so the drop is deferred and runs as the call lets go. A drop with the last
-    output copy still in flight leaves the result intact."""
+    wait on varena), so the drop is deferred, its bytes reported coming, and runs as the call
+    lets go. A drop with the last output copy still in flight leaves the result intact."""
     module = _mlp("cuda")
     with torch.inference_mode():
         x = torch.ones(4, 64, device="cuda")
@@ -254,14 +254,16 @@ def test_a_drop_asked_while_a_call_holds_the_domain_runs_when_it_lets_go() -> No
         owner = recorder.domain
         assert owner is not None
         with ThreadPoolExecutor(1) as varena, owner.using():
-            assert varena.submit(graphs._shed, torch, owner).result() == 0
+            freed, coming = varena.submit(graphs._shed, torch, owner).result()
+            assert freed == 0 and coming == owner.capture_bytes() > 0
             assert recorder.recordings and owner.deferred is not None
         assert not recorder.recordings and owner.captures is None
         module(x)
         module(x)
         torch.cuda._sleep(1 << 29)
         result = module(x)
-        assert graphs._shed(torch, owner) > 0 and not recorder.recordings
+        freed, coming = graphs._shed(torch, owner)
+        assert freed > 0 and coming == 0 and not recorder.recordings
         torch.cuda.synchronize()
         torch.testing.assert_close(result, torch.nn.Sequential.__call__(module, x))
 

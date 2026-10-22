@@ -262,7 +262,7 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
         assert graphs._RECORDERS[module].replays == 7  # call 1 eager, then every one replays
         assert holds[0] is not holds[1]  # a request takes its own hold
         torch.cuda.synchronize()
-        assert graphs._shed(torch, domain) > 0 and module not in domain.holds
+        assert graphs._shed(torch, domain)[0] > 0 and module not in domain.holds
     finally:
         graphs.release(torch, module)
         PLACED.pop(module, None)

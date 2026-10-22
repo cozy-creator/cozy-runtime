@@ -20,7 +20,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -184,6 +184,7 @@ class Domain:
                 self.owner = None
             self.unhold()
             self.drop_captures()
+            self.close_cache()
             self.pool = None  # MemPool destruction releases this pool, never a global flush.
             for stream in (self.stream, self.control):
                 if stream is not None:
@@ -215,9 +216,17 @@ class Domain:
         return True
 
     def drop_captures(self) -> None:
-        """After every graph recorded into it is reset and its static buffers dropped."""
+        """After every graph recorded into it is reset and its static buffers dropped (its cache
+        stays registered: the next capture registers it again)."""
         self.captures = None  # MemPool destruction releases this pool, never a global flush.
         self.served = []
+
+    def holding(self) -> AbstractContextManager[object]:
+        """The pool is never shrunk inside the block (preparation, a capture, a replay), nor
+        after it until the work queued on the current stream completes."""
+        return self.cache.holding() if self.cache is not None else nullcontext()
+
+    def close_cache(self) -> None:
         if self.cache is not None:
             self.cache.close()
             self.cache = None
