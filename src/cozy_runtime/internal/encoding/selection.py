@@ -285,12 +285,6 @@ def native_backend_identity() -> dict[str, str]:
     return identity
 
 
-@lru_cache(maxsize=1)
-def _gemm_build() -> str:
-    """The loaded `_gemm`'s identity, fixed for the process once its module imported."""
-    return native_backend_identity()["_gemm"]
-
-
 def measure_runtime(torch: Any, release: str) -> RuntimeIdentity:
     return RuntimeIdentity(
         release=release,
@@ -607,13 +601,11 @@ def reference_decoder(provider: Provider, device: DeviceFacts, dtype: str) -> bo
 
 
 def implementation_digest(provider: Provider) -> str:
-    """The provider's identity: name, route, device floor, oracle, parts, revision, schemes,
-    and for an encoded GEMM the native build it runs. Records that measured another identity
-    never admit this one; nothing else in Runtime's source joins it."""
-    native = _gemm_build() if provider.route == "encoded_gemm" else ""
+    """The provider's identity: name, route, device floor, oracle, parts, revision, schemes.
+    Records that measured another identity never admit this one. An encoded GEMM's kernels
+    carry their own identity (`verify.Kernel`)."""
     return canonical.digest(
         {
-            "native": native,
             "name": provider.name,
             "route": provider.route,
             "device_predicate": provider.device_predicate,

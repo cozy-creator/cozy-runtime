@@ -14,7 +14,6 @@ from pathlib import Path
 import msgspec
 
 from cozy_runtime import __version__
-from cozy_runtime._kernels import GEMM
 from cozy_runtime.internal import arch, attention, calibrate, prebuilt, qualification, verify
 from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
 from cozy_runtime.internal.probe import qualify
@@ -60,13 +59,10 @@ def main(argv: Sequence[str]) -> int:
         if cuda:
             # The exact prebuilt arm and available optional attention arms are explicit
             # development probes. Missing builds remain refusals, never fabricated facts.
-            prebuilt.library(torch, device.index, device.sm)
-            if family and not prebuilt.ABSENT:
+            ops, _ = prebuilt.library(torch, device.index, device.sm)
+            if ops is not None:
                 provenance["card"] = calibrate.card(torch, device.index, device.sm).facts()
                 provenance["clocks_before"] = calibrate.clocks(device.index)
-                ops = prebuilt.Prebuilt(
-                    torch, device.index, family, device.sm in GEMM["fp8"].get(family, ())
-                )
                 calibrations = calibrate.run(torch, ops, device.sm, progress=calibrated)
                 provenance["clocks_after"] = calibrate.clocks(device.index)
             if device.sm == 90:
@@ -78,7 +74,7 @@ def main(argv: Sequence[str]) -> int:
     # Each format's GEMM verdict holds its probe and its calibration at the packages' shapes.
     rules = {}
     for name, found in calibrations.items():
-        identity = prebuilt.gemm_kernel(name, family)
+        identity = prebuilt.gemm_kernel(name, family, device.sm)
         probed = verdicts.get((identity, device.sm), verify.Verdict(False, "never probed"))
         verdicts[identity, device.sm] = verify.Verdict(
             probed.ok and found.verdict.ok,

@@ -253,7 +253,7 @@ def test_a_windows_wheel_names_the_gemm_that_served_and_why(
     assert "cr-201" in reason
     assert prebuilt.lost("fp8", 89) == prebuilt.lost("int8", 86) == ""
 
-    monkeypatch.setitem(int8_linear._LIBS, 0, prebuilt.Prebuilt(torch, 0, "mma.sync", False))
+    monkeypatch.setitem(int8_linear._LIBS, 0, prebuilt.Prebuilt(torch, 0, "mma.sync", False, 0))
     monkeypatch.setitem(fp8_linear._OPS, 0, int8_linear._LIBS[0].fp8_linear)
     executor = Executor(None, tmp_path)  # type: ignore[arg-type]
     executor.backend = SimpleNamespace(gemm_sites={("transformer", ROWWISE_FP8): 3})

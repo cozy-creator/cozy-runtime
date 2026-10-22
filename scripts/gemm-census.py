@@ -2,7 +2,7 @@
 linear a lane encodes, from the real model classes on the meta device, with M from the packages'
 serving token counts. Each lane's selection is its package recipe's (packages 2f4eaf2:
 sdxl/sdxl/__init__.py INT8 and FP8, qwen-image-2/quantize.py, flux-3-klein/quantize.py,
-character-describer INT8; H3's lanes encode both DiTs' blocks and the conditioner structurally).
+character-describer INT8; H3's lanes (`H3`) are structural).
 
     gemm-census.py <configs> > gemm-shapes.json
 
@@ -10,7 +10,8 @@ character-describer INT8; H3's lanes encode both DiTs' blocks and the conditione
 sdxl-unet, sdxl-te1, sdxl-te2 (stabilityai/stable-diffusion-xl-base-1.0 unet, text_encoder,
 text_encoder_2), qwen-transformer, qwen-te (Qwen/Qwen-Image-2.1), klein-transformer, klein-te
 (black-forest-labs/flux-3-image-klein), describer (Qwen/Qwen3.5-9B), h3-transformer, h3-te
-(MiniMaxAI/MiniMax-H3). It runs with Diffusers 7ecb1e1b (Klein's pin, which carries all three
+(MiniMaxAI/MiniMax-H3). Only H3's base DiT is built: its reference DiT has the same linears. It
+runs with Diffusers 7ecb1e1b (Klein's pin, which carries all three
 DiT classes) and Transformers >= 5.15.
 """
 
@@ -85,6 +86,20 @@ with torch.device("meta"):
     }
 
 _UNET_1280 = ("down_blocks.2", "mid_block", "up_blocks.0")
+#: H3's lanes encode both DiTs' blocks, refiner and context embedder, and the conditioner's
+#: language model, structurally (every rank-2 weight whose K the format takes).
+H3 = (
+    "transformer.transformer_blocks.*",
+    "transformer.token_refiner.*",
+    "transformer.context_embedder.*",
+    "text_encoder.model.language_model.*",
+)
+#: H3's one packed sequence (minimax_h3 official.denoise_rows at its 768x1344 canvas: video and
+#: audio rows) at 5 s and 15 s, plus 512 text rows; Ulysses degree 2 gives each GPU half.
+H3_ROWS = (37710 + 512, 109062 + 512)
+#: The describer's decode batch (1 to 16 images, `describe_characters`; a drafter's verify pass
+#: is 2-4 rows) and an image prompt's prefill.
+DESCRIBER_ROWS = (1, 2, 4, 8, 16, 2048)
 _LM = "model.model.language_model.layers.*"
 #: Each lane's selection: (model, lane, encoding, include globs or None for structural, K multiple).
 LANES = (
@@ -159,14 +174,14 @@ LANES = (
         "h3",
         "int8",
         "int8",
-        ("transformer.transformer_blocks.*", "text_encoder.model.language_model.*"),
+        H3,
         256,
     ),
     (
         "h3",
         "fp8",
         "fp8",
-        ("transformer.transformer_blocks.*", "text_encoder.model.language_model.*"),
+        H3,
         32,
     ),
 )
@@ -200,11 +215,13 @@ def tokens(model: str, name: str) -> tuple[int, ...]:
             return (512,)
         return (4096 + 512,) if "single" in name else (4096,)
     if model == "describer":
-        return (1, 2048)  # a decoded token; an image prompt's prefill
+        return DESCRIBER_ROWS
     if model == "h3":
-        if text:
+        if text or "token_refiner" in name or "context_embedder" in name:
             return (512,)
-        return (1,) if "norm" in name or "modulation" in name or "adaln" in name else (52 * 1024,)
+        if "norm" in name or "modulation" in name or "adaln" in name:
+            return (1,)
+        return (*H3_ROWS, *(rows // 2 for rows in H3_ROWS))
     raise KeyError(model)
 
 

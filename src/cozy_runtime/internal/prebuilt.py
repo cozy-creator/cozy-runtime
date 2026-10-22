@@ -19,14 +19,13 @@ import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache, partial
-from importlib import metadata
 from pathlib import Path
 from types import ModuleType
 
 from cozy_runtime import _kernels
 from cozy_runtime._kernels import ABSENT as ABSENT
 from cozy_runtime._kernels import ARCHS, FAMILIES, GEMM, NO_FA3, TMA_GEMM
-from cozy_runtime.internal import arch, verify
+from cozy_runtime.internal import arch, fatbin, verify
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
 
 #: The verdicts' kernel names, one per format: each verifies on its own.
@@ -59,6 +58,8 @@ class Prebuilt:
     family: str
     #: whether the wheel carries a CUTLASS fp8 GEMM for this card
     cutlass_fp8: bool
+    #: the card's SM count: the bucket its shipped rules were measured for
+    sms: int
     #: format -> the shipped workload rules refining the family default (`verify.rules`)
     rules: dict[str, tuple[verify.Rule, ...]] = field(default_factory=dict)
     _scratch: Callable[[int], Tensor] = field(init=False)
@@ -330,43 +331,31 @@ def _stride(t: Tensor | None) -> int:
 
 
 def artifact(module: str = "_gemm") -> str:
-    """A kernel module's digest, as cozy-runtime's RECORD has it, or "" where none loaded: a
-    verdict never outlives the bytes it judged."""
+    """A loaded kernel module's digest, or "" where none loaded."""
     loaded = getattr(_kernels, module, None)
     if loaded is None or not loaded.__file__:
         return ""
-    return _recorded(Path(loaded.__file__))
+    return _digest(Path(loaded.__file__), 0)
 
 
-def kernel_identity(name: str, module: str = "_gemm") -> verify.Kernel:
-    """`name`'s identity in `module`: its binary's digest and its declared interface's (the
-    module's `.pyi` stub, which every change to the native signature edits)."""
+def kernel_identity(name: str, sm: int, module: str = "_gemm") -> verify.Kernel:
+    """`name`'s identity on `sm`: the cubins `module` carries for that architecture
+    (`fatbin.cubins`), and its declared native interface (the `.pyi` stub, which every change to
+    the native signature edits). Another family's kernels never enter it."""
     stub = Path(_kernels.__file__).with_name(f"{module}.pyi")
-    return verify.Kernel(name, artifact(module), _recorded(stub) if stub.exists() else "")
+    loaded = getattr(_kernels, module, None)
+    build = _digest(Path(loaded.__file__), sm) if loaded is not None and loaded.__file__ else ""
+    return verify.Kernel(name, build, _digest(stub, 0) if stub.exists() else "")
 
 
 @lru_cache(maxsize=16)
-def _recorded(file: Path) -> str:
-    """`file`'s digest in RECORD's own form (sha256, urlsafe base64): the installed wheel's
-    RECORD line, else the file's bytes (a source checkout's build), so both spell one kernel the
-    same way and the release gate can read it from the wheel without loading CUDA."""
-    try:
-        files = metadata.distribution("cozy-runtime").files or []
-    except metadata.PackageNotFoundError:
-        files = []
-    found = next(
-        (
-            f
-            for f in files
-            if f.hash and f.name == file.name and Path(f.locate()).resolve() == file.resolve()
-        ),
-        None,
-    )
-    if found and found.hash:
-        return f"{found.hash.mode}:{found.hash.value}"
-    with file.open("rb") as stream:
-        raw = hashlib.file_digest(stream, "sha256").digest()
-    return "sha256:" + base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+def _digest(file: Path, sm: int) -> str:
+    """`file`'s cubins for `sm`, or with `sm` 0 its whole bytes, in RECORD's form (sha256,
+    urlsafe base64), as the release gate reads them from the wheel."""
+    data = file.read_bytes()
+    if sm:
+        return fatbin.cubins(data, sm)
+    return "sha256:" + base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
 
 
 #: The attention kernels the wheel serves, by candidate name (`attention.KERNELS`).
@@ -408,12 +397,10 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
     family = row.family
     if not any(sm in GEMM[f].get(family, ()) for f in GEMM):
         return None, f"the cozy-runtime wheel has no shipped {family} GEMM for sm{sm}"
-    ops = Prebuilt(torch, index, family, sm in GEMM["fp8"].get(family, ()))
+    sms = torch.cuda.get_device_properties(index).multi_processor_count
+    ops = Prebuilt(torch, index, family, sm in GEMM["fp8"].get(family, ()), sms)
     formats = [f for f in (INT8, FP8) if getattr(row, f.name)]
     verdicts = {f.name: admission(torch, ops, f, family, sm) for f in formats}
-    failed = [f"{name}: {v.detail}" for name, v in verdicts.items() if not v.ok]
-    if failed:
-        return None, f"{family}: {'; '.join(failed)}"
     return ops, "; ".join(f"{name} {v.detail}" for name, v in verdicts.items())
 
 
@@ -423,23 +410,27 @@ DEFAULTED: dict[tuple[int, str], str] = {}
 
 
 def admission(torch: ModuleType, ops: Prebuilt, f: _Format, family: str, sm: int) -> verify.Verdict:
-    """A format's GEMM on this card: its shipped verdict and workload rules refine the family's
-    kernel; with none, the family default serves (a verdict never decides whether a lane runs)."""
-    identity = gemm_kernel(f.name, family)
+    """A format's GEMM on this card: its shipped verdict's workload rules for this card's SM
+    count refine the family's kernel; with none, the family default serves. A verdict never
+    decides whether a lane, a format or the library runs."""
+    identity = gemm_kernel(f.name, family, sm)
     if verify.in_oracle():
         return verify.measured(identity, sm, partial(probe, torch, ops, f))
     found = verify.shipped(identity, sm)
-    if found is not None:
-        ops.rules[f.name] = verify.rules(identity, sm)
+    if found is not None and found.ok:
+        ops.rules[f.name] = tuple(
+            rule for rule in verify.rules(identity, sm) if rule.sms_min < ops.sms <= rule.sms_max
+        )
         return found
-    said = f"no offline verdict for {identity.name} on sm{sm}: the {family} family default serves"
+    why = "no offline verdict" if found is None else f"a refused verdict ({found.detail})"
+    said = f"{why} for {identity.name} on sm{sm}: the {family} family default serves"
     DEFAULTED[sm, f.name] = said
     return verify.Verdict(True, said)
 
 
-def gemm_kernel(f: str, family: str) -> verify.Kernel:
-    """The 8-bit GEMM `f` of `family` in the loaded `_gemm` (`KERNELS`)."""
-    return kernel_identity(f"{KERNELS[f]}-{family.replace('.', '')}")
+def gemm_kernel(f: str, family: str, sm: int) -> verify.Kernel:
+    """The 8-bit GEMM `f` of `family` in the loaded `_gemm`, on `sm` (`KERNELS`)."""
+    return kernel_identity(f"{KERNELS[f]}-{family.replace('.', '')}", sm)
 
 
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
@@ -576,7 +567,7 @@ def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None,
 
     pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16")]
     probe = partial(attention_probe, torch, index, call, True, pairs, True)
-    verdict = verify.admitted(kernel_identity("prebuilt-fa3", "_fa3"), sm, probe)
+    verdict = verify.admitted(kernel_identity("prebuilt-fa3", sm, "_fa3"), sm, probe)
     return (kernel if verdict.ok else None), verdict.detail
 
 

@@ -111,10 +111,9 @@ def _covering(
             if evidence is None
             else make_observation(encoding, provider, device, dtype, evidence)
         )
-        # The current NVFP4 oracle observes one dispatch arm. A W4A16 fallback does not
-        # qualify optional kitchen W4A4, nor its tensor-global activation quantizer. Keep
-        # the declared decode route until offline evidence covers the complete dispatcher.
-        if provider.suite == "nvfp4-native":
+        # An encoded GEMM's facts are its kernels' (`verify`, kernels-sm<N>.json, keyed by the
+        # code that runs): a table observation of it is a leaf benchmark, never admission.
+        if provider.route == "encoded_gemm":
             found = None
         observations.append(
             found if found is not None else _missing(encoding, provider, device, dtype)
@@ -148,8 +147,8 @@ def _missing(encoding: str, provider: Provider, device: DeviceFacts, dtype: str)
         )
     if evidence is None and dtype in HALF and (family := family_default(provider, device)):
         evidence = FamilyDefaultEvidence(
-            note=f"no offline verdict refines {provider.name} on {device.predicate}; the "
-            f"{family} family default serves it"
+            note=f"{provider.name} runs the {family} family's kernels on {device.predicate}; "
+            "its shipped kernel verdict's rules refine them, the family default without one"
         )
     if evidence is None and reference_decoder(provider, device, dtype):
         evidence = ReferenceEvidence(

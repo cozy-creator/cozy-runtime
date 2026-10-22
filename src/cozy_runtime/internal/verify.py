@@ -56,14 +56,18 @@ class Kernel:
 
 
 class Rule(msgspec.Struct, frozen=True):
-    """A measured workload rule: a GEMM of `shape` class (`shape_class`) with
-    `m_min < M <= m_max` rows takes `choice`, a tile config or `CUBLASLT`/`GEMV`. Every choice
-    takes any M in its bucket: partial tiles are predicated, nothing is padded."""
+    """A measured workload rule: on a card with `sms_min < SMs <= sms_max`, a GEMM of `shape`
+    class (`shape_class`) with `m_min < M <= m_max` rows takes `choice`, a tile config or
+    `CUBLASLT`/`GEMV`. Every choice takes any M in its bucket: partial tiles are predicated,
+    nothing is padded. Tile and wave fit depend on the SM count, so a rule covers only the
+    SM-count bucket it was measured in."""
 
     m_min: int
     m_max: int
     shape: str
     choice: int | str
+    sms_min: int
+    sms_max: int
 
 
 class _Row(msgspec.Struct, frozen=True):
@@ -131,7 +135,8 @@ def measuring() -> Iterator[dict[tuple[Kernel, int], Verdict]]:
 def measured(kernel: Kernel, sm: int, probe: Callable[[], Verdict]) -> Verdict:
     """The development oracle's probe, recorded for publication (inside `measuring` only)."""
     records = _OFFLINE.get()
-    assert records is not None, "a consumer never probes"
+    if records is None:
+        raise RuntimeError("a consumer never probes: measured() runs only inside measuring()")
     try:
         verdict = probe()
     except Exception as exc:

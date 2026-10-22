@@ -30,6 +30,10 @@ on:
         description: "Whether to build for Windows x86_64: yes or no"
         type: string
         default: 'yes'
+      measured:
+        description: "yes: Linux x86_64 takes only the cached build the kernel verdicts measured, never compiling (a release); no: a miss compiles"
+        type: string
+        default: 'no'
   pull_request:
     paths: &inputs
       - kernels/**
@@ -79,6 +83,11 @@ jobs:
         with:
           path: modules
           key: ${{ steps.key.outputs.key }}
+      - name: A release ships the kernels its verdicts measured, never a rebuild
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.measured == 'yes' && matrix.arch == 'x86_64'
+        run: |
+          echo "::error::no cached build for ${{ steps.key.outputs.key }}: the shipped kernel verdicts measured a build this release cannot reproduce; re-measure (scripts/kernel-verdicts.sh)"
+          exit 1
       - name: Build and check the modules
         if: steps.cache.outputs.cache-hit != 'true'
         run: |

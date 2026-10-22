@@ -14,9 +14,9 @@ from cozy_runtime.internal import int8_linear, prebuilt, verify  # noqa: E402
 
 KERNEL = verify.Kernel("prebuilt-int8-mmasync", "sha256:build", "sha256:abi")
 RULES = (
-    verify.Rule(0, 4, "square", verify.GEMV),
-    verify.Rule(1024, 2048, "square", 4),
-    verify.Rule(2048, 4096, "up", verify.CUBLASLT),
+    verify.Rule(0, 4, "square", verify.GEMV, 128, 256),
+    verify.Rule(1024, 2048, "square", 4, 128, 256),
+    verify.Rule(2048, 4096, "up", verify.CUBLASLT, 128, 256),
 )
 
 
@@ -69,6 +69,35 @@ def test_a_refused_or_malformed_table_ships_no_rules(tmp_path: Path) -> None:
     assert verify.shipped(KERNEL, 86, tables=tmp_path) is None
 
 
+def test_admission_takes_its_cards_rules_and_a_refusal_never_drops_the_family(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    identity = prebuilt.gemm_kernel("int8", "mma.sync", 89)
+    other = verify.Rule(0, 4, "square", 3, 64, 128)  # measured on a card of another SM bucket
+    with verify.measuring() as records:
+        verify.measured(identity, 89, cpu_probe)
+    verify.publish(tmp_path, 89, records, {identity: (*RULES, other)}, {}, None)
+    monkeypatch.setattr(verify, "TABLES", tmp_path)
+    for sms, rules in ((142, RULES), (128, (other,)), (24, ())):
+        ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False, sms)
+        assert prebuilt.admission(torch, ops, prebuilt.INT8, "mma.sync", 89).ok
+        assert ops.rules["int8"] == rules
+    with verify.measuring() as records:
+        verify.measured(identity, 89, lambda: verify.within({"tile 3": 0.7}, 1e-2))
+    verify.publish(tmp_path, 89, records, {identity: RULES}, {}, None)
+    ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False, 142)
+    try:
+        verdict = prebuilt.admission(torch, ops, prebuilt.INT8, "mma.sync", 89)
+        assert (
+            verdict.ok
+            and "refused verdict" in verdict.detail
+            and "family default" in verdict.detail
+        )
+        assert "int8" not in ops.rules
+    finally:
+        prebuilt.DEFAULTED.pop((89, "int8"), None)
+
+
 def test_a_raising_probe_is_a_refusal_and_consumers_never_probe() -> None:
     def raises() -> verify.Verdict:
         raise RuntimeError("8-bit linear: the GEMM: cudaErrorInvalidKernelImage")
@@ -80,12 +109,12 @@ def test_a_raising_probe_is_a_refusal_and_consumers_never_probe() -> None:
     )
     assert records == {(KERNEL, 90): refused}
     assert not verify.within({}, 1e-2).ok
-    with pytest.raises(AssertionError, match="a consumer never probes"):
+    with pytest.raises(RuntimeError, match="a consumer never probes"):
         verify.measured(KERNEL, 90, forbidden)
 
 
 def test_rules_choose_by_shape_class_and_bucket_else_the_family_default() -> None:
-    ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False, rules={"int8": RULES})
+    ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False, 142, rules={"int8": RULES})
     assert ops.choice(prebuilt.INT8, 1, 4096, 4096) == verify.GEMV
     assert ops.choice(prebuilt.INT8, 2048, 1280, 1280) == 4
     assert ops.choice(prebuilt.INT8, 1025, 1280, 1280) == 4

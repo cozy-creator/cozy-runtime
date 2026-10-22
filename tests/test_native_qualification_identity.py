@@ -1,4 +1,5 @@
-"""Actual wheel binaries/presence determine an encoded GEMM's qualification identity; no GPU."""
+"""Actual wheel binaries and their presence: the provenance a table records, and the per-arch
+kernel identity a verdict binds to; no GPU."""
 
 from __future__ import annotations
 
@@ -19,10 +20,10 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def inspect(root: Path) -> dict[str, Any]:
     program = """import json
-from cozy_runtime.internal.encoding import launch_providers, selection
-providers = [p for ps in launch_providers().values() for p in ps]
-digests = {p.name: selection.implementation_digest(p) for p in providers}
-print(json.dumps({"source":selection.__file__,"digests":digests,"backends":selection.native_backend_identity()}))
+from cozy_runtime.internal import prebuilt
+from cozy_runtime.internal.encoding import selection
+kernels = {sm: prebuilt.gemm_kernel("int8", "mma.sync", sm).build for sm in (86, 89, 120)}
+print(json.dumps({"source":selection.__file__,"kernels":kernels,"backends":selection.native_backend_identity()}))
 """
     done = subprocess.run(
         [sys.executable, "-c", program],
@@ -51,10 +52,11 @@ def test_built_native_pure_unloadable_and_foreign_extension_have_distinct_identi
     assert without["backends"]["_gemm"] == without["backends"]["_norm"] == "ABSENT"
     assert actual["backends"]["platform"] == f"{platform.system()}/{platform.machine()}"
     assert "sha256:" in actual["backends"]["_gemm"]
-    leaf, decoder = "cozy.int8-convrot256.native-leaf/1", "cozy.int8-convrot.dequant/1"
-    # Encoded GEMMs bind the native build they run; a decoder's identity is the same everywhere.
-    assert actual["digests"][leaf] != without["digests"][leaf]
-    assert actual["digests"][decoder] == without["digests"][decoder]
+    # Each family's verdict binds to the cubins its card runs: distinct per arch, absent without
+    # a native module.
+    assert len(set(actual["kernels"].values())) == 3
+    assert all(build.startswith("sha256:") for build in actual["kernels"].values())
+    assert set(without["kernels"].values()) == {""}
 
     # These are real temporary files and real loader failures, not mocked modules. Renaming
     # a host binary to a foreign extension only proves non-loadability here, not Windows execution.
@@ -67,5 +69,4 @@ def test_built_native_pure_unloadable_and_foreign_extension_have_distinct_identi
     failed, other = inspect(tmp_path / "broken"), inspect(tmp_path / "foreign")
     assert failed["backends"]["_gemm"].startswith("unavailable:sha256:")
     assert other["backends"]["_gemm"].startswith("unavailable:sha256:")
-    assert failed["digests"][leaf] != actual["digests"][leaf]
-    assert other["digests"][leaf] != actual["digests"][leaf]
+    assert failed["kernels"] != actual["kernels"]

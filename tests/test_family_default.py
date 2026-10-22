@@ -65,7 +65,7 @@ def test_an_sm89_card_without_verdicts_runs_its_int8_lane_on_the_family_default(
     assert [t.route for t in served.tensors] == ["encoded_gemm"]
     assert served.refused_leaves() == ()
     # At execution the family's GEMM serves without a probe; the run says why.
-    ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False)
+    ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False, 0)
     try:
         verdict = prebuilt.admission(torch, ops, prebuilt.INT8, "mma.sync", 89)
         assert verdict.ok and "family default" in verdict.detail

@@ -5,27 +5,38 @@ shipped packages' GEMM shapes (`SHAPES`, written by `scripts/gemm-census.py`): e
 family's table, the compiled family default, cuBLASLt, and the GEMV for a few int8 rows.
 
 - **Numerics first.** A candidate's timing counts only after its bf16 and fp16 outputs match
-  the exact float64 product of the same quantized operands. The budget is twice that output
-  dtype's own rounding error of the exact product, at every timed shape. A non-finite output
-  fails before any ratio.
-- **Timing.** Each number is a CUDA-event median of `REPS` launches queued behind a sleep, so the
-  host never lets the device idle between them. Cold (the first launch at a shape) is reported
-  apart from warm. Weights and activations rotate through a pool over twice the L2.
-- **Plausibility.** A rate above the card's 8-bit tensor peak or its DRAM peak is refused as
-  impossible.
-- **Rules.** A workload rule (`verify.Rule`) ships where one candidate beats the family default
-  over a (shape class, M bucket) cell by more than the measured spread.
+  the exact float64 product of the same quantized operands, at one row in every 16-row block.
+  The budget is twice the arm's error model: the output dtype's own rounding of that product,
+  plus, for fp8, an accumulator of `FP8_ACCUMULATOR_BITS` random-walking over K, plus, for the
+  GEMV (which quantizes its rows itself), every code at a rounding tie flipping. A non-finite
+  output fails before any ratio. The activation quantizer is held to its law: a code may differ
+  only at a tie.
+- **Timing.** Candidates run interleaved, in a fresh random order each round: round 0 is each
+  one's cold first launch at the shape, then `REPS` warm rounds. A round is queued behind a
+  sleep, so the host never lets the device idle inside it. Every launch takes the pool's
+  least-recently-used operands, and the pool holds over twice the L2.
+- **Plausibility.** A rate above the card's 8-bit tensor peak or its DRAM peak is flagged and
+  excluded from rules.
+- **Rules.** A workload rule (`verify.Rule`) holds for this card's SM-count bucket and a
+  (shape class, M bucket) cell. It ships where one candidate regresses no shape of the cell
+  beyond that shape's measured spread, and beats the family default over the cell's
+  layer-weighted time by more than the cell's spread.
+
+A failed candidate is excluded alone. The verdict fails only on the family default or the
+quantizer: what serves without a rule.
 """
 
 from __future__ import annotations
 
 import math
+import random
 import statistics
 import subprocess
 import time
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import ModuleType
 
@@ -37,12 +48,12 @@ from cozy_runtime.internal.encoding.formats import Tensor, hadamard256
 
 #: The packages' GEMMs: one row per (model, lane, M, N, K) with its layer count.
 SHAPES = Path(__file__).parent / "qualification_tables" / "gemm-shapes.json"
-#: Warm launches per candidate and shape: the median's standard error is then under a quarter
-#: of one launch's spread.
+#: Warm rounds per shape: the median's standard error is then under a quarter of one launch's
+#: spread.
 REPS = 32
-#: One reference row per this many rows, plus the last: every M tile of every family's table
-#: (the smallest is 16 rows, the widest 256) is sampled at its edge and inside large ones.
-ROW_STEP = 128
+#: The smallest M tile any family's table holds (mma.sync's 16x128): one reference row in each
+#: block of this many rows, at a varying offset, plus the last row.
+ROW_BLOCK = 16
 #: Float64 weight bytes per reference chunk, so the exact product fits beside the pools on a
 #: 24 GB card.
 REFERENCE_BYTES = 1 << 28
@@ -51,11 +62,22 @@ REFERENCE_BYTES = 1 << 28
 OPS_PER_CLOCK = {80: 4096, 86: 2048, 89: 2048, 90: 8192, 100: 16384, 103: 16384, 120: 2048}
 #: Twice the widest tile any family's table holds (256): every tile takes it whole.
 TILE_PROBE = 512
+#: Mantissa bits an fp8 tensor-core accumulator keeps under fast accumulation (DeepSeek-V3,
+#: section 3.3.2, measured about 14 on Hopper). int8 accumulates exactly in int32.
+FP8_ACCUMULATOR_BITS = 14
+#: The worst fp32 error of a rotated int8 code, in code units: a 256-term sum within +-127.
+INT8_TIE = 256 * 127 * 2.0**-24
+#: The worst fp32 error of an fp8 code relative to its value: one division, the scale's rounding.
+FP8_TIE = 2.0**-22
 DEFAULT = "default"
-#: The device-clock cycles of sleep that last kept a whole batch queued (`_timed`).
-_SLEEP = [0]
+#: The quantizer and the bf16 GEMM the leaf replaces, timed in the same rounds.
+BASELINES = ("quantize", "bf16")
 #: Out dtypes the lanes write (SDXL fp16, the others bf16); timing uses the first.
 DTYPES = ("bfloat16", "float16")
+#: The device-clock cycles of sleep that last kept a whole round queued (`_timed`).
+_SLEEP = [0]
+
+type Choice = int | str
 
 
 class Shape(msgspec.Struct, frozen=True):
@@ -69,7 +91,7 @@ class Shape(msgspec.Struct, frozen=True):
 
 
 class Candidate(msgspec.Struct):
-    choice: int | str
+    choice: Choice
     ok: bool
     #: out dtype -> relative L2 against the exact product, and its budget
     rel_l2: dict[str, float] = {}
@@ -77,15 +99,23 @@ class Candidate(msgspec.Struct):
     #: the first launch at this shape: device and host microseconds
     cold_us: float = 0.0
     host_first_us: float = 0.0
-    #: warm device microseconds: min, p25, median, p75, max; and every launch, in order
+    #: warm device microseconds: min, p25, median, p75, max; and every round's, in order
     warm_us: tuple[float, ...] = ()
     samples_us: list[float] = []
     tops: float = 0.0
     dram_gbps: float = 0.0
-    #: a warm rate above the card's peak: a measurement the numeric check already passed but
-    #: no rule may use (operands found cached, or a timer fault)
+    #: a warm rate above the card's peak: numerics passed, but no rule may use it
     impossible: bool = False
     note: str = ""
+
+
+class Quantizer(msgspec.Struct):
+    """The activation quantizer against its law at the reference rows."""
+
+    max_step: float
+    mismatched: int
+    #: differing codes not at a rounding tie: a bug
+    unexplained: int
 
 
 class Measured(msgspec.Struct):
@@ -94,11 +124,12 @@ class Measured(msgspec.Struct):
     n: int
     k: int
     shape: str
+    layers: int
     models: list[str]
     pool: int
-    #: the activation quantizer against its law: largest code difference, codes that differ
-    quantize_max_step: float
-    quantize_mismatched: int
+    #: the seed of every round's candidate order
+    seed: str
+    quantizer: Quantizer
     quantize_us: float
     bf16_us: float
     candidates: list[Candidate]
@@ -108,6 +139,7 @@ class Measured(msgspec.Struct):
 class Card:
     clock_hz: float
     l2_bytes: int
+    sms: int
     peak_ops: float
     peak_bytes_per_s: float
 
@@ -115,6 +147,7 @@ class Card:
         return {
             "clock_hz": self.clock_hz,
             "l2_bytes": self.l2_bytes,
+            "sms": self.sms,
             "peak_8bit_tops": self.peak_ops / 1e12,
             "peak_dram_gbps": self.peak_bytes_per_s / 1e9,
         }
@@ -133,6 +166,7 @@ def card(torch: ModuleType, index: int, sm: int) -> Card:
     return Card(
         clock_hz=clock,
         l2_bytes=props.L2_cache_size,
+        sms=props.multi_processor_count,
         peak_ops=OPS_PER_CLOCK[sm] * props.multi_processor_count * clock,
         # Double data rate over the bus width (CUDA's deviceQuery arithmetic).
         peak_bytes_per_s=2 * props.memory_clock_rate * 1e3 * props.memory_bus_width / 8,
@@ -167,15 +201,15 @@ def run(
     for f in (prebuilt.INT8, prebuilt.FP8):
         if not getattr(arch.row(sm), f.name):
             continue
-        cells: dict[tuple[int, int, int], list[str]] = defaultdict(list)
+        cells: dict[tuple[int, int, int], list[Shape]] = defaultdict(list)
         for one in shapes:
             if one.format == f.name:
-                cells[one.m, one.n, one.k].append(f"{one.model}/{one.lane} x{one.layers}")
+                cells[one.m, one.n, one.k].append(one)
         evidence = []
-        for (m, n, k), models in sorted(cells.items()):
-            evidence.append(_shape(torch, ops, f, measured, m, n, k, models))
+        for (m, n, k), rows in sorted(cells.items()):
+            evidence.append(_shape(torch, ops, f, measured, m, n, k, rows))
             progress(evidence[-1])
-        found[f.name] = Calibration(_verdict(evidence), _rules(evidence), evidence)
+        found[f.name] = Calibration(_verdict(evidence), _rules(evidence, measured.sms), evidence)
     return found
 
 
@@ -249,6 +283,12 @@ def _pool(
     return sets
 
 
+def _rows(m: int, rng: random.Random) -> list[int]:
+    """One row in every `ROW_BLOCK`-row block, at a random offset, and the last row."""
+    blocks = range(0, m, ROW_BLOCK)
+    return sorted({*(start + rng.randrange(min(ROW_BLOCK, m - start)) for start in blocks), m - 1})
+
+
 def _picked(torch: ModuleType, codes: Tensor, rows: Tensor) -> Tensor:
     """`codes[rows]` for 8-bit codes, indexed as bytes (torch indexes no float8 dtype)."""
     return codes.view(torch.uint8)[rows].view(codes.dtype)
@@ -266,42 +306,48 @@ def _exact(torch: ModuleType, one: _Set, rows: Tensor) -> Tensor:
     return product * one.scale.double().view(1, -1) + one.bias.double().view(1, -1)
 
 
-def _quantize_law(
+def _law(
     torch: ModuleType, f: prebuilt._Format, one: _Set, rows: Tensor
-) -> tuple[float, int]:
-    """The native quantizer's codes against its law at `rows`: the largest difference in
-    steps (one is a tie rounded the other way; an E4M3 step is one ulp of the law's value)
-    and how many codes differ."""
-    x = one.x[rows]
+) -> tuple[Quantizer, Tensor]:
+    """The native quantizer's codes against its law at `rows`, and where the law sits at a
+    rounding tie (within the fp32 error of the codes' arithmetic): only there may a code differ,
+    by one step."""
+    x, got = one.x[rows], _picked(torch, one.q, rows).double()
     if f.fp8:
-        law, _ = prebuilt._fp8_law(torch, x)
-        want, got = law.float(), _picked(torch, one.q, rows).float()
-        exponent = torch.floor(torch.log2(want.abs().clamp(min=2.0**-6)))
-        steps = (got - want).abs() / torch.exp2(exponent - 3)
+        law, scale = prebuilt._fp8_law(torch, x)
+        value = x.double() / scale.double()
+        want = law.double()
+        step = torch.exp2(torch.floor(torch.log2(want.abs().clamp(min=2.0**-6))) - 3)
+        ties = (value / step - torch.floor(value / step) - 0.5).abs() * step <= (
+            FP8_TIE * value.abs()
+        )
     else:
         rotated = hadamard256(torch, x.double()) / 16
-        row = (rotated.abs().amax(-1, keepdim=True) / 127).clamp(min=1e-12)
-        want = torch.round(rotated / row).clamp(-127, 127)
-        steps = (_picked(torch, one.q, rows).double() - want).abs()
-    return float(steps.max()), int((steps > 0).sum())
+        value = rotated / (rotated.abs().amax(-1, keepdim=True) / 127).clamp(min=1e-12)
+        want, step = torch.round(value).clamp(-127, 127), torch.ones_like(value)
+        ties = (value - torch.floor(value) - 0.5).abs() <= INT8_TIE
+    steps = (got - want).abs() / step
+    differs = steps > 0
+    unexplained = int((differs & ~ties).sum() + (steps > 1).sum())
+    return Quantizer(float(steps.max()), int(differs.sum()), unexplained), ties
 
 
-def _timed(torch: ModuleType, launch: Callable[[], object], reps: int, card: Card) -> list[float]:
-    """Device microseconds of `reps` launches, queued behind a sleep: the batch reruns with a
+def _timed(torch: ModuleType, launches: Sequence[Callable[[], object]], card: Card) -> list[float]:
+    """Device microseconds of each launch, the round queued behind a sleep: it reruns with a
     doubled sleep until the sleep is still running once the host has queued it all, so no host
-    gap enters a measurement. The sleep that last sufficed is where the next batch starts."""
+    gap enters a measurement. The sleep that last sufficed is where the next round starts."""
     cycles = _SLEEP[0]
     while True:
         torch.cuda.synchronize()
         marks = [
             (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-            for _ in range(reps)
+            for _ in launches
         ]
         slept = torch.cuda.Event()
         started = time.perf_counter()
         torch.cuda._sleep(cycles)
         slept.record()
-        for begin, end in marks:
+        for launch, (begin, end) in zip(launches, marks, strict=True):
             begin.record()
             launch()
             end.record()
@@ -314,164 +360,254 @@ def _timed(torch: ModuleType, launch: Callable[[], object], reps: int, card: Car
         cycles = max(2 * cycles, int(2 * queued * card.clock_hz))
 
 
+@dataclass(slots=True)
+class _Round:
+    """One interleaved round: device and first-host microseconds, and why a candidate left."""
+
+    device: dict[Choice, float]
+    host: dict[Choice, float]
+    refused: dict[Choice, str]
+    failed: dict[Choice, str]
+
+
+def _round(
+    torch: ModuleType, card: Card, pool: _Pool, calls: dict[Choice, Callable[[_Set, str], object]],
+    order: Sequence[Choice],
+) -> _Round:  # fmt: skip
+    found = _Round({}, {}, {}, {})
+
+    def launch(choice: Choice) -> Callable[[], None]:
+        def one() -> None:
+            started = time.perf_counter()
+            try:
+                calls[choice](pool.next(), DTYPES[0])
+            except ValueError as refused:  # this tile or the GEMV does not take the shape
+                found.refused[choice] = f"not supported: {refused}"[:200]
+            except torch.cuda.OutOfMemoryError:
+                found.refused[choice] = "out of memory on this card"
+            except Exception as exc:  # a kernel that raises is wrong, never skipped
+                found.failed[choice] = f"{type(exc).__name__}: {exc}"[:200]
+            found.host.setdefault(choice, (time.perf_counter() - started) * 1e6)
+
+        return one
+
+    found.device = dict(zip(order, _timed(torch, [launch(c) for c in order], card), strict=True))
+    return found
+
+
 def _shape(
     torch: ModuleType, ops: prebuilt.Prebuilt, f: prebuilt._Format, card: Card, m: int,
-    n: int, k: int, models: list[str],
+    n: int, k: int, rows_of: Sequence[Shape],
 ) -> Measured:  # fmt: skip
-    sets = _pool(torch, ops, f, card, m, n, k)
-    pool = _Pool(sets)
-    rows = torch.tensor(sorted({*range(0, m, ROW_STEP), m - 1}), device=sets[0].x.device)
-    exact = _exact(torch, sets[0], rows)
+    seed = f"{f.name} {m}x{n}x{k}"
+    rng = random.Random(seed)
+    pool = _Pool(_pool(torch, ops, f, card, m, n, k))
+    first = pool.sets[0]
+    rows = torch.tensor(_rows(m, rng), device=first.x.device)
+    exact = _exact(torch, first, rows)
+    accumulator = 2.0**-FP8_ACCUMULATOR_BITS * math.sqrt(k) if f.fp8 else 0.0
     budget = {
-        name: 2 * verify.error(torch, exact.to(getattr(torch, name)), exact) for name in DTYPES
+        name: 2 * (verify.error(torch, exact.to(getattr(torch, name)), exact) + accumulator)
+        for name in DTYPES
     }
+    quantizer, ties = _law(torch, f, first, rows)
     gemm = ops.fp8_gemm if f.fp8 else ops.int8_gemm
-    choices: list[int | str] = [DEFAULT, *_tiles(ops, f)]
-    if not f.fp8 or ops.cutlass_fp8:
-        choices.append(verify.CUBLASLT)
+    calls: dict[Choice, Callable[[_Set, str], object]] = {}
+    tiles: list[Choice] = [DEFAULT, *_tiles(ops, f)]
+    if ops.cutlass_fp8 or not f.fp8:  # else cuBLASLt is the default itself
+        tiles.append(verify.CUBLASLT)
+    for tile in tiles:
+        calls[tile] = partial(_gemm, gemm, -1 if tile == DEFAULT else tile)
+    budgets = dict.fromkeys(calls, budget)
     if not f.fp8 and m <= _kernels._gemm.GEMV_ROWS:
-        choices.append(verify.GEMV)
-
-    def call(choice: int | str, one: _Set, dtype: str) -> Tensor:
-        out = getattr(torch, dtype)
-        if choice == verify.GEMV:
-            found = ops.int8_gemv(one.x, one.data, one.scale, one.bias, out)
-            if found is None:
-                raise ValueError("the GEMV does not take this shape")
-            return found
-        config = -1 if choice == DEFAULT else choice
-        return gemm(one.q, one.scales, one.data, one.scale, one.bias, out, config)
-
-    candidates = [_candidate(torch, card, call, choice, pool, rows, exact, budget, m, n, k)
-                  for choice in choices]  # fmt: skip
+        calls[verify.GEMV] = partial(_gemv, ops)
+        # The GEMV quantizes its rows itself: at a tie its code may be the other one.
+        flips = (ties.double() @ first.data.double().abs().t()) * first.scales[rows].double()[
+            :, None
+        ]
+        allowance = float((flips * first.scale.double()).norm() / exact.norm())
+        budgets[verify.GEMV] = {name: value + 2 * allowance for name, value in budget.items()}
     quantize = ops.fp8_quantize if f.fp8 else ops.int8_quantize
-    step, mismatched = _quantize_law(torch, f, sets[0], rows)
-    quantize_us = statistics.median(_timed(torch, lambda: quantize(pool.next().x), REPS, card))
-    weights = [one.data.to(torch.bfloat16) for one in sets[: max(2, len(sets) // 2)]]
-
-    def linear() -> Tensor:
-        one = pool.next()
-        return torch.nn.functional.linear(one.x, weights[pool.turn % len(weights)], one.bias)
-
-    bf16_us = statistics.median(_timed(torch, linear, REPS, card))
+    weights = [one.data.to(torch.bfloat16) for one in pool.sets[: max(2, len(pool.sets) // 2)]]
+    baselines: dict[Choice, Callable[[_Set, str], object]] = {
+        "quantize": lambda one, dtype: quantize(one.x),
+        "bf16": lambda one, dtype: torch.nn.functional.linear(
+            one.x, weights[pool.turn % len(weights)], one.bias
+        ),
+    }
+    choices = list(calls)
+    cold = _round(torch, card, pool, calls, rng.sample(choices, len(choices)))
+    candidates = {
+        c: _checked(torch, c, calls[c], cold, first, rows, exact, budgets[c]) for c in choices
+    }
+    alive = [c for c, found in candidates.items() if found.ok and not found.note]
+    samples: dict[Choice, list[float]] = defaultdict(list)
+    everything = {**calls, **baselines}
+    for _ in range(REPS):
+        order = rng.sample([*alive, *BASELINES], len(alive) + len(BASELINES))
+        warm = _round(torch, card, pool, everything, order)
+        for choice, why in {**warm.refused, **warm.failed}.items():
+            if choice not in candidates:
+                raise RuntimeError(f"the {choice} baseline did not run: {why}")
+            candidates[choice].ok, candidates[choice].note = choice in warm.refused, why
+            alive.remove(choice)
+        for choice, us in warm.device.items():
+            samples[choice].append(round(us, 3))
+    for choice in alive:
+        _rates(candidates[choice], samples[choice], card, m, n, k)
     return Measured(
-        f.name, m, n, k, verify.shape_class(n, k), sorted(models), len(sets), step, mismatched,
-        quantize_us, bf16_us, candidates,
+        f.name, m, n, k, verify.shape_class(n, k), sum(one.layers for one in rows_of),
+        sorted(f"{one.model}/{one.lane} x{one.layers}" for one in rows_of), len(pool.sets), seed,
+        quantizer, statistics.median(samples["quantize"]), statistics.median(samples["bf16"]),
+        list(candidates.values()),
     )  # fmt: skip
 
 
-def _candidate(
-    torch: ModuleType, card: Card, call: Callable[[int | str, _Set, str], Tensor],
-    choice: int | str, pool: _Pool, rows: Tensor, exact: Tensor,
-    budget: dict[str, float], m: int, n: int, k: int,
+def _gemm(gemm: Callable[..., Tensor], config: Choice, one: _Set, dtype: str) -> Tensor:
+    out = getattr(gemm.__self__.torch, dtype)  # type: ignore[attr-defined]
+    return gemm(one.q, one.scales, one.data, one.scale, one.bias, out, config)
+
+
+def _gemv(ops: prebuilt.Prebuilt, one: _Set, dtype: str) -> Tensor:
+    found = ops.int8_gemv(one.x, one.data, one.scale, one.bias, getattr(ops.torch, dtype))
+    if found is None:
+        raise ValueError("the GEMV does not take this shape")
+    return found
+
+
+def _checked(
+    torch: ModuleType, choice: Choice, call: Callable[[_Set, str], object], cold: _Round,
+    first: _Set, rows: Tensor, exact: Tensor, budget: dict[str, float],
 ) -> Candidate:  # fmt: skip
-    """One candidate at one shape: a cold launch (its first here, on operands the pool evicted),
-    its bf16 and fp16 outputs checked, and only if both pass its warm median and rates."""
-    host: list[float] = []
-
-    def cold() -> None:
-        started = time.perf_counter()
-        call(choice, pool.next(), DTYPES[0])
-        host.append((time.perf_counter() - started) * 1e6)
-
-    try:
-        (cold_us,) = _timed(torch, cold, 1, card)
-        outputs = [call(choice, pool.sets[0], dtype)[rows] for dtype in DTYPES]
-    except ValueError as refused:  # this tile or the GEMV does not take the shape
-        return Candidate(choice, ok=True, note=f"not supported: {refused}"[:200])
-    except torch.cuda.OutOfMemoryError:
-        torch.cuda.empty_cache()
-        return Candidate(choice, ok=True, note="out of memory on this card")
-    except Exception as exc:  # a kernel that raises is wrong, never skipped
-        return Candidate(choice, ok=False, note=f"{type(exc).__name__}: {exc}"[:200])
-    errors = {
-        name: verify.error(torch, out, exact) for name, out in zip(DTYPES, outputs, strict=True)
-    }
-    ok = all(errors[name] <= budget[name] for name in DTYPES)
-    # JSON holds no infinity: a non-finite output's error is stored as -1 and says so.
-    stored = {name: error if math.isfinite(error) else -1.0 for name, error in errors.items()}
-    found = Candidate(choice, ok, stored, budget, cold_us, host[0])
-    if not ok:
-        finite = all(math.isfinite(error) for error in errors.values())
-        found.note = f"{'' if finite else 'non-finite output; '}numeric check failed: untimed"
+    """A candidate after its cold launch: refused (not taken, ok), raised (failed), or its bf16
+    and fp16 outputs on the reference operands checked."""
+    if choice in cold.refused:
+        return Candidate(choice, True, note=cold.refused[choice])
+    found = Candidate(choice, False, {}, budget, cold.device[choice], cold.host[choice])
+    if choice in cold.failed:
+        found.note = cold.failed[choice]
         return found
-    found.samples_us = [
-        round(sample, 3)
-        for sample in _timed(torch, lambda: call(choice, pool.next(), DTYPES[0]), REPS, card)
-    ]
-    samples = sorted(found.samples_us)
-    median = statistics.median(samples)
-    quartiles = statistics.quantiles(samples, n=4)
-    found.warm_us = (samples[0], quartiles[0], median, quartiles[2], samples[-1])
+    try:
+        outputs = [call(first, dtype) for dtype in DTYPES]
+    except Exception as exc:
+        found.note = f"{type(exc).__name__}: {exc}"[:200]
+        return found
+    errors = {
+        name: verify.error(torch, out[rows], exact)  # type: ignore[index]
+        for name, out in zip(DTYPES, outputs, strict=True)
+    }
+    found.ok = all(errors[name] <= budget[name] for name in DTYPES)
+    # JSON holds no infinity: a non-finite output's error is stored as -1 and says so.
+    found.rel_l2 = {name: e if math.isfinite(e) else -1.0 for name, e in errors.items()}
+    if not found.ok:
+        finite = all(math.isfinite(e) for e in errors.values())
+        found.note = f"{'' if finite else 'non-finite output; '}numeric check failed: untimed"
+    return found
+
+
+def _rates(found: Candidate, samples: list[float], card: Card, m: int, n: int, k: int) -> None:
+    found.samples_us = samples
+    ordered = sorted(samples)
+    median = statistics.median(ordered)
+    quartiles = statistics.quantiles(ordered, n=4)
+    found.warm_us = (ordered[0], quartiles[0], median, quartiles[2], ordered[-1])
     found.tops = 2 * m * n * k / (median * 1e-6) / 1e12
     found.dram_gbps = (m * k + n * k + 2 * m * n) / (median * 1e-6) / 1e9
     if found.tops * 1e12 > card.peak_ops or found.dram_gbps * 1e9 > card.peak_bytes_per_s:
         found.impossible = True
         found.note = "faster than the card's peak: excluded from rules"
-    return found
 
 
 def _verdict(evidence: Sequence[Measured]) -> verify.Verdict:
-    """Every candidate that ran passed its numeric check at every shape; the detail names the
-    worst error against its budget and counts timings above the card's peak."""
-    ran = [(one, c) for one in evidence for c in one.candidates if c.rel_l2]
-    failed = [(one, c) for one in evidence for c in one.candidates if not c.ok]
-    if not ran:
-        return verify.Verdict(False, "no candidate ran")
-    one, worst = max(ran, key=lambda pair: max(_ratio(pair[1], d) for d in DTYPES))
+    """What serves without a rule passed everywhere: the family default's numeric check at every
+    shape, and the quantizer's law. Other failed candidates are excluded alone and counted."""
+    defaults = [(one, c) for one in evidence for c in one.candidates if c.choice == DEFAULT]
+    if not defaults:
+        return verify.Verdict(False, "no shape ran")
+    one, worst = max(defaults, key=lambda pair: max(_ratio(pair[1], d) for d in DTYPES))
     dtype = max(DTYPES, key=lambda d: _ratio(worst, d))
+    failed = [(one, c) for one in evidence for c in one.candidates if not c.ok]
     detail = (
-        f"{len(evidence)} shapes, {len(ran)} candidate runs; worst {worst.choice} at "
-        f"{one.m}x{one.n}x{one.k} {dtype}: rel L2 {worst.rel_l2[dtype]:.2e} "
-        f"(budget {worst.budget[dtype]:.2e})"
+        f"{len(evidence)} shapes, {sum(len(one.candidates) for one in evidence)} candidate runs; "
+        f"default worst at {one.m}x{one.n}x{one.k} {dtype}: "
+        f"rel L2 {worst.rel_l2.get(dtype, -1):.2e} (budget {worst.budget.get(dtype, 0):.2e}); "
+        f"{len(failed)} other candidates excluded; "
+        f"quantizer max step {max(o.quantizer.max_step for o in evidence):g}"
     )
     impossible = sum(c.impossible for one in evidence for c in one.candidates)
     if impossible:
         detail += f"; {impossible} timings above the card's peak, excluded from rules"
-    if failed:
-        one, bad = failed[0]
+    bad = [(o, c) for o, c in defaults if not c.ok]
+    if bad:
+        o, c = bad[0]
+        return verify.Verdict(False, f"the default failed at {o.m}x{o.n}x{o.k}: {c.note}; {detail}")
+    unexplained = [o for o in evidence if o.quantizer.unexplained]
+    if unexplained:
+        o = unexplained[0]
         return verify.Verdict(
-            False, f"{len(failed)} failed, first {bad.choice} at {one.m}x{one.n}x{one.k}: "
-            f"{bad.note}; {detail}",
+            False, f"the quantizer broke its law at {o.m}x{o.n}x{o.k} "
+            f"({o.quantizer.unexplained} codes); {detail}",
         )  # fmt: skip
     return verify.Verdict(True, detail)
 
 
 def _ratio(candidate: Candidate, dtype: str) -> float:
-    budget = candidate.budget[dtype]
-    return candidate.rel_l2[dtype] / budget if budget else math.inf
+    budget = candidate.budget.get(dtype, 0.0)
+    error = candidate.rel_l2.get(dtype, math.inf)
+    return math.inf if error < 0 or not budget else error / budget
 
 
-def _rules(evidence: Sequence[Measured]) -> tuple[verify.Rule, ...]:
-    """Per (shape class, M bucket (2^(b-1), 2^b]): the candidate with the least geometric-mean
-    time over the cell's shapes, where it beats the family default by more than the largest
-    relative interquartile spread either shows there."""
+def _spread(candidate: Candidate) -> float:
+    """The relative interquartile spread of a candidate's warm samples."""
+    return (candidate.warm_us[3] - candidate.warm_us[1]) / candidate.warm_us[2]
+
+
+def _rules(evidence: Sequence[Measured], sms: int) -> tuple[verify.Rule, ...]:
+    """Per (shape class, M bucket (2^(b-1), 2^b]), for this card's SM-count bucket, the cell's
+    `_best` candidate where it has one."""
     cells: dict[tuple[str, int], list[Measured]] = defaultdict(list)
     for one in evidence:
         cells[one.shape, math.ceil(math.log2(one.m))].append(one)
+    power = math.ceil(math.log2(sms))
     rules = []
     for (kind, bucket), group in sorted(cells.items()):
-        timed = [
-            {c.choice: c for c in one.candidates if c.ok and c.warm_us and not c.impossible}
-            for one in group
-        ]
-        if not all(DEFAULT in found for found in timed):
-            continue
-        shared = set.intersection(*(set(found) for found in timed)) - {DEFAULT}
-
-        if not shared:
-            continue
-        means = {
-            choice: statistics.geometric_mean(found[choice].warm_us[2] for found in timed)
-            for choice in (*shared, DEFAULT)
-        }
-        best = min(shared, key=lambda choice: (means[choice], str(choice)))
-        spread = max(
-            (found[choice].warm_us[3] - found[choice].warm_us[1]) / found[choice].warm_us[2]
-            for found in timed
-            for choice in (DEFAULT, best)
-        )
-        if means[DEFAULT] / means[best] > 1 + spread:
+        best = _best(group)
+        if best is not None:
             low = 0 if bucket <= 0 else 2 ** (bucket - 1)
-            rules.append(verify.Rule(low, 2**bucket, kind, best))
+            rules.append(verify.Rule(low, 2**bucket, kind, best, 2 ** (power - 1), 2**power))
     return tuple(rules)
+
+
+def _best(group: Sequence[Measured]) -> Choice | None:
+    """Of the candidates timed at every shape of a cell and regressing none beyond that shape's
+    spread, the one with the least layer-weighted time, where it beats the family default's by
+    more than the cell's largest spread."""
+    timed = [
+        {c.choice: c for c in one.candidates if c.ok and c.warm_us and not c.impossible}
+        for one in group
+    ]
+    if not all(DEFAULT in found for found in timed):
+        return None
+    held = [
+        choice
+        for choice in timed[0]
+        if choice != DEFAULT
+        and all(
+            choice in found
+            and found[choice].warm_us[2]
+            <= found[DEFAULT].warm_us[2]
+            * (1 + max(_spread(found[choice]), _spread(found[DEFAULT])))
+            for found in timed
+        )
+    ]
+    weighted = {
+        choice: sum(
+            one.layers * found[choice].warm_us[2] for one, found in zip(group, timed, strict=True)
+        )
+        for choice in (*held, DEFAULT)
+    }
+    if not held:
+        return None
+    best = min(held, key=lambda choice: (weighted[choice], str(choice)))
+    spread = max(_spread(found[c]) for found in timed for c in (DEFAULT, best))
+    return best if weighted[DEFAULT] / weighted[best] > 1 + spread else None
