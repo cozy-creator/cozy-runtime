@@ -294,7 +294,8 @@ class _Recorder:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.recordings: dict[tuple[object, ...], _Recording] = {}
-        self.seen: set[tuple[object, ...]] = set()
+        #: each key's first attempt (a request; a call where nothing is placed)
+        self.seen: dict[tuple[object, ...], int] = {}
         #: per key, the static buffers its graph would hold (measured on its first, eager call)
         self.statics: dict[tuple[object, ...], int] = {}
         self.failed: dict[tuple[object, ...], str] = {}
@@ -589,6 +590,8 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         placed[0].graph_pass(placed[1], path, args, kwargs) if placed is not None else nullcontext()
     )
     token = _PASS.set(object()) if owner() is module else None
+    if token is not None and placed is not None:
+        placed[0].graph_called(placed[1])
     began = time.perf_counter()
     try:
         with scope:
@@ -663,8 +666,11 @@ def _region_call(
         attempt = placed[0].attempts if placed is not None else recorder.attempts
         if key in recorder.failed or recorder.waiting.get(key) == attempt:
             return eager()
-        if key not in recorder.seen:
-            recorder.seen.add(key)
+        later = placed is not None and placed[0].graph_later(placed[1])
+        if key not in recorder.recordings and not records(
+            recorder.seen.get(key), attempt, later, placed is not None
+        ):
+            recorder.seen.setdefault(key, attempt)
             out = eager()
             # Its graph's static buffers: the inputs it would copy in and the outputs it keeps.
             recorder.statics[key] = _nbytes(torch, leaves) + _nbytes(
@@ -1001,6 +1007,15 @@ def _changed(
     recorder.changes[what] = recorder.changes.get(what, 0) + 1
 
 
+def records(seen: int | None, attempt: int, later: bool, placed: bool) -> bool:
+    """Whether a call records its region's graph: only where a replay is known to follow. Its
+    key's first call (`seen` None) runs as written and measures what the graph would hold. Then
+    a key seen in an earlier attempt (a request) records, and one seen in this attempt records
+    only when the plan runs the component again `later` in it (v7: CLIP recorded 97 graphs on its
+    last call of the request, each replayed once). Unplaced, every call is its own attempt."""
+    return seen is not None and (seen != attempt or later or not placed)
+
+
 def _nbytes(torch: Any, leaves: list[Any]) -> int:
     return sum(v.numel() * v.element_size() for v in leaves if isinstance(v, torch.Tensor))
 
@@ -1084,6 +1099,7 @@ __all__ = [
     "describe",
     "install",
     "record_stream",
+    "records",
     "release",
     "say",
 ]

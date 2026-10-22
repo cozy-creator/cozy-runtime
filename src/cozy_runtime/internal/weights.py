@@ -16,7 +16,7 @@ import threading
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -801,6 +801,27 @@ class _Bakes:
 # ------------------------------------------------------------------------- the placement
 
 
+class Steps:
+    """An attempt's plan (`ctx.plan`), steps per component, and its components' calls so far."""
+
+    def __init__(self) -> None:
+        self.planned: dict[str, int] = {}
+        self.calls: dict[str, int] = {}
+
+    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+        self.planned = {}
+        for step in steps:
+            for name in [step] if isinstance(step, str) else step:
+                self.planned[name] = self.planned.get(name, 0) + 1
+
+    def called(self, component: str) -> None:
+        self.calls[component] = self.calls.get(component, 0) + 1
+
+    def later(self, component: str) -> bool:
+        """The plan runs `component` in a step after its calls so far."""
+        return self.calls.get(component, 0) < self.planned.get(component, 0)
+
+
 class Placement:
     """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
     pins and KV caches as the memory's caches, a request's LoRA serving, and notes."""
@@ -812,12 +833,23 @@ class Placement:
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
+        self.steps = Steps()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
+        self.steps = Steps()
+
+    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+        self.steps.plan(steps)
+
+    def graph_called(self, component: str) -> None:
+        self.steps.called(component)
+
+    def graph_later(self, component: str) -> bool:
+        return self.steps.later(component)
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""

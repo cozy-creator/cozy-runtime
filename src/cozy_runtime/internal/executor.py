@@ -645,6 +645,10 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt()
 
+    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+        for row in self.rows.values():
+            row.plan(steps)
+
     @property
     def notes(self) -> dict[str, str]:
         return {f"{name}.{k}": v for name, row in self.rows.items() for k, v in row.notes.items()}
@@ -4083,6 +4087,8 @@ class Executor:
         request = self.host.requests.get(request_id)
         if request is not None:
             request.plan(list(steps))
+        if self.residency is not None:  # which regions record graphs reads it (`graph_later`)
+            self.residency.plan(steps)
         if self.group is not None and self.rank == 0:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
