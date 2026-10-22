@@ -56,8 +56,6 @@ class Domain:
         self.captures: Any = None
         self.cache: Any = None
         self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
-        #: each graph output's address -> (its recording, its index): segment boundaries
-        self.lent: dict[int, tuple[weakref.ref[Any], int]] = {}
 
     def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
@@ -188,7 +186,6 @@ class Domain:
     def drop_captures(self) -> None:
         """After every graph recorded into it is reset and its static buffers dropped."""
         self.captures = None  # MemPool destruction releases this pool, never a global flush.
-        self.lent.clear()
         if self.cache is not None:
             self.cache.close()
             self.cache = None

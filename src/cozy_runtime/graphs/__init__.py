@@ -100,9 +100,10 @@ class _Recording:
 
     Its outputs are lent: a replay returns aliases of the graph's own output tensors. Their
     storage lives as long as any alias does, and the next replay runs only once none is alive
-    (`ready`); until then a call runs as written. A static input that is another recording's
-    output (`chained`, a segment boundary) is read in place and never written, so a chain of
-    segments copies nothing between them.
+    (`ready`; until then a call runs as written) and after every reader's GPU work: the stream
+    it replayed on, and each stream a reader declared (`record_stream`). A static input that is
+    another recording's output (`chained`, a segment boundary) is read in place and never
+    written, so a chain of segments copies nothing between them.
     """
 
     def __init__(
@@ -115,8 +116,9 @@ class _Recording:
         outputs: Any,
         layout: object,
         served: Any,
+        owner: domain.Domain,
     ) -> None:
-        self.torch, self.graph, self.pool = torch, graph, pool
+        self.torch, self.graph, self.pool, self.owner = torch, graph, pool, owner
         self.inputs, self.chained, self.outputs, self.layout = inputs, chained, outputs, layout
         self.statics = [
             t for t in torch.utils._pytree.tree_leaves(outputs) if isinstance(t, torch.Tensor)
@@ -126,6 +128,8 @@ class _Recording:
         self.held: list[int] | None = None
         #: bytes the last replay copied into its static inputs
         self.copied = 0
+        #: other streams that read the last replay's lent outputs (`record_stream`)
+        self.readers: dict[Any, None] = {}
         self.done: Any = None
         self.stream: Any = None
         self.fenced = True
@@ -152,6 +156,9 @@ class _Recording:
             stream.wait_event(self.done)
         if self.stream is not None and self.stream != stream:
             stream.wait_stream(self.stream)  # readers of the last replay's lent outputs
+        for reader in self.readers:
+            stream.wait_stream(reader)
+        self.readers.clear()
         self.stream, self.fenced = stream, False
         copied = 0
         try:
@@ -172,12 +179,23 @@ class _Recording:
 
     def close(self) -> None:
         """After last use: release static tensors and executable before their pool."""
+        for tensor in self.statics:
+            found = _LENT.get(tensor.data_ptr())
+            if found is not None and found[0]() is self:
+                del _LENT[tensor.data_ptr()]
         self.inputs, self.outputs, self.statics = [], None, []
         self.graph.reset()
         self.graph = self.pool = None
 
     def idle(self) -> bool:
-        return self.fenced and (self.done is None or bool(self.done.query()))
+        if not self.fenced or (self.done is not None and not self.done.query()):
+            return False
+        for reader in self.readers:
+            passed = self.torch.cuda.Event()
+            passed.record(reader)
+            if not passed.query():
+                return False
+        return True
 
 
 def _uses(torch: Any, tensor: Any) -> int:
@@ -262,6 +280,9 @@ class _Recorder:
         self.captures = 0
         self.retired = 0
         self.copy_bytes = 0
+        #: calls run as written because a lent output was still alive or a chained input was not
+        #: its producer's output
+        self.held = 0
         self.landed = LANDED[0]
         self.domain: domain.Domain | None = None
         #: host time preparing and capturing (warmup included), and each way it ran
@@ -286,6 +307,8 @@ class _Recorder:
 
 
 _RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionary()
+#: each live graph output's address -> (its recording, its index among the outputs)
+_LENT: dict[int, tuple[weakref.ref[_Recording], int]] = {}
 _REGIONS: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
 _DECLARED: weakref.WeakSet[Any] = weakref.WeakSet()
 _GAPS: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
@@ -414,6 +437,7 @@ def describe(root: Any) -> dict[str, Any]:
             "captures",
             "retired_graphs",
             "replay_copy_bytes",
+            "held_calls",
         ),
         0,
     )
@@ -435,6 +459,7 @@ def describe(root: Any) -> dict[str, Any]:
             answer["captures"] += recorder.captures
             answer["retired_graphs"] += recorder.retired
             answer["replay_copy_bytes"] += recorder.copy_bytes
+            answer["held_calls"] += recorder.held
             if recorder.recordings:
                 captured.append(path)
             if recorder.attempts:
@@ -442,6 +467,7 @@ def describe(root: Any) -> dict[str, Any]:
                     "capture_attempts": recorder.capture_attempts,
                     "captures": recorder.captures,
                     "capture_ms": round(recorder.capture_ms, 3),
+                    "held": recorder.held,
                     "eager": recorder.eager.document(),
                     "replay": recorder.replayed.document(),
                 }
@@ -605,6 +631,7 @@ def _region_call(
                 return eager()
         verdict = entry.ready(leaves)
         if verdict:
+            recorder.held += 1
             if verdict == "stale" and entry.idle():
                 recorder.recordings.pop(key).close()
             return eager()
@@ -658,7 +685,7 @@ def _record(
         )
         with torch.cuda.stream(stream):
             with allocating:
-                found = [_lent(torch, recorder.domain, leaf) for leaf in leaves]
+                found = [_lent(torch, leaf, recorder.domain) for leaf in leaves]
                 chained = [f[0] if f is not None else None for f in found]
                 inputs = [
                     f[1]
@@ -707,12 +734,12 @@ def _record(
                     if isinstance(t, torch.Tensor)
                 )
             )
-        entry = _Recording(torch, graph, pool, inputs, chained, outputs[0], key, served)
+        owner = recorder.domain
+        entry = _Recording(torch, graph, pool, inputs, chained, outputs[0], key, served, owner)
         recorder.recordings[key] = entry
         recorder.captures += 1
-        owner = recorder.domain
         for index, tensor in enumerate(entry.statics):
-            owner.lent[tensor.data_ptr()] = (weakref.ref(entry), index)
+            _LENT[tensor.data_ptr()] = (weakref.ref(entry), index)
         if placed is not None and owner.cache is None:
             shed = functools.partial(_shed, torch, owner)
             owner.cache = placed[0].cache(f"graphs:{placed[1]}", shed)
@@ -731,14 +758,26 @@ def _record(
             current.wait_stream(stream)
 
 
-def _lent(torch: Any, owner: domain.Domain, leaf: Any) -> tuple[_Recording, Any] | None:
-    """The live recording and static output `leaf` is an alias of: a segment boundary."""
-    found = owner.lent.get(leaf.data_ptr()) if isinstance(leaf, torch.Tensor) else None
+def _lent(
+    torch: Any, leaf: Any, owner: domain.Domain | None = None
+) -> tuple[_Recording, Any] | None:
+    """The live recording and static output `leaf` is an alias of (of `owner`'s graphs)."""
+    found = _LENT.get(leaf.data_ptr()) if isinstance(leaf, torch.Tensor) else None
     entry = found[0]() if found is not None else None
     if found is None or entry is None or entry.graph is None:
         return None
     static = entry.statics[found[1]]
-    return (entry, static) if _same(static, leaf) else None
+    if not _same(static, leaf) or (owner is not None and entry.owner is not owner):
+        return None
+    return entry, static
+
+
+def record_stream(torch: Any, tensor: Any, stream: Any) -> None:
+    """`tensor`, a graph's lent output, is read on `stream`: the graph's next replay waits for
+    the work queued there (torch's `Tensor.record_stream`, for a lent output's reuse)."""
+    found = _lent(torch, tensor)
+    if found is not None:
+        found[0].readers[stream] = None
 
 
 def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str) -> None:
@@ -806,4 +845,13 @@ def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
     )
 
 
-__all__ = ["BYPASS", "capture", "capture_domain", "describe", "install", "release", "say"]
+__all__ = [
+    "BYPASS",
+    "capture",
+    "capture_domain",
+    "describe",
+    "install",
+    "record_stream",
+    "release",
+    "say",
+]

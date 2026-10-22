@@ -379,10 +379,37 @@ def test_a_segment_boundary_copies_nothing_and_a_held_output_is_never_overwritte
         replays = first.replays
         other = torch.randn(4, 64, device="cuda")
         torch.testing.assert_close(module.first(other), _as_written(module.first, other))
-        assert first.replays == replays and torch.equal(held, kept)
+        assert first.replays == replays and torch.equal(held, kept) and first.held == 1
+        assert graphs.describe(module)["held_calls"] == 1
         del held
         torch.testing.assert_close(module.first(other), _as_written(module.first, other))
         assert first.replays == replays + 1
+    graphs.release(torch, module)
+
+
+@pytest.mark.real_gpu
+@pytest.mark.skipif(not CUDA, reason="cross-stream readers need a GPU")
+def test_a_reader_on_another_stream_finishes_before_the_next_replay_overwrites_it() -> None:
+    module = _two_segments()
+    side = torch.cuda.Stream()
+    with torch.inference_mode():
+        x, other = (torch.randn(4, 64, device="cuda") for _ in range(2))
+        for _ in range(3):
+            module.first(x)
+        expected = _as_written(module.first, x)
+        lent = module.first(x)
+        assert graphs._RECORDERS[module.first].replays == 3
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(1 << 28)  # the reader is still queued when its alias is dropped
+            read = lent * 1
+        graphs.record_stream(torch, lent, side)
+        del lent
+        again = module.first(other)
+        assert graphs._RECORDERS[module.first].replays == 4
+        torch.cuda.synchronize()
+        assert torch.equal(read, expected)
+        torch.testing.assert_close(again, _as_written(module.first, other))
     graphs.release(torch, module)
 
 
