@@ -14,14 +14,16 @@
 # --on names, never rented or ended. Rentals run at once; each ends in a trap and is confirmed gone from the list.
 # Groups (`card:group,…` picks): on every card h3ref5 (cold, then warm ×3), h3ref15 (cold), qwen1 qwen2 qwen4 klein
 # sdxl1 sdxl4 anima seedvr2 birefnet describer; on 2x8 and 2x12 h3long2 (long_form 2 × 5 s at degree 2); the scenarios
-# d9 lora beside pair two cotenant twenty pressure kill on 24, and d9 at degree 2 on 2x12.
+# d9 lora beside pair two cotenant twenty pressure kill on 24, and d9 at degree 2 on 2x12. h3ra5 (ref2va, standard
+# steps; cold, then warm ×3) runs when named, for a Hub without the turbo LoRA.
+# Around every run, hostmem.py reads the machine's cgroup memory.events: a receipt carries the OOM kills between.
 # --walls: earlier summaries whose measured walls price the plan, printed before anything is rented; --plan stops there.
 # Results: ./memory-matrix-<stamp>/ (summary.txt: one receipt per run; every run's show JSON; machine logs). Exit
 # status: the line under test's runs below the absolute bar, its cells worse than the shipping line, and rentals,
 # installs or limits that failed.
 set -uo pipefail
 HERE=$(dirname "$(realpath "$0")")
-RECEIPTS=$HERE/memory_receipts.py PORTRAIT=$HERE/portrait.jpg
+RECEIPTS=$HERE/memory_receipts.py PORTRAIT=$HERE/portrait.jpg HOSTMEM=$HERE/hostmem.py
 H=tensorhub ORG=fidika PLAN="" CARDS="" WALLS=()
 declare -A LINE=() ON=()
 while [ $# -gt 0 ]; do
@@ -84,7 +86,7 @@ for spec in $CARDS; do
   exit 2
 done
 
-M="" OWN="" NAME="" FOLLOW="" ON_LINE="" K="" L="" CAP="" ASSET="" FAILED=0 REQ=0
+M="" OWN="" NAME="" FOLLOW="" ON_LINE="" K="" L="" CAP="" ASSET="" HOST_LAST="" FAILED=0 REQ=0
 fail() { say "FAIL $*"; FAILED=$((FAILED + 1)); }
 seed() { echo $((SRANDOM >> 1)); }  # from the OS: new in every subshell
 
@@ -194,15 +196,27 @@ start() {  # start <cell> <cozy run args…>: a detached run on $M; prints its n
   grep -oE '"number": ?[0-9]+' "run-$c.$L.json" | head -1 | grep -oE '[0-9]+$'
 }
 
-finish() {  # finish <cell> <number>: follow the run to its end, confirm its outputs and record its receipt
-  local c=$1 n=$2 state="not started"
+host() {  # host <file>: hostmem.py's reading of the machine's cgroup memory counters now, its run record in <file>
+  local n
+  n=$(cozy run "$HOSTMEM" --on "$M" --tensorhub "$H" --detach --json 2> "$1.err" | grep -oE '"number": ?[0-9]+' | head -1 |
+    grep -oE '[0-9]+$')
+  : > "$1"
+  [ -n "$n" ] && cozy run watch "$n" --tensorhub "$H" > /dev/null 2>&1 && cozy run show "$n" --json --tensorhub "$H" > "$1" 2>&1
+  HOST_LAST=$1
+}
+
+finish() {  # finish <cell> <number>: follow the run to its end, confirm its outputs and record its receipt, with the
+  # host's OOM kills since the reading before it
+  local c=$1 n=$2 state="not started" before=$HOST_LAST
   if [ -n "$n" ]; then
     cozy run watch "$n" --tensorhub "$H" > "watch-$c.$L.log" 2>&1
     state=$(landed "$n" "$c.$L")
   else
     say "$c ($L) did not start: $(tail -c 300 "run-$c.$L.err" | tr '\n' ' ')"
   fi
-  python3 -I "$RECEIPTS" record "show-$c.$L.json" "$c" "${n:-0}" "$state" "$L" "$CAP" | tee -a summary.txt > /dev/null
+  host "host-$c.$L.json"
+  python3 -I "$RECEIPTS" record "show-$c.$L.json" "$c" "${n:-0}" "$state" "$L" "$CAP" "$before" "$HOST_LAST" |
+    tee -a summary.txt > /dev/null
 }
 
 cell() { local c=$1; shift; finish "$c" "$(start "$c" "$@")"; }
@@ -219,12 +233,12 @@ clip() {  # ASSET: a 2 s 832×480 clip no earlier request used, panning over the
     -pix_fmt yuv420p "$ASSET" || fail "no clip $ASSET"
 }
 
-h3ref() {  # h3ref <cell> <seconds> [extra cozy run args…]: ref2va_turbo from a new portrait, prompt and seed
-  local c=$1 s=$2; shift 2
+h3ref() {  # h3ref <cell> <fn> <seconds> [extra cozy run args…]: ref2va_turbo or ref2va from a new portrait, prompt and seed
+  local c=$1 fn=$2 s=$3; shift 3
   printf '{"prompt": "The woman in <Picture 1> walks through a sunlit park in autumn, leaves falling, %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": %d, "clean_references": false, "describe_references": false}\n' \
     "$TAG $c $L" "$(seed)" "$s" > "$c.$L.json"
   portrait
-  cell "$c" "$ORG/minimax-h3/ref2va_turbo" --input "$c.$L.json" --asset "$ASSET" "$@"
+  cell "$c" "$ORG/minimax-h3/$fn" --input "$c.$L.json" --asset "$ASSET" "$@"
 }
 
 h3long() {  # h3long <cell> <segments> <gpus>: long_form of 5 s segments at that degree
@@ -266,8 +280,9 @@ LORA_B="model.turbo_lora=fidika/varena-slim-public-20261020-minimax-h3-turbo-lor
 group() {  # group <name>: one group's runs on line $L, card $K
   local k n a b
   case $1 in
-    h3ref5) h3ref "$K-h3ref5" 5; for k in 1 2 3; do h3ref "$K-h3ref5-warm.$k" 5; done ;;
-    h3ref15) h3ref "$K-h3ref15" 15 ;;
+    h3ref5) h3ref "$K-h3ref5" ref2va_turbo 5; for k in 1 2 3; do h3ref "$K-h3ref5-warm.$k" ref2va_turbo 5; done ;;
+    h3ra5) h3ref "$K-h3ra5" ref2va 5; for k in 1 2 3; do h3ref "$K-h3ra5-warm.$k" ref2va 5; done ;;
+    h3ref15) h3ref "$K-h3ref15" ref2va_turbo 15 ;;
     qwen1|qwen2|qwen4) image "$K-$1" qwen-image-2/generate_image megapixels:="${1#qwen}" ;;
     klein) image "$K-klein" flux-3-klein/generate ;;
     sdxl1|sdxl4) image "$K-$1" sdxl/generate megapixels:="${1#sdxl}" ;;
@@ -280,12 +295,12 @@ group() {  # group <name>: one group's runs on line $L, card $K
       if [ "$K" = 2x12 ]; then
         h3long "$K-d9" 1 2; for k in 1 2 3; do restart minimax-h3; h3long "$K-d9-warm.$k" 1 2; done
       else
-        h3ref "$K-d9" 5; for k in 1 2 3; do restart minimax-h3; h3ref "$K-d9-warm.$k" 5; done
+        h3ref "$K-d9" ref2va_turbo 5; for k in 1 2 3; do restart minimax-h3; h3ref "$K-d9-warm.$k" ref2va_turbo 5; done
       fi ;;
     lora)  # two LoRA variants alternating across Runtime restarts
-      h3ref "$K-lora-a.1" 5 "$LORA_A"; upgrade; h3ref "$K-lora-b.1" 5 "$LORA_B"; upgrade
-      h3ref "$K-lora-a.2" 5 "$LORA_A"; upgrade; h3ref "$K-lora-b.2" 5 "$LORA_B" ;;
-    beside) h3ref "$K-beside-h3" 5; image "$K-beside-qwen4" qwen-image-2/generate_image megapixels:=4 ;;
+      h3ref "$K-lora-a.1" ref2va_turbo 5 "$LORA_A"; upgrade; h3ref "$K-lora-b.1" ref2va_turbo 5 "$LORA_B"; upgrade
+      h3ref "$K-lora-a.2" ref2va_turbo 5 "$LORA_A"; upgrade; h3ref "$K-lora-b.2" ref2va_turbo 5 "$LORA_B" ;;
+    beside) h3ref "$K-beside-h3" ref2va_turbo 5; image "$K-beside-qwen4" qwen-image-2/generate_image megapixels:=4 ;;
     pair)  # SDXL ∥ H3
       a=$(start "$K-pair-sdxl4" "$ORG/sdxl/generate" prompt="a red kite over dunes, $TAG $K pair $L" seed="$(seed)" megapixels:=4)
       printf '{"prompt": "The woman in <Picture 1> flies a red kite over dunes, %s.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": 5, "clean_references": false, "describe_references": false}\n' \
@@ -309,7 +324,7 @@ group() {  # group <name>: one group's runs on line $L, card $K
         image "$K-twenty$([ "$k" -gt 1 ] && echo -warm).$k" sdxl/generate aspect_ratio="${shapes[k % 5]}" megapixels:="${mps[k % 3]}"
       done ;;
     pressure)  # H3's deposits and Qwen's peak on one host; the CLI shows no host RAM, so the receipt cannot prove pressure
-      h3ref "$K-pressure-h3.1" 5; image "$K-pressure-qwen4" qwen-image-2/generate_image megapixels:=4; h3ref "$K-pressure-h3.2" 5 ;;
+      h3ref "$K-pressure-h3.1" ref2va_turbo 5; image "$K-pressure-qwen4" qwen-image-2/generate_image megapixels:=4; h3ref "$K-pressure-h3.2" ref2va_turbo 5 ;;
     kill)  # the matrix's one labeled deliberate failure (D7): canceled mid-denoise; the next request carries the bar
       printf '{"prompt": "DELIBERATE KILL (D7) %s: the woman in <Picture 1> waves.\n\nnon_diegetic_music:\nN/A", "seed": %d, "duration_s": 5, "clean_references": false, "describe_references": false}\n' \
         "$TAG $K $L" "$(seed)" > "$K-kill-victim.$L.json"
@@ -326,7 +341,7 @@ for line in sys.stdin:
     if event.get("type") == "run.progress" and 0 < p.get("completed", 0) < p.get("total", 0):
         sys.exit(0)
 sys.exit(1)' && cozy run cancel "$n" --tensorhub "$H" > "cancel-$K.$L.log" 2>&1
-      finish "$K-kill-victim" "$n"; h3ref "$K-kill-after" 5 ;;
+      finish "$K-kill-victim" "$n"; h3ref "$K-kill-after" ref2va_turbo 5 ;;
     *) fail "card $K: no group $1" ;;
   esac
 }
@@ -339,6 +354,7 @@ rental() {  # rental <spec>…: one rental's cards in order, each group on every
   if [ "$cls" = wddm ]; then M=${ON[wddm]}; NAME=$M; else rent "$gpus" $skus || return "$FAILED"; fi
   K=${1%%:*}
   install "${LINES[0]}" || return "$FAILED"  # before any limit: the line's machine is the one that applies it
+  host "host-$cls-start.json"
   for log in tensord memory; do  # kept here in case the machine is lost mid-run
     cozy machine logs "$M" "$log" -f -n 0 --tensorhub "$H" > "$log-$cls.log" 2>&1 &
     FOLLOW="$FOLLOW $!"

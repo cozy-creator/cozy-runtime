@@ -1,0 +1,18 @@
+{
+ "number": 12920,
+ "status": "completed",
+ "result": {
+  "value": {
+   "/sys/fs/cgroup/cozy-executor-455a3115b39d962c-bae69c4695f39845/memory.current": "<No such file or directory>",
+   "/sys/fs/cgroup/cozy-executor-455a3115b39d962c-bae69c4695f39845/memory.events": "<No such file or directory>",
+   "/sys/fs/cgroup/cozy-executor-455a3115b39d962c-bae69c4695f39845/memory.max": "<No such file or directory>",
+   "/sys/fs/cgroup/cozy-executor-455a3115b39d962c-bae69c4695f39845/memory.peak": "<No such file or directory>",
+   "/sys/fs/cgroup/memory.current": "3991441408",
+   "/sys/fs/cgroup/memory.events": "low 0\nhigh 0\nmax 123782\noom 94\noom_kill 11\noom_group_kill 0",
+   "/sys/fs/cgroup/memory.max": "30999998464",
+   "/sys/fs/cgroup/memory.peak": "31009849344",
+   "meminfo": "MemTotal:       131767096 kB\nMemAvailable:   112911224 kB\nSwapTotal:             0 kB",
+   "self_cgroup": "0::/cozy-executor-455a3115b39d962c-bae69c4695f39845"
+  }
+ }
+}

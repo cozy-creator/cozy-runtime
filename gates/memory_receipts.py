@@ -36,6 +36,24 @@ class Step:
 
 
 @dataclass(frozen=True, slots=True)
+class Fill:
+    """Fills from one source: bytes and the time they took; of them, the bytes whose ceiling was measured, and those
+    bytes times their % of it (so records add up)."""
+
+    source: str
+    nbytes: int
+    ns: int
+    rated: int = 0
+    pct_bytes: float = 0.0
+
+    def add(self, nbytes, ns, ceiling):
+        """Another run of fills against `ceiling` GB/s (0: unmeasured)."""
+        rated = nbytes if ceiling > 0 and ns > 0 else 0
+        return Fill(self.source, self.nbytes + nbytes, self.ns + ns, self.rated + rated,
+                    self.pct_bytes + (rated * 100 * nbytes / ns / ceiling if rated else 0.0))
+
+
+@dataclass(frozen=True, slots=True)
 class Memory:
     """One GPU call's memory record, as either line reports it."""
 
@@ -43,7 +61,7 @@ class Memory:
     kept: int  # bytes imported by fingerprint, no copy
     tier: int  # bytes copied from host RAM
     store: int  # bytes read from the store (disk) on their way to the GPU
-    fills: tuple[tuple[str, int, int, float], ...]  # (source, bytes, ns, its ceiling in GB/s; 0 unmeasured)
+    fills: tuple[Fill, ...]
     copy_ns: int  # time the copies to the GPU took
     stall_ns: int
     retries: int
@@ -70,6 +88,7 @@ class Receipt:
     moved: float | None  # GB
     min: float | None  # GB
     bar: str
+    steps: dict[str, float]  # mean ms per step, by stage
 
 
 def count(value, name):
@@ -135,21 +154,17 @@ def shipping(memory):
     if not isinstance(stats, dict) or not stats:
         raise ValueError("no memory stats")
     copies = stats["copies"]
-    fills = []
-    for kind in ("h2d", "disk"):
-        runs = [c for c in copies if c["kind"] == kind]
-        n = sum(count(c["bytes"], kind) for c in runs)
-        fills.append((kind, n, round(sum(c["seconds"] for c in runs) * 1e9),
-                      sum(c["ceiling"] * c["bytes"] for c in runs) / n if n else 0.0))
-    (_, copied, copy_ns, _), (_, disk, _, _) = fills
-    disk = min(disk, copied)
+    fills = {kind: Fill(kind, 0, 0) for kind in ("h2d", "disk")}
+    for c in copies:
+        fills[c["kind"]] = fills[c["kind"]].add(count(c["bytes"], "copy"), round(c["seconds"] * 1e9), c["ceiling"])
+    copied, copy_ns, disk = fills["h2d"].nbytes, fills["h2d"].ns, min(fills["disk"].nbytes, fills["h2d"].nbytes)
     evicted = {}
     for e in stats["evictions"]:
         evicted[RUNGS[e["rung"]]] = evicted.get(RUNGS[e["rung"]], 0) + count(e["nbytes"], "eviction")
     rows = stats["rows"]
     return Memory(
         leftover_by_gpu=tuple((count(g, "gpu"), count(n, "leftover")) for g, n in stats["leftover_by_gpu"]),
-        kept=0, tier=copied - disk, store=disk, fills=tuple(fills), copy_ns=copy_ns,
+        kept=0, tier=copied - disk, store=disk, fills=tuple(fills.values()), copy_ns=copy_ns,
         stall_ns=sum(count(r["stall_ns"], "stall") for r in rows), retries=count(stats["retries"], "retries"),
         cuts=sum(len(p["cuts"]) for p in stats["peaks"]), parks=sum(e["rung"] == 5 for e in stats["evictions"]),
         evicted=tuple(sorted(evicted.items())), misplaced=(),
@@ -214,15 +229,16 @@ def candidate(memory):
         rows.append((gpu, s, s["moved"], device["ceiling"]))
     fills = []
     for source, ceiling in (("kept", "h2d_gbps"), ("tier", "h2d_gbps"), ("store", "disk_gbps")):
-        n = sum(count(m[source]["bytes"], source) for _, _, m, _ in rows)
-        fills.append((source, n, sum(count(m[source]["ns"], source) for _, _, m, _ in rows),
-                      sum(float(c[ceiling]) * m[source]["bytes"] for _, _, m, c in rows) / n if n else 0.0))
+        fill = Fill(source, 0, 0)
+        for _, _, m, c in rows:
+            fill = fill.add(count(m[source]["bytes"], source), count(m[source]["ns"], source), float(c[ceiling] or 0))
+        fills.append(fill)
     return Memory(
         leftover_by_gpu=tuple((gpu, count(s["leftover"], "leftover")) for gpu, s, *_ in rows),
         kept=sum(count(m["kept"]["bytes"], "kept") for _, _, m, *_ in rows),
         tier=sum(count(m["tier"]["bytes"], "tier") for _, _, m, *_ in rows),
         store=sum(count(m["store"]["bytes"], "store") for _, _, m, *_ in rows),
-        fills=tuple(fills), copy_ns=fills[1][2] + fills[2][2],
+        fills=tuple(fills), copy_ns=fills[1].ns + fills[2].ns,
         stall_ns=sum(count(s["stall_ns"], "stall") for _, s, *_ in rows),
         retries=sum(count(s["retries"], "retries") for _, s, *_ in rows),
         cuts=sum(count(s["cuts"], "cuts") for _, s, *_ in rows),
@@ -243,9 +259,47 @@ def gb(n):
     return "-" if n is None else f"{n / 1e9:.3f}"
 
 
-def record(path, cell, number, state, line, cap):
+def oom_kills(path):
+    """`oom_kill` by cgroup from a hostmem.py run's record (`memory.events`, cgroup v2, counting descendants); empty
+    when there is no such record or the machine shows no cgroup's events."""
+    try:
+        value = json.loads(Path(path).read_text())["result"]["value"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+    out = {}
+    for name, text in value.items() if isinstance(value, dict) else ():
+        if name.endswith("/memory.events") and isinstance(text, str):
+            counts = dict(line.split() for line in text.splitlines() if len(line.split()) == 2)
+            if counts.get("oom_kill", "").isdigit():
+                out[name] = int(counts["oom_kill"])
+    return out
+
+
+def kills(before, after):
+    """Processes the host's OOM killer ended between two hostmem.py readings: the largest delta of a cgroup both show
+    (the outermost counts every descendant); None without two readings."""
+    a, b = oom_kills(before) if before else {}, oom_kills(after) if after else {}
+    deltas = [b[name] - a[name] for name in a.keys() & b.keys()]
+    return max(deltas) if deltas else None
+
+
+def step_times(calls):
+    """Per stage with steps (`measurements.attribution.steps`): count, mean and first step in ms, over the calls."""
+    out = {}
+    for call in calls:
+        steps = (((call.get("measurements") or {}).get("attribution") or {}).get("steps") or {})
+        for stage, t in steps.items() if isinstance(steps, dict) else ():
+            if isinstance(t, dict) and type(t.get("count")) is int and t["count"] > 0:
+                n, total, first = out.get(stage, (0, 0.0, None))
+                out[stage] = (n + t["count"], total + float(t.get("total_ms") or 0.0),
+                              first if first is not None else float(t.get("first_ms") or 0.0))
+    return {stage: (n, total / n, first) for stage, (n, total, first) in out.items()}
+
+
+def record(path, cell, number, state, line, cap, host_before="", host_after=""):
     """Print run `number`'s receipt line (the caller appends it to summary.txt); 1 when it misses the absolute bar,
-    named in `bar=`. `cap` is the card's limit in GiB, or `card`."""
+    named in `bar=`. `cap` is the card's limit in GiB, or `card`; `host_before` and `host_after` are hostmem.py
+    readings around the run, when the matrix took them."""
     try:
         run = json.loads(Path(path).read_text())
     except (OSError, ValueError):
@@ -256,6 +310,9 @@ def record(path, cell, number, state, line, cap):
     victim = "-kill-victim" in cell  # the matrix's one labeled deliberate failure (D7); the run after it has the bar
     if victim:
         bar += [] if status in CANCELED else ["not-killed"]
+    elif status == "failed":  # the run's own reason names it
+        code = (run.get("reason") or {}).get("code") if isinstance(run.get("reason"), dict) else None
+        bar.append(f"failed:{code or 'no-reason'}")
     elif status != "completed" or not (state.startswith("completed ") and state.endswith(" landed")):
         bar.append("incomplete")
     if str(run.get("number")) != str(number):
@@ -275,13 +332,17 @@ def record(path, cell, number, state, line, cap):
             memories.append((ran, PARSERS[line](call["measurements"].get("memory"))))
         except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
             bar.append(re.sub(r"\s+", "_", f"no-mem-stats({type(error).__name__}:{str(error)[:60]})"))
-    if not executed and not victim:
+    if not executed and not victim and status != "failed":
         bar.append("no-gpu-execution")
     if any(sorted(g for g, _ in m.leftover_by_gpu) != sorted(ran) for ran, m in memories):
         bar.append("leftover-gpu-coverage")
     poisoned = any("poisoned" in reason_of(c) for c in [run, *calls])
     if poisoned:
         bar.append("poisoned")
+    killed = kills(host_before, host_after)
+    if killed:
+        bar.append("host-oom-kill")
+    steps = step_times(calls)
     m = [m for _, m in memories]
     total = {f: sum(getattr(x, f) for x in m) for f in ("kept", "tier", "store", "copy_ns", "stall_ns", "retries",
                                                          "cuts", "parks")}
@@ -289,11 +350,12 @@ def record(path, cell, number, state, line, cap):
     leftover = sum(n for x in m for _, n in x.leftover_by_gpu)
     least = None if not m or any(x.min_bytes is None for x in m) else sum(x.min_bytes for x in m)
     dit = [n for x in m for n in x.dit_steps]
-    fills = {}  # source -> [bytes, ns, ceiling x bytes]
+    fills = {}
     for x in m:
-        for source, n, ns, ceiling in x.fills:
-            f = fills.setdefault(source, [0, 0, 0.0])
-            f[0], f[1], f[2] = f[0] + n, f[1] + ns, f[2] + ceiling * n
+        for f in x.fills:
+            was = fills.get(f.source, Fill(f.source, 0, 0))
+            fills[f.source] = Fill(f.source, was.nbytes + f.nbytes, was.ns + f.ns, was.rated + f.rated,
+                                   was.pct_bytes + f.pct_bytes)
     evicted = {}
     for x in m:
         for name, n in x.evicted:
@@ -316,13 +378,15 @@ def record(path, cell, number, state, line, cap):
         "moved": f"{gb(some(moved))}GB", "store": f"{gb(some(total['store']))}GB",
         "tier": f"{gb(some(total['tier']))}GB", "kept": f"{gb(some(total['kept']))}GB",
         "ram_hit": f"{pct(total['tier'], moved)}%",
-        "fill": ",".join(f"{source}:{n / ns:.2f}GB/s/{pct(n / ns, c / n)}%" for source, (n, ns, c) in fills.items()
-                         if n and ns) or "-",  # bytes per ns is GB/s
+        "fill": ",".join(f"{f.source}:{f.nbytes / f.ns:.2f}GB/s/{pct(f.pct_bytes / 100, f.rated)}%"
+                         for f in fills.values() if f.nbytes and f.ns) or "-",  # bytes per ns is GB/s
         "stall": f"{total['stall_ns'] / 1e9:.3f}s", "copy": f"{total['copy_ns'] / 1e9:.3f}s",
         "oom_retries": some(total["retries"]), "cuts": some(total["cuts"]), "parks": some(total["parks"]),
         "evicted": ",".join(f"{k}:{v / 1e9:.2f}" for k, v in sorted(evicted.items()) if v) or "-",
         "leftover": some(leftover), "poisoned": int(poisoned), "min": f"{gb(least)}GB",
-        "dit_step_max": f"{max(dit) if dit else '-'}B", "bar": ",".join(bar) or "ok",
+        "dit_step_max": f"{max(dit) if dit else '-'}B",
+        "step_ms": ",".join(f"{k}:{n}x{mean:.0f}/{first:.0f}" for k, (n, mean, first) in steps.items()) or "-",
+        "oom_kill": "-" if killed is None else f"+{killed}", "bar": ",".join(bar) or "ok",
     }
     print(f"{cell} run={number} {state} " + " ".join(f"{k}={'-' if v is None else v}" for k, v in fields.items())
           + f" reason={reason[:300]}")
@@ -347,7 +411,8 @@ def receipts(path):
         f = dict(re.findall(r" (\w+)=(\S*)", text.split(" reason=")[0]))
         out.append(Receipt(match[1], match[2], match[3], match[4] == "landed", f.get("line", "?"), f.get("cap", "?"),
                            number(f.get("wall", "0s")) or 0.0, number(f.get("exec", "-")), number(f.get("moved", "-")),
-                           number(f.get("min", "-")), f.get("bar", "?")))
+                           number(f.get("min", "-")), f.get("bar", "?"),
+                           {stage: float(mean) for stage, mean in re.findall(r"(\w+):\d+x([\d.]+)/", f.get("step_ms", ""))}))
     return out
 
 
@@ -383,6 +448,10 @@ def compare(summary, lines):
                 x, y = statistics.median(a), statistics.median(b)
                 say.append(f"{field} {x:.3f} -> {y:.3f}{' WORSE' if y > x else ''}")
                 worse += y > x
+            for stage in sorted(set().union(*(r.steps for r in old)) & set().union(*(r.steps for r in new))):
+                a = statistics.median(r.steps[stage] for r in old if stage in r.steps)
+                b = statistics.median(r.steps[stage] for r in new if stage in r.steps)
+                say.append(f"{stage}/step {a:.0f} -> {b:.0f} ms")
             least = [r.min for r in new if r.min is not None]
             print(f"{key}: {'; '.join(say)}{f'; MIN {statistics.median(least):.3f} GB' if least else ''}")
     print(f"memory-matrix: {failures} {tested} runs below the absolute bar, {worse} worse than the shipping line")

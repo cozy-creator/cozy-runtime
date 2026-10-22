@@ -39,5 +39,56 @@
     "tensord": "0.11.0+dev.g5dbf9254",
     "client": "cozy 0.11.0+dev.g2afc1937",
     "show_sha256": "49e27354903683b40fc7ee4cc853a55cdadf787c1f92914e6ddb1940670fccd0"
+  },
+  "sdxl1-candidate-12872.json": {
+    "run": 12872,
+    "source": "outputs/varena-one-vertical/runs/v3/show-12-sdxl1.candidate.json",
+    "target": "paul/sdxl/generate@2.12.0",
+    "software": {
+      "attempt_ordinal": 1,
+      "runtime": "0.30.0+7d0abf75",
+      "tensord": "0.11.0+dev.g8f89a159",
+      "tensord_commit": "8f89a1591a9b9cb8b07e8b740387242c351527eb",
+      "tensorfs": "0.13.0"
+    },
+    "show_sha256": "e3b8cb4bf110d754da2b226f72043e7208e103825701e21a01ce9e2359059e8d"
+  },
+  "sdxl1-shipping-12881.json": {
+    "run": 12881,
+    "source": "outputs/varena-one-vertical/runs/v3/show-12-sdxl1.shipping.json",
+    "target": "paul/sdxl/generate@2.12.0",
+    "software": {
+      "attempt_ordinal": 1,
+      "runtime": "0.30.0+42de9c3e",
+      "tensord": "0.11.0",
+      "tensord_commit": "c72e13722dfe6af88d22d2cf8d210e61d360edd0",
+      "tensorfs": "0.13.0"
+    },
+    "show_sha256": "d5d28f537476415e06ef6bb7e7c55c567644eae86e15703069c46bf17cf9066f"
+  },
+  "h3ra5-failed-12916.json": {
+    "run": 12916,
+    "source": "outputs/varena-one-vertical/runs/v4/show-12-h3ra5.candidate.json",
+    "target": "paul/minimax-h3/ref2va@1.44.0",
+    "software": {
+      "attempt_ordinal": 1,
+      "runtime": "0.30.0+7d0abf75",
+      "tensord": "0.11.0+dev.g8f89a159",
+      "tensord_commit": "8f89a1591a9b9cb8b07e8b740387242c351527eb",
+      "tensorfs": "0.13.0"
+    },
+    "show_sha256": "fa8cb60890a869123580f354eabb1e6cdc6d78be2f6650ee6ce06d1432e321d7"
+  },
+  "hostmem-before.json": {
+    "run": 12910,
+    "source": "outputs/varena-one-vertical/diag/show.json",
+    "show_sha256": "62067505e4ee7eaa4669697966f1efb00bc25839768596f6d51c43e58b776707",
+    "note": "dmesg_oom dropped (unreadable on the pod)"
+  },
+  "hostmem-after.json": {
+    "run": 12920,
+    "source": "outputs/varena-one-vertical/diag/show2.json",
+    "show_sha256": "81fd37aa8aff07db0a265cd6d8445679aec85a47b40378f4fcdb13a7a4a4af05",
+    "note": "dmesg_oom dropped (unreadable on the pod)"
   }
 }

@@ -38,13 +38,13 @@ def varena(reads, capacity=3 * GB, w=int(2.5 * GB), prefetched=0):
 
 
 class Receipts(unittest.TestCase):
-    def record(self, value, cell, line="shipping", cap="24", state="completed landed"):
+    def record(self, value, cell, line="shipping", cap="24", state="completed landed", host=("", "")):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "run.json"
             path.write_text(json.dumps(value))
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
-                code = API["record"](path, cell, str(value["number"]), state, line, cap)
+                code = API["record"](path, cell, str(value["number"]), state, line, cap, *host)
             text = out.getvalue()
             (Path(directory) / "summary.txt").write_text(text)
             return code, text, API["receipts"](Path(directory) / "summary.txt")[0]
@@ -89,7 +89,7 @@ class Receipts(unittest.TestCase):
         code, text, _ = self.record(fixture("qwen4-12709"), "24-qwen4")
         self.assertEqual(code, 0, text)
         self.assertIn("parks=1", text)
-        self.assertIn("fill=h2d:3.91GB/s/19.7%,disk:1.72GB/s/50.9% ", text)  # each against its own ceiling
+        self.assertIn("fill=h2d:3.91GB/s/21.9%,disk:1.72GB/s/51.0% ", text)  # each against its own ceiling
         code, text, row = self.record(fixture("qwen4-12709"), "24-qwen4-warm.2")
         self.assertEqual(row.bar, "warm-oom-retries,store-in-warm")
 
@@ -144,6 +144,30 @@ class Receipts(unittest.TestCase):
         self.assertEqual((code, row.bar, row.moved, row.min), (0, "ok", 0.0, 0.0), text)
         self.assertIn("leftover=0 ", text)
 
+    def test_actual_cold_candidate_record_12872(self):
+        # S8's v3: SDXL 1 MP cold on varena-one at a 12 GiB limit; its store fills and per-step times.
+        code, text, row = self.record(fixture("sdxl1-candidate-12872"), "12-sdxl1", line="candidate", cap="12")
+        self.assertEqual((code, row.bar, row.moved, row.min), (0, "ok", 4.238, 4.238), text)
+        self.assertIn("fill=store:0.78GB/s/11.6% ", text)
+        self.assertIn("step_ms=denoise:20x258/1632 ", text)
+        self.assertEqual(row.steps, {"denoise": 258.0})
+
+    def test_shipping_disk_runs_without_a_ceiling_are_not_rated(self):
+        # TensorFS 0.13's shipping disk runs often record no ceiling (0); only the measured ones are rated.
+        code, text, _ = self.record(fixture("sdxl1-shipping-12881"), "12-sdxl1", cap="12")
+        self.assertEqual(code, 0, text)
+        self.assertIn("fill=h2d:8.69GB/s/35.7%,disk:1.96GB/s/6.6% ", text)
+
+    def test_a_failed_run_names_its_reason_and_the_host_oom_kills(self):
+        # S8's v4: the executor was SIGKILLed by the host's OOM killer; hostmem.py read 5 then 11 kills.
+        value = fixture("h3ra5-failed-12916")
+        host = (str(FIXTURES / "hostmem-before.json"), str(FIXTURES / "hostmem-after.json"))
+        code, text, row = self.record(value, "12-h3ra5", line="candidate", cap="12", state="failed landed", host=host)
+        self.assertEqual((code, row.bar), (1, "failed:executor_invalidated,host-oom-kill"), text)
+        self.assertIn("oom_kill=+6 ", text)
+        self.assertIn("reason=executor_invalidated: device executor ended", text)
+        self.assertIn("oom_kill=- ", self.record(value, "12-h3ra5", line="candidate", cap="12", state="failed landed")[1])
+
     def test_candidate_misplaced_evictions_fail(self):
         value = varena(["Tier", "Hit", "Hit"])
         stats = value["calls"][0]["measurements"]["memory"]["stats"]["varena"][0]["stats"]
@@ -162,6 +186,9 @@ class Receipts(unittest.TestCase):
         code, text = self.compare("".join(rows), ["shipping", "candidate"])
         self.assertEqual(code, 0, text)
         self.assertIn("exec 90.000 -> 89.000; moved 5.000 -> 0.000", text)
+        steps = [r.replace("bar=ok", "step_ms=denoise:8x8616/9896 bar=ok") for r in rows]
+        steps[3:] = [r.replace("8x8616", "8x8000") for r in steps[3:]]
+        self.assertIn("denoise/step 8616 -> 8000 ms", self.compare("".join(steps), ["shipping", "candidate"])[1])
         rows[3] = rows[3].replace("exec=88s", "exec=95s")
         code, text = self.compare("".join(rows), ["shipping", "candidate"])
         self.assertEqual(code, 1)
