@@ -9,6 +9,7 @@ import json
 import sys
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import msgspec
@@ -16,22 +17,32 @@ import msgspec
 from cozy_runtime import __version__
 from cozy_runtime.internal import arch, attention, calibrate, prebuilt, qualification, verify
 from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
-from cozy_runtime.internal.probe import qualify
+from cozy_runtime.internal.probe import Observation, cells, qualify
 
 
-def said(line: str) -> None:
-    """One progress line: the hand-run oracle's watch ends a run that stops printing them."""
-    print(f"PROGRESS {line}", flush=True)
+@dataclass(slots=True)
+class Progress:
+    """`PROGRESS <done>/<total> <what>` lines: the hand-run oracle reports them as the run's
+    progress, and its watch ends a run that stops printing them."""
 
+    total: int
+    done: int = 0
 
-def calibrated(one: calibrate.Measured) -> None:
-    runs = [c for c in one.candidates if c.warm_us]
-    best = min(runs, key=lambda c: c.warm_us[2], default=None)
-    said(
-        f"gemm {one.format} {one.m}x{one.n}x{one.k}: {len(one.candidates)} candidates, "
-        f"{sum(not c.ok for c in one.candidates)} failed, best "
-        f"{best.choice if best else '-'} {best.warm_us[2] if best else 0:.1f} us"
-    )
+    def said(self, line: str) -> None:
+        self.done += 1
+        print(f"PROGRESS {self.done}/{self.total} {line}", flush=True)
+
+    def decoded(self, one: Observation) -> None:
+        self.said(f"decode {one.implementation} {one.output_dtype} passed={one.evidence.passed}")
+
+    def calibrated(self, one: calibrate.Measured) -> None:
+        runs = [c for c in one.candidates if c.warm_us]
+        best = min(runs, key=lambda c: c.warm_us[2], default=None)
+        self.said(
+            f"gemm {one.format} {one.m}x{one.n}x{one.k}: {len(one.candidates)} candidates, "
+            f"{sum(not c.ok for c in one.candidates)} failed, best "
+            f"{best.choice if best else '-'} {best.warm_us[2] if best else 0:.1f} us"
+        )
 
 
 def main(argv: Sequence[str]) -> int:
@@ -43,18 +54,20 @@ def main(argv: Sequence[str]) -> int:
     cuda = device.kind == "cuda"
     family = arch.row(device.sm).family if cuda else ""
     provenance: dict[str, object] = {"device": device.document(), "runtime": runtime.document()}
+    providers = launch_providers()
+    progress = Progress(
+        len(list(cells(providers, dtypes))) + (calibrate.shapes(device.sm) if family else 0)
+    )
     calibrations: dict[str, calibrate.Calibration] = {}
     with verify.measuring() as verdicts:
         _, table = qualify(
             torch,
-            launch_providers(),
+            providers,
             device,
             dtypes,
             release=__version__,
             runtime=runtime,
-            progress=lambda one: said(
-                f"decode {one.implementation} {one.output_dtype} passed={one.evidence.passed}"
-            ),
+            progress=progress.decoded,
         )
         if cuda:
             # The exact prebuilt arm and available optional attention arms are explicit
@@ -63,7 +76,7 @@ def main(argv: Sequence[str]) -> int:
             if ops is not None:
                 provenance["card"] = calibrate.card(torch, device.index, device.sm).facts()
                 provenance["clocks_before"] = calibrate.clocks(device.index)
-                calibrations = calibrate.run(torch, ops, device.sm, progress=calibrated)
+                calibrations = calibrate.run(torch, ops, device.sm, progress=progress.calibrated)
                 provenance["clocks_after"] = calibrate.clocks(device.index)
             if device.sm == 90:
                 prebuilt.fa3(torch, device.index, device.sm)

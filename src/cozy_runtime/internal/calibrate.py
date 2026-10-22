@@ -11,10 +11,11 @@ family's table, the compiled family default, cuBLASLt, and the GEMV for a few in
   GEMV (which quantizes its rows itself), every code at a rounding tie flipping. A non-finite
   output fails before any ratio. The activation quantizer is held to its law: a code may differ
   only at a tie.
-- **Timing.** Candidates run interleaved, in a fresh random order each round: round 0 is each
-  one's cold first launch at the shape, then `REPS` warm rounds. A round is queued behind a
-  sleep, so the host never lets the device idle inside it. Every launch takes the pool's
-  least-recently-used operands, and the pool holds over twice the L2.
+- **Timing.** After its checked first call, each candidate runs interleaved with the others in
+  a fresh random order each round: one cold round (each one's first timed launch, on operands
+  the pool has since evicted), then `REPS` warm rounds, the quantizer and bf16 baselines among
+  them. A round is queued behind a sleep, so the host never lets the device idle inside it.
+  Every launch takes the pool's least-recently-used operands; the pool holds over twice the L2.
 - **Plausibility.** A rate above the card's 8-bit tensor peak or its DRAM peak is flagged and
   excluded from rules.
 - **Rules.** A workload rule (`verify.Rule`) holds for this card's SM-count bucket and a
@@ -74,8 +75,6 @@ DEFAULT = "default"
 BASELINES = ("quantize", "bf16")
 #: Out dtypes the lanes write (SDXL fp16, the others bf16); timing uses the first.
 DTYPES = ("bfloat16", "float16")
-#: The device-clock cycles of sleep that last kept a whole round queued (`_timed`).
-_SLEEP = [0]
 
 type Choice = int | str
 
@@ -96,7 +95,7 @@ class Candidate(msgspec.Struct):
     #: out dtype -> relative L2 against the exact product, and its budget
     rel_l2: dict[str, float] = {}
     budget: dict[str, float] = {}
-    #: the first launch at this shape: device and host microseconds
+    #: the first timed launch, on evicted operands (device us); the first call's host us
     cold_us: float = 0.0
     host_first_us: float = 0.0
     #: warm device microseconds: min, p25, median, p75, max; and every round's, in order
@@ -187,6 +186,13 @@ def clocks(index: int) -> str:
     return done.stdout.strip() or done.stderr.strip()
 
 
+def shapes(sm: int) -> int:
+    """How many GEMM shapes `run` measures on this card."""
+    found = msgspec.json.decode(SHAPES.read_bytes(), type=list[Shape])
+    formats = {f.name for f in (prebuilt.INT8, prebuilt.FP8) if getattr(arch.row(sm), f.name)}
+    return len({(one.format, one.m, one.n, one.k) for one in found if one.format in formats})
+
+
 def run(
     torch: ModuleType,
     ops: prebuilt.Prebuilt,
@@ -252,6 +258,8 @@ class _Pool:
 
     sets: list[_Set]
     turn: int = 0
+    #: device-clock cycles of sleep that last kept a whole round at this shape queued
+    sleep: int = 0
 
     def next(self) -> _Set:
         self.turn += 1
@@ -332,11 +340,14 @@ def _law(
     return Quantizer(float(steps.max()), int(differs.sum()), unexplained), ties
 
 
-def _timed(torch: ModuleType, launches: Sequence[Callable[[], object]], card: Card) -> list[float]:
+def _timed(
+    torch: ModuleType, launches: Sequence[Callable[[], bool]], card: Card, pool: _Pool
+) -> list[float] | None:
     """Device microseconds of each launch, the round queued behind a sleep: it reruns with a
-    doubled sleep until the sleep is still running once the host has queued it all, so no host
-    gap enters a measurement. The sleep that last sufficed is where the next round starts."""
-    cycles = _SLEEP[0]
+    longer sleep until the sleep is still running once the host has queued it all, so no host
+    gap enters a measurement. None, at once, when a launch did not run (it may have waited on
+    the device, so no sleep could stay ahead). The sleep that sufficed starts the shape's next
+    round."""
     while True:
         torch.cuda.synchronize()
         marks = [
@@ -345,54 +356,57 @@ def _timed(torch: ModuleType, launches: Sequence[Callable[[], object]], card: Ca
         ]
         slept = torch.cuda.Event()
         started = time.perf_counter()
-        torch.cuda._sleep(cycles)
+        torch.cuda._sleep(pool.sleep)
         slept.record()
+        ran = True
         for launch, (begin, end) in zip(launches, marks, strict=True):
             begin.record()
-            launch()
+            ran = launch() and ran
             end.record()
         queued = time.perf_counter() - started
         ahead = not slept.query()
         torch.cuda.synchronize()
+        if not ran:
+            return None
         if ahead:
-            _SLEEP[0] = cycles
             return [begin.elapsed_time(end) * 1e3 for begin, end in marks]
-        cycles = max(2 * cycles, int(2 * queued * card.clock_hz))
+        pool.sleep = max(2 * pool.sleep, int(2 * queued * card.clock_hz))
 
 
-@dataclass(slots=True)
-class _Round:
-    """One interleaved round: device and first-host microseconds, and why a candidate left."""
-
-    device: dict[Choice, float]
-    host: dict[Choice, float]
-    refused: dict[Choice, str]
-    failed: dict[Choice, str]
-
-
-def _round(
+def _measure(
     torch: ModuleType, card: Card, pool: _Pool, calls: dict[Choice, Callable[[_Set, str], object]],
-    order: Sequence[Choice],
-) -> _Round:  # fmt: skip
-    found = _Round({}, {}, {}, {})
+    choices: list[Choice], rng: random.Random, rounds: int, left: dict[Choice, str],
+) -> dict[Choice, list[float]]:  # fmt: skip
+    """`rounds` interleaved rounds of `choices`, each in a fresh random order. A candidate that
+    stops running leaves `choices` with its reason in `left`, and its round runs again
+    without it."""
+    samples: dict[Choice, list[float]] = defaultdict(list)
 
-    def launch(choice: Choice) -> Callable[[], None]:
-        def one() -> None:
-            started = time.perf_counter()
+    def launch(choice: Choice) -> Callable[[], bool]:
+        def one() -> bool:
             try:
                 calls[choice](pool.next(), DTYPES[0])
             except ValueError as refused:  # this tile or the GEMV does not take the shape
-                found.refused[choice] = f"not supported: {refused}"[:200]
+                left[choice] = f"not supported: {refused}"[:200]
             except torch.cuda.OutOfMemoryError:
-                found.refused[choice] = "out of memory on this card"
+                left[choice] = "out of memory on this card"
             except Exception as exc:  # a kernel that raises is wrong, never skipped
-                found.failed[choice] = f"{type(exc).__name__}: {exc}"[:200]
-            found.host.setdefault(choice, (time.perf_counter() - started) * 1e6)
+                left[choice] = f"failed: {type(exc).__name__}: {exc}"[:200]
+            return choice not in left
 
         return one
 
-    found.device = dict(zip(order, _timed(torch, [launch(c) for c in order], card), strict=True))
-    return found
+    done = 0
+    while done < rounds:
+        order = rng.sample(choices, len(choices))
+        found = _timed(torch, [launch(c) for c in order], card, pool)
+        if found is None:
+            choices[:] = [c for c in choices if c not in left]
+            continue
+        for choice, us in zip(order, found, strict=True):
+            samples[choice].append(round(us, 3))
+        done += 1
+    return samples
 
 
 def _shape(
@@ -422,43 +436,42 @@ def _shape(
     if not f.fp8 and m <= _kernels._gemm.GEMV_ROWS:
         calls[verify.GEMV] = partial(_gemv, ops)
         # The GEMV quantizes its rows itself: at a tie its code may be the other one.
-        flips = (ties.double() @ first.data.double().abs().t()) * first.scales[rows].double()[
-            :, None
-        ]
-        allowance = float((flips * first.scale.double()).norm() / exact.norm())
-        budgets[verify.GEMV] = {name: value + 2 * allowance for name, value in budget.items()}
+        flips = ties.double() @ first.data.double().abs().t()
+        flips = flips * first.scales[rows].double()[:, None] * first.scale.double()
+        budgets[verify.GEMV] = {
+            name: value + 2 * float(flips.norm() / exact.norm()) for name, value in budget.items()
+        }
+    # The first call of each: refused, raised, or checked in both dtypes before any timing.
+    candidates = {c: _checked(torch, c, calls[c], first, rows, exact, budgets[c]) for c in calls}
+    alive = [c for c, found in candidates.items() if found.ok and not found.note]
+    left: dict[Choice, str] = {}
+    # Cold: each one's first timed launch here, on operands the pool has since evicted.
+    cold = _measure(torch, card, pool, calls, alive, rng, 1, left)
     quantize = ops.fp8_quantize if f.fp8 else ops.int8_quantize
     weights = [one.data.to(torch.bfloat16) for one in pool.sets[: max(2, len(pool.sets) // 2)]]
-    baselines: dict[Choice, Callable[[_Set, str], object]] = {
+    everything: dict[Choice, Callable[[_Set, str], object]] = {
+        **calls,
         "quantize": lambda one, dtype: quantize(one.x),
         "bf16": lambda one, dtype: torch.nn.functional.linear(
             one.x, weights[pool.turn % len(weights)], one.bias
         ),
     }
-    choices = list(calls)
-    cold = _round(torch, card, pool, calls, rng.sample(choices, len(choices)))
-    candidates = {
-        c: _checked(torch, c, calls[c], cold, first, rows, exact, budgets[c]) for c in choices
-    }
-    alive = [c for c, found in candidates.items() if found.ok and not found.note]
-    samples: dict[Choice, list[float]] = defaultdict(list)
-    everything = {**calls, **baselines}
-    for _ in range(REPS):
-        order = rng.sample([*alive, *BASELINES], len(alive) + len(BASELINES))
-        warm = _round(torch, card, pool, everything, order)
-        for choice, why in {**warm.refused, **warm.failed}.items():
-            if choice not in candidates:
-                raise RuntimeError(f"the {choice} baseline did not run: {why}")
-            candidates[choice].ok, candidates[choice].note = choice in warm.refused, why
-            alive.remove(choice)
-        for choice, us in warm.device.items():
-            samples[choice].append(round(us, 3))
-    for choice in alive:
-        _rates(candidates[choice], samples[choice], card, m, n, k)
+    warm = _measure(torch, card, pool, everything, [*alive, *BASELINES], rng, REPS, left)
+    if any(baseline in left for baseline in BASELINES):
+        raise RuntimeError(f"a baseline did not run: {left}")
+    for choice, found in candidates.items():
+        if choice in left:
+            found.ok, found.note = (
+                left[choice].startswith(("not supported", "out of")),
+                left[choice],
+            )
+        elif choice in alive:
+            found.cold_us = cold[choice][0]
+            _rates(found, warm[choice], card, m, n, k)
     return Measured(
         f.name, m, n, k, verify.shape_class(n, k), sum(one.layers for one in rows_of),
         sorted(f"{one.model}/{one.lane} x{one.layers}" for one in rows_of), len(pool.sets), seed,
-        quantizer, statistics.median(samples["quantize"]), statistics.median(samples["bf16"]),
+        quantizer, statistics.median(warm["quantize"]), statistics.median(warm["bf16"]),
         list(candidates.values()),
     )  # fmt: skip
 
@@ -476,21 +489,24 @@ def _gemv(ops: prebuilt.Prebuilt, one: _Set, dtype: str) -> Tensor:
 
 
 def _checked(
-    torch: ModuleType, choice: Choice, call: Callable[[_Set, str], object], cold: _Round,
-    first: _Set, rows: Tensor, exact: Tensor, budget: dict[str, float],
+    torch: ModuleType, choice: Choice, call: Callable[[_Set, str], object], first: _Set,
+    rows: Tensor, exact: Tensor, budget: dict[str, float],
 ) -> Candidate:  # fmt: skip
-    """A candidate after its cold launch: refused (not taken, ok), raised (failed), or its bf16
-    and fp16 outputs on the reference operands checked."""
-    if choice in cold.refused:
-        return Candidate(choice, True, note=cold.refused[choice])
-    found = Candidate(choice, False, {}, budget, cold.device[choice], cold.host[choice])
-    if choice in cold.failed:
-        found.note = cold.failed[choice]
-        return found
+    """A candidate's first calls at a shape, on the reference operands: refused (not taken,
+    ok), raised (failed), or its bf16 and fp16 outputs checked against the exact product."""
+    found = Candidate(choice, False, {}, budget)
+    started = time.perf_counter()
     try:
-        outputs = [call(first, dtype) for dtype in DTYPES]
-    except Exception as exc:
-        found.note = f"{type(exc).__name__}: {exc}"[:200]
+        outputs = [call(first, DTYPES[0])]
+        found.host_first_us = (time.perf_counter() - started) * 1e6
+        outputs.append(call(first, DTYPES[1]))
+    except ValueError as refused:  # this tile or the GEMV does not take the shape
+        return Candidate(choice, True, note=f"not supported: {refused}"[:200])
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        return Candidate(choice, True, note="out of memory on this card")
+    except Exception as exc:  # a kernel that raises is wrong, never skipped
+        found.note = f"failed: {type(exc).__name__}: {exc}"[:200]
         return found
     errors = {
         name: verify.error(torch, out[rows], exact)  # type: ignore[index]

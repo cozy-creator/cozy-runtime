@@ -94,6 +94,12 @@ def main(
             log.write(line)
             log.flush()
             ctx.log(line.rstrip()[:400], level="warn")
+            # `PROGRESS <done>/<total> <what>`: the run's progress, which the machine's stall
+            # watch reads besides the device's own activity.
+            head, _, what = line.removeprefix("PROGRESS ").partition(" ")
+            done, _, total = head.partition("/")
+            if line.startswith("PROGRESS ") and done.isdigit() and total.isdigit():
+                ctx.progress(int(done) / int(total), stage=what.strip()[:80])
     manifest["exit_code"] = child.returncode
     (results / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     ctx.log(f"ORACLE exit={child.returncode} runtime={runtime_sha[:16]}", level="warn")
