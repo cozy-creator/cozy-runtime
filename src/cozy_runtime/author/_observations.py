@@ -51,7 +51,7 @@ import time
 from collections import deque
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Protocol
 
 from cozy_runtime.author._errors import CapabilityError
 
@@ -302,6 +302,22 @@ class EventRing:
 # --------------------------------------------------------------------------- attribution
 
 
+class DeviceClock(Protocol):
+    """The GPU's side of a step: a mark the device passes when the work queued before it is
+    done (a CUDA event, recorded without waiting), and the device time between two marks,
+    read once the device passed both (at the attempt's end, when its streams are idle)."""
+
+    def mark(self) -> object: ...
+    def between(self, start: object, end: object) -> float: ...
+
+
+#: The device clock the executor installs where a GPU runs the attempt (empty: host only).
+#: Steps on the host may run ahead of the device (a replayed graph returns at once), so a
+#: step's host time is when it was queued and its device time is when it ran (v8c: 35 ms
+#: queued against 157 ms run per step, the rest surfacing at the first sync after the loop).
+DEVICE: list[DeviceClock] = []
+
+
 @dataclass(slots=True)
 class Track:
     """One named span's timing and wall bounds. A step track also keeps a bounded series of
@@ -317,6 +333,8 @@ class Track:
     ended_unix_ms: int = 0
     series: list[tuple[int, float]] | None = None
     series_dropped: int = 0
+    #: a step track's device marks around each step (its device time, read at the end)
+    marks: list[tuple[object, object]] | None = None
 
     def add(self, ms: float) -> None:
         end = time.time() * 1000
@@ -352,6 +370,15 @@ class Track:
         if self.series is not None:
             document["series"] = [[end, ms] for end, ms in self.series]
             document["series_dropped"] = self.series_dropped
+        if self.marks and DEVICE:
+            device = [round(DEVICE[0].between(a, b), 3) for a, b in self.marks]
+            document["device"] = {
+                "count": len(device),
+                "total_ms": round(sum(device), 3),
+                "mean_ms": round(sum(device) / len(device), 3),
+                "max_ms": max(device),
+                "series": device,
+            }
         return document
 
 
@@ -372,8 +399,14 @@ class Attribution:
     def stage(self, name: str, ms: float) -> None:
         self._track(self.stages, name).add(ms)
 
-    def step(self, name: str, ms: float) -> None:
-        self._track(self.steps, name, series=True).add(ms)
+    def step(self, name: str, ms: float, marks: tuple[object, object] | None = None) -> None:
+        track = self._track(self.steps, name, series=True)
+        track.add(ms)
+        if marks is not None:
+            if track.marks is None:
+                track.marks = []
+            if len(track.marks) < MAX_SERIES:
+                track.marks.append(marks)
 
     def _track(self, book: dict[str, Track], name: str, *, series: bool = False) -> Track:
         track = book.get(name)

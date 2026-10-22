@@ -24,6 +24,7 @@ from cozy_runtime.internal.executor_replies import Allocator, Ceiling, GpuMemory
 from cozy_runtime.internal.executor_replies import Stats as Record
 
 __all__ = [
+    "Steps",
     "agreed",
     "attend",
     "collective",
@@ -47,6 +48,21 @@ def install(module: nn.Module) -> None:
         if path not in blocks:
             catch.wrap(child, path)
     catch.wrap(module, "model", agree.passing)
+
+
+class Steps:
+    """The device's step clock (`author._observations.DEVICE`): a CUDA event recorded on the
+    current stream at each step, the device time between two read once it passed both."""
+
+    def mark(self) -> object:
+        event = torch.cuda.Event(enable_timing=True)  # type: ignore[no-untyped-call]
+        event.record()
+        return event
+
+    def between(self, start: object, end: object) -> float:
+        assert isinstance(start, torch.cuda.Event) and isinstance(end, torch.cuda.Event)
+        end.synchronize()  # read at the attempt's end: its streams are idle already
+        return float(start.elapsed_time(end))
 
 
 def record(

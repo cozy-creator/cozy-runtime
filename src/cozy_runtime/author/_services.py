@@ -50,7 +50,7 @@ from cozy_runtime.author._decode import (
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
 from cozy_runtime.author._executor_requests import Publish, Published, PublishPart
-from cozy_runtime.author._observations import Attribution, EventRing, Observation, Scalar
+from cozy_runtime.author._observations import DEVICE, Attribution, EventRing, Observation, Scalar
 
 T = TypeVar("T")
 S = TypeVar("S")
@@ -182,6 +182,8 @@ class Attempt:
     metrics_dropped: int = 0
     _counter: int = 0
     _step_mark: float = 0.0
+    #: the device's mark at the previous step (`DEVICE`), when a GPU runs the attempt
+    _step_device: object = None
     #: Sends one publish to the worker, which journals it on the run's output log. None in a
     #: harness with no worker: `published` then records what would have been shown.
     publish: Callable[[Publish], Published] | None = None
@@ -1231,6 +1233,8 @@ class Telemetry(_Bound):
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
         attempt._step_mark = work_clock()
+        clock = DEVICE[0] if DEVICE else None
+        attempt._step_device = clock.mark() if clock is not None else None
         capture = _capture_clock.get()
         if capture is not None:
             capture.schedule(total)
@@ -1239,9 +1243,11 @@ class Telemetry(_Bound):
             self._ctx.raise_if_cancelled()
             now = work_clock()
             mark = attempt._step_mark
+            ran = clock.mark() if clock is not None else None
             if mark and name is not None:
-                attempt.attribution.step(name, (now - mark) * 1000)
-            attempt._step_mark = now
+                marks = (attempt._step_device, ran) if ran is not None else None
+                attempt.attribution.step(name, (now - mark) * 1000, marks)
+            attempt._step_mark, attempt._step_device = now, ran
             step_ms = (now - mark) * 1000 if mark else 0.0
             if (
                 name is None

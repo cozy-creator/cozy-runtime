@@ -8,12 +8,12 @@ import sys
 import threading
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 import pytest
 
-from cozy_runtime.author._observations import MAX_SERIES, Attribution, EventRing
+from cozy_runtime.author._observations import DEVICE, MAX_SERIES, Attribution, EventRing
 from cozy_runtime.internal import execution_evidence, package_interface
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.executor import _SEALED, Executor, _send_reply
@@ -259,6 +259,46 @@ def test_a_long_schedule_keeps_a_bounded_series_and_counts_the_rest() -> None:
         3,
         MAX_SERIES + 3,
     )
+
+
+class _Queued:
+    """A device that runs each step for 4 ms whatever the host's pace: its marks are when
+    each step's work would end, as a CUDA event's would."""
+
+    def __init__(self) -> None:
+        self.at = 0.0
+
+    def mark(self) -> object:
+        self.at += 4.0
+        return self.at
+
+    def between(self, start: object, end: object) -> float:
+        return float(cast("float", end) - cast("float", start))
+
+
+def test_a_step_reports_the_device_time_beside_the_host_s() -> None:
+    """v8c: replayed graphs return at once, so the host queues a step in 35 ms while the
+    device runs it in 157; a step track carries both."""
+    clock = _Queued()
+    DEVICE[:] = [clock]
+    try:
+        attribution = Attribution()
+        before = clock.mark()
+        for _ in range(3):
+            ran = clock.mark()
+            attribution.step("denoise", 1.0, (before, ran))
+            before = ran
+        track: Any = attribution.document()["steps"]["denoise"]
+    finally:
+        DEVICE.clear()
+    assert track["mean_ms"] == 1.0
+    assert track["device"] == {
+        "count": 3,
+        "total_ms": 12.0,
+        "mean_ms": 4.0,
+        "max_ms": 4.0,
+        "series": [4.0, 4.0, 4.0],
+    }
 
 
 def test_a_live_row_carries_the_sequence_the_worker_deduplicates_by() -> None:
