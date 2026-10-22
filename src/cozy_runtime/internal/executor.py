@@ -3590,10 +3590,9 @@ class Executor:
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
         """`gemm.selected`: per component and leaf provider, the kernel its installed leaves serve
-        now (read once a run, never per call). `gemm.family_default`: one serving its family's
-        default kernel, no offline verdict refining it. `gemm.fallback`: each that serves below
-        what its lane wanted, and why, also said as a warning line (a machine before TensorD
-        keeps `gemm.*` drops the fact)."""
+        now (read once a run, never per call). `gemm.fallback`: each that serves below what its
+        lane wanted, and why, also said as a warning line (a machine before TensorD keeps
+        `gemm.*` drops the fact)."""
 
         def fallback(value: str, **fields: Any) -> None:
             record.emit("confession", "gemm.fallback", value, **fields)
@@ -3609,9 +3608,6 @@ class Executor:
             kernel, form = serving(leaf, index), FORMATS[leaf]
             fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
-            default = prebuilt.DEFAULTED.get((sm, form))
-            if default and kernel == native.get(form):
-                record.emit("confession", "gemm.family_default", kernel, reason=default, **fields)
             wanted = native.get(form, kernel)
             reason = prebuilt.lost(form, sm) or (missing[0].reason if missing else "")
             if reason and kernel != wanted:
