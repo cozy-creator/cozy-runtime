@@ -1206,7 +1206,7 @@
  ],
  "runtime": {
   "release": "0.0.36",
-  "source_digest": "sha256:ecd04cd2d3d1640415a30c5edf3e208bf952dff8495b3da2cf1be5b962c20c23",
+  "commit": "unknown",
   "torch_build": "2.13.0+cu130"
  },
  "runtime_release": "0.0.36",

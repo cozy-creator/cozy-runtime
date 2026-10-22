@@ -26,7 +26,7 @@ def test_the_recorded_observation_is_a_real_measured_probe() -> None:
         89,
         "cuda",
     )
-    assert result.runtime.source_digest.startswith("sha256:")
+    assert result.runtime.commit == "unknown"  # recorded before builds stamped provenance
     assert result.runtime.torch_build.startswith("2.")
     assert len(result.observations) == 27
     assert sum(1 for o in result.observations if o.evidence.passed) == 19

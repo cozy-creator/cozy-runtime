@@ -818,7 +818,7 @@
  ],
  "runtime": {
   "release": "0.24.4",
-  "source_digest": "sha256:92dff6b23eaae91e97b8a00ad2764e77ec64ba3cac273f0a2b680546fff7b180",
+  "commit": "unknown",
   "torch_build": "2.14.0+cu130"
  },
  "runtime_release": "0.24.4",

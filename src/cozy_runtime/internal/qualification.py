@@ -47,7 +47,7 @@ TABLE_DTYPES = ("bfloat16", "float16", "float32")
 SHIPPED = Path(__file__).resolve().parent / "qualification_tables"
 
 #: Bumped when a table's MEANING changes in a way its name does not catch.
-TABLE_FORMAT = 3
+TABLE_FORMAT = 4
 
 #: Native leaves whose lane is one tensor-core format: on a card whose row has it, the family's
 #: default GEMM serves where no offline verdict refines the choice (prebuilt, else cuBLASLt).
@@ -82,11 +82,10 @@ class Qualification:
 
 
 def table_name(device: DeviceFacts, runtime: RuntimeIdentity) -> str:
-    """What a table answers for: the card architecture, torch's minor version and the source
-    of every decode, leaf, oracle and admission rule."""
+    """What a table answers for: the card architecture and torch's minor version. Each
+    observation is matched by its implementation's own identity (`implementation_digest`)."""
     minor = ".".join(runtime.torch_build.split("+")[0].split(".")[:2])
-    digest = runtime.source_digest.removeprefix("sha256:")[:16]
-    return f"{device.predicate}-torch{minor}-{digest}-v{TABLE_FORMAT}"
+    return f"{device.predicate}-torch{minor}-v{TABLE_FORMAT}"
 
 
 def _cell(one: Observation) -> tuple[str, str, str]:

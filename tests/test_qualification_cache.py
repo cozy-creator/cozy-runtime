@@ -112,8 +112,11 @@ def test_stale_and_partial_tables_keep_only_their_actual_offline_facts(
 ) -> None:
     table = offline[3]
     ship(tmp_path, table)
-    stale = dataclasses.replace(offline[2], source_digest="sha256:" + "0" * 64)
-    assert load(offline, tmp_path, runtime=stale).source == "supported"
+    other_torch = dataclasses.replace(offline[2], torch_build="2.99.0+cu130")
+    assert load(offline, tmp_path, runtime=other_torch).source == "supported"
+    # Another Runtime build with the same implementations keeps every fact.
+    rebuilt = dataclasses.replace(offline[2], commit="another-commit")
+    assert load(offline, tmp_path, runtime=rebuilt).source == "shipped"
     # A valid partial table retains its facts; another destination uses the declared decoder.
     result = load(offline, tmp_path, dtypes=("float32", "float16"))
     assert result.source == "shipped"

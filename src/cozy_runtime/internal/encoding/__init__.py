@@ -32,7 +32,6 @@ from cozy_runtime.internal.encoding.leaves import (
     RowwiseNativeLeaf,
 )
 from cozy_runtime.internal.encoding.selection import (
-    IDENTITY_SOURCES,
     NAMED_SEAMS,
     OBJECTIVE_AXIS,
     Capabilities,
@@ -49,12 +48,10 @@ from cozy_runtime.internal.encoding.selection import (
     launch_providers,
     measure_device,
     measure_runtime,
-    runtime_source_digest,
 )
 
 __all__ = [
     "E4M3_MAX",
-    "IDENTITY_SOURCES",
     "NAMED_SEAMS",
     "OBJECTIVE_AXIS",
     "PLAIN",
@@ -91,5 +88,4 @@ __all__ = [
     "measure_runtime",
     "params_of",
     "refuse",
-    "runtime_source_digest",
 ]

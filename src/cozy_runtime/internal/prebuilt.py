@@ -13,12 +13,14 @@ cuBLASLt's by design. `torch` is the torch module: this module imports no torch.
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from functools import partial
+from functools import lru_cache, partial
 from importlib import metadata
+from pathlib import Path
 from types import ModuleType
 
 from cozy_runtime import _kernels
@@ -57,6 +59,8 @@ class Prebuilt:
     family: str
     #: whether the wheel carries a CUTLASS fp8 GEMM for this card
     cutlass_fp8: bool
+    #: format -> the shipped workload rules refining the family default (`verify.rules`)
+    rules: dict[str, tuple[verify.Rule, ...]] = field(default_factory=dict)
     _scratch: Callable[[int], Tensor] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -68,20 +72,48 @@ class Prebuilt:
     ) -> Tensor:
         flat = self._rows(INT8, x)
         rows, width = flat.shape
-        bias = self._weight(INT8, data, scale, bias, width, out_dtype)
         shape = (*x.shape[:-1], data.shape[0])
-        if rows <= _kernels._gemm.GEMV_ROWS:
-            out = self.torch.empty(shape, dtype=out_dtype, device=x.device)
-            code = 0 if rows == 0 else _kernels._gemm.gemv(
-                self.index, flat.data_ptr(), self._half(flat.dtype), data.data_ptr(),
-                scale.data_ptr(), _ptr(bias), out.data_ptr(), self._half(out_dtype), rows,
-                data.shape[0], width, self._stream(),
-            )  # fmt: skip
-            if code != _kernels._gemm.NOT_SUPPORTED:
-                self._check(code, "the GEMV")
-                return out
+        if rows <= _kernels._gemm.GEMV_ROWS and self.choice(INT8, rows, data.shape[0], width) in (
+            None,
+            verify.GEMV,
+        ):
+            out = self.int8_gemv(flat, data, scale, bias, out_dtype)
+            if out is not None:
+                return out.view(shape)
         q, scales = self.int8_quantize(flat)
         return self.int8_gemm(q, scales, data, scale, bias, out_dtype).view(shape)
+
+    def int8_gemv(
+        self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: object
+    ) -> Tensor | None:
+        """The one-launch GEMV (it rotates and quantizes `x`'s few rows itself), or None
+        where it does not take the shape."""
+        flat = self._rows(INT8, x)
+        rows, width = flat.shape
+        bias = self._weight(INT8, data, scale, bias, width, out_dtype)
+        out = self.torch.empty(rows, data.shape[0], dtype=out_dtype, device=x.device)
+        code = 0 if rows == 0 else _kernels._gemm.gemv(
+            self.index, flat.data_ptr(), self._half(flat.dtype), data.data_ptr(),
+            scale.data_ptr(), _ptr(bias), out.data_ptr(), self._half(out_dtype), rows,
+            data.shape[0], width, self._stream(),
+        )  # fmt: skip
+        if code == _kernels._gemm.NOT_SUPPORTED:
+            return None
+        self._check(code, "the GEMV")
+        return out
+
+    def choice(self, f: _Format, rows: int, n: int, k: int) -> int | str | None:
+        """The shipped rule's kernel for an `f` GEMM of this shape, or None: the family
+        default (`_gemm.gemm`'s compiled choice) serves."""
+        kind = verify.shape_class(n, k)
+        return next(
+            (
+                rule.choice
+                for rule in self.rules.get(f.name, ())
+                if rule.shape == kind and rule.m_min < rows <= rule.m_max
+            ),
+            None,
+        )
 
     def fp8_linear(
         self, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None, out_dtype: object
@@ -120,7 +152,7 @@ class Prebuilt:
         scale: Tensor,
         bias: Tensor | None,
         out_dtype: object,
-        config: int = -1,
+        config: int | str = -1,
     ) -> Tensor:
         return self._gemm(INT8, q, scales, data, scale, bias, out_dtype, config)
 
@@ -132,7 +164,7 @@ class Prebuilt:
         scale: Tensor,
         bias: Tensor | None,
         out_dtype: object,
-        config: int = -1,
+        config: int | str = -1,
     ) -> Tensor:
         return self._gemm(FP8, q, scales, data, scale, bias, out_dtype, config)
 
@@ -174,7 +206,7 @@ class Prebuilt:
         scale: Tensor,
         bias: Tensor | None,
         out_dtype: object,
-        config: int,
+        config: int | str,
     ) -> Tensor:
         torch = self.torch
         want = torch.float8_e4m3fn if f.fp8 else torch.int8
@@ -187,23 +219,26 @@ class Prebuilt:
         out = torch.empty(rows, data.shape[0], dtype=out_dtype, device=q.device)
         if rows == 0:
             return out
+        # -1: the shipped rule, else the family default; a tile or CUBLASLT: exactly that.
+        strict = config != -1
+        choice = config if strict else self.choice(f, rows, data.shape[0], width)
+        native = choice != verify.CUBLASLT and (not f.fp8 or self.cutlass_fp8)
         code = _kernels._gemm.NOT_SUPPORTED
-        if not f.fp8 or self.cutlass_fp8:
+        if native:
             code = _kernels._gemm.gemm(
                 self.index, FAMILIES.index(self.family), f.fp8, q.data_ptr(), scales.data_ptr(),
                 data.data_ptr(), scale.data_ptr(), _ptr(bias), out.data_ptr(),
-                self._half(out_dtype), rows, data.shape[0], width, config,
+                self._half(out_dtype), rows, data.shape[0], width,
+                choice if isinstance(choice, int) else -1,
                 None if f.fp8 else self._scratch, self._stream(),
             )  # fmt: skip
         if code == 0:
             return out
         if code != _kernels._gemm.NOT_SUPPORTED:
             self._check(code, "the GEMM")
-        if config >= 0:
+        if strict and native:
             raise ValueError(f"{f.name}_gemm: config {config} cannot take {rows}x{width}")
-        if f.fp8 and not self.cutlass_fp8:
-            pass  # cuBLASLt is this card's fp8 GEMM
-        elif f.name not in _SAID:
+        if native and f.name not in _SAID:
             _SAID.add(f.name)
             print(f"[{f.name}] the prebuilt GEMM did not run (M={rows} N={data.shape[0]} "
                   f"K={width}); cuBLASLt serves such calls", file=sys.stderr)  # fmt: skip
@@ -295,24 +330,43 @@ def _stride(t: Tensor | None) -> int:
 
 
 def artifact(module: str = "_gemm") -> str:
-    """A kernel module's digest, as cozy-runtime's RECORD has it, or its loaded file's for a source
-    checkout's build (no RECORD names it): a verdict never outlives the bytes it judged."""
+    """A kernel module's digest, as cozy-runtime's RECORD has it, or "" where none loaded: a
+    verdict never outlives the bytes it judged."""
+    loaded = getattr(_kernels, module, None)
+    if loaded is None or not loaded.__file__:
+        return ""
+    return _recorded(Path(loaded.__file__))
+
+
+def kernel_identity(name: str, module: str = "_gemm") -> verify.Kernel:
+    """`name`'s identity in `module`: its binary's digest and its declared interface's (the
+    module's `.pyi` stub, which every change to the native signature edits)."""
+    stub = Path(_kernels.__file__).with_name(f"{module}.pyi")
+    return verify.Kernel(name, artifact(module), _recorded(stub) if stub.exists() else "")
+
+
+@lru_cache(maxsize=16)
+def _recorded(file: Path) -> str:
+    """`file`'s digest in RECORD's own form (sha256, urlsafe base64): the installed wheel's
+    RECORD line, else the file's bytes (a source checkout's build), so both spell one kernel the
+    same way and the release gate can read it from the wheel without loading CUDA."""
     try:
         files = metadata.distribution("cozy-runtime").files or []
     except metadata.PackageNotFoundError:
         files = []
-    path = f"cozy_runtime/_kernels/{module}."
     found = next(
-        (f for f in files if str(f).startswith(path) and f.suffix in (".so", ".pyd") and f.hash),
+        (
+            f
+            for f in files
+            if f.hash and f.name == file.name and Path(f.locate()).resolve() == file.resolve()
+        ),
         None,
     )
     if found and found.hash:
         return f"{found.hash.mode}:{found.hash.value}"
-    loaded = getattr(_kernels, module, None)
-    if loaded is None or not loaded.__file__:
-        return ""
-    with open(loaded.__file__, "rb") as stream:
-        return f"sha256:{hashlib.file_digest(stream, 'sha256').hexdigest()}"
+    with file.open("rb") as stream:
+        raw = hashlib.file_digest(stream, "sha256").digest()
+    return "sha256:" + base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
 
 
 #: The attention kernels the wheel serves, by candidate name (`attention.KERNELS`).
@@ -369,17 +423,23 @@ DEFAULTED: dict[tuple[int, str], str] = {}
 
 
 def admission(torch: ModuleType, ops: Prebuilt, f: _Format, family: str, sm: int) -> verify.Verdict:
-    """A format's GEMM on this card: its shipped verdict refines the family's kernel; with none,
-    the family default serves (a verdict never decides whether a lane runs)."""
-    kernel = f"{KERNELS[f.name]}-{family.replace('.', '')}"
+    """A format's GEMM on this card: its shipped verdict and workload rules refine the family's
+    kernel; with none, the family default serves (a verdict never decides whether a lane runs)."""
+    identity = gemm_kernel(f.name, family)
     if verify.in_oracle():
-        return verify.measured(kernel, artifact(), sm, partial(probe, torch, ops, f))
-    found = verify.shipped(kernel, artifact(), sm)
+        return verify.measured(identity, sm, partial(probe, torch, ops, f))
+    found = verify.shipped(identity, sm)
     if found is not None:
+        ops.rules[f.name] = verify.rules(identity, sm)
         return found
-    said = f"no offline verdict for {kernel} on sm{sm}: the {family} family default serves"
+    said = f"no offline verdict for {identity.name} on sm{sm}: the {family} family default serves"
     DEFAULTED[sm, f.name] = said
     return verify.Verdict(True, said)
+
+
+def gemm_kernel(f: str, family: str) -> verify.Kernel:
+    """The 8-bit GEMM `f` of `family` in the loaded `_gemm` (`KERNELS`)."""
+    return kernel_identity(f"{KERNELS[f]}-{family.replace('.', '')}")
 
 
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
@@ -516,7 +576,7 @@ def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None,
 
     pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16")]
     probe = partial(attention_probe, torch, index, call, True, pairs, True)
-    verdict = verify.admitted("prebuilt-fa3", artifact("_fa3"), sm, probe)
+    verdict = verify.admitted(kernel_identity("prebuilt-fa3", "_fa3"), sm, probe)
     return (kernel if verdict.ok else None), verdict.detail
 
 

@@ -108,6 +108,9 @@ jobs:
       - name: Verify wheel selection
         working-directory: source
         run: uv run --script scripts/verify-wheels.py --dist dist
+      - name: Shipped offline kernel facts bind to the built kernels
+        working-directory: source
+        run: uv run --script scripts/verify-verdicts.py --dist dist
       # cr-095: a release silently missing a platform file is refused.
       # Everything visible in dist/ is uploaded, so the set is exact; the digests travel to
       # `publish` outside the artifact.

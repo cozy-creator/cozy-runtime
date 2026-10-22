@@ -1,7 +1,7 @@
 """A release gate's qualification table: `python -m cozy_runtime.cli.qualify <dir>` measures
 the decode suite on this process's first card over `qualification.TABLE_DTYPES` and writes its
-table into `<dir>` (the source tree's `qualification.SHIPPED`), replacing the stale tables of
-the same card architecture and torch minor."""
+table and its kernel verdicts into `<dir>` (the source tree's `qualification.SHIPPED`), replacing
+that card architecture's."""
 
 from __future__ import annotations
 
@@ -39,10 +39,9 @@ def main(argv: Sequence[str]) -> int:
 
     directory, name = Path(argv[0]), qualification.table_name(device, runtime)
     directory.mkdir(parents=True, exist_ok=True)
-    for stale in directory.glob(f"{name.rsplit('-', 2)[0]}-*.json"):
-        stale.unlink()
     qualification.write_table(directory / f"{name}.json", table)
-    kernel_tables = verify.publish(directory, verdicts)
+    provenance = {"device": device.document(), "runtime": runtime.document()}
+    kernels = verify.publish(directory, device.sm, verdicts, {}, provenance, None)
     passed = sum(one.evidence.passed for one in table.observations)
     print(
         json.dumps(
@@ -50,7 +49,7 @@ def main(argv: Sequence[str]) -> int:
                 "table": name,
                 "observations": len(table.observations),
                 "passed": passed,
-                "kernel_tables": [p.name for p in kernel_tables],
+                "kernels": kernels.name,
             }
         )
     )

@@ -509,8 +509,10 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
     # Bind the loaded wrapper/extension, including environment-provided packages. Recipe
     # names and an empty "environment" key cannot borrow another binary's measurements.
     implementation = import_module(candidate.import_name.split(".")[0])
-    key = verify.implementation_artifact(implementation)
-    verdict = verify.admitted(f"attention-{candidate.name}", key, device.sm, probe)
+    identity = verify.Kernel(
+        f"attention-{candidate.name}", verify.implementation_artifact(implementation)
+    )
+    verdict = verify.admitted(identity, device.sm, probe)
     if not verdict.ok:
         raise AttentionRefusal(
             "attention_kernel_failed_verification",

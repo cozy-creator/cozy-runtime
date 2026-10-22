@@ -33,6 +33,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, NoReturn
 
+from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.internal import accel, canonical
 from cozy_runtime.internal.encoding.adapters import CoreDequant
 from cozy_runtime.internal.encoding.comfy import ComfyDequant
@@ -224,72 +225,22 @@ def device_line(device: DeviceFacts) -> str:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeIdentity:
-    """WHAT WAS RUNNING when a measurement was taken (#549.9).
-
-    A capability record is a claim about an implementation on a device. Both halves have an
-    identity and only the device half had one: two runtime builds with different arithmetic
-    in `encoding/` produced records that were indistinguishable and therefore interchangeable.
-
-    `source_digest` covers encoding/probe sources and the installed native backend's bytes,
-    platform and loadability. Pure and native wheels cannot share fast-kernel facts. Tables
-    themselves are excluded, so packaging measured facts leaves their implementation key
-    unchanged.
-    """
+    """WHAT WAS RUNNING when a measurement was taken (#549.9): provenance on every table and
+    record. Facts are matched by each implementation's own identity (`implementation_digest`,
+    `verify.Kernel`), never by this."""
 
     release: str
-    source_digest: str
+    commit: str
     torch_build: str
     native_backends: tuple[tuple[str, str], ...] = ()
 
     def document(self) -> dict[str, Any]:
         return {
             "release": self.release,
-            "source_digest": self.source_digest,
+            "commit": self.commit,
             "torch_build": self.torch_build,
             "native_backends": dict(self.native_backends),
         }
-
-
-#: The modules whose bytes decide what a capability record MEANS. Anything that changes a
-#: decode, a leaf forward, a swizzle, an oracle or the admission arithmetic is here; the CLI,
-#: the worker and the author surface are not, because they cannot change a measurement.
-IDENTITY_SOURCES = (
-    "internal/encoding/comfy.py",
-    "internal/encoding/vectors/cases/comfy.json",
-    "internal/encoding/formats.py",
-    "internal/encoding/leaves.py",
-    "internal/encoding/selection.py",
-    "internal/probe.py",
-    "internal/qualification.py",
-    "internal/verify.py",
-    "internal/arch.py",
-    "internal/prebuilt.py",
-    "internal/int8_linear.py",
-    "internal/fp8_linear.py",
-    "internal/nvfp4_linear.py",
-    "internal/attention.py",
-    "internal/attention_upstream.py",
-    "internal/kernel_sources.py",
-    "internal/resolution.py",
-)
-
-
-def runtime_source_digest() -> str:
-    """A digest over `IDENTITY_SOURCES` as installed. Missing files are SPELLED, not skipped.
-
-    A source file that cannot be read is recorded as absent rather than silently omitted:
-    two builds that differ by a deleted module must not share a digest.
-    """
-    root = Path(__file__).resolve().parent.parent.parent
-    body: dict[str, str] = {}
-    for rel in IDENTITY_SOURCES:
-        path = root / rel
-        try:
-            body[rel] = canonical.digest({"bytes": path.read_bytes().hex()})
-        except OSError:
-            body[rel] = "absent"
-    body.update((f"native/{name}", value) for name, value in native_backend_identity().items())
-    return canonical.digest(body)
 
 
 @lru_cache(maxsize=32)
@@ -334,10 +285,16 @@ def native_backend_identity() -> dict[str, str]:
     return identity
 
 
+@lru_cache(maxsize=1)
+def _gemm_build() -> str:
+    """The loaded `_gemm`'s identity, fixed for the process once its module imported."""
+    return native_backend_identity()["_gemm"]
+
+
 def measure_runtime(torch: Any, release: str) -> RuntimeIdentity:
     return RuntimeIdentity(
         release=release,
-        source_digest=runtime_source_digest(),
+        commit=COMMIT,
         torch_build=str(getattr(torch, "__version__", "unknown")),
         native_backends=tuple(sorted(native_backend_identity().items())),
     )
@@ -405,7 +362,7 @@ class CapabilityRecord:
     It is evidence at ONE shape, not a whole-plan wall, so nothing ranks on it (see
     `resolution.score`); it exists so that a leaf that measured slower is READABLE on every
     record, plan and boot line that serves it, rather than banked and never read."""
-    runtime_source_digest: str = ""
+    runtime_commit: str = ""
     torch_build: str = ""
     os_arch: str = ""
     device_index: int = 0
@@ -428,7 +385,7 @@ class CapabilityRecord:
             "implementation_digest": self.implementation_digest,
             "implementation_revision": self.implementation_revision,
             "runtime_release": self.runtime_release,
-            "runtime_source_digest": self.runtime_source_digest,
+            "runtime_commit": self.runtime_commit,
             "torch_build": self.torch_build,
             "os_arch": self.os_arch,
             "device_predicate": self.device_predicate,
@@ -650,10 +607,13 @@ def reference_decoder(provider: Provider, device: DeviceFacts, dtype: str) -> bo
 
 
 def implementation_digest(provider: Provider) -> str:
-    """The provider's identity: name, route, device floor, oracle, parts, revision, schemes.
-    Records that measured another identity never admit this one."""
+    """The provider's identity: name, route, device floor, oracle, parts, revision, schemes,
+    and for an encoded GEMM the native build it runs. Records that measured another identity
+    never admit this one; nothing else in Runtime's source joins it."""
+    native = _gemm_build() if provider.route == "encoded_gemm" else ""
     return canonical.digest(
         {
+            "native": native,
             "name": provider.name,
             "route": provider.route,
             "device_predicate": provider.device_predicate,

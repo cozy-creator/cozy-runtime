@@ -1337,7 +1337,7 @@ def admission_table(result: QualificationResult) -> Capabilities:
                 kernel_numeric_error=observation.evidence.route_axes.deviation_rel,
                 leaf_speedup_x=_leaf_speedup(observation.evidence),
                 # #549.9's identity, carried onto every record it minted.
-                runtime_source_digest=result.runtime.source_digest,
+                runtime_commit=result.runtime.commit,
                 torch_build=result.runtime.torch_build,
                 os_arch=result.device.os_arch,
                 device_index=result.device.index,
