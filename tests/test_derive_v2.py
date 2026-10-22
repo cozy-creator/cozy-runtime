@@ -123,8 +123,8 @@ def test_a_quantized_output_is_its_slots_lane_beside_the_lanes_already_there(
     lane = plan(["unet"], "int8.convrot")
     result = quantize(Weights(source), lane, ctx=ctx, tel=fake_telemetry(), output="int8")
     assert [(item[1], item[4]) for item in shown] == [
-        (weights_store.DERIVED, "int8"),
-        ("local/acme", "int8"),
+        (weights_store.DERIVED, weights_store.variant("int8")),
+        ("local/acme", weights_store.variant("int8")),
     ]
 
     def lane_of(variant: str) -> tensorfs.Checkpoint:
@@ -132,8 +132,8 @@ def test_a_quantized_output_is_its_slots_lane_beside_the_lanes_already_there(
             "local/acme", revision="main", variant=variant, cache_dir=store, local_files_only=True
         )
 
-    assert lane_of("").id == source, "the lane the tag held stays"
-    int8 = lane_of("int8")
+    assert lane_of("model.cozytensors").id == source, "the lane the tag held stays"
+    int8 = lane_of(weights_store.variant("int8"))
     assert int8.id == result.checkpoint
     encoding = int8.components["unet"].tensors["blocks.0.proj.weight"].encoding
     assert encoding is not None and encoding.scheme == "int8.convrot"
