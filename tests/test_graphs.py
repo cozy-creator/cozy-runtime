@@ -92,6 +92,7 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         for way in ("eager", "replay"):
             assert region[way]["device_timed"] == region[way]["calls"], region
             assert region[way]["host_ms"] > 0 and region[way]["device_ms"] > 0, region
+        assert recorder.domain is not None
         graphs._shed(torch, recorder.domain)
         assert not recorder.recordings
         retired = graphs.describe(module)
@@ -247,11 +248,13 @@ def test_a_pool_is_not_shed_until_its_last_output_copy_finishes() -> None:
         module(x)
         torch.cuda.synchronize()
         recorder = graphs._RECORDERS[module]
+        owner = recorder.domain
+        assert owner is not None
         torch.cuda._sleep(1 << 29)
         result = module(x)
-        assert graphs._shed(torch, recorder.domain) == 0 and recorder.recordings
+        assert graphs._shed(torch, owner) == 0 and recorder.recordings
         torch.cuda.synchronize()
-        assert graphs._shed(torch, recorder.domain) > 0 and not recorder.recordings
+        assert graphs._shed(torch, owner) > 0 and not recorder.recordings
         torch.testing.assert_close(result, torch.nn.Sequential.__call__(module, x))
 
 
@@ -452,7 +455,9 @@ def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
     ):
         assert safe(torch, unet.get_submodule(path)) is pure, path
 
-    class PackageProcessor(diffusers.models.attention_processor.AttnProcessor2_0):
+    base: Any = diffusers.models.attention_processor.AttnProcessor2_0
+
+    class PackageProcessor(base):  # type: ignore[misc]
         pass
 
     attention = unet.get_submodule("up_blocks.0.attentions.0.transformer_blocks.0.attn1")
