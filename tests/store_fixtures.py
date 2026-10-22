@@ -67,9 +67,11 @@ def context(
     outputs: Mapping[str, int] = {"model": 64 << 20},
     *,
     shown: Shown | None = None,
+    destination: str = "",
 ) -> Context:
     """An attempt's `Context` reading its `Weights` sources from `store` and writing `outputs`
-    into it; each checkpoint item it shows is appended to `shown`."""
+    into it, uploaded to `destination` (`org/name@tag`) when it names one; each checkpoint item
+    it shows is appended to `shown`."""
     items = shown if shown is not None else []
     bound = weights_store.Outputs(
         store,
@@ -78,6 +80,7 @@ def context(
         code=request_id,
         bounds=outputs,
         show=lambda *item: items.append(item),
+        destination=destination,
     )
     return Context(
         request_id,

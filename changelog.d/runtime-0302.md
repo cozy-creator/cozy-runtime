@@ -1,0 +1,1 @@
+Runtime 0.30.2: a weights output is the variant named for its slot. A quantizer's `int8` output is the `int8` lane, written beside the lanes its destination tag already holds; on 0.30.1 it was the unnamed default and replaced the source lane (`cozy model quantize`, run 12928).

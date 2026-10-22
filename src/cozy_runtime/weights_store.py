@@ -202,11 +202,16 @@ def replay_key(actor: str, code: str, slot: str, work: Mapping[str, object]) -> 
     return "sha256:" + hashlib.sha256(f"{actor}\0{code}\0{slot}\0{body}".encode()).hexdigest()
 
 
-def finished(store: Path, transaction: str) -> Checkpoint | None:
-    """The output a finished derivation of `transaction` committed, if `store` has one."""
+def finished(store: Path, transaction: str, slot: str) -> Checkpoint | None:
+    """Output `slot`'s variant that a finished derivation of `transaction` committed, if `store`
+    has one."""
     try:
         return tensorfs.open(
-            DERIVED, revision=tag(transaction), cache_dir=store, local_files_only=True
+            DERIVED,
+            revision=tag(transaction),
+            variant=slot,
+            cache_dir=store,
+            local_files_only=True,
         )
     except tensorfs.NotFoundError:
         return None
@@ -218,10 +223,10 @@ def tag(transaction: str) -> str:
 
 
 class Output:
-    """One derived checkpoint, output `slot`, written into `store` under its replay key
-    `transaction`. A finished one replays (`done`): every tensor is there and `commit`
-    answers it. An interrupted one resumes: what an earlier attempt wrote `has`. At most
-    `max_new_bytes` are written."""
+    """One derived checkpoint, output `slot` and the variant of that name (a quantizer's `int8`
+    output is the `int8` lane), written into `store` under its replay key `transaction`. A
+    finished one replays (`done`): every tensor is there and `commit` answers it. An interrupted
+    one resumes: what an earlier attempt wrote `has`. At most `max_new_bytes` are written."""
 
     def __init__(
         self,
@@ -238,12 +243,17 @@ class Output:
         #: each component a write may name, declared as its base (else first source) declares it
         froms = (*reversed(derivation.sources), *([derivation.base] if derivation.base else []))
         self.declared = {name: c for ck in froms for name, c in ck.components.items()}
-        self.done = finished(store, transaction)
+        self.done = finished(store, transaction, slot)
         self._writer = (
             None
             if self.done is not None
             else tensorfs.Writer(
-                base=derivation.base, resume=transaction.removeprefix("sha256:"), cache_dir=store
+                base=derivation.base,
+                repo_id=DERIVED,
+                revision=tag(transaction),
+                variant=slot,
+                resume=transaction.removeprefix("sha256:"),
+                cache_dir=store,
             )
         )
         self._components: dict[str, tensorfs.ComponentWriter] = {}
@@ -374,18 +384,9 @@ class Output:
                 keys.setdefault(component, []).append(key)
             for component, ordered in keys.items():
                 self.component(component).order(ordered)
-            committed = self._writer.commit()
-            with _thin(self.store, committed) as folder:
-                tensorfs.upload_folder(
-                    repo_id=DERIVED, revision=tag(self.transaction), folder_path=folder,
-                    cache_dir=self.store, endpoint="local",
-                )  # fmt: skip
-            self.done = tensorfs.open(
-                DERIVED,
-                revision=tag(self.transaction),
-                cache_dir=self.store,
-                local_files_only=True,
-            )
+            self._writer.commit()
+            self.done = finished(self.store, self.transaction, self.slot)
+            assert self.done is not None
             self.close()
         return self.done
 

@@ -109,6 +109,41 @@ def test_a_lane_encodes_by_scheme_and_decodes_through_the_reference(
     assert tuple(out.pipeline.cls) == ("diffusers", "", "StableDiffusionPipeline")
 
 
+def test_a_quantized_output_is_its_slots_lane_beside_the_lanes_already_there(
+    store: Path, source: str, tmp_path: Path
+) -> None:
+    """`cozy model quantize` writes output `int8` onto a repo whose tag holds the source as its
+    default lane: the commit keeps that lane and adds `int8` (run 12928 replaced it)."""
+    folder = tensorfs.materialize(
+        tensorfs.open(source, cache_dir=store, local_files_only=True), local_dir=tmp_path / "src"
+    )
+    tensorfs.upload_folder(repo_id="local/acme", folder_path=folder, cache_dir=store)
+    shown: Shown = []
+    ctx = context(store, outputs={"int8": 64 << 20}, shown=shown, destination="local/acme@main")
+    lane = plan(["unet"], "int8.convrot")
+    result = quantize(Weights(source), lane, ctx=ctx, tel=fake_telemetry(), output="int8")
+    assert [(item[1], item[4]) for item in shown] == [
+        (weights_store.DERIVED, "int8"),
+        ("local/acme", "int8"),
+    ]
+
+    def lane_of(variant: str) -> tensorfs.Checkpoint:
+        return tensorfs.open(
+            "local/acme", revision="main", variant=variant, cache_dir=store, local_files_only=True
+        )
+
+    assert lane_of("").id == source, "the lane the tag held stays"
+    int8 = lane_of("int8")
+    assert int8.id == result.checkpoint
+    encoding = int8.components["unet"].tensors["blocks.0.proj.weight"].encoding
+    assert encoding is not None and encoding.scheme == "int8.convrot"
+    again = quantize(
+        Weights(source), lane, ctx=context(store, outputs={"int8": 64 << 20}),
+        tel=fake_telemetry(), output="int8",
+    )  # fmt: skip
+    assert again.replayed and again.checkpoint == result.checkpoint
+
+
 def test_a_committed_output_replays_and_an_interrupted_one_resumes(
     store: Path, source: str
 ) -> None:
@@ -174,7 +209,7 @@ def test_a_derived_output_writes_its_own_component_config(store: Path, source: s
             out.config("adapter", {"rank": 4})
             out.copy("adapter", "norm.weight", base, from_component="unet")
             out.commit()
-        written = weights_store.finished(store, out.transaction)
+        written = weights_store.finished(store, out.transaction, "model")
         assert written is not None and written.components["unet"].config == pruned, request
         assert written.components["unet"].cls == base.components["unet"].cls
         assert written.components["adapter"].config == {"rank": 4}
