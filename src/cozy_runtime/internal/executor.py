@@ -693,8 +693,6 @@ _CONSTRUCTION_MODULES = (
     "cozy_runtime.internal.derive",
     "cozy_runtime.internal.encoding",
     "cozy_runtime.internal.fill",
-    "cozy_runtime.internal.planfacts",
-    "cozy_runtime.internal.probe",
     "cozy_runtime.internal.weights",
     "cozy_runtime.internal.resolution",
     "cozy_runtime.internal.triton_kernels",
@@ -2271,7 +2269,7 @@ class Executor:
         self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
-        # cannot say which of construction, qualification or lease acquisition spent the
+        # cannot say which of construction, resolution or lease acquisition spent the
         # wall clock, and that ambiguity kept a 20s cost unattributed across three issues.
         stages: list[tuple[str, float]] = []
         _mark = [started]
@@ -2303,8 +2301,6 @@ class Executor:
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
-        from cozy_runtime.internal.planfacts import PlanFacts
-        from cozy_runtime.internal.qualification import qualified
         from cozy_runtime.internal.resolution import (
             ConstructionFacts,
             PlanRefusal,
@@ -2362,8 +2358,8 @@ class Executor:
         # mixed artifact reported the rung and contained the tensors, and the rung was hashed
         # into generation identity while having no execution authority at all. What is
         # resolved here is the whole plan — the exact snapshot map, every tensor's provider,
-        # route and validated geometry, the device and runtime identity, the placement and
-        # the objective — and its digest is what enters identity. The LABEL derives from it.
+        # route and validated geometry, the device and runtime identity and the placement —
+        # and its digest is what enters identity. The LABEL derives from it.
         #
         # The artifact is surveyed from its HEADER (cr-006 measured the real fp8 UNet's
         # whole per-tensor encoding plan at 400,592 B read, zero tensor bytes), so this
@@ -2396,7 +2392,6 @@ class Executor:
             store=binding.store,
             snapshot=binding.snapshot,
             snapshots=dict(per_component),
-            reference=True,
         )
         vmap = reference.snapshot_map()
         host = self.host
@@ -2423,23 +2418,12 @@ class Executor:
                 f"on ({device_facts.driver} here): serve an f16 lane",
             )
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
-        # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
+        # lane's card, so a multi-GPU pod's plan names the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding.release)
-        # Read only the shipped facts for the schemes these model rows actually store.
+        # Only the schemes these rows store. Which may serve here is a rule of the card's
+        # tensor cores (`selection.admit`, xs-065): no suite runs and nothing is measured.
         stored = {row.encoded.scheme for row in rows}
         providers = {s: c for s, c in launch_providers().items() if s in stored}
-        # Unsupported cells refuse or use an already-qualified route; inference never probes.
-        qualification = qualified(
-            torch,
-            providers,
-            device_facts,
-            sorted({dtype_name(r.dtype) for r in rows}),
-            release=binding.release,
-            runtime=runtime_identity,
-        )
-        qualified_pair = (qualification.capabilities, qualification.result)
-        stage("qualify")
-        objective = binding.objective or "latency"
         model_cls = next(
             cls for cls in self._model_classes() if cls.__name__ == binding.model_class
         )
@@ -2468,21 +2452,16 @@ class Executor:
         # the plan already chosen and the package already imported; a plan whose route the
         # package cannot consent to is not a candidate, so it is never built.
         consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
-        facts = PlanFacts()
         try:
             plan = resolve(
-                variants=[reference],
-                rows_for={reference.name: rows},
+                variant=reference,
+                rows=rows,
                 providers=providers,
-                capabilities=qualification.capabilities,
                 device=device_facts,
                 runtime=runtime_identity,
                 construction=construction,
-                facts=facts,
-                objective=objective,
                 placement=binding.placement or "all_resident",
                 encoded_leaves=consent,
-                steps_basis=binding.steps_basis or 20,
                 dtype_name=dtype_name,
             )
         except PlanRefusal as exc:
@@ -2490,7 +2469,7 @@ class Executor:
                 "ok": False,
                 "code": exc.code,
                 "detail": str(exc).splitlines()[0][:900],
-                "plan": {"walk": msgspec.to_builtins(exc.steps), "objective": binding.objective},
+                "plan": {"walk": msgspec.to_builtins(exc.steps)},
             }
         stage("resolve")
         mine = GroupPlan(
@@ -2528,8 +2507,6 @@ class Executor:
             memory=host.memory,
             device=device,
             construction=self._group_model_key,
-            # The suite already ran, above, to resolve the plan.
-            qualified=qualified_pair,
             device_facts=device_facts,
             release=binding.release,
             custody=binding.custody,
@@ -2757,7 +2734,6 @@ class Executor:
             "stages": list(stages)
             + [(f"construct.{name}", ms) for name, ms in record.stage_ms]
             + [(f"register.{name}", ms) for name, ms in backend.legs],
-            "qualification": qualification.document(),
             "substrate_census": list(record.weightless),
             "execution_plan": planned,
             "filled": record.filled,
@@ -2940,10 +2916,6 @@ class Executor:
             ),
             "routes": routes,
             "kernels": kernels,
-            "calibrated": all(bool(row.get("calibrated")) for row in deliveries.values()),
-            "objective": ", ".join(
-                sorted({str(row.get("objective", "")) for row in deliveries.values()})
-            ),
         }
         self.facts = {
             "cuda_init_ms": sum(float(facts.get("cuda_init_ms", 0)) for _, facts in facts_rows),
@@ -3624,10 +3596,9 @@ class Executor:
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
         """`gemm.selected`: per component and leaf provider, the kernel its installed leaves serve
-        now (read once a run, never per call). `gemm.family_default`: one serving its family's
-        default kernel, no offline verdict refining it. `gemm.fallback`: each that serves below
-        what its lane wanted, and why, also said as a warning line (a machine before TensorD
-        keeps `gemm.*` drops the fact)."""
+        now (read once a run, never per call). `gemm.fallback`: each that serves below what its
+        lane wanted, and why, also said as a warning line (a machine before TensorD keeps
+        `gemm.*` drops the fact)."""
 
         def fallback(value: str, **fields: Any) -> None:
             record.emit("confession", "gemm.fallback", value, **fields)
@@ -3643,9 +3614,6 @@ class Executor:
             kernel, form = serving(leaf, index), FORMATS[leaf]
             fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
-            default = prebuilt.DEFAULTED.get((sm, form))
-            if default and kernel == native.get(form):
-                record.emit("confession", "gemm.family_default", kernel, reason=default, **fields)
             wanted = native.get(form, kernel)
             reason = prebuilt.lost(form, sm) or (missing[0].reason if missing else "")
             if reason and kernel != wanted:

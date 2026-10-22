@@ -28,8 +28,17 @@ class Row:
     inherited: bool = False
 
     def formats(self) -> frozenset[str]:
+        """Its tensor-core formats: what a native leaf's `formats` must be within. `mxfp8` is
+        block-scaled fp8, which comes with the block-scaled fp4 MMA."""
         return frozenset(
-            f for f, on in (("int8", self.int8), ("fp8", self.fp8), ("fp4", self.fp4)) if on
+            f
+            for f, on in (
+                ("int8", self.int8),
+                ("fp8", self.fp8),
+                ("fp4", self.fp4),
+                ("mxfp8", self.fp8 and self.fp4),
+            )
+            if on
         )
 
 
@@ -69,6 +78,13 @@ def row(sm: int, family: str = "") -> Row:
     chosen = family or _LEARNED.get(sm, tried[0])
     fp4 = sm >= 100 and chosen != MMA_SYNC  # an inherited mma.sync is not block-scaled
     return Row(f"sm_{sm}", chosen, int8=True, fp8=sm >= 89, fp4=fp4, inherited=True)
+
+
+def hardware(sm: int) -> Row:
+    """The card's row by its compute capability alone: a named row, else the newest family the cc
+    could hold, never what a process has learned since. Admission reads it (`selection.admit`),
+    so a card's lanes are the same on every Load."""
+    return row(sm, (families(sm) or ("",))[0])
 
 
 def learn(sm: int, family: str) -> None:

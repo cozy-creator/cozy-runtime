@@ -133,7 +133,7 @@ def failed(op: str, device: int, exc: Exception) -> None:
 
 
 def library(index: int) -> prebuilt.Prebuilt:
-    """The library admitted by shipped offline facts for this card."""
+    """The library `native` verified for this card."""
     return _LIBS[index]
 
 
@@ -169,7 +169,7 @@ def native(torch: ModuleType, index: int) -> Op | None:
         ops, detail = prebuilt.library(torch, index, sm)
         if ops is None:
             raise kernel_sources.Absent(detail)
-        print(f"[int8] offline-qualified prebuilt kernels on sm{sm}: {detail}", file=sys.stderr)
+        print(f"[int8] prebuilt kernels verified on sm{sm}: {detail}", file=sys.stderr)
         _HALF[:] = (torch.bfloat16, torch.float16)
         _LIBS[index] = ops
         _OPS[index] = ops.int8_linear
@@ -181,13 +181,6 @@ def native(torch: ModuleType, index: int) -> Op | None:
 def kitchen(torch: ModuleType, index: int) -> ModuleType | None:
     """`comfy_kitchen`'s CUDA backend on this card, or None while its build runs (it starts on
     the first ask) and for good when this card or machine cannot have it."""
-
-    from cozy_runtime.internal import verify
-
-    # A format oracle that ran the prebuilt/reference arm cannot admit a kitchen build
-    # that appears later. Its separate int8/fp8/NVFP4 arms need explicit offline facts.
-    if not verify.in_oracle():
-        return None
 
     def opened(sm: int) -> ModuleType | None:
         if not arch.row(sm).family:

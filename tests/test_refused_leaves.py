@@ -1,33 +1,29 @@
-"""A plan that serves tensors decoded because this device REFUSED their leaf says so, once per
-(component, lane, leaf, reason). A decode by design (a geometry the format rules out, a package
-that declines leaves) says nothing. A run names the kernel each component's leaves served
-(`gemm.selected`) and each fallback below its lane (`gemm.fallback`).
-
-Real measurements only: the shipped sm86 table (RTX 3090) and the recorded sm89 probe, whose
-fp8 leaf failed its float16 GEMM check and raised for float32.
+"""A plan that serves tensors decoded because this card does not serve their leaf (its row
+lacks the leaf's tensor cores, `selection.admit`) says so, once per (component, lane, leaf,
+reason). A decode by design (a geometry the format rules out, a package that declines leaves)
+says nothing. A run names the kernel each component's leaves served (`gemm.selected`) and each
+fallback below its lane (`gemm.fallback`).
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 
-import msgspec
 import pytest
 
 from cozy_runtime import _kernels
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8
 from cozy_runtime.derive.microscale import encode_int8_convrot256
-from cozy_runtime.internal import fp8_linear, int8_linear, prebuilt, probe, qualification
+from cozy_runtime.internal import fp8_linear, int8_linear, prebuilt, probe
 from cozy_runtime.internal.encoding import (
-    Capabilities,
     DeviceFacts,
     Encoded,
     Int8ConvRotNativeLeaf,
     Nvfp4NativeLeaf,
     RolePart,
+    RuntimeIdentity,
     launch_providers,
     params_of,
 )
@@ -35,8 +31,6 @@ from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.fill import PlanRow, dtype_name
-from cozy_runtime.internal.planfacts import PlanFacts
-from cozy_runtime.internal.probe import QualificationResult
 from cozy_runtime.internal.resolution import (
     ConstructionFacts,
     RefusedLeaves,
@@ -45,10 +39,12 @@ from cozy_runtime.internal.resolution import (
     resolve,
 )
 from test_int8_convrot import weight
-from test_leaf_speedup_record import rekeyed, sm86
 from test_nvfp4 import roles
 
 FP8_LEAF = "cozy.fp8-rowwise.native-leaf/1"
+INT8_LEAF = "cozy.int8-convrot256.native-leaf/1"
+RTX_3090 = DeviceFacts("cuda", "NVIDIA GeForce RTX 3090", 86, "580.95.05/api13000", "350W/N/A")
+B300 = DeviceFacts("cuda", "NVIDIA B300", 103, "580.95.05/api13000", "1100W/N/A")
 
 
 PARAMS: dict[str, dict[str, object]] = {
@@ -68,26 +64,20 @@ def row(key: str, scheme: str, dtype: str, shape: tuple[int, int]) -> PlanRow:
     return PlanRow(key, name, component, dtype, shape, 2 * shape[0] * shape[1], encoded)
 
 
-def plan(
-    rows: list[PlanRow], capabilities: Capabilities, device: DeviceFacts, consent: str = "accept"
-) -> ResolvedModelPlan:
+def plan(rows: list[PlanRow], device: DeviceFacts, consent: str = "accept") -> ResolvedModelPlan:
     return resolve(
-        variants=[Variant("lane", "store", "sha256:" + "1" * 64, {}, True)],
-        rows_for={"lane": rows},
+        variant=Variant("lane", "store", "sha256:" + "1" * 64),
+        rows=rows,
         providers=launch_providers(),
-        capabilities=capabilities,
         device=device,
-        runtime=rekeyed().runtime,
+        runtime=RuntimeIdentity("t/1", "2.14.0"),
         construction=ConstructionFacts("t/1", "t:Model", ("te", "unet")),
-        facts=PlanFacts(),
         encoded_leaves=consent,
         dtype_name=dtype_name,
     )
 
 
 def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not() -> None:
-    table = sm86()
-    capabilities = probe.admission_table(table)
     rows = [
         row("unet.a.weight", "fp8.rowwise", "bf16", (64, 256)),
         row("unet.b.weight", "fp8.rowwise", "bf16", (128, 256)),
@@ -95,7 +85,7 @@ def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not
         # The int8 GEMM needs N % 8 == 0: decoded by the format's rule, not refused.
         row("te.d.weight", "int8.convrot", "bf16", (60, 256)),
     ]
-    served = plan(rows, capabilities, table.device)
+    served = plan(rows, RTX_3090)
     assert {t.key: t.route for t in served.tensors} == {
         "unet.a.weight": "decoded_float",
         "unet.b.weight": "decoded_float",
@@ -107,34 +97,31 @@ def test_a_leaf_below_its_floor_warns_and_a_geometry_or_a_declined_leaf_does_not
             "unet",
             "fp8.rowwise",
             FP8_LEAF,
-            "its kernel needs cuda.sm89+ and this device is cuda.sm86",
+            f"{FP8_LEAF} needs cuda.sm89+ and this device is cuda.sm86",
             "bfloat16",
             2,
         ),
     )
-    assert plan(rows, capabilities, table.device, "refuse").refused_leaves() == ()
+    assert plan(rows, RTX_3090, "refuse").refused_leaves() == ()
 
 
-def test_a_leaf_that_failed_or_raised_in_qualification_warns_once_per_reason() -> None:
-    result = rekeyed()
+def test_a_card_whose_row_lacks_the_lanes_tensor_cores_decodes_and_says_why() -> None:
+    """B300 (sm103) has fp8 and fp4 tensor cores and no int8: its int8 leaves decode, by rule."""
     rows = [
-        row("unet.a.weight", "fp8.rowwise", "f16", (64, 256)),
-        row("unet.b.weight", "fp8.rowwise", "f32", (64, 256)),
-        row("unet.c.weight", "fp8.rowwise", "f32", (128, 256)),
-        row("unet.d.weight", "fp8.rowwise", "bf16", (64, 256)),
+        row("unet.a.weight", "int8.convrot", "bf16", (64, 256)),
+        row("unet.b.weight", "int8.convrot", "f16", (64, 256)),
+        row("unet.c.weight", "fp8.rowwise", "bf16", (64, 256)),
     ]
-    served = plan(rows, probe.admission_table(result), result.device)
-    assert served.by_key()["unet.d.weight"].route == "encoded_gemm"
-    assert [(g.reason, g.tensors) for g in served.refused_leaves()] == [
-        (
-            "builtins.ValueError: Only bf16 and fp16 high precision output types are "
-            "supported for row-wise scaling.",
-            2,
-        ),
-        (
-            "its GEMM measured 0.9 relative error against the 0.3 bound (finite True, out float16)",
-            1,
-        ),
+    served = plan(rows, B300)
+    assert {t.key: t.route for t in served.tensors} == {
+        "unet.a.weight": "decoded_float",
+        "unet.b.weight": "decoded_float",
+        "unet.c.weight": "encoded_gemm",
+    }
+    why = f"cuda.sm103 (Blackwell Ultra) has no int8 tensor cores for {INT8_LEAF}"
+    assert [(g.leaf, g.reason, g.dtype, g.tensors) for g in served.refused_leaves()] == [
+        (INT8_LEAF, why, "bfloat16", 1),
+        (INT8_LEAF, why, "float16", 1),
     ]
 
 
@@ -172,14 +159,11 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
     nvfp4(torch.randn(40, 512, dtype=torch.bfloat16))
     assert set(vars(nvfp4)) == before  # nothing written per call
 
-    table = sm86()
     rows = [row(f"unet.{n}.weight", "fp8.rowwise", "bf16", (64, 256)) for n in "ab"]
     executor = Executor(None, tmp_path)  # type: ignore[arg-type]
     executor.backend = SimpleNamespace(gemm_sites=leaf_sites(leaves))
     executor.models = {"klein": object()}
-    executor.refused_leaves = plan(
-        rows, probe.admission_table(table), table.device
-    ).refused_leaves()
+    executor.refused_leaves = plan(rows, RTX_3090).refused_leaves()
 
     def emitted() -> list[tuple[object, ...]]:
         record = Attempt("gemm", tmp_path, 0)
@@ -213,7 +197,7 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
         "gemm.fallback",
         "torch.linear",
         ("component", "klein/unet"),
-        ("reason", "its kernel needs cuda.sm89+ and this device is cuda.sm86"),
+        ("reason", f"{FP8_LEAF} needs cuda.sm89+ and this device is cuda.sm86"),
         ("served", "bf16"),
         ("sites", 2),
         ("wanted", "fp8"),

@@ -7,9 +7,8 @@ picked a provider PER TENSOR, and the two could not see each other: a mixed arti
 reported was hashed into generation identity despite having no execution authority — nothing
 downstream ever read it to fill anything.
 
-The chooser is gone, the `(variant, rung)` table is gone (see `planfacts.py` for what
-replaced it and why the old rows are INVALID rather than migrated), and `resolution.py` makes
-one joint decision over whole plans.
+The chooser is gone, the `(variant, rung)` table is gone, and `resolution.py` makes one
+decision per plan, by rule.
 
 **What it still is, and why it is worth keeping.** A route's COST CLASS is a real fact that
 belongs somewhere, and nothing else knows it: *when* is a decode paid — never, once at fill,
@@ -28,10 +27,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-#: WHICH KERNEL each route computes with. Re-exported from `resolution.py` so there is one
-#: definition: the launch tier's two float routes both compute through the ordinary library
-#: GEMM — that is what "kernel-neutral" means and it is checked, not asserted.
-from cozy_runtime.internal.resolution import ROUTE_KERNEL
+#: WHICH KERNEL each route computes with. The two float routes compute in the destination's
+#: own dtype through the ordinary library GEMM — that is what "kernel-neutral" means, and it
+#: is data so the placement walk can be checked not to have moved it.
+ROUTE_KERNEL: dict[str, str] = {
+    "verbatim": "library_float",
+    "decoded_float": "library_float",
+    "encoded_gemm": "encoded_gemm",
+}
 
 __all__ = [
     "DELIVERY_RUNGS",

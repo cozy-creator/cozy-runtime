@@ -265,12 +265,12 @@ class Provider(Protocol):
     @property
     def code_revision(self) -> str:
         """Bumped when the arithmetic, operand layout or kernel call changes; it joins the
-        capability-record key, so records of the old code stop admitting the new."""
+        implementation digest a plan names."""
         ...
 
     @property
     def suite(self) -> str:
-        """The probe oracle that qualifies it."""
+        """The conformance oracle that checks it (`probe.py`)."""
         ...
 
     @property
@@ -296,6 +296,17 @@ class LeafProvider(Provider, Protocol):
     @property
     def output_dtype_rule(self) -> str:
         """`contract`: the leaf emits the destination dtype the contract named."""
+        ...
+
+    @property
+    def formats(self) -> frozenset[str]:
+        """The tensor-core formats its kernels multiply in (`arch.Row.formats`): it serves a
+        card whose row has every one, and decodes elsewhere (`selection.admit`)."""
+        ...
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """The destination dtypes its kernels write; a tensor of another decodes."""
         ...
 
     def leaf(self, torch: Any, parts: Mapping[str, Any], replaced: Any, out_dtype: Any) -> Any: ...
