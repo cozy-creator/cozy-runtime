@@ -7,7 +7,6 @@ the catch on every model it loads (`install`); nothing else here is the executor
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from pathlib import Path
 
 import msgspec
@@ -38,7 +37,7 @@ __all__ = [
 ]
 
 
-def install(module: nn.Module, state: Sequence[str] = ()) -> None:
+def install(module: nn.Module) -> None:
     """Install known pure cuts and name their enclosing blocks, without replay wrappers."""
     cuts.install(module)
     blocks = blocks_of(module)

@@ -84,6 +84,14 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         assert facts["graph_pool_bytes"] > 0 and facts["domain_workspace_bytes"] > 0
         assert facts["replay_copy_bytes"] > 0
         torch.cuda.synchronize()
+        # Per region, design §5's measures: captures and their time, and each way it ran (two
+        # first calls eager, four replays), host submission and device time, from events alone.
+        region = graphs.describe(module)["regions"][""]
+        assert region["captures"] == 2 and region["capture_ms"] > 0
+        assert region["eager"]["calls"] == 2 and region["replay"]["calls"] == 4
+        for way in ("eager", "replay"):
+            assert region[way]["device_timed"] == region[way]["calls"], region
+            assert region[way]["host_ms"] > 0 and region[way]["device_ms"] > 0, region
         graphs._shed(torch, recorder)
         assert not recorder.recordings
         retired = graphs.describe(module)

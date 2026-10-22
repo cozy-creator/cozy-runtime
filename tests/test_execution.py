@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import os
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -18,6 +22,8 @@ from cozy_runtime.internal.execution import catch, cuts  # noqa: E402
 from execution_models import checkpoint, memory, placed, scores, transformer  # noqa: E402
 
 BF16 = torch.bfloat16
+AGREEMENT = Path(__file__).parent / "testdata" / "collective_agreement.py"
+ENV = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "CUDA_VISIBLE_DEVICES": ""}
 
 
 @pytest.fixture(autouse=True)
@@ -44,6 +50,55 @@ def test_without_an_oom_the_catch_changes_nothing(tmp_path: Path) -> None:
             got = model(x)
     assert torch.equal(got, want)
     assert r.stats().leftover == 0
+
+
+def test_an_oom_at_a_cut_site_takes_rust_s_cut_and_the_next_request_starts_there(
+    tmp_path: Path,
+) -> None:
+    """An FFN projection that cannot allocate for more than 48 tokens (an allocation the
+    allocator could not make room for) runs out inside its FFN's cut site: Rust cuts the site
+    finer, its token pieces give the whole FFN's result, and the next request at that shape
+    starts at the level Rust kept, with nothing running out."""
+    plain = transformer()
+    mem = memory()
+    model = placed(mem, checkpoint(tmp_path, "dit", plain), "dit", transformer)
+    refused: list[int] = []
+
+    def short(module: nn.Module, args: tuple[Any, ...]) -> None:
+        rows = args[0].numel() // args[0].shape[-1]
+        if rows > 48:
+            refused.append(rows)
+            catch._refused(0, rows * 256 * 2, 0, 0)
+            raise torch.OutOfMemoryError("out of memory. Tried to allocate 48.00 KiB")
+
+    model.blocks[0].ff.net[0].proj.register_forward_pre_hook(short)
+    x = tokens(1)
+    with torch.no_grad():
+        want = plain(x)
+        with mem.request("short") as r, execution.serving(r):
+            got = model(x)
+        assert refused and r.stats().cuts >= 1
+        torch.testing.assert_close(got, want, rtol=2**-6, atol=2**-6)
+        refused.clear()
+        with mem.request("short again") as r, execution.serving(r):
+            again = model(x)
+    assert not refused and r.stats().cuts == r.stats().retries == 0
+    assert torch.equal(again, got)
+
+
+def test_an_oom_in_an_exchange_becomes_the_same_cut_on_every_gpu(tmp_path: Path) -> None:
+    """Two gloo ranks: in the first pass every rank's exchange runs out before any rank enters
+    its collectives. None runs it again; each fails typed and tells Rust, and from the next pass
+    both agree the finer level and cross the heads in halves, each pass degree 1's result byte
+    for byte. The ranks' rows are gathered once, in the first pass at their shapes."""
+    argv = [sys.executable, str(AGREEMENT), str(tmp_path), "--degree", "2"]
+    subprocess.run(argv, env=ENV, check=True)
+    for rank in range(2):
+        passes = json.loads((tmp_path / f"rank-{rank}.json").read_text())["passes"]
+        assert passes[0]["failed"] == "device_out_of_memory", passes
+        assert all(p["byte_equal"] for p in passes[1:]), passes
+        assert [p["exchanged_heads"] for p in passes] == [[], [4, 4], [4, 4], [4, 4]], passes
+        assert [p["gathered"] for p in passes] == [1, 0, 0, 0], passes
 
 
 def test_a_conv_cut_site_s_bands_are_the_whole_conv() -> None:

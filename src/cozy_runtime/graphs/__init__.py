@@ -13,7 +13,9 @@ import contextvars
 import functools
 import sys
 import threading
+import time
 import weakref
+from collections import deque
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from typing import Any
@@ -151,6 +153,51 @@ class _Recording:
         return self.fenced and (self.done is None or bool(self.done.query()))
 
 
+class _Timing:
+    """One way a region runs (eager or replayed): its calls, the host time each took to submit,
+    and its device time between two CUDA events around it, read once the device has passed them
+    (never by waiting; a later call or the reply settles them)."""
+
+    def __init__(self) -> None:
+        self.calls = self.timed = 0
+        self.host_ms = self.device_ms = 0.0
+        self.pending: deque[tuple[Any, Any]] = deque()
+        self.free: list[tuple[Any, Any]] = []
+
+    def run[T](self, torch: Any, call: Callable[[], T]) -> T:
+        stream = torch.cuda.current_stream()
+        start, end = self.free.pop() if self.free else (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        start.record(stream)
+        began = time.perf_counter()
+        try:
+            return call()
+        finally:
+            self.host_ms += (time.perf_counter() - began) * 1e3
+            end.record(stream)
+            self.calls += 1
+            self.pending.append((start, end))
+            self.settle()
+
+    def settle(self) -> None:
+        while self.pending and self.pending[0][1].query():
+            start, end = self.pending.popleft()
+            self.device_ms += start.elapsed_time(end)
+            self.timed += 1
+            self.free.append((start, end))
+
+    def document(self) -> dict[str, Any]:
+        self.settle()
+        return {
+            "calls": self.calls,
+            "host_ms": round(self.host_ms, 3),
+            "device_ms": round(self.device_ms, 3),
+            "device_timed": self.timed,
+        }
+
+
 class _Recorder:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -168,6 +215,9 @@ class _Recorder:
         self.copy_bytes = 0
         self.landed = LANDED[0]
         self.domain: domain.Domain | None = None
+        #: host time preparing and capturing (warmup included), and each way it ran
+        self.capture_ms = 0.0
+        self.eager, self.replayed = _Timing(), _Timing()
 
     def forget(self, torch: Any) -> bool:
         if any(not entry.idle() for entry in self.recordings.values()):
@@ -311,7 +361,7 @@ def describe(root: Any) -> dict[str, Any]:
         ),
         0,
     )
-    captured, gaps = [], {}
+    captured, gaps, timed = [], {}, {}
     for module, (owner, path) in list(_REGIONS.items()):
         if owner() is not root:
             continue
@@ -331,6 +381,13 @@ def describe(root: Any) -> dict[str, Any]:
             answer["replay_copy_bytes"] += recorder.copy_bytes
             if recorder.recordings:
                 captured.append(path)
+            timed[path] = {
+                "capture_attempts": recorder.capture_attempts,
+                "captures": recorder.captures,
+                "capture_ms": round(recorder.capture_ms, 3),
+                "eager": recorder.eager.document(),
+                "replay": recorder.replayed.document(),
+            }
             pools.update((entry.pool.id, entry.pool) for entry in recorder.recordings.values())
             if recorder.domain is not None:
                 domains[id(recorder.domain)] = recorder.domain
@@ -347,6 +404,7 @@ def describe(root: Any) -> dict[str, Any]:
             answer[key] += decode[key]
     answer.update(
         captured_regions=sorted(captured),
+        regions=dict(sorted(timed.items())),
         eager_gaps=gaps,
         graph_pools=len(pools),
         graph_pool_bytes=sum(
@@ -417,23 +475,26 @@ def _region_call(
             if placed is not None
             else capture_domain(torch, _REGIONS[module][0]())
         )
+    def eager() -> Any:
+        return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+
     with recorder.domain.using(), recorder.lock:
         if recorder.landed != LANDED[0] and not recorder.forget(torch):
-            return call(module, *args, **kwargs)
+            return eager()
         recorder.attempts += 1
         attempt = placed[0].attempts if placed is not None else recorder.attempts
         if key in recorder.failed or recorder.waiting.get(key) == attempt:
-            return call(module, *args, **kwargs)
+            return eager()
         if key not in recorder.seen:
             recorder.seen.add(key)
-            return call(module, *args, **kwargs)
+            return eager()
         if placed is not None:
             if (
                 recorder.binding is not None
                 and not recorder.binding.valid()
                 and not recorder.forget(torch)
             ):
-                return call(module, *args, **kwargs)
+                return eager()
             if recorder.binding is None:
                 path = _REGIONS[module][1]
                 recorder.binding = placed[0].retain(placed[1], (path,))
@@ -446,7 +507,7 @@ def _region_call(
             if placed is not None and not placed[0].graph_accounted():
                 why = _GAPS[module] = "driver/context memory is unmeasured"
                 _failed(recorder, key, placed, why)
-                return call(module, *args, **kwargs)
+                return eager()
             # Discovery owns the complete range set and then the admitted free headroom.
             # Only the declared pure region runs here; this does not select/tune kernels.
             lease = (
@@ -460,13 +521,15 @@ def _region_call(
                 if not _unprepared(exc):
                     raise
                 recorder.waiting[key] = attempt
-                return call(module, *args, **kwargs)
+                return eager()
+            began = time.perf_counter()
             try:
                 entry = _record(torch, module, call, leaves, spec, recorder, key, placed)
             finally:
                 lease.__exit__(None, None, None)
+                recorder.capture_ms += (time.perf_counter() - began) * 1e3
             if entry is None:
-                return call(module, *args, **kwargs)
+                return eager()
         # Outputs are real allocations before the physical lease: admission sees their actual
         # allocator segments. No output allocation can fail after graph launch and cause replay.
         try:
@@ -475,7 +538,7 @@ def _region_call(
             if not _unprepared(exc):
                 raise
             recorder.waiting[key] = attempt
-            return call(module, *args, **kwargs)
+            return eager()
         lease = (
             binding.prepare(torch.cuda.current_stream()) if binding is not None else nullcontext()
         )
@@ -486,9 +549,9 @@ def _region_call(
                 raise
             del out
             recorder.waiting[key] = attempt
-            return call(module, *args, **kwargs)
+            return eager()
         try:
-            result = entry(leaves, out)
+            result = recorder.replayed.run(torch, lambda: entry(leaves, out))
             _GAPS.pop(module, None)
             recorder.replays += 1
             recorder.copy_bytes += entry.copy_bytes

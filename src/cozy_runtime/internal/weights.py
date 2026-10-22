@@ -445,7 +445,7 @@ class Backend:
         )
         model = self.memory.load(root)
         # Install explicit pure cuts and names; arbitrary package code is never replayed.
-        execution.install(root, getattr(root, "_cozy_state", ()))
+        execution.install(root)
         return model
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:

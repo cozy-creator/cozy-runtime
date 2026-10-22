@@ -259,15 +259,20 @@ def cut[T](
 
 @contextmanager
 def collective(site: str, finest: int) -> Iterator[None]:
-    """A collective's extent, `finest` its finest level: an OOM inside asks Rust as
-    `collective` (local answers only, the finer level kept for the next pass's agreement), and
-    no cut outside it goes finer. Its peak is measured as the site's."""
+    """A collective's extent, `finest` its finest level; no cut outside it goes finer. Its peak
+    is measured as the site's. An OOM inside (the allocator already made what room it could)
+    is never run again here, since peers may be waiting in its collectives: it fails the
+    request, and Rust keeps a finer level for the next pass's agreement (`r.levels`)."""
     request = CURRENT.get()
     scope = Scope(site, finest, 0, collective=True)
     _local.scopes.append(scope)
     try:
         with nullcontext() if request is None else request.site(site, True, finest):
             yield
+    except Exception as exc:
+        if request is not None and short(exc):
+            request.oom(_need(), site, True, finest)
+        raise
     finally:
         _local.scopes.remove(scope)
 
