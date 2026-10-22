@@ -175,3 +175,89 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
         graphs.release(torch, module)
         PLACED.pop(module, None)
         model.close()
+
+
+def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Path) -> None:
+    """A region that is the whole component holds every block bound from its first replay to
+    the next request: no replay waits on binding again (speed2 13522's idle before each
+    replay). A new request takes a new hold; shedding the graphs lets it go."""
+    if not torch.cuda.is_available():
+        pytest.skip("native graph residency requires CUDA")
+    memory = Memory.open(0, limit=CAP)
+    torch.manual_seed(23)
+    width = 256
+
+    def build() -> Any:
+        stack = torch.nn.Sequential(*(torch.nn.Linear(width, width) for _ in range(4)))
+        stack._no_split_modules = ("Linear",)  # each Linear a block
+        return stack
+
+    plain = build().eval()
+    source = torch.randn(2, width)
+    with torch.inference_mode():
+        expected = plain(source)
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    component = writer.component("stack", cls=("torch", "", "Module"), config={})
+    for key, value in plain.state_dict().items():
+        component.put(
+            key,
+            value.contiguous().view(torch.uint8).numpy().tobytes(),
+            dtype="F32",
+            shape=list(value.shape),
+        )
+    checkpoint = writer.commit()
+    with torch.device("meta"):
+        module = build()
+    vars(module)["_varena"] = Declared(Weights(checkpoint, "stack"))
+    model = memory.load(module, "gpu")
+    facts = measure_device(torch, 0)
+    runtime = measure_runtime(torch, "graph-hold-test")
+    plan = ResolvedModelPlan(
+        variant="test",
+        store="test",
+        snapshots={},
+        reference_variant="test",
+        policy="test",
+        tensors=(),
+        device=facts,
+        runtime=runtime,
+        placement="block_paging",
+        objective="latency",
+        construction=ConstructionFacts("test", "Sequential", ("stack",)),
+        encoded_leaves="refuse",
+    )
+    backend = Backend(
+        {},
+        [],
+        torch=torch,
+        plan=plan,
+        memory=memory,
+        device=memory.device,
+        construction="test",
+        release="test",
+        device_facts=facts,
+        qualified=(Capabilities(), QualificationResult("test", facts, "", "test", runtime, 0, [])),
+    )
+    backend.models["stack"] = model
+    placement = Placement(memory, backend)
+    assert graphs.install(torch, object(), {"stack": module})[0] == "stack"
+    try:
+        holds = []
+        for turn in range(2):
+            placement.open_attempt()
+            with torch.inference_mode(), memory.request(f"hold-{turn}", [module] * 4):
+                for _ in range(4):
+                    got = module(source.to(memory.device)).cpu()
+                    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
+                    domain = placement.graph_domain("stack")
+                    if graphs._RECORDERS[module].replays:
+                        assert domain.hold is not None and domain.held_for == placement.attempts
+                holds.append(domain.hold)
+        assert graphs._RECORDERS[module].replays == 7  # call 1 eager, then every one replays
+        assert holds[0] is not holds[1]  # a request takes its own hold
+        torch.cuda.synchronize()
+        assert graphs._shed(torch, domain) > 0 and domain.hold is None
+    finally:
+        graphs.release(torch, module)
+        PLACED.pop(module, None)
+        model.close()

@@ -399,6 +399,7 @@ def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> int:
         nbytes = owner.capture_bytes()
         for recorder in recorders:
             recorder.forget(torch)
+        owner.unhold()
         owner.drop_captures()
         return nbytes
     finally:
@@ -665,10 +666,9 @@ def _region_call(
                 raise
             recorder.waiting[key] = attempt
             return eager()
-        lease = (
-            binding.prepare(torch.cuda.current_stream()) if binding is not None else nullcontext()
-        )
         try:
+            whole = _REGIONS[module][1] == ""
+            lease = _lease(torch, recorder.domain, placed, binding, attempt, whole)
             lease.__enter__()
         except Exception as exc:
             if not _unprepared(exc):
@@ -810,6 +810,29 @@ def record_stream(torch: Any, tensor: Any, stream: Any) -> None:
     found = _lent(torch, tensor)
     if found is not None:
         found[0].readers[stream] = None
+
+
+def _lease(
+    torch: Any, owner: domain.Domain, placed: Any, binding: Any, attempt: int, whole: bool
+) -> Any:
+    """A replay's residency: its region's blocks prepared around it. A region that is the whole
+    component instead holds every block bound for the rest of the request from its first replay
+    (design §5: warm resident segments keep their backing), so no replay waits on binding them
+    again; the hold goes at the next request, when the graphs are shed, or when the fill
+    changes under it. A component that does not fit refuses the hold as it would the lease."""
+    if placed is None or binding is None:
+        return nullcontext()
+    stream = torch.cuda.current_stream()
+    if owner.hold is not None and owner.held_for != attempt:
+        owner.unhold()
+    if not whole and owner.hold is None:
+        return binding.prepare(stream)
+    if owner.hold is None:
+        owner.hold = placed[0].graph_hold(placed[1], owner.unhold)
+        owner.held_for, owner.hold_stream = attempt, stream
+    elif owner.hold_stream != stream:
+        stream.wait_stream(owner.hold_stream)
+    return nullcontext()
 
 
 def _refused(module: Any, placed: Any, why: str) -> None:

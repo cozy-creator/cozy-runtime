@@ -16,7 +16,8 @@ import threading
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -102,6 +103,9 @@ class Backend:
         #: each component's loaded model, and its LoRA bakes
         self.models: dict[str, Model] = {}
         self.bakes: dict[str, _Bakes] = {}
+        #: id(module) -> the loaded model (of any construction) and path holding it, and the module
+        self.owned: dict[int, tuple[Model, str, object]] = {}
+        self.indexed: tuple[int, ...] = ()
         #: each component's bind routes, which keep its decoded tensors for the generation
         self.routes: dict[str, _Routes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
@@ -411,6 +415,7 @@ class Backend:
             graphs.release(self.torch, model.module)
             model.close()
         self.models.clear()
+        self.owned, self.indexed = {}, ()
         for routes in self.routes.values():
             routes.close()
         self.routes.clear()
@@ -425,15 +430,37 @@ class Backend:
 
     # -- construction internals
 
-    def _owner(self, module: object) -> tuple[str, str] | None:
-        """The checkpoint component (its content id) and module path that hold `module`, when
-        a component this process loaded does, of any construction (H3's turbo overlay is its
-        own)."""
-        for model in list(self.memory.models.values()):
-            for path, sub in model.module.named_modules():
-                if sub is module:
-                    return model.key, path
-        return None
+    def _owner(self, module: object) -> tuple[Model, str] | None:
+        """The loaded model and module path that hold `module`, when a component this process
+        loaded does, of any construction (H3's turbo overlay is its own). Indexed once per set
+        of loaded models: a fill asks for every hooked linear of every block it fills."""
+        models = list(self.memory.models.values())
+        loaded = tuple(map(id, models))
+        if loaded != self.indexed:  # a model loaded, closed or reloaded since
+            self.indexed = loaded
+            self.owned = {
+                id(sub): (model, path, sub)
+                for model in models
+                for path, sub in model.module.named_modules()
+            }
+        held = self.owned.get(id(module))
+        return None if held is None or held[2] is not module else (held[0], held[1])
+
+    @contextmanager
+    def _reading(self, module: object) -> Iterator[None]:
+        """`module`'s stored tensors bound while a fill reads them outside its model's forward
+        (a LoRA source's factors): only the piece of that model which holds `module` (its
+        block, with the model's common), released once read."""
+        owned = self._owner(module)
+        if owned is None:  # not a loaded model's: its tensors are its own
+            yield
+            return
+        binding = owned[0].retain((owned[1],))
+        try:
+            with binding.prepare():
+                yield
+        finally:
+            binding.close()
 
     def _route(self, key: str) -> str:
         return str(self.selected[key].provider.route)
@@ -645,7 +672,7 @@ class _Bakes:
     def __init__(
         self, backend: Backend, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
     ) -> None:
-        self.torch, self.owner = backend.torch, backend._owner
+        self.torch, self.owner, self.reading = backend.torch, backend._owner, backend._reading
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
         self.baked = 0
@@ -705,7 +732,8 @@ class _Bakes:
                 named = self.owner(got[0])
                 if named is None:
                     return None
-                deltas.append((*named, str(got[1].dtype), str(got[2].dtype), repr(float(got[3]))))
+                dtypes = (str(got[1].dtype), str(got[2].dtype))
+                deltas.append((named[0].name, named[1], *dtypes, repr(float(got[3]))))
             held.append((stored, bake.encoding, deltas))
         return repr(held)
 
@@ -719,20 +747,30 @@ class _Bakes:
                 continue
             downs = [parts[a]["value"] for a, _, _ in bake.factors]
             ups = [parts[b]["value"] * scale for _, b, scale in bake.factors]
-            for hook in bake.hooks:
-                got = hook.lora_factors()
-                if got is not None:
+            torch, named, got = self.torch, None, None
+            # A hook's factors are another model's tensors, read here outside its forward: each
+            # bound as its own piece only while copied (a few MB each, not the source whole),
+            # then asked for again, as the bound tensors.
+            with ExitStack() as reading:
+                for hook in bake.hooks:
+                    named = hook.lora_factors()
+                    if named is None:
+                        continue
+                    reading.enter_context(self.reading(named[0]))
+                    got = hook.lora_factors()
+                    assert got is not None
                     downs.append(got[1])
                     ups.append(got[2] * got[3])
-            if not downs:
+                delta = bool(downs)
+                if delta:
+                    kind = downs[0].dtype
+                    down = torch.cat([d.to(kind) for d in downs])
+                    up = torch.cat([u.to(kind) for u in ups], dim=1)
+                del named, got, downs, ups  # no view of a source outlives its piece's bind
+            if not delta:
                 continue
-            kind, torch = downs[0].dtype, self.torch
             lora_bake.bake(
-                torch,
-                dict(weight),
-                torch.cat([d.to(kind) for d in downs]),
-                torch.cat([u.to(kind) for u in ups], dim=1),
-                seed=zlib.crc32(f"{identity}\0{stored}".encode()),
+                torch, dict(weight), down, up, seed=zlib.crc32(f"{identity}\0{stored}".encode())
             )
             self.baked += 1
 
@@ -792,6 +830,11 @@ class Placement:
     def graph_segments(self, component: str) -> tuple[str, ...]:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)
+
+    def graph_hold(self, component: str, shed: Callable[[], None]) -> Any:
+        """Every block of the component bound until released: a request's replays keep their
+        backing instead of binding it again around each one."""
+        return self.models[component].hold(shed)
 
     def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
         return self.models[component].passing(entry, args, kwargs)

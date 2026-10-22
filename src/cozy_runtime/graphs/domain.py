@@ -56,6 +56,11 @@ class Domain:
         self.captures: Any = None
         self.cache: Any = None
         self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
+        #: the component's blocks held bound across a request's replays (`Model.hold`), the
+        #: request it was taken in, and the stream it bound on
+        self.hold: Any = None
+        self.held_for = -1
+        self.hold_stream: Any = None
 
     def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
@@ -167,6 +172,7 @@ class Domain:
             if self.owner is not None:
                 self.owner.reset()
                 self.owner = None
+            self.unhold()
             self.drop_captures()
             self.pool = None  # MemPool destruction releases this pool, never a global flush.
             for stream in (self.stream, self.control):
@@ -182,6 +188,12 @@ class Domain:
                 self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
             )
         return self.captures
+
+    def unhold(self) -> None:
+        """The blocks go back to binding per use (their pins drop after the queued uses)."""
+        hold, self.hold, self.held_for, self.hold_stream = self.hold, None, -1, None
+        if hold is not None:
+            hold.release()
 
     def drop_captures(self) -> None:
         """After every graph recorded into it is reset and its static buffers dropped."""
