@@ -22,7 +22,16 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from tensorfs.varena.torch import Cache, Declared, Level, Memory, Model, Weights, blocks_of
+from tensorfs.varena.torch import (
+    Binding,
+    Cache,
+    Declared,
+    Level,
+    Memory,
+    Model,
+    Weights,
+    blocks_of,
+)
 
 from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
@@ -869,7 +878,7 @@ class Placement:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)
 
-    def graph_whole(self, component: str, binding: Any) -> bool:
+    def graph_whole(self, component: str, binding: Binding) -> bool:
         """`binding` covers every block of the component."""
         model = self.models[component]
         return len(binding.blocks) == sum(
