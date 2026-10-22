@@ -782,6 +782,9 @@ class Executor:
         #: HOST ONLY: its GPUs' grants from `Start`, a table and an events descriptor per GPU
         #: (rank 0 hands follower r the r-th, a follower holds its own)
         self.ledgers: list[int] = []
+        #: Why varena runs standalone on a private table, outside TensorD's ledger ("" it does
+        #: not): an older TensorD's grant this Runtime cannot use (skew degrades)
+        self.standalone = ""
         #: The machine's sealed TensorFS cache directory.
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -1548,7 +1551,8 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        if (command.devices or command.ledgers) and command.memory_protocol != 1:
+        if (command.devices or command.ledgers) and command.memory_protocol > 1:
+            # A newer TensorD's grant layout is unknown here: its descriptors stay unread.
             self.poisoned = "incompatible memory protocol"
             return {
                 "ok": False,
@@ -1557,7 +1561,19 @@ class Executor:
                 f"TensorD supplied {command.memory_protocol}. Upgrade TensorD, Runtime "
                 "and TensorFS together.",
             }
-        ledgers = [fd for _ in range(command.ledgers) for fd in self.channel.recv_ledger()]
+        if command.ledgers and command.memory_protocol < 1:
+            # An older TensorD hands each GPU's pre-varena ledger (a memfd and an eventfd),
+            # which this Runtime cannot use: they close, and varena runs standalone.
+            for fd in self.channel.recv_fds(2 * command.ledgers):
+                os.close(fd)
+            self.standalone = (
+                f"TensorD's memory protocol {command.memory_protocol} predates this Runtime's "
+                "(1): varena runs standalone on a private table, outside the machine's ledger"
+            )
+            print(f"[memory] {self.standalone}", file=sys.stderr, flush=True)
+            ledgers: list[int] = []
+        else:
+            ledgers = [fd for _ in range(command.ledgers) for fd in self.channel.recv_ledger()]
         if self.poisoned or self.ledgers:
             for fd in ledgers:  # one set per process
                 os.close(fd)
@@ -1862,6 +1878,7 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
+            **({"memory_standalone": self.standalone} if self.standalone else {}),
         }
 
     def _model_classes(self) -> list[type[Model[Any]]]:
