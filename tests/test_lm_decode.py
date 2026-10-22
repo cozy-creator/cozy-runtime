@@ -159,12 +159,18 @@ def test_windows_double_up_to_the_capacity() -> None:
 
 
 @pytest.mark.skipif(DEVICE != "cuda", reason="CUDA graphs need a GPU")
-def test_decode_replays_graphs_on_cuda(capfd: pytest.CaptureFixture[str]) -> None:
+def test_decode_replays_graphs_on_cuda() -> None:
     torch.manual_seed(2)
     model = _qwen3_5()
     ids = torch.randint(10, 290, (1, 300), device=DEVICE)
     _same(model, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, 64)
-    assert "(graphs)" in capfd.readouterr().err
+    engine = lm._ENGINES[model]
+    assert len(engine.graphs) == 1 and engine.captured[0] == 1
+    assert engine.eager == 1  # the real first token initializes the exact capture pool
+    recorded = next(iter(engine.graphs.values()))
+    _same(model, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, 64)
+    assert next(iter(engine.graphs.values())) is recorded
+    assert engine.captured[0] == 1 and engine.eager == 1
 
 
 def test_running_out_of_memory_never_restarts_a_prefill() -> None:
