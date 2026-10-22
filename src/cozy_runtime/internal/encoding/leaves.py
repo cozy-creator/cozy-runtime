@@ -30,6 +30,7 @@ from cozy_runtime.author.kernels import (
     INT8_CONVROT,
     ROWWISE_FP8,
     PreQuantized,
+    readable,
     shared_operand,
 )
 from cozy_runtime.internal import fp8_linear, int8_linear, nvfp4_linear
@@ -198,23 +199,28 @@ def _native_leaf_class(torch: ModuleType) -> type:
         BUFFERS: ClassVar[dict[str, str]] = {"weight": "data"}  # no `.weight` on this leaf
 
         def linear(self, x: Tensor | PreQuantized, prequantized: PreQuantized | None) -> Tensor:
+            # The ops launch by pointer: a leaf run outside its model's forward (Klein's
+            # modulation heads) has its weight read in (cr-208).
             ops = _NATIVE_OPS[self.provider]
             out_dtype = self.out_dtype
-            if isinstance(x, PreQuantized):
-                # A producer's prologue (`kernels.int8_rows`) hands the operand in place of x.
-                if torch.is_autocast_enabled(x.payload.device.type):
-                    out_dtype = torch.get_autocast_dtype(x.payload.device.type)
-                return ops.gemm(torch, x, self.data, self.scale, self.bias, out_dtype)
-            cast = x
-            if torch.is_autocast_enabled(x.device.type):
-                # As the replaced `nn.Linear` does: from and to the autocast dtype.
-                out_dtype = torch.get_autocast_dtype(x.device.type)
-                cast = x.to(out_dtype)
-            if prequantized is None or prequantized.provider != self.provider:
-                prequantized = shared_operand(x, self.provider, lambda: ops.quantize(torch, cast))
-            if prequantized is not None:
-                return ops.gemm(torch, prequantized, self.data, self.scale, self.bias, out_dtype)
-            return ops.linear(torch, cast, self.data, self.scale, self.bias, out_dtype)
+            with readable(self.data, self.scale, self.bias) as (data, scale, bias):
+                if isinstance(x, PreQuantized):
+                    # A producer's prologue (`kernels.int8_rows`) hands the operand in place of x.
+                    if torch.is_autocast_enabled(x.payload.device.type):
+                        out_dtype = torch.get_autocast_dtype(x.payload.device.type)
+                    return ops.gemm(torch, x, data, scale, bias, out_dtype)
+                cast = x
+                if torch.is_autocast_enabled(x.device.type):
+                    # As the replaced `nn.Linear` does: from and to the autocast dtype.
+                    out_dtype = torch.get_autocast_dtype(x.device.type)
+                    cast = x.to(out_dtype)
+                if prequantized is None or prequantized.provider != self.provider:
+                    prequantized = shared_operand(
+                        x, self.provider, lambda: ops.quantize(torch, cast)
+                    )
+                if prequantized is not None:
+                    return ops.gemm(torch, prequantized, data, scale, bias, out_dtype)
+                return ops.linear(torch, cast, data, scale, bias, out_dtype)
 
         def int8_prologue(
             self,

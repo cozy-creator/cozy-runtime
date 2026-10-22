@@ -1547,7 +1547,7 @@ class _Engine:
         kind = torch.bool if self.closed is False else self.model.dtype
         mask = torch.full((size, 1, 1, capacity), self.closed, dtype=kind, device=device)
         stops = max(8, max((len(r.request.stops) for r in held), default=0))
-        vocab = int(self.model.get_output_embeddings().weight.shape[0])
+        vocab = int(self.model.get_output_embeddings().out_features)  # an int8 head: no .weight
         long = {"dtype": torch.long, "device": device}
         fields = {
             "ids": torch.zeros((size, 1), **long),
