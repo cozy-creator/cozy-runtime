@@ -37,6 +37,12 @@ _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
 #: The component root call in flight: a region's purity and structure are read once per pass.
 _PASS: contextvars.ContextVar[object | None] = contextvars.ContextVar("cozy_graphs_pass")
 _PLAIN = (type(None), bool, int, float, str)
+#: graph owners beside the regions (the LM engine's decode steps), each its (snapshot, release)
+#: of a component root, registered by its module when a package imports it: a Runtime serving no
+#: LM never imports Transformers for them (v7: 2.8 s of executor imports)
+DECODERS: list[
+    tuple[Callable[[Any], tuple[dict[str, int], list[Any], Any]], Callable[[Any], None]]
+] = []
 _SAID: set[str] = set()
 
 
@@ -468,8 +474,6 @@ def describe(root: Any) -> dict[str, Any]:
     count each live pool once (a device's shared pool under the first component it served);
     driver/context and pending native frees remain ledger facts.
     """
-    from cozy_runtime import lm
-
     pools: dict[tuple[int, int], Any] = {}
     domains: dict[int, domain.Domain] = {}
     answer: dict[str, Any] = dict.fromkeys(
@@ -533,14 +537,21 @@ def describe(root: Any) -> dict[str, Any]:
     shared = domain.existing(root)
     if shared is not None:
         domains[id(shared)] = shared
-    decode, decode_pools, decode_domain = lm._graph_snapshot(root)
-    pools.update((pool.id, pool) for pool in decode_pools)
-    if decode_domain is not None:
-        domains[id(decode_domain)] = decode_domain
-    if decode:
-        answer["decode"] = decode
-        for key in ("active_graphs", "capture_attempts", "captures", "retired_graphs", "replays"):
-            answer[key] += decode[key]
+    for snapshot, _ in DECODERS:
+        decode, decode_pools, decode_domain = snapshot(root)
+        pools.update((pool.id, pool) for pool in decode_pools)
+        if decode_domain is not None:
+            domains[id(decode_domain)] = decode_domain
+        if decode:
+            answer["decode"] = decode
+            for key in (
+                "active_graphs",
+                "capture_attempts",
+                "captures",
+                "retired_graphs",
+                "replays",
+            ):
+                answer[key] += decode[key]
     answer.update(
         captured_regions=sorted(captured),
         regions=dict(sorted(timed.items())),
@@ -1066,6 +1077,7 @@ def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
 
 __all__ = [
     "BYPASS",
+    "DECODERS",
     "capture",
     "capture_device",
     "capture_domain",
