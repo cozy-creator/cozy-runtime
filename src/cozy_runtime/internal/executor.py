@@ -146,6 +146,7 @@ from cozy_runtime.internal import (
     int8_linear,
     kernel_cache,
     kernel_compile,
+    library_oom,
     model_config,
     package_interface,
     prebuilt,
@@ -2578,6 +2579,8 @@ class Executor:
                 )
             _split.install(cuts.split)
             attention_ulysses.install(cuts.attend)
+            if device.type == "cuda":
+                library_oom.install(torch)
         backend = Backend(
             checkpoints,
             rows,
@@ -4688,13 +4691,17 @@ class Executor:
         lane's device: the worker sealed this process to exactly its lane (cr-066)."""
         return Device(self.device_kind, 0) if self.torch is not None else Device()
 
-    def _request(self, request_id: str) -> contextlib.AbstractContextManager[MemoryRequest | None]:
+    @contextlib.contextmanager
+    def _request(self, request_id: str) -> Iterator[MemoryRequest | None]:
         """The attempt as varena's request (memory-varena §5.7): everything it allocated is freed
-        at its end, failed or not, and its steps are measured."""
+        at its end, failed or not, and its steps are measured. Its thread's allocation failures
+        are varena's to answer, never a library's silent fallback (`library_oom`)."""
         memory = self.host.memory
         if memory is None:
-            return contextlib.nullcontext()
-        return memory.request(request_id)
+            yield None
+            return
+        with memory.request(request_id) as request, library_oom.surfaced():
+            yield request
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
