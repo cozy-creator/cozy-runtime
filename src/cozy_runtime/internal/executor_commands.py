@@ -227,6 +227,9 @@ class Binding(Release, frozen=True, kw_only=True):
     package: str = ""
     model: str = ""
     adapters: tuple[Adapter, ...] = ()
+    #: In a group, each placeable component's GPU (an index within it): 0 keeps it beside the
+    #: serial scope, g >= 1 keeps it resident on GPU g, where its calls and remote scopes run.
+    homes: dict[str, int] = {}
 
     def parameter_names(self) -> tuple[str, ...]:
         """Every declared name for this shared construction, its primary first."""
@@ -330,6 +333,8 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     #: None honors installed per-field bounds; zero retains the older default ceiling.
     max_input_bytes: int | None = None
     construction: str = ""
+    #: The family whose GPUs its calls share: a wait on a child call yields its room to it.
+    family: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
     #: Each `Weights[M]` parameter's checkpoint, opened directly through TensorFS.

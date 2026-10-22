@@ -202,7 +202,6 @@ from cozy_runtime.internal.parallel.group import (
     RankSpec,
     abort_process_group,
     join_rank,
-    receive_residence,
 )
 from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
@@ -1409,10 +1408,11 @@ class Executor:
             self.group.close()
         return {"ok": False, "code": exc.code, "detail": exc.message[:900]}
 
-    def _install_group(self, torch: Any, model: Any, capacity: int = 0) -> dict[str, Any] | None:
-        """Every rank shards its replica, takes its side of the mirror, and agrees which
-        follower keeps each placeable component that rank 0 has no room for. `capacity` is
-        the ceiling the group agreed at load."""
+    def _install_group(
+        self, torch: Any, model: Any, homes: Mapping[str, int]
+    ) -> dict[str, Any] | None:
+        """Every rank shards its replica, takes its side of the mirror, and keeps the placeable
+        components TensorD homed on its GPU (`Binding.homes`, decided by varena)."""
         if self.world <= 1:
             return None
         owner = self.host
@@ -1455,14 +1455,13 @@ class Executor:
                     progress=functools.partial(_allocations, torch),
                     device=self._rank_device(torch),
                 )
-        hosted = mirror.hosting_plan(
-            placeable=tuple(getattr(type(model), "__placeable__", ())),
-            sizes=self.backend.sizes(),
-            sharded={name[1] for name in owner.group_sharded if name[0] == self._group_model_key},
-            scopes=component_use(type(model)),
-            capacity=capacity,
-            world=self.world,
-        )
+        sharded = {name[1] for name in owner.group_sharded if name[0] == self._group_model_key}
+        hosted = {component: gpu for component, gpu in homes.items() if gpu}
+        for component, gpu in hosted.items():
+            if component not in roots or component in sharded or not 0 < gpu < self.world:
+                return self._group_refusal(
+                    GroupRefusal(f"{component} cannot be homed on GPU {gpu}", code="group_unformed")
+                )
         for component_name, home in hosted.items():
             name = (self._group_model_key, component_name)
             owner.group_hosted[name] = home
@@ -2285,7 +2284,6 @@ class Executor:
         stage("cuda_init")
         from cozy_runtime.author import ModelRegistry
         from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
-        from cozy_runtime.author._model import component_use
         from cozy_runtime.internal.derive import Observations, serving_substrate
         from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
         from cozy_runtime.internal.planfacts import PlanFacts
@@ -2526,36 +2524,6 @@ class Executor:
             custody=binding.custody,
         )
         stage("backend_ctor")
-        # THE GROUP AGREES ITS PLAN before any rank registers a byte (cr-068), and the smallest
-        # device any rank has: what a placeable component's home may hold.
-        total = accel.allocation(torch, self.device_kind)["driver_total_bytes"]
-        try:
-            if self.world > 1 and self.rank == 0:
-                assert self.group is not None
-                agreed, _ = self.group.agree_residence(
-                    model=self._group_model_key,
-                    plan=mine.document(),
-                    required=0,
-                    park=lambda _need: [],
-                    ceiling=lambda: total,
-                )
-            elif self.world > 1:
-                agreed = receive_residence(
-                    self.channel,
-                    rank=self.rank,
-                    model=self._group_model_key,
-                    plan=mine.document(),
-                    required=0,
-                    park=lambda _keys: None,
-                    ceiling=lambda: total,
-                )
-            else:
-                agreed = total
-        except (GroupRefusal, SeamError) as exc:
-            return self._group_refusal(
-                exc if isinstance(exc, GroupRefusal) else GroupRefusal(str(exc))
-            )
-        stage("admission")
         artifact = Artifact(
             reference.snapshot,
             tensor_schema_of(rows),
@@ -2723,6 +2691,15 @@ class Executor:
                         )
                     )
                 theirs = dict(reply.get("facts") or {})
+                try:  # THE FOLLOWERS RESOLVED THE SAME PLAN (cr-068)
+                    GroupPlan.read(theirs.get("group_plan") or {}).assert_agrees(
+                        mine, rank=follower.rank
+                    )
+                except (GpuDivergence, msgspec.ValidationError) as exc:
+                    return self._group_refusal(
+                        exc if isinstance(exc, GpuDivergence) else
+                        GpuDivergence(follower.gpu, "group_plan", str(exc))
+                    )
                 if theirs.get("filled_bytes") != record.filled_bytes:
                     return self._group_refusal(
                         GpuDivergence(
@@ -2736,7 +2713,7 @@ class Executor:
             if refused is not None:
                 return refused
         self.facts = {}
-        refused = self._install_group(torch, model, agreed)
+        refused = self._install_group(torch, model, binding.homes)
         if refused is None and self.rank == 0:
             # The execution plan's kernels already built for every GPU install now, before
             # the first request, on every GPU (`_install_ready_kernels`).
@@ -2771,6 +2748,7 @@ class Executor:
             "execution_plan": planned,
             "filled": record.filled,
             "filled_bytes": record.filled_bytes,
+            **({"group_plan": mine.document()} if self.rank else {}),
             "device_free_bytes": memory["driver_free_bytes"],
             "device_total_bytes": memory["driver_total_bytes"],
             "allocator_bytes": memory["allocated_bytes"],
@@ -3420,7 +3398,7 @@ class Executor:
                             ),
                             publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
-                                command.request_id, self.host.call_interfaces
+                                command.request_id, command.family, self.host.call_interfaces
                             ),
                         ),
                     )
@@ -4241,9 +4219,9 @@ class Executor:
                 proxy.__module__ = module
                 imported.__dict__[export] = proxy
 
-    def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
+    def _call_broker(self, request_id: str, family: str, rows: tuple[CallInterface, ...]) -> Any:
         """This attempt's broker over `rows`, bound once per executor (a served package's
-        attempts share its Start's rows)."""
+        attempts share its Start's rows); a wait on a child yields to `family`."""
         if not rows:
             return None
         if self._bound_calls is None or self._bound_calls[0] is not rows:
@@ -4254,14 +4232,14 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
-            functools.partial(self._yielding, request_id),
+            functools.partial(self._yielding, request_id, family),
         )
 
-    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[object]:
-        """While the attempt waits on a child call, its request yields its reserved room to the
-        child; its allocated tensors stay counted (`r.yielding`)."""
+    def _yielding(self, request_id: str, family: str) -> contextlib.AbstractContextManager[object]:
+        """While the attempt waits on a child call, its request yields its reserved room to its
+        `family` alone; its allocated tensors stay counted (`r.yielding`)."""
         request = self.host.requests.get(request_id)
-        return contextlib.nullcontext() if request is None else request.yielding()
+        return contextlib.nullcontext() if request is None else request.yielding(family)
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:

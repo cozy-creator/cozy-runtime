@@ -563,71 +563,39 @@ def test_an_oom_on_one_rank_becomes_the_same_cut_on_every_rank(tmp_path: Path, s
 # ------------------------------------------------------------ in place, park, package code
 
 
-class UpBlock(nn.Module):  # type: ignore[misc]
-    """A VAE up-block's shape: norm, SiLU, conv; the SiLU's input is dead after it."""
+class LateRead(nn.Module):  # type: ignore[misc]
+    """Writes a buffer it did not make (so it runs under the layer); from its second run a
+    phase reads its SiLU's input after the SiLU (py-review-2's case 5)."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.norm, self.conv = nn.GroupNorm(4, 16), nn.Conv2d(16, 16, 3, padding=1)
+        torch.manual_seed(0)
+        self.lin = nn.Linear(8, 8)
+        self.register_buffer("hits", torch.zeros(1))
+        self.step = 0
 
     def forward(self, x: Any) -> Any:
-        return self.conv(torch.nn.functional.silu(self.norm(x)))
+        self.hits.add_(1)
+        h = self.lin(x)
+        a = torch.nn.functional.silu(h)
+        if self.step >= 1:
+            a = a + h
+        self.step += 1
+        return a
 
 
-class Decoder(nn.Module):  # type: ignore[misc]
-    _no_split_modules = ("UpBlock",)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.up = UpBlock()
-
-    def forward(self, x: Any) -> Any:
-        return self.up(torch.nn.functional.interpolate(x, scale_factor=2.0))
-
-
-def decoder() -> Decoder:
-    torch.manual_seed(12)
-    model = Decoder()
-    model.to(BF16).eval()
-    return model
-
-
-def silu_or_conv(func: Any) -> bool:
-    """The SiLU's result beside its input, and the conv's working memory (`Card`)."""
-    return func.overloadpacket in (torch.ops.aten.silu, torch.ops.aten.convolution)
-
-
-def test_a_silu_whose_input_is_dead_runs_in_place_else_needs_the_park(tmp_path: Path) -> None:
-    """At 40 KiB the up-block's [16, 32, 32] SiLU beside its input does not fit. Cold, nothing
-    has shown its input dead: Rust's answers reach Park, and a CPU has nothing to park, so the
-    request is exhausted. Once a run has shown the input dead, the SiLU runs in place, the conv
-    in bands, and the result is the whole one."""
-    plain = decoder()
-    ck = checkpoint(tmp_path, "decoder", plain)
-    x = torch.randn(1, 16, 16, 16, generator=torch.Generator().manual_seed(13)).to(BF16)
+def test_a_layered_block_runs_its_ops_as_written() -> None:
+    """No op is rewritten (an activation in place would have read the first run's liveness
+    into a later one): every run of a layered block equals the plain module's, bit for bit."""
+    plain, caught = LateRead(), LateRead()
+    catch.wrap(caught, catch.Block("block", caught))
+    xs = [torch.randn(2, 8, generator=torch.Generator().manual_seed(n)) for n in range(3)]
+    mem = memory()
     with torch.no_grad():
-        want = plain(x)
-        cold = memory()
-        model = placed(cold, ck, "decoder", decoder)
-        with (
-            pytest.raises(Exception) as raised,
-            Card(limit=40 << 10, working=silu_or_conv),
-            cold.request("cold") as r,
-            execution.serving(r),
-        ):
-            model(x)
-        assert fault(raised.value) is Fault.EXHAUSTED and r.stats().parks >= 1
-        warm = memory()
-        model = placed(warm, ck, "decoder", decoder)
-        with warm.request("warm") as r, execution.serving(r):
-            assert torch.equal(model(x), want)
-        card = Card(limit=40 << 10, working=silu_or_conv)
-        with card, warm.request("short") as r, execution.serving(r):
-            got = model(x)
-    assert card.refused and r.stats().parks == 0
-    error = (got.float() - want.float()).abs().max().item()
-    print(f"up-block, SiLU in place, conv in bands: max error {error:.3g} against whole")
-    torch.testing.assert_close(got, want, rtol=2**-7, atol=2**-7)
+        want = [plain(x) for x in xs]
+        with mem.request("late read") as r, execution.serving(r):
+            got = [caught(x) for x in xs]
+    assert all(torch.equal(a, b) for a, b in zip(got, want, strict=True))
 
 
 class Short(TorchDispatchMode):  # type: ignore[misc]

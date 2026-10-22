@@ -5,8 +5,8 @@ Op bands (the layer's, `catch.RULES`): conv only, by images, else by output chan
 groups), each band written by the conv's `out` form into its slice of the result, so its
 workspace shrinks with the band (measured on a GPU: tests/test_band_live_bytes.py). Nearest
 upsampling and group norm keep no working memory beyond their results: bands save nothing
-there, and Rust cuts the call around them (a package's `split`). SiLU and GELU run in place when
-their input is dead (`catch`), else Rust parks.
+there, and Rust cuts the call around them (a package's `split`). An activation's result beside
+its input is Rust's to park, never an op rewritten in place.
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
 """
@@ -349,7 +349,7 @@ def split[T](name: str, key: str, total: int, finest: int, run: Callable[[int], 
     def at(level: int) -> T:
         return run(max(pieces(total, level), finest))
 
-    return catch.cut(f"split:{key}", levels(-(-total // max(finest, 1))), at, ())
+    return catch.cut(f"split:{key}", levels(-(-total // max(finest, 1))), at, (), str(total))
 
 
 def launch[T](operands: Sequence[object], run: Callable[[], T]) -> T:

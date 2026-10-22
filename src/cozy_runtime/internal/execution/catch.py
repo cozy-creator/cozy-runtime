@@ -59,9 +59,14 @@ class Request(Protocol):
     """varena's request handle, as the execution layer uses it."""
 
     def oom(
-        self, need: int | None, site: str | None, collective: bool = False, finest: int = 0
+        self,
+        need: int | None,
+        site: str | None,
+        collective: bool = False,
+        finest: int = 0,
+        shape: str = "",
     ) -> Next: ...
-    def cut(self, site: str) -> int: ...
+    def cut(self, site: str, shape: str = "") -> int: ...
     def measured(self) -> bool: ...
     def levels(self) -> list[tuple[str, int]]: ...
     def agree(self, levels: list[tuple[str, int]]) -> None: ...
@@ -97,18 +102,16 @@ class Scope:
     collective: bool = False
     operands: object = ()
     ordinals: dict[str, int] = field(default_factory=dict)
+    #: its operands' shape key: Rust keeps a level per (site, shape)
+    shape: str = ""
 
 
 @dataclass(eq=False, slots=True)
 class _Run:
-    """A block running: how many ops of each kind it ran under the layer (their cut sites) and
-    how many ops in all (each op's index: the same in every run of the block)."""
+    """A block running: how many ops of each kind it ran under the layer (their cut sites)."""
 
     block: Block
     ordinals: dict[str, int] = field(default_factory=dict)
-    ops: int = 0
-    #: its ops so far are its first run's (`Block.ops`): an in-place op there is the same op
-    same: bool = True
 
     def site(self, kind: str) -> str:
         n = self.ordinals[kind] = self.ordinals.get(kind, 0) + 1
@@ -174,6 +177,11 @@ def piece() -> None:
         _local.scopes[-1].ordinals.clear()
 
 
+def shape_key(operands: object) -> str:
+    """The shapes of the tensors in `operands`, as Rust keys a site's level by them."""
+    return "|".join("x".join(map(str, t.shape)) for t in tensors(operands))
+
+
 def short(exc: BaseException) -> bool:
     """An allocation failure the catch may answer: not one a writing op raised, nor in a
     capture (a graph cannot run an op twice)."""
@@ -218,7 +226,7 @@ def answer(
     if scope is None:
         found = request.oom(nbytes, None)
     else:
-        found = request.oom(nbytes, scope.site, collective, scope.finest)
+        found = request.oom(nbytes, scope.site, collective, scope.finest, scope.shape)
     match found:
         case Next.Retry():
             return
@@ -250,14 +258,18 @@ def settle[T](run: Callable[[], T], own: Scope | None, operands: object, first: 
         answer(request, nbytes, own, operands, first)
 
 
-def cut[T](site: str, finest: int, run: Callable[[int], T], operands: object) -> T:
+def cut[T](
+    site: str, finest: int, run: Callable[[int], T], operands: object, shape: str | None = None
+) -> T:
     """`run(level)` for a call that cuts itself (FFN tokens, attention pieces, a package's
-    split, a norm's bands): at the level Rust holds for `site`, finer when it or an op inside it
-    ran out and Rust cut it. Its peak is measured as the site's (`r.site`)."""
+    split, a norm's bands): at the level Rust holds for `site` at its `shape` (its operands'
+    shapes when None), finer when it or an op inside it ran out and Rust cut it. Its peak is
+    measured as the site's (`r.site`)."""
     request = CURRENT.get()
     if request is None:
         return run(0)
-    scope = Scope(site, finest, request.cut(site), operands=operands)
+    key = shape_key(operands) if shape is None else shape
+    scope = Scope(site, finest, request.cut(site, key), operands=operands, shape=key)
     _local.scopes.append(scope)
 
     def whole() -> T:
@@ -300,7 +312,7 @@ def attempt[T](run: Callable[[], T], operands: object) -> T:
     runs again as an op does. A block whose first run launches it writes what its operands are,
     as far as the layer can tell: one it did not make keeps the block from running bare."""
     for journal in _local.layer.journals if _local.layer is not None else ():
-        journal.wrote |= any(journal.key(p) not in journal.made for p in _storages(operands))
+        journal.wrote |= any(p not in journal.made for p in _storages(operands))
     return settle(run, None, operands)
 
 
@@ -423,9 +435,8 @@ class Block:
     """A block for the catch: its site name, the model root its declared `state` paths are
     under, and what its first run showed (`bare` None: not run yet): whether it may run bare,
     whether it joins a collective, the generators it draws from, the attributes it rebinds and the
-    lists and dicts it changes in place, the
-    ops whose first input is dead after them (by index among its ops, which were `ops`), and the
-    input shapes at which it ran out bare in a collective."""
+    lists and dicts it changes in place, and the input shapes at which it ran out bare in a
+    collective."""
 
     name: str
     root: nn.Module
@@ -435,8 +446,6 @@ class Block:
     generators: tuple[torch.Generator, ...] = ()
     changes: tuple[tuple[object, str], ...] = ()
     contents: tuple[list[object] | dict[object, object], ...] = ()
-    dead: frozenset[int] = frozenset()
-    ops: tuple[OpOverload, ...] = ()
     short: set[tuple[object, ...]] = field(default_factory=set)
 
 
@@ -481,7 +490,7 @@ def run[T](
         with _layer() as layer:
             if block.bare is not None:
                 return forward(*args, **kwargs)
-            journal = _Journal(_local.run)
+            journal = _Journal()
             before, short_before = _attributes(module), layer.short
             layer.journals.append(journal)
             try:
@@ -491,8 +500,6 @@ def run[T](
         block.bare = not journal.wrote and layer.short == short_before
         block.joined, block.generators = journal.joined, tuple(journal.generators.values())
         block.changes, block.contents = _changed(module, before, _attributes(module))
-        block.dead = journal.dead((out, args, kwargs, _held(module)))
-        block.ops = tuple(journal.ops) if block.dead else ()
         return out
     finally:
         _local.run = outer
@@ -547,11 +554,6 @@ def _unlayered() -> Iterator[None]:
 
 def _shapes(value: object) -> tuple[object, ...]:
     return tuple((tuple(t.shape), t.dtype) for t in tensors(value))
-
-
-def _held(module: nn.Module) -> list[object]:
-    """The tensors a module tree holds as attributes after a run, lists and dicts included."""
-    return [v for m in module.modules() for v in vars(m).values()]
 
 
 @contextmanager
@@ -677,41 +679,18 @@ def _trait(func: OpOverload) -> tuple[bool, bool, bool, Rule | None]:
     return writes, seeded, fresh, RULES.get(func.overloadpacket)
 
 
-#: elementwise ops with an in-place form: run in place when their input is dead after them
-_IN_PLACE = {torch.ops.aten.silu.default: torch.ops.aten.silu_.default}
-_IN_PLACE[torch.ops.aten.gelu.default] = torch.ops.aten.gelu_.default
-
-
-#: a storage as a journal tells them apart: its address, and how many storages its ops made there
-#: (an allocator gives a freed address to the next result)
-type _Key = tuple[int, int]
-
-
 @dataclass(eq=False, slots=True)
 class _Journal:
-    """A block's first run (`run`): the storages its ops made, whether one wrote into any other,
-    whether it joined a collective, the generators its seeded ops drew from, and each storage's
-    last read, for the in-place ops whose input is dead after them."""
+    """A block's first run: the storages its ops made, whether one wrote into any other (a
+    storage alive then is no freed address its ops made again), whether it joined a
+    collective, and the generators its seeded ops drew from."""
 
-    run: _Run
-    made: set[_Key] = field(default_factory=set)
-    births: dict[int, int] = field(default_factory=dict)
+    made: set[int] = field(default_factory=set)
     wrote: bool = False
     joined: bool = False
     generators: dict[int, torch.Generator] = field(default_factory=dict)
-    #: ops it saw, the last op that read each storage, and its own in-place candidates: the
-    #: op it saw as which, its index in its run, and the storage of its input
-    seen: int = 0
-    last: dict[_Key, int] = field(default_factory=dict)
-    candidates: list[tuple[int, int, _Key]] = field(default_factory=list)
-    #: its own run's ops in order (not a nested block's)
-    ops: list[OpOverload] = field(default_factory=list)
 
-    def key(self, at: int) -> _Key:
-        """The storage at address `at` now."""
-        return at, self.births.get(at, 0)
-
-    def before(self, func: OpOverload, args: Args, kwargs: Kwargs, index: int) -> None:
+    def before(self, func: OpOverload, args: Args, kwargs: Kwargs) -> None:
         writes, seeded, _, _ = _trait(func)
         self.joined |= func.namespace in _COLLECTIVES
         if writes and not self.wrote:
@@ -721,31 +700,13 @@ class _Journal:
                 for i, a in enumerate(schema)
                 if a.alias_info is not None and a.alias_info.is_write
             ]
-            self.wrote = any(self.key(p) not in self.made for p in _storages(written))
+            self.wrote = any(p not in self.made for p in _storages(written))
         if seeded:
             self.generators.update((id(g), g) for g in _generators(func, args, kwargs))
-        self.seen += 1
-        self.last.update((self.key(p), self.seen) for p in _storages((args, kwargs)))
-        if _local.run is self.run:
-            self.ops.append(func)
-        if func in _IN_PLACE and _local.run is self.run and args:
-            self.candidates.append((self.seen, index, self.key(_storage(tensors(args[0])[0]))))
 
     def after(self, func: OpOverload, out: object) -> None:
         if _trait(func)[2]:
-            for p in _storages(out):
-                self.births[p] = self.births.get(p, 0) + 1
-                self.made.add(self.key(p))
-
-    def dead(self, escaped: object) -> frozenset[int]:
-        """The in-place candidates whose input the block made and nothing read after them, nor
-        holds once it returns (its result, its arguments, its modules' attributes)."""
-        kept = {self.key(p) for p in _storages(escaped, depth=4)}
-        return frozenset(
-            index
-            for seen, index, p in self.candidates
-            if p[0] and p in self.made and self.last.get(p) == seen and p not in kept
-        )
+            self.made.update(_storages(out))
 
 
 class Layer(TorchDispatchMode):  # type: ignore[misc]
@@ -765,34 +726,16 @@ class Layer(TorchDispatchMode):  # type: ignore[misc]
         self, func: OpOverload, types: object, args: Args = (), kwargs: Kwargs | None = None
     ) -> object:
         kwargs = kwargs or {}
-        run = _local.run
-        index = -1 if run is None else run.ops
-        if run is not None:
-            run.ops += 1
-            ops = run.block.ops
-            run.same = run.same and index < len(ops) and ops[index] is func
         for journal in self.journals:
-            journal.before(func, args, kwargs, index)
-        out = self._run(func, args, kwargs, index)
+            journal.before(func, args, kwargs)
+        out = self._run(func, args, kwargs)
         for journal in self.journals:
             journal.after(func, out)
         return out
 
-    def _run(self, func: OpOverload, args: Args, kwargs: Kwargs, index: int) -> object:
+    def _run(self, func: OpOverload, args: Args, kwargs: Kwargs) -> object:
         writes, draws, _, rule = _trait(func)
         request = CURRENT.get()
-        run = _local.run
-        if (
-            run is not None
-            and func in _IN_PLACE
-            and index in run.block.dead
-            and run.same  # the same ops led here as in the run that showed its input dead
-            and not _local.scopes  # no cut around it runs again and reads its input
-            and not torch.is_grad_enabled()
-        ):
-            in_place = _IN_PLACE[func]
-            in_place(args[0], *args[1:], **kwargs)
-            return args[0]
         if writes or func.namespace in _COLLECTIVES or request is None:
             try:
                 return func(*args, **kwargs)
@@ -805,7 +748,8 @@ class Layer(TorchDispatchMode):  # type: ignore[misc]
         own: Scope | None = None
         named = site(func.overloadpacket.__name__) if rule is not None else None
         if named is not None:
-            own = Scope(named, 0, request.cut(named))
+            key = shape_key((args, kwargs))
+            own = Scope(named, 0, request.cut(named, key), shape=key)
         bands: list[Banded | None] = []  # the op's bands, made once, when first needed
         states = [(g, g.get_state()) for g in _generators(func, args, kwargs)] if draws else []
 
