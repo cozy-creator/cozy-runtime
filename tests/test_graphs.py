@@ -507,6 +507,12 @@ def test_a_package_subclass_takes_its_base_s_contract_only_by_declaring_it() -> 
     assert not safe(torch, Silent.from_config(config))  # undeclared: its own code, eager
     declared = Declared.from_config(config)
     assert safe(torch, declared)
+    # Runtime's execution layer wraps the root's forward, which Diffusers decorates: still pure
+    # (speed2 13522 kept the whole UNet eager on exactly this).
+    from cozy_runtime.internal import execution
+
+    execution.install(declared)
+    assert safe(torch, declared)
     assert not safe(torch, Overriding.from_config(config))  # overrides the base: refused
     declared.register_forward_pre_hook(lambda *_: None)  # HiDiffusion's size hook
     assert not safe(torch, declared)

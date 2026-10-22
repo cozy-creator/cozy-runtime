@@ -180,9 +180,11 @@ def _local(torch: Any, sub: Any) -> bool:
         if forward is None:
             continue
         if forward is own.get("_cozy_execution_forward"):
+            # Unwrapped to the bottom on both sides: a library decorator on the class forward
+            # (Diffusers' UNet) is followed through the bound method as well.
             original = inspect.unwrap(forward)
             base = WRAPPERS.get(type(sub), type(sub))
-            if getattr(original, "__func__", original) is base.forward:
+            if getattr(original, "__func__", original) is inspect.unwrap(base.forward):
                 continue
             forward = original
         if not getattr(forward, "__module__", "").startswith("cozy_runtime.internal.execution."):
