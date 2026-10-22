@@ -85,6 +85,10 @@ package = true
 # The historical SDXL development corpus keeps its own locked dependency cohort.
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
+[tool.uv.sources]
+# Dev pin until the cohort release: the tensorfs-py the varena-two integration builds.
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "f14bff35271d8a381bfa1c88fd4c7d90625347c7", subdirectory = "crates/tensorfs-py" }
+
 [tool.mypy]
 python_version = "3.12"
 files = ["src", "checks", "tests", "examples"]

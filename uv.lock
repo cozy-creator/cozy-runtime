@@ -398,7 +398,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.30.3"
+version = "0.31.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -466,12 +466,12 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", specifier = ">=0.13,<0.14" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.13,<0.14" },
+    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=f14bff35271d8a381bfa1c88fd4c7d90625347c7" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=f14bff35271d8a381bfa1c88fd4c7d90625347c7" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
-    { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.13" },
-    { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.13" },
-    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.13" },
+    { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.14" },
+    { name = "torch", marker = "extra == 'corpus'", specifier = ">=2.14" },
+    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.14" },
     { name = "transformers", marker = "extra == 'adapters'", specifier = ">=5.16.1" },
     { name = "transformers", marker = "extra == 'corpus'", specifier = ">=4.40" },
 ]
@@ -485,7 +485,7 @@ dev = [
     { name = "pytest", specifier = ">=8.4" },
     { name = "pytest-split", specifier = ">=0.11.0" },
     { name = "ruff", specifier = ">=0.16" },
-    { name = "tensorfs", specifier = ">=0.13,<0.14" },
+    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=f14bff35271d8a381bfa1c88fd4c7d90625347c7" },
 ]
 diffusers = [
     { name = "diffusers", specifier = ">=0.40.0" },
@@ -493,7 +493,7 @@ diffusers = [
     { name = "peft", specifier = ">=0.20,<0.21" },
     { name = "safetensors", specifier = ">=0.8.0" },
     { name = "tokenizers", specifier = ">=0.23.1" },
-    { name = "torch", specifier = ">=2.13" },
+    { name = "torch", specifier = ">=2.14" },
     { name = "torchvision", specifier = ">=0.28" },
     { name = "transformers", specifier = ">=5.16.1" },
 ]
@@ -1767,17 +1767,8 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.13.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e1/7e/28d5e1a9a97a4507381a88c6ada9c8d5d83b464a600781232fd734ea026d/tensorfs-0.13.0.tar.gz", hash = "sha256:08de2ffa38e847eaf228b3e866a686b0712f1d3290c1e64da7e600463bbf9fbc", size = 5615600, upload-time = "2026-10-21T19:02:41.428Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/b4/31/b9b50fa28f0728d1154d7e10b8d747e5f3597659b94bef9daebda7e8f082/tensorfs-0.13.0-cp311-abi3-macosx_10_12_x86_64.whl", hash = "sha256:42ba7dce21973e857aaa29402ed387bc013cf7898e0b8672c45aff0940f0260b", size = 8569459, upload-time = "2026-10-21T19:02:29.42Z" },
-    { url = "https://files.pythonhosted.org/packages/55/db/7216afd40d93e005ec7e85fc6bc5f1af50d7dbb1331b978439a181b21bc5/tensorfs-0.13.0-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:542bb456e023eee5a328e5361a35ee2a9e2a38ab718d2ef83522c2c2287e9951", size = 7864690, upload-time = "2026-10-21T19:02:31.355Z" },
-    { url = "https://files.pythonhosted.org/packages/4c/64/448514e17f7efa8d273b3b6e2ea4146f4182f88e92d75e3218288338b9f4/tensorfs-0.13.0-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:2919a956a8f3f16fe3aa14756b29d99f396f417c240aa54f578729c8e1eb581f", size = 10251053, upload-time = "2026-10-21T19:02:33.296Z" },
-    { url = "https://files.pythonhosted.org/packages/32/20/5e4bbf1f8b5b03d907b836cc96c0a06f485dfca6a5ab27fd2ca806a3f537/tensorfs-0.13.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:921e5442b1f4d73374c6cb9a4106507e203ba17db68e01717977eca31399b8db", size = 11003044, upload-time = "2026-10-21T19:02:35.87Z" },
-    { url = "https://files.pythonhosted.org/packages/5b/83/e6455ad166a4ff3a4796e65a79e6fc6d7a2cdda845be0b6cde83863ece20/tensorfs-0.13.0-cp311-abi3-win_amd64.whl", hash = "sha256:0e4924c6429f474d52de3ca7bae35f1b54daa1e2c5e63aa95a5f7005b9d189ab", size = 10536196, upload-time = "2026-10-21T19:02:37.857Z" },
-    { url = "https://files.pythonhosted.org/packages/98/7f/2365587f236d4821a3fd3f76754414fdc6e0f32e978689b82c67e44ece70/tensorfs-0.13.0-cp311-abi3-win_arm64.whl", hash = "sha256:338c3abd09d003c9e473a73226305cf810934aece20f91f4c88ae922d69c9e10", size = 7829939, upload-time = "2026-10-21T19:02:39.843Z" },
-]
+version = "0.14.0"
+source = { git = "https://github.com/cozy-creator/cozy-creator.git?subdirectory=crates%2Ftensorfs-py&rev=f14bff35271d8a381bfa1c88fd4c7d90625347c7#f14bff35271d8a381bfa1c88fd4c7d90625347c7" }
 
 [[package]]
 name = "tokenizers"
