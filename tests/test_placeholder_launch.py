@@ -27,7 +27,7 @@ import sys
 import numpy as np
 import tensorfs
 import torch
-from tensorfs.varena.torch import Memory, Placeholder
+from tensorfs.varena.torch import Declared, Memory, Placeholder, Weights
 from cozy_runtime.derive.microscale import encode_int8_convrot256
 from cozy_runtime.internal import int8_linear
 from cozy_runtime.internal.encoding import Int8ConvRotNativeLeaf
@@ -56,7 +56,8 @@ class Net(torch.nn.Module):
 
 
 net, memory = Net(), Memory.open(torch.device("cuda", 0))
-memory.load(net, ck=checkpoint)
+vars(net)["_varena"] = Declared(Weights(checkpoint, "net"))
+memory.load(net, "gpu")
 head = net.heads["txt"]
 data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).view(OUT, IN).cuda()
 scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32).cuda()

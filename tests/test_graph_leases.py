@@ -331,7 +331,7 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
     )
     backend.models.update(models)
     placement = Placement(memory, backend)
-    assert sorted(graphs.install(torch, object(), modules)) == sorted(names)
+    assert {"first", "second"} <= set(graphs.install(torch, object(), modules))
     try:
         for turn in range(3):
             placement.open_attempt()

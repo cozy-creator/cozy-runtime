@@ -579,9 +579,10 @@ def test_twenty_steps_capture_the_root_once_and_replay_it_nineteen_times() -> No
     with torch.inference_mode():
         for step in range(20):
             unet.cozy_step = step
-            got = unet(sample, 999 - step * 50, encoder_hidden_states=context).sample
+            timestep = torch.tensor(999 - step * 50, device="cuda")  # a scheduler's, a tensor
+            got = unet(sample, timestep, encoder_hidden_states=context).sample
         token = graphs.BYPASS.set(True)
-        want = unet(sample, 999 - 19 * 50, encoder_hidden_states=context).sample
+        want = unet(sample, timestep, encoder_hidden_states=context).sample
         graphs.BYPASS.reset(token)
     recorder = graphs._RECORDERS[unet]
     assert (recorder.capture_attempts, recorder.replays) == (1, 19)
