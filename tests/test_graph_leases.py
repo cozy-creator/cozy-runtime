@@ -46,6 +46,7 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
     if not torch.cuda.is_available():
         pytest.skip("native graph residency requires CUDA")
     memory = Memory.open(0, limit=CAP)
+    assert memory.native.context_measurable(), "a hard cap proof requires measured context bytes"
     torch.set_num_threads(2)
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.benchmark = False
@@ -163,8 +164,10 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
                 torch.cuda.stream(stream),
                 memory.request(f"runtime-concurrent-{scale}", [module]),
             ):
-                actual = module((source * scale).to(memory.device)).cpu()
-            torch.testing.assert_close(actual, expected * scale, atol=1e-5, rtol=1e-4)
+                returned = module((source * scale).to(memory.device))
+                torch.cuda._sleep(1 << 20)
+                actual = returned.square().cpu()
+            torch.testing.assert_close(actual, (expected * scale).square(), atol=1e-5, rtol=1e-4)
 
         with ThreadPoolExecutor(max_workers=2) as workers:
             list(workers.map(concurrent, [1.0, 2.0]))

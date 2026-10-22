@@ -175,7 +175,9 @@ def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
             x = torch.full((rows, 64), value, device="cuda")
             expected = torch.nn.Sequential.__call__(module, x)
             module(x)
-            return module(x), expected
+            returned = module(x)
+            torch.cuda._sleep(1 << 20)
+            return returned.square(), expected.square()
 
     with ThreadPoolExecutor(max_workers=2) as workers:
         a, b = workers.submit(run, first, 1.0, 4), workers.submit(run, second, 2.0, 8)

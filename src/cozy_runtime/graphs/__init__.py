@@ -369,6 +369,8 @@ def _region_call(
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
         else "outside its purity contract"
         if not safe(torch, module)
+        else "without measured driver/context memory"
+        if placed is not None and not placed[0].graph_accounted()
         else _unplain(torch, leaves)
     )
     if why:

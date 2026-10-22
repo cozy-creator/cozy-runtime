@@ -1709,8 +1709,12 @@ class _Engine:
     def _replay(self, size: int, cuda: bool) -> None:
         drafted = self._drafting(size)
         key = (size, self.cache.window, drafted)
-        reason = _capture_contract(self.model) or (
-            "draft head has no isolated capture contract" if drafted else ""
+        placed = PLACED.get(self.model)
+        unaccounted = cuda and placed is not None and not placed[0].graph_accounted()
+        reason = (
+            ("driver/context memory is unmeasured" if unaccounted else "")
+            or _capture_contract(self.model)
+            or ("draft head has no isolated capture contract" if drafted else "")
         )
         if cuda and reason:
             if key not in self.unrecorded:

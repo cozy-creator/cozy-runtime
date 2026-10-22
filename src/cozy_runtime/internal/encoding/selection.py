@@ -24,10 +24,12 @@ outputs, owned by the eval plane, and a Frobenius norm may never stand in for on
 
 from __future__ import annotations
 
+import hashlib
 import platform
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -237,12 +239,14 @@ class RuntimeIdentity:
     release: str
     source_digest: str
     torch_build: str
+    native_backends: tuple[tuple[str, str], ...] = ()
 
-    def document(self) -> dict[str, str]:
+    def document(self) -> dict[str, Any]:
         return {
             "release": self.release,
             "source_digest": self.source_digest,
             "torch_build": self.torch_build,
+            "native_backends": dict(self.native_backends),
         }
 
 
@@ -274,7 +278,49 @@ def runtime_source_digest() -> str:
             body[rel] = canonical.digest({"bytes": path.read_bytes().hex()})
         except OSError:
             body[rel] = "absent"
+    body.update((f"native/{name}", value) for name, value in native_backend_identity().items())
     return canonical.digest(body)
+
+
+@lru_cache(maxsize=32)
+def _binary_digest(path: str, changed: int, size: int) -> str:
+    """Hash immutable installed binaries once per file identity, outside inference loops."""
+    with Path(path).open("rb") as source:
+        return "sha256:" + hashlib.file_digest(source, "sha256").hexdigest()
+
+
+def native_backend_identity() -> dict[str, str]:
+    """The actual native decode/GEMM backend, including a pure or unloadable wheel.
+
+    The qualification table is not part of this identity: adding measured facts cannot
+    change the binaries they qualified. Platform distinguishes foreign/absent backends;
+    a file that exists but did not load cannot borrow a loaded module's observations.
+    """
+    from cozy_runtime import _kernels
+
+    root = Path(_kernels.__file__).parent
+    identity = {"platform": f"{platform.system()}/{platform.machine()}"}
+    for name in ("_gemm", "_norm"):
+        loaded = getattr(_kernels, name, None) if not _kernels.ABSENT else None
+        candidates = sorted(
+            p for p in root.glob(f"{name}.*") if p.suffix in (".so", ".pyd", ".dll", ".dylib")
+        )
+        if loaded is not None:
+            candidates = [Path(loaded.__file__)]
+        if not candidates:
+            identity[name] = "ABSENT"
+            continue
+        try:
+            hashes = []
+            for path in candidates:
+                stat = path.stat()
+                hashes.append(_binary_digest(str(path), stat.st_mtime_ns, stat.st_size))
+            identity[name] = ("loaded:" if loaded is not None else "unavailable:") + ",".join(
+                hashes
+            )
+        except OSError:
+            identity[name] = "unavailable:unreadable"
+    return identity
 
 
 def measure_runtime(torch: Any, release: str) -> RuntimeIdentity:
@@ -282,6 +328,7 @@ def measure_runtime(torch: Any, release: str) -> RuntimeIdentity:
         release=release,
         source_digest=runtime_source_digest(),
         torch_build=str(getattr(torch, "__version__", "unknown")),
+        native_backends=tuple(sorted(native_backend_identity().items())),
     )
 
 

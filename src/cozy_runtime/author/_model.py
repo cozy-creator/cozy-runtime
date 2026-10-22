@@ -285,6 +285,10 @@ class Residency(Protocol):
         """A distinct allocator pool for one executable's static data and scratch."""
         ...
 
+    def graph_accounted(self) -> bool:
+        """Whether per-process driver/context bytes can be included in graph admission."""
+        ...
+
     def graph_domain(self, component: str) -> Any:
         """Shared capture stream and library workspace, serialized across component graphs."""
         ...

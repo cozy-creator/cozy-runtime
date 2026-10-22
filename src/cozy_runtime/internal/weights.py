@@ -712,6 +712,9 @@ class Placement:
     def graph_pool(self) -> Any:
         return self.memory.new_pool()
 
+    def graph_accounted(self) -> bool:
+        return self.memory.cuda and self.memory.native.context_measurable()
+
     def graph_domain(self, component: str) -> Any:
         from cozy_runtime.graphs import capture_domain
 
