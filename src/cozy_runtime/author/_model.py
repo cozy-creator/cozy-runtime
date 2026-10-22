@@ -307,8 +307,8 @@ class Residency(Protocol):
         """Declared model-block paths that bound graph regions independently of residency."""
         ...
 
-    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
-        """Open the ordinary model pass before capture; nested regions share its cut state."""
+    def graph_pass(self, component: str, entry: str) -> Any:
+        """Open the ordinary model pass before capture; nested regions share it."""
         ...
 
     def graph_idle(self) -> Any:

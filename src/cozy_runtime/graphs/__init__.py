@@ -780,9 +780,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         return call(module, *args, **kwargs)
     placed = _placed(module)
     owner, path = region
-    scope = (
-        placed[0].graph_pass(placed[1], path, args, kwargs) if placed is not None else nullcontext()
-    )
+    scope = placed[0].graph_pass(placed[1], path) if placed is not None else nullcontext()
     token = _PASS.set(object()) if owner() is module else None
     began = time.perf_counter()
     try:
@@ -997,7 +995,7 @@ def _record(
     placed: Any,
     submit: float,
 ) -> bool:
-    """Records `pending`'s signature at idle on zeroed inputs of its layout, in the device's
+    """Records `pending`'s signature at idle on seeded inputs of its layout, in the device's
     capture pool: a warm-up run, its device-busy time (`_busy`), then the capture only when its
     eager calls were launch-bound: their host submission took longer than the device's work, so
     the device sat idle inside them. False tries again at a later period (no free room, a kernel
@@ -1013,16 +1011,8 @@ def _record(
         if placed is not None and not placed[0].graph_accounted():
             _failed(module, recorder, key, "driver/context memory is unmeasured")
             return True
-        # The pass keys its room by the arguments' shapes: meta tensors carry them.
-        shapes = torch.utils._pytree.tree_unflatten(
-            [
-                torch.empty(v.shape, dtype=v.dtype, device="meta") if isinstance(v, _Leaf) else v
-                for v in pending.leaves
-            ],
-            pending.spec,
-        )
         scope = (
-            placed[0].graph_pass(placed[1], _REGIONS[module][1], *shapes)
+            placed[0].graph_pass(placed[1], _REGIONS[module][1])
             if placed is not None
             else nullcontext()
         )

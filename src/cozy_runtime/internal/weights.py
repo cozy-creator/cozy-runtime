@@ -882,8 +882,8 @@ class Placement:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)
 
-    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
-        return self.models[component].passing(entry, args, kwargs)
+    def graph_pass(self, component: str, entry: str) -> Any:
+        return self.models[component].passing(entry)
 
     def graph_idle(self) -> AbstractContextManager[object]:
         """An idle capture's request: it fills free bytes only and never evicts."""
