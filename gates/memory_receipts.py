@@ -2,6 +2,7 @@
 """The memory matrix's receipts (design varena-slim §5): one typed record per run from `cozy run show --json`, the
 absolute bar, Belady MIN over the recorded page-reference trace, the matched comparison, and the rentals' plan."""
 
+import hashlib
 import heapq
 import json
 import math
@@ -458,6 +459,40 @@ def compare(summary, lines):
     return min(failures + worse, 255)
 
 
+def landed(run, out):
+    """`<status> landed` when every output of `run` is in `out` under its sha256, else what is missing."""
+    missing = [o["name"] for o in run.get("output") or []
+               if not any(f.is_file() and "sha256:" + hashlib.sha256(f.read_bytes()).hexdigest() == o.get("sha256")
+                          for f in Path(out).glob(f"*{o['name']}*"))]
+    return f"{run.get('status', '?')} " + (f"missing:{','.join(missing)}" if missing else "landed")
+
+
+def replay(directory):
+    """Receipts for a run directory the matrix (or S8's vertical script) wrote, from its records alone: every
+    `show-<card>-<cell>.<line>.json` with its outputs in `out-<cell>.<line>/` and, when the matrix took them, the
+    hostmem.py readings `host-<cell>.<line>.json`, each run's kills counted from the reading before it on the same
+    rental (`host-<rental>-start.json` first). Returns the receipts' failures."""
+    root, failed = Path(directory), 0
+    before = {p.name[len("host-"):-len("-start.json")]: str(p) for p in root.glob("host-*-start.json")}
+    shows = [p for p in root.glob("show-*.json") if re.fullmatch(r"show-[\w.-]+\.(shipping|candidate)\.json", p.name)]
+    order = []
+    for path in shows:
+        run = json.loads(path.read_text())
+        order.append((run.get("settled_at_ms") or 0, path, run))
+    for _, path, run in sorted(order, key=lambda o: o[0]):
+        name = path.name[len("show-"):-len(".json")]
+        cell, line = name.rsplit(".", 1)
+        card = cell.split("-", 1)[0]
+        rental = CARDS[card][0] if card in CARDS else card
+        host = root / f"host-{name}.json"
+        after = str(host) if host.is_file() else ""
+        failed += record(path, cell, run.get("number", 0), landed(run, root / f"out-{name}"), line,
+                         card[2:] if card.startswith("2x") else card, before.get(rental, "") if after else "", after)
+        if after:
+            before[rental] = after
+    return failed
+
+
 def rental(catalog, card):
     """`<class> <gpus> <limit> <sku>…`: the card's rental, its SKUs with that many GPUs cheapest first (the catalog's
     expected price: an hour plus a 100 GB download)."""
@@ -528,6 +563,8 @@ if __name__ == "__main__":
             result = record(*args)
         elif verb == "compare":
             result = compare(args[0], args[1:])
+        elif verb == "replay":
+            result = min(replay(args[0]), 255)
         elif verb == "rental":
             print(rental(*args))
             result = 0
@@ -536,7 +573,7 @@ if __name__ == "__main__":
             plan(args[0], args[1].split(","), args[2:split], args[split + 1:])
             result = 0
         else:
-            raise ValueError("use record, compare, rental or plan")
+            raise ValueError("use record, compare, replay, rental or plan")
     except (OSError, ValueError, TypeError, KeyError, IndexError) as error:
         print(f"memory receipt refused: {error}")
         result = 1

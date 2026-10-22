@@ -18,6 +18,7 @@
 # steps; cold, then warm ×3) runs when named, for a Hub without the turbo LoRA.
 # Around every run, hostmem.py reads the machine's cgroup memory.events: a receipt carries the OOM kills between.
 # --walls: earlier summaries whose measured walls price the plan, printed before anything is rented; --plan stops there.
+# `memory_receipts.py replay <dir>` re-derives every receipt from a run directory's records (this one's or S8's).
 # Results: ./memory-matrix-<stamp>/ (summary.txt: one receipt per run; every run's show JSON; machine logs). Exit
 # status: the line under test's runs below the absolute bar, its cells worse than the shipping line, and rentals,
 # installs or limits that failed.

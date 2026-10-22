@@ -199,6 +199,34 @@ class Receipts(unittest.TestCase):
         self.assertIn("not compared (shipping missed its bar)", text)
         self.assertEqual(self.compare(missed, ["shipping"])[0], 1)  # a shakedown counts the shipping line's own
 
+    def test_replay_records_a_run_directory_from_its_records(self):
+        # A dry run over S8's layout: show-<cell>.<line>.json, outputs in out-<cell>.<line>/, host readings beside.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, cell in (("sdxl1-shipping-12881", "12-sdxl1.shipping"), ("sdxl1-candidate-12872", "12-sdxl1.candidate"),
+                               ("h3ra5-failed-12916", "12-h3ra5.candidate")):
+                (root / f"show-{cell}.json").write_text(json.dumps(fixture(name)))
+            (root / "host-12-h3ra5.candidate.json").write_text((FIXTURES / "hostmem-after.json").read_text())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                failed = API["replay"](root)
+            (root / "summary.txt").write_text(out.getvalue())
+            rows = {(r.cell, r.line): r for r in API["receipts"](root / "summary.txt")}
+        self.assertEqual(failed, 1)
+        self.assertEqual(rows[("12-sdxl1", "candidate")].bar, "ok")
+        self.assertEqual(rows[("12-sdxl1", "shipping")].bar, "ok")
+        # One reading alone gives no delta: the kill count needs the reading before the run.
+        self.assertEqual(rows[("12-h3ra5", "candidate")].bar, "failed:executor_invalidated")
+        with tempfile.TemporaryDirectory() as directory:  # with the rental's first reading, the kills count
+            root = Path(directory)
+            (root / "show-12-h3ra5.candidate.json").write_text(json.dumps(fixture("h3ra5-failed-12916")))
+            (root / "host-1x24-start.json").write_text((FIXTURES / "hostmem-before.json").read_text())
+            (root / "host-12-h3ra5.candidate.json").write_text((FIXTURES / "hostmem-after.json").read_text())
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                API["replay"](root)
+        self.assertIn("oom_kill=+6 bar=failed:executor_invalidated,host-oom-kill", out.getvalue())
+
     def test_rentals_come_cheapest_first_from_the_catalog(self):
         self.assertEqual(API["rental"](CATALOG, "8"), "1x24 1 8GiB rtx-pro-4000 l4 rtx-4090 rtx-3090")
         self.assertEqual(API["rental"](CATALOG, "2x12"), "2x24 2 12GiB rtx-pro-4000 l4 rtx-4090 rtx-3090")
