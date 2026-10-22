@@ -175,7 +175,6 @@ def test_a_gloo_group_forms_on_a_kernel_chosen_port_and_agrees_or_refuses(
         backend="gloo",
         python=sys.executable,
         root=str(tmp_path),
-        sample_seconds=0.2,
         launch=_launcher(env),
         devices=("4", "5", "6"),
     )
@@ -263,7 +262,6 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
         backend="gloo",
         python=sys.executable,
         root=str(tmp_path),
-        sample_seconds=0.2,
         launch=_launcher(env),
         devices=("0", "1"),
     )
@@ -297,7 +295,6 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
         backend="gloo",
         python=sys.executable,
         root=str(tmp_path),
-        sample_seconds=0.2,
         launch=_launcher(env),
         devices=("4", "5"),
     )
@@ -332,7 +329,6 @@ def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Pa
         backend="gloo",
         python=sys.executable,
         root=str(tmp_path),
-        sample_seconds=0.2,
         launch=_launcher(env),
         devices=("4", "5"),
     )
@@ -365,41 +361,6 @@ def test_an_imported_rank_0_forks_its_followers(tmp_path: Path) -> None:
     )
     assert done.returncode == 0, done.stdout + done.stderr
     assert done.stdout.strip() == "forked 2 followers, formed 3", done.stdout
-
-
-@needs_torch
-def test_a_follower_that_never_dials_back_is_judged_by_its_own_meter(tmp_path: Path) -> None:
-    """No clock: a follower that never answers `hello` is condemned only once its own
-    progress meter has been flat for longer than the floor (`liveness.Pace`), and the
-    refusal names the measurement."""
-    env = {**os.environ}
-
-    def sleeper(module_argv: list[str], fd: int) -> spawn.Child:
-        del module_argv
-        return spawn.spawn_follower(
-            python=sys.executable,
-            module_argv=["-c", "import time; time.sleep(600)"],
-            env=env,
-            inherit_fd=fd,
-        )
-
-    group = RankGroup(
-        degree=2,
-        backend="gloo",
-        python=sys.executable,
-        root=str(tmp_path),
-        sample_seconds=0.2,
-        launch=sleeper,
-    )
-    try:
-        group.spawn()
-        with pytest.raises(GroupRefusal) as refused:
-            group.dial_back(seal_snapshot(env))
-        assert refused.value.code == "group_broken"
-        assert "wedged during 'hello'" in refused.value.message
-        assert "no measurable progress for" in refused.value.message, refused.value.message
-    finally:
-        group.close()
 
 
 # ------------------------------------------------------------------ the wire and gate

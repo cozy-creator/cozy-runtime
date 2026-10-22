@@ -23,7 +23,6 @@ group = RankGroup(
     backend="gloo",
     python=sys.executable,
     root=str(root),
-    sample_seconds=0.2,
     launch=leader._follower,
     devices=("4", "5", "6"),
 )

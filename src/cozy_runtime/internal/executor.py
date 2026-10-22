@@ -616,11 +616,6 @@ def _trees(command: Invoke) -> dict[str, tuple[Path, str]]:
     return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
 
 
-def _allocations(torch: Any) -> int:
-    """GPU 0's progress in a group call: the allocations its ops made (`group.watched`)."""
-    return int(torch.cuda.memory_stats().get("allocation.all.allocated", 0))
-
-
 def _serving(module: str, export: str, surface: Any) -> _CallType:
     """A callable bound from its own code, called as every function is: `{payload, models}`.
     Its direct caller passes the model slots beside the request fields (`_CallType.models`)."""
@@ -1472,7 +1467,6 @@ class Executor:
                     spool=lambda: owner._attempt_spool,
                     cancelled=owner._attempt_cancelled,
                     reform=owner._group_reform,
-                    progress=functools.partial(_allocations, torch),
                     device=self._rank_device(torch),
                 )
         hosted = mirror.hosting_plan(
