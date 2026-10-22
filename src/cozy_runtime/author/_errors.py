@@ -233,6 +233,14 @@ def unwind(exc: BaseException) -> None:
             chain += (link.__cause__, link.__context__)
 
 
+def _leaves(group: BaseExceptionGroup[BaseException]) -> list[BaseException]:
+    return [
+        leaf
+        for exc in group.exceptions
+        for leaf in (_leaves(exc) if isinstance(exc, BaseExceptionGroup) else [exc])
+    ]
+
+
 def classify(exc: BaseException | None) -> Outcome:
     """Map what escaped a handler onto the neutral set.
 
@@ -241,6 +249,11 @@ def classify(exc: BaseException | None) -> Outcome:
     """
     if exc is None:
         return SUCCEEDED
+    if isinstance(exc, BaseExceptionGroup):
+        # A task group's failure is its tasks': a cancel among them is the attempt's own
+        # (cancelling a long_form ended FAILED), else the first one that escaped.
+        leaves = _leaves(exc)
+        return classify(next((e for e in leaves if isinstance(e, Cancelled)), leaves[0]))
     if isinstance(exc, Cancelled):
         origin: Origin = "runtime" if isinstance(exc, DeadlineExceeded) else "author"
         return Outcome("canceled", origin, exc.code, exc.message, exc.fields)

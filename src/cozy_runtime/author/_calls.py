@@ -416,12 +416,12 @@ class _Broker:
                     if ready.task is not None and ready.index not in self.activated:
                         answer = self.exchange(self._intent(ready), CallState)
                         self._observe(ready, answer)
-                        self._check(answer, ready.index, answer.child_request_id)
+                        self._check(answer, ready.index, call.ctx)
                         self.activated.add(ready.index)
                 seen = self.nudged
                 answer = self.exchange(ChildPoll(call_index=call.index), CallState)
                 self._observe(call, answer)
-                self._check(answer, call.index, answer.child_request_id)
+                self._check(answer, call.index, call.ctx)
                 if answer.state == "succeeded":
                     raw = answer.result.encode()
                     if len(raw) > MAX_CALL_BYTES:
@@ -554,12 +554,16 @@ class _Broker:
         )
 
     @staticmethod
-    def _check(answer: Answer, index: int, child_request_id: str = "") -> None:
+    def _check(answer: Answer, index: int, ctx: Context | None = None) -> None:
         if not answer.ok:
+            if ctx is not None:
+                # A child ended by this attempt's own cancel is that cancel, not its failure.
+                ctx.raise_if_cancelled()
             child = ChildFailure(
                 "\n".join(filter(None, (answer.detail, getattr(answer, "traceback", ""))))
             )
-            raise ChildCallError(answer.code, answer.detail, index, child_request_id) from child
+            child_id = getattr(answer, "child_request_id", "")
+            raise ChildCallError(answer.code, answer.detail, index, child_id) from child
 
     def close(self) -> None:
         self.closed = True
