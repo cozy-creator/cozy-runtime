@@ -1,7 +1,7 @@
 """Which implementation executes which stored bytes, in three seams, each importing only the
 ones before it: `formats.py` (the stored contracts and the decoding providers), `leaves.py`
-(the providers that replace a module) and `selection.py` (device identity, capability records
-and the launch table). `probe.py` measures; this package decides.
+(the providers that replace a module) and `selection.py` (device identity, admission by rule
+and the launch table).
 """
 
 from __future__ import annotations
@@ -32,37 +32,30 @@ from cozy_runtime.internal.encoding.leaves import (
     RowwiseNativeLeaf,
 )
 from cozy_runtime.internal.encoding.selection import (
-    IDENTITY_SOURCES,
+    FLOAT_DTYPES,
     NAMED_SEAMS,
-    OBJECTIVE_AXIS,
-    Capabilities,
-    CapabilityRecord,
     DeviceFacts,
     Refusal,
     RuntimeIdentity,
     Selection,
     Selector,
     TensorCandidates,
+    admit,
     device_line,
-    geometry_class,
     implementation_digest,
     launch_providers,
     measure_device,
     measure_runtime,
-    runtime_source_digest,
 )
 
 __all__ = [
     "E4M3_MAX",
-    "IDENTITY_SOURCES",
+    "FLOAT_DTYPES",
     "NAMED_SEAMS",
-    "OBJECTIVE_AXIS",
     "PLAIN",
     "REFUSALS",
     "ROW_SCALE_FLOOR",
     "TORCH_DTYPES",
-    "Capabilities",
-    "CapabilityRecord",
     "DeviceFacts",
     "Encoded",
     "EncodingRefusal",
@@ -83,13 +76,12 @@ __all__ = [
     "TensorCandidates",
     "TensorwiseDequant",
     "Verbatim",
+    "admit",
     "device_line",
-    "geometry_class",
     "implementation_digest",
     "launch_providers",
     "measure_device",
     "measure_runtime",
     "params_of",
     "refuse",
-    "runtime_source_digest",
 ]

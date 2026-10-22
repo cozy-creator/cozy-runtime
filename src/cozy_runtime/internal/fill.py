@@ -66,7 +66,7 @@ REFUSALS = frozenset(
         "lease_live",  # a staging slot reused before its completion event
         "derived_unmaterialized",  # a non-persistent buffer the fill plane cannot supply
         "unknown_encoding",  # a scheme no provider here decodes
-        "encoding_unqualified",  # no capability record for this device
+        "encoding_unqualified",  # no provider this device admits (`selection.admit`)
         "role_mismatch",  # parts no provider accounts for
         "checkpoint_unreadable",  # a header or document that does not parse
         "store_unusable",  # a store TensorFS refuses to open
@@ -461,9 +461,8 @@ def servability(rows: Sequence[PlanRow], answer: ResolvedModelPlan | PlanRefusal
         by_scheme[one.encoded.scheme] = by_scheme.get(one.encoded.scheme, 0) + 1
     if isinstance(answer, ResolvedModelPlan):
         return Servability(True, by_scheme, answer.route_census(), "", "")
-    summary = {"no_rows", "unconsented", "unscored", "eligible", "chosen", "chosen_uncalibrated"}
     for step in answer.steps:
-        if step.verdict in summary:
+        if step.verdict in ("no_rows", "chosen"):
             continue
         code = "encoding_unqualified" if step.verdict == "unqualified" else step.verdict
         if code in REFUSALS:

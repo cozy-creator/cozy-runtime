@@ -1,25 +1,16 @@
-"""cr-006 seam 3 — SELECTION: device identity, capability records, and the launch table.
+"""cr-006 seam 3 — SELECTION: device identity, admission by rule, and the launch table.
 
-Seams one and two build providers. This one decides which of them may run, on THIS machine,
-for THIS tensor — and, since #549.1, it stops deciding one line earlier than it used to.
+Seams one and two build providers. This one says which of them may serve THIS tensor on THIS
+card, by rule (xs-065, owner 2026-10-22): nothing here reads a measurement, a shipped table or
+a machine's history, so a card no one has benchmarked selects as a measured one of its row.
 
-**What changed.** `Capabilities.admit` used to be a second, parallel authority: it ranked
-providers per tensor under the deployment's objective, and refused `objective_unranked` the
-moment the objective was `latency` and two providers qualified — which is the default
-objective, so the default path refused as soon as a second provider existed. Meanwhile
-`delivery.py` picked ONE artifact-wide rung from a table that DOES hold latency
-measurements. Two choosers, neither able to see the other's numbers.
-
-This module now offers CANDIDATES and a reason, and `resolution.py` makes ONE joint
-decision over whole plans. That is the whole of #549.3: latency is measurable where the
-measurement lives (per resolved plan, in the fact store), footprint and
-`kernel_numeric_error` are measurable per provider (in the records here), and nothing has
-to refuse for want of an axis.
-
-**The fidelity axis is now `kernel_numeric_error`** (#549.11). It measures a route's own
-GEMM against an f64 reference over the exactly-dequantized weights. It is a KERNEL
-diagnostic and it is not model quality: quality is a paired video+audio eval on real
-outputs, owned by the eval plane, and a Frobenius norm may never stand in for one.
+`admit` is the whole rule. A verbatim tensor always serves. A decoder serves on CPU and CUDA,
+and on MPS unless the tensor stores float8 parts. A native leaf serves on CUDA when the card
+clears its device floor and the card's `arch` row has every tensor-core format the leaf
+declares (`LeafProvider.formats`): a lane runs natively wherever its tensor cores exist and
+decodes only where they do not. Which kernel computes inside the leaf is its dispatch's own
+rule (`int8_linear`, `fp8_linear`, `nvfp4_linear`): the family's prebuilt kernel, else a
+generic one (cuBLASLt, Triton, torch). `resolution.py` takes one route per tensor.
 """
 
 from __future__ import annotations
@@ -28,15 +19,15 @@ import platform
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from pathlib import Path
 from typing import Any, NoReturn
 
-from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal import accel, arch, canonical
 from cozy_runtime.internal.encoding.adapters import CoreDequant
 from cozy_runtime.internal.encoding.comfy import ComfyDequant
 from cozy_runtime.internal.encoding.formats import (
     Encoded,
     Int8ConvRotDequant,
+    LeafProvider,
     MicroScaledDequant,
     Nvfp4Dequant,
     Provider,
@@ -60,25 +51,10 @@ from cozy_runtime.internal.encoding.leaves import (
 
 @dataclass(frozen=True, slots=True)
 class DeviceFacts:
-    """What a capability record is keyed against — STRENGTHENED by #549.9.
-
-    Every field is stable for the life of the machine, which is what lets a probe result be
-    keyed by it. What the pre-#549 key was MISSING, and why each one matters:
-
-    * `driver` was `torch.version.cuda`, **which is not the driver** — it is the CUDA
-      runtime torch was built against. Two pods with identical torch wheels and different
-      NVIDIA drivers produced the same key, so a record minted under a driver with a
-      miscompiled kernel was reused under one without it. The real driver version now comes
-      from NVML and the CUDA runtime is carried BESIDE it, spelled as what it is.
-    * `index` and the NVML `configuration` behind it. `_nvml` queried **GPU zero** whatever
-      device was selected, so a multi-GPU pod minted every record against card 0's power cap
-      and MIG profile. The query is now `-i <index>`.
-    * `os_arch`. The same card under a different libc/kernel/arch is a different measurement
-      subject, and nothing recorded it.
-
-    `configuration` is the NVML power cap plus MIG profile (§3.2): two "same model" GPUs at
-    different power caps are not the same device, and first-writer-wins must never let a
-    power-starved pod mint the fleet's coefficients.
+    """The card a plan resolves for: its class (`predicate`), its architecture (`sm`, which
+    picks the `arch` row `admit` reads) and the facts a plan and a refusal name it by (#549.9):
+    the REAL driver from NVML with torch's CUDA runtime beside it, the selected card's index
+    and NVML configuration (power cap and MIG profile), and its OS and architecture.
     """
 
     kind: str
@@ -88,16 +64,16 @@ class DeviceFacts:
     """The REAL NVIDIA driver version, from NVML. Never `torch.version.cuda`."""
     configuration: str
     index: int = 0
-    """The device this record was measured on. NVML is queried with `-i <index>`."""
+    """The selected card. NVML is queried with `-i <index>`."""
     cuda_runtime: str = ""
     """The CUDA runtime torch was built against — a BUILD fact, carried beside the driver
     rather than in place of it. This is the field that used to be called `driver`."""
     os_arch: str = ""
-    """`Linux/x86_64` or `Linux/aarch64`. The measurement subject includes its operating system."""
+    """`Linux/x86_64` or `Linux/aarch64`."""
 
     @property
     def predicate(self) -> str:
-        """The device CLASS a capability record names: `cuda.sm89`, `mps`, `cpu`."""
+        """The device CLASS a provider floor names: `cuda.sm89`, `mps`, `cpu`."""
         return f"cuda.sm{self.sm}" if self.kind == "cuda" else self.kind
 
     def satisfies(self, predicate: str) -> bool:
@@ -119,7 +95,7 @@ class DeviceFacts:
         return self.sm == int(floor)
 
     def tuple_key(self) -> str:
-        """The measured device identity carried by qualification evidence."""
+        """The device identity in one string, as a conformance report names it."""
         return (
             f"{self.kind}/{self.name}/dev{self.index}/{self.configuration}/"
             f"driver={self.driver}/cudart={self.cuda_runtime}/{self.os_arch}"
@@ -140,14 +116,13 @@ class DeviceFacts:
 
 
 def measure_device(torch: Any, index: int = 0) -> DeviceFacts:
-    """Read the SELECTED device once, as facts a probe result may be keyed by.
+    """Read the SELECTED device once, as the facts a plan names it by.
 
     `index` is honoured all the way down (#549.9): torch is asked about that device and NVML
     is queried with `-i index`. Passing 0 and reading card 0 while filling card 3 is the
     defect this signature always looked like it did not have.
 
-    An unreadable knob is SPELLED into the key rather than defaulted, so a probe minted
-    while NVML was mute cannot be reused as one minted while it answered.
+    An unreadable knob is SPELLED rather than defaulted.
     """
     kind = accel.host_backend_family()
     os_arch = f"{platform.system()}/{platform.machine()}"
@@ -182,12 +157,8 @@ def measure_device(torch: Any, index: int = 0) -> DeviceFacts:
 
 
 def _nvml(query: str, index: int) -> str:
-    """One bounded NVML read OF THE SELECTED DEVICE. `N/A` and a failure are both SPELLED.
-
-    `-i {index}` is #549.9's fix and it is one flag: without it every record on a multi-GPU
-    host was keyed by card ZERO's power cap and MIG profile, however many cards the fill
-    plane was about to use.
-    """
+    """One bounded NVML read OF THE SELECTED DEVICE (`-i {index}`, #549.9). `N/A` and a
+    failure are both SPELLED."""
     try:
         out = subprocess.run(
             [
@@ -222,301 +193,54 @@ def device_line(device: DeviceFacts) -> str:
 
 @dataclass(frozen=True, slots=True)
 class RuntimeIdentity:
-    """WHAT WAS RUNNING when a measurement was taken (#549.9).
-
-    A capability record is a claim about an implementation on a device. Both halves have an
-    identity and only the device half had one: two runtime builds with different arithmetic
-    in `encoding/` produced records that were indistinguishable and therefore interchangeable.
-
-    `source_digest` is over this runtime's own encoding/fill/probe sources, so an edit to a
-    decode or a leaf forward invalidates the records that measured the old one. It is
-    computed from the installed FILES rather than from a version string, because a version
-    string is a promise and a digest is a fact.
-    """
+    """WHAT RAN a plan: the Runtime release and the torch build (#549.9)."""
 
     release: str
-    source_digest: str
     torch_build: str
 
     def document(self) -> dict[str, str]:
-        return {
-            "release": self.release,
-            "source_digest": self.source_digest,
-            "torch_build": self.torch_build,
-        }
-
-
-#: The modules whose bytes decide what a capability record MEANS. Anything that changes a
-#: decode, a leaf forward, a swizzle, an oracle or the admission arithmetic is here; the CLI,
-#: the worker and the author surface are not, because they cannot change a measurement.
-IDENTITY_SOURCES = (
-    "internal/encoding/comfy.py",
-    "internal/encoding/vectors/cases/comfy.json",
-    "internal/encoding/formats.py",
-    "internal/encoding/leaves.py",
-    "internal/encoding/selection.py",
-    "internal/probe.py",
-    "internal/resolution.py",
-)
-
-
-def runtime_source_digest() -> str:
-    """A digest over `IDENTITY_SOURCES` as installed. Missing files are SPELLED, not skipped.
-
-    A source file that cannot be read is recorded as absent rather than silently omitted:
-    two builds that differ by a deleted module must not share a digest.
-    """
-    root = Path(__file__).resolve().parent.parent.parent
-    body: dict[str, str] = {}
-    for rel in IDENTITY_SOURCES:
-        path = root / rel
-        try:
-            body[rel] = canonical.digest({"bytes": path.read_bytes().hex()})
-        except OSError:
-            body[rel] = "absent"
-    return canonical.digest(body)
+        return {"release": self.release, "torch_build": self.torch_build}
 
 
 def measure_runtime(torch: Any, release: str) -> RuntimeIdentity:
-    return RuntimeIdentity(
-        release=release,
-        source_digest=runtime_source_digest(),
-        torch_build=str(getattr(torch, "__version__", "unknown")),
-    )
+    return RuntimeIdentity(release=release, torch_build=str(getattr(torch, "__version__", "")))
 
 
-# --------------------------------------------------------------------- geometry classes
+# --------------------------------------------------------------------------- admission
+
+#: The destinations a decoder or a native leaf writes; any other dtype is stored verbatim.
+FLOAT_DTYPES = frozenset({"float16", "bfloat16", "float32", "float64"})
 
 
-def geometry_class(shape: Sequence[int]) -> str:
-    """The COARSE geometry a measurement was taken at, recorded on every record (#549.9).
-
-    It is EVIDENCE, not a filter. A record says "this was measured on rank-2 geometry whose K
-    is a multiple of 32", and `Provider.supports` is what actually gates a tensor.
-    """
-    if len(shape) != 2:
-        return f"rank{len(shape)}"
-    return "rank2.block32" if int(shape[1]) % 32 == 0 else "rank2.ragged32"
-
-
-# ------------------------------------------------------------------- capability records
-
-
-@dataclass(frozen=True, slots=True)
-class CapabilityRecord:
-    """The tfs-013 key, kept whole and widened by #549.9: an (encoding, implementation,
-    runtime, device, dtype, geometry) qualification.
-
-    A record cannot exist without `evidence_digest`, which is the digest of the probe
-    observation that minted it — so "qualified" always means "something ran and was
-    measured", never "someone believed".
-
-    The two MEASURED axes below are what turned this from a membership test into an
-    ORDERING (#517e). They are stored on the record and not derived at admission because
-    they are properties of a probe run: a number the table carries is a number something
-    produced, and one nothing produced is spelled -1.0 rather than defaulted to a value
-    that would win or lose a comparison it was never entitled to enter.
-    """
-
-    scheme: str
-    implementation_digest: str
-    runtime_release: str
-    device_predicate: str
-    output_dtype: str
-    delivery_route: str
-    evidence_digest: str
-    resident_bits_per_element: float = -1.0
-    """FOOTPRINT axis. The bits this route leaves resident per logical element, measured on
-    the probe's own tensor: the destination dtype's width on a decode route (the weights are
-    float either way), the role bytes on an encoded-GEMM one. -1.0 means NOT MEASURED."""
-    kernel_numeric_error: float = -1.0
-    """The KERNEL DIAGNOSTIC axis, renamed from `route_deviation_rel`/"fidelity" (#549.11).
-    Relative Frobenius of the ROUTE's own GEMM output against an f64 reference over the
-    exactly-dequantized weights, on identical activations — the one quantity comparable
-    across a decode route and an encoded one, because it prices the whole route rather than
-    one of its halves. -1.0 means NOT MEASURED.
-
-    It is NOT model quality and may never be reported as such: quality is a paired
-    video+audio eval on real outputs and belongs to the eval plane (#549.6)."""
-    leaf_speedup_x: float = -1.0
-    """The LEAF SPEED evidence, encoded-GEMM routes only: the float GEMM's wall over the
-    leaf's forward at the probe shape, activation quantization inside the timed region
-    (`probe._leaf_bench`). Above 1.0 the leaf wins; below it the leaf LOSES to decoding and
-    the route is a memory play. -1.0 means NOT MEASURED, which every decode route is.
-
-    It is evidence at ONE shape, not a whole-plan wall, so nothing ranks on it (see
-    `resolution.score`); it exists so that a leaf that measured slower is READABLE on every
-    record, plan and boot line that serves it, rather than banked and never read."""
-    runtime_source_digest: str = ""
-    torch_build: str = ""
-    os_arch: str = ""
-    device_index: int = 0
-    device_driver: str = ""
-    cuda_runtime: str = ""
-    geometry_class: str = ""
-    implementation_revision: str = ""
-
-    def axis(self, objective: str) -> float:
-        """The ranking key for one objective. Lower is better; -1.0 means UNRANKABLE."""
-        if objective == "footprint":
-            return self.resident_bits_per_element
-        if objective == "kernel_numeric_error":
-            return self.kernel_numeric_error
-        return -1.0
-
-    def document(self) -> dict[str, str | int | float]:
-        return {
-            "scheme": self.scheme,
-            "implementation_digest": self.implementation_digest,
-            "implementation_revision": self.implementation_revision,
-            "runtime_release": self.runtime_release,
-            "runtime_source_digest": self.runtime_source_digest,
-            "torch_build": self.torch_build,
-            "os_arch": self.os_arch,
-            "device_predicate": self.device_predicate,
-            "device_index": self.device_index,
-            "device_driver": self.device_driver,
-            "cuda_runtime": self.cuda_runtime,
-            "output_dtype": self.output_dtype,
-            "geometry_class": self.geometry_class,
-            "delivery_route": self.delivery_route,
-            "evidence_digest": self.evidence_digest,
-            "resident_bits_per_element": self.resident_bits_per_element,
-            "kernel_numeric_error": self.kernel_numeric_error,
-            "leaf_speedup_x": self.leaf_speedup_x,
-        }
-
-
-#: Which MEASURED record field each PER-TENSOR objective ranks implementations on.
-#:
-#: `latency` is deliberately absent AND ITS ABSENCE IS NO LONGER A REFUSAL (#549.3). Nothing
-#: on a capability record measures a quantity comparable between "a decode paid once at
-#: fill" and "a GEMM paid every step" — but the PLAN FACT store does, per resolved plan, and
-#: `resolution.py` ranks whole plans there. What used to happen instead was that the default
-#: objective refused before the layer holding those measurements ever ran.
-OBJECTIVE_AXIS: dict[str, str] = {
-    "footprint": "resident_bits_per_element",
-    "kernel_numeric_error": "kernel_numeric_error",
-}
-
-
-class Capabilities:
-    """The fail-closed admission table. No default branch, no "unknown means allowed"."""
-
-    def __init__(
-        self,
-        records: Sequence[CapabilityRecord] = (),
-        refusals: Mapping[tuple[str, str, str], str] | None = None,
-    ) -> None:
-        self.records = list(records)
-        #: (encoding, implementation digest, output dtype) -> why that cell minted no record
-        self.refusals = dict(refusals or {})
-
-    def add(self, record: CapabilityRecord) -> None:
-        self.records.append(record)
-
-    def qualified(
-        self,
-        encoding: str,
-        device: DeviceFacts,
-        output_dtype: str,
-        among: Mapping[str, Provider],
-    ) -> list[CapabilityRecord]:
-        """Every record that admits one of `among` on this device, for this dtype.
-
-        `among` is implementation digest -> provider, for exactly the candidates whose
-        declared role set the header satisfies AND whose geometry preflight passed. A record
-        for an implementation this build does not carry admits nothing, and neither does a
-        provider whose declared device floor this card misses — the two filters are separate
-        because they answer different questions ("was this measured here" and "does this
-        implementation claim this card"), and collapsing them would let a stale record select
-        a provider that is gone.
-        """
-        return [
-            record
-            for record in self.records
-            if record.scheme == encoding
-            and record.output_dtype == output_dtype
-            and device.satisfies(record.device_predicate)
-            and record.implementation_digest in among
-            and device.satisfies(among[record.implementation_digest].device_predicate)
-        ]
-
-    def rank(
-        self, records: Sequence[CapabilityRecord], among: Mapping[str, Provider], objective: str
-    ) -> list[CapabilityRecord]:
-        """Order candidates best-first under one objective. NEVER refuses (#549.3).
-
-        An objective with a measured axis orders on it, lower better, the implementation NAME
-        breaking an exact tie so the answer is a function of the measurements and not of dict
-        iteration order. An objective with NO per-record axis — `latency` — orders by name
-        alone and says nothing: the plan level ranks routes, and a stable order here just
-        keeps this function total.
-
-        A candidate whose axis is UNMEASURED (-1.0) sorts LAST rather than first: -1.0 is
-        smaller than every real measurement, and "nobody measured it" must never win a
-        comparison it was not entitled to enter.
-        """
-        axis = OBJECTIVE_AXIS.get(objective)
-
-        def key(record: CapabilityRecord) -> tuple[int, float, str]:
-            name = among[record.implementation_digest].name
-            if axis is None:
-                return (0, 0.0, name)
-            value = record.axis(objective)
-            return (1, 0.0, name) if value < 0.0 else (0, value, name)
-
-        return sorted(records, key=key)
-
-    def admit(
-        self,
-        encoding: str,
-        device: DeviceFacts,
-        output_dtype: str,
-        *,
-        objective: str,
-        among: Mapping[str, Provider],
-    ) -> CapabilityRecord:
-        """The best qualified record for this (encoding, device, dtype). One answer.
-
-        Kept as the single-answer door for callers that legitimately want one — the fill
-        plane, once a plan has already been resolved. Plan resolution uses `qualified` plus
-        `rank` so it can build alternative plans and price them WHOLE.
-        """
-        records = self.qualified(encoding, device, output_dtype, among)
-        if not records:
-            raise refuse(
-                "encoding_unqualified",
-                self._why(encoding, device, output_dtype, among),
-                [encoding],
-            )
-        return self.rank(records, among, objective)[0]
-
-    def _why(
-        self,
-        encoding: str,
-        device: DeviceFacts,
-        output_dtype: str,
-        among: Mapping[str, Provider],
-    ) -> str:
-        elsewhere = sorted({r.device_predicate for r in self.records if r.scheme == encoding})
-        seam = NAMED_SEAMS.get(encoding)
-        alternative = f" The route that WOULD serve it is {seam[0]}: {seam[1]}." if seam else ""
-        # WHICH implementations exist and what each one's floor is. "No qualified provider"
-        # is the same words whether nothing was built or nothing was measured, and those are
-        # different problems with different remedies.
-        built = " | ".join(
-            f"{p.name} [{p.route}] floor {p.device_predicate}"
-            f"{'' if device.satisfies(p.device_predicate) else ' — this card misses that floor'}"
-            for p in sorted(among.values(), key=lambda p: p.name)
-        )
+def admit(provider: Provider, device: DeviceFacts, output_dtype: str, encoded: Encoded) -> str:
+    """ "" when `provider` may serve this tensor into `output_dtype` on `device`, else why not:
+    a rule of the provider's declarations and the card's `arch` row, nothing measured."""
+    if provider.route == "verbatim":
+        return ""
+    if output_dtype not in FLOAT_DTYPES:
+        return f"{provider.name} writes float destinations and this one is {output_dtype}"
+    if not device.satisfies(provider.device_predicate):
         return (
-            f"{encoding} has no qualified provider on "
-            f"{device_line(device)} for output dtype {output_dtype}. Qualified device "
-            f"predicates for this encoding: {elsewhere or 'none'}. Implementations this "
-            f"build carries: {built or 'none'}.{alternative} An unrecognised device is the "
-            "ABSENCE of evidence, never permission."
+            f"{provider.name} needs {provider.device_predicate} and this device is "
+            f"{device.predicate}"
         )
+    if isinstance(provider, LeafProvider):
+        if device.kind != "cuda":
+            return f"{provider.name} runs on CUDA tensor cores and this device is {device.kind}"
+        if output_dtype not in provider.out_dtypes:
+            wrote = "/".join(sorted(provider.out_dtypes))
+            return f"{provider.name} writes {wrote}, not {output_dtype}"
+        row = arch.hardware(device.sm)
+        lacking = sorted(provider.formats - row.formats())
+        if lacking:
+            return (
+                f"{device.predicate} ({row.name}) has no {'/'.join(lacking)} tensor cores for "
+                f"{provider.name}"
+            )
+        return ""
+    if device.kind == "mps" and any(part.dtype.startswith("f8_") for part in encoded.parts):
+        return f"{provider.name}: MPS has no float8, and this tensor stores float8 parts"
+    return ""
 
 
 # --------------------------------------------------------------------------- the seams
@@ -526,7 +250,7 @@ class Capabilities:
 NAMED_SEAMS: dict[str, tuple[str, str]] = {
     "fp8.tensorwise": (
         "cuda.sm90+",
-        "encoded-GEMM fp8 tensor-core execution via torch._scaled_mm; elsewhere the qualified "
+        "encoded-GEMM fp8 tensor-core execution via torch._scaled_mm; elsewhere the "
         "route is decoded_float, which this runtime serves",
     ),
 }
@@ -536,11 +260,13 @@ NAMED_SEAMS: dict[str, tuple[str, str]] = {
 
 
 def launch_providers() -> dict[str, tuple[Provider, ...]]:
-    """Scheme -> its candidate providers. Their order decides nothing: `resolution.py` picks
-    among qualified records."""
+    """Scheme -> its candidate providers, in the order `Selector` prefers them within a route:
+    the first one `admit` lets serve a tensor is that route's."""
     out: dict[str, list[Provider]] = {}
     builds: tuple[Callable[[str], Provider], ...] = (
         Verbatim,
+        # The decode cores first: Triton kernels on CUDA, where a scheme's own dequant is eager.
+        CoreDequant,
         TensorwiseDequant,
         RowwiseDequant,
         columnwise,
@@ -551,7 +277,6 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Nvfp4NativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
-        CoreDequant,
         ComfyDequant,
     )
     for build in builds:
@@ -565,7 +290,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
 
 def implementation_digest(provider: Provider) -> str:
     """The provider's identity: name, route, device floor, oracle, parts, revision, schemes.
-    Records that measured another identity never admit this one."""
+    A plan names the implementation it executes by it."""
     return canonical.digest(
         {
             "name": provider.name,
@@ -589,7 +314,6 @@ class Selection:
     tensor's params."""
 
     provider: Provider
-    record: CapabilityRecord
     encoded: Encoded
     reason: str = ""
     """Why this provider, in one sentence, carried into the resolved plan."""
@@ -600,10 +324,9 @@ class Selection:
 
 @dataclass(frozen=True, slots=True)
 class Refusal:
-    """A leaf this device REFUSED for a tensor whose bytes and shape admit it: its qualification
-    failed, its kernel is unavailable here, or it raised. Never a by-design route: a geometry
-    the format rules out is `TensorCandidates.geometry_refused`, and a recipe's float layer is
-    stored plain."""
+    """A leaf this card does not serve for a tensor whose bytes and shape admit it (`admit`
+    says why). Never a by-design route: a geometry the format rules out is
+    `TensorCandidates.geometry_refused`, and a recipe's float layer is stored plain."""
 
     leaf: str
     reason: str
@@ -611,59 +334,39 @@ class Refusal:
 
 @dataclass(frozen=True, slots=True)
 class TensorCandidates:
-    """Every route this tensor CAN take on this device, plus what refused the others.
-
-    This is the object #549.1 needed and the old `select`-only surface could not provide:
-    plan resolution has to build the encoded plan AND the decode-floor plan before pricing
-    either, so it needs the alternatives rather than one winner.
-    """
+    """Every route this tensor CAN take on this device, plus what refused the others."""
 
     key: str
     encoded: Encoded
     output_dtype: str
     by_route: Mapping[str, Selection] = field(default_factory=dict)
-    """route -> its best qualified implementation, already ranked under the objective."""
+    """route -> the first admitted implementation of it, in launch order."""
     geometry_refused: tuple[tuple[str, str], ...] = ()
     """(provider name, why) for candidates this tensor's own SHAPE ruled out (#549.5)."""
     unqualified: str = ""
-    """The capability refusal, verbatim, if NO route qualified."""
+    """Why no route serves this tensor on this device, when none does."""
     routes_offered: frozenset[str] = frozenset()
-    """Every route this tensor's BYTES and SHAPE admit on some device, qualified here or
-    not. `by_route` minus this is what this card did not qualify."""
+    """Every route this tensor's BYTES and SHAPE admit on some device."""
     refused: tuple[Refusal, ...] = ()
-    """The encoded leaves this card refused for this tensor, with why."""
+    """The encoded leaves this card does not serve for this tensor, with why."""
 
 
 class Selector:
-    """Per-tensor candidate resolution: by scheme, fail-closed, O(1) per key.
+    """Per-tensor candidate resolution by scheme, by rule (`admit`)."""
 
-    `objective` is the DEPLOYMENT's stated axis, carried down from the resolved plan. It is a
-    constructor argument rather than a per-call one because delivery is decided ONCE per
-    generation: a per-tensor objective would let one component's leaves and another's
-    disagree about what this deployment is for.
-    """
-
-    def __init__(
-        self,
-        providers: Mapping[str, tuple[Provider, ...]],
-        capabilities: Capabilities,
-        device: DeviceFacts,
-        objective: str = "kernel_numeric_error",
-    ) -> None:
+    def __init__(self, providers: Mapping[str, tuple[Provider, ...]], device: DeviceFacts) -> None:
         self.providers = providers
-        self.capabilities = capabilities
         self.device = device
-        self.objective = objective
 
     def candidates(
         self, key: str, encoded: Encoded, output_dtype: str, shape: Sequence[int]
     ) -> TensorCandidates:
         """Every servable route for one tensor. Filters in order, each with its own remedy:
-        scheme known, parts accounted for, shape and params supported, measured here."""
+        scheme known, parts accounted for, shape and params supported, admitted here."""
         providers = self.providers.get(encoded.scheme)
         if not providers:
             self._refuse_unknown(key, encoded)
-        among: dict[str, Provider] = {}
+        among: list[Provider] = []
         mismatched: list[tuple[Provider, list[str], list[str]]] = []
         geometry: list[tuple[str, str]] = []
         params = dict(encoded.params)
@@ -678,7 +381,7 @@ class Selector:
             if why:
                 geometry.append((candidate.name, why))
                 continue
-            among[implementation_digest(candidate)] = candidate
+            among.append(candidate)
         if not among and mismatched and not geometry:
             raise refuse(
                 "role_mismatch",
@@ -700,56 +403,42 @@ class Selector:
                 + " | ".join(f"{name}: {why}" for name, why in geometry),
                 [key],
             )
-        records = self.capabilities.qualified(encoded.scheme, self.device, output_dtype, among)
-        offered = frozenset(provider.route for provider in among.values())
-        if not records:
-            return TensorCandidates(
-                key,
-                encoded,
-                output_dtype,
-                {},
-                tuple(geometry),
-                self.capabilities._why(encoded.scheme, self.device, output_dtype, among),
-                offered,
-            )
         best: dict[str, Selection] = {}
-        for record in self.capabilities.rank(records, among, self.objective):
-            provider = among[record.implementation_digest]
-            if provider.route in best:
-                continue
-            reason = self._reason(provider, record, among, geometry)
-            best[provider.route] = Selection(provider, record, encoded, reason)
-        refused = tuple(
-            Refusal(
-                provider.name,
-                self.capabilities.refusals.get(
-                    (encoded.scheme, digest, output_dtype), "no qualification record"
-                ),
-            )
-            for digest, provider in among.items()
-            if provider.route == "encoded_gemm" and "encoded_gemm" not in best
+        refused: list[Refusal] = []
+        reasons: list[str] = []
+        for provider in among:
+            why = admit(provider, self.device, output_dtype, encoded)
+            if why:
+                reasons.append(why)
+                if provider.route == "encoded_gemm":
+                    refused.append(Refusal(provider.name, why))
+            elif provider.route not in best:
+                best[provider.route] = Selection(
+                    provider, encoded, self._reason(provider, geometry)
+                )
+        seam = NAMED_SEAMS.get(encoded.scheme)
+        unqualified = (
+            ""
+            if best
+            else f"{encoded.scheme} has no provider on {device_line(self.device)} for output "
+            f"dtype {output_dtype}: {' | '.join(reasons)}"
+            + (f". The route that WOULD serve it is {seam[0]}: {seam[1]}" if seam else "")
         )
         return TensorCandidates(
-            key, encoded, output_dtype, best, tuple(geometry), "", offered, refused
+            key,
+            encoded,
+            output_dtype,
+            best,
+            tuple(geometry),
+            unqualified,
+            frozenset(provider.route for provider in among),
+            () if "encoded_gemm" in best else tuple(refused),
         )
 
-    def _reason(
-        self,
-        provider: Provider,
-        record: CapabilityRecord,
-        among: Mapping[str, Provider],
-        geometry: Sequence[tuple[str, str]],
-    ) -> str:
-        peers = sorted(p.name for p in among.values() if p.name != provider.name)
-        why = (
-            f"{provider.name} [{provider.route}], measured on {record.device_predicate}: "
-            f"{record.resident_bits_per_element:.3f} resident b/elt, "
-            f"kernel_numeric_error {record.kernel_numeric_error:.6f}"
-        )
+    def _reason(self, provider: Provider, geometry: Sequence[tuple[str, str]]) -> str:
+        why = f"{provider.name} [{provider.route}] on {self.device.predicate}"
         if geometry:
             why += "; geometry ruled out " + ", ".join(f"{n} ({w[:80]}…)" for n, w in geometry)
-        elif peers:
-            why += f"; also qualified: {', '.join(peers)}"
         return why
 
     def _refuse_unknown(self, key: str, encoded: Encoded) -> NoReturn:
@@ -767,25 +456,3 @@ class Selector:
             f"{device_line(self.device)}; the route that would serve it is {seam[0]}: {seam[1]}",
             [key],
         )
-
-    def select(
-        self, key: str, encoded: Encoded, output_dtype: str, shape: Sequence[int] = ()
-    ) -> Selection:
-        """One answer, for a caller whose plan is already resolved. `shape` defaults to the
-        `weight` (or plain `value`) part's own."""
-        if not shape:
-            data = next((p for p in encoded.parts if p.role in ("weight", "value")), None)
-            shape = data.shape if data else ()
-        found = self.candidates(key, encoded, output_dtype, shape)
-        if not found.by_route:
-            raise refuse("encoding_unqualified", found.unqualified or f"{key}: unqualified", [key])
-        order = self.capabilities.rank(
-            [s.record for s in found.by_route.values()],
-            {implementation_digest(s.provider): s.provider for s in found.by_route.values()},
-            self.objective,
-        )
-        first = order[0]
-        for selection in found.by_route.values():
-            if selection.record is first:
-                return selection
-        return next(iter(found.by_route.values()))

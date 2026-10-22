@@ -16,8 +16,7 @@ from tensorfs.varena.torch import Memory, Placeholder  # noqa: E402
 
 from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.author._model import PLACED  # noqa: E402
-from cozy_runtime.internal.encoding import Capabilities, measure_device, measure_runtime  # noqa: E402
-from cozy_runtime.internal.probe import QualificationResult  # noqa: E402
+from cozy_runtime.internal.encoding import measure_device, measure_runtime  # noqa: E402
 from cozy_runtime.internal.resolution import ConstructionFacts, ResolvedModelPlan  # noqa: E402
 from cozy_runtime.internal.weights import Backend, Residency  # noqa: E402
 
@@ -56,13 +55,11 @@ def placed(tmp_path: Path) -> Iterator[tuple[Any, Any, Residency, list[int]]]:
         variant="test",
         store="test",
         snapshots={},
-        reference_variant="test",
         policy="test",
         tensors=(),
         device=facts,
         runtime=runtime,
         placement="all_resident",
-        objective="latency",
         construction=ConstructionFacts("test", "Identity", ("identity",)),
         encoded_leaves="refuse",
     )
@@ -74,7 +71,6 @@ def placed(tmp_path: Path) -> Iterator[tuple[Any, Any, Residency, list[int]]]:
         memory=memory,
         device=device,
         construction="test",
-        qualified=(Capabilities(), QualificationResult("test", facts, "", "test", runtime, 0, [])),
         device_facts=facts,
     )
     backend.models["identity"] = model

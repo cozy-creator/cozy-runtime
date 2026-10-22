@@ -225,8 +225,6 @@ class Binding(Release, frozen=True, kw_only=True):
     variant: str = ""
     development: bool = False
     custody: Custody = "canonical"
-    objective: str = ""
-    steps_basis: int = 0
     placement: str = ""
     package: str = ""
     model: str = ""

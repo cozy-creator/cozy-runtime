@@ -40,10 +40,10 @@ from cozy_runtime.internal import canonical, lora_bake
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
-    Capabilities,
     DeviceFacts,
     LeafProvider,
     Selection,
+    admit,
     device_line,
     implementation_digest,
     launch_providers,
@@ -62,9 +62,6 @@ from cozy_runtime.internal.fill import (
 )
 from cozy_runtime.internal.fill import fit as fill_fit
 from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (Ulysses' torch side, served)
-from cozy_runtime.internal.planfacts import PlanFacts
-from cozy_runtime.internal.probe import QualificationResult
-from cozy_runtime.internal.qualification import qualified
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
 if TYPE_CHECKING:
@@ -102,7 +99,6 @@ class Backend:
         memory: Memory,
         device: torch.device,
         construction: str,
-        qualified: tuple[Capabilities, QualificationResult],
         device_facts: DeviceFacts,
         custody: str = "canonical",
         grant: Grant | None = None,
@@ -132,7 +128,6 @@ class Backend:
         self.stats: dict[str, float] = {}
         self.device_facts = device_facts
         self.providers = launch_providers()
-        self.capabilities, self.probe = qualified
         self.execution = plan
         self.resolved: dict[str, TensorResolution] = plan.by_key()
         planned, held = set(self.resolved), set(self.plan)
@@ -166,20 +161,12 @@ class Backend:
         device: torch.device,
         construction: str,
         release: str,
-        objective: str = "latency",
         encoded_leaves: str = "accept",
     ) -> Backend:
-        """A backend for a driver script with no model class: measure, qualify, resolve a
-        `script_plan` over these rows, then construct, through the executor's own authority."""
+        """A backend for a driver script with no model class: resolve a `script_plan` over
+        these rows, then construct, through the executor's own authority."""
         facts = measure_device(torch, device.index or 0)
         providers = launch_providers()
-        qualification = qualified(
-            torch,
-            providers,
-            facts,
-            sorted({dtype_name(row.dtype) for row in rows}),
-            release=release,
-        )
         plan = script_plan(
             rows=rows,
             components=sorted({row.component for row in rows}),
@@ -188,11 +175,8 @@ class Backend:
             snapshot=next(iter(checkpoints.values())).id,
             snapshots={name: book.id for name, book in checkpoints.items()},
             providers=providers,
-            capabilities=qualification.capabilities,
             device=facts,
             runtime=measure_runtime(torch, release),
-            facts=PlanFacts(),
-            objective=objective,
             encoded_leaves=encoded_leaves,
             dtype_name=dtype_name,
         )
@@ -204,14 +188,12 @@ class Backend:
             memory=memory,
             device=device,
             construction=construction,
-            qualified=(qualification.capabilities, qualification.result),
             device_facts=facts,
         )
 
     def _select(self, key: str, row: PlanRow) -> Selection:
         """The plan's provider for one destination, matched by digest against this build and
-        this device's capability records. Anything else is `plan_divergence`, never a
-        re-selection."""
+        admitted on this device. Anything else is `plan_divergence`, never a re-selection."""
         resolved = self.resolved.get(key)
         if resolved is None:
             raise _refuse("plan_divergence", f"{key}: the plan names no such destination", [key])
@@ -244,20 +226,15 @@ class Backend:
                 ),
                 [key],
             )
-        records = self.capabilities.qualified(
-            row.encoded.scheme,
-            self.device_facts,
-            resolved.output_dtype,
-            {resolved.implementation_digest: provider},
-        )
-        if not records:
+        why = admit(provider, self.device_facts, resolved.output_dtype, row.encoded)
+        if why:
             raise _refuse(
                 "plan_divergence",
-                f"{key}: {device_line(self.device_facts)} holds no capability record for "
-                f"{resolved.implementation}",
+                f"{key}: {device_line(self.device_facts)} does not serve "
+                f"{resolved.implementation}: {why}",
                 [key],
             )
-        return Selection(provider, records[0], row.encoded, resolved.reason)
+        return Selection(provider, row.encoded, resolved.reason)
 
     # -- the Backend protocol
 
@@ -624,7 +601,9 @@ class _Routes:
             return {name: out}
         leaf, replaced, derived = self.leaves[key]
         provider = cast(LeafProvider, self.providers[key])
-        made = _bound(leaf, derived, parts, lambda: provider.leaf(torch, parts, replaced, leaf.out_dtype))
+        made = _bound(
+            leaf, derived, parts, lambda: provider.leaf(torch, parts, replaced, leaf.out_dtype)
+        )
         return {f"{name.removesuffix('.weight')}.{buffer}": t for buffer, t in made.items()}
 
 
@@ -641,7 +620,9 @@ def _bound(
     """`leaf`'s role buffers, by buffer name, from one bind's stored `parts`: the roles it keeps
     as stored, and the `derived` ones from a fresh leaf of the same provider."""
     buffers = leaf.BUFFERS
-    made = {buffers.get(r, r): t for r, t in parts.items() if r in leaf._cozy_roles and r not in derived}
+    made = {
+        buffers.get(r, r): t for r, t in parts.items() if r in leaf._cozy_roles and r not in derived
+    }
     if derived:
         built = fresh()
         made.update({buffers.get(r, r): built._buffers[buffers.get(r, r)] for r in derived})

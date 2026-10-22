@@ -1,43 +1,26 @@
-"""cr-006 — the per-device qualification suite that MINTS capability records.
+"""cr-006 — the conformance suite: each decoder and native leaf against an independent oracle.
 
-§3.2's cost placement, made concrete: this runs ONCE per (card architecture, torch minor,
-Runtime source), at a release gate, and its result ships as a typed table (`qualified`). Per
-request there is only arithmetic.
+The Runtime never runs this to serve (xs-065, owner 2026-10-22): selection is a rule
+(`selection.admit`). This is how a rule earns its kernels. The tests run it on CPU, and
+`python -m cozy_runtime.cli.conformance` runs it by hand on a real card of a new family before
+a rule names that family's kernels.
 
-Four things happen per (encoding, IMPLEMENTATION, output dtype), in this order, and a
-failure at any one leaves NO record — which is what "fail-closed" means when the table is
-minted rather than declared. The middle term is new: since #517e an encoding carries
-ORDERED CANDIDATES rather than one provider, and each candidate is qualified separately,
-because "fp8.rowwise works here" is not a fact — "this implementation of it works here" is.
+Per (encoding, IMPLEMENTATION, output dtype):
 
-1. **numerics self-check** against an INDEPENDENT reference. The e4m3 decoder below is
-   written from the OCP number format by integer arithmetic, not by asking torch to cast —
-   a self-check that uses the implementation as its own oracle checks nothing. The domain
-   is the WHOLE format: all 256 e4m3 bit patterns, at a per-tensor scale or against 256
-   row scales, NaN included (as a NaN, not a number) and overflow included (as an
-   infinity, not a plausible finite number). The suite a provider gets is keyed on the
-   ORACLE NAME it declares (`Provider.suite`), so an implementation with no oracle
-   qualifies nothing rather than passing by default.
-   A NATIVE LEAF's oracle is a different shape and has to be: its stored roles never become
-   a float tensor, so there is nothing per-element to check. `_native_agreement` runs the
-   leaf's real kernel on the real arch against an f64 matmul over the exactly-dequantized
-   weights — which is the only check that can see a kernel that returns wrong numbers
-   without raising.
-2. **micro-benchmark** at a realistic tensor size, so the plan table has a measured
-   decode rate rather than an assumed one — or, for a leaf, a measured forward beside the
-   float GEMM it replaces.
-3. **route axes** — the two MEASURED numbers `Capabilities.admit` RANKS candidates on
-   (#517e): resident bits per element, and the whole route's deviation from an f64
-   reference on identical inputs. Both routes are scored in ONE frame, because #517d's
-   finding is that fidelity and footprint order OPPOSITELY and a chooser therefore needs
-   an objective with numbers on both sides rather than a ladder position.
-4. **record** — the tfs-013 key with the evidence digest of exactly this observation.
+1. **numerics** against an INDEPENDENT reference. The e4m3 decoder below is written from the
+   OCP number format by integer arithmetic, not by asking torch to cast — a self-check that
+   uses the implementation as its own oracle checks nothing. The domain is the WHOLE format:
+   all 256 e4m3 bit patterns, at a per-tensor scale or against 256 row scales, NaN included
+   (as a NaN) and overflow included (as an infinity). The suite a provider gets is keyed on
+   the ORACLE NAME it declares (`Provider.suite`), so an implementation with no oracle passes
+   nothing rather than passing by default.
+   A NATIVE LEAF's oracle is its own GEMM: its stored roles never become a float tensor, so
+   `_native_agreement` runs the leaf's real kernel on the real card against an f64 matmul
+   over the exactly-dequantized weights — the only check that sees a kernel that returns
+   wrong numbers without raising.
+2. **spec vectors**: the reviewed spec's producer-mined cases, decoded bit for bit.
 
-The suite QUALIFIES a fixed kernel set; it does not search one. Its seconds are returned as
-an observation.
-
-**The result is release data** (`qualification`): one table per card architecture, torch
-minor and Runtime source, measured by the release gates and shipped in the wheel.
+It times nothing: speed is the rules' business, measured offline and written into code.
 """
 
 from __future__ import annotations
@@ -57,19 +40,17 @@ from tensorfs import UnsupportedError
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_nvfp4
-from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal import accel
 from cozy_runtime.internal.decode_cores import Cores
 from cozy_runtime.internal.decode_schemes import run, sample
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
-    Capabilities,
-    CapabilityRecord,
     DeviceFacts,
+    Encoded,
     LeafProvider,
     Provider,
-    RolePart,
     RuntimeIdentity,
-    geometry_class,
+    admit,
     implementation_digest,
     measure_runtime,
 )
@@ -87,33 +68,19 @@ from cozy_runtime.internal.encoding.formats import (
 
 # `torch`, `device`, `dtype` and tensor values are `Any`: the check venv carries no torch.
 
-#: One decode of this many elements is the micro-benchmark's unit — a realistic attention
-#: projection, not a toy and not a search space.
+#: The weight every oracle decodes: a realistic attention projection.
 BENCH_SHAPE = (2048, 2048)
-BENCH_REPS = 8
 
-#: The token count the ROUTE AXES measure one GEMM at, against `BENCH_SHAPE` weights. Small
-#: on purpose: the axes are a fidelity and a footprint number, not a throughput one, and a
-#: qualification suite that spent a second per (provider, dtype) on a matmul nobody reads
-#: would be paying §3.2's prepare-time budget for nothing.
+#: The token count a native leaf's GEMM is checked at, against `BENCH_SHAPE` weights.
 FIDELITY_TOKENS = 256
 
 #: Where a native route's GEMM stops being lossy and starts being wrong. #517d measured the
 #: real thing at 0.146 relative (16.7 dB); a mis-strided scale or a transposed operand
 #: measures past 0.5. The line is drawn in the gap and it is a SANITY bound, not a quality
-#: one — quality is the ranked axis, not the gate.
+#: one.
 NATIVE_DEVIATION_BOUND = 0.30
 
-# ----------------------------------------------------------------- the result records
-
-
-class RouteAxes(msgspec.Struct, frozen=True):
-    """The two MEASURED axes `Capabilities.admit` ranks on (#517e). -1.0 is NOT MEASURED,
-    which makes a record UNRANKABLE rather than plausible: a zero would win every comparison
-    it was never entitled to enter."""
-
-    deviation_rel: float = -1.0
-    resident_bits_per_element: float = -1.0
+# ---------------------------------------------------------------------- the results
 
 
 class Sweep(msgspec.Struct, frozen=True, omit_defaults=True):
@@ -149,21 +116,6 @@ class NativeAgreement(
     note: str = ""
 
 
-class DecodeBench(msgspec.Struct, frozen=True):
-    shape: list[int]
-    reps: int
-    decode_ns: int
-    gb_per_s: float
-
-
-class LeafBench(msgspec.Struct, frozen=True):
-    shape: list[int]
-    reps: int
-    leaf_ns: int
-    float_gemm_ns: int
-    speedup_x: float
-
-
 class VectorCheck(msgspec.Struct, frozen=True, omit_defaults=True):
     """One mined case: its bytes compared, skipped for geometry, or refused for its roles."""
 
@@ -189,13 +141,11 @@ class SpecVectors(
 class VerbatimEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="verbatim"):
     note: str
     passed: bool = True
-    route_axes: RouteAxes = RouteAxes()
 
 
 class UnmeasuredEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="unmeasured"):
     note: str
     passed: bool = False
-    route_axes: RouteAxes = RouteAxes()
 
 
 class NativeEvidence(
@@ -203,16 +153,12 @@ class NativeEvidence(
 ):
     numerics: NativeAgreement
     passed: bool
-    route_axes: RouteAxes
-    micro_bench: LeafBench | None = None
 
 
 class DecodeEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="decode"):
     numerics: Sweep
     spec_vectors: SpecVectors
-    micro_bench: DecodeBench
     passed: bool
-    route_axes: RouteAxes = RouteAxes()
 
 
 Evidence = VerbatimEvidence | UnmeasuredEvidence | NativeEvidence | DecodeEvidence
@@ -225,24 +171,25 @@ class Observation(msgspec.Struct, frozen=True):
     implementation_revision: str
     device_predicate: str
     output_dtype: str
-    geometry_class: str
-    """WHAT SHAPE THIS WAS MEASURED AT (#549.9). Evidence, not a filter: `Provider.supports`
-    gates a tensor's geometry, and filtering admission on this string too would refuse the
-    decode floor for the ragged tensor it is the only route for."""
     delivery_route: str
     evidence: Evidence
 
 
-class QualificationResult(msgspec.Struct, frozen=True):
-    """One suite run: what it ran on and everything it observed. What `qualified` keeps."""
+class Conformance(msgspec.Struct, frozen=True):
+    """One suite run: the card it ran on, the Runtime, and every observation."""
 
-    tuple_key: str = msgspec.field(name="tuple")
     device: DeviceFacts
-    device_predicate: str
-    runtime_release: str
     runtime: RuntimeIdentity
     suite_ms: int
     observations: list[Observation]
+
+    @property
+    def passed(self) -> bool:
+        """Every cell the card's floors admit passed: a cell below a floor is not a failure."""
+        return all(
+            one.evidence.passed or isinstance(one.evidence, UnmeasuredEvidence)
+            for one in self.observations
+        )
 
 
 def e4m3_value(bits: int) -> float:
@@ -625,10 +572,9 @@ def _native_agreement(
     Two failures this catches and nothing else in the runtime would:
 
     * **the kernel does not exist here.** `torch._scaled_mm` raising on this arch, this
-      torch build or this dtype is recorded VERBATIM and mints no record — which is the
-      whole of "a device with no measured suite mints nothing" for the native routes.
+      torch build or this dtype is recorded VERBATIM as a failure.
     * **a silently wrong kernel.** A mis-strided scale or a transposed operand returns wrong
-      numbers without raising. It fails HERE, far past the budget, and mints nothing.
+      numbers without raising. It fails HERE, far past the budget.
 
     The budget is deliberately LOOSE — this is a w8a8 route and the activation quantization
     is a real, measured, accepted loss (#517d: 16.72 dB against the dequant lane's 20.82 dB).
@@ -646,8 +592,7 @@ def _native_agreement(
         return NativeAgreement(
             passed=False,
             kernel=f"{type(exc).__module__}.{type(exc).__name__}: {exc}",
-            note="the native kernel refused on this device; no record is minted, and the "
-            "encoding falls to whichever decode provider this card DID qualify",
+            note="the native kernel refused on this device",
         )
     deviation = _relative(torch, got, reference)
     finite = bool(torch.isfinite(got).all())
@@ -664,7 +609,7 @@ def _native_agreement(
 
 
 class _StandIn:
-    """The module a leaf stands in for, during qualification only.
+    """The module a leaf stands in for, during conformance only.
 
     A leaf reads its geometry off the module it REPLACES rather than off the payload, so
     the oracle has to hand it one. This is the smallest thing that answers those questions
@@ -683,9 +628,9 @@ class _StandIn:
 def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dict[str, Any]]:
     """A deterministic `BENCH_SHAPE` weight and the stored roles of it, per suite.
 
-    SEEDED, so two probes of one device measure the same tensor and their records are
-    comparable; and quantized by the encoding's OWN equation, so what the routes are then
-    compared on is a real carrier rather than random bytes that no producer would emit.
+    SEEDED, so two runs on one device check the same tensor; and quantized by the encoding's
+    OWN equation, so the oracle checks a real carrier rather than random bytes that no producer
+    would emit.
     """
     if provider.suite == "comfy-decode":
         return _comfy_fixture(torch, provider, device, BENCH_SHAPE)
@@ -772,7 +717,7 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
             .to(next(iter(roles.values())).device)
         )
     if provider.suite == "comfy-decode":
-        # Only the constant-q fixture above enters this benchmark/route oracle.
+        # Only the constant-q fixture above enters this route oracle.
         # Its normalized rotation is identity on all-ones; the independently
         # stored channel scale is the exact value, not another decoder's output.
         rows, packed = (int(n) for n in roles["weight"].shape)
@@ -822,59 +767,11 @@ def _relative(torch: Any, got: Any, reference: Any) -> float:
     return float(delta / reference.norm().clamp(min=1e-30))
 
 
-def _decode_axes(torch: Any, provider: Provider, device: Any, dtype: Any) -> RouteAxes:
-    """The two MEASURED axes #517e's ranking orders providers on, in ONE comparable frame.
-
-    Both routes are scored against the same reference — an f64 matmul over the exact value
-    of the same stored roles — so `deviation_rel` prices the WHOLE route on each side: the
-    decode route's rounding into the destination dtype and the float GEMM that follows, and
-    the native route's activation quantization and its encoded GEMM. That comparability is
-    the point. A fidelity number that measured a decode's element error against a native
-    route's GEMM error would order the two on a scale neither shares.
-
-    Footprint is the other side of the same fact and is read the same way: what stays
-    RESIDENT per logical element once the fill is over. On a decode route that is the
-    destination dtype's own width, because the weights are float either way; on a native
-    route it is the role bytes, because the roles are the weight (`_native_axes`).
-    """
-    _, roles = _weight_roles(torch, provider, device)
-    destination = torch.empty(*BENCH_SHAPE, dtype=dtype, device=device)
-    provider.decode(torch, roles, destination)
-    x = _activation(torch, device, dtype)
-    reference = _reference_gemm(torch, x, _exact_weight(torch, provider, roles))
-    # The weights are FLOAT after this route's fill, which is the whole of "it buys bytes
-    # read and load time, NOT VRAM". Reading it off the destination rather than asserting
-    # 16 keeps it true for an f32 destination too.
-    return RouteAxes(
-        _relative(torch, x @ destination.t(), reference), 8.0 * destination.element_size()
-    )
-
-
-#: torch dtype name -> TensorFS carrier name, for the role parts a leaf prices.
-_CARRIER = {name: carrier for carrier, name in TORCH_DTYPES.items()}
-
-
-def _native_axes(torch: Any, provider: LeafProvider, device: Any, deviation: float) -> RouteAxes:
-    """A native route's axes: its measured GEMM deviation, and the role bytes the leaf keeps
-    resident, priced by the provider from the probe's real tensors."""
-    weight, roles = _weight_roles(torch, provider, device)
-    parts = {
-        role: RolePart(
-            role,
-            _CARRIER[str(t.dtype).removeprefix("torch.")],
-            tuple(int(n) for n in t.shape),
-            int(t.numel() * t.element_size()),
-        )
-        for role, t in roles.items()
-    }
-    return RouteAxes(deviation, provider.resident_bits_per_element(parts, int(weight.numel())))
-
-
 # ------------------------------------------------------------- the conformance vectors
 
 #: The cozytensors/1 conformance decode cases, one file per scheme family (tensorfs
 #: `conformance/vectors/cases/<family>.json`). They ship in the package, so an installed wheel
-#: qualifies as the repo does.
+#: checks as the repo does.
 VECTORS = Path(__file__).resolve().parent / "encoding" / "vectors" / "cases"
 
 
@@ -987,67 +884,6 @@ def _spec_vectors(torch: ModuleType, provider: Provider, device: Tensor) -> Spec
     return SpecVectors(passed=all(c.passed for c in cases), cases=cases)
 
 
-def _micro_bench(torch: Any, provider: Provider, device: Any, dtype: Any) -> DecodeBench:
-    rows, cols = BENCH_SHAPE
-    destination = torch.empty(rows, cols, dtype=dtype, device=device)
-    _, parts = _weight_roles(torch, provider, device)
-    provider.decode(torch, parts, destination)
-    # The fence goes through the accelerator boundary (#447): a queue timed without its own
-    # synchronize would mint a fictional decode rate.
-    accel.synchronize(torch, device.type)
-    started = time.perf_counter_ns()
-    for _ in range(BENCH_REPS):
-        provider.decode(torch, parts, destination)
-    accel.synchronize(torch, device.type)
-    took = (time.perf_counter_ns() - started) / BENCH_REPS
-    # Bytes the decode actually touches: every stored role IN, the logical tensor OUT. Summed
-    # over the parts rather than assuming one byte per element, because a scale role is real
-    # traffic and a rate that ignores it flatters this route.
-    moved = rows * cols * destination.element_size() + sum(
-        int(t.numel() * t.element_size()) for t in parts.values()
-    )
-    return DecodeBench(list(BENCH_SHAPE), BENCH_REPS, int(took), round(moved / took, 3))
-
-
-def _leaf_bench(torch: Any, provider: LeafProvider, device: Any, dtype: Any) -> LeafBench:
-    """One native leaf's FORWARD, timed, against the same shape's bf16 GEMM.
-
-    The decode bench times a decode because that is the whole of what a decode route costs
-    at fill. A native leaf costs nothing at fill and everything per step, so the number that
-    means the same thing is its forward — and it is reported BESIDE the float GEMM it
-    replaces, because "2.03x" and "0.52x" are the same kernel with and without
-    `use_fast_accum` (#517b) and a bare microsecond count hides which one ran.
-
-    The activation quantization is INSIDE the timed region on purpose. #515f's finding is
-    that an unfused eager quantizer costs 0.11-2.80 ms and can eat the GEMM win on small
-    shapes; a benchmark that timed the bare GEMM would publish a speedup this build does
-    not have.
-    """
-    weight, roles = _weight_roles(torch, provider, device)
-    x = _activation(torch, device, dtype)
-    leaf = provider.leaf(torch, roles, _StandIn(int(weight.shape[1]), int(weight.shape[0])), dtype)
-    float_weight = weight.to(dtype)
-
-    def timed(fn: Callable[[], object]) -> float:
-        fn()
-        accel.synchronize(torch, device.type)
-        started = time.perf_counter_ns()
-        for _ in range(BENCH_REPS):
-            fn()
-        accel.synchronize(torch, device.type)
-        return (time.perf_counter_ns() - started) / BENCH_REPS
-
-    leaf_ns = timed(lambda: leaf(x))
-    float_ns = timed(lambda: x @ float_weight.t())
-    return LeafBench(
-        shape=[FIDELITY_TOKENS, *[int(n) for n in weight.shape]],
-        reps=BENCH_REPS,
-        leaf_ns=int(leaf_ns),
-        float_gemm_ns=int(float_ns),
-        speedup_x=round(float_ns / max(leaf_ns, 1.0), 4),
-    )
-
-
 def _cores_reference(
     torch: ModuleType, provider: CoreDequant, roles: Mapping[str, Tensor], shape: tuple[int, ...]
 ) -> Tensor:
@@ -1076,8 +912,7 @@ def _numerics_cores(torch: ModuleType, provider: Provider, device: Tensor, dtype
 
 #: Which self-check a provider gets, keyed by the ORACLE IT DECLARES (`Provider.suite`) and
 #: never by class or role set, so a second implementation of one encoding is measured by the
-#: same oracle as the first. A suite name in neither table qualifies NOTHING: minting a record
-#: for a decoder no oracle checked is exactly the fabricated evidence the table forbids.
+#: same oracle as the first. A suite name in neither table passes NOTHING.
 DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
     "comfy-decode": _numerics_comfy,
     "fp8-tensorwise-decode": _numerics,
@@ -1098,37 +933,18 @@ NATIVE_SUITES = frozenset(
 )
 
 
-def qualify(
+def conform(
     torch: Any,
     providers: Mapping[str, tuple[Provider, ...]],
     device: DeviceFacts,
     output_dtypes: Sequence[str],
     *,
     release: str,
-    runtime: RuntimeIdentity | None = None,
-) -> tuple[Capabilities, QualificationResult]:
-    """Run the suite and return this process's admission table.
-
-    The evidence for a route that decodes nothing (`plain/1`) is the fill plane's own
-    byte-identity proof, so its record carries the trivial observation rather than a
-    fabricated one — a record with no evidence is the thing this design forbids, and a
-    record whose evidence says "verbatim" is honest.
-
-    The BACKEND is gated first, through `accel` (#496c/#503d: every backend question lives
-    there). This is that gate's first consumer, and the reason it needs one: without it a
-    backend with no measured suite would run these vectors anyway and mint records whose
-    device predicate claims a card the suite never ran on. Refusing here is #501f's runtime
-    twin — the capability answer is typed and it happens BEFORE any fill, not after a
-    manifest has been believed.
-
-    `runtime` is #549.9's other half. A capability record is a claim about an IMPLEMENTATION
-    on a device, and only the device half used to have an identity. The runtime's source
-    digest and torch build ride every record. Defaulted rather than required so a caller that
-    has torch and a release can still probe; the default MEASURES, it does not fabricate.
-    """
+) -> Conformance:
+    """Run the suite on this card. A route that decodes nothing (`plain/1`) carries the fill
+    plane's byte-identity proof; a cell this card does not serve observes nothing. The BACKEND
+    is gated first, through `accel`: a backend with no suite refuses."""
     accel.qualification_gate(device.kind)
-    if runtime is None:
-        runtime = measure_runtime(torch, release)
     target = torch.device(device.kind)
     started = time.perf_counter_ns()
     observations = [
@@ -1137,20 +953,17 @@ def qualify(
             provider,
             device,
             name,
-            settled(provider, device) or _measured(torch, provider, target, getattr(torch, name)),
+            settled(provider, device, name)
+            or _measured(torch, provider, target, getattr(torch, name)),
         )
         for encoding, provider, name in cells(providers, output_dtypes)
     ]
-    result = QualificationResult(
-        tuple_key=device.tuple_key(),
+    return Conformance(
         device=device,
-        device_predicate=device.predicate,
-        runtime_release=release,
-        runtime=runtime,
+        runtime=measure_runtime(torch, release),
         suite_ms=(time.perf_counter_ns() - started) // 1_000_000,
         observations=observations,
     )
-    return admission_table(result), result
 
 
 #: The params a suite's synthetic operands are written with: the producers' own (ModelOpt's
@@ -1178,8 +991,8 @@ PROBE_PARAMS: dict[str, dict[str, object]] = {
 
 def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tensor) -> Evidence:
     """`_evidence`, where a device that lacks a dtype the decode reads (MPS has no float8)
-    mints no record for it: the encoding refuses at bind naming why."""
-    # Qualification considers every provider even for a plain F64/FP8 model.
+    observes nothing for it."""
+    # The suite considers every provider even for a plain F64/FP8 model.
     # Those are valid verbatim outputs, not logical Comfy decode destinations.
     if provider.suite == "comfy-decode" and dtype not in (
         torch.float32,
@@ -1201,56 +1014,36 @@ def _measured(torch: ModuleType, provider: Provider, target: Tensor, dtype: Tens
 
 
 def _evidence(torch: Any, provider: Provider, target: Any, dtype: Any) -> Evidence:
-    """One measured (implementation, output dtype)'s evidence. Only a PASSED one mints a record."""
+    """One (implementation, output dtype)'s evidence."""
     if isinstance(provider, LeafProvider) and provider.suite in NATIVE_SUITES:
         agreement = _native_agreement(torch, provider, target, dtype)
-        if not agreement.passed:
-            return NativeEvidence(numerics=agreement, passed=False, route_axes=RouteAxes())
-        return NativeEvidence(
-            numerics=agreement,
-            passed=True,
-            micro_bench=_leaf_bench(torch, provider, target, dtype),
-            route_axes=_native_axes(torch, provider, target, agreement.deviation_rel),
-        )
+        return NativeEvidence(numerics=agreement, passed=agreement.passed)
     suite = DECODE_SUITES.get(provider.suite)
     if suite is None:
-        # An implementation no oracle covers. NOT an error and NOT a pass: it mints no
-        # record, so the encoding refuses at bind naming this device — the same answer an
-        # unqualified card gets, for the same reason.
+        # An implementation no oracle covers: NOT a pass.
         return UnmeasuredEvidence(
             note=f"no oracle named {provider.suite!r}; an unchecked implementation is not a "
-            "qualified one"
+            "conforming one"
         )
     sweep = suite(torch, provider, target, dtype)
     # #549.4: the REVIEWED SPEC's own producer-mined cases, decoded bit-for-bit. The
     # synthetic sweep proves the arithmetic; this proves the provider reads the layout a real
-    # producer emits at the rank and stride THIS digest pins. Both must pass to mint.
+    # producer emits at the rank and stride THIS digest pins. Both must pass.
     vectors = _spec_vectors(torch, provider, target)
     passed = sweep.passed and vectors.passed
-    return DecodeEvidence(
-        numerics=sweep,
-        spec_vectors=vectors,
-        micro_bench=_micro_bench(torch, provider, target, dtype),
-        passed=passed,
-        route_axes=_decode_axes(torch, provider, target, dtype) if passed else RouteAxes(),
-    )
+    return DecodeEvidence(numerics=sweep, spec_vectors=vectors, passed=passed)
 
 
-def settled(provider: Provider, device: DeviceFacts) -> Evidence | None:
-    """Evidence nothing has to measure: a verbatim route, or a card below the provider's floor."""
+def settled(provider: Provider, device: DeviceFacts, dtype: str) -> Evidence | None:
+    """Evidence nothing has to measure: a verbatim route, or a cell serving would not run here
+    (`selection.admit`): the suite checks what this card serves."""
     if provider.route == "verbatim":
         return VerbatimEvidence(
             note="no decode: the stored bytes ARE the logical bytes, and the fill plane's "
             "source-comparison proves them byte for byte"
         )
-    if not device.satisfies(provider.device_predicate):
-        # Qualifying a leaf on a card whose kernel it does not claim would mint a record whose
-        # predicate says this card.
-        return UnmeasuredEvidence(
-            note=f"its kernel needs {provider.device_predicate} and this device is "
-            f"{device.predicate}"
-        )
-    return None
+    why = admit(provider, device, dtype, Encoded(provider.encoding, (), ()))
+    return UnmeasuredEvidence(note=why) if why else None
 
 
 def cells(
@@ -1275,88 +1068,6 @@ def make_observation(
         implementation_revision=provider.code_revision,
         device_predicate=device.predicate,
         output_dtype=dtype,
-        geometry_class=geometry_class(BENCH_SHAPE),
         delivery_route=provider.route,
         evidence=evidence,
     )
-
-
-def admission_table(result: QualificationResult) -> Capabilities:
-    """Observations -> the admission table. A FAILED observation mints no record; its reason
-    is kept, so a tensor served by another route can say why."""
-    return Capabilities(
-        [
-            CapabilityRecord(
-                scheme=observation.scheme,
-                implementation_digest=observation.implementation_digest,
-                runtime_release=result.runtime_release,
-                device_predicate=observation.device_predicate,
-                output_dtype=observation.output_dtype,
-                delivery_route=observation.delivery_route,
-                evidence_digest=canonical.digest(msgspec.to_builtins(observation.evidence)),
-                resident_bits_per_element=observation.evidence.route_axes.resident_bits_per_element,
-                kernel_numeric_error=observation.evidence.route_axes.deviation_rel,
-                leaf_speedup_x=_leaf_speedup(observation.evidence),
-                # #549.9's identity, carried onto every record it minted.
-                runtime_source_digest=result.runtime.source_digest,
-                torch_build=result.runtime.torch_build,
-                os_arch=result.device.os_arch,
-                device_index=result.device.index,
-                device_driver=result.device.driver,
-                cuda_runtime=result.device.cuda_runtime,
-                geometry_class=observation.geometry_class,
-                implementation_revision=observation.implementation_revision,
-            )
-            for observation in result.observations
-            if observation.evidence.passed
-        ],
-        {
-            (o.scheme, o.implementation_digest, o.output_dtype): _refusal(o.evidence)
-            for o in result.observations
-            if not o.evidence.passed
-        },
-    )
-
-
-def _refusal(evidence: Evidence) -> str:
-    """Why a failed observation minted no record, in one clause."""
-    match evidence:
-        case NativeEvidence(numerics=numerics):
-            return numerics.kernel or (
-                f"its GEMM measured {numerics.deviation_rel:.3g} relative error against the "
-                f"{numerics.tolerance} bound (finite {numerics.finite}, out {numerics.out_dtype})"
-            )
-        case DecodeEvidence():
-            return "its decode failed the format oracle or the spec's vectors"
-        case _:
-            return evidence.note
-
-
-def _leaf_speedup(evidence: Evidence) -> float:
-    """`speedup_x` off a native observation's leaf bench; -1.0 for everything else."""
-    if isinstance(evidence, NativeEvidence) and evidence.micro_bench is not None:
-        return evidence.micro_bench.speedup_x
-    return -1.0
-
-
-def leaf_speedups(result: QualificationResult) -> dict[str, float]:
-    """`<implementation>@<output dtype>` -> the WORST `speedup_x` a passed leaf observation
-    banked for it, across every spec digest it was measured under. What the boot record
-    prints, so a leaf this card measured losing to its float GEMM is read where the route
-    census is read."""
-    worst: dict[str, float] = {}
-    for observation in result.observations:
-        speedup = _leaf_speedup(observation.evidence)
-        if not observation.evidence.passed or speedup < 0.0:
-            continue
-        name = f"{observation.implementation}@{observation.output_dtype}"
-        worst[name] = min(worst.get(name, speedup), speedup)
-    return dict(sorted(worst.items()))
-
-
-class UnreportableObservation(Exception):
-    """A record would have crossed the process boundary carrying a byte TensorFS refuses.
-
-    Loud rather than dropped: a silently omitted record reads to the hub as "this card
-    cannot run it", which is the wrong answer with the wrong remedy.
-    """

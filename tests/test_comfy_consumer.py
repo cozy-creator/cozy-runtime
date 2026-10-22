@@ -82,8 +82,8 @@ def test_independent_constant_q_oracle_and_golden_qualification(scheme: str, dty
 
 @pytest.mark.parametrize("dtype", ["float64", "float8_e4m3fn"])
 def test_plain_only_output_dtypes_leave_comfy_unmeasured(dtype: str) -> None:
-    # The global qualifier visits these candidates even when the model is plain.
-    # An unsupported encoded destination must not abort or mint a capability.
+    # The conformance suite visits these candidates even when the model is plain.
+    # An unsupported encoded destination must not abort or pass.
     evidence = probe._measured(
         torch, ComfyDequant("int4.convrot"), torch.device("cpu"), getattr(torch, dtype)
     )

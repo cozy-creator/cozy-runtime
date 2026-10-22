@@ -8,13 +8,11 @@ import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.internal import canonical, probe
-from cozy_runtime.internal.encoding import launch_providers
+from cozy_runtime.internal import canonical
+from cozy_runtime.internal.encoding import DeviceFacts, RuntimeIdentity, launch_providers
 from cozy_runtime.internal.fill import Checkpoint, dtype_name
-from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.resolution import ConstructionFacts, Variant, resolve
 from store_fixtures import home
-from test_leaf_speedup_record import sm86
 
 TENSORS = 40_000
 
@@ -40,18 +38,14 @@ def test_a_40000_tensor_plan_resolves_and_digests(
     ]
     store = home(tmp_path, monkeypatch)
     checkpoint = _checkpoint(store, keys)
-    table = sm86()
     ref = checkpoint.id
-    variant = Variant("sm86", str(tmp_path), ref, {"model": ref}, True)
     plan = resolve(
-        variants=[variant],
-        rows_for={"sm86": checkpoint.rows("model")},
+        variant=Variant("sm86", str(tmp_path), ref, {"model": ref}),
+        rows=checkpoint.rows("model"),
         providers=launch_providers(),
-        capabilities=probe.admission_table(table),
-        device=table.device,
-        runtime=table.runtime,
+        device=DeviceFacts("cuda", "NVIDIA GeForce RTX 3090", 86, "580", "350W/N/A"),
+        runtime=RuntimeIdentity("t/1", "2.14.0"),
         construction=ConstructionFacts("t/1", "wide:Model", ("model",)),
-        facts=PlanFacts(),
         dtype_name=dtype_name,
     )
     assert len(plan.tensors) == TENSORS

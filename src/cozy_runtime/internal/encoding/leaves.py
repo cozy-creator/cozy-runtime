@@ -274,8 +274,7 @@ class RowwiseNativeLeaf:
     `_scaled_mm(use_fast_accum=True)`'s: on an L40S the default ran 0.52x bf16 and the fast
     one 2.03x, for -0.007 to -0.018 dB (#517b).
 
-    The floor `cuda.sm89+` is where an fp8 tensor-core GEMM exists; whether it pays on a card
-    is what the probe measures.
+    The floor `cuda.sm89+` is where an fp8 tensor-core GEMM exists (`formats`).
     """
 
     encoding: str = "fp8.rowwise"
@@ -304,6 +303,15 @@ class RowwiseNativeLeaf:
     @property
     def suite(self) -> str:
         return "fp8-rowwise-native"
+
+    @property
+    def formats(self) -> frozenset[str]:
+        return frozenset({"fp8"})
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """`_scaled_mm`'s row-wise scaling writes half precision only."""
+        return frozenset({"bfloat16", "float16"})
 
     @property
     def required(self) -> frozenset[str]:
@@ -392,6 +400,15 @@ class Int8ConvRotNativeLeaf:
     @property
     def suite(self) -> str:
         return "int8-convrot256-native"
+
+    @property
+    def formats(self) -> frozenset[str]:
+        return frozenset({"int8"})
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """Half through the 8-bit op; float32 through torch's int8 GEMM."""
+        return frozenset({"bfloat16", "float16", "float32"})
 
     @property
     def required(self) -> frozenset[str]:
@@ -504,6 +521,16 @@ class Nvfp4NativeLeaf:
     @property
     def suite(self) -> str:
         return "nvfp4-native"
+
+    @property
+    def formats(self) -> frozenset[str]:
+        """None: W4A16 runs on every MMA card, W4A4 where the row has fp4 (`nvfp4_linear`)."""
+        return frozenset()
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """Half through its kernels; float32 through the eager decode."""
+        return frozenset({"bfloat16", "float16", "float32"})
 
     @property
     def required(self) -> frozenset[str]:
@@ -642,6 +669,15 @@ class MicroScaledNativeLeaf:
     @property
     def suite(self) -> str:
         return "mxfp8-native"
+
+    @property
+    def formats(self) -> frozenset[str]:
+        return frozenset({"mxfp8"})
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """`_scaled_mm`'s MX scaling, at half precision."""
+        return frozenset({"bfloat16", "float16"})
 
     @property
     def required(self) -> frozenset[str]:
