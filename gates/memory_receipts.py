@@ -90,7 +90,7 @@ class Receipt:
     moved: float | None  # GB
     min: float | None  # GB
     bar: str
-    steps: dict[str, float]  # mean ms per step, by stage
+    steps: dict[str, tuple[float, float | None]]  # by stage: the first step's ms (eager) and the rest's mean
     graphs: dict[str, str]  # graph_* fields as printed
 
 
@@ -321,7 +321,9 @@ def graph_counts(calls):
 
 
 def step_times(calls):
-    """Per stage with steps (`measurements.attribution.steps`): count, mean and first step in ms, over the calls."""
+    """Per stage with steps (`measurements.attribution.steps`), over the calls: the count, the first step's ms and the
+    mean of the rest. The Runtime runs a signature's first call eager and replays its graph from the second, so the
+    first step is the eager one (`eager = first call per signature`)."""
     out = {}
     for call in calls:
         steps = (((call.get("measurements") or {}).get("attribution") or {}).get("steps") or {})
@@ -330,7 +332,7 @@ def step_times(calls):
                 n, total, first = out.get(stage, (0, 0.0, None))
                 out[stage] = (n + t["count"], total + float(t.get("total_ms") or 0.0),
                               first if first is not None else float(t.get("first_ms") or 0.0))
-    return {stage: (n, total / n, first) for stage, (n, total, first) in out.items()}
+    return {stage: (n, first, (total - first) / (n - 1) if n > 1 else None) for stage, (n, total, first) in out.items()}
 
 
 def record(path, cell, number, state, line, cap, host_before="", host_after=""):
@@ -422,7 +424,8 @@ def record(path, cell, number, state, line, cap, host_before="", host_after=""):
         "evicted": ",".join(f"{k}:{v / 1e9:.2f}" for k, v in sorted(evicted.items()) if v) or "-",
         "leftover": some(leftover), "poisoned": int(poisoned), "min": f"{gb(least)}GB",
         "dit_step_max": f"{max(dit) if dit else '-'}B",
-        "step_ms": ",".join(f"{k}:{n}x{mean:.0f}/{first:.0f}" for k, (n, mean, first) in steps.items()) or "-",
+        "step_ms": ",".join(f"{k}:{n}x{first:.0f}/{'-' if rest is None else f'{rest:.0f}'}"
+                           for k, (n, first, rest) in steps.items()) or "-",  # count x first (eager) / rest
         "oom_kill": "-" if killed is None else f"+{killed}", "host_max": f"{gb(limit)}GB",
         # §5's graph report: captures, replay coverage of region calls, regions captured, pool bytes, replay copies
         "graph_capture": graphs and f"{graphs['captures']}/{graphs['capture_attempts']}",
@@ -458,7 +461,8 @@ def receipts(path):
         out.append(Receipt(match[1], match[2], match[3], match[4] == "landed", f.get("line", "?"), f.get("cap", "?"),
                            number(f.get("wall", "0s")) or 0.0, number(f.get("exec", "-")), number(f.get("moved", "-")),
                            number(f.get("min", "-")), f.get("bar", "?"),
-                           {stage: float(mean) for stage, mean in re.findall(r"(\w+):\d+x([\d.]+)/", f.get("step_ms", ""))},
+                           {stage: (float(first), number(rest)) for stage, first, rest in
+                            re.findall(r"(\w+):\d+x([\d.]+)/([\d.]+|-)", f.get("step_ms", ""))},
                            {k: v for k, v in f.items() if k.startswith("graph_") and v != "-"}))
     return out
 
@@ -496,9 +500,13 @@ def compare(summary, lines):
                 say.append(f"{field} {x:.3f} -> {y:.3f}{' WORSE' if y > x else ''}")
                 worse += y > x
             for stage in sorted(set().union(*(r.steps for r in old)) & set().union(*(r.steps for r in new))):
-                a = statistics.median(r.steps[stage] for r in old if stage in r.steps)
-                b = statistics.median(r.steps[stage] for r in new if stage in r.steps)
-                say.append(f"{stage}/step {a:.0f} -> {b:.0f} ms")
+                # eager = first call per signature; replayed = the steps after it; shipping's replayed steps beside
+                med = lambda rows, i: statistics.median(v for r in rows if stage in r.steps
+                                                        for v in [r.steps[stage][i]] if v is not None) \
+                    if any(stage in r.steps and r.steps[stage][i] is not None for r in rows) else None
+                ms = lambda v: "-" if v is None else f"{v:.0f}"
+                say.append(f"{stage}/step eager {ms(med(new, 0))} replayed {ms(med(new, 1))} | shipping "
+                           f"{ms(med(old, 1))} ms (eager = first call per signature)")
             for field in ("graph_replay", "graph_capture", "graph_pool", "graph_copy"):
                 a, b = (next((r.graphs[field] for r in rows if field in r.graphs), "-") for rows in (old, new))
                 if a != "-" or b != "-":

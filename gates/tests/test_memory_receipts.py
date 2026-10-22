@@ -149,8 +149,8 @@ class Receipts(unittest.TestCase):
         code, text, row = self.record(fixture("sdxl1-candidate-12872"), "12-sdxl1", line="candidate", cap="12")
         self.assertEqual((code, row.bar, row.moved, row.min), (0, "ok", 4.238, 4.238), text)
         self.assertIn("fill=store:0.78GB/s/11.6% ", text)
-        self.assertIn("step_ms=denoise:20x258/1632 ", text)
-        self.assertEqual(row.steps, {"denoise": 258.0})
+        self.assertIn("step_ms=denoise:20x1632/185 ", text)  # the eager first step, then the replayed 19's mean
+        self.assertEqual(row.steps, {"denoise": (1632.0, 185.0)})
 
     def test_shipping_disk_runs_without_a_ceiling_are_not_rated(self):
         # TensorFS 0.13's shipping disk runs often record no ceiling (0); only the measured ones are rated.
@@ -209,9 +209,10 @@ class Receipts(unittest.TestCase):
         code, text = self.compare("".join(rows), ["shipping", "candidate"])
         self.assertEqual(code, 0, text)
         self.assertIn("exec 90.000 -> 89.000; moved 5.000 -> 0.000", text)
-        steps = [r.replace("bar=ok", "step_ms=denoise:8x8616/9896 bar=ok") for r in rows]
-        steps[3:] = [r.replace("8x8616", "8x8000") for r in steps[3:]]
-        self.assertIn("denoise/step 8616 -> 8000 ms", self.compare("".join(steps), ["shipping", "candidate"])[1])
+        steps = [r.replace("bar=ok", "step_ms=denoise:8x9896/8616 bar=ok") for r in rows]
+        steps[3:] = [r.replace("8x9896/8616", "8x9000/8000") for r in steps[3:]]
+        self.assertIn("denoise/step eager 9000 replayed 8000 | shipping 8616 ms (eager = first call per signature)",
+                      self.compare("".join(steps), ["shipping", "candidate"])[1])
         rows[3] = rows[3].replace("exec=88s", "exec=95s")
         code, text = self.compare("".join(rows), ["shipping", "candidate"])
         self.assertEqual(code, 1)
