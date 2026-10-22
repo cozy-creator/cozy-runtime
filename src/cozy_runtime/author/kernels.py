@@ -2,7 +2,9 @@
 
 Model code lives in the model's package and the Runtime stays generic (owner ruling,
 2026-10-14); kernels are hand-written, never `torch.compile`, and compile on the GPU that runs
-them while the executor starts. A package declares its Triton kernels once, at import, as a
+them while the executor starts. Compiling fixed shipped source is permitted; consumer
+benchmarking, autotuning, torch.compile and competing implementation search are not.
+A package declares its Triton kernels once, at import, as a
 `TritonKernels`. Each executor that imports the package submits their build for its GPUs'
 architectures when it starts, beside the weight download; the machine's compile manager builds
 each key once, niced, out of process. `Model.execution_plan` receives a `Plan` whose `load`
