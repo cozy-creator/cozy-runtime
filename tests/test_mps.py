@@ -605,6 +605,7 @@ class Machine:
             "application": self.application,
             "package_interface": str(self.interface),
             "devices": "0",
+            "memory_protocol": 1,
             "constructions": [{"path": path, "manifest": manifest, "components": components}],
         }
         started = self.executor.start(msgspec.convert(start, Start))

@@ -130,6 +130,28 @@ def test_memory_protocol_is_advertised_before_start_and_torch_import(zygote: Any
     assert reply["torch_loaded"] is False
 
 
+@pytest.mark.parametrize("memory_protocol", [None, 0, 2])
+def test_gpu_start_refuses_incompatible_memory_before_reading_descriptors(
+    zygote: Any, memory_protocol: int | None
+) -> None:
+    _process, channel, start = zygote
+    command = {**start, "devices": "0", "ledgers": 1}
+    if memory_protocol is not None:
+        command["memory_protocol"] = memory_protocol
+    channel.send(command)
+    # No GPU or descriptor is supplied. Receiving this frame proves the real executor
+    # refused before either the legacy first FD or the incompatible second FD could block.
+    reply = channel.recv(timeout=5, total_timeout=5)
+    assert reply is not None and not reply["ok"]
+    assert reply["code"] == "memory_protocol_incompatible"
+    assert _call(channel, {"cmd": "hello"})["torch_loaded"] is False
+
+
+def test_cpu_start_needs_no_gpu_memory_protocol(zygote: Any) -> None:
+    _process, channel, start = zygote
+    assert _call(channel, {**start, "import_only": True})["ok"]
+
+
 def test_a_segfaulting_executor_leaves_its_python_stack(tmp_path: Path) -> None:
     (tmp_path / "segvapp.py").write_text(APP)
     sys.path.insert(0, str(tmp_path))

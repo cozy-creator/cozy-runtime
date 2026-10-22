@@ -1548,6 +1548,15 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
+        if (command.devices or command.ledgers) and command.memory_protocol != 1:
+            self.poisoned = "incompatible memory protocol"
+            return {
+                "ok": False,
+                "code": "memory_protocol_incompatible",
+                "detail": "GPU Start requires memory_protocol=1 before ledger transfer; "
+                f"TensorD supplied {command.memory_protocol}. Upgrade TensorD, Runtime "
+                "and TensorFS together.",
+            }
         ledgers = [fd for _ in range(command.ledgers) for fd in self.channel.recv_ledger()]
         if self.poisoned or self.ledgers:
             for fd in ledgers:  # one set per process
