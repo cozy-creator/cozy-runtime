@@ -274,6 +274,10 @@ class Residency(Protocol):
         `close` and `nbytes`; None off a GPU."""
         ...
 
+    def unpin(self, component: str, owner: str, token: object) -> None:
+        """Remove the owner's matching pin; weights stay bound while any token reference lives."""
+        ...
+
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
         ...

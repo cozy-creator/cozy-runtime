@@ -461,9 +461,7 @@ class Backend:
         read from the checkpoint by varena, which seals them and deposits the layout with TensorD
         for the next load."""
         rows = {self.plan[key].name: self.plan[key] for key in keys}
-        bakes = self.bakes[name] = _Bakes(
-            self.torch, root, rows, set(blocks_of(root)), self._owner
-        )
+        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)), self._owner)
         grant = replace(self._granted(name), keys=tuple(rows))
         vars(root)["_varena"] = Declared(  # `_cozy_state`: what the package's forward changes
             grant,
@@ -826,6 +824,13 @@ class Residency:
         cache.nbytes = model.home_bytes()
         self.pins[(component, owner)] = (token, cache)
         return token
+
+    def unpin(self, component: str, owner: str, token: object) -> None:
+        """Drop this owner's cache; outstanding tokens keep its event-ordered hold alive."""
+        held = self.pins.get((component, owner))
+        if held is not None and held[0] is token:
+            self.pins.pop((component, owner))
+            held[1].close()
 
     def cache(self, owner: str, shed: Shrink) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
