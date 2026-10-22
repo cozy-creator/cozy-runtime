@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from cozy_runtime.author import Config, Loader, Model, sequence_parallel, uses_components
+from cozy_runtime.author import (
+    Config,
+    Loader,
+    Model,
+    placeable,
+    sequence_parallel,
+    uses_components,
+)
 
 
 class Pipeline:
@@ -26,6 +33,7 @@ class BaseModel(Model[Pipeline], encoded_leaves="accept"):
         return None
 
 
+@placeable("text_encoder")
 @sequence_parallel(degrees=(2, 4))
 class RenderModel(BaseModel):
     @uses_components("dit", "vae")

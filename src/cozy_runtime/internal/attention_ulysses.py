@@ -11,12 +11,13 @@ reduction (`head_local=False`) is registered without context parallelism.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING, Protocol, TypedDict
 
 if TYPE_CHECKING:
+    import torch
     from diffusers.models.attention_dispatch import AttentionBackendName
     from torch import Tensor
     from torch.distributed import ProcessGroup
@@ -67,20 +68,46 @@ _SEEN: ContextVar[tuple[dict[str, set[str]], set[object]] | None] = ContextVar(
     "cozy_attention_seen", default=None
 )
 _MEMBERS: dict[str, AttentionBackendName] = {}
-#: the memory's attention cut (`tensorfs.varena.cuts.attend`), installed with the memory
-_CUT: Callable[..., Tensor] | None = None
-#: the torch side (`internal.parallel.ulysses`), which serves itself here once imported
+
+
+class Execution(Protocol):
+    """The execution layer's side (`internal.execution`, installed with the memory): the
+    attention cut, the pass's agreed exchange level, and a collective's extent."""
+
+    def attend(
+        self,
+        call: Callable[..., Tensor],
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        mask: Tensor | None = None,
+        *,
+        rows: int = 0,
+        heads: bool = True,
+    ) -> Tensor: ...
+
+    def agreed(self) -> int: ...
+
+    def sizes(self, gather: Callable[[], list[int]]) -> list[int]: ...
+
+    def collective(self, site: str, finest: int) -> AbstractContextManager[None]: ...
+
+
+_EXECUTION: Execution | None = None
+#: the exchanges' one cut site (`execution.agree.SITE`)
+SITE = "ulysses"
+
+
+def install(execution: Execution | None) -> None:
+    global _EXECUTION
+    _EXECUTION = execution
+
+#: the torch side, served only after the executor imports torch.
 _GROUP: Callable[[object], ProcessGroup] | None = None
 _EXCHANGE: Callable[..., Tensor] | None = None
 
 
-def install(cut: Callable[..., Tensor] | None) -> None:
-    global _CUT
-    _CUT = cut
-
-
 def serve(group_of: Callable[[object], ProcessGroup], exchange_of: Callable[..., Tensor]) -> None:
-    """The process group and the exchange of Ulysses, from the module that runs torch."""
     global _GROUP, _EXCHANGE
     _GROUP, _EXCHANGE = group_of, exchange_of
 
@@ -159,10 +186,9 @@ def _call(
         if signature not in named:
             named.add(signature)
             seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
-    cut = _CUT
-    if cut is None:
+    if _EXECUTION is None:
         return local.forward(query, key, value, **options)
-    return cut(
+    return _EXECUTION.attend(
         lambda q, k, v, mask: local.forward(q, k, v, **{**options, "attn_mask": mask}),
         query,
         key,

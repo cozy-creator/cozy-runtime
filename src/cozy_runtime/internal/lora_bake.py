@@ -499,7 +499,7 @@ def recipe(device: int) -> str:
     """What names the bytes a bake writes on `device` to other executors: `VARIANT`, the path
     this process bakes by (fused, once its build ended well, else the eager reference) and
     what that path's numerics come from."""
-    if _ready(device):
+    if device >= 0 and _ready(device):
         return f"{VARIANT} fused triton {triton.__version__}"
     return f"{VARIANT} eager"
 

@@ -3,7 +3,7 @@
 Runtime records each placed component's calls and replays them (`install`, run by the executor
 when it constructs a model); a package declares a component `@uncaptured` to opt out. A graph
 reads weights at their addresses, so its component is pinned for as long as its recordings live
-(`Residency.pin`): wholly bound at home, counted as a cache. When memory needs room, or the
+(`Placement.pin`): every block held bound, counted as a cache. When memory needs room, or the
 component's LoRAs change, the pin's shed drops every recording and its pool, and the weights go.
 
 The first call of each signature runs as written; one whose GPU work outlasts its launches
@@ -310,6 +310,8 @@ def _record(
         recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
     reserved = torch.cuda.memory_reserved()
     inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
+    if placed is not None:  # replays read them at their addresses: never parked
+        placed[0].keep(*(t for t in inputs if t is not None))
     static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
     cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
     outputs: list[Any] = []

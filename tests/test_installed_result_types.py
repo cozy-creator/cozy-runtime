@@ -91,7 +91,7 @@ def test_installed_proxy_prefetch_keeps_its_admitted_public_identity(
     monkeypatch.setattr(engine, "_durable", seam(exchange))
     for _ in range(2):
         engine._install_call_proxies(rows)
-        broker = engine._call_broker("parent", rows)
+        broker = engine._call_broker("parent", "", rows)
         assert (imported.select.__module__, imported.select.__name__) == (
             rows[0].module,
             rows[0].export,

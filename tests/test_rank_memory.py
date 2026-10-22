@@ -1,8 +1,9 @@
-"""Actual CPU Memory requests and executor sockets; synthetic GPU facts test identity conversion."""
+"""A request's memory on every rank: real CPU memories (varena's host pages) and executor
+sockets. Each rank opens its own request beside rank 0's, `ctx.plan` replaces its plan on every
+rank, and each rank's record (`measurements.memory.varena`) comes back, failed or not."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import os
 import socket
@@ -12,33 +13,40 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, cast
 
 import msgspec
 import pytest
 
 torch = pytest.importorskip("torch")
 
-from tensorfs.varena.torch import Copy, Eviction, Memory, Step  # noqa: E402
-
 from cozy_runtime.author import App, Context  # noqa: E402
 from cozy_runtime.author._invoke import Invocation, prepare, run_prepared  # noqa: E402
-from cozy_runtime.internal import executor_commands, request_memory, spawn  # noqa: E402
+from cozy_runtime.internal import execution, spawn  # noqa: E402
 from cozy_runtime.internal.executor import Executor, serve  # noqa: E402
-from cozy_runtime.internal.executor_replies import Memory as ReplyMemory  # noqa: E402
+from cozy_runtime.internal.executor_commands import Map  # noqa: E402
 from cozy_runtime.internal.executor_replies import RankMemory  # noqa: E402
 from cozy_runtime.internal.parallel.group import RankGroup  # noqa: E402
 from cozy_runtime.internal.seam import Channel  # noqa: E402
+from execution_models import memory  # noqa: E402
 
 
 class Empty(msgspec.Struct):
     pass
 
 
+def placed(executor: Executor, store: Path) -> Executor:
+    """`executor` with a memory over host pages, the execution layer and a TensorFS store."""
+    store.mkdir(parents=True, exist_ok=True)
+    executor.memory, executor.execution, executor.store = memory(), execution, store
+    return executor
+
+
 @contextmanager
 def follower(tmp_path: Path) -> Iterator[tuple[Executor, Channel]]:
     left, right = socket.socketpair()
-    worker, peer = Executor(Channel(left), tmp_path, rank=1, world=2), Channel(right)
-    worker.memory = Memory.open(torch.device("cpu"))
+    worker = placed(Executor(Channel(left), tmp_path, rank=1, world=2), tmp_path / "store")
+    peer = Channel(right)
     worker.constructions["construction"] = worker._construction_child("construction")
     thread = threading.Thread(target=serve, args=(worker, worker.channel))
     thread.start()
@@ -68,53 +76,36 @@ def command(
     return msgspec.convert(peer.recv(), RankMemory, strict=True)
 
 
-def test_answer_path_preserves_keep_weights_and_request_boundaries(tmp_path: Path) -> None:
+def test_a_followers_request_begins_plans_and_ends_with_its_record(tmp_path: Path) -> None:
     with follower(tmp_path) as (worker, peer):
-        peer.send(
-            executor_commands.encode(executor_commands.KeepWeights(construction="construction"))
-        )
-        assert peer.recv() == {"reply": "keep_weights", "ok": True}
         for request_id in ("first", "second"):
             assert command(peer, "begin", request_id).ok
-            assert worker.memory is not None and len(worker.memory.active) == 1
-            peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
-            assert peer.recv() == {
-                "reply": "keep_weights", "ok": False, "code": "request_memory_busy"
-            }
+            assert list(worker.requests) == [request_id]
+            assert command(peer, "begin", "another").code == "request_memory_busy"
             assert command(peer, "plan", request_id, (("old",),)).ok
             assert command(peer, "plan", request_id, (("right", "left"), ("last",))).ok
-            assert not command(peer, "end", "another-request").ok
-            assert len(worker.memory.active) == 1
+            assert command(peer, "end", "another").code == "request_memory_absent"
             reply = command(peer, "end", request_id)
             assert reply.ok and reply.rank == 1 and reply.request_id == request_id
-            assert reply.memory is not None and reply.memory.plan == [["left", "right"], ["last"]]
-            assert not reply.memory.leftover_by_gpu, "CPU requests cannot supply GPU evidence"
-            assert (
-                not worker.memory.active
-                and not worker.memory.plans
-                and worker._rank_request is None
-            )
-            peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
-            assert peer.recv() == {"reply": "keep_weights", "ok": True}
+            assert reply.memory is not None and reply.memory.gpu == -1  # a CPU names no GPU
+            assert reply.memory.stats.request == request_id
+            assert reply.memory.stats.leftover == 0
+            assert not worker.requests and worker._rank_request is None
 
 
-def test_failed_mirrored_command_still_closes_its_request(tmp_path: Path) -> None:
+def test_a_failed_mirrored_command_still_closes_its_request(tmp_path: Path) -> None:
     with follower(tmp_path) as (worker, peer):
         assert command(peer, "begin").ok
         peer.send({"cmd": "run", "component": ["missing", "component"]})
         reply = peer.recv()
         assert reply is not None and reply["ok"] is False
         assert command(peer, "end").ok
-        assert (
-            worker.memory is not None and not worker.memory.active and worker._rank_request is None
-        )
-        peer.send(executor_commands.encode(executor_commands.KeepWeights(construction="construction")))
-        assert peer.recv() == {"reply": "keep_weights", "ok": True}
+        assert not worker.requests and worker._rank_request is None
         assert command(peer, "begin", "next").ok
         assert command(peer, "end", "next").ok
 
 
-def test_weightless_follower_request_returns_no_gpu_evidence(tmp_path: Path) -> None:
+def test_a_weightless_follower_reports_no_record(tmp_path: Path) -> None:
     with follower(tmp_path) as (worker, peer):
         worker.memory = None
         assert command(peer, "begin").ok
@@ -123,101 +114,93 @@ def test_weightless_follower_request_returns_no_gpu_evidence(tmp_path: Path) -> 
         assert ended.ok and ended.memory is None and worker._rank_request is None
 
 
-def test_single_rank_keeps_its_local_request_plan_and_reply(tmp_path: Path) -> None:
+def test_one_rank_plans_its_own_request_and_records_it(tmp_path: Path) -> None:
     left, right = socket.socketpair()
-    executor = Executor(Channel(left), tmp_path)
-    executor.memory = Memory.open(torch.device("cpu"))
+    executor = placed(Executor(Channel(left), tmp_path), tmp_path / "store")
     try:
-        with executor._request("single") as request, executor._ranks_request("single") as ranks:
+        with executor._request("single") as rows, executor._ranks_request("single") as ranks:
             executor._plan_request("single", ["old"])
             executor._plan_request("single", ["local"])
-            assert torch.arange(4).sum().item() == 6
-        assert request is not None and request.stats is not None and not ranks
-        reply = msgspec.convert(executor._memory(request.stats, ranks), ReplyMemory, strict=True)
-        assert reply.plan == [["local"]] and reply.leftover == 0 and not reply.leftover_by_gpu
-        assert not executor.memory.active and not executor.memory.plans
+            assert list(executor.requests) == ["single"]
+        assert not ranks and not executor.requests
+        assert len(rows) == 1 and rows[0].stats.request == "single"
+        assert rows[0].torch is None  # no GPU: no allocator to count
     finally:
         left.close()
         right.close()
 
 
-def test_real_cpu_context_stats_map_logical_two_gpu_facts_to_lane_two_three() -> None:
-    memory = Memory.open(torch.device("cpu"))
-    with memory.request("cpu") as request:
-        request.plan(["transformer"])
-        value = torch.arange(8).sum()
-        assert value.item() == 28
-    assert request.stats is not None
-    source = request.stats
-    records = []
-    for ordinal in (0, 1):
-        step = Step("transformer", ordinal, 1, 10, 10, ordinal + 1, 0, 0, 0)
-        copies = tuple(
-            Copy(
-                kind=kind,
-                gpu=gpu,
-                bytes=2,
-                seconds=1,
-                gbps=2e-9,
-                ceiling=1,
-                pct=0,
-                link="",
-                busy_s=0,
-                pin_s=0,
-                staged=0,
-                cached=0,
-            )
-            for kind, gpu in (("h2d", ordinal), ("disk", -1))
-        )
-        facts = dataclasses.replace(
-            source,
-            steps=(step,),
-            leftover=((ordinal, ordinal + 2),),
-            copied=ordinal + 1,
-            retries=ordinal,
-            copies=copies,
-            evictions=(Eviction("transformer", ordinal, 2, "room", 4),),
-        )
-        measured = request_memory.measured(facts, [2, 3])
-        assert measured is not None
-        records.append(measured)
-    result = request_memory.combined(records)
-    assert result is not None
-    assert result.leftover_by_gpu == [(2, 2), (3, 3)] and result.leftover == 5
-    assert [row.gpu for row in result.rows] == [2, 3]
-    assert [row.gpu for row in result.evictions] == [2, 3]
-    assert [row.gpu for row in result.copies] == [2, -1, 3, -1]
-    assert result.steps == {"transformer": [3]} and result.paged_in == 3 and result.retries == 1
-    assert result.plan == [["transformer"]]
-    with pytest.raises(ValueError, match="duplicate physical"):
-        request_memory.combined([records[0], records[0]])
-    with pytest.raises(ValueError, match="different request plans"):
-        request_memory.combined([records[0], msgspec.structs.replace(records[1], plan=[])])
-    with pytest.raises(ValueError, match="unmapped CUDA"):
-        request_memory.measured(facts, [])
+def test_a_wait_on_a_child_yields_to_the_invoke_s_family(tmp_path: Path) -> None:
+    """While an attempt waits on a child call, its request yields its room under the family
+    its Invoke names, through varena's `yielding(family)`; twice in one request, as two child
+    calls would. An attempt with no request has nothing to yield."""
+    left, right = socket.socketpair()
+    executor = placed(Executor(Channel(left), tmp_path), tmp_path / "store")
+    try:
+        with executor._request("parent") as rows:
+            for _ in range(2):
+                with executor._yielding("parent", "family-a"):
+                    pass
+            with executor._yielding("absent", "family-a"):
+                pass
+        assert rows[0].stats.leftover == 0
+    finally:
+        left.close()
+        right.close()
 
 
-def test_group_forwards_plans_and_closes_every_request_after_failure(tmp_path: Path) -> None:
-    fixture = Path(__file__).parent / "testdata/request_memory_follower.py"
+def launch(argv: list[str], fd: int) -> spawn.Child:
+    """A real follower process (`testdata/request_memory_follower.py`)."""
+    return spawn.spawn_follower(
+        python=sys.executable,
+        module_argv=[str(Path(__file__).parent / "testdata/request_memory_follower.py"), *argv[2:]],
+        inherit_fd=fd,
+        env={**os.environ, "CUDA_VISIBLE_DEVICES": "", "OMP_NUM_THREADS": "1"},
+    )
 
-    def launch(argv: list[str], fd: int) -> spawn.Child:
-        return spawn.spawn_follower(
-            python=sys.executable,
-            module_argv=[str(fixture), *argv[2:]],
-            inherit_fd=fd,
-            env={
-                **os.environ,
-                "CUDA_VISIBLE_DEVICES": "",
-                "OMP_NUM_THREADS": "1",
-                "MKL_NUM_THREADS": "1",
-            },
-        )
 
+def test_a_request_cancelled_before_its_invoke_leaves_nothing(tmp_path: Path) -> None:
+    """Cancelled while it waited for admission, a prepared request is never invoked: what its
+    prepare retained goes as the cancel is read, and the executor returns to the pool empty."""
+    left, right = socket.socketpair()
+    executor, peer = Executor(Channel(left), tmp_path), Channel(right)
+    construction = executor.constructions["construction"] = executor._construction_child("c")
+    construction.prepared["waiting"] = construction.prepared["next"] = cast(Any, object())
+    try:
+        peer.send({"cmd": "cancel", "request_id": "waiting"})
+        peer.send({"cmd": "hello"})
+        assert executor.mux.command() == {"cmd": "hello"}
+        assert list(construction.prepared) == ["next"]
+    finally:
+        left.close()
+        right.close()
+
+
+def test_a_group_maps_on_every_rank(tmp_path: Path) -> None:
+    """TensorD's `Map` at any degree: rank 0 maps its models and every follower its own."""
+    group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
+    left, right = socket.socketpair()
+    leader = Executor(Channel(left), tmp_path, world=2)
+    leader.constructions["construction"] = leader._construction_child("construction")
+    placed(leader, tmp_path / "store").group = group
+    group.spawn()
+    try:
+        assert leader.map(Map(construction="construction", level="ram")) == {"ok": True}
+        refused = leader.map(Map(construction="absent"))
+        assert refused["code"] == "construction_not_loaded"
+    finally:
+        group.close()
+        left.close()
+        right.close()
+
+
+def test_a_group_plans_every_rank_and_closes_every_request_after_a_failure(
+    tmp_path: Path,
+) -> None:
     group = RankGroup(degree=2, backend="cpu:gloo", root=str(tmp_path), launch=launch)
     left, right = socket.socketpair()
     leader = Executor(Channel(left), tmp_path, world=2, construction="construction")
-    leader.memory = Memory.open(torch.device("cpu"))
-    leader.group = group
+    placed(leader, tmp_path / "store").group = group
     app = App()
 
     @app.entrypoint(accelerator=False)
@@ -230,10 +213,7 @@ def test_group_forwards_plans_and_closes_every_request_after_failure(tmp_path: P
     group.spawn()
     try:
         for request_id in ("first", "after-failure"):
-            with (
-                leader._request(request_id) as request,
-                leader._ranks_request(request_id) as replies,
-            ):
+            with leader._request(request_id) as own, leader._ranks_request(request_id) as ranks:
                 _, outcome, _ = run_prepared(
                     prepared,
                     Invocation(
@@ -244,15 +224,8 @@ def test_group_forwards_plans_and_closes_every_request_after_failure(tmp_path: P
                     ),
                 )
                 assert outcome.terminal == "failed" and "request failure" in outcome.message
-            assert request is not None and request.stats is not None
-            assert len(replies) == 1 and replies[0].plan == [["left", "right"], ["last"]]
-            assert not leader.memory.active and not leader.memory.plans
-            own = request_memory.measured(request.stats, [])
-            assert own is not None and request_memory.combined([own, *replies]) is not None
-        kept = group.call(
-            executor_commands.encode(executor_commands.KeepWeights(construction="construction"))
-        )
-        assert all(reply.get("ok") is True for reply in kept)
+            assert [row.stats.request for row in (*own, *ranks)] == [request_id] * 2
+            assert not leader.requests
     finally:
         group.close()
         left.close()

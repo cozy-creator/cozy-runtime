@@ -20,10 +20,9 @@ from typing import Any
 
 import msgspec
 import pytest
-from tensorfs.varena import Ledger
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import executor_commands, package_interface, spawn
+from cozy_runtime.internal import executor_commands, package_interface, seam, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover
 from cozy_runtime.internal.parallel import cp, wire
@@ -31,7 +30,6 @@ from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
-GiB = 1 << 30
 
 
 def _torch_here() -> str:
@@ -137,6 +135,41 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
         )
     )
     assert tolerated["entrypoints"][0]["models"][0]["sequence_parallel"]["degrees"] == [2]
+
+
+def test_placeable_components_reach_the_interface_and_their_gpus_reach_the_binding() -> None:
+    """`@placeable(...)` -> the interface slot `placeable` (sorted), which TensorD reads; its
+    Load names each one's GPU on the binding (`homes`), which `_install_group` keeps them on."""
+    from cozy_runtime.author import Model, placeable
+    from cozy_runtime.author._signature import ModelBinding as AuthorSlot
+
+    @placeable("vae", "text_encoder")
+    class Hosting(Model[object]):
+        pass
+
+    slot = AuthorSlot(path="serve.models.m", param="m", model_class=Hosting, components={})
+    assert _slot_document(slot)["placeable"] == ["text_encoder", "vae"]
+    plain = dataclasses.replace(slot, model_class=Model)
+    assert "placeable" not in _slot_document(plain)
+    body = package_interface.build(discover(PACKAGE))
+    entry = next(row for row in body["entrypoints"] if row["name"] == "marco")
+    for placed, ok in ((["text_encoder", "vae"], True), (["vae", "text_encoder"], False)):
+        entry["models"] = [
+            {"path": "marco.models.m", "class": "Hosting", "component_use": {}, "placeable": placed}
+        ]
+        raw = package_interface.canonical_bytes(body)
+        if ok:
+            read = package_interface.read_bytes(raw)
+            marco = next(row for row in read["entrypoints"] if row["name"] == "marco")
+            assert marco["models"][0]["placeable"] == placed
+            continue
+        with pytest.raises(package_interface.StalePackageInterface, match="placeable"):
+            package_interface.read_bytes(raw)
+    load = executor_commands.decode(
+        {"cmd": "load", "construction": "c", "binding": {"homes": {"text_encoder": 1, "vae": 0}}}
+    )
+    assert isinstance(load, executor_commands.Load)
+    assert load.single().binding.homes == {"text_encoder": 1, "vae": 0}
 
 
 # ---------------------------------------------------------------------- gloo (torch)
@@ -286,7 +319,7 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
 
 
 def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one ledger memfd and eventfd per GPU after its Start; rank 0
+    """TensorD hands rank 0 one grant per GPU after its Start; rank 0
     forwards the Start to its followers, which take their own ledger at join. A follower
     handed the Start as TensorD sent it waited in `start` for descriptors nobody sends, and
     the group wedged there (runs 11824, 11829). Real follower processes take rank 0's
@@ -319,11 +352,11 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
 
 @needs_torch
 @pytest.mark.skipif(sys.platform != "linux", reason="varena's ledger is Linux's")
-def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one ledger memfd and eventfd per GPU; rank 0 relays each
-    follower's pair at join, and the follower claims its row there. A real varena ledger's
-    pair crosses the real seam to a real follower process, and the group forms past join:
-    run 11905 broke there, its eventfd refused as a memfd ("cannot take a host tier")."""
+def test_a_group_forms_with_each_followers_grant(tmp_path: Path) -> None:
+    """TensorD hands rank 0 one grant (the table and a description for the row's lock) per
+    GPU; rank 0 relays each follower's at join, and the follower opens its memory on it. Both
+    cross the real seam to a real follower process, and the group forms past join (run 11905
+    broke there, a descriptor refused as the wrong kind)."""
     import torch
 
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
@@ -336,15 +369,17 @@ def test_a_group_forms_with_each_followers_ledger_memfd_and_eventfd(tmp_path: Pa
         launch=_launcher(env),
         devices=("4", "5"),
     )
-    ledger = Ledger.create("GPU-follower-5", GiB)
-    assert ledger.events_fd is not None
+    table = seam.anonymous("cozy-test-table")
+    row = os.open(f"/proc/self/fd/{table}", os.O_RDWR | os.O_CLOEXEC)
     try:
         group.spawn()
         group.dial_back(seal_snapshot(env))
-        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[ledger.fd, ledger.events_fd])
+        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[table, row])
         assert group.formed and torch.distributed.get_world_size() == 2
     finally:
         group.close()
+        os.close(table)
+        os.close(row)
     assert not torch.distributed.is_initialized()
 
 
