@@ -136,14 +136,14 @@ def test_the_reference_and_the_quantizer_law_on_the_cpu() -> None:
     scale, bias = torch.rand(n, generator=generator) * 1e-3, torch.randn(n).to(torch.bfloat16)
     one = calibrate._Set(x, q, row.view(-1).float(), data, scale, bias)
     rows = torch.tensor(calibrate._rows(m, random.Random(2)))
-    law, ties = calibrate._law(torch, prebuilt.INT8, one, rows)
-    assert law == Quantizer(0.0, 0, 0) and ties.shape == (len(rows), k)
+    assert calibrate._law(torch, prebuilt.INT8, one, rows) == Quantizer(0.0, 0, 0)
     want = (q[rows].double() @ data.double().t()) * row[rows].float().double()
     want = want * scale.double() + bias.double()
     assert torch.equal(calibrate._exact(torch, one, rows), want)
-    column = int((~ties[0]).nonzero()[0])
+    value = (rotated / row)[rows[0]]
+    column = int(((value - value.floor() - 0.5).abs() > calibrate.INT8_TIE).nonzero()[0])
     q[rows[0], column] += 1 if q[rows[0], column] < 0 else -1  # one step, but at no tie
-    assert calibrate._law(torch, prebuilt.INT8, one, rows)[0] == Quantizer(1.0, 1, 1)
+    assert calibrate._law(torch, prebuilt.INT8, one, rows) == Quantizer(1.0, 1, 1)
 
 
 def test_only_the_offline_oracle_imports_the_calibration() -> None:

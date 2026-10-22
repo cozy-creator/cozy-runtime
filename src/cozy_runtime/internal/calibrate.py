@@ -7,8 +7,7 @@ family's table, the compiled family default, cuBLASLt, and the GEMV for a few in
 - **Numerics first.** A candidate's timing counts only after its bf16 and fp16 outputs match
   the exact float64 product of the same quantized operands, at one row in every 16-row block.
   The budget is twice the arm's error model: the output dtype's own rounding of that product,
-  plus, for fp8, an accumulator of `FP8_ACCUMULATOR_BITS` random-walking over K, plus, for the
-  GEMV (which quantizes its rows itself), every code at a rounding tie flipping. A non-finite
+  plus, for fp8, an accumulator of `FP8_ACCUMULATOR_BITS` random-walking over K. A non-finite
   output fails before any ratio. The activation quantizer is held to its law: a code may differ
   only at a tie.
 - **Timing.** After its checked first call, each candidate runs interleaved with the others in
@@ -322,12 +321,9 @@ def _exact(torch: ModuleType, one: _Set, rows: Tensor) -> Tensor:
     return product * one.scale.double().view(1, -1) + one.bias.double().view(1, -1)
 
 
-def _law(
-    torch: ModuleType, f: prebuilt._Format, one: _Set, rows: Tensor
-) -> tuple[Quantizer, Tensor]:
-    """The native quantizer's codes against its law at `rows`, and where the law sits at a
-    rounding tie (within the fp32 error of the codes' arithmetic): only there may a code differ,
-    by one step."""
+def _law(torch: ModuleType, f: prebuilt._Format, one: _Set, rows: Tensor) -> Quantizer:
+    """The native quantizer's codes against its law at `rows`: a code may differ only where the
+    law sits at a rounding tie (within the fp32 error of the codes' arithmetic), by one step."""
     x, got = one.x[rows], _picked(torch, one.q, rows).double()
     if f.fp8:
         law, scale = prebuilt._fp8_law(torch, x)
@@ -345,7 +341,7 @@ def _law(
     steps = (got - want).abs() / step
     differs = steps > 0
     unexplained = int((differs & ~ties).sum() + (steps > 1).sum())
-    return Quantizer(float(steps.max()), int(differs.sum()), unexplained), ties
+    return Quantizer(float(steps.max()), int(differs.sum()), unexplained)
 
 
 def _timed(
@@ -432,7 +428,7 @@ def _shape(
         name: 2 * (verify.error(torch, exact.to(getattr(torch, name)), exact) + accumulator)
         for name in DTYPES
     }
-    quantizer, ties = _law(torch, f, first, rows)
+    quantizer = _law(torch, f, first, rows)
     gemm = ops.fp8_gemm if f.fp8 else ops.int8_gemm
     calls: dict[Choice, Callable[[_Set, str], object]] = {}
     tiles: list[Choice] = [DEFAULT, *_tiles(ops, f)]
@@ -440,17 +436,12 @@ def _shape(
         tiles.append(verify.CUBLASLT)
     for tile in tiles:
         calls[tile] = partial(_gemm, gemm, -1 if tile == DEFAULT else tile)
-    budgets = dict.fromkeys(calls, budget)
+    # The GEMV quantizes its rows itself, by the quantizer's own fp32 law: it is held to the
+    # same budget, and a code it rounds the other way at a tie shows as error.
     if not f.fp8 and m <= _kernels._gemm.GEMV_ROWS:
         calls[verify.GEMV] = partial(_gemv, ops)
-        # The GEMV quantizes its rows itself: at a tie its code may be the other one.
-        flips = ties.double() @ first.data.double().abs().t()
-        flips = flips * first.scales[rows].double()[:, None] * first.scale.double()
-        budgets[verify.GEMV] = {
-            name: value + 2 * float(flips.norm() / exact.norm()) for name, value in budget.items()
-        }
     # The first call of each: refused, raised, or checked in both dtypes before any timing.
-    candidates = {c: _checked(torch, c, calls[c], first, rows, exact, budgets[c]) for c in calls}
+    candidates = {c: _checked(torch, c, calls[c], first, rows, exact, budget) for c in calls}
     alive = [c for c, found in candidates.items() if found.ok and not found.note]
     left: dict[Choice, str] = {}
     # Cold: each one's first timed launch here, on operands the pool has since evicted.
