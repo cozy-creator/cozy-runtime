@@ -195,6 +195,7 @@ class Prebuilt:
             if config is None:
                 key = (f.name, self._half(out_dtype), rows, data.shape[0], width)
                 config = tune.config(self.index, key)
+                config = -1 if config is None else config
             code = _kernels._gemm.gemm(
                 self.index, FAMILIES.index(self.family), f.fp8, q.data_ptr(), scales.data_ptr(),
                 data.data_ptr(), scale.data_ptr(), _ptr(bias), out.data_ptr(),

@@ -2529,6 +2529,7 @@ class Executor:
                     else None
                 )
                 host.memory = Memory.open(device, ledger, Mode(host.memory_mode))
+                tune.watch(functools.partial(_neighbour_runs, host.memory))
             except VarenaUnsupported as exc:  # no varena on this OS (Windows)
                 return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
             host.memory.context = max(host.device_context, 0)
@@ -5082,7 +5083,18 @@ def serve(executor: Executor, channel: Channel) -> int:
         _send_reply(channel, reply)
 
 
+def _neighbour_runs(memory: object) -> bool:
+    """Whether another process on this executor's GPU runs a request now, by varena's ledger:
+    the local tuner waits for it as for this process's own commands."""
+    found = getattr(memory, "row", None)
+    if found is None:
+        return False
+    table, row = found
+    return any(f.state == "live" and f.running and f.slot != row.id for f in table.snapshot())
+
+
 def _shut(executor: Executor, channel: Channel) -> int:
+    tune.stop()
     if executor.group is not None:
         executor.group.close()
     channel.send({"reply": "shutdown", "ok": True})

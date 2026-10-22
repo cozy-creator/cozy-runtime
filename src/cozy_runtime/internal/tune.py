@@ -2,17 +2,20 @@
 
 A GEMM's launch config is its kernel's rule (`choose()` in `kernels/csrc/gemm`) until this card
 has measured a better one for that exact shape. Each shape a served call multiplies at is noted
-(`config`); while its executor is idle, the tuner times the shape on its family's configs. A
-config replaces the rule only when its output is bit-identical to the rule's on the same
-operands (int8 accumulates exactly; an fp8 config that sums in another order shows here and is
-refused), its measured rate is one the card can reach, and its median beats the rule's by more
-than both spreads. Every measurement is kept in one file on this machine, keyed by the kernel
-binary, the card and the driver. A missing, stale or unreadable file is the rule; nothing is
-uploaded, and nothing here decides a lane or a route.
+(`config`); while its executor is idle and no other process on the GPU runs a request, the tuner
+times the shape on its family's configs. A config replaces the rule only when its output is
+bit-identical to the rule's on the same operands (int8 accumulates exactly; an fp8 config that
+sums in another order shows here and is refused), its measured rate is one the card can reach,
+and its median beats the rule's by more than both spreads and by 1%. Measurements are kept in one
+file on this machine, keyed by the kernel binary, the card and the driver; a missing, stale or
+unreadable file is the rule. Nothing is uploaded, and nothing here decides a lane or a route. A
+shape the tuner could not measure (no room, an error) is remembered in this process only.
 
-A run never waits on tuning beyond one round: the tuner holds the device for a round at a time
-(milliseconds) and stops at a round boundary when a command starts (`command`). A call reads
-the table as it stands: eager, its next call; a CUDA graph, its next capture.
+A run never waits on tuning beyond one step of a round: the tuner holds the device for one
+launch group at a time (milliseconds) and stops at its boundary when a command starts
+(`command`) or a neighbour on the GPU runs a request (`watch`). A call reads the table as it
+stands: eager, its next call; a CUDA graph, its next capture. Two idle executors on one GPU may
+tune at once; each one's spread then widens and it keeps the rule.
 """
 
 from __future__ import annotations
@@ -48,8 +51,13 @@ BUDGET_S = 60.0
 ROUNDS = 15
 #: Past the largest family table (mma.sync's 7): configs past a table's end refuse.
 CONFIGS = 12
-#: Device cycles a round starts queued behind, so no host gap enters a launch's time.
+#: Device cycles a round starts queued behind, so no host gap enters a launch's time; doubled
+#: within a round while the host outruns it, never past `SLEEP_CAP`.
 SLEEP_CYCLES = 1 << 20
+SLEEP_CAP = 1 << 26
+#: Shapes a process notes for tuning, and units a table keeps: the most multiply-adds first.
+PENDING_CAP = 128
+UNITS_CAP = 1024
 #: Tables kept on a machine: a floor under growth across kernel builds and drivers.
 KEEP = 64
 #: Dense 8-bit tensor-core operations per clock per SM, from NVIDIA's architecture
@@ -57,6 +65,8 @@ KEEP = 64
 OPS_PER_CLOCK = {80: 4096, 86: 2048, 87: 2048, 89: 2048, 90: 8192, 100: 16384, 103: 16384}
 #: An sm OPS_PER_CLOCK does not name (RTX 50's block-scaled mma.sync, a new cc).
 OPS_FALLBACK = 2048
+#: The rule's index in `Table.choices`: a measured shape the rule serves.
+RULE = -1
 
 
 def name(key: Key) -> str:
@@ -74,7 +84,6 @@ class Unit(msgspec.Struct, frozen=True, omit_defaults=True):
     number behind that, microseconds as median and interquartile spread."""
 
     config: int | None = None
-    note: str = ""
     rule_us: float = 0.0
     rule_spread_us: float = 0.0
     configs: dict[str, tuple[float, float]] = {}
@@ -91,14 +100,17 @@ class Unit(msgspec.Struct, frozen=True, omit_defaults=True):
 
 
 class Identity(msgspec.Struct, frozen=True):
-    """What a table answers for: the kernel binary, the card and its driver."""
+    """What a table answers for: the kernel binary, the card (its SM count and L2 decide the
+    rule's tiles too) and its driver."""
 
     kernel: str
     family: str
     sm: int
     card: str
+    sms: int
+    l2_bytes: int
     driver: str
-    schema: int = 1
+    schema: int = 2
 
 
 class Document(msgspec.Struct):
@@ -115,17 +127,30 @@ class Table:
         self.choices: dict[Key, int] = {}
 
     def merge(self, units: dict[str, Unit]) -> None:
-        self.units.update(units)
+        """A new dict each time: a reader iterating the old one never sees it change."""
+        merged = {**self.units, **units}
+        if len(merged) > UNITS_CAP:  # the shapes with the most multiply-adds stay
+            weight = {key: parse(key)[2] * parse(key)[3] * parse(key)[4] for key in merged}
+            merged = dict(sorted(merged.items(), key=lambda kv: -weight[kv[0]])[:UNITS_CAP])
+        self.units = merged
         self.choices = {
-            parse(key): unit.config for key, unit in self.units.items() if unit.config is not None
+            parse(key): RULE if unit.config is None else unit.config for key, unit in merged.items()
         }
 
 
 def identity(ops: Prebuilt, kernel: str) -> Identity:
     torch = ops.torch
     major, minor = torch.cuda.get_device_capability(ops.index)
-    card = str(torch.cuda.get_device_properties(ops.index).name)
-    return Identity(kernel, ops.family, major * 10 + minor, card, accel.driver_version())
+    props = torch.cuda.get_device_properties(ops.index)
+    return Identity(
+        kernel=kernel,
+        family=ops.family,
+        sm=major * 10 + minor,
+        card=str(props.name),
+        sms=int(props.multi_processor_count),
+        l2_bytes=int(props.L2_cache_size),
+        driver=accel.driver_version(),
+    )
 
 
 def _path(found: Identity) -> Path | None:
@@ -170,47 +195,69 @@ def _keep(table: Table) -> None:
 
 # ------------------------------------------------------------------- the process's state
 
-#: Device index -> its library and table, once the library serves there (`attach`).
+#: Device index -> its library, table, and the stream the tuner times on.
 _OPS: dict[int, Prebuilt] = {}
 _TABLES: dict[int, Table] = {}
+_STREAMS: dict[int, object] = {}
 #: Device index -> shapes its calls ran that the table has not measured, and how many calls.
 _PENDING: dict[int, dict[Key, int]] = {}
+#: Shapes this process could not measure (no room, an error): never retried here, never kept.
+_SKIPPED: dict[Key, str] = {}
 #: Commands running now; the tuner works only at zero (`command`).
 _STATE = threading.Condition()
 _BUSY = [0]
 _SPENT = [0.0]
-#: Held for one tuning round; a command starting waits only for the round in flight.
+_STOPPED = [False]
+#: Whether another process on this GPU runs a request now (`watch`).
+_NEIGHBOURS: list[Callable[[], bool]] = []
+#: Held for one launch group; a command starting waits only for the group in flight.
 _DEVICE = threading.Lock()
 _THREAD: list[threading.Thread] = []
 
 
 def attach(ops: Prebuilt, kernel: str) -> None:
-    """The library serving device `ops.index`, and the table this machine kept for it."""
+    """The library serving device `ops.index`, the table this machine kept for it, and the one
+    stream the tuner times on there."""
     found = identity(ops, kernel)
     table = Table(found, _path(found))
     table.merge(_read(table.path, found))
     _OPS[ops.index], _TABLES[ops.index] = ops, table
+    _STREAMS[ops.index] = ops.torch.cuda.Stream(ops.index)
 
 
-def config(index: int, key: Key) -> int:
-    """The tuned config for `key` on device `index`, else -1 (the rule): a dict lookup a call,
-    and a count while the shape waits to be measured."""
+def watch(neighbours: Callable[[], bool]) -> None:
+    """How the tuner knows another process on its GPU runs a request: it waits for that too."""
+    _NEIGHBOURS[:] = [neighbours]
+
+
+def stop() -> None:
+    """The executor shuts down: no further unit starts."""
+    _STOPPED[0] = True
+    with _STATE:
+        _STATE.notify_all()
+
+
+def config(index: int, key: Key) -> int | None:
+    """The tuned config for `key` on device `index`, else None (the rule): one dict lookup a
+    call, and a count while the shape waits to be measured."""
     table = _TABLES.get(index)
     if table is None:
-        return -1
+        return None
     found = table.choices.get(key)
     if found is not None:
-        return found
-    if name(key) not in table.units:
-        pending = _PENDING.setdefault(index, {})
-        pending[key] = pending.get(key, 0) + 1
-    return -1
+        return None if found == RULE else found
+    pending = _PENDING.setdefault(index, {})
+    if key in pending:
+        pending[key] += 1
+    elif len(pending) < PENDING_CAP and _SPENT[0] < BUDGET_S and key not in _SKIPPED:
+        pending[key] = 1
+    return None
 
 
 @contextlib.contextmanager
 def command() -> Iterator[None]:
-    """One executor command: tuning yields until it ends. It waits only for the round in flight,
-    and once the executor is idle again the tuner measures what its calls ran."""
+    """One executor command: tuning yields until it ends. It waits only for the launch group in
+    flight, and once the executor is idle again the tuner measures what its calls ran."""
     with _STATE:
         _BUSY[0] += 1
     with _DEVICE:
@@ -221,13 +268,18 @@ def command() -> Iterator[None]:
         with _STATE:
             _BUSY[0] -= 1
             _STATE.notify_all()
-            if not _THREAD and _PENDING:
+            if not _THREAD and _PENDING and not _STOPPED[0]:
                 _THREAD.append(threading.Thread(target=_loop, name="cozy-tune", daemon=True))
                 _THREAD[0].start()
 
 
 def _busy() -> bool:
-    return _BUSY[0] > 0
+    if _BUSY[0] > 0 or _STOPPED[0]:
+        return True
+    try:
+        return any(neighbours() for neighbours in _NEIGHBOURS)
+    except Exception:  # an unreadable ledger: assume a neighbour runs
+        return True
 
 
 def _next() -> tuple[int, Key] | None:
@@ -242,25 +294,44 @@ def _next() -> tuple[int, Key] | None:
 
 
 def _loop() -> None:
-    while _SPENT[0] < BUDGET_S:
+    while _SPENT[0] < BUDGET_S and not _STOPPED[0]:
         with _STATE:
-            _STATE.wait_for(lambda: not _busy() and _next() is not None)
-            found = _next()
+            _STATE.wait_for(lambda: _STOPPED[0] or (_BUSY[0] == 0 and _next() is not None))
+            found = None if _STOPPED[0] else _next()
         if found is None:
+            continue
+        if _busy():  # a neighbour runs a request: look again shortly
+            time.sleep(1.0)
             continue
         index, key = found
         started = time.monotonic()
+        unit: Unit | str | None
         try:
-            unit = _unit(_OPS[index], key)
-        except Exception as exc:  # a shape the tuner cannot measure keeps the rule
-            unit = Unit(note=f"{type(exc).__name__}: {exc}"[:300])
+            unit = _unit(_OPS[index], _STREAMS[index], key)
+        except Exception as exc:  # a shape the tuner cannot measure keeps the rule here
+            unit = f"{type(exc).__name__}: {exc}"[:300]
+        finally:
+            _release(index)
         _SPENT[0] += time.monotonic() - started
-        if unit is None:  # a command started: the shape waits for the next idle
+        if unit is None:  # a command or a neighbour started: the shape waits for the next idle
+            continue
+        _PENDING[index].pop(key, None)
+        if isinstance(unit, str):
+            _SKIPPED[key] = unit
             continue
         table = _TABLES[index]
-        _PENDING[index].pop(key, None)
         table.merge({name(key): unit})
         _keep(table)
+        for known in [k for k in _PENDING[index] if k in table.choices]:  # another executor's
+            _PENDING[index].pop(known, None)
+
+
+def _release(index: int) -> None:
+    """The unit's operands are gone: give their cached blocks back, when no command runs, so
+    neither varena's room nor a neighbour counts on bytes the tuner held."""
+    with _DEVICE:
+        if not _BUSY[0] and index in _OPS:
+            _OPS[index].torch.cuda.empty_cache()
 
 
 # ---------------------------------------------------------------------------- measuring
@@ -277,27 +348,33 @@ class _Set(msgspec.Struct):
 type _Call = Callable[[_Set, int, bool], Tensor]
 
 
-def _unit(ops: Prebuilt, key: Key) -> Unit | None:
+def _unit(ops: Prebuilt, stream: object, key: Key) -> Unit | str | None:
     """One shape measured on this card: the rule and each config bit-identical to it, timed in
-    interleaved rounds. None when a command started (nothing kept)."""
+    interleaved rounds. None when a command or a neighbour started; why, when it cannot be
+    measured here."""
     fmt, fp16, m, n, k = key
     torch = ops.torch
     if fmt == "fp8" and not ops.cutlass_fp8:
-        return Unit(note="cuBLASLt multiplies fp8 on this card: nothing to tune")
+        return "cuBLASLt multiplies fp8 on this card: nothing to tune"
     dtype = torch.float16 if fp16 else torch.bfloat16
-    props = torch.cuda.get_device_properties(ops.index)
-    each = m * k + 4 * m + n * k + 6 * n + 4 * m * n
-    free, _ = torch.cuda.mem_get_info(ops.index)
-    if 2 * each > free // 4:
-        return Unit(note=f"no room: two operand sets are {2 * each} B and {free} B are free")
-    count = min(max(2, math.ceil(2 * props.L2_cache_size / each)), max(2, free // 4 // each))
+    table = _TABLES[ops.index]
+    each = m * k + 4 * m + n * k + 6 * n
+    # The peak beside the sets: the operands' float temporaries and three outputs at once.
+    peak = 6 * m * k + 3 * 2 * m * n
+    with _DEVICE:
+        if _busy():
+            return None
+        free, _ = torch.cuda.mem_get_info(ops.index)
+    if 2 * each + peak > free // 4:
+        return f"no room: {2 * each + peak} B against {free} B free"
+    room = (free // 4 - peak) // each
+    count = min(max(2, math.ceil(2 * table.identity.l2_bytes / each)), max(2, room))
     gemm = ops.fp8_gemm if fmt == "fp8" else ops.int8_gemm
 
     def call(one: _Set, choice: int, bias: bool = True) -> Tensor:
         return gemm(one.q, one.scales, one.data, one.scale, one.bias if bias else None,
                     dtype, choice)  # fmt: skip
 
-    stream = torch.cuda.Stream(ops.index)
     sets: list[_Set] = []
     with torch.cuda.device(ops.index), torch.cuda.stream(stream):
         for seed in range(count):
@@ -305,45 +382,77 @@ def _unit(ops: Prebuilt, key: Key) -> Unit | None:
                 if _busy():
                     return None
                 sets.append(_operands(ops, fmt, m, n, k, dtype, seed))
-                stream.synchronize()
-        identical: list[int] = []
-        refused: dict[str, str] = {}
+                stream.synchronize()  # type: ignore[attr-defined]
+        identical, refused = _identical(torch, stream, sets, call)
+        if identical is None:
+            return None
+        if str(RULE) in refused:  # the rule disagrees with itself: nothing to compare against
+            return refused[str(RULE)]
+        if identical == [RULE]:  # no other config writes the rule's bytes: the rule serves
+            return Unit(refused=refused, sets=count)
+        times = _rounds(torch, stream, sets, identical, call)
+        if times is None:
+            return None
         with _DEVICE:
-            if _busy():
-                return None
-            rule = [call(sets[0], -1), call(sets[1], -1), call(sets[0], -1, False)]
-            for choice in range(CONFIGS):
-                try:
-                    got = [
-                        call(sets[0], choice),
-                        call(sets[1], choice),
-                        call(sets[0], choice, False),
-                    ]
-                except ValueError as exc:  # this config does not take the shape, or past the end
-                    refused[str(choice)] = str(exc)[:120]
-                    continue
-                if all(torch.equal(a, b) for a, b in zip(got, rule, strict=True)):
-                    identical.append(choice)
-                else:
-                    refused[str(choice)] = "its output differs from the rule's"
-            stream.synchronize()
-        times = _rounds(torch, stream, sets, [-1, *identical], call)
-    if times is None:
-        return None
+            sets.clear()
     major, minor = torch.cuda.get_device_capability(ops.index)
     per_clock = OPS_PER_CLOCK.get(major * 10 + minor, OPS_FALLBACK)
-    peak = per_clock * props.multi_processor_count * props.clock_rate * 1e3
-    return verdict(times, 2 * m * n * k / peak * 1e6, refused, len(sets))
+    clock_hz = torch.cuda.get_device_properties(ops.index).clock_rate * 1e3
+    rate = per_clock * table.identity.sms * clock_hz
+    floor_us = 2 * m * n * k / rate * 1e6 if rate > 0 else 0.0
+    return verdict(times, floor_us, refused, count)
+
+
+def _identical(
+    torch: ModuleType, stream: object, sets: list[_Set], call: _Call
+) -> tuple[list[int] | None, dict[str, str]]:
+    """The rule (twice: it must agree with itself) and each config whose outputs equal the
+    rule's on two operand sets, with and without bias, one config per hold of the device."""
+    refused: dict[str, str] = {}
+    with _DEVICE:
+        if _busy():
+            return None, refused
+        rule = [call(sets[0], RULE, True), call(sets[1], RULE, True), call(sets[0], RULE, False)]
+        again = [call(sets[0], RULE, True), call(sets[1], RULE, True), call(sets[0], RULE, False)]
+        steady = all(torch.equal(a, b) for a, b in zip(rule, again, strict=True))
+        del again
+        stream.synchronize()  # type: ignore[attr-defined]
+    if not steady:
+        return [RULE], {str(RULE): "the rule's own output varies between calls"}
+    identical = [RULE]
+    for choice in range(CONFIGS):
+        with _DEVICE:
+            if _busy():
+                return None, refused
+            try:
+                same = all(
+                    torch.equal(call(one, choice, bias), want)
+                    for (one, bias), want in zip(
+                        ((sets[0], True), (sets[1], True), (sets[0], False)), rule, strict=True
+                    )
+                )
+            except ValueError as exc:  # this config does not take the shape, or past the end
+                refused[str(choice)] = str(exc)[:120]
+                continue
+            finally:
+                stream.synchronize()  # type: ignore[attr-defined]
+        if same:
+            identical.append(choice)
+        else:
+            refused[str(choice)] = "its output differs from the rule's"
+    with _DEVICE:
+        del rule
+    return identical, refused
 
 
 def verdict(
     times: dict[int, list[float]], floor_us: float, refused: dict[str, str], sets: int
 ) -> Unit:
-    """`times` (config -> device microseconds, -1 the rule's) as a unit: the fastest config
-    whose median beats the rule's by more than both spreads and by 1%, none faster than the
-    card can multiply (`floor_us`, the shape at the card's peak); else the rule."""
+    """`times` (config -> device microseconds, the rule's under `RULE`) as a unit: the fastest
+    config whose median beats the rule's by more than both spreads and by 1%, none faster than
+    the card can multiply (`floor_us`, the shape at the card's peak); else the rule."""
     stats = {c: (statistics.median(t), _spread(t)) for c, t in times.items()}
-    rule_us, rule_spread = stats.pop(-1)
+    rule_us, rule_spread = stats.pop(RULE)
     plausible = {c: s for c, s in stats.items() if s[0] >= floor_us / 1.05}
     best = min(plausible, key=lambda c: plausible[c][0], default=None)
     wins = (
@@ -374,12 +483,14 @@ def _operands(ops: Prebuilt, fmt: str, m: int, n: int, k: int, dtype: object, se
         weight = torch.randn(n, k, generator=generator, device=device) * 0.02
         scale = (weight.abs().amax(-1).float() / 448.0).clamp(min=1e-12)
         data = (weight / scale.view(-1, 1)).clamp(-448, 448).to(torch.float8_e4m3fn)
+        del weight
         q, scales = ops.fp8_quantize(x)
     else:
         data = torch.randint(-127, 128, (n, k), generator=generator, device=device,
                              dtype=torch.int8)  # fmt: skip
         scale = torch.rand(n, generator=generator, device=device).add_(0.5).mul_(1e-3)
         q, scales = ops.int8_quantize(x)
+    del x
     bias = torch.randn(n, generator=generator, device=device).to(dtype)
     return _Set(q, scales, data, scale.contiguous(), bias)
 
@@ -389,12 +500,14 @@ def _rounds(
 ) -> dict[int, list[float]] | None:
     """Device microseconds of each choice: one untimed round, then `ROUNDS`, each queued behind
     a sleep so no host gap enters a launch, in a fresh order, every launch on the least recently
-    used operand set (the sets hold over twice the L2). None when a command started."""
+    used operand set (the sets hold over twice the L2). None when a command or a neighbour
+    started. Each round is one hold of the device."""
     times: dict[int, list[float]] = {c: [] for c in choices}
     rng = random.Random(len(sets))
-    turn, sleep = 0, SLEEP_CYCLES
+    turn = 0
     for round_ in range(ROUNDS + 1):
         order = rng.sample(choices, len(choices))
+        sleep = SLEEP_CYCLES
         while True:
             with _DEVICE:
                 if _busy():
@@ -413,12 +526,14 @@ def _rounds(
                     marks.append((choice, begin, end))
                 ahead = not slept.query()
                 stream.synchronize()  # type: ignore[attr-defined]
-            if ahead:
+                found = [(choice, begin.elapsed_time(end) * 1e3) for choice, begin, end in marks]
+                del marks, slept
+            if ahead or sleep >= SLEEP_CAP:
                 break
             sleep *= 2
         if round_:
-            for choice, begin, end in marks:
-                times[choice].append(begin.elapsed_time(end) * 1e3)
+            for choice, us in found:
+                times[choice].append(us)
     return times
 
 
@@ -434,7 +549,7 @@ def summary(index: int) -> dict[str, int | float]:
     table = _TABLES.get(index)
     if table is None:
         return {}
-    gains = [unit.gain() for unit in table.units.values() if unit.config is not None]
+    gains = [unit.gain() for unit in list(table.units.values()) if unit.config is not None]
     return {
         "measured": len(table.units),
         "faster": len(gains),
