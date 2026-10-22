@@ -223,6 +223,90 @@ def test_each_band_rule_is_the_whole_op(dtype: Any) -> None:
                 torch.testing.assert_close(got, whole, rtol=2**-16, atol=2**-14)
 
 
+def test_a_conv_cut_site_s_bands_are_the_whole_conv() -> None:
+    """The module-level conv cut at levels 0-3 on real CPU kernels in bfloat16, each one's max
+    error printed: level 0 is the module's own call; 2-D by images and by output channels, and
+    3-D by output channels, bit-equal to the whole conv."""
+    gen = torch.Generator().manual_seed(14)
+    cases = {
+        "conv2d by channels": (nn.Conv2d(16, 16, 3, padding=1), (1, 16, 32, 32)),
+        "conv2d by images": (nn.Conv2d(16, 16, 3, padding=1), (4, 16, 16, 16)),
+        "conv3d by channels": (nn.Conv3d(8, 16, 3, padding=1), (1, 8, 4, 16, 16)),
+    }
+    for name, (conv, shape) in cases.items():
+        conv, x = conv.to(BF16), torch.randn(*shape, generator=gen).to(BF16)
+        with torch.no_grad():
+            whole = conv(x)
+            units = x.shape[0] if x.shape[0] > 1 else conv.weight.shape[0]
+            for level in range(4):
+                got = cuts._bands(
+                    conv._conv_forward, x, conv.weight, conv.bias, x.shape[0] > 1, units, level
+                )
+                error = (got.float() - whole.float()).abs().max().item()
+                print(f"{name} level {level}: max error {error:.3g} against whole")
+                assert torch.equal(got, whole), (name, level)
+
+
+class ConvBlock(nn.Module):  # type: ignore[misc]
+    def __init__(self) -> None:
+        super().__init__()
+        self.flat, self.deep = nn.Conv2d(16, 16, 3, padding=1), nn.Conv3d(4, 4, 3, padding=1)
+
+    def forward(self, x: Any) -> Any:
+        h = self.flat(x)
+        return self.deep(h.view(1, 4, 4, *h.shape[2:]))
+
+
+class Convs(nn.Module):  # type: ignore[misc]
+    _no_split_modules = ("ConvBlock",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block = ConvBlock()
+
+    def forward(self, x: Any) -> Any:
+        return self.block(x)
+
+
+def convs() -> Convs:
+    torch.manual_seed(15)
+    model = Convs()
+    model.to(BF16).eval()
+    return model
+
+
+def test_a_conv_in_a_bare_block_cuts_at_its_own_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """At 40 KiB neither conv fits with its working memory. Warm, its block runs bare: the
+    convs' own cut sites take Rust's cut (no op passes the request's layer), the result is the
+    whole one, and the next request starts each conv at the level Rust kept."""
+    plain = convs()
+    mem = memory()
+    model = placed(mem, checkpoint(tmp_path, "convs", plain), "convs", convs)
+    x = torch.randn(1, 16, 32, 32, generator=torch.Generator().manual_seed(16)).to(BF16)
+    computed: list[str] = []
+    dispatch = catch.Layer.__torch_dispatch__
+
+    def counted(self: Any, func: Any, *rest: Any) -> Any:
+        if all(a.alias_info is None for a in func._schema.returns):
+            computed.append(str(func))
+        return dispatch(self, func, *rest)
+
+    with torch.no_grad():
+        want = plain(x)
+        with mem.request("journal") as r, execution.serving(r):
+            model(x)
+        monkeypatch.setattr(catch.Layer, "__torch_dispatch__", counted)
+        cold, warm = Card(limit=40 << 10, working=banded), Card(limit=40 << 10, working=banded)
+        with cold, mem.request("cold") as r, execution.serving(r):
+            got = model(x)
+        assert cold.refused and r.stats().cuts >= 1 and not computed, computed
+        with warm, mem.request("warm") as r, execution.serving(r):
+            again = model(x)
+    assert warm.refused == 0 and torch.equal(got, want) and torch.equal(again, want)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_ffn_tokens_and_attention_pieces_against_the_whole(dtype: Any) -> None:
     """FFN token pieces and attention head groups and query rows at levels 1-3 against the call

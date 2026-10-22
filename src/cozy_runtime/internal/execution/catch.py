@@ -259,12 +259,18 @@ def settle[T](run: Callable[[], T], own: Scope | None, operands: object, first: 
 
 
 def cut[T](
-    site: str, finest: int, run: Callable[[int], T], operands: object, shape: str | None = None
+    site: str,
+    finest: int,
+    run: Callable[[int], T],
+    operands: object,
+    shape: str | None = None,
+    measured: bool = True,
 ) -> T:
     """`run(level)` for a call that cuts itself (FFN tokens, attention pieces, a package's
-    split, a norm's bands): at the level Rust holds for `site` at its `shape` (its operands'
-    shapes when None), finer when it or an op inside it ran out and Rust cut it. Its peak is
-    measured as the site's (`r.site`)."""
+    split, a norm's or a conv's bands): at the level Rust holds for `site` at its `shape` (its
+    operands' shapes when None), finer when it or an op inside it ran out and Rust cut it. Its
+    peak is measured as the site's (`r.site`) when `measured`: a conv's, many and small within
+    its pass, is not (Rust keeps the level it cut one to)."""
     request = CURRENT.get()
     if request is None:
         return run(0)
@@ -277,7 +283,7 @@ def cut[T](
         return run(scope.level)
 
     try:
-        with request.site(site, False, finest):
+        with request.site(site, False, finest) if measured else nullcontext():
             while True:
                 try:
                     return settle(whole, scope, operands, first=True)

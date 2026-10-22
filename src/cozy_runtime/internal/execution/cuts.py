@@ -160,10 +160,17 @@ catch.RULES[aten.convolution] = _conv
 def install(module: nn.Module) -> int:
     """Call cuts under `module`: token pieces for Diffusers' FFNs and their activation
     projections (GELU, GEGLU, SwiGLU and subclasses; a block that calls its FFN's parts still
-    cuts at the projection, whose [tokens, inner] intermediate is the widest), and row bands
-    for its channel RMS norms. Each site is the module's path. Returns how many it cut."""
+    cuts at the projection, whose [tokens, inner] intermediate is the widest), row bands for its
+    channel RMS norms, and image or output-channel bands for its 2-D and 3-D convs (at the
+    conv itself, so a subclass's forward around it, a causal pad, is untouched). Each site is
+    the module's path. Returns how many it cut."""
     count = 0
     for path, sub in module.named_modules():
+        if isinstance(sub, nn.Conv2d | nn.Conv3d) and "_cozy_cut" not in vars(sub):
+            own = vars(sub).get("_conv_forward")
+            sub._conv_forward = _conv_bands(f"{path}:bands", sub, own or _conv_of(sub))
+            vars(sub)["_cozy_cut"] = True
+            count += 1
         kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
         rms = _rms_contract(sub, kinds)
         if rms is not None and "_cozy_cut" not in vars(sub):
@@ -175,6 +182,64 @@ def install(module: nn.Module) -> int:
             vars(sub)["_cozy_cut"] = True
             count += 1
     return count
+
+
+type Conv = Callable[[Tensor, Tensor, Tensor | None], Tensor]
+
+
+def _conv_of(module: nn.Module) -> Conv:
+    """`module`'s class `_conv_forward` as it is at each call."""
+    return lambda x, w, b: type(module)._conv_forward(module, x, w, b)
+
+
+def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
+    """A conv at the level Rust holds for `site`: whole at 0, else in bands of images, else
+    (one image, ungrouped) of output channels, each band copied into its slice of the result.
+    Measured on a GPU (tests/test_band_live_bytes.py): the band's workspace is what shrinks."""
+
+    def cut(x: Tensor, weight: Tensor, bias: Tensor | None) -> Tensor:
+        batched = x.dim() == weight.dim()
+        by_images = batched and x.shape[0] > 1
+        # the conv's own groups apply to every call: a channel band of a grouped one is not
+        # its conv; an encoded leaf does not slice
+        whole_groups = module.groups == 1 and type(weight) in (Tensor, nn.Parameter)
+        units = x.shape[0] if by_images else weight.shape[0] if batched and whole_groups else 1
+        if units < 2 or torch.is_grad_enabled():
+            return conv(x, weight, bias)
+        run = functools.partial(_bands, conv, x, weight, bias, by_images, units)
+        shape = "x".join(map(str, x.shape))
+        return catch.cut(site, levels(units), run, (x,), shape, measured=False)
+
+    return cut
+
+
+def _bands(
+    conv: Conv,
+    x: Tensor,
+    weight: Tensor,
+    bias: Tensor | None,
+    by_images: bool,
+    units: int,
+    level: int,
+) -> Tensor:
+    if not level:
+        return conv(x, weight, bias)
+    size, out, axis = pieces(units, level), None, 0 if by_images else 1
+    for at in range(0, units, size):
+        catch.piece()
+        if by_images:
+            part = conv(x[at : at + size], weight, bias)
+        else:
+            band = slice(at, at + size)
+            part = conv(x, weight[band], bias[band] if bias is not None else None)
+        if out is None:
+            shape = list(part.shape)
+            shape[axis] = units
+            out = part.new_empty(shape)
+        out.narrow(axis, at, part.shape[axis]).copy_(part)
+        del part
+    assert out is not None
+    return out
 
 
 def _forward(module: nn.Module) -> Callable[..., object]:
