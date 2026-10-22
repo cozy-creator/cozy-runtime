@@ -637,6 +637,17 @@ class _RankRequest:
     rows: list[GpuMemory]
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Install:
+    """A plan's install waiting for its kernel set's build (`Plan.when_ready`): the set, its build
+    on this GPU, the package's install, and its construction's plan reports."""
+
+    name: str
+    ready: Callable[[], Launch | None]
+    install: Callable[[Launch], None]
+    reports: dict[str, Mapping[str, object]]
+
+
 class _CompositeResidency:
     """The placements of a many-model construction, one per model slot, as one."""
 
@@ -883,7 +894,7 @@ class Executor:
         #: passing over what `passed` names
         self._reselect: Callable[..., attention.Applied] | None = None
         #: kernel installs waiting for their build on every GPU (`Plan.when_ready`), by set name
-        self._installs: list[tuple[str, Callable[[], Launch | None], Callable[[Launch], None]]] = []
+        self._installs: list[_Install] = []
         #: Device facts for this prepared generation, reused for per-request pin checks.
         self.device_facts: Any = None
         #: a follower's hold of rank 0's attention selection for the current attempt
@@ -1946,7 +1957,7 @@ class Executor:
         def when_ready(kernels: TritonKernels, install: Callable[[Launch], None]) -> bool:
             built = functools.partial(ready, kernels, device=device)
             here = built() is not None
-            self._installs.append((kernels.name, built, install))
+            self._installs.append(_Install(kernels.name, built, install, reports))
             return here
 
         try:
@@ -3724,13 +3735,14 @@ class Executor:
         set name, and the sets whose build ended without them, dropped for good."""
         launches: dict[str, Launch] = {}
         failed: list[str] = []
-        for name, ready, _install in self._installs:
+        for row in self._installs:
+            name = row.name
             if (sets is not None and name not in sets) or name in launches or name in failed:
                 continue
             try:
-                launch = ready()
+                launch = row.ready()
             except Exception as exc:  # an upgrade is never worth a failed run
-                print(f"[kernels] {name}: deferred install refused: {exc}"[:600], file=sys.stderr)
+                self._refuse_install(name, "kernels_failed", f"its build failed: {exc}")
                 failed.append(name)
                 continue
             if launch is not None:
@@ -3743,19 +3755,28 @@ class Executor:
         that raises is dropped with its set's others, and the construction serves as it was.
         Graphs record the new paths again (`LANDED`)."""
         failed: set[str] = set()
-        for name, _ready, install in self._installs:
-            if name in launches and name not in failed:
+        for row in self._installs:
+            if row.name in launches and row.name not in failed:
                 try:
-                    install(launches[name])
+                    row.install(launches[row.name])
                 except Exception as exc:  # an upgrade is never worth a failed run
-                    print(f"[kernels] {name}: install refused: {exc}"[:600], file=sys.stderr)
-                    failed.add(name)
+                    self._refuse_install(row.name, "install_refused", f"its install raised: {exc}")
+                    failed.add(row.name)
         self._drop(launches)
         LANDED[0] += bool(launches)
         return sorted(set(launches) - failed)
 
     def _drop(self, sets: Collection[str]) -> None:
-        self._installs = [row for row in self._installs if row[0] not in sets]
+        self._installs = [row for row in self._installs if row.name not in sets]
+
+    def _refuse_install(self, name: str, code: str, detail: str) -> None:
+        """A deferred install of set `name` that will never run: said in the log and in its
+        construction's plan reports under the set's name (where a package reports its deferral,
+        so the report never stays "deferred")."""
+        print(f"[kernels] {name}: {detail}"[:600], file=sys.stderr)
+        for row in self._installs:
+            if row.name == name:
+                row.reports[name] = {"applied": False, "code": code, "detail": detail[:300]}
 
     def _install_in_group(self, launches: dict[str, Launch]) -> Frame | None:
         """Rank 0's half: each follower names which of these sets it has built (one whose
@@ -3774,10 +3795,10 @@ class Executor:
                         raise GpuDivergence(follower.gpu, "kernels", str(reply.get("detail")))
                     missing = set(launches) - set(reply.get("built") or ())
                     for name in sorted(set(reply.get("failed") or ()) & missing):
-                        print(
-                            f"[kernels] {name}: {follower.gpu} has no build of it; the group "
-                            "serves without it",
-                            file=sys.stderr,
+                        self._refuse_install(
+                            name,
+                            "kernels_failed",
+                            f"{follower.gpu} has no build of it; the group serves without it",
                         )
                         self._drop((name,))
                     launches = {n: launch for n, launch in launches.items() if n not in missing}

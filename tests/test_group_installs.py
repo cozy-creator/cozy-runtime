@@ -65,7 +65,7 @@ def test_a_group_installs_its_kernels_only_once_every_gpu_has_them(tmp_path: Pat
         (tmp_path / "built-0").touch()  # GPU 0's build is done, GPU 1's still compiling
         assert leader._install_ready_kernels() is None
         assert not list(tmp_path.glob("installed-*")), "no GPU installs while one cannot"
-        assert [row[0] for row in leader._installs] == ["test-group-glue"]
+        assert [row.name for row in leader._installs] == ["test-group-glue"]
         (tmp_path / "built-1").touch()
         assert leader._install_ready_kernels() is None
         assert sorted(p.name for p in tmp_path.glob("installed-*")) == [
@@ -83,6 +83,9 @@ def test_a_set_one_gpu_cannot_build_is_dropped_on_every_gpu(tmp_path: Path) -> N
         assert leader._install_ready_kernels() is None
         assert leader._installs == [] and not list(tmp_path.glob("installed-*"))
         assert not leader.poisoned
+        # never installed: the construction's receipts say why, not only the log
+        report = leader.plan_reports["dit"]["test-group-glue"]
+        assert report["code"] == "kernels_failed" and "GPU 1" in str(report["detail"])
 
 
 def test_an_install_only_a_follower_refuses_is_a_divergent_group(tmp_path: Path) -> None:
@@ -101,6 +104,7 @@ def test_an_install_rank_0_refuses_is_dropped_and_the_group_stays_whole(tmp_path
         assert leader._install_ready_kernels() is None
         assert leader._installs == [] and not list(tmp_path.glob("installed-*"))
         assert not leader.poisoned
+        assert leader.plan_reports["dit"]["test-group-glue"]["code"] == "install_refused"
 
 
 def test_a_follower_serves_rank_0s_whole_selection(tmp_path: Path) -> None:
