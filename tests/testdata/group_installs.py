@@ -62,7 +62,7 @@ def construction(worker: Executor, root: Path) -> Executor:
     """The construction both ranks hold: its deferred install, and one attention site."""
     child = worker._construction_child("construction")
     child._group_model_key = KEY
-    child._execution_plan(glued(root, worker.rank), torch, never, built(root, worker.rank))
+    child._execution_plan(glued(root, worker.rank), torch, never, built(root, worker.rank), {})
     site = Attention(query_dim=32, heads=2, dim_head=16)
     child.backend = SimpleNamespace(roots={"dit": site})
     child.device_facts = FACTS

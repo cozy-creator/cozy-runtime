@@ -900,7 +900,7 @@ def fence_one_address_predicate() -> list[str]:
 #: `dict[str, Any]` record's missing key, 2026-09-28). Records are decoded once, at their
 #: boundary, into typed structs; this count under `internal/` may only fall. Lower it in
 #: the change that removes some.
-ANY_CEILING = 443
+ANY_CEILING = 441
 
 
 def any_references(tree: ast.AST) -> int:
@@ -973,6 +973,48 @@ def fence_no_home_paths() -> list[str]:
     return found
 
 
+#: CUDA's host functions on a stream (and the bindings that wrap them). varena's allocator
+#: hook waits on pages' release events with the allocating thread holding the GIL: a host
+#: function that takes the GIL, queued on a compute stream, never runs and those events never
+#: fire.
+HOST_FUNCTIONS = frozenset(
+    {
+        "cudaLaunchHostFunc",
+        "cuLaunchHostFunc",
+        "cudaStreamAddCallback",
+        "cuStreamAddCallback",
+        "launch_host_func",
+    }
+)
+NATIVE_SUFFIXES = (".cu", ".cuh", ".cpp", ".h")
+
+
+def fence_no_stream_host_functions() -> list[str]:
+    """No Runtime or package code queues a host function on a CUDA stream (step 1's ruling)."""
+    bad: list[str] = []
+    for path in sorted({*py_files(), *package_and_model_code()}):
+        for node in ast.walk(ast.parse(path.read_text())):
+            name = (
+                node.attr
+                if isinstance(node, ast.Attribute)
+                else node.id
+                if isinstance(node, ast.Name)
+                else node.value
+                if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                else ""
+            )
+            if name in HOST_FUNCTIONS:
+                bad.append(f"{path.relative_to(ROOT)}:{node.lineno}: names {name}")
+    word = re.compile(r"\b(" + "|".join(sorted(HOST_FUNCTIONS)) + r")\b")
+    for path in sorted(p for p in (ROOT / "kernels").rglob("*") if p.suffix in NATIVE_SUFFIXES):
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            bad += [f"{path.relative_to(ROOT)}:{n}: names {m[1]}" for m in word.finditer(line)]
+    return [
+        f"{where} — a host function on a stream can deadlock varena's allocator wait"
+        for where in bad
+    ]
+
+
 FENCES = {
     "one-address-predicate": fence_one_address_predicate,
     "forbidden-dependency": fence_forbidden_dependency,
@@ -994,6 +1036,7 @@ FENCES = {
     "base-distributions": fence_base_distributions,
     "any-ratchet": fence_any_ratchet,
     "no-home-paths": fence_no_home_paths,
+    "no-stream-host-functions": fence_no_stream_host_functions,
 }
 
 

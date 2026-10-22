@@ -109,10 +109,14 @@ Launch = Callable[..., None]
 argument positional as the kernel declares it."""
 
 
+def _unreported(name: str, document: Mapping[str, object]) -> None:
+    """A plan run outside an executor (a test, a conformance script) reports nowhere."""
+
+
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """What Runtime hands `Model.execution_plan`: the GPU this construction serves on, and the
-    package's compiled kernels for it."""
+    """What Runtime hands `Model.execution_plan`: the GPU this construction serves on, the
+    package's compiled kernels for it, and where its outcome is reported."""
 
     device: Any
     load: Callable[[TritonKernels], Launch]
@@ -124,6 +128,10 @@ class Plan:
     A construction serves while its kernels compile, and a run never waits for one. True when
     this GPU's build is done now. Raises `KernelsUnavailable` as `load` does; an install that
     fails leaves the construction as it was. None: `load`, then install."""
+    report: Callable[[str, Mapping[str, object]], None] = _unreported
+    """What the plan installed under `name`: applied or not, with its code and detail. The
+    construction's receipts carry it (`measurements.execution.plan_reports`), so a refusal shows
+    in `run show`, not only in the executor's log."""
 
 
 @dataclass(frozen=True, slots=True)

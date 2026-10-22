@@ -20,6 +20,7 @@ import functools
 import inspect
 import json
 import logging
+import sys
 import threading
 import time
 import weakref
@@ -306,8 +307,24 @@ class Residency(Protocol):
         """Declared model-block paths that bound graph regions independently of residency."""
         ...
 
-    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
-        """Open the ordinary model pass before capture; nested regions share its cut state."""
+    def graph_pass(self, component: str, entry: str) -> Any:
+        """Open the ordinary model pass before capture; nested regions share it."""
+        ...
+
+    def graph_idle(self) -> Any:
+        """An idle capture's memory request: free bytes only, never an eviction."""
+        ...
+
+    def graph_held(self, component: str) -> Any:
+        """The stream `component`'s blocks were held bound on for its plan step, or None."""
+        ...
+
+    def using(self, method: str, components: tuple[str, ...]) -> AbstractContextManager[None]:
+        """A local scope of `components` (`method`'s call): their memory passes and holds."""
+        ...
+
+    def graph_resident(self, binding: Any) -> bool:
+        """Every page a retained region covers is on the device now."""
         ...
 
     #: How many attempts (requests) it has opened.
@@ -320,6 +337,17 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: Kernel builds this process loaded after it started (a boot build landing): calls may take a
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
+#: Builds a call found landed during a request: each serves from the next request boundary
+#: (`land`), so a request's kernel choices never change under it nor drop its graphs.
+STAGED: list[Callable[[], None]] = []
+
+
+def land() -> None:
+    """At a request boundary, no call in a scope: every staged build serves from now on."""
+    landed = bool(STAGED)
+    while STAGED:
+        STAGED.pop(0)()
+    LANDED[0] += landed
 
 
 class Building(Exception):
@@ -998,7 +1026,7 @@ class _ComponentScope:
     A REMOTE scope, whose every declared component the runtime keeps on another GPU of the
     group (`Placement.remote`), uses nothing on this device."""
 
-    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote")
+    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote", "_using")
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
@@ -1007,6 +1035,7 @@ class _ComponentScope:
         self._remote: contextvars.Token[Any] | None = None
         self._local: contextvars.Token[Any] | None = None
         self._call: Context | None = None
+        self._using: AbstractContextManager[None] | None = None
 
     def __enter__(self) -> None:
         model = self._model
@@ -1048,6 +1077,9 @@ class _ComponentScope:
         self._local = _LOCAL_SCOPES.set(
             (*_LOCAL_SCOPES.get(), (model, self._method, self._components))
         )
+        if model._cozy_residency is not None:
+            self._using = model._cozy_residency.using(self._method, self._components)
+            self._using.__enter__()
         if model._cozy_harness is not None:
             model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
 
@@ -1060,6 +1092,9 @@ class _ComponentScope:
             if placement is not None:
                 placement.leave(self._components)
             return
+        if self._using is not None:
+            using, self._using = self._using, None
+            using.__exit__(*sys.exc_info())  # a raise in the scope ends its passes as failed
         if self._local is not None:
             _LOCAL_SCOPES.reset(self._local)
             self._local = None
@@ -1241,6 +1276,7 @@ class ModelRegistry:
         started = time.perf_counter()
         model = cls()
         loader = self._loader(model, artifact, mode)
+        made = time.perf_counter()
         object.__setattr__(model, "_cozy_loading", True)
         try:
             with ExitStack() as stack:
@@ -1268,7 +1304,8 @@ class ModelRegistry:
             # The package's whole load() beside its constructions' legs: what its own code spent
             # after them (tokenizers, schedulers, its assets).
             legs = {
-                "before_load": began - started,  # the model, its loader, the substrate's entry
+                "model": made - started,  # the package's model and its loader
+                "substrate_enter": began - made,
                 "package_load": loaded - began,
                 "substrate_exit": exited - loaded,
             }

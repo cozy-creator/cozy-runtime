@@ -12,6 +12,7 @@ comfy-kitchen's reviewed binary, else eagerly on torch's int8 GEMM, and every ru
 
 from __future__ import annotations
 
+import functools
 import site
 import sys
 import time
@@ -23,7 +24,7 @@ from types import ModuleType
 from typing import cast
 
 from cozy_runtime.author._errors import Fault, fault, is_capacity
-from cozy_runtime.author._model import LANDED, WARNINGS, Building
+from cozy_runtime.author._model import STAGED, WARNINGS, Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.internal import (
     arch,
@@ -50,6 +51,8 @@ class _Build:
     served: object = None
     asked: float = float("-inf")
     final: str = ""
+    #: found landed by a later ask: it serves from the next request (`land`)
+    staged: bool = False
 
 
 #: The loaded op: `(x, data, scale, bias, out_dtype) -> out`.
@@ -73,24 +76,30 @@ def _built(
     opened: Callable[[int], object],
 ) -> object:
     """`opened(sm)` on this card once its build lands, None while it runs (the first ask starts
-    it) and for good when this card or machine cannot have it, said once."""
+    it) and for good when this card or machine cannot have it, said once. Found landed by a
+    later ask, it serves from the next request (`land`)."""
     state = states.setdefault(index, _Build())
     now = time.monotonic()
     if (
         state.served is not None
         or state.final
+        or state.staged
         or now - state.asked < POLL_SECONDS
         or torch.cuda.is_current_stream_capturing()  # a load would end the graph being recorded
     ):
         return state.served
-    state.asked = now
+    first, state.asked = state.asked == float("-inf"), now
     major, minor = torch.cuda.get_device_capability(index)
     sm = major * 10 + minor
     try:
-        state.served = opened(sm)
-        if state.served is not None:
-            LANDED[0] += 1
+        served = opened(sm)
+        if served is not None:
             print(f"[int8] {name} serves sm{sm}", file=sys.stderr)
+            if first:
+                state.served = served
+            else:
+                state.staged = True
+                STAGED.append(functools.partial(setattr, state, "served", served))
     except Exception as exc:  # the next path serves this process; said once
         if is_capacity(exc):  # the device ran out opening it: the memory manager answers
             raise

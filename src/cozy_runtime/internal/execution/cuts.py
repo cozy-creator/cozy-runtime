@@ -62,7 +62,7 @@ def install(module: nn.Module) -> int:
         # out in a DiT block's 546 MiB rms_norm, a site with no cut).
         if type(sub) is nn.RMSNorm and "forward" not in vars(sub) and "_cozy_cut" not in vars(sub):
             norm: nn.Module = sub
-            norm.forward = _norm(f"{path}:tokens", sub, _forward(sub))
+            norm.forward = catch.transparent(_norm(f"{path}:tokens", sub, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
             count += 1
             continue
@@ -72,11 +72,11 @@ def install(module: nn.Module) -> int:
         kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
         rms = _rms_contract(sub, kinds)
         if rms is not None and "_cozy_cut" not in vars(sub):
-            sub.forward = _rms(f"{path}:rows", sub, *rms, _forward(sub))
+            sub.forward = catch.transparent(_rms(f"{path}:rows", sub, *rms, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
             count += 1
         if any(k in _FFN for k in kinds) and "_cozy_cut" not in vars(sub):
-            sub.forward = _ffn(f"{path}:tokens", sub, _forward(sub))
+            sub.forward = catch.transparent(_ffn(f"{path}:tokens", sub, _forward(sub)))
             vars(sub)["_cozy_cut"] = True
             count += 1
     return count

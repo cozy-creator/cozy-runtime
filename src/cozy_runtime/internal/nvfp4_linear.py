@@ -18,12 +18,15 @@
 
 from __future__ import annotations
 
+import functools
+import math
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from types import ModuleType
 from typing import TYPE_CHECKING
 
+from cozy_runtime.author._model import STAGED
 from cozy_runtime.author.kernels import (
     KernelsUnavailable,
     Launch,
@@ -280,16 +283,21 @@ READY: list[Callable[..., Launch | None]] = []
 
 def _launcher(device: Device) -> Launch | None:
     """This GPU's launcher once the executor start's build is loaded, else None (asked again
-    after `POLL_SECONDS`): the caller then decodes eagerly."""
+    after `POLL_SECONDS`): the caller then decodes eagerly. Found loaded by a later ask, it
+    serves from the next request (`land`)."""
     index = device.index or 0
-    asked, launch = _LAUNCH.get(index, (float("-inf"), None))
+    asked, launch = _LAUNCH.get(index, (-math.inf, None))
     now = time.monotonic()
     if launch is None and now - asked >= POLL_SECONDS:
         try:
-            launch = READY[0](KERNELS, device=device) if READY else None
+            found = READY[0](KERNELS, device=device) if READY else None
         except KernelsUnavailable:
-            launch = None
-        _LAUNCH[index] = (now, launch)
+            found = None
+        if found is not None and asked != -math.inf:
+            _LAUNCH[index] = (math.inf, None)  # asked no more: staged
+            STAGED.append(functools.partial(_LAUNCH.__setitem__, index, (now, found)))
+        else:
+            _LAUNCH[index] = (now, launch := found)
     return launch
 
 

@@ -506,7 +506,8 @@ def _census(module: Any) -> tuple[object, ...]:
     )
 
 
-def _report(document: dict[str, object]) -> None:
+def _report(plan: Plan, document: dict[str, object]) -> None:
+    plan.report("fused_dit_blocks", document)
     print(f"[cozy] fused DiT blocks: {json.dumps(document, sort_keys=True)}", file=sys.stderr)
 
 
@@ -516,7 +517,7 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
     not the declared layout; reported). Never waits for the kernels' compile."""
     device = torch.device(plan.device)
     if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
-        _report({"applied": False, "reason": f"fused blocks serve CUDA sm80+, not {device}"})
+        _report(plan, {"applied": False, "reason": f"fused blocks serve CUDA sm80+, not {device}"})
         return ""
     blocks: list[tuple[str, Any]] = [
         (f"{index}.{path}", module)
@@ -525,13 +526,13 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
         if type(module) is layout.block
     ]
     if not blocks:
-        _report({"applied": False, "reason": f"no {layout.block.__qualname__}"})
+        _report(plan, {"applied": False, "reason": f"no {layout.block.__qualname__}"})
         return ""
     switch = _Switch()
     try:
         sites = [(block, _site(block, layout, switch, path)) for path, block in blocks]
     except _Mismatch as exc:
-        _report({"applied": False, "reason": str(exc)})
+        _report(plan, {"applied": False, "reason": str(exc)})
         return ""
     before = [_census(root) for root in roots]
     # A sequential block's attention calls its q/k norms; a parallel block launches them.
@@ -547,19 +548,19 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
 
     def activate(launch: Launch) -> None:
         switch.launch = launch
-        _report({"applied": True, "blocks": len(blocks), "kernels": layout.kernels.name})
+        _report(plan, {"applied": True, "blocks": len(blocks), "kernels": layout.kernels.name})
 
     try:
         if plan.when_ready is None:
             activate(plan.load(layout.kernels))
         elif not plan.when_ready(layout.kernels, activate):
-            _report({"applied": False, "reason": "compiling; fused from the next request on"})
+            _report(plan, {"applied": False, "reason": "compiling; fused from the next request on"})
     except KernelsUnavailable as exc:
         if exc.code == "kernels_corrupt":
             raise
         for module, cls in eager:
             module.__class__ = cls
-        _report({"applied": False, "reason": f"{exc.code}: {exc}"})
+        _report(plan, {"applied": False, "reason": f"{exc.code}: {exc}"})
         return ""
     return _identity(layout)
 

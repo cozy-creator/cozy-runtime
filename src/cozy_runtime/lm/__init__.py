@@ -1669,7 +1669,7 @@ class _Engine:
         try:
             with ExitStack() as stack:
                 if binding is not None:
-                    stack.enter_context(binding.prepare(current, workspace=None))
+                    stack.enter_context(binding.prepare(current))
                 self.domain.initialize()
                 side = self.domain.stream
                 side.wait_stream(current)

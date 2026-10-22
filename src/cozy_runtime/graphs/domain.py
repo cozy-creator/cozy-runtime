@@ -21,7 +21,6 @@ import threading
 import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass
 from typing import Any
 
 
@@ -64,8 +63,6 @@ class Domain:
         #: the pool's own lock (never held across a wait): a call's hold count and varena's drop
         self.pool_lock = threading.Lock()
         self.held = 0
-        #: per component root, its blocks held bound across a request's replays (`Model.hold`)
-        self.holds: weakref.WeakKeyDictionary[Any, Hold] = weakref.WeakKeyDictionary()
 
     def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
@@ -177,7 +174,6 @@ class Domain:
             if self.owner is not None:
                 self.owner.reset()
                 self.owner = None
-            self.unhold()
             self.drop_captures()
             self.close_cache()
             self.pool = None  # MemPool destruction releases this pool, never a global flush.
@@ -194,14 +190,6 @@ class Domain:
                 self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
             )
         return self.captures
-
-    def unhold(self, root: Any = None) -> None:
-        """`root`'s blocks (every root's when None) go back to binding per use (their pins drop
-        after the queued uses)."""
-        for held in [root] if root is not None else list(self.holds):
-            hold = self.holds.pop(held, None)
-            if hold is not None:
-                hold.hold.release()
 
     def serve(self, root: Any) -> bool:
         """`root`'s graphs record into the pool from now on; True when it is new to it."""
@@ -248,16 +236,6 @@ class Domain:
             if self.captures is None
             else sum(s["total_size"] for s in self.captures.snapshot(include_traces=False))
         )
-
-
-@dataclass(slots=True)
-class Hold:
-    """A component's blocks held bound (`Model.hold`), the request it was taken in, and the
-    stream it bound on."""
-
-    hold: Any
-    attempt: int
-    stream: Any
 
 
 _LOCK = threading.RLock()

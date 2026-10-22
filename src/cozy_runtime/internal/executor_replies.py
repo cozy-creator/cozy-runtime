@@ -45,25 +45,22 @@ class Ref(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Step(msgspec.Struct, frozen=True, kw_only=True):
-    """One step: the capacity it ran against, its working set, its evictions by class."""
+    """One step: the capacity it ran against and what make_room took in it, by class."""
 
     capacity: int
-    w: int
     evicted: tuple[int, ...]
 
 
-class Decision(msgspec.Struct, frozen=True, kw_only=True):
-    """One non-trivial decision a request's demand made: what asked (`trigger`: pass, bind,
-    oom, prepare, workspace, outside), what it did (`action`: lower, cut, cut_outside, park,
-    exhausted, evict_d, evict_w), the bytes asked (exhausted: short) and freed, a cut's level."""
+class MakeRoom(msgspec.Struct, frozen=True, kw_only=True):
+    """One make_room that had to take bytes: the plan step, what asked (the allocator hook, a
+    bind, a range's preparation), the free bytes asked and taken, and the release events it
+    waited on first."""
 
     step: int
     trigger: str
-    action: str
-    site: str | None
     need: int
     freed: int
-    level: int | None
+    waited: int
 
 
 class Unregisters(msgspec.Struct, frozen=True, kw_only=True):
@@ -75,20 +72,19 @@ class Unregisters(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Refusal(msgspec.Struct, frozen=True, kw_only=True):
-    """varena's allocator callback's last refusal on a pool during the request: why
-    (`no_reclaim`: over the limit, the stock gave nothing), the bytes refused, the pool's live
-    bytes plus outside it, and the limit it was admitted to."""
+    """varena's allocator hook's last refusal on a pool during the request: why, the bytes
+    refused, and the row's free bytes then."""
 
     pool: tuple[int, int]
     why: str
     size: int
-    held: int
-    limit: int
+    free: int
 
 
 class Stats(msgspec.Struct, frozen=True, kw_only=True):
-    """varena's record of one request (varena-slim §5), as its core writes it. `evicted` is by
-    class (F, O, S, N, D, W, P)."""
+    """varena's record of one request (varena-slim §5), as its core writes it: what make_room
+    took (`evicted`, by class F, O, S, N, D, W, P), the most it held at a pass end (pages and
+    segments) and its passes' compute bytes."""
 
     request: str
     moved: Moved
@@ -97,21 +93,13 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     stall_ns: int
     evicted: tuple[int, ...]
     peak: int
+    compute: int
+    host: int | None
+    tier: int
     leftover: int
-    #: the policy's own counters, absent from a core with one make_room loop (varena-slim step 1)
-    evicted_lowered: int = 0
-    speculative_evicted_d: int = 0
-    retries: int = 0
-    cuts: int = 0
-    parks: int = 0
-    parked: int = 0
-    lowered: bool = False
-    room: int = 0
-    host: int | None = None
-    tier: int = 0
-    keep_pending: int = 0
-    unregisters: Unregisters = Unregisters(calls=0, bytes=0, max_ns=0)
-    decisions: tuple[Decision, ...] = ()
+    keep_pending: int
+    unregisters: Unregisters
+    make_room: tuple[MakeRoom, ...]
 
 
 class Allocator(msgspec.Struct, frozen=True, kw_only=True):
@@ -136,8 +124,12 @@ class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
     ceiling: Ceiling | None
     stats: Stats
     torch: Allocator | None
-    #: varena's allocator callback's refusals during the request, one per pool (its last)
-    refusals: tuple[Refusal, ...] = ()
+    #: varena's allocator hook's refusals during the request, one per pool (its last)
+    refusals: tuple[Refusal, ...]
+    #: the request's pool's drop at its end (torch syncs its events), and per pass that made
+    #: room its pool's free blocks then: (model, key, bytes, the largest)
+    flush_ms: float
+    pool_free: tuple[tuple[str, str, int, int], ...]
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):

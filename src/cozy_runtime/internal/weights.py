@@ -12,12 +12,13 @@ and notes.
 
 from __future__ import annotations
 
+import functools
 import threading
 import time
 import zlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -26,6 +27,7 @@ from tensorfs.varena.torch import (
     Binding,
     Cache,
     Declared,
+    Hold,
     Level,
     Memory,
     Model,
@@ -466,7 +468,7 @@ class Backend:
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
-        routes = self.routes[name] = _Routes(self, name, rows, root)
+        routes = self.routes[name] = _Routes(self, name, rows)
         leg = self._leg(f"{name}.routes", leg)
         vars(root)["_varena"] = Declared(
             Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
@@ -476,11 +478,15 @@ class Backend:
         # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).
         model = self.memory.load(root, Level.RAM)
-        leg = self._leg(f"{name}.load", leg)
-        # Install explicit pure cuts and names; arbitrary package code is never replayed.
-        execution.install(root)
-        self._leg(f"{name}.catch", leg)
+        self._leg(f"{name}.load", leg)
         return model
+
+    def install_execution(self) -> None:
+        """Runtime's pure cuts and block names on every registered component, after the
+        construction's execution plan (its fused blocks and glue stand). Arbitrary package code
+        is never replayed."""
+        for name in self.models:
+            execution.install(self.roots[name])
 
     def _leg(self, name: str, since: float) -> float:
         now = time.perf_counter()
@@ -548,10 +554,8 @@ class _Routes:
     bind: it is kept under the fill identity it was decoded from, as the memory's cache, which
     varena sheds on its ask (the next bind decodes again). Leaf buffers live for that bind."""
 
-    def __init__(
-        self, backend: Backend, component: str, rows: Mapping[str, PlanRow], root: Module
-    ) -> None:
-        self.backend, self.component, self.root = backend, component, root
+    def __init__(self, backend: Backend, component: str, rows: Mapping[str, PlanRow]) -> None:
+        self.backend, self.component = backend, component
         self.torch = backend.torch
         self.rows = dict(rows)
         self.routes = {stored: backend._route(row.key) for stored, row in rows.items()}
@@ -608,11 +612,7 @@ class _Routes:
         with self.lock:
             self.decoded[key] = (identity, out)
             if self.cache is None:
-                self.cache = self.backend.memory.cache(
-                    f"decoded:{self.component}",
-                    self.shed,
-                    model=self.root,
-                )
+                self.cache = self.backend.memory.cache(f"decoded:{self.component}", self.shed)
             self.cache.cached(self._held())
 
     def _held(self) -> int:
@@ -787,30 +787,10 @@ class _Bakes:
 # ------------------------------------------------------------------------- the placement
 
 
-class Steps:
-    """An attempt's plan (`ctx.plan`), steps per component, and its components' calls so far."""
-
-    def __init__(self) -> None:
-        self.planned: dict[str, int] = {}
-        self.calls: dict[str, int] = {}
-
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
-        self.planned = {}
-        for step in steps:
-            for name in [step] if isinstance(step, str) else step:
-                self.planned[name] = self.planned.get(name, 0) + 1
-
-    def called(self, component: str) -> None:
-        self.calls[component] = self.calls.get(component, 0) + 1
-
-    def later(self, component: str) -> bool:
-        """The plan runs `component` in a step after its calls so far."""
-        return self.calls.get(component, 0) < self.planned.get(component, 0)
-
-
 class Placement:
     """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
-    pins and KV caches as the memory's caches, a request's LoRA serving, and notes."""
+    pins and KV caches as the memory's caches, a request's LoRA serving, notes, and each
+    scope's varena pass and step hold (`using`)."""
 
     def __init__(self, memory: Memory, backend: Backend) -> None:
         self.memory = memory
@@ -819,25 +799,57 @@ class Placement:
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
-        self.steps = Steps()
+        #: the request's plan (`ctx.plan`): the components each step runs together
+        self.steps: list[frozenset[str]] = []
+        #: components whose blocks are held bound, with the stream their binds queued on, and
+        #: those this step found no free room to hold
+        self.holds: dict[str, tuple[Hold, Any]] = {}
+        self.unheld: set[str] = set()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
-        self.steps = Steps()
+        self.steps = []
+        self.release()
         for model in self.models.values():
             graphs.mark(model.module)
 
     def plan(self, steps: Sequence[str | Collection[str]]) -> None:
-        self.steps.plan(steps)
+        self.steps = [frozenset([step] if isinstance(step, str) else step) for step in steps]
 
-    def graph_called(self, component: str) -> None:
-        self.steps.called(component)
+    @contextmanager
+    def using(self, method: str, components: tuple[str, ...]) -> Iterator[None]:
+        """A local scope (`_ComponentScope`): one varena pass per component for the call, its
+        forwards nested in it, and its blocks held bound from free bytes while its plan step
+        lasts. A hold never outlives the step: a later step's activations cannot evict pinned
+        pages (S3). A component with no free room binds per block."""
+        entering = {name for name in components if name in self.models}
+        self.release(keep=entering.union(*(s for s in self.steps if s & entering)))
+        stream = self.torch.cuda.current_stream() if self.memory.cuda else None
+        for name in sorted(entering - self.holds.keys() - self.unheld):
+            shed = functools.partial(self.holds.pop, name, None)
+            hold = self.models[name].hold(shed, free_only=True)
+            if hold is None:
+                self.unheld.add(name)
+            else:
+                self.holds[name] = (hold, stream)
+        with ExitStack() as passes:
+            for name in sorted(entering):
+                passes.enter_context(self.models[name].passing(method))
+            yield
 
-    def graph_later(self, component: str) -> bool:
-        return self.steps.later(component)
+    def release(self, keep: Collection[str] = ()) -> None:
+        """The holds of components outside `keep`: all of them at the request's end."""
+        for name in [name for name in self.holds if name not in keep]:
+            self.holds.pop(name)[0].release()
+            self.unheld.clear()  # room came back
+
+    def graph_held(self, component: str) -> Any:
+        """The stream `component`'s held blocks bound on, or None when they are not held."""
+        held = self.holds.get(component)
+        return None if held is None else held[1]
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""
@@ -868,25 +880,20 @@ class Placement:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)
 
-    def graph_whole(self, component: str, binding: Binding) -> bool:
-        """`binding` covers every block of the component."""
-        model = self.models[component]
-        return len(binding.blocks) == sum(
-            b is not None for b in (model.common, *model.blocks.values())
-        )
+    def graph_pass(self, component: str, entry: str) -> Any:
+        return self.models[component].passing(entry)
 
-    def graph_hold(self, component: str, shed: Callable[[], None]) -> Any:
-        """Every block of the component bound until released: a request's replays keep their
-        backing instead of binding it again around each one."""
-        return self.models[component].hold(shed)
+    def graph_idle(self) -> AbstractContextManager[object]:
+        """An idle capture's request: it fills free bytes only and never evicts."""
+        return self.memory.request("graphs-idle", idle=True)
 
-    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
-        return self.models[component].passing(entry, args, kwargs)
+    def graph_resident(self, binding: Binding) -> bool:
+        """Every page `binding` covers is on the device now (an idle capture never fills one)."""
+        return binding.resident()
 
-    def cache(self, owner: str, shed: Callable[[int], int], roots: list[Any]) -> Cache | None:
-        """Device bytes `owner` keeps for speed for the components `roots`, counted and shed
-        on ask, in their class; None off a GPU."""
-        return self.memory.cache(owner, shed, model=roots) if self.memory.cuda else None
+    def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
+        """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
+        return self.memory.cache(owner, shed) if self.memory.cuda else None
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value

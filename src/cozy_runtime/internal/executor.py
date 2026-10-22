@@ -113,11 +113,13 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._model import (
+    LANDED,
     SCOPES,
     WARNINGS,
     Model,
     WarningRow,
     component_use,
+    land,
 )
 from cozy_runtime.author._observations import DEVICE, Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
@@ -649,6 +651,10 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.plan(steps)
 
+    def release(self) -> None:
+        for row in self.rows.values():
+            row.release()
+
     @property
     def notes(self) -> dict[str, str]:
         return {f"{name}.{k}": v for name, row in self.rows.items() for k, v in row.notes.items()}
@@ -863,6 +869,8 @@ class Executor:
         #: by model binding path: the execution plan it installed (its fused glue's identity),
         #: "" when eager
         self.planned: dict[str, str] = {}
+        #: per binding path, what its execution plan reported (`Plan.report`)
+        self.plan_reports: dict[str, dict[str, Mapping[str, object]]] = {}
         #: by request: an attempt's handler outcome, the stage it last reported and its record,
         #: the reason an attempt whose tail raised still answers with (`unsettled`)
         self.handled: dict[str, tuple[Outcome, str, AuthorAttempt]] = {}
@@ -1084,6 +1092,11 @@ class Executor:
             "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
             "plan": {k: v for m in self.model_executors or [self] for k, v in m.planned.items()},
+            "plan_reports": {
+                k: dict(v)
+                for m in self.model_executors or [self]
+                for k, v in m.plan_reports.items()
+            },
             "construction": {
                 "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
                 "prepare_ms": float(facts.get("prepare_ms", 0)),
@@ -1921,9 +1934,11 @@ class Executor:
         torch: object,
         load: Callable[..., Launch],
         ready: Callable[..., Launch | None],
+        reports: dict[str, Mapping[str, object]],
     ) -> str:
         """The model's own execution plan on its filled components, on this GPU: its
-        identity, "" when it installs none. A raise refuses the construction, typed."""
+        identity, "" when it installs none, and what it reports into `reports`. A raise refuses
+        the construction, typed."""
         if type(model).execution_plan is Model.execution_plan:
             return ""
         device = self._rank_device(torch)
@@ -1936,7 +1951,9 @@ class Executor:
 
         try:
             identity = model.execution_plan(
-                Plan(device, functools.partial(load, device=device), when_ready)
+                Plan(
+                    device, functools.partial(load, device=device), when_ready, reports.__setitem__
+                )
             )
         except Exception as exc:
             code = getattr(exc, "code", "")
@@ -2587,8 +2604,12 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc).splitlines()[0][:900]}
         try:
             # THE MODEL'S OWN EXECUTION PLAN: its fused kernels, glue and hooks.
-            planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
+            reports = self.plan_reports[binding.model_binding_path] = {}
+            planned = self._execution_plan(model, torch, load_kernels, kernels_ready, reports)
             self.planned[binding.model_binding_path] = planned
+            # Runtime's cuts and block names after the plan: its substitutions stand, and cuts
+            # land only on what stays Diffusers (v13: H3's glue refused modules they had wrapped).
+            backend.install_execution()
             roots = backend.roots
             stage("execution_plan")
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,
@@ -3105,6 +3126,7 @@ class Executor:
         residency's attempt."""
         turn = object()
         with SCOPES.held(turn):
+            land()  # builds found landed during the last requests serve from this one
             target._upgrade_attention(turn)
             refused = target._install_ready_kernels()
             if refused is not None:
@@ -3386,7 +3408,7 @@ class Executor:
                             ),
                             publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
-                                command.request_id, command.family, self.host.call_interfaces
+                                command.request_id, self.host.call_interfaces
                             ),
                         ),
                     )
@@ -3484,6 +3506,8 @@ class Executor:
         d2h_started = time.perf_counter()
         if torch is not None and last:
             accel.drain(torch, self.device_kind)
+        if self.residency is not None and last:
+            self.residency.release()  # the last step's holds
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
@@ -3716,7 +3740,8 @@ class Executor:
 
     def _install(self, launches: Mapping[str, Launch]) -> list[str]:
         """Every waiting install of these built sets, now: the sets whose installs all ran. One
-        that raises is dropped with its set's others, and the construction serves as it was."""
+        that raises is dropped with its set's others, and the construction serves as it was.
+        Graphs record the new paths again (`LANDED`)."""
         failed: set[str] = set()
         for name, _ready, install in self._installs:
             if name in launches and name not in failed:
@@ -3726,6 +3751,7 @@ class Executor:
                     print(f"[kernels] {name}: install refused: {exc}"[:600], file=sys.stderr)
                     failed.add(name)
         self._drop(launches)
+        LANDED[0] += bool(launches)
         return sorted(set(launches) - failed)
 
     def _drop(self, sets: Collection[str]) -> None:
@@ -4057,7 +4083,7 @@ class Executor:
         request = self.host.requests.get(request_id)
         if request is not None:
             request.plan(list(steps))
-        if self.residency is not None:  # which regions record graphs reads it (`graph_later`)
+        if self.residency is not None:  # a step's components keep their holds (`using`)
             self.residency.plan(steps)
         if self.group is not None and self.rank == 0:
             normalized = tuple(
@@ -4209,9 +4235,9 @@ class Executor:
                 proxy.__module__ = module
                 imported.__dict__[export] = proxy
 
-    def _call_broker(self, request_id: str, family: str, rows: tuple[CallInterface, ...]) -> Any:
+    def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
         """This attempt's broker over `rows`, bound once per executor (a served package's
-        attempts share its Start's rows); a wait on a child yields to `family`."""
+        attempts share its Start's rows)."""
         if not rows:
             return None
         if self._bound_calls is None or self._bound_calls[0] is not rows:
@@ -4222,14 +4248,7 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
-            functools.partial(self._yielding, request_id, family),
         )
-
-    def _yielding(self, request_id: str, family: str) -> contextlib.AbstractContextManager[object]:
-        """While the attempt waits on a child call, its request yields its reserved room to its
-        `family` alone; its allocated tensors stay counted (`r.yielding`)."""
-        request = self.host.requests.get(request_id)
-        return contextlib.nullcontext() if request is None else request.yielding(family)
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
@@ -4458,8 +4477,7 @@ class Executor:
         finally:
             if request is not None:
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
-                stats = request.stats()
-                rows.append(host.execution.record(stats, gpu, device, self._store(), since))
+                rows.append(host.execution.record(request, gpu, device, self._store(), since))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
@@ -4828,6 +4846,8 @@ class _Order:
         #: ticket -> whether it runs alone, until its command is answered
         self._open: dict[int, bool] = {}
         self._next = 0
+        #: commands answered so far: an idle period follows each (`idle`)
+        self.answered = 0
 
     def ticket(self, alone: bool) -> int:
         with self._changed:
@@ -4855,7 +4875,42 @@ class _Order:
         finally:
             with self._changed:
                 del self._open[ticket]
+                self.answered += 1
                 self._changed.notify_all()
+
+    @contextlib.contextmanager
+    def idle(self, answered: int, ready: Callable[[], bool]) -> Iterator[int]:
+        """Once no command is open, one was answered since `answered` and `ready()`: the order
+        held as a process-wide command holds it, so a command arriving waits for the holder to
+        give it back (`waiting`). Yields the answered count."""
+        with self._changed:
+            self._changed.wait_for(lambda: not self._open and self.answered != answered and ready())
+            self._next += 1
+            ticket, answered = self._next, self.answered
+            self._open[ticket] = True
+        try:
+            yield answered
+        finally:
+            with self._changed:
+                del self._open[ticket]
+                self._changed.notify_all()
+
+    def waiting(self) -> bool:
+        """A command arrived beside the idle holder."""
+        return len(self._open) > 1
+
+
+def _idle(order: _Order) -> None:
+    """Graphs record off the request path (`graphs.capture_idle`): after a command is answered,
+    while no other is open. One arriving makes the capture yield at its next region boundary."""
+    own_thread()
+    answered = 0
+    while True:
+        with order.idle(answered, lambda: bool(graphs.IDLE.jobs)) as answered:
+            try:
+                graphs.capture_idle(order.waiting)
+            except Exception:
+                traceback.print_exc()
 
 
 def serve(executor: Executor, channel: Channel) -> int:
@@ -4866,6 +4921,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
     order = _Order()
+    threading.Thread(target=_idle, args=(order,), name="graphs-idle", daemon=True).start()
     while True:
         try:
             frame = executor.mux.command()

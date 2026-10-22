@@ -13,7 +13,7 @@ import msgspec
 import tensorfs
 import torch
 from tensorfs.varena import allocator_refusals, allocator_stats
-from tensorfs.varena.torch import Stats, blocks_of
+from tensorfs.varena.torch import Request, blocks_of
 from torch import nn
 
 from cozy_runtime.internal.execution import agree, catch, cuts
@@ -66,11 +66,11 @@ class Steps:
 
 
 def record(
-    stats: Stats, gpu: int, device: int | None, store: Path, since: Allocator | None
+    request: Request, gpu: int, device: int | None, store: Path, since: Allocator | None
 ) -> GpuMemory:
     """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`: TensorFS's fill
-    ceilings for CUDA `device` (None: no GPU) and `store`, varena's record of the request, and
-    torch's allocator since its start (`counters`)."""
+    ceilings for CUDA `device` (None: no GPU) and `store`, varena's record of the request, its
+    pool's drop, and torch's allocator since its start (`counters`)."""
     now = counters(device)
     delta = None if now is None or since is None else _delta(now, since)
     # The callback's last refusal per pool is the process's: this request's only when the
@@ -79,12 +79,14 @@ def record(
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
-        stats=msgspec.json.decode(stats.json(), type=Record),
+        stats=msgspec.json.decode(request.stats().json(), type=Record),
         torch=delta,
         refusals=tuple(
-            Refusal(pool=pool, why=why, size=size, held=held, limit=limit)
-            for _, pool, why, size, held, limit in refused
+            Refusal(pool=pool, why=why, size=size, free=free)
+            for _, pool, why, size, free in refused
         ),
+        flush_ms=round(request.flush_ms, 3),
+        pool_free=tuple(request.pool_free),
     )
 
 

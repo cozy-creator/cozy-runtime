@@ -226,8 +226,15 @@ def wrap(
         finally:
             _local.named, _local.ordinals = outer
 
-    module.forward = named
+    module.forward = transparent(named)
     vars(module)["_cozy_execution_forward"] = named
+
+
+def transparent[F: Callable[..., object]](forward: F) -> F:
+    """`forward` stands in for its module's own (the class's at each call) with its results:
+    marked as TensorFS's wrappers were, which a package's shape check allows (H3's `_plain`)."""
+    vars(forward)["_varena"] = True
+    return forward
 
 
 def current(module: nn.Module) -> Callable[..., object]:
