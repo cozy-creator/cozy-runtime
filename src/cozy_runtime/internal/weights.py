@@ -738,6 +738,13 @@ class Placement:
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value
 
+    def document(self) -> dict[str, Any]:
+        """Aggregate at the request boundary; replay updates only constant-size counters."""
+        return {
+            "notes": dict(self.notes),
+            "graphs": {name: graphs.describe(model.module) for name, model in self.models.items()},
+        }
+
     def baked(self) -> int:
         return sum(bakes.baked for bakes in self.bakes.values())
 

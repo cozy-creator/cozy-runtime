@@ -182,6 +182,26 @@ def release(model: Any) -> None:
         engine.where = ()
 
 
+def _graph_snapshot(model: Any) -> tuple[dict[str, int], list[Any], Any]:
+    """Final-reply facts and live pool owners; no device work or per-token aggregation."""
+    with _ENGINES_LOCK:
+        engine = _ENGINES.get(model)
+    if engine is None:
+        return {}, [], None
+    return (
+        {
+            "active_graphs": len(engine.graphs),
+            "capture_attempts": int(engine.captured[0]),
+            "captures": engine.recorded,
+            "retired_graphs": engine.retired_graphs,
+            "replays": engine.replayed,
+            "eager_steps": engine.eager,
+        },
+        list(engine.pools.values()),
+        engine.domain,
+    )
+
+
 class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
     """The multi-token-prediction head of a Qwen3.5 or Qwen3-Next checkpoint, its weights where
     the checkpoint keeps them (`mtp.*`): the `draft` `generate` takes. From a token's embedding
@@ -1007,6 +1027,9 @@ class _Engine:
         #: captures recorded in this engine's life and their seconds, steps run eagerly
         self.captured = [0, 0.0]
         self.eager = 0
+        self.recorded = 0
+        self.replayed = 0
+        self.retired_graphs = 0
         #: `LANDED` when a capture met a kernel still building (none records until one lands),
         #: and when the graphs were last started over
         self.building, self.landed = -1, LANDED[0]
@@ -1721,12 +1744,14 @@ class _Engine:
             self.captured[1] += time.perf_counter() - capturing
             if graph is not None:
                 self.graphs[key] = graph
+                self.recorded += 1
             else:
                 self.pools.pop(key, None)
                 if why:
                     self._unrecorded(key, why)
         if graph is not None:
             graph.replay()
+            self.replayed += 1
         else:
             self._advance(size)
             self.eager += 1
@@ -1740,6 +1765,7 @@ class _Engine:
             for event in self.completions.values():
                 event.synchronize()
             self.completions.clear()
+            self.retired_graphs += len(self.graphs)
             self.graphs, self.warmed, self.unrecorded, self.pools = {}, set(), {}, {}
             self.pool = None
             torch.cuda.empty_cache()

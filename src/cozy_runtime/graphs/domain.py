@@ -130,6 +130,12 @@ def release(root: Any) -> None:
         _retire(found, found.generation)
 
 
+def existing(root: Any) -> Domain | None:
+    """Observe an existing owner without creating a domain or touching CUDA."""
+    with _LOCK:
+        return _OWNERS.get(root)
+
+
 def _retire(found: Domain, generation: int) -> None:
     with _LOCK:
         if found.generation == generation and found.owned:

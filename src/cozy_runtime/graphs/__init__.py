@@ -88,6 +88,11 @@ class _Recording:
         self.inputs, self.outputs, self.layout = inputs, outputs, layout
         self.served = [(b, i) for b, impls in served.items() for i in impls]
         self.nbytes = nbytes
+        self.copy_bytes = sum(
+            t.numel() * t.element_size()
+            for t in [*inputs, *torch.utils._pytree.tree_leaves(outputs)]
+            if isinstance(t, torch.Tensor)
+        )
         self.done: Any = None
         self.stream: Any = None
         self.fenced = True
@@ -138,12 +143,17 @@ class _Recorder:
         self.cache: Any = None
         self.replays = 0
         self.attempts = 0
+        self.capture_attempts = 0
+        self.captures = 0
+        self.retired = 0
+        self.copy_bytes = 0
         self.landed = LANDED[0]
         self.domain: domain.Domain | None = None
 
     def forget(self, torch: Any) -> bool:
         if any(not entry.idle() for entry in self.recordings.values()):
             return False
+        self.retired += len(self.recordings)
         self.recordings.clear()
         if self.binding is not None:
             self.binding.close()
@@ -161,6 +171,8 @@ class _Recorder:
 
 _RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionary()
 _REGIONS: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
+_DECLARED: weakref.WeakSet[Any] = weakref.WeakSet()
+_GAPS: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
 _CLASSES: dict[type, type] = {}
 
 
@@ -179,6 +191,7 @@ def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
             for candidate in regions(torch, root.get_submodule(block) if block else root, block)
         )
         for path, module in candidates:
+            _DECLARED.add(module)
             _REGIONS[module] = (weakref.ref(root), path)
             if not getattr(type(module), "_cozy_graphed", False):
                 module.__class__ = _graphed(torch, type(module))
@@ -243,12 +256,87 @@ def release(torch: Any, root: Any) -> None:
                         entry.done.synchronize()
                 recorder.forget(torch)
         _REGIONS.pop(module, None)
+        _DECLARED.discard(module)
+        _GAPS.pop(module, None)
     domain.release(root)
 
 
 def capture_domain(torch: Any, root: Any, memory: Any = None) -> domain.Domain:
     """The component owns hidden library scratch independently of its disposable graphs."""
     return domain.acquire(torch, root, memory)
+
+
+def describe(root: Any) -> dict[str, Any]:
+    """One final-reply snapshot, never an aggregate scan on the replay hot path.
+
+    Counts are cumulative for this component generation. Region call counts are not a
+    percentage of whole-model work: eager parents may enclose captured children. Pool bytes
+    count each live pool once; driver/context and pending native frees remain ledger facts.
+    """
+    from cozy_runtime import lm
+
+    pools: dict[tuple[int, int], Any] = {}
+    domains: dict[int, domain.Domain] = {}
+    answer: dict[str, Any] = dict.fromkeys(
+        (
+            "declared_regions",
+            "active_graphs",
+            "region_calls",
+            "replays",
+            "capture_attempts",
+            "captures",
+            "retired_graphs",
+            "replay_copy_bytes",
+        ),
+        0,
+    )
+    captured, gaps = [], {}
+    for module, (owner, path) in list(_REGIONS.items()):
+        if owner() is not root:
+            continue
+        answer["declared_regions"] += module in _DECLARED
+        if module in _GAPS:
+            gaps[path] = _GAPS[module]
+        recorder = _RECORDERS.get(module)
+        if recorder is None:
+            continue
+        with recorder.lock:
+            answer["active_graphs"] += len(recorder.recordings)
+            answer["region_calls"] += recorder.attempts
+            answer["replays"] += recorder.replays
+            answer["capture_attempts"] += recorder.capture_attempts
+            answer["captures"] += recorder.captures
+            answer["retired_graphs"] += recorder.retired
+            answer["replay_copy_bytes"] += recorder.copy_bytes
+            if recorder.recordings:
+                captured.append(path)
+            pools.update((entry.pool.id, entry.pool) for entry in recorder.recordings.values())
+            if recorder.domain is not None:
+                domains[id(recorder.domain)] = recorder.domain
+    shared = domain.existing(root)
+    if shared is not None:
+        domains[id(shared)] = shared
+    decode, decode_pools, decode_domain = lm._graph_snapshot(root)
+    pools.update((pool.id, pool) for pool in decode_pools)
+    if decode_domain is not None:
+        domains[id(decode_domain)] = decode_domain
+    if decode:
+        answer["decode"] = decode
+        for key in ("active_graphs", "capture_attempts", "captures", "retired_graphs", "replays"):
+            answer[key] += decode[key]
+    answer.update(
+        captured_regions=sorted(captured),
+        eager_gaps=gaps,
+        graph_pools=len(pools),
+        graph_pool_bytes=sum(
+            segment["total_size"]
+            for pool in pools.values()
+            for segment in pool.snapshot(include_traces=False)
+        ),
+        domains=len(domains),
+        domain_workspace_bytes=sum(d.nbytes() for d in domains.values()),
+    )
+    return answer
 
 
 def _unprepared(exc: BaseException) -> bool:
@@ -284,9 +372,11 @@ def _region_call(
         else _unplain(torch, leaves)
     )
     if why:
+        _GAPS[module] = why
         if placed is not None:
             placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
         return call(module, *args, **kwargs)
+    _GAPS.pop(module, None)
     recorder = _RECORDERS.setdefault(module, _Recorder())
     levels = placed[0].graph_levels() if placed is not None else ()
     addresses = (
@@ -374,8 +464,7 @@ def _region_call(
         try:
             result = entry(leaves, out)
             recorder.replays += 1
-            if placed is not None:
-                placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
+            recorder.copy_bytes += entry.copy_bytes
             return result
         finally:
             lease.__exit__(None, None, None)
@@ -394,6 +483,7 @@ def _record(
     # This path is restricted to the shipped pure contracts. Warmup discovers capacity in
     # the exact capture pool; it does not time or select kernels, or run arbitrary package code.
     current, stream = torch.cuda.current_stream(), None
+    recorder.capture_attempts += 1
     try:
         assert recorder.domain is not None
         recorder.domain.initialize()
@@ -448,6 +538,7 @@ def _record(
         nbytes = sum(segment["total_size"] for segment in pool.snapshot())
         entry = _Recording(torch, graph, pool, inputs, outputs[0], key, served, nbytes)
         recorder.recordings[key] = entry
+        recorder.captures += 1
         if recorder.cache is not None:
             recorder.cache.cached(sum(e.nbytes for e in recorder.recordings.values()))
         return entry
@@ -467,15 +558,6 @@ def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str)
     recorder.waiting[key] = placed[0].attempts if placed is not None else recorder.attempts
     say(f"graph:{key!r}:{why}", f"[graphs] pure region remains eager: {why}")
     WARNINGS.append(("a CUDA graph was not used", {"why": why}))
-
-
-def _facts(recorder: _Recorder) -> str:
-    held = sum(e.nbytes for e in recorder.recordings.values())
-    shared = recorder.domain.nbytes() if recorder.domain is not None else 0
-    return (
-        f"{len(recorder.recordings)} regions, {recorder.replays} replays, {held >> 20} MiB pools, "
-        f"domain {id(recorder.domain):x} {shared >> 20} MiB shared"
-    )
 
 
 def _unplain(torch: Any, leaves: list[Any]) -> str:
@@ -530,4 +612,4 @@ def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
     )
 
 
-__all__ = ["BYPASS", "capture", "capture_domain", "install", "release", "say"]
+__all__ = ["BYPASS", "capture", "capture_domain", "describe", "install", "release", "say"]

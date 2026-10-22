@@ -16,17 +16,17 @@ pytestmark = pytest.mark.real_gpu
 def test_preparation_oom_leaves_one_eager_call_and_no_executable() -> None:
     if not torch.cuda.is_available():
         pytest.skip("real CUDA allocation refusal")
-    module = torch.nn.Linear(1, 1).cuda().eval()
+    module = torch.nn.Linear(16 << 20, 1).cuda().eval()
     graphs.install(torch, object(), {"linear": module})
     with torch.inference_mode():
-        x = torch.zeros((16 << 20, 1), device="cuda")
+        x = torch.zeros((1, 16 << 20), device="cuda")
         result = module(x)  # first eager call also seeds output capacity in the default pool
         del result
         torch.cuda.synchronize()
         reserved = torch.cuda.memory_reserved()
         total = torch.cuda.get_device_properties(0).total_memory
-        # The domain/private capture pool cannot borrow the default pool's cached output.
-        # It must refuse preparation while one ordinary eager result still fits that cache.
+        # A 64 MiB static input cannot fit even if Torch drops every cached segment; the
+        # ordinary eager result is one float and still fits the existing output segment.
         torch.cuda.set_per_process_memory_fraction(reserved / total)
         calls: list[int] = []
         original = sys.getprofile()

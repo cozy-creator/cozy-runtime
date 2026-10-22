@@ -77,8 +77,19 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         finally:
             graphs.BYPASS.reset(token)
         assert recorder.replays == 4
+        facts = graphs.describe(module)
+        assert facts["active_graphs"] == facts["captures"] == facts["graph_pools"] == 2
+        assert facts["declared_regions"] == facts["domains"] == 1
+        assert facts["captured_regions"] == [""] and facts["replays"] == 4
+        assert facts["graph_pool_bytes"] > 0 and facts["domain_workspace_bytes"] > 0
+        assert facts["replay_copy_bytes"] > 0
+        torch.cuda.synchronize()
         graphs._shed(torch, recorder)
         assert not recorder.recordings
+        retired = graphs.describe(module)
+        assert retired["active_graphs"] == retired["graph_pools"] == 0
+        assert retired["retired_graphs"] == retired["captures"] == 2
+        assert retired["domain_workspace_bytes"] == facts["domain_workspace_bytes"]
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")

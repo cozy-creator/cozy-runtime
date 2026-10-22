@@ -128,6 +128,10 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
                     for layer, saved in zip(module.layers, recordings, strict=True)
                 )
             domain = placement.graph_domain("network")
+            facts = placement.document()["graphs"]["network"]
+            if turn >= 1:
+                assert facts["active_graphs"] == facts["captures"] == DEPTH
+                assert facts["domains"] == 1 and facts["retired_graphs"] == 0
             pool_bytes = sum(
                 entry.nbytes
                 for layer in module.layers

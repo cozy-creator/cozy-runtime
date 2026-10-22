@@ -3491,7 +3491,7 @@ class Executor:
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
         peak_reserved = accel.peak_reserved(torch, self.device_kind) if torch is not None else 0
-        residency_document = {"notes": dict(self.residency.notes)} if self.residency else {}
+        residency_document = self.residency.document() if self.residency else {}
         working_peak = max(peak_vram - allocated_at_start, 0)
         if self.group is not None:
             working_peak = max(working_peak, *self.group.working_peaks.values(), 0)
@@ -4501,7 +4501,7 @@ class Executor:
         child = self.constructions.get(self.active)
         if child is None or child.residency is None:
             return {}
-        return {"notes": dict(child.residency.notes)}
+        return child.residency.document()
 
     def process_incarnations(self) -> list[dict[str, Any]]:
         """The actual rank births, including a follower that vanished before this probe."""
