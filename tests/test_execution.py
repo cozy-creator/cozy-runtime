@@ -113,12 +113,11 @@ def _decode_split(mem: Any, tmp_path: Path) -> tuple[Any, Any, tuple[Cut, ...], 
     return model, z, tiles, cuts.levels(-(-z.numel() // _finest(tuple(z.shape), tiles)))
 
 
-def test_a_tiled_decode_that_runs_out_whole_goes_finer_or_fails_typed(tmp_path: Path) -> None:
+def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> None:
     """v6 13598, on host pages: the VAE's last up block cannot allocate above 10x10 latent
-    windows, so the whole 16x16 decode runs out inside its pass. Each answer cuts the split
-    finer or runs it again; a run again that fails where and as the last did is no measured
-    progress and fails typed. Never the whole decode again and again (13598 re-ran it for 17
-    minutes until cancelled)."""
+    windows, so the whole 16x16 decode runs out inside its pass. Run again at the same level
+    and failing at the same point without progress, varena cuts the split finer (never another
+    Retry): the decode completes in tiles. 13598 re-ran the whole decode for 17 minutes."""
     mem = memory()
     model, z, tiles, levels = _decode_split(mem, tmp_path)
     refused: list[tuple[int, int]] = []
@@ -134,22 +133,16 @@ def test_a_tiled_decode_that_runs_out_whole_goes_finer_or_fails_typed(tmp_path: 
 
     model.decoder.up_blocks[-1].register_forward_pre_hook(short)
     with torch.no_grad(), mem.request("decode") as r, execution.serving(r):
-        try:
-            got = split(lambda x: model.decode(x).sample, z, *tiles)
-        except Exception as exc:
-            assert is_capacity(exc), exc
-            print(f"failed typed after {refused}: {exc}")
-            assert refused.count(refused[0]) == len(refused) <= 2
-            return
+        got = split(lambda x: model.decode(x).sample, z, *tiles)
     print(f"completed finer after {refused}, {r.stats().cuts} cut(s)")
-    assert tuple(got.shape) == (1, 3, 32, 32) and torch.isfinite(got).all()
-    assert r.stats().cuts >= 1 and max(refused.count(w) for w in refused) <= 2
+    assert tuple(got.shape) == (1, 3, 32, 32) and bool(torch.isfinite(got).all())
+    assert r.stats().cuts >= 1 and all(refused.count(w) <= 2 for w in set(refused)), refused
 
 
 def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:
     """A pass start varena refuses (Exhausted: the VAE's weights alone exceed the memory) inside
-    the split is the split's out-of-memory: it is asked, and with no cut able to help it fails
-    typed, the pass tried a bounded number of times."""
+    the split is the split's out-of-memory: varena is asked with the split's site, and with no
+    cut able to help it answers Exhausted, typed, the pass tried a bounded number of times."""
     mem = memory(capacity=1 << 16)
     model, z, tiles, levels = _decode_split(mem, tmp_path)
     starts: list[int] = []

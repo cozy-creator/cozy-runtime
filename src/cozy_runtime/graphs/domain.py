@@ -5,10 +5,12 @@ begin/end on a control stream and fork onto a separate, uniquely owned library s
 small owner graph on the library stream is reset only at final domain teardown; it is never
 replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
 
-A component's graphs also share one capture pool. `using` serializes every region call of the
-component on the device (a host lock and a completion event across streams), and each replay
-copies its inputs in and its outputs out inside that interval, so no two graphs' scratch is
-ever live at once: the pool holds one region's working set plus every graph's static buffers.
+A placed model's components run one after another on a device, so all their graphs share the
+device's one domain and capture pool (`device`): sized at the largest region's working set, not
+the sum. `using` serializes every region call on the device (a host lock and a completion event
+across streams), and each replay copies its inputs in and its outputs out inside that interval,
+so no two graphs' scratch is ever live at once: the pool holds one region's working set plus
+every graph's static buffers.
 """
 
 from __future__ import annotations
@@ -17,8 +19,9 @@ import ctypes
 import sys
 import threading
 import weakref
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -52,15 +55,16 @@ class Domain:
         self.config: Any = None
         self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
-        #: the graphs' shared capture pool, its accounting cache, and the recorders using it
+        #: the graphs' shared capture pool, its accounting cache, the recorders using it, and
+        #: the component roots they serve (the cache's components), first capture first
         self.captures: Any = None
         self.cache: Any = None
         self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
-        #: the component's blocks held bound across a request's replays (`Model.hold`), the
-        #: request it was taken in, and the stream it bound on
-        self.hold: Any = None
-        self.held_for = -1
-        self.hold_stream: Any = None
+        self.served: list[weakref.ref[Any]] = []
+        #: varena's drop of the pool, asked while a call held the domain: run as it lets go
+        self.deferred: Callable[[], object] | None = None
+        #: per component root, its blocks held bound across a request's replays (`Model.hold`)
+        self.holds: weakref.WeakKeyDictionary[Any, Hold] = weakref.WeakKeyDictionary()
 
     def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
@@ -121,22 +125,28 @@ class Domain:
 
     @contextmanager
     def using(self) -> Iterator[None]:
-        """Serialize shared workspace and order producers/output copies across streams."""
-        with self.lock:
-            current = self.torch.cuda.current_stream(self.device)
-            depth = getattr(self.local, "depth", 0)
-            if not depth and self.done is not None:
-                current.wait_event(self.done)
-                self.last_stream, self.fenced = current, False
-            self.local.depth = depth + 1
-            try:
-                yield
-            finally:
-                self.local.depth -= 1
+        """Serialize shared workspace and order producers/output copies across streams. A drop
+        varena asked for while a call held the domain runs once the outermost call lets go."""
+        depth = getattr(self.local, "depth", 0)
+        try:
+            with self.lock:
+                current = self.torch.cuda.current_stream(self.device)
                 if not depth and self.done is not None:
+                    current.wait_event(self.done)
                     self.last_stream, self.fenced = current, False
-                    self.done.record(current)
-                    self.fenced = True
+                self.local.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self.local.depth -= 1
+                    if not depth and self.done is not None:
+                        self.last_stream, self.fenced = current, False
+                        self.done.record(current)
+                        self.fenced = True
+        finally:
+            if not depth and (deferred := self.deferred) is not None:
+                self.deferred = None
+                deferred()
 
     def prime_blas(self) -> None:
         """Prime the actual capture thread's handle into persistent domain ownership."""
@@ -189,15 +199,25 @@ class Domain:
             )
         return self.captures
 
-    def unhold(self) -> None:
-        """The blocks go back to binding per use (their pins drop after the queued uses)."""
-        hold, self.hold, self.held_for, self.hold_stream = self.hold, None, -1, None
-        if hold is not None:
-            hold.release()
+    def unhold(self, root: Any = None) -> None:
+        """`root`'s blocks (every root's when None) go back to binding per use (their pins drop
+        after the queued uses)."""
+        for held in [root] if root is not None else list(self.holds):
+            hold = self.holds.pop(held, None)
+            if hold is not None:
+                hold.hold.release()
+
+    def serve(self, root: Any) -> bool:
+        """`root`'s graphs record into the pool from now on; True when it is new to it."""
+        if any(r() is root for r in self.served):
+            return False
+        self.served = [r for r in self.served if r() is not None] + [weakref.ref(root)]
+        return True
 
     def drop_captures(self) -> None:
         """After every graph recorded into it is reset and its static buffers dropped."""
         self.captures = None  # MemPool destruction releases this pool, never a global flush.
+        self.served = []
         if self.cache is not None:
             self.cache.close()
             self.cache = None
@@ -217,8 +237,31 @@ class Domain:
         )
 
 
+@dataclass(slots=True)
+class Hold:
+    """A component's blocks held bound (`Model.hold`), the request it was taken in, and the
+    stream it bound on."""
+
+    hold: Any
+    attempt: int
+    stream: Any
+
+
 _LOCK = threading.RLock()
 _OWNERS: weakref.WeakKeyDictionary[Any, Domain] = weakref.WeakKeyDictionary()
+#: per device memory, the one domain its placed models' graphs share
+_DEVICES: weakref.WeakKeyDictionary[Any, Domain] = weakref.WeakKeyDictionary()
+
+
+def device(torch: Any, memory: Any) -> Domain:
+    """The device's domain: every placed component's graphs, serialized, in one pool."""
+    with _LOCK:
+        found = _DEVICES.get(memory)
+        if found is None:
+            found = _DEVICES[memory] = Domain(torch, memory)
+            finalizer = weakref.finalize(memory, found.finish)
+            finalizer.atexit = False
+        return found
 
 
 def acquire(torch: Any, root: Any, memory: Any = None) -> Domain:

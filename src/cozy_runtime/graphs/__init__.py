@@ -283,6 +283,8 @@ class _Recorder:
         self.lock = threading.Lock()
         self.recordings: dict[tuple[object, ...], _Recording] = {}
         self.seen: set[tuple[object, ...]] = set()
+        #: per key, the static buffers its graph would hold (measured on its first, eager call)
+        self.statics: dict[tuple[object, ...], int] = {}
         self.failed: dict[tuple[object, ...], str] = {}
         self.waiting: dict[tuple[object, ...], int] = {}
         self.binding: Any = None
@@ -304,6 +306,10 @@ class _Recorder:
     def forget(self, torch: Any) -> bool:
         if any(not entry.idle() for entry in self.recordings.values()):
             return False
+        self.drop()
+        return True
+
+    def drop(self) -> None:
         self.retired += len(self.recordings)
         for entry in self.recordings.values():
             entry.close()
@@ -312,10 +318,10 @@ class _Recorder:
             self.binding.close()
             self.binding = None
         self.seen.clear()
+        self.statics.clear()
         self.failed.clear()
         self.waiting.clear()
         self.landed = LANDED[0]
-        return True
 
 
 _RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionary()
@@ -384,24 +390,33 @@ def _placed(module: Any) -> tuple[Any, str] | None:
 
 
 def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> int:
-    """Every graph of the component goes, with their shared pool, once none is in use."""
-    if not owner.lock.acquire(blocking=False):
+    """Varena's ask: every graph on the device goes, with their shared pool (it never asks while
+    a call holds the pool). A region call in flight on another thread holds the locks, and may
+    wait on varena: the drop runs when it lets them go (its bytes arrive as the cache closes;
+    they are reported coming once the core's shrink answer carries them)."""
+    nbytes = owner.capture_bytes()
+    if not _drop(torch, owner):
+        owner.deferred = functools.partial(_drop, torch, owner)
         return 0
+    return nbytes
+
+
+def _drop(torch: Any, owner: domain.Domain) -> bool:
+    """Every graph on the device and its pool go now; False when a call holds the locks."""
+    if not owner.lock.acquire(blocking=False):
+        return False
     recorders = list(owner.recorders)
     held: list[_Recorder] = []
     try:
         for recorder in recorders:
             if not recorder.lock.acquire(blocking=False):
-                return 0
+                return False
             held.append(recorder)
-        if any(not e.idle() for r in recorders for e in r.recordings.values()):
-            return 0
-        nbytes = owner.capture_bytes()
         for recorder in recorders:
-            recorder.forget(torch)
+            recorder.drop()
         owner.unhold()
         owner.drop_captures()
-        return nbytes
+        return True
     finally:
         for recorder in held:
             recorder.lock.release()
@@ -411,9 +426,13 @@ def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> int:
 def release(torch: Any, root: Any) -> None:
     """A generation's explicit teardown: finish its output copies before releasing addresses."""
     modules = [module for module, (owner, _) in _REGIONS.items() if owner() is root]
+    shared: set[domain.Domain] = set()
     for module in modules:
         recorder = _RECORDERS.pop(module, None)
         if recorder is not None:
+            if recorder.domain is not None:
+                shared.add(recorder.domain)
+                recorder.domain.recorders.discard(recorder)
             with recorder.lock:
                 for entry in recorder.recordings.values():
                     if not entry.fenced:
@@ -426,6 +445,10 @@ def release(torch: Any, root: Any) -> None:
         _DECLARED.discard(module)
         _GAPS.pop(module, None)
         _CHECKED.pop(module, None)
+    for owner in shared:
+        owner.unhold(root)
+        if not owner.recorders:  # the device's last component: its pool goes with it
+            owner.drop_captures()
     domain.release(root)
 
 
@@ -434,12 +457,18 @@ def capture_domain(torch: Any, root: Any, memory: Any = None) -> domain.Domain:
     return domain.acquire(torch, root, memory)
 
 
+def capture_device(torch: Any, memory: Any) -> domain.Domain:
+    """A placed component's graphs share the device's domain with its other components'."""
+    return domain.device(torch, memory)
+
+
 def describe(root: Any) -> dict[str, Any]:
     """One final-reply snapshot, never an aggregate scan on the replay hot path.
 
     Counts are cumulative for this component generation. Region call counts are not a
     percentage of whole-model work: eager parents may enclose captured children. Pool bytes
-    count each live pool once; driver/context and pending native frees remain ledger facts.
+    count each live pool once (a device's shared pool under the first component it served);
+    driver/context and pending native frees remain ledger facts.
     """
     from cozy_runtime import lm
 
@@ -489,9 +518,14 @@ def describe(root: Any) -> dict[str, Any]:
                     "eager": recorder.eager.document(),
                     "replay": recorder.replayed.document(),
                 }
-            pools.update((entry.pool.id, entry.pool) for entry in recorder.recordings.values())
-            if recorder.domain is not None:
-                domains[id(recorder.domain)] = recorder.domain
+            # A device's shared pool and domain count once, under the first component served.
+            first = recorder.domain is None or not recorder.domain.served
+            if not first and recorder.domain is not None:
+                first = recorder.domain.served[0]() is root
+            if first:
+                pools.update((entry.pool.id, entry.pool) for entry in recorder.recordings.values())
+                if recorder.domain is not None:
+                    domains[id(recorder.domain)] = recorder.domain
     shared = domain.existing(root)
     if shared is not None:
         domains[id(shared)] = shared
@@ -610,7 +644,12 @@ def _region_call(
             return eager()
         if key not in recorder.seen:
             recorder.seen.add(key)
-            return eager()
+            out = eager()
+            # Its graph's static buffers: the inputs it would copy in and the outputs it keeps.
+            recorder.statics[key] = _nbytes(torch, leaves) + _nbytes(
+                torch, torch.utils._pytree.tree_leaves(out)
+            )
+            return out
         if placed is not None:
             if (
                 recorder.binding is not None
@@ -626,6 +665,14 @@ def _region_call(
             if placed is not None and not placed[0].graph_accounted():
                 why = _GAPS[module] = "driver/context memory is unmeasured"
                 _failed(recorder, key, placed, why)
+                return eager()
+            # Admitted only beside the step's working set: its static buffers must fit in what
+            # the request could get without evicting W or a pinned page (the pool's growth past
+            # that is refused by the allocator, never taken from W).
+            spare = placed[0].graph_spare() if placed is not None else None
+            if spare is not None and spare < recorder.statics.get(key, 0):
+                recorder.waiting[key] = attempt
+                _refused(module, placed, f"graph refused: room ({spare} bytes spare)")
                 return eager()
             # Discovery owns the complete range set and then the admitted free headroom.
             # Only the declared pure region runs here; this does not select/tune kernels.
@@ -667,8 +714,8 @@ def _region_call(
             recorder.waiting[key] = attempt
             return eager()
         try:
-            whole = _REGIONS[module][1] == ""
-            lease = _lease(torch, recorder.domain, placed, binding, attempt, whole)
+            root, path = _REGIONS[module][0](), _REGIONS[module][1]
+            lease = _lease(torch, recorder.domain, placed, binding, attempt, root, path == "")
             lease.__enter__()
         except Exception as exc:
             if not _unprepared(exc):
@@ -772,16 +819,21 @@ def _record(
         recorder.captures += 1
         for index, tensor in enumerate(entry.statics):
             _LENT[tensor.data_ptr()] = (weakref.ref(entry), index)
-        if placed is not None and owner.cache is None:
-            shed = functools.partial(_shed, torch, owner)
-            owner.cache = placed[0].cache(f"graphs:{placed[1]}", shed)
+        if placed is not None and (owner.serve(_REGIONS[module][0]()) or owner.cache is None):
+            # One cache for the pool, serving every component recorded into it (its class is
+            # the most protective of theirs): registered again when one joins.
+            if owner.cache is not None:
+                owner.cache.close()
+            roots = [r for r in (ref() for ref in owner.served) if r is not None]
+            owner.cache = placed[0].cache("graphs", functools.partial(_shed, torch, owner), roots)
         if owner.cache is not None:
             owner.cache.cached(owner.capture_bytes())
         return entry
     except Exception as exc:
         if not is_capacity(exc) and not isinstance(exc, Building | domain.Unavailable):
             raise
-        _failed(recorder, key, placed, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
+        why = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+        _failed(recorder, key, placed, f"graph refused: room ({why})" if is_capacity(exc) else why)
         return None
     finally:
         if stream is not None:
@@ -813,7 +865,13 @@ def record_stream(torch: Any, tensor: Any, stream: Any) -> None:
 
 
 def _lease(
-    torch: Any, owner: domain.Domain, placed: Any, binding: Any, attempt: int, whole: bool
+    torch: Any,
+    owner: domain.Domain,
+    placed: Any,
+    binding: Any,
+    attempt: int,
+    root: Any,
+    whole: bool,
 ) -> Any:
     """A replay's residency: its region's blocks prepared around it. A region that is the whole
     component instead holds every block bound for the rest of the request from its first replay
@@ -823,15 +881,17 @@ def _lease(
     if placed is None or binding is None:
         return nullcontext()
     stream = torch.cuda.current_stream()
-    if owner.hold is not None and owner.held_for != attempt:
-        owner.unhold()
-    if not whole and owner.hold is None:
+    held = owner.holds.get(root)
+    if held is not None and held.attempt != attempt:
+        owner.unhold(root)
+        held = None
+    if not whole and held is None:
         return binding.prepare(stream)
-    if owner.hold is None:
-        owner.hold = placed[0].graph_hold(placed[1], owner.unhold)
-        owner.held_for, owner.hold_stream = attempt, stream
-    elif owner.hold_stream != stream:
-        stream.wait_stream(owner.hold_stream)
+    if held is None:
+        hold = placed[0].graph_hold(placed[1], functools.partial(owner.unhold, root))
+        owner.holds[root] = domain.Hold(hold, attempt, stream)
+    elif held.stream != stream:
+        stream.wait_stream(held.stream)
     return nullcontext()
 
 
@@ -849,6 +909,10 @@ def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str)
     recorder.waiting[key] = placed[0].attempts if placed is not None else recorder.attempts
     say(f"graph:{key!r}:{why}", f"[graphs] pure region remains eager: {why}")
     WARNINGS.append(("a CUDA graph was not used", {"why": why}))
+
+
+def _nbytes(torch: Any, leaves: list[Any]) -> int:
+    return sum(v.numel() * v.element_size() for v in leaves if isinstance(v, torch.Tensor))
 
 
 def _unplain(torch: Any, leaves: list[Any]) -> str:
@@ -924,6 +988,7 @@ def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
 __all__ = [
     "BYPASS",
     "capture",
+    "capture_device",
     "capture_domain",
     "describe",
     "install",

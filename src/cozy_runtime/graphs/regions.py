@@ -154,10 +154,15 @@ def contract(cls: type) -> type:
     return _declaration(cls) or cls
 
 
-@functools.cache
+_READS: dict[tuple[type, type], frozenset[str]] = {}
+
+
 def reads(cls: type, stop: type) -> frozenset[str]:
     """Every attribute name the code of `cls` (its classes below `stop`) can name: the most its
     contract can read of a module's state. A name only a package's code uses is not here."""
+    known = _READS.get((cls, stop))
+    if known is not None:
+        return known
     names: set[str] = set()
 
     def scan(code: types.CodeType) -> None:
@@ -174,7 +179,8 @@ def reads(cls: type, stop: type) -> frozenset[str]:
                 code = getattr(inspect.unwrap(fn), "__code__", None) if callable(fn) else None
                 if isinstance(code, types.CodeType):
                     scan(code)
-    return frozenset(names)
+    found = _READS[(cls, stop)] = frozenset(names)
+    return found
 
 
 def _declaration(cls: type) -> type | None:
