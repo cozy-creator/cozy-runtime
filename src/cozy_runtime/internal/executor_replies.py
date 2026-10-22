@@ -24,12 +24,13 @@ class Fills(msgspec.Struct, frozen=True, kw_only=True):
 
 class Moved(msgspec.Struct, frozen=True, kw_only=True):
     """Bytes moved by source (kept pages imported, the RAM tier, the store); `speculative` of
-    them were prefetched."""
+    them were prefetched; `saved`, filled pages copied into the RAM tier afterwards."""
 
     kept: Fills
     tier: Fills
     store: Fills
     speculative: int
+    saved: Fills = Fills(bytes=0, ns=0)
 
 
 class Ref(msgspec.Struct, frozen=True, kw_only=True):
@@ -51,6 +52,40 @@ class Step(msgspec.Struct, frozen=True, kw_only=True):
     evicted: tuple[int, ...]
 
 
+class Decision(msgspec.Struct, frozen=True, kw_only=True):
+    """One non-trivial decision a request's demand made: what asked (`trigger`: pass, bind,
+    oom, prepare, workspace, outside), what it did (`action`: lower, cut, cut_outside, park,
+    exhausted, evict_d, evict_w), the bytes asked (exhausted: short) and freed, a cut's level."""
+
+    step: int
+    trigger: str
+    action: str
+    site: str | None
+    need: int
+    freed: int
+    level: int | None
+
+
+class Unregisters(msgspec.Struct, frozen=True, kw_only=True):
+    """RAM-tier host ranges unlocked while it ran (each stalls the device until idle)."""
+
+    calls: int
+    bytes: int
+    max_ns: int
+
+
+class Refusal(msgspec.Struct, frozen=True, kw_only=True):
+    """varena's allocator callback's last refusal on a pool during the request: why
+    (`no_reclaim`: over the limit, the stock gave nothing), the bytes refused, the pool's live
+    bytes plus outside it, and the limit it was admitted to."""
+
+    pool: tuple[int, int]
+    why: str
+    size: int
+    held: int
+    limit: int
+
+
 class Stats(msgspec.Struct, frozen=True, kw_only=True):
     """varena's record of one request (varena-slim §5), as its core writes it. `evicted` is by
     class (F, O, S, N, D, W, P)."""
@@ -70,17 +105,25 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     lowered: bool
     peak: int
     leftover: int
+    room: int = 0
+    host: int | None = None
+    tier: int = 0
+    keep_pending: int = 0
+    unregisters: Unregisters = Unregisters(calls=0, bytes=0, max_ns=0)
+    decisions: tuple[Decision, ...] = ()
 
 
 class Allocator(msgspec.Struct, frozen=True, kw_only=True):
     """torch's caching allocator over a request on one GPU (`torch.cuda.memory_stats` deltas,
     the device's: a request beside it on that GPU counts too): allocations retried after it
-    freed its cache, cudaMalloc and cudaFree calls, and the all-stream syncs those frees took."""
+    freed its cache, cudaMalloc and cudaFree calls, and the all-stream syncs those frees took;
+    and the allocations varena's callback refused on the device."""
 
     num_alloc_retries: int
     num_device_alloc: int
     num_device_free: int
     num_sync_all_streams: int
+    refused: int = 0
 
 
 class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
@@ -92,6 +135,8 @@ class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
     ceiling: Ceiling | None
     stats: Stats
     torch: Allocator | None
+    #: varena's allocator callback's refusals during the request, one per pool (its last)
+    refusals: tuple[Refusal, ...] = ()
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):

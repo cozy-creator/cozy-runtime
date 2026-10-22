@@ -12,7 +12,9 @@ then query rows, a package's `split` by windows.
 from __future__ import annotations
 
 import functools
+import math
 from collections.abc import Callable, Sequence
+from typing import cast
 
 import torch
 from torch import Tensor, nn
@@ -56,6 +58,14 @@ def install(module: nn.Module) -> int:
             sub._conv_forward = _conv_bands(f"{path}:bands", sub, _conv_of(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
+        # torch's RMS norm reduces each row alone: token pieces are the whole (v7 H3 13826 ran
+        # out in a DiT block's 546 MiB rms_norm, a site with no cut).
+        if type(sub) is nn.RMSNorm and "forward" not in vars(sub) and "_cozy_cut" not in vars(sub):
+            norm: nn.Module = sub
+            norm.forward = _norm(f"{path}:tokens", sub, _forward(sub))
+            vars(sub)["_cozy_cut"] = True
+            count += 1
+            continue
         # A custom subclass/instance forward is package code, even when its base is pure.
         if "forward" in vars(sub) or not type(sub).forward.__module__.startswith("diffusers."):
             continue
@@ -198,6 +208,44 @@ def _tokens(forward: Callable[..., object], x: Tensor, tokens: int, level: int) 
         del part
     assert out is not None
     return out.view(*x.shape[:-1], *out.shape[1:])
+
+
+def _norm(site: str, module: nn.Module, forward: Callable[..., object]) -> Callable[..., object]:
+    """A norm over its trailing `normalized_shape` in pieces of whole rows (tokens)."""
+    dims = len(cast("tuple[int, ...]", module.normalized_shape))
+
+    def cut(x: object, *args: object, **kwargs: object) -> object:
+        if (
+            args
+            or kwargs
+            or not isinstance(x, Tensor)
+            or torch.is_grad_enabled()
+            or x.dim() <= dims
+        ):
+            return forward(x, *args, **kwargs)
+        row = math.prod(int(n) for n in x.shape[-dims:])
+        tokens = x.numel() // max(row, 1)
+        if tokens < 2:
+            return forward(x)
+        flat = x.reshape(tokens, *x.shape[-dims:])
+        run = functools.partial(_rows, forward, flat, tokens)
+        out = catch.cut(site, levels(tokens), run, (x,))
+        return cast(Tensor, out).view(x.shape)
+
+    return cut
+
+
+def _rows(forward: Callable[..., object], flat: Tensor, tokens: int, level: int) -> object:
+    if not level:
+        return forward(flat)
+    size, out = pieces(tokens, level), None
+    for at in range(0, tokens, size):
+        catch.piece()
+        part = cast(Tensor, forward(flat[at : at + size]))
+        out = part.new_empty((tokens, *part.shape[1:])) if out is None else out
+        out[at : at + part.shape[0]].copy_(part)
+        del part
+    return out
 
 
 def _rms_contract(module: nn.Module, kinds: Sequence[str]) -> tuple[bool, int, int] | None:

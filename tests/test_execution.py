@@ -8,7 +8,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -137,6 +137,10 @@ def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> N
     print(f"completed finer after {refused}, {r.stats().cuts} cut(s)")
     assert tuple(got.shape) == (1, 3, 32, 32) and bool(torch.isfinite(got).all())
     assert r.stats().cuts >= 1 and all(refused.count(w) <= 2 for w in set(refused)), refused
+    # The record the reply carries names each decision and what asked for it.
+    row = execution.record(r.stats(), -1, None, tmp_path, None)
+    assert [(d.trigger, d.action) for d in row.stats.decisions] == [("oom", "cut_outside")]
+    assert row.stats.decisions[0].site is not None and row.stats.decisions[0].level == 1
 
 
 def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:
@@ -158,6 +162,61 @@ def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:
     print(f"{failed.value!r} after {len(starts)} pass start(s)")
     assert is_capacity(failed.value)
     assert len(starts) <= 2 * (levels + 1)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_an_rms_norm_s_token_pieces_are_the_whole_norm(dtype: Any) -> None:
+    """torch's nn.RMSNorm (v7 H3 13826's site) at levels 0-3 on real CPU kernels: each row is
+    normalized alone, so token pieces are the whole norm, bit for bit."""
+    gen = torch.Generator().manual_seed(15)
+    norm = nn.RMSNorm(48, eps=1e-6).to(dtype)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(48, generator=gen).to(dtype))
+    cut = cuts._norm("norm:tokens", norm, norm.forward)
+    x = torch.randn(2, 37, 48, generator=gen).to(dtype)
+    with torch.no_grad():
+        whole = norm(x)
+        flat = x.reshape(-1, 48)
+        for level in range(4):
+            got = cast("Any", cuts._rows(norm.forward, flat, flat.shape[0], level)).view(x.shape)
+            assert torch.equal(got, whole), level
+        assert torch.equal(cut(x), whole)
+
+
+def test_an_oom_in_an_rms_norm_cuts_it_by_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An RMS norm whose op cannot allocate for more than 32 rows runs out inside its own cut
+    site: Rust cuts it finer and its token pieces give the whole norm's result (block code's
+    norm, the allocation 13826 could not make). The op's refusal is torch's, in its forward."""
+
+    def build() -> nn.Module:
+        torch.manual_seed(16)
+        return nn.Sequential(nn.Linear(16, 16), nn.RMSNorm(16), nn.Linear(16, 16)).to(BF16)
+
+    plain = build().eval()
+    mem = memory()
+    model = placed(mem, checkpoint(tmp_path, "normed", plain), "normed", build)
+    refused: list[int] = []
+
+    norm = nn.RMSNorm.forward
+
+    def short(module: nn.RMSNorm, x: torch.Tensor) -> torch.Tensor:
+        rows = x.numel() // x.shape[-1]
+        if rows > 32:
+            refused.append(rows)
+            catch._refused(0, rows * 16 * 2, 0, 0)
+            raise torch.OutOfMemoryError("out of memory. Tried to allocate 2.00 KiB")
+        return cast("torch.Tensor", norm(module, x))
+
+    x = tokens(3, rows=96)
+    with torch.no_grad():
+        want = plain(x)
+    monkeypatch.setattr(nn.RMSNorm, "forward", short)
+    with torch.no_grad(), mem.request("normed") as r, execution.serving(r):
+        got = model(x)
+    assert refused and r.stats().cuts >= 1
+    assert torch.equal(got, want)
 
 
 def test_a_conv_cut_site_s_bands_are_the_whole_conv() -> None:
