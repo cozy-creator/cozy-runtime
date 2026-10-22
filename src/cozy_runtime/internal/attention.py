@@ -487,10 +487,10 @@ def _import(candidate: Candidate) -> ModuleType:
 
 
 def _launch(ready: Ready, device: DeviceFacts) -> None:
-    """`verify_op` for a compiled kernel: each (head dim, dtype) it serves against attention in
-    float64 on this card, kept per machine by its build's key (`verify`). One that fails, or
-    whose probe raises, is not served. Torch's own backends need none; Sol runs only inside its
-    model's layout."""
+    """Require the compiled arm's shipped verdict; only the offline oracle executes its probe.
+
+    Torch's own backends are the supported reference; Sol also requires its model layout.
+    """
     candidate = ready.candidate
     if not candidate.artifact or ready.name in attention_sol.NAMES or device.kind != "cuda":
         return
@@ -506,8 +506,11 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
 
     probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, pairs,
                     False)  # fmt: skip
-    key = (ready.artifact or {}).get("key", "")
-    verdict = verify.verified(f"attention-{candidate.name}", key, device.sm, probe)
+    # Bind the loaded wrapper/extension, including environment-provided packages. Recipe
+    # names and an empty "environment" key cannot borrow another binary's measurements.
+    implementation = import_module(candidate.import_name.split(".")[0])
+    key = verify.implementation_artifact(implementation)
+    verdict = verify.admitted(f"attention-{candidate.name}", key, device.sm, probe)
     if not verdict.ok:
         raise AttentionRefusal(
             "attention_kernel_failed_verification",

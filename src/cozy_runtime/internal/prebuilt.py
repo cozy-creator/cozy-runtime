@@ -341,36 +341,33 @@ def lost(f: str, sm: int) -> str:
 
 
 def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, str]:
-    """The prebuilt ops on cuda:`index` (capability `sm`) once each format its row runs passes
-    its probe, or None and why. A card no row names tries each family it could hold, newest
-    first (`arch`, §2.6): the first whose kernels verify is the card's."""
+    """The shipped family, admitted by offline facts; unknown cards use reference execution.
+
+    Probes execute only in the explicit development oracle scope, never while serving.
+    """
     if ABSENT:
         return None, ABSENT
-    if not arch.families(sm):
-        return None, f"sm{sm} has no tensor-core family"
-    carried = [family for family in arch.families(sm) if any(family in GEMM[f] for f in GEMM)]
-    if not carried:  # a Windows wheel has mma.sync only (cr-201)
-        return None, f"the cozy-runtime wheel has no {'/'.join(arch.families(sm))} GEMM"
-    digest = artifact()
-    reasons: list[str] = []
-    for family in carried:
-        row = arch.row(sm, family)
-        ops = Prebuilt(torch, index, family, sm in GEMM["fp8"].get(family, ()))
-        formats = [f for f in (INT8, FP8) if getattr(row, f.name)]
-        verdicts = {
-            f.name: verify.verified(
-                f"{KERNELS[f.name]}-{family.replace('.', '')}", digest, sm,
-                partial(probe, torch, ops, f),
-            )
-            for f in formats
-        }  # fmt: skip
-        failed = [f"{name}: {v.detail}" for name, v in verdicts.items() if not v.ok]
-        if not failed:
-            if row.inherited:
-                arch.learn(sm, family)
-            return ops, "; ".join(f"{name} {v.detail}" for name, v in verdicts.items())
-        reasons.append(f"{family}: {'; '.join(failed)}")
-    return None, f"the prebuilt kernels failed verification on sm{sm}: {' | '.join(reasons)}"
+    row = arch.ROWS.get(sm)
+    if row is None:
+        return None, f"sm{sm} has no shipped native family; reference execution serves"
+    family = row.family
+    if not any(sm in GEMM[f].get(family, ()) for f in GEMM):
+        return None, f"the cozy-runtime wheel has no shipped {family} GEMM for sm{sm}"
+    ops = Prebuilt(torch, index, family, sm in GEMM["fp8"].get(family, ()))
+    formats = [f for f in (INT8, FP8) if getattr(row, f.name)]
+    verdicts = {
+        f.name: verify.admitted(
+            f"{KERNELS[f.name]}-{family.replace('.', '')}",
+            artifact(),
+            sm,
+            partial(probe, torch, ops, f),
+        )
+        for f in formats
+    }
+    failed = [f"{name}: {v.detail}" for name, v in verdicts.items() if not v.ok]
+    if failed:
+        return None, f"{family}: {'; '.join(failed)}"
+    return ops, "; ".join(f"{name} {v.detail}" for name, v in verdicts.items())
 
 
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
@@ -507,7 +504,7 @@ def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None,
 
     pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16")]
     probe = partial(attention_probe, torch, index, call, True, pairs, True)
-    verdict = verify.verified("prebuilt-fa3", artifact("_fa3"), sm, probe)
+    verdict = verify.admitted("prebuilt-fa3", artifact("_fa3"), sm, probe)
     return (kernel if verdict.ok else None), verdict.detail
 
 

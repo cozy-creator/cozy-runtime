@@ -260,6 +260,16 @@ IDENTITY_SOURCES = (
     "internal/encoding/leaves.py",
     "internal/encoding/selection.py",
     "internal/probe.py",
+    "internal/qualification.py",
+    "internal/verify.py",
+    "internal/arch.py",
+    "internal/prebuilt.py",
+    "internal/int8_linear.py",
+    "internal/fp8_linear.py",
+    "internal/nvfp4_linear.py",
+    "internal/attention.py",
+    "internal/attention_upstream.py",
+    "internal/kernel_sources.py",
     "internal/resolution.py",
 )
 
@@ -300,8 +310,9 @@ def native_backend_identity() -> dict[str, str]:
 
     root = Path(_kernels.__file__).parent
     identity = {"platform": f"{platform.system()}/{platform.machine()}"}
-    for name in ("_gemm", "_norm"):
-        loaded = getattr(_kernels, name, None) if not _kernels.ABSENT else None
+    for name in ("_gemm", "_norm", "_fa3"):
+        refused = _kernels.NO_FA3 if name == "_fa3" else _kernels.ABSENT
+        loaded = getattr(_kernels, name, None) if not refused else None
         candidates = sorted(
             p for p in root.glob(f"{name}.*") if p.suffix in (".so", ".pyd", ".dll", ".dylib")
         )

@@ -1,4 +1,7 @@
-"""`verify_op`: every native kernel is checked on the device before it serves (design §6.3).
+"""Offline kernel evidence and read-only consumer admission.
+
+`admitted` never runs a consumer probe. `measuring` is an explicit development-only scope.
+The machine cache below belongs only to development qualification, not inference admission.
 
 A prebuilt, local or JIT kernel runs its probe once against an exact reference on the card it
 will serve: a non-finite output fails before any ratio, then the relative L2 error must be within
@@ -16,13 +19,21 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from types import ModuleType
+from typing import TYPE_CHECKING
 
 from cozy_runtime.internal import accel, filelock, kernel_cache
 from cozy_runtime.internal.encoding.formats import Tensor
+
+if TYPE_CHECKING:
+    from cozy_runtime.internal.encoding import RuntimeIdentity
+
 
 #: The verdict files under the machine's kernel store.
 VERDICTS = "verified"
@@ -120,3 +131,136 @@ def _write(path: Path, key: tuple[str, str, int, str], verdict: Verdict) -> None
         os.replace(temporary, path)
     except OSError:
         temporary.unlink(missing_ok=True)
+
+
+# Consumer dispatch reads immutable release facts. Only the explicit development scope below
+# may execute a probe; the machine-local cache above is never consumer admission evidence.
+_OFFLINE: ContextVar[dict[tuple[str, str, int], Verdict] | None] = ContextVar(
+    "kernel_offline_verdicts", default=None
+)
+
+
+def in_oracle() -> bool:
+    return _OFFLINE.get() is not None
+
+
+@contextmanager
+def measuring() -> Iterator[dict[tuple[str, str, int], Verdict]]:
+    """Development oracle scope: collect the exact kernel arms actually qualified."""
+    records: dict[tuple[str, str, int], Verdict] = {}
+    token = _OFFLINE.set(records)
+    try:
+        yield records
+    finally:
+        _OFFLINE.reset(token)
+
+
+@lru_cache(maxsize=1)
+def _identity() -> tuple[RuntimeIdentity, str, str]:
+    import torch
+
+    from cozy_runtime.internal.encoding import measure_runtime
+
+    runtime = measure_runtime(torch, "offline")
+    return runtime, runtime.source_digest, runtime.torch_build
+
+
+def _name(sm: int, source: str, torch_build: str) -> str:
+    build = hashlib.sha256(torch_build.encode()).hexdigest()[:12]
+    return f"kernels-sm{sm}-{source.removeprefix('sha256:')[:16]}-{build}.json"
+
+
+def publish(directory: Path, records: dict[tuple[str, str, int], Verdict]) -> list[Path]:
+    """Export real offline verdicts beside format qualification data, without rewriting identity."""
+    runtime, source, torch_build = _identity()
+    directory.mkdir(parents=True, exist_ok=True)
+    written = []
+    for sm in sorted({key[2] for key in records}):
+        path = directory / _name(sm, source, torch_build)
+        rows = [
+            {"kernel": kernel, "artifact": artifact, "sm": card, **asdict(verdict)}
+            for (kernel, artifact, card), verdict in sorted(records.items())
+            if card == sm
+        ]
+        data = {"schema": 1, "runtime": asdict(runtime), "sm": sm, "verdicts": rows}
+        temporary = path.with_name(f".{path.name}.{os.getpid()}")
+        temporary.write_text(json.dumps(data, sort_keys=True))
+        os.replace(temporary, path)
+        written.append(path)
+    return written
+
+
+def admitted(
+    kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict], *, tables: Path | None = None
+) -> Verdict:
+    """A shipped verdict, or a real probe only within the explicit offline oracle scope."""
+    _, source, torch_build = _identity()
+    if (records := _OFFLINE.get()) is not None:
+        # A source change invalidates old development-cache verdicts as well as shipped facts.
+        verdict = verified(kernel, f"{artifact};source={source};torch={torch_build}", sm, probe)
+        records[kernel, artifact, sm] = verdict
+        return verdict
+    directory = Path(__file__).parent / "qualification_tables" if tables is None else tables
+    try:
+        document = json.loads((directory / _name(sm, source, torch_build)).read_bytes())
+        runtime = document["runtime"]
+        if (
+            document["schema"] != 1
+            or document["sm"] != sm
+            or runtime["source_digest"] != source
+            or runtime["torch_build"] != torch_build
+        ):
+            raise ValueError("kernel verdict identity mismatch")
+        for row in document["verdicts"]:
+            if row["kernel"] == kernel and row["artifact"] == artifact and row["sm"] == sm:
+                if type(row["ok"]) is not bool or not isinstance(row["detail"], str):
+                    raise ValueError("invalid kernel verdict")
+                return Verdict(row["ok"], row["detail"])
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return Verdict(False, f"no matching offline verdict for {kernel} on sm{sm}")
+
+
+@lru_cache(maxsize=32)
+def implementation_artifact(module: ModuleType) -> str:
+    """Hash the imported wrapper and native implementation, not its recipe's display name.
+
+    Package trees include their fixed JIT sources. Single-file wrappers also bind imported
+    extension modules, such as flash_attn_interface's separately installed CUDA module.
+    """
+    from cozy_runtime.internal import canonical
+
+    roots = tuple(Path(p) for p in getattr(module, "__path__", ()))
+    files = {
+        path
+        for root in roots
+        for path in root.rglob("*")
+        if path.suffix
+        in (
+            ".py",
+            ".so",
+            ".pyd",
+            ".dll",
+            ".dylib",
+            ".cu",
+            ".cuh",
+            ".h",
+            ".hpp",
+            ".cpp",
+            ".cc",
+            ".ptx",
+            ".cubin",
+            ".json",
+        )
+    }
+    if getattr(module, "__file__", None):
+        files.add(Path(module.__file__))
+    for imported in vars(module).values():
+        if isinstance(imported, ModuleType) and getattr(imported, "__file__", None):
+            path = Path(imported.__file__)
+            if path.suffix in (".so", ".pyd", ".dll", ".dylib"):
+                files.add(path)
+    if not files:
+        return "ABSENT"
+    # Paths outside the installed tree are not part of identity; compiled bytes are.
+    return canonical.digest(sorted(hashlib.sha256(p.read_bytes()).hexdigest() for p in files))

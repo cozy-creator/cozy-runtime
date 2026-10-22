@@ -13,15 +13,12 @@ import pytest
 from cozy_runtime.author import AttentionProducer, ConformanceError, Model
 from cozy_runtime.author import _attention as author_attention
 from cozy_runtime.internal import (
-    accel,
     arch,
     attention,
-    kernel_cache,
     kernel_sources,
     machine_kernels,
     prebuilt,
     static_interface,
-    verify,
 )
 from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.executor import _attention_pin
@@ -70,32 +67,11 @@ def test_each_row_from_its_capability_and_a_set_is_their_intersection() -> None:
 # ------------------------------------------------------------------------------ GEMM
 
 
-@pytest.mark.skipif(bool(prebuilt.ABSENT), reason="this Runtime wheel carries no kernels")
-def test_an_unnamed_card_takes_the_newest_family_whose_prebuilt_kernels_verified(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A fake 13.0, with the verdicts an earlier process on this machine left (§2.6): the wheel's
-    tcgen05 and wgmma kernels failed their probe on it, mma.sync's passed. The card takes
-    mma.sync's 8-bit op and row, and is never probed again."""
+def test_an_unnamed_card_uses_reference_without_search_or_probe() -> None:
     torch = pytest.importorskip("torch")
-    monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [kernel_cache.Store(tmp_path / "u0")])
-    monkeypatch.setattr(verify, "_KNOWN", {})
-    digest = prebuilt.artifact()
-    for family in ("tcgen05", "wgmma", "mma.sync"):
-        for f in ("int8", "fp8"):
-            kernel = f"{prebuilt.KERNELS[f]}-{family.replace('.', '')}"
-            key = (kernel, digest, 130, accel.driver_version())
-            path = verify._path(key)
-            assert path is not None
-            path.parent.mkdir(parents=True, exist_ok=True)
-            verify._write(path, key, verify.Verdict(family == "mma.sync", "an earlier probe"))
     ops, detail = prebuilt.library(torch, 0, 130)
-    assert ops is not None and ops.family == "mma.sync", detail
-    row = arch.row(130)
-    assert row.inherited and (row.family, row.formats()) == ("mma.sync", _88)
-    assert attention.walk(row, 8) == ["kitchen-int8", "sageattention", "sdpa"]
-    assert arch.inherited(130, "GPU-x").startswith("sm_130 (GPU-x) has no row; served as mma.sync")
-    assert arch.inherited(90, "H100") == ""
+    assert ops is None
+    assert "no shipped native family" in detail or prebuilt.ABSENT
 
 
 # ------------------------------------------------------------------------- attention cells
