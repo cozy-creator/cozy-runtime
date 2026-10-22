@@ -507,7 +507,7 @@ class Backend:
             grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
             if self.grant is not None:
                 held = self.grant(grant.manifest, self._layout(name))
-                admitted = {"seal": held.seal} if ADMITS else {}
+                admitted: dict[str, Any] = {"seal": held.seal} if ADMITS else {}
                 grant = replace(
                     grant,
                     host_fd=held.fd,
