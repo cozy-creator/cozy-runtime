@@ -183,3 +183,45 @@ def test_a_decoded_tensor_decodes_once_across_twenty_binds(tmp_path: Path) -> No
         backend.close()
         native.close()
     assert not routes.decoded and routes.cache is None
+
+
+def test_a_component_is_served_in_eval_mode(tmp_path: Path) -> None:
+    """Constructed in training mode (as Diffusers and transformers build), its dropout would
+    act on every request; registered, it serves as written for inference."""
+    from tensorfs.varena import GpuId
+    from tensorfs.varena.torch import Memory
+
+    from cozy_runtime.internal.fill import Checkpoint
+    from cozy_runtime.internal.weights import Backend
+
+    values = torch.randn(64, 32)
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    component = writer.component("net", cls=("torch", "", "Sequential"), config={})
+    component.put("0.weight", values.numpy().tobytes(), dtype="F32", shape=[64, 32])
+    native = writer.commit()
+    del component, writer
+    checkpoint = Checkpoint(native)
+    rows = checkpoint.rows("net")
+    memory = Memory.open(GpuId(f"cozy-eval-mode-{os.getpid()}", "cpu", 1 << 30))
+    backend = Backend.for_script(
+        {"net": checkpoint},
+        rows,
+        torch=torch,
+        memory=memory,
+        device=torch.device("cpu"),
+        construction="eval-mode",
+        release="eval-mode",
+    )
+    with torch.device("meta"):
+        net = torch.nn.Sequential(torch.nn.Linear(32, 64, bias=False), torch.nn.Dropout(0.5))
+    assert net.training
+    model = backend._register("net", net, [r.key for r in rows])
+    try:
+        assert not any(m.training for m in net.modules())
+        x = torch.randn(4, 32)
+        with torch.no_grad(), memory.request("eval-mode"):
+            assert torch.equal(net(x), x @ values.T)
+    finally:
+        model.close()
+        backend.close()
+        native.close()

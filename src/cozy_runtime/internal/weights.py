@@ -440,7 +440,9 @@ class Backend:
 
     def _register(self, name: str, root: Module, keys: list[str]) -> Model:
         """One component loaded into the memory: its stored tensors, bound through their
-        routes, its LoRAs baked on page-in, under the execution layer's catch."""
+        routes, its LoRAs baked on page-in, under the execution layer's catch. Served in eval
+        mode: a model built in training mode would apply its dropouts to every request."""
+        root.eval()
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
