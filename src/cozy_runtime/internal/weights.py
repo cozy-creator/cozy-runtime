@@ -468,7 +468,7 @@ class Backend:
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
-        routes = self.routes[name] = _Routes(self, name, rows, root)
+        routes = self.routes[name] = _Routes(self, name, rows)
         leg = self._leg(f"{name}.routes", leg)
         vars(root)["_varena"] = Declared(
             Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
@@ -550,10 +550,8 @@ class _Routes:
     bind: it is kept under the fill identity it was decoded from, as the memory's cache, which
     varena sheds on its ask (the next bind decodes again). Leaf buffers live for that bind."""
 
-    def __init__(
-        self, backend: Backend, component: str, rows: Mapping[str, PlanRow], root: Module
-    ) -> None:
-        self.backend, self.component, self.root = backend, component, root
+    def __init__(self, backend: Backend, component: str, rows: Mapping[str, PlanRow]) -> None:
+        self.backend, self.component = backend, component
         self.torch = backend.torch
         self.rows = dict(rows)
         self.routes = {stored: backend._route(row.key) for stored, row in rows.items()}
@@ -610,11 +608,7 @@ class _Routes:
         with self.lock:
             self.decoded[key] = (identity, out)
             if self.cache is None:
-                self.cache = self.backend.memory.cache(
-                    f"decoded:{self.component}",
-                    self.shed,
-                    model=self.root,
-                )
+                self.cache = self.backend.memory.cache(f"decoded:{self.component}", self.shed)
             self.cache.cached(self._held())
 
     def _held(self) -> int:
@@ -893,10 +887,9 @@ class Placement:
         """Every page `binding` covers is on the device now (an idle capture never fills one)."""
         return bool(binding.native.resident())
 
-    def cache(self, owner: str, shed: Callable[[int], int], roots: list[Any]) -> Cache | None:
-        """Device bytes `owner` keeps for speed for the components `roots`, counted and shed
-        on ask, in their class; None off a GPU."""
-        return self.memory.cache(owner, shed, model=roots) if self.memory.cuda else None
+    def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
+        """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
+        return self.memory.cache(owner, shed) if self.memory.cuda else None
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value

@@ -3393,7 +3393,7 @@ class Executor:
                             ),
                             publish=lambda request: exchange(request, Published),
                             calls=self.host._call_broker(
-                                command.request_id, command.family, self.host.call_interfaces
+                                command.request_id, self.host.call_interfaces
                             ),
                         ),
                     )
@@ -4220,9 +4220,9 @@ class Executor:
                 proxy.__module__ = module
                 imported.__dict__[export] = proxy
 
-    def _call_broker(self, request_id: str, family: str, rows: tuple[CallInterface, ...]) -> Any:
+    def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
         """This attempt's broker over `rows`, bound once per executor (a served package's
-        attempts share its Start's rows); a wait on a child yields to `family`."""
+        attempts share its Start's rows)."""
         if not rows:
             return None
         if self._bound_calls is None or self._bound_calls[0] is not rows:
@@ -4233,14 +4233,7 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
-            functools.partial(self._yielding, request_id, family),
         )
-
-    def _yielding(self, request_id: str, family: str) -> contextlib.AbstractContextManager[object]:
-        """While the attempt waits on a child call, its request yields its reserved room to its
-        `family` alone; its allocated tensors stay counted (`r.yielding`)."""
-        request = self.host.requests.get(request_id)
-        return contextlib.nullcontext() if request is None else request.yielding(family)
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
@@ -4469,8 +4462,7 @@ class Executor:
         finally:
             if request is not None:
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
-                stats = request.stats()
-                rows.append(host.execution.record(stats, gpu, device, self._store(), since))
+                rows.append(host.execution.record(request, gpu, device, self._store(), since))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is

@@ -1017,11 +1017,7 @@ def _record(
             else nullcontext()
         )
         # Discovery owns the complete range set and then the admitted free headroom.
-        lease = (
-            recorder.binding.prepare(current, workspace=None)
-            if recorder.binding is not None
-            else nullcontext()
-        )
+        lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
         with scope, lease:
             owner.initialize()
             stream = owner.stream
@@ -1092,13 +1088,9 @@ def _record(
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
         for index, tensor in enumerate(entry.statics):
             _LENT[tensor.data_ptr()] = (weakref.ref(entry), index)
-        if placed is not None and (owner.serve(_REGIONS[module][0]()) or owner.cache is None):
-            # One cache for the pool, serving every component recorded into it (its class is
-            # the most protective of theirs): registered again when one joins.
-            if owner.cache is not None:
-                owner.cache.close()
-            roots = [r for r in (ref() for ref in owner.served) if r is not None]
-            owner.cache = placed[0].cache("graphs", functools.partial(_shed, torch, owner), roots)
+        owner.serve(_REGIONS[module][0]())
+        if placed is not None and owner.cache is None:  # one cache for the device's pool
+            owner.cache = placed[0].cache("graphs", functools.partial(_shed, torch, owner))
         if owner.cache is not None:
             owner.cache.cached(owner.capture_bytes())
         return True

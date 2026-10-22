@@ -130,25 +130,6 @@ def test_one_rank_plans_its_own_request_and_records_it(tmp_path: Path) -> None:
         right.close()
 
 
-def test_a_wait_on_a_child_yields_to_the_invoke_s_family(tmp_path: Path) -> None:
-    """While an attempt waits on a child call, its request yields its room under the family
-    its Invoke names, through varena's `yielding(family)`; twice in one request, as two child
-    calls would. An attempt with no request has nothing to yield."""
-    left, right = socket.socketpair()
-    executor = placed(Executor(Channel(left), tmp_path), tmp_path / "store")
-    try:
-        with executor._request("parent") as rows:
-            for _ in range(2):
-                with executor._yielding("parent", "family-a"):
-                    pass
-            with executor._yielding("absent", "family-a"):
-                pass
-        assert rows[0].stats.leftover == 0
-    finally:
-        left.close()
-        right.close()
-
-
 def launch(argv: list[str], fd: int) -> spawn.Child:
     """A real follower process (`testdata/request_memory_follower.py`)."""
     return spawn.spawn_follower(
