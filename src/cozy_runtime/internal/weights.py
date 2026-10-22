@@ -793,6 +793,11 @@ class Placement:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)
 
+    def graph_hold(self, component: str, shed: Callable[[], None]) -> Any:
+        """Every block of the component bound until released: a request's replays keep their
+        backing instead of binding it again around each one."""
+        return self.models[component].hold(shed)
+
     def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
         return self.models[component].passing(entry, args, kwargs)
 
