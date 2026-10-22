@@ -21,11 +21,12 @@ import inspect
 import json
 import logging
 import threading
+import time
 import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import (
     Any,
     Concatenate,
@@ -1250,8 +1251,10 @@ class ModelRegistry:
                 # substrate this is exactly the old behaviour: an ordinary construction.
                 if self._substrate is not None:
                     stack.enter_context(self._substrate())
+                began = time.perf_counter()
                 with loading(loader):
                     model.load(loader)
+                loaded = round((time.perf_counter() - began) * 1000, 1)
             records = loader.records()
             if not records:
                 raise ConformanceError(
@@ -1260,6 +1263,9 @@ class ModelRegistry:
                     code="no_construction",
                 )
             record = records[0] if len(records) == 1 else _merge(records)
+            # The package's whole load() beside its constructions' legs: what its own code spent
+            # after them (tokenizers, schedulers, its assets).
+            record = replace(record, stage_ms=(*record.stage_ms, ("package_load", loaded)))
             if record.skipped and not record.components:
                 raise ModelFitRefused(
                     {

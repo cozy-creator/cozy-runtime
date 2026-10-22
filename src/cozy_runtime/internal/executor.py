@@ -2750,7 +2750,9 @@ class Executor:
             "prepare_ms": round((time.perf_counter() - started) * 1000, 2),
             "prepared_unix_ms": int(time.time() * 1000),
             # THE SEGMENT LEDGER (cr-102), in execution order.
-            "stages": list(stages) + [(f"construct.{name}", ms) for name, ms in record.stage_ms],
+            "stages": list(stages)
+            + [(f"construct.{name}", ms) for name, ms in record.stage_ms]
+            + [(f"register.{name}", ms) for name, ms in backend.legs],
             "qualification": qualification.document(),
             "substrate_census": list(record.weightless),
             "execution_plan": planned,

@@ -110,6 +110,9 @@ class Backend:
         self.routes: dict[str, _Routes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
         self.stats: dict[str, float] = {}
+        #: the registration's own legs (leaves installed, each component's load and catch), in
+        #: execution order: what the construction's `fill` leg spent beside validation
+        self.legs: list[tuple[str, float]] = []
         self.device_facts = device_facts
         self.providers = launch_providers()
         self.capabilities, self.probe = qualified
@@ -389,18 +392,20 @@ class Backend:
                 f"({', '.join(missing[:4])}): a DestinationSet is complete or nothing commits",
                 missing[:6],
             )
-        started = time.perf_counter()
+        started = leg = time.perf_counter()
         order = list(self.enqueued)
         self.leaves = {
             key: self._install_leaf(key) for key in order if self._route(key) == "encoded_gemm"
         }
         self.gemm_sites = leaf_sites(self.leaves)
+        leg = self._leg("leaves", leg)
         for name, root in self.roots.items():
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
                 self.models[name] = self._register(name, root, keys)
         if self.device.type == "cuda" and any(b.bakes for b in self.bakes.values()):
             lora_bake.warm(self.device.index or 0)  # its kernels build at load, in a child
+            self._leg("lora_warm", leg)
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
         self.state = "ready"
 
@@ -470,11 +475,13 @@ class Backend:
         """One component loaded into the memory: its stored tensors, bound through their
         routes, its LoRAs baked on page-in, under the execution layer's catch. Served in eval
         mode: a model built in training mode would apply its dropouts to every request."""
+        leg = time.perf_counter()
         root.eval()
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
         routes = self.routes[name] = _Routes(self, name, rows, root)
+        leg = self._leg(f"{name}.routes", leg)
         vars(root)["_varena"] = Declared(
             Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
             fill=bakes if bakes.bakes else None,
@@ -483,9 +490,16 @@ class Backend:
         # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).
         model = self.memory.load(root, Level.RAM)
+        leg = self._leg(f"{name}.load", leg)
         # Install explicit pure cuts and names; arbitrary package code is never replayed.
         execution.install(root)
+        self._leg(f"{name}.catch", leg)
         return model
+
+    def _leg(self, name: str, since: float) -> float:
+        now = time.perf_counter()
+        self.legs.append((name, round((now - since) * 1000, 1)))
+        return now
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
