@@ -397,45 +397,20 @@ def _placed(module: Any) -> tuple[Any, str] | None:
     return PLACED.get(region[0]()) if region is not None else PLACED.get(module)
 
 
-def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> tuple[int, int]:
-    """Varena's ask: every graph on the device goes, with their shared pool (it never asks while
-    a call holds the pool). A region call in flight on another thread holds the locks, and may
-    wait on varena: the drop runs when it lets them go, its bytes coming. (freed, coming)."""
-    nbytes = owner.capture_bytes()
-    if _drop(torch, owner):
-        return nbytes, 0
-    owner.deferred = functools.partial(_land, torch, owner)
-    return 0, nbytes
-
-
-def _land(torch: Any, owner: domain.Domain) -> None:
-    """A deferred drop, as the call holding the domain lets go: its coming bytes arrive."""
-    if not _drop(torch, owner):
-        owner.deferred = functools.partial(_land, torch, owner)
-    elif owner.cache is not None:
-        owner.cache.cached(0)
-
-
-def _drop(torch: Any, owner: domain.Domain) -> bool:
-    """Every graph on the device and its pool go now; False when a call holds the locks."""
-    if not owner.lock.acquire(blocking=False):
-        return False
-    recorders = list(owner.recorders)
-    held: list[_Recorder] = []
-    try:
-        for recorder in recorders:
-            if not recorder.lock.acquire(blocking=False):
-                return False
-            held.append(recorder)
-        for recorder in recorders:
+def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> int:
+    """Varena's ask: every graph on the device goes now, with their shared pool. It never asks
+    a held pool, so no call reads, captures or replays a recording of it; a call that took its
+    hold after varena decided finds it held, and nothing goes. Only the pool's own lock is
+    taken: a region call may hold the domain while its bind waits on varena (review 7, K1)."""
+    with owner.pool_lock:
+        if owner.held:
+            return 0
+        nbytes = owner.capture_bytes()
+        for recorder in list(owner.recorders):
             recorder.drop()
         owner.unhold()
         owner.drop_captures()
-        return True
-    finally:
-        for recorder in held:
-            recorder.lock.release()
-        owner.lock.release()
+        return nbytes
 
 
 def release(torch: Any, root: Any) -> None:
@@ -678,88 +653,106 @@ def _region_call(
                 return eager()
             if recorder.binding is None:
                 recorder.binding = placed[0].retain(placed[1], (_REGIONS[module][1],))
-        binding = recorder.binding
-        entry = recorder.recordings.get(key)
-        if entry is None:
-            if placed is not None and not placed[0].graph_accounted():
-                why = _GAPS[module] = "driver/context memory is unmeasured"
-                _failed(recorder, key, placed, why)
-                return eager()
-            # Admitted only beside the step's working set: its static buffers must fit in what
-            # the request could get without evicting W or a pinned page (the pool's growth past
-            # that is refused by the allocator, never taken from W).
-            spare = placed[0].graph_spare() if placed is not None else None
-            if spare is not None and spare < recorder.statics.get(key, 0):
-                recorder.waiting[key] = attempt
-                _refused(module, placed, f"graph refused: room ({spare} bytes spare)")
-                return eager()
-            # Discovery owns the complete range set and then the admitted free headroom.
-            # Only the declared pure region runs here; this does not select/tune kernels.
-            lease = (
-                binding.prepare(torch.cuda.current_stream(), workspace=None)
-                if binding is not None
-                else nullcontext()
-            )
-            held = recorder.domain.holding()  # the pool it grows is never shrunk under it
-            held.__enter__()
-            try:
-                lease.__enter__()
-            except Exception as exc:
-                held.__exit__(None, None, None)
-                if not _unprepared(exc):
-                    raise
-                recorder.waiting[key] = attempt
-                _refused(module, placed, f"its weights cannot all be resident at once ({exc})")
-                return eager()
-            began = time.perf_counter()
-            try:
-                entry = _record(torch, module, call, leaves, spec, recorder, key, placed)
-            finally:
-                lease.__exit__(None, None, None)
-                held.__exit__(None, None, None)
-                took = (time.perf_counter() - began) * 1e3
-                recorder.capture_ms += took
-                recorder.capture_each.append(round(took, 3))
-            if entry is None:
-                return eager()
-        verdict = entry.ready(leaves)
-        if verdict:
-            recorder.held += 1
-            if verdict == "stale" and entry.idle():
-                recorder.recordings.pop(key).close()
-            return eager()
-        # A component root's results leave the component (a package's loop may keep them past
-        # its next call): they are copied out, allocated before the physical lease so admission
-        # sees their segments. Regions inside the call lend theirs.
-        # Its pool is held from preparation until the replay completes on the device: no
-        # preparation of its own evicts the graph it is about to replay.
+        # The pool is held from reading its recording through preparation, a capture and the
+        # replay until the device completes it: varena never shrinks the graph a call is using.
         with recorder.domain.holding():
-            try:
-                out = entry.output() if _REGIONS[module][0]() is module else None
-            except Exception as exc:
-                if not _unprepared(exc):
-                    raise
-                recorder.waiting[key] = attempt
-                return eager()
-            try:
-                root, path = _REGIONS[module][0](), _REGIONS[module][1]
-                lease = _lease(torch, recorder.domain, placed, binding, attempt, root, path == "")
-                lease.__enter__()
-            except Exception as exc:
-                if not _unprepared(exc):
-                    raise
-                del out
-                recorder.waiting[key] = attempt
-                _refused(module, placed, f"its weights cannot all be resident at once ({exc})")
-                return eager()
-            try:
-                result = recorder.replayed.run(torch, lambda: entry(leaves, out))
-                _GAPS.pop(module, None)
-                recorder.replays += 1
-                recorder.copy_bytes += entry.copied
-                return result
-            finally:
-                lease.__exit__(None, None, None)
+            result = _replay(torch, module, call, leaves, spec, placed, recorder, key)
+        return eager() if result is _EAGER else result
+
+
+#: `_replay`'s answer when the call runs as written
+_EAGER = object()
+
+
+def _replay(
+    torch: Any,
+    module: Any,
+    call: Callable[..., Any],
+    leaves: list[Any],
+    spec: Any,
+    placed: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+) -> Any:
+    """The call replayed (captured first when it has no recording), or `_EAGER`."""
+    owner = recorder.domain
+    assert owner is not None
+    attempt = placed[0].attempts if placed is not None else recorder.attempts
+    binding = recorder.binding
+    entry = recorder.recordings.get(key)
+    if entry is None:
+        if placed is not None and not placed[0].graph_accounted():
+            why = _GAPS[module] = "driver/context memory is unmeasured"
+            _failed(recorder, key, placed, why)
+            return _EAGER
+        # Admitted only beside the step's working set: its static buffers must fit in what the
+        # request could get without evicting W or a pinned page (the pool's growth past that is
+        # refused by the allocator, never taken from W).
+        spare = placed[0].graph_spare() if placed is not None else None
+        if spare is not None and spare < recorder.statics.get(key, 0):
+            recorder.waiting[key] = attempt
+            _refused(module, placed, f"graph refused: room ({spare} bytes spare)")
+            return _EAGER
+        # Discovery owns the complete range set and then the admitted free headroom.
+        # Only the declared pure region runs here; this does not select/tune kernels.
+        lease = (
+            binding.prepare(torch.cuda.current_stream(), workspace=None)
+            if binding is not None
+            else nullcontext()
+        )
+        try:
+            lease.__enter__()
+        except Exception as exc:
+            if not _unprepared(exc):
+                raise
+            recorder.waiting[key] = attempt
+            _refused(module, placed, f"its weights cannot all be resident at once ({exc})")
+            return _EAGER
+        began = time.perf_counter()
+        try:
+            entry = _record(torch, module, call, leaves, spec, recorder, key, placed)
+        finally:
+            lease.__exit__(None, None, None)
+            took = (time.perf_counter() - began) * 1e3
+            recorder.capture_ms += took
+            recorder.capture_each.append(round(took, 3))
+        if entry is None:
+            return _EAGER
+    verdict = entry.ready(leaves)
+    if verdict:
+        recorder.held += 1
+        if verdict == "stale" and entry.idle():
+            recorder.recordings.pop(key).close()
+        return _EAGER
+    # A component root's results leave the component (a package's loop may keep them past its
+    # next call): they are copied out, allocated before the physical lease so admission sees
+    # their segments. Regions inside the call lend theirs.
+    try:
+        out = entry.output() if _REGIONS[module][0]() is module else None
+    except Exception as exc:
+        if not _unprepared(exc):
+            raise
+        recorder.waiting[key] = attempt
+        return _EAGER
+    try:
+        root, path = _REGIONS[module][0](), _REGIONS[module][1]
+        lease = _lease(torch, owner, placed, binding, attempt, root, path == "")
+        lease.__enter__()
+    except Exception as exc:
+        if not _unprepared(exc):
+            raise
+        del out
+        recorder.waiting[key] = attempt
+        _refused(module, placed, f"its weights cannot all be resident at once ({exc})")
+        return _EAGER
+    try:
+        result = recorder.replayed.run(torch, lambda: entry(leaves, out))
+        _GAPS.pop(module, None)
+        recorder.replays += 1
+        recorder.copy_bytes += entry.copied
+        return result
+    finally:
+        lease.__exit__(None, None, None)
 
 
 def _record(

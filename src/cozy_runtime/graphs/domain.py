@@ -19,8 +19,8 @@ import ctypes
 import sys
 import threading
 import weakref
-from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -61,8 +61,9 @@ class Domain:
         self.cache: Any = None
         self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
         self.served: list[weakref.ref[Any]] = []
-        #: varena's drop of the pool, asked while a call held the domain: run as it lets go
-        self.deferred: Callable[[], object] | None = None
+        #: the pool's own lock (never held across a wait): a call's hold count and varena's drop
+        self.pool_lock = threading.Lock()
+        self.held = 0
         #: per component root, its blocks held bound across a request's replays (`Model.hold`)
         self.holds: weakref.WeakKeyDictionary[Any, Hold] = weakref.WeakKeyDictionary()
 
@@ -125,28 +126,22 @@ class Domain:
 
     @contextmanager
     def using(self) -> Iterator[None]:
-        """Serialize shared workspace and order producers/output copies across streams. A drop
-        varena asked for while a call held the domain runs once the outermost call lets go."""
-        depth = getattr(self.local, "depth", 0)
-        try:
-            with self.lock:
-                current = self.torch.cuda.current_stream(self.device)
+        """Serialize shared workspace and order producers/output copies across streams."""
+        with self.lock:
+            current = self.torch.cuda.current_stream(self.device)
+            depth = getattr(self.local, "depth", 0)
+            if not depth and self.done is not None:
+                current.wait_event(self.done)
+                self.last_stream, self.fenced = current, False
+            self.local.depth = depth + 1
+            try:
+                yield
+            finally:
+                self.local.depth -= 1
                 if not depth and self.done is not None:
-                    current.wait_event(self.done)
                     self.last_stream, self.fenced = current, False
-                self.local.depth = depth + 1
-                try:
-                    yield
-                finally:
-                    self.local.depth -= 1
-                    if not depth and self.done is not None:
-                        self.last_stream, self.fenced = current, False
-                        self.done.record(current)
-                        self.fenced = True
-        finally:
-            if not depth and (deferred := self.deferred) is not None:
-                self.deferred = None
-                deferred()
+                    self.done.record(current)
+                    self.fenced = True
 
     def prime_blas(self) -> None:
         """Prime the actual capture thread's handle into persistent domain ownership."""
@@ -221,10 +216,19 @@ class Domain:
         self.captures = None  # MemPool destruction releases this pool, never a global flush.
         self.served = []
 
-    def holding(self) -> AbstractContextManager[object]:
-        """The pool is never shrunk inside the block (preparation, a capture, a replay), nor
-        after it until the work queued on the current stream completes."""
-        return self.cache.holding() if self.cache is not None else nullcontext()
+    @contextmanager
+    def holding(self) -> Iterator[None]:
+        """The pool is never shrunk inside the block (reading a recording, preparation, a
+        capture, a replay), nor after it until the work queued on the current stream completes:
+        varena never asks a held cache, and a drop it asked before the hold finds it held."""
+        with self.pool_lock:
+            self.held += 1
+        try:
+            with self.cache.holding() if self.cache is not None else nullcontext():
+                yield
+        finally:
+            with self.pool_lock:
+                self.held -= 1
 
     def close_cache(self) -> None:
         if self.cache is not None:

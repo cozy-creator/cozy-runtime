@@ -240,10 +240,12 @@ def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
 
 @pytest.mark.real_gpu
 @pytest.mark.skipif(not CUDA, reason="graph retirement needs real completion events")
-def test_a_drop_asked_while_a_call_holds_the_domain_runs_when_it_lets_go() -> None:
-    """Varena's shrink runs on its own thread; a region call in flight holds the domain (and may
-    wait on varena), so the drop is deferred, its bytes reported coming, and runs as the call
-    lets go. A drop with the last output copy still in flight leaves the result intact."""
+def test_a_shrink_while_a_call_holds_the_domain_completes_at_once() -> None:
+    """Review 7 K1's chain: a region call holds the domain while its bind waits on varena,
+    whose demand shrinks the pool on varena's thread. The shrink takes only the pool's own
+    lock: it drops every graph and frees the pool at once, never waiting on the call. A pool a
+    call holds (varena decided before the hold) gives nothing. A drop with the last output copy
+    still in flight leaves the result intact."""
     module = _mlp("cuda")
     with torch.inference_mode():
         x = torch.ones(4, 64, device="cuda")
@@ -254,16 +256,16 @@ def test_a_drop_asked_while_a_call_holds_the_domain_runs_when_it_lets_go() -> No
         owner = recorder.domain
         assert owner is not None
         with ThreadPoolExecutor(1) as varena, owner.using():
-            freed, coming = varena.submit(graphs._shed, torch, owner).result()
-            assert freed == 0 and coming == owner.capture_bytes() > 0
-            assert recorder.recordings and owner.deferred is not None
-        assert not recorder.recordings and owner.captures is None
+            assert varena.submit(graphs._shed, torch, owner).result() > 0
+            assert not recorder.recordings and owner.captures is None
         module(x)
         module(x)
+        with ThreadPoolExecutor(1) as varena, owner.holding():
+            assert varena.submit(graphs._shed, torch, owner).result() == 0
+            assert recorder.recordings
         torch.cuda._sleep(1 << 29)
         result = module(x)
-        freed, coming = graphs._shed(torch, owner)
-        assert freed > 0 and coming == 0 and not recorder.recordings
+        assert graphs._shed(torch, owner) > 0 and not recorder.recordings
         torch.cuda.synchronize()
         torch.testing.assert_close(result, torch.nn.Sequential.__call__(module, x))
 
