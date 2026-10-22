@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import Any, ClassVar, cast
 
 import pytest
 import tensorfs
@@ -83,8 +83,9 @@ class Source:
         return factors, factors.lora_down, factors.lora_up, SCALE
 
 
-def _store(tmp_path: Path) -> tuple[tensorfs.Checkpoint, dict[str, torch.Tensor]]:
-    torch.manual_seed(5)
+def _store(tmp_path: Path, seed: int) -> tuple[tensorfs.Checkpoint, dict[str, torch.Tensor]]:
+    """Weights and factors from `seed`: the same seed is the same bytes (one fingerprint)."""
+    torch.manual_seed(seed)
     values = {f"blocks.{i}.lin.weight": torch.randn(DIM, DIM) for i in range(2)}
     factors = {
         f"blocks.{i}.lin.lora_{role}": torch.randn(*shape)
@@ -101,12 +102,10 @@ def _store(tmp_path: Path) -> tuple[tensorfs.Checkpoint, dict[str, torch.Tensor]
     return native, {**values, **factors}
 
 
-@pytest.mark.parametrize("pieces", [True, False], ids=["pieces", "no-blocks"])
-def test_a_bake_reads_each_sources_factors_in_its_piece(tmp_path: Path, pieces: bool) -> None:
-    native, values = _store(tmp_path)
+def _backend(native: tensorfs.Checkpoint, table: str) -> tuple[Backend, Memory, list[Any]]:
     checkpoint = Checkpoint(native)
     rows = [*checkpoint.rows("overlay"), *checkpoint.rows("dit")]
-    memory = Memory.open(GpuId(f"cozy-lora-pieces-{os.getpid()}-{pieces}", "cpu", 1 << 30))
+    memory = Memory.open(GpuId(f"cozy-lora-pieces-{os.getpid()}-{table}", "cpu", 1 << 30))
     backend = Backend.for_script(
         {"dit": checkpoint, "overlay": checkpoint},
         rows,
@@ -116,6 +115,13 @@ def test_a_bake_reads_each_sources_factors_in_its_piece(tmp_path: Path, pieces: 
         construction="lora-pieces",
         release="lora-pieces",
     )
+    return backend, memory, rows
+
+
+@pytest.mark.parametrize("pieces", [True, False], ids=["pieces", "no-blocks"])
+def test_a_bake_reads_each_sources_factors_in_its_piece(tmp_path: Path, pieces: bool) -> None:
+    native, values = _store(tmp_path, 5 + pieces)  # each case its own bytes: each bakes fresh
+    backend, memory, rows = _backend(native, str(pieces))
     with torch.device("meta"):
         overlay, net = Overlay(pieces), Net()
     for i, block in enumerate(net.blocks):
