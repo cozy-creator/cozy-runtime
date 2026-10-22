@@ -21,6 +21,7 @@ from typing import Any
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
+from cozy_runtime.graphs import domain
 from cozy_runtime.graphs.regions import regions, safe
 from cozy_runtime.internal import attention_ulysses
 
@@ -138,6 +139,7 @@ class _Recorder:
         self.replays = 0
         self.attempts = 0
         self.landed = LANDED[0]
+        self.domain: domain.Domain | None = None
 
     def forget(self, torch: Any) -> bool:
         if any(not entry.idle() for entry in self.recordings.values()):
@@ -241,6 +243,12 @@ def release(torch: Any, root: Any) -> None:
                         entry.done.synchronize()
                 recorder.forget(torch)
         _REGIONS.pop(module, None)
+    domain.release(root)
+
+
+def capture_domain(torch: Any, root: Any, memory: Any = None) -> domain.Domain:
+    """The component owns hidden library scratch independently of its disposable graphs."""
+    return domain.acquire(torch, root, memory)
 
 
 def _unprepared(exc: BaseException) -> bool:
@@ -291,7 +299,13 @@ def _region_call(
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
     key = (*_signature(torch, leaves, spec), _structure(torch, module), levels, addresses, autocast)
-    with recorder.lock:
+    if recorder.domain is None:
+        recorder.domain = (
+            placed[0].graph_domain(placed[1])
+            if placed is not None
+            else capture_domain(torch, _REGIONS[module][0]())
+        )
+    with recorder.domain.using(), recorder.lock:
         if recorder.landed != LANDED[0] and not recorder.forget(torch):
             return call(module, *args, **kwargs)
         recorder.attempts += 1
@@ -381,9 +395,14 @@ def _record(
     # the exact capture pool; it does not time or select kernels, or run arbitrary package code.
     current, stream = torch.cuda.current_stream(), None
     try:
-        pool = placed[0].graph_pool() if placed is not None else torch.cuda.MemPool()
-        stream = torch.cuda.Stream()
+        assert recorder.domain is not None
+        recorder.domain.initialize()
+        stream = recorder.domain.stream
         stream.wait_stream(current)
+        # Library handles cache scratch by stream. Initialize under domain ownership before
+        # any region pool becomes active; every executable sharing that scratch is serialized.
+        recorder.domain.prime_blas()
+        pool = placed[0].graph_pool() if placed is not None else torch.cuda.MemPool()
         allocating = (
             placed[0].graph_allocating(pool)
             if placed is not None
@@ -452,7 +471,11 @@ def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str)
 
 def _facts(recorder: _Recorder) -> str:
     held = sum(e.nbytes for e in recorder.recordings.values())
-    return f"{len(recorder.recordings)} regions, {recorder.replays} replays, {held >> 20} MiB pools"
+    shared = recorder.domain.nbytes() if recorder.domain is not None else 0
+    return (
+        f"{len(recorder.recordings)} regions, {recorder.replays} replays, {held >> 20} MiB pools, "
+        f"domain {id(recorder.domain):x} {shared >> 20} MiB shared"
+    )
 
 
 def _unplain(torch: Any, leaves: list[Any]) -> str:
@@ -507,4 +530,4 @@ def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
     )
 
 
-__all__ = ["BYPASS", "capture", "install", "native", "release", "say"]
+__all__ = ["BYPASS", "capture", "capture_domain", "install", "release", "say"]

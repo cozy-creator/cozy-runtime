@@ -1,6 +1,4 @@
-"""`graphs.install`: a component root's calls run as written on a CPU; on CUDA the second call of
-a signature records a graph whose first replay is checked against the call as written, later
-calls replay it, and a call that depends on more than its arguments keeps running as written."""
+"""Development numerical and lifetime qualification for shipped pure CUDA graph regions."""
 
 from __future__ import annotations
 
@@ -158,22 +156,33 @@ def test_an_unknown_python_hook_keeps_the_region_eager() -> None:
 def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
     module = _mlp("cuda")
     first, second = torch.cuda.Stream(), torch.cuda.Stream()
-    with torch.inference_mode():
-        module(torch.ones(4, 64, device="cuda"))
-        module(torch.ones(4, 64, device="cuda"))
+    first.wait_stream(torch.cuda.current_stream())
+    second.wait_stream(torch.cuda.current_stream())
 
-    def run(stream: Any, value: float) -> tuple[Any, Any]:
+    def run(stream: Any, value: float, rows: int) -> tuple[Any, Any]:
         with torch.inference_mode(), torch.cuda.stream(stream):
-            x = torch.full((4, 64), value, device="cuda")
+            x = torch.full((rows, 64), value, device="cuda")
             expected = torch.nn.Sequential.__call__(module, x)
+            module(x)
             return module(x), expected
 
     with ThreadPoolExecutor(max_workers=2) as workers:
-        a, b = workers.submit(run, first, 1.0), workers.submit(run, second, 2.0)
+        a, b = workers.submit(run, first, 1.0, 4), workers.submit(run, second, 2.0, 8)
         outputs = [a.result(), b.result()]
     torch.cuda.synchronize()
+    recorder = graphs._RECORDERS[module]
+    assert len(recorder.recordings) == 2
     for got, expected in outputs:
         torch.testing.assert_close(got, expected)
+    # Retire one executable/pool while the other still embeds the domain's BLAS pointers.
+    shared = recorder.domain.pool
+    workspace = recorder.domain.nbytes()
+    key = next(k for k, v in recorder.recordings.items() if v.inputs[0].shape[0] == 4)
+    del recorder.recordings[key]
+    torch.cuda.empty_cache()
+    assert recorder.domain.pool is shared and recorder.domain.nbytes() == workspace
+    got, expected = run(second, 3.0, 8)
+    torch.testing.assert_close(got, expected)
     graphs.release(torch, module)
     # Returned copies outlive both the executable and its private allocator pool.
     for got, expected in outputs:

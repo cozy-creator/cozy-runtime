@@ -285,6 +285,10 @@ class Residency(Protocol):
         """A distinct allocator pool for one executable's static data and scratch."""
         ...
 
+    def graph_domain(self, component: str) -> Any:
+        """Shared capture stream and library workspace, serialized across component graphs."""
+        ...
+
     def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
         """Prepare allocations in the same pool capture will use, outside capture."""
         ...

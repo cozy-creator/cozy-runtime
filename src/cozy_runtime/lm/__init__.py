@@ -13,12 +13,11 @@ its token on the GPU (greedy, with an optional presence penalty), writes it wher
 reads it and advances its own positions, so replays queue back to back and the host reads the
 stop flag a few steps behind.
 
-A graph reads the weights at their plane homes: a weight set keeps one device address range for
-its life, and a refill maps a region back at the same address. For the loop Runtime leases every
-block the step reads at home and turns their paging hooks off (`Residency.held`). Where they do
-not all fit, or the device has no room for a graph's pool beside them, the call decodes
-through Transformers' loop, and so does one that runs out of device memory; on a CPU, or after a
-capture fails (a run warning), the same step runs eagerly. A model this does not
+A graph reads retained virtual addresses: a refill maps physical backing at those same
+addresses. The loop leases every block the step reads only while its driver is active. If
+the full set cannot be prepared before execution, the call uses Transformers' loop. Errors
+after execution starts are final; package code is never restarted. On a CPU, or after a safe
+capture refusal (a run warning), the same step runs eagerly. A model this does not
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
 generation config that adds logits processors) generates through Transformers, said once.
 
@@ -47,7 +46,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, capture, say
+from cozy_runtime.graphs import BYPASS, capture, capture_domain, say
 from cozy_runtime.lm import _kernels
 
 try:
@@ -1028,7 +1027,7 @@ class _Engine:
         self.unprepared: BaseException | None = None
         self.completions: dict[Any, Any] = {}
         self.unfenced: set[Any] = set()
-        self.side: Any = None
+        self.domain: Any = None
         #: (bucket, window, drafted) -> why that step runs eagerly
         self.unrecorded: dict[tuple[int, int, bool], str] = {}
         #: the graphs recorded a path that changed since (a kernel landed in `install`)
@@ -1228,6 +1227,13 @@ class _Engine:
         self.cache.window = window(max(row.reach for row in rows) + per, self.capacity)
         stream, event = None, None
         if self.cache_device.type == "cuda":
+            if self.domain is None:
+                placed = PLACED.get(self.model)
+                self.domain = (
+                    placed[0].graph_domain(placed[1])
+                    if placed is not None
+                    else capture_domain(torch, self.model)
+                )
             stream = torch.cuda.current_stream()
             event = self.completions.get(stream)
             if event is None:
@@ -1235,7 +1241,8 @@ class _Engine:
                 event.record(stream)  # instantiate before any accepted step can run
             self.unfenced.add(stream)
         try:
-            run(size)
+            with self.domain.using() if stream is not None else nullcontext():
+                run(size)
         finally:
             if event is not None:
                 event.record(stream)
@@ -1649,13 +1656,18 @@ class _Engine:
     def _graph_memory(self, pool: Any, *, route: bool) -> Iterator[None]:
         """Prepare the exact pool and join the side stream before the driver lease can end."""
         current = torch.cuda.current_stream()
-        self.side.wait_stream(current)
         placed = PLACED.get(self.model)
         binding = self.addresses.get(id(self.model))
+        side = None
         try:
-            with torch.cuda.stream(self.side), ExitStack() as stack:
+            with ExitStack() as stack:
                 if binding is not None:
-                    stack.enter_context(binding.prepare(self.side, workspace=None))
+                    stack.enter_context(binding.prepare(current, workspace=None))
+                self.domain.initialize()
+                side = self.domain.stream
+                side.wait_stream(current)
+                self.domain.prime_blas()
+                stack.enter_context(torch.cuda.stream(side))
                 stack.enter_context(
                     placed[0].graph_allocating(pool, route=route)
                     if placed is not None
@@ -1663,9 +1675,13 @@ class _Engine:
                     if route
                     else nullcontext()
                 )
-                yield
+                try:
+                    yield
+                finally:
+                    current.wait_stream(side)  # before the discovery lease records last use
         finally:
-            current.wait_stream(self.side)
+            if side is not None:
+                current.wait_stream(side)
 
     def _replay(self, size: int, cuda: bool) -> None:
         drafted = self._drafting(size)
@@ -1681,8 +1697,6 @@ class _Engine:
             return
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
-            if self.side is None:
-                self.side = torch.cuda.Stream()
             if key not in self.warmed:
                 placed = PLACED.get(self.model)
                 pool = placed[0].graph_pool() if placed is not None else torch.cuda.MemPool()
@@ -1698,7 +1712,9 @@ class _Engine:
             try:
                 # Warm routing ended: capture enters the SAME pool, not a nested use_mem_pool.
                 with self._graph_memory(pool, route=False):
-                    graph, why = capture(torch, lambda: self._advance(size), pool, self.side)
+                    graph, why = capture(
+                        torch, lambda: self._advance(size), pool, self.domain.stream
+                    )
             except Building:
                 graph, why, self.building = None, "", LANDED[0]
             self.captured[0] += 1

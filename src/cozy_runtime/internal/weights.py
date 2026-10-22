@@ -684,6 +684,7 @@ class Placement:
 
     def __init__(self, memory: Memory, backend: Backend) -> None:
         self.memory = memory
+        self.torch = backend.torch
         self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
@@ -710,6 +711,11 @@ class Placement:
 
     def graph_pool(self) -> Any:
         return self.memory.new_pool()
+
+    def graph_domain(self, component: str) -> Any:
+        from cozy_runtime.graphs import capture_domain
+
+        return capture_domain(self.torch, self.models[component].module, self.memory)
 
     def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
         return self.memory.allocating(pool, route=route)
