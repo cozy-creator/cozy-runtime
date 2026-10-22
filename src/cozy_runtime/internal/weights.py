@@ -580,9 +580,7 @@ class Backend:
                 if held is not None:
                     leaf._buffers[name] = torch.empty_like(held, device=self.device)
         setattr(owner, attribute, leaf)
-        kept = leaf.roles()
-        derived = tuple(sorted(role for role in parts if kept.get(role) is not parts[role]))
-        return leaf, replaced, derived
+        return leaf, replaced, _derived(leaf, parts)
 
 
 # ----------------------------------------------------------------- routes and LoRA bakes
@@ -624,14 +622,29 @@ class _Routes:
             self.providers[key].decode(torch, parts, out)
             return {name: out}
         leaf, replaced, derived = self.leaves[key]
-        path, buffers = name.removesuffix(".weight"), leaf.BUFFERS
-        made = {f"{path}.{buffers.get(r, r)}": t for r, t in parts.items() if r not in derived}
-        if derived:
-            provider = cast(LeafProvider, self.providers[key])
-            fresh = provider.leaf(torch, parts, replaced, leaf.out_dtype)
-            for role in derived:
-                made[f"{path}.{buffers.get(role, role)}"] = fresh._buffers[buffers.get(role, role)]
-        return made
+        provider = cast(LeafProvider, self.providers[key])
+        made = _bound(leaf, derived, parts, lambda: provider.leaf(torch, parts, replaced, leaf.out_dtype))
+        return {f"{name.removesuffix('.weight')}.{buffer}": t for buffer, t in made.items()}
+
+
+def _derived(leaf: Any, parts: Mapping[str, Any]) -> tuple[str, ...]:
+    """The stored roles `leaf` keeps as other tensors than the stored ones (cast, swizzled): a
+    bind makes them again from the stored bytes. A stored role it does not read is neither."""
+    kept = leaf.roles()
+    return tuple(sorted(role for role in kept if role in parts and kept[role] is not parts[role]))
+
+
+def _bound(
+    leaf: Any, derived: Sequence[str], parts: Mapping[str, Tensor], fresh: Callable[[], Any]
+) -> dict[str, Tensor]:
+    """`leaf`'s role buffers, by buffer name, from one bind's stored `parts`: the roles it keeps
+    as stored, and the `derived` ones from a fresh leaf of the same provider."""
+    buffers = leaf.BUFFERS
+    made = {buffers.get(r, r): t for r, t in parts.items() if r in leaf._cozy_roles and r not in derived}
+    if derived:
+        built = fresh()
+        made.update({buffers.get(r, r): built._buffers[buffers.get(r, r)] for r in derived})
+    return made
 
 
 @runtime_checkable

@@ -447,6 +447,19 @@ class Int8ConvRotNativeLeaf:
         )
 
 
+def _nvfp4_leaf_class(torch: ModuleType) -> type:
+    """`EncodedLinear` keyed by nvfp4's stored roles, held in the buffers its kernels read."""
+    cached: type | None = getattr(_nvfp4_leaf_class, "_cached", None)
+    if cached is not None:
+        return cached
+
+    class Nvfp4Linear(_leaf_class(torch)):  # type: ignore[misc]
+        BUFFERS: ClassVar[dict[str, str]] = {"scale": "weight_scale", "scale_2": "weight_scale_2"}
+
+    _nvfp4_leaf_class._cached = Nvfp4Linear  # type: ignore[attr-defined]
+    return Nvfp4Linear
+
+
 @dataclass(frozen=True, slots=True)
 class Nvfp4NativeLeaf:
     """`nvfp4-w4a4/1` ENCODED GEMM: the stored E2M1 payload and E4M3 block scales stay resident
@@ -561,13 +574,9 @@ class Nvfp4NativeLeaf:
         second = parts["scale_2"].to(torch.float32).reshape(1)
         if params.get("global_scale") == "divide":
             second = 1.0 / second  # the kernels multiply: one f32 reciprocal, a W4A4 rounding
-        return _leaf_class(torch)(
+        return _nvfp4_leaf_class(torch)(
             Nvfp4NativeLeaf._forward,
-            {
-                "weight": weight,
-                "weight_scale": blocked,
-                "weight_scale_2": second,
-            },
+            {"weight": weight, "scale": blocked, "scale_2": second},
             getattr(replaced, "bias", None),
             out_dtype,
             self.name,

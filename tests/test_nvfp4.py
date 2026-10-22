@@ -160,3 +160,30 @@ def test_leaf_matches_its_exact_weight() -> None:
             error = (got.double().cpu() - reference).norm() / reference.norm()
             # W4A4 on the kitchen path, the exact weight times an unquantized input elsewhere.
             assert error < 0.15, (device, dtype, float(error))
+
+
+def test_the_weight_plane_binds_a_stored_tensor_into_the_leaf_it_planned() -> None:
+    """`_Routes`: the leaf built on meta at plan time takes one bind's stored roles in the buffers
+    its kernels read, the derived ones made again from the stored bytes, a stored role no leaf
+    reads left out. H3's nvfp4 lane failed here with `KeyError: 'scale'` (runs 13145, 13185):
+    the leaf named its roles after its buffers."""
+    torch = pytest.importorskip("torch")
+    from cozy_runtime.internal import probe
+    from cozy_runtime.internal.encoding import Nvfp4NativeLeaf
+    from cozy_runtime.internal.weights import _bound, _derived
+
+    provider, shape = Nvfp4NativeLeaf(params=PARAMS), probe._StandIn(512, 256)
+    stored = roles(torch, weight(256, 512, 5), "cpu")
+    stored["input_scale"] = torch.ones((), dtype=torch.float32)
+    meta = {role: tensor.to("meta") for role, tensor in stored.items()}
+    planned = provider.leaf(torch, meta, shape, torch.bfloat16)
+    derived = _derived(planned, meta)
+    made = _bound(planned, derived, stored, lambda: provider.leaf(torch, stored, shape, torch.bfloat16))
+    direct = provider.leaf(torch, stored, shape, torch.bfloat16)
+    assert made.keys() == {"weight", "weight_scale", "weight_scale_2"}
+    for name, tensor in made.items():
+        planned._buffers[name] = tensor
+        assert torch.equal(tensor.view(torch.uint8), direct._buffers[name].view(torch.uint8)), name
+    planned._buffers["_logical_dtype"] = direct._buffers["_logical_dtype"]
+    x = torch.randn(3, 512, generator=torch.Generator().manual_seed(9)).to(torch.bfloat16)
+    assert torch.equal(planned(x), direct(x))
