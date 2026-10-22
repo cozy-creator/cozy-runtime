@@ -156,6 +156,7 @@ from cozy_runtime.internal import (
     sandbox,
     spawn,
     stage_memo,
+    streams,
     tolerant,
     tools,
     zygote,
@@ -2537,6 +2538,7 @@ class Executor:
                 )
             _split.install(cuts.split)
             attention_ulysses.install(cuts.attend)
+            streams.install(cuts.launch)
             if device.type == "cuda":
                 library_oom.install(torch)
         backend = Backend(

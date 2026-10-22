@@ -48,7 +48,7 @@ from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
-from cozy_runtime.internal import attention_ulysses, module_state
+from cozy_runtime.internal import attention_ulysses, module_state, streams
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
@@ -318,7 +318,7 @@ def _record(
     started, landed = time.perf_counter(), LANDED[0]
     try:
         if recorder.pool is None:
-            recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+            recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), streams.stream(torch)
         reserved = torch.cuda.memory_reserved()
         inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
         static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]

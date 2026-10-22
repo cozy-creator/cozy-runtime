@@ -20,6 +20,7 @@ import math
 from collections.abc import Sequence
 from typing import Any
 
+from cozy_runtime.internal import streams
 from cozy_runtime.internal.config import short_socket_directory
 
 #: The exchange the group formed with, by process group; absent: NCCL.
@@ -47,7 +48,7 @@ class CopyEngineExchange:
         self.torch, self.symm, self.pg = torch, symm, pg
         self.rank, self.world = rank, world
         self.device = torch.device("cuda", torch.cuda.current_device())
-        self.streams = [torch.cuda.Stream(self.device) for _ in range(world)]
+        self.streams = [streams.stream(torch, self.device) for _ in range(world)]
         self.buffer = symm.empty(BUFFER_BYTES, dtype=torch.uint8, device=self.device)
         self.flag = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.handle: Any = None
