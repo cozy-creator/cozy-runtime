@@ -473,7 +473,7 @@ class Backend:
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
-        routes = self.routes[name] = _Routes(self, name, rows)
+        routes = self.routes[name] = _Routes(self, name, rows, root)
         vars(root)["_varena"] = Declared(
             Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
             fill=bakes if bakes.bakes else None,
@@ -545,8 +545,10 @@ class _Routes:
     bind: it is kept under the fill identity it was decoded from, as the memory's cache, which
     varena sheds on its ask (the next bind decodes again). Leaf buffers live for that bind."""
 
-    def __init__(self, backend: Backend, component: str, rows: Mapping[str, PlanRow]) -> None:
-        self.backend, self.component = backend, component
+    def __init__(
+        self, backend: Backend, component: str, rows: Mapping[str, PlanRow], root: Module
+    ) -> None:
+        self.backend, self.component, self.root = backend, component, root
         self.torch = backend.torch
         self.rows = dict(rows)
         self.routes = {stored: backend._route(row.key) for stored, row in rows.items()}
@@ -603,7 +605,11 @@ class _Routes:
         with self.lock:
             self.decoded[key] = (identity, out)
             if self.cache is None:
-                self.cache = self.backend.memory.cache(f"decoded:{self.component}", self.shed)
+                self.cache = self.backend.memory.cache(
+                    f"decoded:{self.component}",
+                    self.shed,
+                    model=self.root,
+                )
             self.cache.cached(self._held())
 
     def _held(self) -> int:
@@ -816,9 +822,13 @@ class Placement:
         return self.memory.cuda and self.memory.native.context_measurable()
 
     def graph_domain(self, component: str) -> Any:
-        from cozy_runtime.graphs import capture_domain
+        return graphs.capture_device(self.torch, self.memory)
 
-        return capture_domain(self.torch, self.models[component].module, self.memory)
+    def graph_spare(self) -> int | None:
+        """What the running request could get without evicting its working set or a pinned
+        page (None outside a request)."""
+        request = execution.catch.CURRENT.get()
+        return request.spare() if request is not None else None
 
     def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
         return self.memory.allocating(pool, route=route)
@@ -839,9 +849,10 @@ class Placement:
     def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
         return self.models[component].passing(entry, args, kwargs)
 
-    def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
-        """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
-        return self.memory.cache(owner, shed) if self.memory.cuda else None
+    def cache(self, owner: str, shed: Callable[[int], int], roots: list[Any]) -> Cache | None:
+        """Device bytes `owner` keeps for speed for the components `roots`, counted and shed
+        on ask, in their class; None off a GPU."""
+        return self.memory.cache(owner, shed, model=roots) if self.memory.cuda else None
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value

@@ -18,7 +18,11 @@ from tensorfs.varena.torch import Declared, Memory, Weights  # noqa: E402
 
 from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.author._model import PLACED  # noqa: E402
-from cozy_runtime.internal.encoding import Capabilities, measure_device, measure_runtime  # noqa: E402
+from cozy_runtime.internal.encoding import (  # noqa: E402
+    Capabilities,
+    measure_device,
+    measure_runtime,
+)
 from cozy_runtime.internal.probe import QualificationResult  # noqa: E402
 from cozy_runtime.internal.resolution import ConstructionFacts, ResolvedModelPlan  # noqa: E402
 from cozy_runtime.internal.weights import Backend, Placement  # noqa: E402
@@ -250,14 +254,102 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
                     got = module(source.to(memory.device)).cpu()
                     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
                     domain = placement.graph_domain("stack")
+                    held = domain.holds.get(module)
                     if graphs._RECORDERS[module].replays:
-                        assert domain.hold is not None and domain.held_for == placement.attempts
-                holds.append(domain.hold)
+                        assert held is not None and held.attempt == placement.attempts
+                assert held is not None
+                holds.append(held.hold)
         assert graphs._RECORDERS[module].replays == 7  # call 1 eager, then every one replays
         assert holds[0] is not holds[1]  # a request takes its own hold
         torch.cuda.synchronize()
-        assert graphs._shed(torch, domain) > 0 and domain.hold is None
+        assert graphs._shed(torch, domain)[0] > 0 and module not in domain.holds
     finally:
         graphs.release(torch, module)
         PLACED.pop(module, None)
         model.close()
+
+
+def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
+    """Ruling 2 (v6 13590: the VAE's own pool took 2.98 GB beside the UNet's): components run
+    one after another on a device, so their graphs share the device's one domain and pool,
+    registered as one cache serving both, and counted once."""
+    if not torch.cuda.is_available():
+        pytest.skip("native graph residency requires CUDA")
+    memory = Memory.open(0, limit=CAP)
+    torch.manual_seed(29)
+    width, names = 256, ("first", "second")
+
+    def build() -> Any:
+        stack = torch.nn.Sequential(*(torch.nn.Linear(width, width) for _ in range(2)))
+        stack._no_split_modules = ("Linear",)
+        return stack
+
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    plain = {name: build().eval() for name in names}
+    for name, module in plain.items():
+        component = writer.component(name, cls=("torch", "", "Module"), config={})
+        for key, value in module.state_dict().items():
+            data = value.contiguous().view(torch.uint8).numpy().tobytes()
+            component.put(key, data, dtype="F32", shape=list(value.shape))
+    checkpoint = writer.commit()
+    source = torch.randn(2, width)
+    with torch.inference_mode():
+        expected = plain["second"](plain["first"](source))
+    modules, models = {}, {}
+    for name in names:
+        with torch.device("meta"):
+            modules[name] = build()
+        vars(modules[name])["_varena"] = Declared(Weights(checkpoint, name))
+        models[name] = memory.load(modules[name], "ram")
+    facts = measure_device(torch, 0)
+    runtime = measure_runtime(torch, "graph-shared-pool-test")
+    plan = ResolvedModelPlan(
+        variant="test",
+        store="test",
+        snapshots={},
+        reference_variant="test",
+        policy="test",
+        tensors=(),
+        device=facts,
+        runtime=runtime,
+        placement="block_paging",
+        objective="latency",
+        construction=ConstructionFacts("test", "Sequential", names),
+        encoded_leaves="refuse",
+    )
+    backend = Backend(
+        {},
+        [],
+        torch=torch,
+        plan=plan,
+        memory=memory,
+        device=memory.device,
+        construction="test",
+        release="test",
+        device_facts=facts,
+        qualified=(Capabilities(), QualificationResult("test", facts, "", "test", runtime, 0, [])),
+    )
+    backend.models.update(models)
+    placement = Placement(memory, backend)
+    assert sorted(graphs.install(torch, object(), modules)) == sorted(names)
+    try:
+        for turn in range(3):
+            placement.open_attempt()
+            steps = [modules["first"], modules["second"]]
+            with torch.inference_mode(), memory.request(f"shared-{turn}", steps):
+                hidden = modules["first"](source.to(memory.device))
+                got = modules["second"](hidden).cpu()
+            torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
+        domain = placement.graph_domain("first")
+        assert domain is placement.graph_domain("second") and domain.captures is not None
+        assert [ref() for ref in domain.served] == [modules["first"], modules["second"]]
+        assert all(graphs._RECORDERS[m].replays == 2 for m in modules.values())
+        described = placement.document()["graphs"]
+        assert described["first"]["graph_pool_bytes"] == domain.capture_bytes() > 0
+        assert described["second"]["graph_pool_bytes"] == 0  # the shared pool counts once
+        assert domain.cache is not None
+    finally:
+        for name, module in modules.items():
+            graphs.release(torch, module)
+            PLACED.pop(module, None)
+            models[name].close()
