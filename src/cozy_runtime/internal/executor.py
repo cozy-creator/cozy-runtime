@@ -304,21 +304,6 @@ def _gpu(rank: int) -> str:
     return execution_evidence.gpu_name(_sealed_entries(), rank)
 
 
-def _qualification_cache() -> str:
-    """Where a measured qualification is kept between executors, from the SEAL.
-
-    `COZY_HOME` is already a reviewed imposition — the executor resolves the same CAS as
-    the worker through it — and the worker already keeps node-local caches under it. This
-    is a path, not a switch: an unset or relative value means nowhere to keep a result and
-    the suite simply runs, which is what every executor did before cr-103. The directory
-    is not created here; `qualification.qualified` makes it when it has something to keep.
-    """
-    home = _SEALED.get("COZY_HOME", "").strip()
-    if not home or not Path(home).is_absolute():
-        return ""
-    return str(Path(home) / "qualification")
-
-
 def _restore_seal() -> tuple[str, ...]:
     """Re-impose sealed values that package code changed, and name them.
 
@@ -691,7 +676,6 @@ class _OnDemand:
             if self._model is None:
                 self._model = self._build()
         return getattr(self._model, name)
-
 
 
 #: The runtime modules a construction imports, named ONCE so `start` can warm
@@ -2408,15 +2392,10 @@ class Executor:
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's records name the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding.release)
-        # Only the schemes these rows store: a machine measures the decoders a model needs (a
-        # table grows as models arrive), not every scheme the Runtime can read.
+        # Read only the shipped facts for the schemes these model rows actually store.
         stored = {row.encoded.scheme for row in rows}
         providers = {s: c for s, c in launch_providers().items() if s in stored}
-        # MEASURED ONCE PER (card, build, providers, dtypes), NOT ONCE PER PREPARE
-        # (cr-103). The decode suite is 3.2-6.1 s of every model-bearing prepare and none
-        # of its inputs change between two models on one warm pod, which is the swap case
-        # exactly. `qualified` keys the result on the whole of what determines it and
-        # keeps it under COZY_HOME; a term that moves is a miss and the suite runs.
+        # Unsupported cells refuse or use an already-qualified route; inference never probes.
         qualification = qualified(
             torch,
             providers,
@@ -2424,7 +2403,6 @@ class Executor:
             sorted({dtype_name(r.dtype) for r in rows}),
             release=binding.release,
             runtime=runtime_identity,
-            cache=_qualification_cache(),
         )
         qualified_pair = (qualification.capabilities, qualification.result)
         stage("qualify")
@@ -2697,8 +2675,9 @@ class Executor:
                     )
                 except (GpuDivergence, msgspec.ValidationError) as exc:
                     return self._group_refusal(
-                        exc if isinstance(exc, GpuDivergence) else
-                        GpuDivergence(follower.gpu, "group_plan", str(exc))
+                        exc
+                        if isinstance(exc, GpuDivergence)
+                        else GpuDivergence(follower.gpu, "group_plan", str(exc))
                     )
                 if theirs.get("filled_bytes") != record.filled_bytes:
                     return self._group_refusal(
