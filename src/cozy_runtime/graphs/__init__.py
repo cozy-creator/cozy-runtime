@@ -46,6 +46,7 @@ from typing import Any
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
+from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.internal import attention_ulysses, module_state
 
@@ -270,8 +271,10 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
     pin: object = None
     if placed is not None:
         residency, name = placed
+        if recorder.waiting.get(key) == residency.attempts:
+            return call(module, *args, **kwargs)
         pin = residency.pin(name, f"graphs:{name}", functools.partial(_shed, torch, recorder))
-        if pin is None or recorder.waiting.get(key) == residency.attempts:
+        if pin is None:
             return call(module, *args, **kwargs)
     if pin is None or recorder.structure[0] is not pin:  # read once per pin
         recorder.structure = (pin, _structure(module))
@@ -285,6 +288,13 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
     if entry is None:
         entry = _record(torch, module, call, leaves, spec, recorder, key, layout, placed)
         if entry is None:
+            if not recorder.recordings:
+                _shed(torch, recorder)
+                if placed is not None:
+                    placed[0].unpin(placed[1], f"graphs:{placed[1]}", pin)
+                # Both locals retain the token: let its event-ordered hold go before eager
+                # execution. Other callers' recordings still retain their own references.
+                pin = layout = None
             return call(module, *args, **kwargs)
     recorder.replays += 1
     if placed is not None:
@@ -306,18 +316,25 @@ def _record(
     """Record the call at `key` into the component's pool, and check its first replay against
     the call run as written. None, with a run warning, when it cannot be."""
     started, landed = time.perf_counter(), LANDED[0]
-    if recorder.pool is None:
-        recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
-    reserved = torch.cuda.memory_reserved()
-    inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
-    static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
-    cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
-    outputs: list[Any] = []
-    pool = recorder.pool
-    # Measuring changes nothing the call would see: its passes put back the attributes and
-    # the generators they advanced (the owner: a first request equals a warm one).
-    state = module_state.snapshot(module)
-    cpu, cuda = torch.random.get_rng_state(), torch.cuda.get_rng_state()
+    try:
+        if recorder.pool is None:
+            recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+        reserved = torch.cuda.memory_reserved()
+        inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
+        static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
+        cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
+        outputs: list[Any] = []
+        pool = recorder.pool
+        # Measuring restores the attributes and generators advanced by its passes.
+        state = module_state.snapshot(module)
+        cpu, cuda = torch.random.get_rng_state(), torch.cuda.get_rng_state()
+    except Exception as exc:
+        # Preparation has not invoked package code. Never extend this catch around capture,
+        # replay or validation: the model may already have executed by then.
+        if not is_capacity(exc):
+            raise
+        why = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
+        return _failed(torch, recorder, key, placed, why, type(module).__name__)
     try:
         graph, why = capture(
             torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
@@ -357,28 +374,36 @@ def _record(
     recorder.record_s += time.perf_counter() - started
     if graph is None:
         outputs.clear()
-        recorder.tries[key] = tries = recorder.tries.get(key, 0) + 1
-        if not why or why.startswith("its ") or tries >= TRIES:  # the call's own doing
-            recorder.failed.add(key)
-        elif placed is not None:  # a cold process's other device work can end a capture
-            recorder.waiting[key] = placed[0].attempts
-        if why or not recorder.recordings:
-            recorder.pool = None  # spent: the next recording takes a new one
-            torch.cuda.empty_cache()
-        if not why:
-            return None
-        line = f"{type(module).__name__} runs as written at this signature: {why}"
-        say(f"graphs:{type(module).__name__}:{tries}:{why[:40]}", f"[graphs] {line}")
-        if key in recorder.failed:
-            WARNINGS.append(
-                ("a CUDA graph was not used", {"module": type(module).__name__, "why": why})
-            )
-        return None
+        return _failed(torch, recorder, key, placed, why, type(module).__name__)
     entry = _Recording(torch, graph, inputs, outputs[0], layout, served)
     if recorder.pool is pool:  # else the plane released the pool for room meanwhile
         recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
         recorder.recordings[key] = entry
     return entry
+
+
+def _failed(
+    torch: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    placed: Any,
+    why: str,
+    name: str,
+) -> None:
+    """Retire an unsuccessful recording and defer this signature before eager execution."""
+    recorder.tries[key] = tries = recorder.tries.get(key, 0) + 1
+    if not why or why.startswith("its ") or tries >= TRIES:
+        recorder.failed.add(key)
+    elif placed is not None:
+        recorder.waiting[key] = placed[0].attempts
+    if why or not recorder.recordings:
+        recorder.pool = None
+        torch.cuda.empty_cache()
+    if why:
+        line = f"{name} runs as written at this signature: {why}"
+        say(f"graphs:{name}:{tries}:{why[:40]}", f"[graphs] {line}")
+        if key in recorder.failed:
+            WARNINGS.append(("a CUDA graph was not used", {"module": name, "why": why}))
 
 
 def _chose(recorder: _Recorder, key: tuple[object, ...], why: str, detail: str) -> None:
