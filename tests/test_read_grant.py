@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from cozy_runtime.author._executor_requests import HostGrant
 from cozy_runtime.internal.executor import Executor
 from cozy_runtime.internal.seam import Channel, sealed
 from tensord_peer import answer_read_grants
@@ -41,8 +42,8 @@ def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path) -> 
     layout = sealed("layout", b"a host layout varena sealed in another executor")
     try:
         with grants(tmp_path, {"sha256:held": layout}) as (executor, asked):
-            fd, pages, _ = executor._read_grant(MANIFEST, "sha256:held")
-            assert pages == [] and fd is not None and asked == ["sha256:held"]
+            fd, pages = (held := executor._read_grant(MANIFEST, "sha256:held")).fd, held.pages
+            assert pages == () and fd is not None and not held.seal and asked == ["sha256:held"]
             assert os.pread(fd, 64, 0) == b"a host layout varena sealed in another executor"
             os.close(fd)
     finally:
@@ -51,8 +52,16 @@ def test_a_held_layout_is_the_one_descriptor_mapped_as_it_is(tmp_path: Path) -> 
 
 def test_an_unheld_layout_grants_nothing_and_varena_reads_the_checkpoint(tmp_path: Path) -> None:
     with grants(tmp_path, {}) as (executor, asked):
-        assert executor._read_grant(MANIFEST, "sha256:cold") == (None, [], "")
+        assert executor._read_grant(MANIFEST, "sha256:cold") == HostGrant()
         assert asked == ["sha256:cold"]
+
+
+def test_an_unheld_layout_seals_only_where_the_machine_admits_it(tmp_path: Path) -> None:
+    peer = {"admitted": frozenset({"sha256:fits"})}
+    with grants(tmp_path, {}, **peer) as (executor, asked):
+        assert executor._read_grant(MANIFEST, "sha256:fits") == HostGrant(seal=True)
+        assert executor._read_grant(MANIFEST, "sha256:short") == HostGrant(seal=False)
+        assert asked == ["sha256:fits", "sha256:short"]
 
 
 def test_a_layout_another_process_seals_is_asked_again_until_its_one_copy_is_deposited(
@@ -62,8 +71,9 @@ def test_a_layout_another_process_seals_is_asked_again_until_its_one_copy_is_dep
     try:
         peer = {"sealing": {"sha256:s": 2}}
         with grants(tmp_path, {"sha256:s": layout}, **peer) as (executor, asked):
-            fd, pages, _ = executor._read_grant(MANIFEST, "sha256:s")
-            assert fd is not None and pages == []
+            held = executor._read_grant(MANIFEST, "sha256:s")
+            fd = held.fd
+            assert fd is not None and held.pages == ()
             assert asked == ["sha256:s"] * 3, "two sealing answers, then the deposit"
             assert os.pread(fd, 64, 0) == b"sealed by GPU 0 while GPU 1 asked"
             os.close(fd)
@@ -93,7 +103,8 @@ def test_a_held_layout_carries_kept_regions_and_their_fingerprint(tmp_path: Path
                 }
             )
             peer.send_fds([layout, page])
-            fd, pages, fingerprint = received.result()
+            held = received.result()
+            fd, pages, fingerprint = held.fd, held.pages, held.fingerprint
         assert fd is not None and fingerprint == "sha256:layout-parts"
         assert len(pages) == 1 and pages[0][0] == 3
         try:
