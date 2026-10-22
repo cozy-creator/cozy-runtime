@@ -1238,6 +1238,7 @@ class ModelRegistry:
         mode: Mode,
         adapters: Sequence[AdapterRef] = (),
     ) -> Generation:
+        started = time.perf_counter()
         model = cls()
         loader = self._loader(model, artifact, mode)
         object.__setattr__(model, "_cozy_loading", True)
@@ -1254,7 +1255,8 @@ class ModelRegistry:
                 began = time.perf_counter()
                 with loading(loader):
                     model.load(loader)
-                loaded = round((time.perf_counter() - began) * 1000, 1)
+                loaded = time.perf_counter()
+            exited = time.perf_counter()
             records = loader.records()
             if not records:
                 raise ConformanceError(
@@ -1265,7 +1267,15 @@ class ModelRegistry:
             record = records[0] if len(records) == 1 else _merge(records)
             # The package's whole load() beside its constructions' legs: what its own code spent
             # after them (tokenizers, schedulers, its assets).
-            record = replace(record, stage_ms=(*record.stage_ms, ("package_load", loaded)))
+            legs = {
+                "before_load": began - started,  # the model, its loader, the substrate's entry
+                "package_load": loaded - began,
+                "substrate_exit": exited - loaded,
+            }
+            record = replace(
+                record,
+                stage_ms=(*record.stage_ms, *((k, round(v * 1000, 1)) for k, v in legs.items())),
+            )
             if record.skipped and not record.components:
                 raise ModelFitRefused(
                     {
@@ -1307,6 +1317,10 @@ class ModelRegistry:
             object.__setattr__(model, "_cozy_record", record)
             object.__setattr__(model, "_cozy_identity", identity)
             object.__setattr__(model, "_cozy_ready", True)
+            # The whole construction; beside construct_and_register it leaves only the registry.
+            done = round((time.perf_counter() - started) * 1000, 1)
+            record = replace(record, stage_ms=(*record.stage_ms, ("construct", done)))
+            object.__setattr__(model, "_cozy_record", record)
         except Exception:
             # Transactional: a failure rolls fills, caches and registrations back together
             # and no generation is ever observable half-built (§1.1).
