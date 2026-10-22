@@ -1051,12 +1051,9 @@ def _record(
             )
             with torch.cuda.stream(stream):
                 with allocating:
+                    seeded = torch.Generator(device=current.device).manual_seed(_SEED)
                     inputs = [
-                        torch.empty_strided(
-                            v.shape, v.stride, dtype=v.dtype, device=v.device
-                        ).zero_()
-                        if isinstance(v, _Leaf)
-                        else None
+                        _input(torch, v, seeded) if isinstance(v, _Leaf) else None
                         for v in pending.leaves
                     ]
                     static = [
@@ -1068,12 +1065,11 @@ def _record(
                     try:
                         with attention_ulysses.observing() as served:
                             took = time.perf_counter()
-                            warm = call(module, *cargs, **ckwargs)
+                            eager = call(module, *cargs, **ckwargs)
                             took = (time.perf_counter() - took) * 1e3
-                            if not _clonable(torch, warm):
+                            if not _clonable(torch, eager):
                                 _failed(module, recorder, key, "output is not a tensor tree")
                                 return True
-                            del warm  # preseeded capacity remains in this pool
                             busy = _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
                     finally:
                         _WARMING.reset(warming)
@@ -1096,6 +1092,13 @@ def _record(
                     return True
                 if not _clonable(torch, outputs[0]):
                     _failed(module, recorder, key, "captured output is not a tensor tree")
+                    return True
+                graph.replay()  # served only when it reproduces the eager run bit for bit
+                pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
+                if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
+                    why = "its replay differs from the eager run on the same inputs"
+                    _failed(module, recorder, key, why)
+                    WARNINGS.append(("a CUDA graph was not used", {"why": why}))
                     return True
         entry = _Recording(torch, graph, pool, inputs, outputs[0], key, served, owner)
         recorder.recordings[key] = entry
@@ -1135,6 +1138,24 @@ def _device_bound(submit: float, busy: float) -> str:
     if busy < submit:
         return ""
     return f"device-bound: {busy:.3f} ms of device work a call, {submit:.3f} ms to submit it"
+
+
+#: the idle inputs' seed: any fixed one (the verify needs the same inputs twice, not these)
+_SEED = 0
+
+
+def _input(torch: Any, leaf: _Leaf, generator: Any) -> Any:
+    """A static input of `leaf`'s layout, seeded: floats standard normal (zeros would hide a
+    replay that drops work), bools fair coins, integers zero (a valid index into any table)."""
+    span = 1 + sum((n - 1) * s for n, s in zip(leaf.shape, leaf.stride, strict=True))
+    span = span if all(leaf.shape) else 0
+    flat = torch.zeros(span, dtype=leaf.dtype, device=leaf.device)
+    if flat.is_floating_point() or flat.is_complex():  # drawn wide, cast (fp8 draws nothing)
+        wide = torch.complex64 if flat.is_complex() else torch.float32
+        flat.copy_(torch.randn(span, generator=generator, device=leaf.device, dtype=wide))
+    elif flat.dtype == torch.bool:
+        flat.copy_(torch.randint(0, 2, (span,), generator=generator, device=leaf.device))
+    return flat.as_strided(leaf.shape, leaf.stride)
 
 
 #: per device, its sleep kernel's cycles a millisecond (`_busy`'s gate)
