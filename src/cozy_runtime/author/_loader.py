@@ -195,9 +195,13 @@ def _without_provenance(data: Mapping[str, object]) -> dict[str, object]:
 
 def _carrier(key: str, value: object) -> str | None:
     """Why this entry is a source carrier, if it is. Keys AND values are checked: a value
-    that is a filesystem path or a URL is one whatever its key is called."""
+    that is a filesystem path or a URL is one whatever its key is called. A key naming a
+    carrier refuses a value that could be one; a flag, number or null names no source (an
+    upstream tokenizer's saved `local_files_only: false`)."""
     lowered = key.lower()
-    if lowered in PATH_KEYS or lowered.endswith(PATH_SUFFIXES):
+    if (lowered in PATH_KEYS or lowered.endswith(PATH_SUFFIXES)) and not (
+        value is None or isinstance(value, (bool, int, float))
+    ):
         return f"{key!r} names a source carrier"
     if isinstance(value, str) and (
         value.startswith(("/", "./", "../", "~/", "file://")) or "://" in value
