@@ -339,6 +339,11 @@ def test_a_destination_commits_each_output_under_its_private_tag(
                 array = got.components["model"].tensors.read("w")
                 assert isinstance(array, tensorfs.Array) and array.tobytes() == value
     assert trees[0] != trees[1]
-    # A new tag is private: no public tag names a default for the destination.
-    with pytest.raises(tensorfs.NotFoundError):
-        tensorfs.open(repo, endpoint=origin, cache_dir=tmp_path / "default")
+    # A new tag is private, so no public version is the default; with none, `main` is, for a
+    # reader who can read it (this origin's readers read every tag).
+    if named == "main":
+        with tensorfs.open(repo, endpoint=origin, cache_dir=tmp_path / "default") as default:
+            assert default.id == artifact.checkpoint
+    else:
+        with pytest.raises(tensorfs.NotFoundError):
+            tensorfs.open(repo, endpoint=origin, cache_dir=tmp_path / "default")
