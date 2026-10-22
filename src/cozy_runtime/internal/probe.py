@@ -46,9 +46,11 @@ from cozy_runtime.internal.decode_schemes import run, sample
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
     DeviceFacts,
+    Encoded,
     LeafProvider,
     Provider,
     RuntimeIdentity,
+    admit,
     implementation_digest,
     measure_runtime,
 )
@@ -940,8 +942,8 @@ def conform(
     release: str,
 ) -> Conformance:
     """Run the suite on this card. A route that decodes nothing (`plain/1`) carries the fill
-    plane's byte-identity proof; a card below a provider's floor observes nothing for it. The
-    BACKEND is gated first, through `accel`: a backend with no suite refuses."""
+    plane's byte-identity proof; a cell this card does not serve observes nothing. The BACKEND
+    is gated first, through `accel`: a backend with no suite refuses."""
     accel.qualification_gate(device.kind)
     target = torch.device(device.kind)
     started = time.perf_counter_ns()
@@ -951,7 +953,8 @@ def conform(
             provider,
             device,
             name,
-            settled(provider, device) or _measured(torch, provider, target, getattr(torch, name)),
+            settled(provider, device, name)
+            or _measured(torch, provider, target, getattr(torch, name)),
         )
         for encoding, provider, name in cells(providers, output_dtypes)
     ]
@@ -1031,19 +1034,16 @@ def _evidence(torch: Any, provider: Provider, target: Any, dtype: Any) -> Eviden
     return DecodeEvidence(numerics=sweep, spec_vectors=vectors, passed=passed)
 
 
-def settled(provider: Provider, device: DeviceFacts) -> Evidence | None:
-    """Evidence nothing has to measure: a verbatim route, or a card below the provider's floor."""
+def settled(provider: Provider, device: DeviceFacts, dtype: str) -> Evidence | None:
+    """Evidence nothing has to measure: a verbatim route, or a cell serving would not run here
+    (`selection.admit`): the suite checks what this card serves."""
     if provider.route == "verbatim":
         return VerbatimEvidence(
             note="no decode: the stored bytes ARE the logical bytes, and the fill plane's "
             "source-comparison proves them byte for byte"
         )
-    if not device.satisfies(provider.device_predicate):
-        return UnmeasuredEvidence(
-            note=f"its kernel needs {provider.device_predicate} and this device is "
-            f"{device.predicate}"
-        )
-    return None
+    why = admit(provider, device, dtype, Encoded(provider.encoding, (), ()))
+    return UnmeasuredEvidence(note=why) if why else None
 
 
 def cells(

@@ -227,7 +227,10 @@ def admit(provider: Provider, device: DeviceFacts, output_dtype: str, encoded: E
     if isinstance(provider, LeafProvider):
         if device.kind != "cuda":
             return f"{provider.name} runs on CUDA tensor cores and this device is {device.kind}"
-        row = arch.row(device.sm)
+        if output_dtype not in provider.out_dtypes:
+            wrote = "/".join(sorted(provider.out_dtypes))
+            return f"{provider.name} writes {wrote}, not {output_dtype}"
+        row = arch.hardware(device.sm)
         lacking = sorted(provider.formats - row.formats())
         if lacking:
             return (
@@ -262,6 +265,8 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
     out: dict[str, list[Provider]] = {}
     builds: tuple[Callable[[str], Provider], ...] = (
         Verbatim,
+        # The decode cores first: Triton kernels on CUDA, where a scheme's own dequant is eager.
+        CoreDequant,
         TensorwiseDequant,
         RowwiseDequant,
         columnwise,
@@ -272,7 +277,6 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Nvfp4NativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
-        CoreDequant,
         ComfyDequant,
     )
     for build in builds:

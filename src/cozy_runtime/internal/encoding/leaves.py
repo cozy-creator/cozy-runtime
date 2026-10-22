@@ -309,6 +309,11 @@ class RowwiseNativeLeaf:
         return frozenset({"fp8"})
 
     @property
+    def out_dtypes(self) -> frozenset[str]:
+        """`_scaled_mm`'s row-wise scaling writes half precision only."""
+        return frozenset({"bfloat16", "float16"})
+
+    @property
     def required(self) -> frozenset[str]:
         return frozenset({"weight", "scale"})
 
@@ -399,6 +404,11 @@ class Int8ConvRotNativeLeaf:
     @property
     def formats(self) -> frozenset[str]:
         return frozenset({"int8"})
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """Half through the 8-bit op; float32 through torch's int8 GEMM."""
+        return frozenset({"bfloat16", "float16", "float32"})
 
     @property
     def required(self) -> frozenset[str]:
@@ -516,6 +526,11 @@ class Nvfp4NativeLeaf:
     def formats(self) -> frozenset[str]:
         """None: W4A16 runs on every MMA card, W4A4 where the row has fp4 (`nvfp4_linear`)."""
         return frozenset()
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """Half through its kernels; float32 through the eager decode."""
+        return frozenset({"bfloat16", "float16", "float32"})
 
     @property
     def required(self) -> frozenset[str]:
@@ -658,6 +673,11 @@ class MicroScaledNativeLeaf:
     @property
     def formats(self) -> frozenset[str]:
         return frozenset({"mxfp8"})
+
+    @property
+    def out_dtypes(self) -> frozenset[str]:
+        """`_scaled_mm`'s MX scaling, at half precision."""
+        return frozenset({"bfloat16", "float16"})
 
     @property
     def required(self) -> frozenset[str]:
