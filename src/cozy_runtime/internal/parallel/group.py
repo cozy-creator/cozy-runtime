@@ -20,14 +20,14 @@ from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Annotated, Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 import msgspec
 
 from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED
 from cozy_runtime.internal import execution_evidence, liveness, spawn
 from cozy_runtime.internal.config import inherited_environment, update_environment
-from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
+from cozy_runtime.internal.parallel.plan import GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
@@ -86,40 +86,6 @@ class _Hello(msgspec.Struct, frozen=True):
     rank: int
     world: int
     sealed: dict[str, str]
-
-
-_Bytes = Annotated[int, msgspec.Meta(ge=0)]
-
-
-class _Offer(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_budget"):
-    """A follower's plan and the bytes it needs, for `agree_residence`."""
-
-    rank: int
-    model: str
-    plan: GroupPlan
-    required: _Bytes
-
-
-class _Parking(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_budget"):
-    """Rank 0's answer to the offers: the constructions every rank parks."""
-
-    model: str
-    park: list[str]
-
-
-class _Measured(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_ceiling"):
-    """A follower's ceiling, measured after it parked."""
-
-    rank: int
-    model: str
-    ceiling: _Bytes
-
-
-class _Ceiling(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_ceiling"):
-    """The group's ceiling: the smallest any rank measured."""
-
-    model: str
-    ceiling: _Bytes
 
 
 class SpreadLog(TypedDict):
@@ -265,48 +231,6 @@ def abort_process_group() -> None:
             abort()
     except Exception:  # teardown must not raise
         return
-
-
-def _decode[T](
-    frame: Mapping[str, object] | None, kind: type[T], gpu: str, field_name: str, what: str
-) -> T:
-    """One residence message, or a divergence naming the GPU and the field it broke."""
-    try:
-        return msgspec.convert(frame, kind)
-    except msgspec.ValidationError as exc:
-        raise GpuDivergence(gpu, field_name, f"{what}: {exc}") from exc
-
-
-def receive_residence(
-    channel: Channel,
-    *,
-    rank: int,
-    model: str,
-    plan: Mapping[str, object],
-    required: int,
-    park: Callable[[list[str]], None],
-    ceiling: Callable[[], int],
-) -> int:
-    """A follower's half of `RankGroup.agree_residence`.
-
-    Offer this rank's plan and need, park what rank 0 parked, offer the ceiling measured
-    after that, and accept only a matching, no-larger group ceiling.
-    """
-    offer = _Offer(rank, model, GroupPlan.read(plan), required)
-    gpu = execution_evidence.gpu_name(offer.plan.devices, rank)
-    channel.send(msgspec.to_builtins(offer))
-    what = "invalid group parking decision"
-    parking = _decode(channel.recv(timeout=None), _Parking, gpu, "parked_constructions", what)
-    if parking.model != model:
-        raise GpuDivergence(gpu, "parked_constructions", f"{what} for {parking.model!r}")
-    park(parking.park)
-    local = ceiling()
-    channel.send(msgspec.to_builtins(_Measured(rank, model, local)))
-    what = "invalid group residence ceiling"
-    shared = _decode(channel.recv(timeout=None), _Ceiling, gpu, "resident_budget_bytes", what)
-    if shared.model != model or shared.ceiling > local:
-        raise GpuDivergence(gpu, "resident_budget_bytes", what)
-    return shared.ceiling
 
 
 class RankGroup:
@@ -732,51 +656,6 @@ class RankGroup:
                 self._break(f"{follower.gpu} answered {head.reply!r} to {name!r}{refused}")
                 raise GroupRefusal(self.broken, code="group_broken")
             return body
-
-    def agree_residence(
-        self,
-        *,
-        model: str,
-        plan: Mapping[str, object],
-        required: int,
-        park: Callable[[int], list[str]],
-        ceiling: Callable[[], int],
-    ) -> tuple[int, list[str]]:
-        """Agree the plan, the constructions to park, and the ceiling, before any fill.
-
-        Every rank resolved on its own card; each offer carries its plan and the bytes it
-        needs. A plan that differs is divergence, refused before a destination exists. Rank
-        0 parks for the largest need any rank reported and every rank parks the same
-        constructions; each then measures its own ceiling and the group fills under the
-        smallest. The control seam also observes an early load failure or rank death,
-        without parking the leader in a device collective.
-        """
-        need = int(required)
-        mine = GroupPlan.read(plan)
-        for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
-            offer = _decode(reply, _Offer, follower.gpu, "resident_budget", "invalid GPU offer")
-            if (offer.rank, offer.model) != (follower.rank, model):
-                raise GpuDivergence(follower.gpu, "resident_budget", "invalid GPU offer")
-            offer.plan.assert_agrees(mine, rank=follower.rank)
-            need = max(need, offer.required)
-        parked = park(need)
-        self.broadcast(msgspec.to_builtins(_Parking(model, parked)))
-        shared = ceiling()
-        for follower, reply in zip(self.followers, self.collect("resident_ceiling"), strict=True):
-            measured = _decode(
-                reply,
-                _Measured,
-                follower.gpu,
-                "resident_budget_bytes",
-                "invalid GPU residence ceiling",
-            )
-            if (measured.rank, measured.model) != (follower.rank, model):
-                raise GpuDivergence(
-                    follower.gpu, "resident_budget_bytes", "invalid GPU residence ceiling"
-                )
-            shared = min(shared, measured.ceiling)
-        self.broadcast(msgspec.to_builtins(_Ceiling(model, shared)))
-        return shared, parked
 
     def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
         self.broadcast(command)

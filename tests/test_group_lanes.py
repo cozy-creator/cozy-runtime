@@ -137,6 +137,41 @@ def test_the_authors_degrees_reach_the_interface_and_its_fixed_point() -> None:
     assert tolerated["entrypoints"][0]["models"][0]["sequence_parallel"]["degrees"] == [2]
 
 
+def test_placeable_components_reach_the_interface_and_their_gpus_reach_the_binding() -> None:
+    """`@placeable(...)` -> the interface slot `placeable` (sorted), which TensorD reads; its
+    Load names each one's GPU on the binding (`homes`), which `_install_group` keeps them on."""
+    from cozy_runtime.author import Model, placeable
+    from cozy_runtime.author._signature import ModelBinding as AuthorSlot
+
+    @placeable("vae", "text_encoder")
+    class Hosting(Model[object]):
+        pass
+
+    slot = AuthorSlot(path="serve.models.m", param="m", model_class=Hosting, components={})
+    assert _slot_document(slot)["placeable"] == ["text_encoder", "vae"]
+    plain = dataclasses.replace(slot, model_class=Model)
+    assert "placeable" not in _slot_document(plain)
+    body = package_interface.build(discover(PACKAGE))
+    entry = next(row for row in body["entrypoints"] if row["name"] == "marco")
+    for placed, ok in ((["text_encoder", "vae"], True), (["vae", "text_encoder"], False)):
+        entry["models"] = [
+            {"path": "marco.models.m", "class": "Hosting", "component_use": {}, "placeable": placed}
+        ]
+        raw = package_interface.canonical_bytes(body)
+        if ok:
+            read = package_interface.read_bytes(raw)
+            marco = next(row for row in read["entrypoints"] if row["name"] == "marco")
+            assert marco["models"][0]["placeable"] == placed
+            continue
+        with pytest.raises(package_interface.StalePackageInterface, match="placeable"):
+            package_interface.read_bytes(raw)
+    load = executor_commands.decode(
+        {"cmd": "load", "construction": "c", "binding": {"homes": {"text_encoder": 1, "vae": 0}}}
+    )
+    assert isinstance(load, executor_commands.Load)
+    assert load.single().binding.homes == {"text_encoder": 1, "vae": 0}
+
+
 # ---------------------------------------------------------------------- gloo (torch)
 
 
