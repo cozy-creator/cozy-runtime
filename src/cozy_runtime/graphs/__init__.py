@@ -88,6 +88,8 @@ class _Recording:
         self.served = [(b, i) for b, impls in served.items() for i in impls]
         self.nbytes = nbytes
         self.done: Any = None
+        self.stream: Any = None
+        self.fenced = True
 
     def output(self) -> Any:
         """Caller-owned outputs allocated before residency admission or graph launch."""
@@ -98,24 +100,30 @@ class _Recording:
 
     def __call__(self, leaves: list[Any], out: Any) -> Any:
         torch, stream = self.torch, self.torch.cuda.current_stream()
-        if self.done is not None:
+        if self.done is None:
+            self.done = torch.cuda.Event()
+            self.done.record(stream)  # instantiate before any replay can be enqueued
+        else:
             stream.wait_event(self.done)
-        for static, value in zip(self.inputs, leaves, strict=True):
-            if static is not None:
-                static.copy_(value)
-        self.graph.replay()
-        source = torch.utils._pytree.tree_leaves(self.outputs)
-        for dst, src in zip(torch.utils._pytree.tree_leaves(out), source, strict=True):
-            if isinstance(src, torch.Tensor):
-                dst.copy_(src)
-        for backend, implementation in self.served:
-            attention_ulysses.record(backend, implementation)
-        self.done = torch.cuda.Event()
-        self.done.record(stream)
-        return out
+        self.stream, self.fenced = stream, False
+        try:
+            for static, value in zip(self.inputs, leaves, strict=True):
+                if static is not None:
+                    static.copy_(value)
+            self.graph.replay()
+            source = torch.utils._pytree.tree_leaves(self.outputs)
+            for dst, src in zip(torch.utils._pytree.tree_leaves(out), source, strict=True):
+                if isinstance(src, torch.Tensor):
+                    dst.copy_(src)
+            for backend, implementation in self.served:
+                attention_ulysses.record(backend, implementation)
+            return out
+        finally:
+            self.done.record(stream)
+            self.fenced = True
 
     def idle(self) -> bool:
-        return self.done is None or bool(self.done.query())
+        return self.fenced and (self.done is None or bool(self.done.query()))
 
 
 class _Recorder:
@@ -226,7 +234,10 @@ def release(torch: Any, root: Any) -> None:
         if recorder is not None:
             with recorder.lock:
                 for entry in recorder.recordings.values():
-                    if entry.done is not None:
+                    if not entry.fenced:
+                        entry.stream.synchronize()
+                        entry.fenced = True
+                    elif entry.done is not None:
                         entry.done.synchronize()
                 recorder.forget(torch)
         _REGIONS.pop(module, None)

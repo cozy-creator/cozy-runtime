@@ -1026,7 +1026,8 @@ class _Engine:
         self.pools: dict[tuple[int, int, bool], Any] = {}
         self.addresses: dict[int, Any] = {}
         self.unprepared: BaseException | None = None
-        self.used_streams: set[Any] = set()
+        self.completions: dict[Any, Any] = {}
+        self.unfenced: set[Any] = set()
         self.side: Any = None
         #: (bucket, window, drafted) -> why that step runs eagerly
         self.unrecorded: dict[tuple[int, int, bool], str] = {}
@@ -1225,9 +1226,20 @@ class _Engine:
         rows = [row for row in self.slots if row is not None]
         per = DEPTH + 1 if self._drafting(size) else 1
         self.cache.window = window(max(row.reach for row in rows) + per, self.capacity)
+        stream, event = None, None
         if self.cache_device.type == "cuda":
-            self.used_streams.add(torch.cuda.current_stream())
-        run(size)
+            stream = torch.cuda.current_stream()
+            event = self.completions.get(stream)
+            if event is None:
+                event = self.completions[stream] = torch.cuda.Event()
+                event.record(stream)  # instantiate before any accepted step can run
+            self.unfenced.add(stream)
+        try:
+            run(size)
+        finally:
+            if event is not None:
+                event.record(stream)
+                self.unfenced.discard(stream)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
         for request in {id(row.request): row.request for row in rows}.values():
@@ -1638,8 +1650,6 @@ class _Engine:
         """Prepare the exact pool and join the side stream before the driver lease can end."""
         current = torch.cuda.current_stream()
         self.side.wait_stream(current)
-        self.used_streams.add(self.side)
-        self.used_streams.add(current)
         placed = PLACED.get(self.model)
         binding = self.addresses.get(id(self.model))
         try:
@@ -1708,9 +1718,12 @@ class _Engine:
     def _forget(self) -> None:
         """Release recordings only at the driver's already-drained step boundary."""
         if self.graphs or self.pools:
-            for stream in self.used_streams:
+            for stream in self.unfenced:
                 stream.synchronize()
-            self.used_streams.clear()
+            self.unfenced.clear()
+            for event in self.completions.values():
+                event.synchronize()
+            self.completions.clear()
             self.graphs, self.warmed, self.unrecorded, self.pools = {}, set(), {}, {}
             self.pool = None
             torch.cuda.empty_cache()
@@ -1912,7 +1925,13 @@ class _Engine:
         if not self.cond.acquire(blocking=False):
             return False
         try:
-            if self.driver is not None or self.pending or self.cache is None:
+            if (
+                self.driver is not None
+                or self.pending
+                or self.cache is None
+                or self.unfenced
+                or any(not event.query() for event in self.completions.values())
+            ):
                 return False
             self._drop()
             return True
