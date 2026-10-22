@@ -211,16 +211,16 @@ def native() -> str:
 @contextmanager
 def readable[*Ts](*tensors: *Ts) -> Iterator[tuple[*Ts]]:
     """The operands of a kernel launched outside torch's dispatch (Triton, a compiled
-    extension), which reads them by pointer. A weight with no plane bytes bound is a stand-in
-    with nothing behind its pointer: its plane maps and holds it for the launch, or refuses
-    (`weights.Unbound.reading`). Every such launch goes through here, so none is handed one."""
-    standins = [t for t in tensors if hasattr(type(t), "reading")]
-    if not standins:
-        yield tensors
-        return
-    reading = getattr(type(standins[0]), "reading")  # noqa: B009
-    with reading(standins, "a kernel launch") as read:
-        yield cast("tuple[*Ts]", tuple(read.operand(t) for t in tensors))
+    extension), which reads them by pointer. A weight varena has not bound now (no forward of
+    its block or model runs) is a placeholder whose pointer is 0: its read binds it, and the
+    tensor read holds the pin until it dies, past the launch (`Placeholder._varena_read`).
+    Every such launch goes through here, so none is handed a null pointer (cr-208)."""
+    yield cast("tuple[*Ts]", tuple(_read(t) for t in tensors))
+
+
+def _read(tensor: Any) -> Any:
+    read = getattr(tensor, "_varena_read", None)
+    return tensor if read is None else read()
 
 
 def rms_rope_split_half(
