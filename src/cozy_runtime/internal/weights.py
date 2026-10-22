@@ -74,7 +74,7 @@ if TYPE_CHECKING:
 #: `ReadGrant` by manifest and layout digest.
 type Grant = Callable[[str, str], HostGrant]
 #: Whether this TensorFS seals a host layout only where TensorD admits it (`WeightGrant.seal`,
-#: 0.13.1); an older one seals on every unheld load, as it always did.
+#: 0.13.2); an older one seals on every unheld load, as it always did.
 ADMITS = "seal" in {f.name for f in fields(WeightGrant)}
 #: GPU pages varena kept, given to TensorD (`KeepPages`): layout digest, fingerprint, and
 #: `(region, span, fd)` each (the callee's to close).
