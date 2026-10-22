@@ -46,7 +46,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, capture, capture_domain, say
+from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, say
 from cozy_runtime.lm import _kernels
 
 try:
@@ -2011,3 +2011,6 @@ __all__ = [
     "release",
     "window",
 ]
+
+
+DECODERS.append((_graph_snapshot, release))

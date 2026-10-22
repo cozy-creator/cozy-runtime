@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from tensorfs.varena.torch import Cache, Declared, Level, Memory, Model, Weights, blocks_of
 
-from cozy_runtime import graphs, lm
+from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
 from cozy_runtime.internal import execution, lora_bake
@@ -411,7 +411,8 @@ class Backend:
 
     def close(self) -> None:
         for model in self.models.values():
-            lm.release(model.module)
+            for _, release in graphs.DECODERS:
+                release(model.module)
             graphs.release(self.torch, model.module)
             model.close()
         self.models.clear()
