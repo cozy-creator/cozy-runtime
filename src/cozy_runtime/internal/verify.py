@@ -194,12 +194,26 @@ def admitted(
     kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict], *, tables: Path | None = None
 ) -> Verdict:
     """A shipped verdict, or a real probe only within the explicit offline oracle scope."""
+    if _OFFLINE.get() is not None:
+        return measured(kernel, artifact, sm, probe)
+    found = shipped(kernel, artifact, sm, tables=tables)
+    return found or Verdict(False, f"no matching offline verdict for {kernel} on sm{sm}")
+
+
+def measured(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) -> Verdict:
+    """The development oracle's probe, recorded for publication (inside `measuring` only)."""
+    records = _OFFLINE.get()
+    assert records is not None, "a consumer never probes"
     _, source, torch_build = _identity()
-    if (records := _OFFLINE.get()) is not None:
-        # A source change invalidates old development-cache verdicts as well as shipped facts.
-        verdict = verified(kernel, f"{artifact};source={source};torch={torch_build}", sm, probe)
-        records[kernel, artifact, sm] = verdict
-        return verdict
+    # A source change invalidates old development-cache verdicts as well as shipped facts.
+    verdict = verified(kernel, f"{artifact};source={source};torch={torch_build}", sm, probe)
+    records[kernel, artifact, sm] = verdict
+    return verdict
+
+
+def shipped(kernel: str, artifact: str, sm: int, *, tables: Path | None = None) -> Verdict | None:
+    """The release's offline verdict for this exact kernel, artifact and card, or None."""
+    _, source, torch_build = _identity()
     directory = Path(__file__).parent / "qualification_tables" if tables is None else tables
     try:
         document = json.loads((directory / _name(sm, source, torch_build)).read_bytes())
@@ -218,7 +232,7 @@ def admitted(
                 return Verdict(row["ok"], row["detail"])
     except (OSError, ValueError, KeyError, TypeError):
         pass
-    return Verdict(False, f"no matching offline verdict for {kernel} on sm{sm}")
+    return None
 
 
 @lru_cache(maxsize=32)

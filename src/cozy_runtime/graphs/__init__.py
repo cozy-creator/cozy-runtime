@@ -270,10 +270,6 @@ class _Recorder:
         self.failed: dict[tuple[object, ...], str] = {}
         self.waiting: dict[tuple[object, ...], int] = {}
         self.binding: Any = None
-        #: the pass its purity and structure were last read in, and what they were
-        self.checked: object = None
-        self.pure = False
-        self.structure: tuple[object, ...] = ()
         self.replays = 0
         self.attempts = 0
         self.capture_attempts = 0
@@ -312,6 +308,10 @@ _LENT: dict[int, tuple[weakref.ref[_Recording], int]] = {}
 _REGIONS: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
 _DECLARED: weakref.WeakSet[Any] = weakref.WeakSet()
 _GAPS: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
+#: each region's purity and structure, with the root call (pass) they were read in
+_CHECKED: weakref.WeakKeyDictionary[Any, tuple[object, bool, tuple[object, ...]]] = (
+    weakref.WeakKeyDictionary()
+)
 _CLASSES: dict[type, type] = {}
 
 
@@ -408,6 +408,7 @@ def release(torch: Any, root: Any) -> None:
         _REGIONS.pop(module, None)
         _DECLARED.discard(module)
         _GAPS.pop(module, None)
+        _CHECKED.pop(module, None)
     domain.release(root)
 
 
@@ -534,13 +535,12 @@ def _region_call(
     torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any, placed: Any
 ) -> Any:
     leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
-    recorder = _RECORDERS.get(module)
-    if recorder is None:
-        recorder = _RECORDERS.setdefault(module, _Recorder())
     stamp = _PASS.get(None)
-    if stamp is None or recorder.checked is not stamp:
-        recorder.checked, recorder.pure = stamp, safe(torch, module)
-        recorder.structure = _structure(torch, module) if recorder.pure else ()
+    checked = _CHECKED.get(module)
+    if checked is None or stamp is None or checked[0] is not stamp:
+        pure = safe(torch, module)
+        checked = _CHECKED[module] = (stamp, pure, _structure(torch, module) if pure else ())
+    _, pure, structure = checked
     why = (
         "with gradients"
         if torch.is_grad_enabled()
@@ -551,7 +551,7 @@ def _region_call(
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
         else "outside its purity contract"
-        if not recorder.pure
+        if not pure
         else _unplain(torch, leaves)
     )
     if why:
@@ -559,6 +559,9 @@ def _region_call(
         if placed is not None:
             placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
         return call(module, *args, **kwargs)
+    recorder = _RECORDERS.get(module)
+    if recorder is None:
+        recorder = _RECORDERS.setdefault(module, _Recorder())
     levels = placed[0].graph_levels() if placed is not None else ()
     addresses = (
         ()
@@ -569,7 +572,7 @@ def _region_call(
         )
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
-    key = (*_signature(torch, leaves, spec), recorder.structure, levels, addresses, autocast)
+    key = (*_signature(torch, leaves, spec), structure, levels, addresses, autocast)
     if recorder.domain is None:
         recorder.domain = (
             placed[0].graph_domain(placed[1])

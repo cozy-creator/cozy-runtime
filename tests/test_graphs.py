@@ -370,10 +370,11 @@ def test_a_segment_boundary_copies_nothing_and_a_held_output_is_never_overwritte
         # Only the root's input is copied in; the boundary between the two graphs is read in place.
         assert first.copy_bytes == 3 * x.nbytes and second.copy_bytes == 0
         # Purity and structure are read once per root call, for every region under it.
-        assert first.checked is second.checked is not None
-        stamp = first.checked
+        stamps = [graphs._CHECKED[m][0] for m in (module.first, module.second)]
+        assert stamps[0] is stamps[1] is not None
         module(x)
-        assert first.checked is second.checked is not stamp
+        assert graphs._CHECKED[module.first][0] is graphs._CHECKED[module.second][0]
+        assert graphs._CHECKED[module.first][0] is not stamps[0]
         facts = graphs.describe(module)
         assert facts["graph_pools"] == 1 and facts["captured_regions"] == ["first", "second"]
         # A caller holding a lent output: the next call runs as written and leaves it intact.
@@ -433,7 +434,7 @@ def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
         cross_attention_dim=16,
         norm_num_groups=8,
         use_linear_projection=True,
-    ).eval()
+    )  # left in training mode, as Runtime constructs it: no gradients, inert dropouts
     blocks = blocks_of(unet)
     found = [path for path, _ in segments(torch, unet, blocks)]
     top = [p for p in found if not any(p.startswith(f"{q}.") for q in found)]
@@ -464,3 +465,7 @@ def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
     attention.set_processor(PackageProcessor())
     assert not safe(torch, unet.get_submodule("up_blocks.0"))
     assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
+    # A dropout that would act in training mode makes its container impure.
+    unet.get_submodule("up_blocks.0.resnets.0.dropout").p = 0.1
+    assert not safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
+    assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0").eval())

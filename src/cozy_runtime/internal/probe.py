@@ -198,6 +198,16 @@ class UnmeasuredEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="unm
     route_axes: RouteAxes = RouteAxes()
 
 
+class FamilyDefaultEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="family-default"):
+    """A native leaf on a card with its lane's tensor cores and no offline verdict: the family's
+    default GEMM serves. Verdicts refine the kernel within a family; they never decide whether
+    the lane runs. No measured axes."""
+
+    note: str
+    passed: bool = True
+    route_axes: RouteAxes = RouteAxes()
+
+
 class ReferenceEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="reference"):
     """A shipped decoder's format/API contract, with no measured timing or accuracy axes."""
 
@@ -224,7 +234,12 @@ class DecodeEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="decode"
 
 
 Evidence = (
-    VerbatimEvidence | ReferenceEvidence | UnmeasuredEvidence | NativeEvidence | DecodeEvidence
+    VerbatimEvidence
+    | ReferenceEvidence
+    | FamilyDefaultEvidence
+    | UnmeasuredEvidence
+    | NativeEvidence
+    | DecodeEvidence
 )
 
 

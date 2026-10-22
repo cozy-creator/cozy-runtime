@@ -20,8 +20,8 @@ from cozy_runtime.internal.encoding import leaves
 # package subclass cannot inherit a marker and thereby acquire its parent's contract.
 WRAPPERS: dict[type, type] = {}
 
-#: Diffusers implementations pure in eval mode once every child is, by defining module: the
-#: token-wise feed-forwards, and SDXL-class UNet containers (attention through `PROCESSORS`).
+#: Diffusers implementations pure once every child is, by defining module: the token-wise
+#: feed-forwards, and SDXL-class UNet containers (attention through `PROCESSORS`).
 DIFFUSERS = {
     "diffusers.models.activations": {
         "GELU",
@@ -72,11 +72,9 @@ def safe(torch: Any, module: Any) -> bool:
         return known and "linear" not in vars(module)
     if kind == "sequential":
         return all(safe(torch, child) for child in module.children())
-    return (
-        not module.training
-        and _processor(module)
-        and all(_child(torch, child) for child in module.children())
-    )
+    # Training mode alone changes none of these forwards without gradients; a dropout that
+    # would act in it is refused per child (`_child`).
+    return _processor(module) and all(_child(torch, child) for child in module.children())
 
 
 #: A class's contract, by class, with the call path and forward it was read for.

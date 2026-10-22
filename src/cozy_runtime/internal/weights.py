@@ -12,6 +12,7 @@ and notes.
 
 from __future__ import annotations
 
+import threading
 import time
 import zlib
 from collections import Counter
@@ -101,6 +102,8 @@ class Backend:
         #: each component's loaded model, and its LoRA bakes
         self.models: dict[str, Model] = {}
         self.bakes: dict[str, _Bakes] = {}
+        #: each component's bind routes, which keep its decoded tensors for the generation
+        self.routes: dict[str, _Routes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
         self.stats: dict[str, float] = {}
         self.device_facts = device_facts
@@ -408,6 +411,9 @@ class Backend:
             graphs.release(self.torch, model.module)
             model.close()
         self.models.clear()
+        for routes in self.routes.values():
+            routes.close()
+        self.routes.clear()
 
     def sizes(self) -> dict[str, int]:
         """Each loaded component's stored bytes."""
@@ -434,14 +440,17 @@ class Backend:
 
     def _register(self, name: str, root: Module, keys: list[str]) -> Model:
         """One component loaded into the memory: its stored tensors, bound through their
-        routes, its LoRAs baked on page-in, under the execution layer's catch."""
+        routes, its LoRAs baked on page-in, under the execution layer's catch. Served in eval
+        mode: a model built in training mode would apply its dropouts to every request."""
+        root.eval()
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
+        routes = self.routes[name] = _Routes(self, name, rows)
         vars(root)["_varena"] = Declared(
             Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
             fill=bakes if bakes.bakes else None,
-            bind=_Routes(self, rows),
+            bind=routes,
         )
         model = self.memory.load(root)
         # Install explicit pure cuts and names; arbitrary package code is never replayed.
@@ -503,11 +512,14 @@ class Backend:
 
 
 class _Routes:
-    """A stored tensor's parts as the module's tensors (`Declared.bind`): as stored,
-    decoded into a fresh float tensor, or a native leaf's role buffers (derived roles made from
-    the stored ones). What it makes lives for that bind only."""
+    """A stored tensor's parts as the module's tensors (`Declared.bind`): as stored, decoded
+    into a float tensor, or a native leaf's role buffers (derived roles made from the stored
+    ones). A decoded tensor is decoded once a generation (`delivery.cost_class`), not once a
+    bind: it is kept under the fill identity it was decoded from, as the memory's cache, which
+    varena sheds on its ask (the next bind decodes again). Leaf buffers live for that bind."""
 
-    def __init__(self, backend: Backend, rows: Mapping[str, PlanRow]) -> None:
+    def __init__(self, backend: Backend, component: str, rows: Mapping[str, PlanRow]) -> None:
+        self.backend, self.component = backend, component
         self.torch = backend.torch
         self.rows = dict(rows)
         self.routes = {stored: backend._route(row.key) for stored, row in rows.items()}
@@ -519,6 +531,10 @@ class _Routes:
             for stored, row in rows.items()
             if row.key in backend.leaves
         }
+        self.lock = threading.Lock()
+        #: stored key -> (the fill identity it was decoded under, the decoded tensor)
+        self.decoded: dict[str, tuple[str, Tensor]] = {}
+        self.cache: Cache | None = None
 
     def __call__(self, key: str, parts: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
         torch, row = self.torch, self.rows[key]
@@ -527,9 +543,16 @@ class _Routes:
         if route == "verbatim":
             return {name: parts["value"]}
         if route == "decoded_float":
+            identity = self._identity()
+            with self.lock:
+                held = self.decoded.get(key)
+                if held is not None and held[0] == identity:
+                    return {name: held[1]}
             dtype = getattr(torch, TORCH_DTYPES[row.dtype])
             out = torch.empty(row.shape, dtype=dtype, device=next(iter(parts.values())).device)
             self.providers[key].decode(torch, parts, out)
+            if identity:
+                self._keep(key, identity, out)
             return {name: out}
         leaf, replaced, derived = self.leaves[key]
         path, buffers = name.removesuffix(".weight"), leaf.BUFFERS
@@ -540,6 +563,45 @@ class _Routes:
             for role in derived:
                 made[f"{path}.{buffers.get(role, role)}"] = fresh._buffers[buffers.get(role, role)]
         return made
+
+    def _identity(self) -> str:
+        """What the stored bytes are now: as stored, or the fill (LoRA bake) identity they were
+        baked under; "" where the fill declares none, whose decode is never kept."""
+        model = self.backend.models.get(self.component)
+        if model is None or model.fill is None:
+            return "stored"
+        return model.identity or ""
+
+    def _keep(self, key: str, identity: str, out: Tensor) -> None:
+        with self.lock:
+            self.decoded[key] = (identity, out)
+            if self.cache is None:
+                self.cache = self.backend.memory.cache(f"decoded:{self.component}", self.shed)
+            self.cache.cached(self._held())
+
+    def _held(self) -> int:
+        return sum(t.numel() * t.element_size() for _, t in self.decoded.values())
+
+    def shed(self, want: int) -> int:
+        """Varena's ask: decoded tensors go until `want` bytes have (every one for `want` <= 0)."""
+        with self.lock:
+            freed = 0
+            for key in list(self.decoded):
+                if want > 0 and freed >= want:
+                    break
+                tensor = self.decoded.pop(key)[1]
+                freed += tensor.numel() * tensor.element_size()
+            if self.cache is not None:
+                self.cache.cached(self._held())
+            return freed
+
+    def close(self) -> None:
+        """The generation ends: every decoded tensor, and the cache that accounted for them."""
+        with self.lock:
+            self.decoded.clear()
+            if self.cache is not None:
+                self.cache.close()
+                self.cache = None
 
 
 @runtime_checkable
