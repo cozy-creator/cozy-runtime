@@ -20,9 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def inspect(root: Path) -> dict[str, Any]:
     program = """import json
+import torch
 from cozy_runtime.internal import prebuilt
 from cozy_runtime.internal.encoding import selection
-kernels = {sm: prebuilt.gemm_kernel("int8", "mma.sync", sm).build for sm in (86, 89, 120)}
+ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False, 0)
+kernels = {sm: prebuilt.gemm_kernel("int8", ops, sm).build for sm in (86, 89, 120)}
 print(json.dumps({"source":selection.__file__,"kernels":kernels,"backends":selection.native_backend_identity()}))
 """
     done = subprocess.run(

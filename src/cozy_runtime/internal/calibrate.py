@@ -132,6 +132,8 @@ class Measured(msgspec.Struct):
     quantize_us: float
     bf16_us: float
     candidates: list[Candidate]
+    #: `SHAPE_CLOCKS` read once the shape's rounds ended
+    clocks: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,12 +174,17 @@ def card(torch: ModuleType, index: int, sm: int) -> Card:
     )
 
 
-def clocks(index: int) -> str:
-    """The card's clocks, power and throttle state, as nvidia-smi reports them now."""
-    query = (
-        "name,clocks.sm,clocks.max.sm,clocks.mem,clocks.max.mem,power.limit,power.max_limit,"
-        "power.draw,temperature.gpu,clocks_event_reasons.active"
-    )
+#: What `clocks` reads: the card's clocks, power and throttle state.
+CLOCKS = (
+    "name,clocks.sm,clocks.max.sm,clocks.mem,clocks.max.mem,power.limit,power.max_limit,"
+    "power.draw,temperature.gpu,clocks_event_reasons.active"
+)
+#: The same read after each shape: what its timings ran at.
+SHAPE_CLOCKS = "clocks.sm,clocks.mem,power.draw,temperature.gpu,clocks_event_reasons.active"
+
+
+def clocks(index: int, query: str = CLOCKS) -> str:
+    """One nvidia-smi (NVML) read of `query` on the card, now."""
     done = subprocess.run(
         ["nvidia-smi", "-i", str(index), f"--query-gpu={query}", "--format=csv,noheader"],
         capture_output=True,
@@ -215,7 +222,8 @@ def run(
         for (m, n, k), rows in sorted(cells.items()):
             evidence.append(_shape(torch, ops, f, measured, m, n, k, rows))
             progress(evidence[-1])
-        found[f.name] = Calibration(_verdict(evidence), _rules(evidence, measured.sms), evidence)
+        rules = _rules(evidence, measured.sms, torch.__version__)
+        found[f.name] = Calibration(_verdict(evidence), rules, evidence)
     return found
 
 
@@ -472,7 +480,7 @@ def _shape(
         f.name, m, n, k, verify.shape_class(n, k), sum(one.layers for one in rows_of),
         sorted(f"{one.model}/{one.lane} x{one.layers}" for one in rows_of), len(pool.sets), seed,
         quantizer, statistics.median(warm["quantize"]), statistics.median(warm["bf16"]),
-        list(candidates.values()),
+        list(candidates.values()), clocks(ops.index, SHAPE_CLOCKS),
     )  # fmt: skip
 
 
@@ -581,9 +589,9 @@ def _spread(candidate: Candidate) -> float:
     return (candidate.warm_us[3] - candidate.warm_us[1]) / candidate.warm_us[2]
 
 
-def _rules(evidence: Sequence[Measured], sms: int) -> tuple[verify.Rule, ...]:
+def _rules(evidence: Sequence[Measured], sms: int, torch_build: str) -> tuple[verify.Rule, ...]:
     """Per (shape class, M bucket (2^(b-1), 2^b]), for this card's SM-count bucket, the cell's
-    `_best` candidate where it has one."""
+    `_best` candidate where it has one; a cuBLASLt choice names the torch build it ran."""
     cells: dict[tuple[str, int], list[Measured]] = defaultdict(list)
     for one in evidence:
         cells[one.shape, math.ceil(math.log2(one.m))].append(one)
@@ -593,7 +601,8 @@ def _rules(evidence: Sequence[Measured], sms: int) -> tuple[verify.Rule, ...]:
         best = _best(group)
         if best is not None:
             low = 0 if bucket <= 0 else 2 ** (bucket - 1)
-            rules.append(verify.Rule(low, 2**bucket, kind, best, 2 ** (power - 1), 2**power))
+            torch = torch_build if best == verify.CUBLASLT else ""
+            rules.append(verify.Rule(low, 2**bucket, kind, best, 2 ** (power - 1), 2**power, torch))
     return tuple(rules)
 
 
@@ -601,14 +610,20 @@ def _best(group: Sequence[Measured]) -> Choice | None:
     """Of the candidates timed at every shape of a cell and regressing no default there beyond
     the pair's spread, the one with the least layer-weighted time, where it beats the family
     default's by more than the cell's largest spread. At a few int8 rows a served linear's
-    default is the GEMV, which quantizes inside: a rule must not regress it either, comparing
-    its time plus the quantizer's. The GEMV is never a rule's choice."""
+    default is the GEMV, which quantizes inside: a rule needs it timed at every shape and must
+    not regress it, comparing its time plus the quantizer's. The GEMV is never a rule's
+    choice."""
     timed = [
         {c.choice: c for c in one.candidates if c.ok and c.warm_us and not c.impossible}
         for one in group
     ]
     if not all(DEFAULT in found for found in timed):
         return None
+    # Where the GEMV was a candidate it is a served linear's default: untimed, nothing is known
+    # to beat it.
+    for one, found in zip(group, timed, strict=True):
+        if any(c.choice == verify.GEMV for c in one.candidates) and verify.GEMV not in found:
+            return None
 
     def holds(choice: Choice, one: Measured, found: dict[Choice, Candidate]) -> bool:
         if choice not in found:

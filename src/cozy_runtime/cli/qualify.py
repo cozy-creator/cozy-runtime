@@ -59,6 +59,7 @@ def main(argv: Sequence[str]) -> int:
         len(list(cells(providers, dtypes))) + (calibrate.shapes(device.sm) if family else 0)
     )
     calibrations: dict[str, calibrate.Calibration] = {}
+    ops: prebuilt.Prebuilt | None = None
     with verify.measuring() as verdicts:
         _, table = qualify(
             torch,
@@ -87,7 +88,9 @@ def main(argv: Sequence[str]) -> int:
     # Each format's GEMM verdict holds its probe and its calibration at the packages' shapes.
     rules = {}
     for name, found in calibrations.items():
-        identity = prebuilt.gemm_kernel(name, family, device.sm)
+        if ops is None:
+            break
+        identity = prebuilt.gemm_kernel(name, ops, device.sm)
         probed = verdicts.get((identity, device.sm), verify.Verdict(False, "never probed"))
         verdicts[identity, device.sm] = verify.Verdict(
             probed.ok and found.verdict.ok,

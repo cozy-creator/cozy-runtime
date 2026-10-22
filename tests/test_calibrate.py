@@ -45,7 +45,9 @@ def test_a_rule_ships_only_where_it_beats_the_default_beyond_the_spread() -> Non
         # (0, 1] square: the GEMV is the default; no other candidate beats it.
         shape(1, 4096, 4096, timed(DEFAULT, 10.0), timed(verify.GEMV, 10.0), timed(3, 40.0)),
     ]
-    assert calibrate._rules(evidence, SMS) == (verify.Rule(2048, 4096, "square", 4, 128, 256),)
+    assert calibrate._rules(evidence, SMS, "2.14.1+cu130") == (
+        verify.Rule(2048, 4096, "square", 4, 128, 256),
+    )
 
 
 def test_a_rule_regresses_no_shape_of_its_cell() -> None:
@@ -55,22 +57,36 @@ def test_a_rule_regresses_no_shape_of_its_cell() -> None:
         shape(8192, 1280, 1280, timed(DEFAULT, 100.0), timed(4, 50.0), timed(0, 100.5), layers=60),
         shape(4608, 3072, 3072, timed(DEFAULT, 100.0), timed(4, 110.0), timed(0, 100.0), layers=1),
     ]
-    assert calibrate._rules(evidence, SMS) == ()
+    assert calibrate._rules(evidence, SMS, "2.14.1+cu130") == ()
     refused = Candidate(4, True, note="not supported: tile 4 cannot take 2900x3072")
     evidence = [
         shape(4096, 1280, 1280, timed(DEFAULT, 120.0), timed(4, 100.0), timed(0, 110.0)),
         shape(2900, 3072, 3072, timed(DEFAULT, 360.0), refused, timed(0, 300.0)),
     ]
-    assert calibrate._rules(evidence, 24) == (verify.Rule(2048, 4096, "square", 0, 16, 32),)
+    assert calibrate._rules(evidence, 24, "2.14.1+cu130") == (
+        verify.Rule(2048, 4096, "square", 0, 16, 32),
+    )
 
 
 def test_at_a_few_rows_a_rule_must_not_regress_the_gemv_leaf() -> None:
     # Tile 6 beats the GEMM default by far, but with the quantizer (1 us here) it loses to the
     # GEMV a served linear uses at M <= 4: no rule. Where the GEMV is slower, tile 6 ships.
     slower = [shape(2, 1024, 4096, timed(DEFAULT, 15.0), timed(6, 11.0), timed(verify.GEMV, 11.5))]
-    assert calibrate._rules(slower, SMS) == ()
+    assert calibrate._rules(slower, SMS, "2.14.1+cu130") == ()
     faster = [shape(2, 1024, 4096, timed(DEFAULT, 15.0), timed(6, 11.0), timed(verify.GEMV, 14.0))]
-    assert calibrate._rules(faster, SMS) == (verify.Rule(1, 2, "down", 6, 128, 256),)
+    assert calibrate._rules(faster, SMS, "2.14.1+cu130") == (
+        verify.Rule(1, 2, "down", 6, 128, 256),
+    )
+
+
+def test_no_rule_where_the_gemv_was_tried_but_not_timed_and_cublaslt_names_its_torch() -> None:
+    refused = Candidate(verify.GEMV, True, note="not supported: the GEMV does not take this shape")
+    untimed = [shape(2, 1024, 4096, timed(DEFAULT, 15.0), timed(6, 11.0), refused)]
+    assert calibrate._rules(untimed, SMS, "2.14.1+cu130") == ()
+    evidence = [shape(4096, 1280, 1280, timed(DEFAULT, 120.0), timed(verify.CUBLASLT, 90.0))]
+    assert calibrate._rules(evidence, SMS, "2.14.1+cu130") == (
+        verify.Rule(2048, 4096, "square", verify.CUBLASLT, 128, 256, "2.14.1+cu130"),
+    )
 
 
 def test_only_the_default_and_the_quantizer_fail_the_verdict() -> None:

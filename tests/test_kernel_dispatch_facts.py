@@ -72,11 +72,12 @@ def test_a_refused_or_malformed_table_ships_no_rules(tmp_path: Path) -> None:
 def test_admission_takes_its_cards_rules_and_a_refusal_never_drops_the_family(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    identity = prebuilt.gemm_kernel("int8", "mma.sync", 89)
+    identity = prebuilt.gemm_kernel("int8", prebuilt.Prebuilt(torch, 0, "mma.sync", False, 0), 89)
     other = verify.Rule(0, 4, "square", 3, 64, 128)  # measured on a card of another SM bucket
+    stale = verify.Rule(8, 16, "up", verify.CUBLASLT, 128, 256, "2.0.0+another-cublaslt")
     with verify.measuring() as records:
         verify.measured(identity, 89, cpu_probe)
-    verify.publish(tmp_path, 89, records, {identity: (*RULES, other)}, {}, None)
+    verify.publish(tmp_path, 89, records, {identity: (*RULES, other, stale)}, {}, None)
     monkeypatch.setattr(verify, "TABLES", tmp_path)
     for sms, rules in ((142, RULES), (128, (other,)), (24, ())):
         ops = prebuilt.Prebuilt(torch, 0, "mma.sync", False, sms)
@@ -96,6 +97,14 @@ def test_admission_takes_its_cards_rules_and_a_refusal_never_drops_the_family(
         assert "int8" not in ops.rules
     finally:
         prebuilt.DEFAULTED.pop((89, "int8"), None)
+
+
+def test_a_cublaslt_gemm_and_its_rules_bind_the_torch_build_too() -> None:
+    ada = prebuilt.Prebuilt(torch, 0, "mma.sync", False, 142)  # no native fp8 GEMM on Ada
+    assert prebuilt.gemm_kernel("fp8", ada, 89).torch == torch.__version__
+    assert prebuilt.gemm_kernel("int8", ada, 89).torch == ""
+    hopper = prebuilt.Prebuilt(torch, 0, "wgmma", True, 132)
+    assert prebuilt.gemm_kernel("fp8", hopper, 90).torch == ""
 
 
 def test_a_raising_probe_is_a_refusal_and_consumers_never_probe() -> None:

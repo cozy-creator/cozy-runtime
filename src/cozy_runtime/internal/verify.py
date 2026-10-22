@@ -48,11 +48,14 @@ class Verdict:
 @dataclass(frozen=True, slots=True)
 class Kernel:
     """What a verdict binds to: `name` (family included), the digest of the bytes that run,
-    and the digest of their declared native interface ("" where the bytes declare it)."""
+    the digest of their declared native interface ("" where the bytes declare it), and the
+    torch build where torch's cuBLASLt runs."""
 
     name: str
     build: str
     abi: str = ""
+    #: the torch build whose cuBLASLt it runs, where it runs one
+    torch: str = ""
 
 
 class Rule(msgspec.Struct, frozen=True):
@@ -68,6 +71,8 @@ class Rule(msgspec.Struct, frozen=True):
     choice: int | str
     sms_min: int
     sms_max: int
+    #: the torch build whose cuBLASLt a `CUBLASLT` choice was measured with
+    torch: str = ""
 
 
 class _Row(msgspec.Struct, frozen=True):
@@ -77,6 +82,7 @@ class _Row(msgspec.Struct, frozen=True):
     ok: bool
     detail: str
     rules: tuple[Rule, ...] = ()
+    torch: str = ""
 
 
 class _Document(msgspec.Struct, frozen=True):
@@ -167,7 +173,7 @@ def _rows(file: Path, changed: int, size: int) -> dict[Kernel, _Row]:
         return {}
     if document.schema != SCHEMA or file.name != path(document.sm, file.parent).name:
         return {}
-    return {Kernel(row.name, row.build, row.abi): row for row in document.verdicts}
+    return {Kernel(row.name, row.build, row.abi, row.torch): row for row in document.verdicts}
 
 
 def _shipped_row(kernel: Kernel, sm: int, tables: Path | None) -> _Row | None:
@@ -205,6 +211,7 @@ def publish(
             "name": kernel.name,
             "build": kernel.build,
             "abi": kernel.abi,
+            "torch": kernel.torch,
             "ok": verdict.ok,
             "detail": verdict.detail,
             "rules": [msgspec.to_builtins(rule) for rule in rules.get(kernel, ())],

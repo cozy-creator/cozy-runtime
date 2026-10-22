@@ -94,9 +94,9 @@ H3 = (
     "transformer.context_embedder.*",
     "text_encoder.model.language_model.*",
 )
-#: H3's one packed sequence (minimax_h3 official.denoise_rows at its 768x1344 canvas: video and
-#: audio rows) at 5 s and 15 s, plus 512 text rows; Ulysses degree 2 gives each GPU half.
-H3_ROWS = (37710 + 512, 109062 + 512)
+#: H3's one packed sequence (minimax_h3 official.denoise_rows at its 768x1344 canvas) at 5 s and
+#: 15 s; Ulysses degree 2 gives each GPU half.
+H3_ROWS = (37710, 109062)
 #: The describer's decode batch (1 to 16 images, `describe_characters`; a drafter's verify pass
 #: is 2-4 rows) and an image prompt's prefill.
 DESCRIBER_ROWS = (1, 2, 4, 8, 16, 2048)

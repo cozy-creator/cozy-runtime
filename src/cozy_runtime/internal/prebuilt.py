@@ -17,7 +17,7 @@ import base64
 import hashlib
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache, partial
 from pathlib import Path
 from types import ModuleType
@@ -413,13 +413,15 @@ def admission(torch: ModuleType, ops: Prebuilt, f: _Format, family: str, sm: int
     """A format's GEMM on this card: its shipped verdict's workload rules for this card's SM
     count refine the family's kernel; with none, the family default serves. A verdict never
     decides whether a lane, a format or the library runs."""
-    identity = gemm_kernel(f.name, family, sm)
+    identity = gemm_kernel(f.name, ops, sm)
     if verify.in_oracle():
         return verify.measured(identity, sm, partial(probe, torch, ops, f))
     found = verify.shipped(identity, sm)
     if found is not None and found.ok:
         ops.rules[f.name] = tuple(
-            rule for rule in verify.rules(identity, sm) if rule.sms_min < ops.sms <= rule.sms_max
+            rule
+            for rule in verify.rules(identity, sm)
+            if rule.sms_min < ops.sms <= rule.sms_max and rule.torch in ("", torch.__version__)
         )
         return found
     why = "no offline verdict" if found is None else f"a refused verdict ({found.detail})"
@@ -428,9 +430,16 @@ def admission(torch: ModuleType, ops: Prebuilt, f: _Format, family: str, sm: int
     return verify.Verdict(True, said)
 
 
-def gemm_kernel(f: str, family: str, sm: int) -> verify.Kernel:
-    """The 8-bit GEMM `f` of `family` in the loaded `_gemm`, on `sm` (`KERNELS`)."""
-    return kernel_identity(f"{KERNELS[f]}-{family.replace('.', '')}", sm)
+def gemm_kernel(f: str, ops: Prebuilt, sm: int) -> verify.Kernel:
+    """The 8-bit GEMM `f` of the card's family in the loaded `_gemm`, on `sm` (`KERNELS`). Where
+    the card's `f` GEMM is cuBLASLt's (fp8 with no native one), the torch build carrying it
+    joins the identity: a torch upgrade invalidates what it measured."""
+    found = kernel_identity(f"{KERNELS[f]}-{ops.family.replace('.', '')}", sm)
+    return (
+        replace(found, torch=ops.torch.__version__)
+        if f == FP8.name and not ops.cutlass_fp8
+        else found
+    )
 
 
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
