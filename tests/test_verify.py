@@ -43,6 +43,25 @@ def test_a_verdict_is_kept_per_machine_and_a_driver_update_verifies_again(
     assert probes[1:] == ["999.1", "999.1"]
 
 
+def test_a_device_that_ran_out_during_the_probe_keeps_no_verdict(store: Path) -> None:
+    """Out of memory says nothing about the kernel: it raises for the memory manager, keeps no
+    verdict on the machine, and the next open checks again."""
+    torch = pytest.importorskip("torch")
+    probes: list[int] = []
+
+    def short() -> Verdict:
+        probes.append(1)
+        if len(probes) == 1:
+            raise torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 20.00 MiB")
+        return verify.within({"bf16 linear M=3": 2e-3}, 1e-2)
+
+    with pytest.raises(torch.OutOfMemoryError):
+        verify.verified("prebuilt-int8-mmasync", "sha256:abc", 89, short)
+    assert not list((store / verify.VERDICTS).glob("*.json"))
+    assert verify.verified("prebuilt-int8-mmasync", "sha256:abc", 89, short).ok
+    assert len(probes) == 2
+
+
 def test_a_probe_over_budget_or_raising_refuses_the_kernel_for_good() -> None:
     over = verify.verified(
         "prebuilt-fp8-wgmma", "sha256:abc", 90, lambda: verify.within({"tile 3": 0.7}, 1e-2)
