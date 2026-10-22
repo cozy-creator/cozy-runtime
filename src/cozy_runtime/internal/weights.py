@@ -13,7 +13,6 @@ and notes.
 from __future__ import annotations
 
 import time
-import weakref
 import zlib
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
@@ -23,8 +22,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from tensorfs.varena.torch import Cache, Declared, Memory, Model, Weights, blocks_of
 
-from cozy_runtime import graphs
-from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime import graphs, lm
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
 from cozy_runtime.internal import execution, lora_bake
@@ -406,6 +404,7 @@ class Backend:
 
     def close(self) -> None:
         for model in self.models.values():
+            lm.release(model.module)
             graphs.release(self.torch, model.module)
             model.close()
         self.models.clear()
@@ -689,8 +688,6 @@ class Placement:
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
-        #: (component, owner) -> its pin and the cache that holds it
-        self.pins: dict[tuple[str, str], tuple[_Pin, Cache]] = {}
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
@@ -703,38 +700,6 @@ class Placement:
         for bakes in self.bakes.values():
             bakes.strategy = strategy
 
-    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> _Pin | None:
-        """Every block of `component` bound for `owner` (a CUDA graph replays at their
-        addresses, decoded copies included), held as a cache of the memory's: when memory asks
-        for room, `shed` drops what read them and the hold goes. The weights stay bound while
-        the returned token lives, so a replay in flight keeps them. None when they do not all
-        fit (the component streams)."""
-        held = self.pins.get((component, owner))
-        if held is not None:
-            return held[0]
-        model = self.models.get(component)
-        if model is None:
-            return None
-        try:
-            hold = model.hold()
-        except Exception as exc:
-            if fault(exc) is not Fault.EXHAUSTED:
-                raise
-            return None
-
-        def give(_: int) -> int:
-            self.pins.pop((component, owner), None)
-            cache.close()
-            return shed()
-
-        # its pins are already pinned pages: the cache counts nothing, and its shrink drops the
-        # graphs and the hold
-        cache = self.memory.cache(owner, give)
-        token = _Pin()
-        weakref.finalize(token, hold.release)
-        self.pins[(component, owner)] = (token, cache)
-        return token
-
     def keep(self, *held: Tensor) -> None:
         """Tensors a cache or a hold owns (KV slots, a graph's static inputs): never parked."""
         execution.keep(*held)
@@ -746,8 +711,8 @@ class Placement:
     def graph_pool(self) -> Any:
         return self.memory.new_pool()
 
-    def graph_allocating(self, pool: Any) -> Any:
-        return self.memory.allocating(pool)
+    def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
+        return self.memory.allocating(pool, route=route)
 
     def graph_levels(self) -> tuple[tuple[str, int], ...]:
         request = execution.catch.CURRENT.get()
@@ -756,6 +721,9 @@ class Placement:
     def graph_segments(self, component: str) -> tuple[str, ...]:
         """Use the model's declared block topology, including when the full model streams."""
         return tuple(self.models[component].blocks) or ("",)
+
+    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
+        return self.models[component].passing(entry, args, kwargs)
 
     def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
@@ -766,12 +734,6 @@ class Placement:
 
     def baked(self) -> int:
         return sum(bakes.baked for bakes in self.bakes.values())
-
-
-class _Pin:
-    """A pinned component's token: its blocks stay bound while a reference lives."""
-
-    __slots__ = ("__weakref__",)
 
 
 def _derived_values(root: Module) -> dict[tuple[Module, str], Tensor]:

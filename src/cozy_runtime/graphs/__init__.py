@@ -239,8 +239,20 @@ def _unprepared(exc: BaseException) -> bool:
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
     if BYPASS.get() or not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
         return call(module, *args, **kwargs)
-    leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
     placed = _placed(module)
+    scope = (
+        placed[0].graph_pass(placed[1], _REGIONS[module][1], args, kwargs)
+        if placed is not None
+        else nullcontext()
+    )
+    with scope:
+        return _region_call(torch, module, call, args, kwargs, placed)
+
+
+def _region_call(
+    torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any, placed: Any
+) -> Any:
+    leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
     why = (
         "with gradients"
         if torch.is_grad_enabled()
@@ -366,45 +378,54 @@ def _record(
             if placed is not None
             else torch.cuda.use_mem_pool(pool)
         )
-        with allocating, torch.cuda.stream(stream):
-            inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
-            static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
-            cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
-            with attention_ulysses.observing() as served:
-                warm = call(module, *cargs, **ckwargs)
-            if not _clonable(torch, warm):
-                recorder.failed[key] = "output is not a tensor tree"
-                return None
-            # Keep an independent reference for correctness, outside the capture pool's
-            # device bytes. The copy completes before its source can be reused by capture.
-            reference = torch.utils._pytree.tree_map(
-                lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, warm
+        with torch.cuda.stream(stream):
+            with allocating:
+                inputs = [
+                    leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves
+                ]
+                static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
+                cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
+                with attention_ulysses.observing() as served:
+                    warm = call(module, *cargs, **ckwargs)
+                if not _clonable(torch, warm):
+                    recorder.failed[key] = "output is not a tensor tree"
+                    return None
+                # Keep an independent reference for correctness, outside the capture pool's
+                # device bytes. The copy completes before its source can be reused by capture.
+                reference = torch.utils._pytree.tree_map(
+                    lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, warm
+                )
+                del warm
+            capturing = (
+                placed[0].graph_allocating(pool, route=False)
+                if placed is not None
+                else nullcontext()
             )
-            del warm
-            outputs: list[Any] = []
-            graph, why = capture(
-                torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, stream
-            )
-            if graph is None:
-                _failed(recorder, key, placed, why)
-                return None
-            if not _clonable(torch, outputs[0]):
-                recorder.failed[key] = "captured output is not a tensor tree"
-                return None
-            graph.replay()
-            for got, want in zip(
-                torch.utils._pytree.tree_leaves(outputs[0]),
-                torch.utils._pytree.tree_leaves(reference),
-                strict=True,
-            ):
-                if isinstance(got, torch.Tensor):
-                    try:
-                        torch.testing.assert_close(got.cpu(), want, rtol=5e-2, atol=1e-5)
-                    except AssertionError:
-                        recorder.failed[key] = "captured result differs from the pure call"
-                        _failed(recorder, key, placed, recorder.failed[key])
-                        return None
-            current.wait_stream(stream)
+            with capturing:
+                outputs: list[Any] = []
+                graph, why = capture(
+                    torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, stream
+                )
+                if graph is None:
+                    _failed(recorder, key, placed, why)
+                    return None
+                if not _clonable(torch, outputs[0]):
+                    recorder.failed[key] = "captured output is not a tensor tree"
+                    return None
+                graph.replay()
+                for got, want in zip(
+                    torch.utils._pytree.tree_leaves(outputs[0]),
+                    torch.utils._pytree.tree_leaves(reference),
+                    strict=True,
+                ):
+                    if isinstance(got, torch.Tensor):
+                        try:
+                            torch.testing.assert_close(got.cpu(), want, rtol=5e-2, atol=1e-5)
+                        except AssertionError:
+                            recorder.failed[key] = "captured result differs from the pure call"
+                            _failed(recorder, key, placed, recorder.failed[key])
+                            return None
+                current.wait_stream(stream)
         if placed is not None:
             placed[0].keep(
                 *(

@@ -263,12 +263,6 @@ class Residency(Protocol):
     supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
     """
 
-    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> object | None:
-        """Every weight of `component` bound at its address for `owner` (a CUDA graph reads
-        them there) until memory asks for room, when `shed` drops what read them; they stay
-        bound while the returned token lives. None when part of it streams."""
-        ...
-
     def cache(self, owner: str, shed: Callable[[int], int]) -> Any:
         """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `cached`
         and `close`; None off a GPU."""
@@ -291,7 +285,7 @@ class Residency(Protocol):
         """A distinct allocator pool for one executable's static data and scratch."""
         ...
 
-    def graph_allocating(self, pool: Any) -> Any:
+    def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
         """Prepare allocations in the same pool capture will use, outside capture."""
         ...
 
@@ -301,6 +295,10 @@ class Residency(Protocol):
 
     def graph_segments(self, component: str) -> tuple[str, ...]:
         """Declared model-block paths that bound graph regions independently of residency."""
+        ...
+
+    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
+        """Open the ordinary model pass before capture; nested regions share its cut state."""
         ...
 
     #: How many attempts (requests) it has opened.

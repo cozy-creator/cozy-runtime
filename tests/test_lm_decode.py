@@ -167,38 +167,28 @@ def test_decode_replays_graphs_on_cuda(capfd: pytest.CaptureFixture[str]) -> Non
     assert "(graphs)" in capfd.readouterr().err
 
 
-def _three_calls(model: Any, prompt: int, new: int, capturing: bool) -> list[bool]:
-    """Three calls with a decoder layer that runs out of device memory once, inside a CUDA
-    graph capture or outside one; each must give Transformers' tokens."""
-    stop = [7, 9]
-    calls = []
-    for n in range(3):
-        ids = torch.randint(10, 290, (1, prompt + n), device=DEVICE)
-        inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
-        calls.append((inputs, _reference(model, inputs, new, stop, 0.0)))
-    armed = [True]
+def test_running_out_of_memory_never_restarts_a_prefill() -> None:
+    """An actual allocation failure after the model starts is final, with no fallback call."""
+    model = _qwen3()
+    ids = torch.randint(10, 290, (1, 8), device=DEVICE)
+    inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    calls: list[int] = []
     layer = [m for m in model.modules() if type(m).__name__.endswith("DecoderLayer")][1]
 
-    def hook(*_: Any) -> None:
-        inside = DEVICE == "cuda" and torch.cuda.is_current_stream_capturing()
-        if armed[0] and inside == capturing:
-            armed[0] = False
-            raise torch.OutOfMemoryError("CUDA out of memory (injected)")
+    def exhaust(*_: Any) -> None:
+        calls.append(1)
+        torch.empty(1 << 62, dtype=torch.uint8, device=DEVICE)
 
-    layer.register_forward_pre_hook(hook)
-    for inputs, want in calls:
-        got = lm.generate(model, inputs, max_new_tokens=new, stop=stop, pad=0)
-        assert torch.equal(got, want)
-    return armed
-
-
-def test_running_out_of_memory_decodes_through_transformers() -> None:
-    from cozy_runtime.author._model import WARNINGS
-
-    torch.manual_seed(4)
-    WARNINGS.clear()
-    assert not _three_calls(_qwen3_5(), 40, 24, capturing=False)[0]
-    assert [message for message, _ in WARNINGS] == ["decode ran through Transformers' loop"]
+    hook = layer.register_forward_pre_hook(exhaust)
+    engine = lm._Engine(model)
+    request = lm._Request(inputs, 4, [7], 0, 0.0)
+    with torch.inference_mode(), pytest.raises(RuntimeError):
+        engine.generate(request, None)
+    hook.remove()
+    assert calls == [1] and request.error is not None and not request.fallback
+    assert engine.driver is None and not engine.slots
+    # A capacity error leaves the device usable for the next real request.
+    _same(model, inputs, 4)
 
 
 @pytest.mark.skipif(DEVICE != "cuda", reason="CUDA graphs need a GPU")
@@ -218,15 +208,14 @@ def test_a_rebuilt_rotary_table_records_the_steps_anew() -> None:
 
 
 @pytest.mark.skipif(DEVICE != "cuda", reason="CUDA graphs need a GPU")
-def test_a_capture_out_of_memory_leaves_the_decode_serving(
-    capfd: pytest.CaptureFixture[str],
-) -> None:
-    from cozy_runtime.author._model import WARNINGS
-
-    torch.manual_seed(3)
-    WARNINGS.clear()
-    assert not _three_calls(_qwen3_5(), 100, 40, capturing=True)[0]
-    assert [message for message, _ in WARNINGS] == ["a CUDA graph was not used"]
-    lines = [line for line in capfd.readouterr().err.splitlines() if " tokens after " in line]
-    assert len(lines) == 3 and "eager" in lines[0]
-    assert all("(graphs)" in line for line in lines[1:])
+def test_an_unknown_decode_hook_is_an_explicit_capture_gap() -> None:
+    model = _qwen3()
+    ids = torch.randint(10, 290, (1, 8), device=DEVICE)
+    inputs = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+    calls: list[int] = []
+    hook = model.register_forward_pre_hook(lambda *_: calls.append(1))
+    _same(model, inputs, 12)
+    hook.remove()
+    engine = lm._ENGINES[model]
+    assert calls and not engine.graphs
+    assert set(engine.unrecorded.values()) == {"custom Python hooks"}

@@ -40,7 +40,7 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
 from cozy_runtime.author._context import CURRENT, Context
@@ -165,6 +165,22 @@ def generate(
             return engine.generate(request, draft)
     finally:
         BYPASS.reset(token)
+
+
+def release(model: Any) -> None:
+    """Retire an idle model's decode buffers, graphs and virtual address ownership."""
+    with _PLANE, _ENGINES_LOCK:
+        engine = _ENGINES.pop(model, None)
+        if engine is None:
+            return
+        if engine.driver is not None or engine.pending:
+            _ENGINES[model] = engine
+            raise RuntimeError("cannot unload a language model while decode is active")
+        engine._drop()
+        for binding in engine.addresses.values():
+            binding.close()
+        engine.addresses.clear()
+        engine.where = ()
 
 
 class Draft(torch.nn.Module if not ABSENT else object):  # type: ignore[misc]
@@ -388,6 +404,12 @@ def _unsupported(model: Any) -> str:
     if getattr(config, "is_encoder_decoder", False):
         return "an encoder-decoder"
     text = config.get_text_config(decoder=True)
+    if (
+        "moe" in type(model).__name__.lower()
+        or max(int(getattr(text, field, 0) or 0) for field in ("num_experts", "num_local_experts"))
+        > 1
+    ):
+        return "MoE routing has no bounded decode graph contract"
     attention = getattr(text, "_attn_implementation", None) or getattr(
         config, "_attn_implementation", ""
     )
@@ -403,6 +425,39 @@ def _unsupported(model: Any) -> str:
         if getattr(model.generation_config, name, None) not in idle
     ]
     return f"its generation config adds {extras}" if extras else ""
+
+
+def _capture_contract(model: Any) -> str:
+    """Shipped dense decode contracts; persistent KV, positions and counters are device buffers.
+
+    The real warm step initializes cache views and advances accepted history once. Capture
+    only records the next step's device writes. Custom Python hooks and arbitrary model code
+    are never speculatively executed by this graph builder.
+    """
+    forward = type(model).forward
+    if not forward.__module__.startswith("transformers.models.") or type(model).__name__ not in {
+        "Qwen3ForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+    }:
+        return "no shipped dense decode capture contract"
+    if model.training:
+        return "training state"
+    for sub in model.modules():
+        for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
+            if any(
+                not getattr(h, "__module__", "").startswith("tensorfs.varena.")
+                for h in hooks.values()
+            ):
+                return "custom Python hooks"
+        own = vars(sub).get("forward")
+        if (
+            own is not None
+            and own is not vars(sub).get("_cozy_execution_forward")
+            and not getattr(own, "__module__", "").startswith("cozy_runtime.")
+        ):
+            return "custom Python forward"
+    return ""
 
 
 class _Presence:
@@ -964,10 +1019,14 @@ class _Engine:
         self.cache: Any = None
         self.views: dict[int, Any] = {}
         self.graphs: dict[tuple[int, int, bool], Any] = {}
-        #: (rows, drafted) that ran one eager step: the next is recorded
-        self.warmed: set[tuple[int, bool]] = set()
+        #: Full shape variants whose real accepted step preseeded their capture pool.
+        self.warmed: set[tuple[int, int, bool]] = set()
         self.layout: tuple[object, ...] | None = None
         self.pool: Any = None
+        self.pools: dict[tuple[int, int, bool], Any] = {}
+        self.addresses: dict[int, Any] = {}
+        self.unprepared: BaseException | None = None
+        self.used_streams: set[Any] = set()
         self.side: Any = None
         #: (bucket, window, drafted) -> why that step runs eagerly
         self.unrecorded: dict[tuple[int, int, bool], str] = {}
@@ -1077,6 +1136,8 @@ class _Engine:
                         self.incoming = list(self.pending)
                         self.pending.clear()
                     if held is False:
+                        if self._occupied():
+                            raise self.unprepared or RuntimeError("decode residency was lost")
                         for request in self.incoming:
                             request.fallback = "its decode set does not fit at home"
                         self.incoming = []
@@ -1091,18 +1152,16 @@ class _Engine:
                             break  # a waiting caller drives on
                     if occupied:
                         self._steps()
-        except torch.OutOfMemoryError as exc:
-            self._fail(None, f"OutOfMemoryError: {exc}".splitlines()[0][:300])
-        except BaseException as exc:  # a failed step fails every row in it
-            self._fail(exc, "")
+        except BaseException as exc:  # post-start failures never restart package generation
+            self._fail(exc)
             raise
         finally:
             with self.cond:
                 self.driver = None
                 self.cond.notify_all()
 
-    def _fail(self, exc: BaseException | None, why: str) -> None:
-        """Every held and waiting call ends: with `exc`, or through Transformers' loop (`why`)."""
+    def _fail(self, exc: BaseException) -> None:
+        """Every held and waiting call fails; no partially executed generation is restarted."""
         with self.cond:
             requests = {id(row.request): row.request for row in self.slots if row is not None}
             requests.update({id(request): request for request in self.pending})
@@ -1110,10 +1169,7 @@ class _Engine:
             self.pending.clear()
             self.incoming = []
             for request in requests.values():
-                if exc is not None:
-                    request.error = exc
-                else:
-                    request.fallback = why
+                request.error = exc
             self._drop()
             self.cond.notify_all()
 
@@ -1121,33 +1177,38 @@ class _Engine:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
     def _hold(self, stack: ExitStack) -> bool:
-        """The model (and its head) pinned at home for the decode graphs (`Placement.pin`);
-        False when part of one streams (the calls then decode through Transformers' loop)."""
-        targets = self._targets()
-        # The steps also read buffers the model builds (its rotary tables): a rebuilt one (a
-        # component placed again) records anew.
+        """Retain graph addresses, but lease their physical backing only while this driver runs.
+
+        A full decode that cannot prepare its dependencies refuses before model execution;
+        Transformers can then use Runtime's individual graph segments while streaming.
+        """
+        self.unprepared = None
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
         built = tuple(t.data_ptr() for t in derived)
-        if not targets:
-            self.where = (built,)
-            return True
-        pins = [r.pin(name, f"lm:{name}", self._unpinned) for _, (r, name) in targets]
-        if any(pin is None for pin in pins):
-            return False
-        self.where = (*pins, built)
+        identities: list[object] = []
+        with ExitStack() as leases:
+            for module, (residency, name) in self._targets():
+                binding = self.addresses.get(id(module))
+                if binding is not None and not binding.valid():
+                    self._forget()
+                    binding.close()
+                    binding = None
+                if binding is None:
+                    binding = self.addresses[id(module)] = residency.retain(name, ("",))
+                try:
+                    leases.enter_context(binding.prepare())
+                except Exception as exc:
+                    if not is_capacity(exc) and getattr(exc, "code", None) != "STALE_BINDING":
+                        raise
+                    self.unprepared = exc
+                    return False
+                identities.append(binding.identity)
+            self.where = (*identities, built)
+            stack.enter_context(leases.pop_all())
         return True
 
-    #: the pins the graphs read weights through: they live while this engine refers to them
+    #: Immutable address/fill generations, not cached physical pins.
     where: tuple[object, ...] = ()
-
-    def _unpinned(self) -> int:
-        """Memory asks for the pinned weights: an idle engine lets its graphs and pins go now,
-        a busy one at its next loop."""
-        if self.idle():
-            self.where = ()
-        else:
-            self.rehold = self.stale = True
-        return 0
 
     def _cancelled(self) -> bool:
         """Whether a held row's call was cancelled: the host stops queueing steps for it."""
@@ -1164,6 +1225,8 @@ class _Engine:
         rows = [row for row in self.slots if row is not None]
         per = DEPTH + 1 if self._drafting(size) else 1
         self.cache.window = window(max(row.reach for row in rows) + per, self.capacity)
+        if self.cache_device.type == "cuda":
+            self.used_streams.add(torch.cuda.current_stream())
         run(size)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
@@ -1192,12 +1255,7 @@ class _Engine:
             if waiting or (admitted and self._occupied()):
                 waiting.append(request)
                 continue
-            try:
-                joined = self._admit(request)
-            except torch.OutOfMemoryError as exc:  # this call alone takes Transformers' loop
-                request.fallback = f"OutOfMemoryError: {exc}".splitlines()[0][:300]
-                torch.cuda.empty_cache()
-                continue
+            joined = self._admit(request)
             if joined:
                 admitted = True
             else:
@@ -1298,8 +1356,7 @@ class _Engine:
             return False
         capacity = max(self.capacity, -(-reach // MIN_WINDOW) * MIN_WINDOW)
         fresh = self._prefill(request)
-        if not self._grow(size, capacity, fresh):
-            return False
+        self._grow(size, capacity, fresh)
         self._splice(request, fresh, [slot for slot, row in enumerate(self.slots) if row is None])
         return True
 
@@ -1324,7 +1381,7 @@ class _Engine:
         prepared = model.prepare_inputs_for_generation(
             ids, past_key_values=fresh, use_cache=True, is_first_iteration=True, **kwargs
         )
-        # Under the caller's recovery, which makes room op by op, into this call's own cache.
+        # Native allocation recovery runs underneath this single prefill invocation.
         with _taking(model) as taken:
             logits = model(**prepared, return_dict=True).logits[:, -1]
         hidden = taken[-1]
@@ -1412,21 +1469,14 @@ class _Engine:
         request.at = (self.captured[0], self.captured[1], self.eager)
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
 
-    def _grow(self, size: int, capacity: int, fresh: _Prefill) -> bool:
-        """Buffers for `size` slots of `capacity` positions, counted as the memory's cache; the
-        rows held now move over, and the graphs record again. False when they do not fit."""
+    def _grow(self, size: int, capacity: int, fresh: _Prefill) -> None:
+        """Allocate slots after prefill; a refusal is final, never a repeated prefill."""
         if self.reservation is None:
             self.reservation = _reservation(self.model, self._shed)
-        try:
-            self._buffers(size, capacity, fresh)
-        except Exception as exc:
-            if not is_capacity(exc):
-                raise
-            return False
+        self._buffers(size, capacity, fresh)
         if self.reservation is not None:
             self.held = _slot_bytes(fresh, capacity, self.draft is not None, self.text) * size
             self.reservation.cached(self.held)
-        return True
 
     def _buffers(self, size: int, capacity: int, fresh: _Prefill) -> None:
         device = fresh.token.device
@@ -1583,28 +1633,70 @@ class _Engine:
                 torch.cuda.current_stream().synchronize()
         self.retire = True
 
+    @contextmanager
+    def _graph_memory(self, pool: Any, *, route: bool) -> Iterator[None]:
+        """Prepare the exact pool and join the side stream before the driver lease can end."""
+        current = torch.cuda.current_stream()
+        self.side.wait_stream(current)
+        self.used_streams.add(self.side)
+        self.used_streams.add(current)
+        placed = PLACED.get(self.model)
+        binding = self.addresses.get(id(self.model))
+        try:
+            with torch.cuda.stream(self.side), ExitStack() as stack:
+                if binding is not None:
+                    stack.enter_context(binding.prepare(self.side, workspace=None))
+                stack.enter_context(
+                    placed[0].graph_allocating(pool, route=route)
+                    if placed is not None
+                    else torch.cuda.use_mem_pool(pool)
+                    if route
+                    else nullcontext()
+                )
+                yield
+        finally:
+            current.wait_stream(self.side)
+
     def _replay(self, size: int, cuda: bool) -> None:
         drafted = self._drafting(size)
         key = (size, self.cache.window, drafted)
+        reason = _capture_contract(self.model) or (
+            "draft head has no isolated capture contract" if drafted else ""
+        )
+        if cuda and reason:
+            if key not in self.unrecorded:
+                self._unrecorded(key, reason)
+            self._advance(size)
+            self.eager += 1
+            return
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
-            if (size, drafted) not in self.warmed:
-                self.warmed.add((size, drafted))
-                self._advance(size)
+            if self.side is None:
+                self.side = torch.cuda.Stream()
+            if key not in self.warmed:
+                placed = PLACED.get(self.model)
+                pool = placed[0].graph_pool() if placed is not None else torch.cuda.MemPool()
+                self.pools[key] = pool
+                # This is the caller's actual next token, never an extra speculative warmup.
+                with self._graph_memory(pool, route=True):
+                    self._advance(size)
+                self.warmed.add(key)
+                self.eager += 1
                 return
-            if self.pool is None:
-                self.pool, self.side = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
+            pool = self.pools[key]
             capturing = time.perf_counter()
             try:
-                graph, why = capture(torch, lambda: self._advance(size), self.pool, self.side)
-            except Building:  # eager until a kernel lands
+                # Warm routing ended: capture enters the SAME pool, not a nested use_mem_pool.
+                with self._graph_memory(pool, route=False):
+                    graph, why = capture(torch, lambda: self._advance(size), pool, self.side)
+            except Building:
                 graph, why, self.building = None, "", LANDED[0]
             self.captured[0] += 1
             self.captured[1] += time.perf_counter() - capturing
             if graph is not None:
                 self.graphs[key] = graph
             else:
-                self.pool = None  # an aborted capture spent its pool
+                self.pools.pop(key, None)
                 if why:
                     self._unrecorded(key, why)
         if graph is not None:
@@ -1614,10 +1706,13 @@ class _Engine:
             self.eager += 1
 
     def _forget(self) -> None:
-        """Every recorded step goes, and its pool: a fresh pool records the next ones (a pool
-        whose graphs are gone takes no new recording)."""
-        if self.graphs or self.pool is not None:
-            self.graphs, self.warmed, self.unrecorded, self.pool = {}, set(), {}, None
+        """Release recordings only at the driver's already-drained step boundary."""
+        if self.graphs or self.pools:
+            for stream in self.used_streams:
+                stream.synchronize()
+            self.used_streams.clear()
+            self.graphs, self.warmed, self.unrecorded, self.pools = {}, set(), {}, {}
+            self.pool = None
             torch.cuda.empty_cache()
 
     def _unrecorded(self, key: tuple[int, int, bool], why: str) -> None:
