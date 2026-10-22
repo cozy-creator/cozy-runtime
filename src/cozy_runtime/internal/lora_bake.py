@@ -440,7 +440,7 @@ def bake_nvfp4(
         fits = torch.searchsorted(magnitudes, need.contiguous()).clamp(max=126)
         code = blocks[start:stop].long() & 0x7F
         if grid == "keep":  # past halfway to the 8 E2M1 lacks, the block's scale grows
-            code = torch.where(need > magnitudes[code] * E2M1_OUTGROWN, fits, code)
+            code = torch.where(need * 6 > magnitudes[code] * 7, fits, code)
         else:
             code = fits
         unit = (magnitudes[code] * second).unsqueeze(-1)
@@ -500,14 +500,13 @@ def bake(
     (`bake_nvfp4`). bf16, E4M3, int8 and E2M1 round stochastically, scales kept: nearest
     returns a small delta to where it was, and loses most of a LoRA's effect on fp8
     (MEASURE.md, TensorD #26). `seed` names the weight's noise. A GPU bakes fused unless
-    `stats` are asked for (the eager reference measures them); nvfp4 bakes eagerly."""
+    `stats` are asked for (the eager reference measures them)."""
     device = next(iter(stored.values())).device
-    nvfp4 = "scale_2" in stored
-    if not nvfp4 and stats is None and device.type == "cuda" and _ready(device.index or 0):
+    if stats is None and device.type == "cuda" and _ready(device.index or 0):
         fused(torch, stored, down, up, seed)
         return
     generator = torch.Generator(device=device).manual_seed(seed & SEED_MASK)
-    if nvfp4:
+    if "scale_2" in stored:
         bake_nvfp4(
             torch,
             stored["weight"],
@@ -566,8 +565,9 @@ def accumulate(
 
 #: Stored forms the fused kernel bakes (`bakeable`): bf16 (stochastic), f16 and f32 (nearest),
 #: `fp8.rowwise` (E4M3, stochastic, scale kept), `int8-convrot256/1` (int8 of the rotated
-#: rows, stochastic, scale kept; `fused` rotates `down`).
-BF16, F16, F32, ROWWISE, INT8 = range(5)
+#: rows, stochastic, scale kept; `fused` rotates `down`), and `nvfp4` (its own kernel, as
+#: `bake_nvfp4` with `keep`).
+BF16, F16, F32, ROWWISE, INT8, NVFP4 = range(6)
 #: A seed is 31 bits: one Triton signature for every weight.
 SEED_MASK = 0x7FFFFFFF
 _TILE = 64
@@ -590,6 +590,17 @@ def fused(
 ) -> None:
     """`bake`, one kernel launch: each tile adds its `up @ down` (f32) to the decoded stored
     values and rounds them back in place."""
+    factors = (up.to(torch.float32).contiguous(), down.to(torch.float32).contiguous())
+    if "scale_2" in stored:
+        raw = stored["weight"].view(torch.uint8)
+        rows, cols = raw.shape[0], 2 * raw.shape[1]
+        second = stored["scale_2"].to(torch.float32).reshape(1)
+        grid = (triton.cdiv(rows, _TILE), triton.cdiv(cols, _TILE))
+        _bake_nvfp4_kernel[grid](
+            raw, stored["scale"].view(torch.uint8), second, *factors, rows, cols, down.shape[0],
+            seed & SEED_MASK, TILE=_TILE, INNER=_INNER,
+        )  # fmt: skip
+        return
     if "value" in stored:
         data = scale = stored["value"]
         kind = {torch.bfloat16: BF16, torch.float16: F16, torch.float32: F32}[data.dtype]
@@ -601,7 +612,8 @@ def fused(
     if not data.is_contiguous():
         raise ValueError("a fused bake writes a contiguous [out, in] weight")
     rows, cols = data.shape
-    factors = (up.to(torch.float32).contiguous(), down.to(torch.float32).contiguous())
+    if kind == INT8:
+        factors = (factors[0], down.to(torch.float32).contiguous())
     grid = (triton.cdiv(rows, _TILE), triton.cdiv(cols, _TILE))
     _bake_kernel[grid](
         data, scale, *factors, rows, cols, down.shape[0], seed & SEED_MASK,
@@ -685,6 +697,18 @@ def check(torch: ModuleType, device: Device) -> None:
         if not torch.equal(got, want):
             wrong = int((got != want).sum())
             raise RuntimeError(f"the fused bake of form {kind} stored {wrong} values off the grid")
+    # nvfp4: 0.25 (E2M1 0.5 under a 0.5 block scale) + 24 * +-1/32 is 1.0 or -0.5, both on that
+    # block's kept grid, over a partial column tile.
+    stored = {
+        "weight": torch.full((rows, cols // 2), 0x11, dtype=torch.uint8, device=device),
+        "scale": torch.full((rows, cols // 16), 0.5, device=device).to(torch.float8_e4m3fn),
+        "scale_2": torch.ones(1, device=device),
+    }
+    fused(torch, stored, down, up, NVFP4)
+    got = _nvfp4_decode(torch, stored["weight"], stored["scale"].view(torch.uint8), 1.0)
+    if not torch.equal(got, want):
+        wrong = int((got != want).sum())
+        raise RuntimeError(f"the fused bake of form {NVFP4} stored {wrong} values off the grid")
     # int8 of rotated rows: 2 + 24 * +-1/48 / 0.5 is 3 or 1 (the regular Hadamard keeps a
     # constant row), over partial row tiles and two inner steps.
     data = torch.full((rows, 256), 2, dtype=torch.int8, device=device)
@@ -699,6 +723,7 @@ def check(torch: ModuleType, device: Device) -> None:
 #: Never specialized on a value or an address's alignment: one compiled kernel per form serves
 #: every weight wherever it lies.
 _VALUES, _ADDRESSES = ["rows", "cols", "rank", "seed"], ["data", "scale", "up", "down"]
+_NVFP4_ADDRESSES = ["data", "blocks", "second", "up", "down"]
 
 if triton is not None:
 
@@ -724,6 +749,93 @@ if triton is not None:
         kept = ((lifted.to(tl.uint32, bitcast=True) + (noise >> 12)) >> 20).to(tl.int32)
         code = kept - tl.where(small, 968, 960)  # (f32 exponent - 120) << 3 | mantissa
         return tl.where(payload < 0, code | 128, code)
+
+    @triton.jit
+    def _e4m3_at_least(need):  # type: ignore[no-untyped-def]
+        """The smallest E4M3 code (int32, at most 126) whose magnitude holds `need` >= 0: its f32
+        bits rounded up to three mantissa bits, or below 2^-6 a count of 2^-9."""
+        bits = (need.to(tl.uint32, bitcast=True) + 0xFFFFF) & 0xFFF00000
+        normal = (((bits >> 23).to(tl.int32) - 120) << 3) | ((bits >> 20) & 7).to(tl.int32)
+        code = tl.where(need < 0.015625, tl.ceil(need * 512.0).to(tl.int32), normal)
+        return tl.minimum(tl.maximum(code, 0), 126)
+
+    @triton.jit
+    def _e2m1_value(code):  # type: ignore[no-untyped-def]
+        """E2M1 codes (int32, sign in bit 3) -> f32."""
+        index = (code & 7).to(tl.float32)
+        magnitude = tl.where(
+            index < 4, index * 0.5, tl.where(index < 6, index - 2.0, tl.where(index < 7, 4.0, 6.0))
+        )
+        return tl.where(code >= 8, -magnitude, magnitude)
+
+    @triton.jit
+    def _stochastic_e2m1(payload, draw):  # type: ignore[no-untyped-def]
+        """|payload| (block units, saturating at 6) -> its E2M1 magnitude code, the upper neighbour
+        with the probability of the distance covered."""
+        magnitude = tl.minimum(tl.abs(payload), 6.0)
+        step = tl.where(magnitude < 2.0, 0.5, tl.where(magnitude < 4.0, 1.0, 2.0))
+        low = tl.minimum(tl.floor(magnitude / step) * step, 6.0)
+        index = tl.where(
+            low < 2.0, low * 2.0, tl.where(low < 4.0, low + 2.0, tl.where(low < 6.0, 6.0, 7.0))
+        )
+        return (index + tl.where(draw < (magnitude - low) / step, 1.0, 0.0)).to(tl.int32)
+
+    @triton.jit(  # type: ignore[untyped-decorator]
+        do_not_specialize=_VALUES, do_not_specialize_on_alignment=_NVFP4_ADDRESSES
+    )
+    def _bake_nvfp4_kernel(  # type: ignore[no-untyped-def]
+        data, blocks, second, up, down, rows, cols, rank, seed,
+        TILE: tl.constexpr, INNER: tl.constexpr,
+    ):  # fmt: skip
+        """`bake_nvfp4` with `keep`, one tile of 16-element blocks at a time."""
+        row = (tl.program_id(0) * TILE + tl.arange(0, TILE)).to(tl.int64)
+        col = (tl.program_id(1) * TILE + tl.arange(0, TILE)).to(tl.int64)
+        delta = tl.zeros((TILE, TILE), dtype=tl.float32)
+        for start in range(0, rank, INNER):
+            inner = start + tl.arange(0, INNER)
+            a = tl.load(
+                up + row[:, None] * rank + inner[None, :],
+                mask=(row[:, None] < rows) & (inner[None, :] < rank),
+                other=0.0,
+            )
+            b = tl.load(
+                down + inner[:, None] * cols + col[None, :],
+                mask=(inner[:, None] < rank) & (col[None, :] < cols),
+                other=0.0,
+            )
+            delta += tl.dot(a, b, input_precision="ieee")
+        inside = (row[:, None] < rows) & (col[None, :] < cols)
+        width, count = cols // 2, cols // 16
+        byte = tl.load(data + row[:, None] * width + col[None, :] // 2, mask=inside, other=0)
+        code = tl.where(col[None, :] % 2 == 0, byte & 15, byte >> 4).to(tl.int32)
+        scaled = tl.load(blocks + row[:, None] * count + col[None, :] // 16, mask=inside, other=0)
+        scaled = scaled.to(tl.int32)
+        level = tl.load(second)
+        target = _e2m1_value(code) * (_decode_e4m3(scaled) * level) + delta
+        shape = (TILE, TILE // 16, 16)
+        need = tl.max(tl.reshape(tl.abs(target), shape), axis=2) / (6.0 * level)
+        kept = tl.max(tl.reshape(scaled, shape), axis=2)
+        grown = need * 6.0 > _decode_e4m3(kept) * 7.0  # `E2M1_OUTGROWN`
+        block = tl.where(grown, _e4m3_at_least(need), kept)
+        unit = tl.reshape(tl.broadcast_to((_decode_e4m3(block) * level)[:, :, None], shape), (TILE, TILE))
+        payload = target / tl.where(unit > 0, unit, 1.0)
+        at = row[:, None] * cols + col[None, :]
+        nibble = _stochastic_e2m1(payload, tl.rand(seed, at.to(tl.uint32)))
+        negative = tl.where(target == 0, code >= 8, target < 0)  # a zero keeps its stored sign
+        nibble = nibble | tl.where(negative, 8, 0)
+        low, high = tl.split(tl.reshape(nibble, (TILE, TILE // 2, 2)))
+        pair = tl.program_id(1) * (TILE // 2) + tl.arange(0, TILE // 2).to(tl.int64)
+        tl.store(
+            data + row[:, None] * width + pair[None, :],
+            (low | (high << 4)).to(tl.uint8),
+            mask=(row[:, None] < rows) & (pair[None, :] < width),
+        )
+        which = tl.program_id(1) * (TILE // 16) + tl.arange(0, TILE // 16).to(tl.int64)
+        tl.store(
+            blocks + row[:, None] * count + which[None, :],
+            block.to(tl.uint8),
+            mask=(row[:, None] < rows) & (which[None, :] < count),
+        )
 
     @triton.jit(  # type: ignore[untyped-decorator]
         do_not_specialize=_VALUES, do_not_specialize_on_alignment=_ADDRESSES
