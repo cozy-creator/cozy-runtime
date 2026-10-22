@@ -5,7 +5,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-import pytest
 import tensorfs
 
 from cozy_runtime.internal import canonical, probe
@@ -13,7 +12,6 @@ from cozy_runtime.internal.encoding import launch_providers
 from cozy_runtime.internal.fill import Checkpoint, dtype_name
 from cozy_runtime.internal.planfacts import PlanFacts
 from cozy_runtime.internal.resolution import ConstructionFacts, Variant, resolve
-from store_fixtures import home
 from test_leaf_speedup_record import sm86
 
 TENSORS = 40_000
@@ -28,9 +26,7 @@ def _checkpoint(store: Path, keys: list[str]) -> Checkpoint:
     return Checkpoint(writer.commit())
 
 
-def test_a_40000_tensor_plan_resolves_and_digests(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_40000_tensor_plan_resolves_and_digests(tmp_path: Path) -> None:
     """Its plan identity passes 8 MiB, where the old document cap refused the load with
     `size_cap` (from about 30,000 tensors)."""
     keys = [
@@ -38,7 +34,7 @@ def test_a_40000_tensor_plan_resolves_and_digests(
         ".gate_up_proj.weight_scale_inv"
         for i in range(TENSORS)
     ]
-    store = home(tmp_path, monkeypatch)
+    store = tmp_path / "store"
     checkpoint = _checkpoint(store, keys)
     table = sm86()
     ref = checkpoint.id
