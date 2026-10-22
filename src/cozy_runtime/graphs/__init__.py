@@ -22,7 +22,7 @@ from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.graphs.regions import regions, safe
+from cozy_runtime.graphs.regions import WRAPPERS, regions, safe
 from cozy_runtime.internal import attention_ulysses
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
@@ -243,6 +243,7 @@ def _graphed(torch: Any, cls: type) -> type:
                 "__qualname__": cls.__qualname__,
             },
         )
+        WRAPPERS[made] = cls
     return made
 
 
@@ -385,6 +386,8 @@ def _region_call(
         if torch.is_grad_enabled()
         else "under activation capture"
         if _capture_clock.get() is not None
+        else "under custom tensor dispatch"
+        if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
         else "outside its purity contract"
@@ -589,6 +592,8 @@ def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str)
 
 def _unplain(torch: Any, leaves: list[Any]) -> str:
     tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
+    if any(type(t) not in (torch.Tensor, torch.nn.Parameter) for t in tensors):
+        return "with custom tensor dispatch"
     if not tensors or not all(t.is_cuda for t in tensors):
         return "without CUDA tensor arguments"
     if any(
@@ -602,7 +607,7 @@ def _unplain(torch: Any, leaves: list[Any]) -> str:
 def _clonable(torch: Any, out: Any) -> bool:
     leaves = torch.utils._pytree.tree_leaves(out)
     return any(isinstance(v, torch.Tensor) for v in leaves) and all(
-        isinstance(v, torch.Tensor) or type(v) in _PLAIN for v in leaves
+        type(v) in (torch.Tensor, torch.nn.Parameter) or type(v) in _PLAIN for v in leaves
     )
 
 

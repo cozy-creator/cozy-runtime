@@ -261,3 +261,53 @@ def test_a_custom_call_is_not_given_a_library_purity_contract() -> None:
     with torch.inference_mode():
         module(torch.ones(1, 4))
     assert calls == [1] and module not in graphs._RECORDERS
+
+
+def test_inherited_forward_does_not_grant_a_custom_call_impl_purity() -> None:
+    calls: list[int] = []
+    base: Any = torch.nn.Linear
+
+    class PackageLinear(base):
+        def _call_impl(self, *args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            return super()._call_impl(*args, **kwargs)
+
+    module = PackageLinear(4, 4)
+    assert graphs.install(torch, object(), {"custom": module}) == []
+    with torch.inference_mode():
+        for _ in range(4):
+            module(torch.ones(1, 4))
+    assert calls == [1] * 4 and module not in graphs._RECORDERS
+
+
+def test_only_runtime_generated_classes_unwrap_to_known_contracts() -> None:
+    module = torch.nn.Linear(4, 4)
+    assert graphs.install(torch, object(), {"plain": module}) == ["plain"]
+    assert graphs.safe(torch, module)
+    base: Any = type(module)
+
+    class PackageSubclass(base):
+        pass
+
+    inherited = PackageSubclass(4, 4)
+    assert not graphs.safe(torch, inherited)
+    assert graphs.install(torch, object(), {"inherited": inherited}) == []
+
+
+def test_execution_wrapper_does_not_hide_a_package_instance_forward() -> None:
+    from cozy_runtime.internal import execution
+
+    calls: list[int] = []
+    module = torch.nn.Linear(4, 4)
+    original = module.forward
+
+    def package(x: Any) -> Any:
+        calls.append(1)
+        return original(x)
+
+    module.forward = package
+    execution.install(module)
+    assert graphs.install(torch, object(), {"package": module}) == []
+    with torch.inference_mode():
+        module(torch.ones(1, 4))
+    assert calls == [1] and module not in graphs._RECORDERS
