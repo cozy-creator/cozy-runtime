@@ -235,6 +235,8 @@ def cut[T](
         return run(0)
     key = shape_key(operands) if shape is None else shape
     scope = Scope(site, finest, request.cut(site, key), operands=operands, shape=key)
+    if _capturing():
+        return run(scope.level)  # prepared variant; no metrics or recovery inside capture
     _local.scopes.append(scope)
 
     def whole() -> T:
@@ -400,6 +402,7 @@ def wrap(
             _local.named, _local.ordinals = outer
 
     module.forward = named
+    vars(module)["_cozy_execution_forward"] = named
 
 
 def current(module: nn.Module) -> Callable[..., object]:

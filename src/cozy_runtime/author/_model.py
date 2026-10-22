@@ -283,6 +283,26 @@ class Residency(Protocol):
         parks them."""
         ...
 
+    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+        """Retain a region's virtual addresses; prepare() leases backing only during use."""
+        ...
+
+    def graph_pool(self) -> Any:
+        """A distinct allocator pool for one executable's static data and scratch."""
+        ...
+
+    def graph_allocating(self, pool: Any) -> Any:
+        """Prepare allocations in the same pool capture will use, outside capture."""
+        ...
+
+    def graph_levels(self) -> tuple[tuple[str, int], ...]:
+        """The active pass's cut levels, part of its graph variant identity."""
+        ...
+
+    def graph_segments(self, component: str) -> tuple[str, ...]:
+        """Declared model-block paths that bound graph regions independently of residency."""
+        ...
+
     #: How many attempts (requests) it has opened.
     attempts: int
 

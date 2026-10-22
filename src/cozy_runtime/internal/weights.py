@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from tensorfs.varena.torch import Cache, Declared, Memory, Model, Weights, blocks_of
 
+from cozy_runtime import graphs
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
@@ -405,6 +406,7 @@ class Backend:
 
     def close(self) -> None:
         for model in self.models.values():
+            graphs.release(self.torch, model.module)
             model.close()
         self.models.clear()
 
@@ -616,7 +618,7 @@ class _Bakes:
                 self.bakes[stored] = bake
 
     @property
-    def identity(self) -> str:
+    def identity(self) -> str | None:
         """What a bake writes now, the same in every process (`Filling.identity`): the strategy
         and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each baked
         weight's stored name and encoding with each delta's content (a stored factor pair of
@@ -633,27 +635,6 @@ class _Bakes:
         device = torch.cuda.current_device() if torch.cuda.is_initialized() else -1
         held: list[object] = [lora_bake.recipe(device), torch.__version__]
         held.append(torch.cuda.get_device_capability(device) if device >= 0 else "cpu")
-        for stored, bake in sorted(self.bakes.items()):
-            deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
-            for hook in bake.hooks:
-                got = hook.lora_factors()
-                if got is None:
-                    continue
-                deltas.append((got[0], str(got[1].dtype), str(got[2].dtype), repr(float(got[3]))))
-            held.append((stored, bake.encoding, deltas))
-        return repr(held)
-
-    def identity(self) -> str | None:
-        """What `prepare()` just named, the same in every process (`Fill.identity`): the
-        recipe, and each baked weight's stored name and encoding with each delta's content (a
-        stored factor pair of this checkpoint, or an overlay checkpoint's component and module
-        path), dtypes and scale. None when an overlay's checkpoint cannot be named."""
-        torch = self.torch
-        if self.strategy != "bake":
-            return repr((self.strategy,))
-        device = torch.cuda.current_device()
-        held: list[object] = [lora_bake.recipe(device), torch.__version__]
-        held.append(torch.cuda.get_device_capability(device))
         for stored, bake in sorted(self.bakes.items()):
             deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
             for hook in bake.hooks:
@@ -757,6 +738,24 @@ class Placement:
     def keep(self, *held: Tensor) -> None:
         """Tensors a cache or a hold owns (KV slots, a graph's static inputs): never parked."""
         execution.keep(*held)
+
+    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+        """The region's address ownership, independent of its physical replay lease."""
+        return self.models[component].retain(paths)
+
+    def graph_pool(self) -> Any:
+        return self.memory.new_pool()
+
+    def graph_allocating(self, pool: Any) -> Any:
+        return self.memory.allocating(pool)
+
+    def graph_levels(self) -> tuple[tuple[str, int], ...]:
+        request = execution.catch.CURRENT.get()
+        return tuple(request.levels()) if request is not None else ()
+
+    def graph_segments(self, component: str) -> tuple[str, ...]:
+        """Use the model's declared block topology, including when the full model streams."""
+        return tuple(self.models[component].blocks) or ("",)
 
     def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
