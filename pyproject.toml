@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.30.3"
+version = "0.31.0"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.13,<0.14",
+    "tensorfs>=0.14,<0.15",
     "cryptography>=45",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -31,7 +31,7 @@ dev = [
     "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.13,<0.14",
+    "tensorfs>=0.14,<0.15",
     "av>=19.0.1",
     # CI partitions this unchanged suite across independent delegated runners.
     "pytest-split>=0.11.0",
@@ -42,7 +42,7 @@ diffusers = [
     "peft>=0.20,<0.21",
     "diffusers>=0.40.0",
     "transformers>=5.16.1",
-    "torch>=2.13",
+    "torch>=2.14",
     "torchvision>=0.28",
     "numpy>=1.26",
     "safetensors>=0.8.0",
@@ -152,20 +152,20 @@ warn_unused_ignores = false
 [project.optional-dependencies]
 assessment = ["cozy-eval>=0.7"]
 # The derivation harness and the serving executor. Corpus venvs install this.
-derive = ["torch>=2.13"]
+derive = ["torch>=2.14"]
 # The separate SDXL corpus retains its own upstream dependency cohort.
-corpus = ["torch>=2.13", "diffusers>=0.36", "transformers>=4.40"]
+corpus = ["torch>=2.14", "diffusers>=0.36", "transformers>=4.40"]
 media = [
     "av>=19.0.1",
 ]
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
-model-execution = ["tensorfs>=0.13,<0.14"]
+model-execution = ["tensorfs>=0.14,<0.15"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
     "peft>=0.20,<0.21",
-    "torch>=2.13",
+    "torch>=2.14",
     "transformers>=5.16.1",
     "tokenizers>=0.23.1",
 ]
