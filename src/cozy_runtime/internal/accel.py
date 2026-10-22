@@ -491,8 +491,7 @@ def initialized(torch: Any, kind: str) -> bool:
 
 def oom_error(torch: Any, kind: str) -> type[BaseException]:
     """The OOM exception CLASS, for an `except` clause that must name the type before an
-    instance exists. An instance is classified by `author._errors.is_device_oom`: MPS also
-    refuses a buffer larger than Metal allows as a plain RuntimeError."""
+    instance exists. An instance is classified by `author._errors.fault`."""
     cls = getattr(torch, "OutOfMemoryError", None)
     if not isinstance(cls, type):  # pragma: no cover - a torch without the class
         raise AcceleratorUnsupported(kind, "oom_error")

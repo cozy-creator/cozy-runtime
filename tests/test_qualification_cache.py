@@ -1,257 +1,162 @@
-"""The decode qualification is release data: one table per card architecture and torch minor.
-
-The input is the RECORDED REAL PROBE `tests/observations/probe-cuda-sm89.json` (an RTX 4070
-Laptop, sm89, torch 2.13.0+cu130), its observations moved onto this build's spec digests by
-implementation name with every measurement verbatim (as `test_leaf_speedup_record.rekeyed`).
-
-**How "the suite did not run" is proved.** `qualified` is handed an object that is not torch;
-every path that measures reaches for an attribute of it and raises.
-"""
+"""Offline qualification files and deterministic reference admission, using real CPU decoders."""
 
 from __future__ import annotations
 
 import dataclasses
-import fcntl
-import json
-import threading
+import sys
 from pathlib import Path
 from typing import Any
 
 import msgspec
 import pytest
 
-from cozy_runtime.cli import qualify
-from cozy_runtime.internal import qualification
-from cozy_runtime.internal.encoding import (
-    DeviceFacts,
-    Provider,
-    implementation_digest,
+torch = pytest.importorskip("torch")
+
+from cozy_runtime.internal import probe, qualification  # noqa: E402
+from cozy_runtime.internal.encoding import (  # noqa: E402
     launch_providers,
     measure_device,
     measure_runtime,
 )
-from cozy_runtime.internal.encoding.adapters import CoreDequant
-from cozy_runtime.internal.probe import QualificationResult
-
-OBSERVATION = Path(__file__).resolve().parent / "observations" / "probe-cuda-sm89.json"
-NO_TORCH = object()
+from cozy_runtime.internal.encoding.selection import reference_decoder  # noqa: E402
 
 
-def recorded() -> QualificationResult:
-    return msgspec.convert(json.loads(OBSERVATION.read_bytes()), QualificationResult)
-
-
-def providers() -> dict[str, tuple[Provider, ...]]:
-    """This build's providers the recording measured an implementation of."""
-    names = {one.implementation for one in recorded().observations}
-    return {
-        encoding: kept
-        for encoding, group in launch_providers().items()
-        if (kept := tuple(p for p in group if p.name in names))
-    }
-
-
-def table() -> QualificationResult:
-    """The recording as this build's table: one observation per (spec, implementation, dtype)."""
-    result = recorded()
-    by_name = {(one.implementation, one.output_dtype): one for one in result.observations}
-    return msgspec.structs.replace(
-        result,
-        observations=[
-            msgspec.structs.replace(
-                by_name[(provider.name, dtype)],
-                scheme=encoding,
-                implementation_digest=implementation_digest(provider),
-            )
-            for encoding, group in providers().items()
-            for provider in group
-            for dtype in qualification.TABLE_DTYPES
-        ],
+@pytest.fixture(scope="module")
+def offline() -> tuple[Any, Any, Any, Any]:
+    if torch.cuda.is_available():
+        pytest.skip("CPU decoder proof: run with CUDA_VISIBLE_DEVICES= to leave GPUs untouched")
+    device, runtime = measure_device(torch, 0), measure_runtime(torch, "offline-test")
+    providers = {k: v for k, v in launch_providers().items() if k in ("plain", "fp8.rowwise")}
+    # This is the developer's real offline oracle. Its measurements are never forged or rekeyed.
+    _, table = probe.qualify(
+        torch, providers, device, ("float32",), release="offline-test", runtime=runtime
     )
+    return providers, device, runtime, table
 
 
-def ship(directory: Path, result: QualificationResult) -> str:
-    name = qualification.table_name(result.device, result.runtime)
-    directory.mkdir(parents=True, exist_ok=True)
-    qualification.write_table(directory / f"{name}.json", result)
-    return name
+def load(offline: Any, directory: Path, **options: Any) -> qualification.Qualification:
+    providers, device, runtime, _ = offline
+    visited: list[str] = []
+    forbidden = {"qualify", "_measured", "_evidence", "_leaf_bench", "_micro_bench"}
 
+    def calls(frame: Any, event: str, arg: Any) -> None:
+        if (
+            event == "call"
+            and frame.f_code.co_filename == probe.__file__
+            and frame.f_code.co_name in forbidden
+        ):
+            visited.append(frame.f_code.co_name)
 
-def load(
-    device: DeviceFacts, cache: Path | None = None, **moved: Any
-) -> qualification.Qualification:
-    shipped = table()
-    return qualification.qualified(
-        NO_TORCH,
-        providers(),
-        device,
-        moved.get("dtypes", ("bfloat16", "int64")),
-        release="9.9.9",
-        runtime=dataclasses.replace(shipped.runtime, **moved.get("runtime", {})),
-        cache=str(cache or ""),
-    )
-
-
-def test_a_table_answers_for_its_architecture_torch_minor_and_runtime_source() -> None:
-    device, runtime = table().device, table().runtime
-    name = qualification.table_name(device, runtime)
-    same = [
-        dataclasses.replace(device, name="NVIDIA L40S", driver="600.1", index=3),
-        dataclasses.replace(device, configuration="150W/[N/A]"),
-    ]
-    assert {qualification.table_name(other, runtime) for other in same} == {name}
-    assert (
-        qualification.table_name(device, dataclasses.replace(runtime, torch_build="2.13.1")) == name
-    )
-    assert qualification.table_name(device, dataclasses.replace(runtime, release="9.9.9")) == name
-    moved = [
-        qualification.table_name(dataclasses.replace(device, sm=90), runtime),
-        qualification.table_name(device, dataclasses.replace(runtime, torch_build="2.14.0+cu130")),
-        qualification.table_name(
-            device, dataclasses.replace(runtime, source_digest="sha256:" + "0" * 64)
-        ),
-    ]
-    assert name not in moved and len(set(moved)) == len(moved)
-
-
-def test_a_shipped_table_answers_another_card_of_its_architecture_without_the_suite(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    shipped = table()
-    monkeypatch.setattr(qualification, "SHIPPED", tmp_path / "shipped")
-    name = ship(qualification.SHIPPED, shipped)
-    other = dataclasses.replace(shipped.device, name="NVIDIA GeForce RTX 4090", driver="580.1")
-
-    answer = load(other, runtime={"torch_build": "2.13.1+cu130"})
-
-    assert (answer.source, answer.key) == ("shipped", name)
-    bf16 = [o for o in shipped.observations if o.output_dtype == "bfloat16" and o.evidence.passed]
-    verbatim = sum(p.route == "verbatim" for group in providers().values() for p in group)
-    # every passed bf16 observation, and the int64 destination's verbatim route, unmeasured
-    assert len(answer.capabilities.records) == len(bf16) + verbatim
-    assert {r.output_dtype for r in answer.capabilities.records} == {"bfloat16", "int64"}
-
-
-def test_another_architecture_torch_minor_or_source_measures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    shipped = table()
-    monkeypatch.setattr(qualification, "SHIPPED", tmp_path / "shipped")
-    ship(qualification.SHIPPED, shipped)
-    for device, runtime in (
-        (dataclasses.replace(shipped.device, sm=90), {}),
-        (shipped.device, {"torch_build": "2.14.0+cu130"}),
-        (shipped.device, {"source_digest": "sha256:" + "0" * 64}),
-    ):
-        with pytest.raises(AttributeError):
-            load(device, runtime=runtime)
-    # a table filed under another table's name is not evidence about it
-    sm90 = dataclasses.replace(shipped.device, sm=90)
-    qualification.write_table(
-        qualification.SHIPPED / f"{qualification.table_name(sm90, shipped.runtime)}.json", shipped
-    )
-    with pytest.raises(AttributeError):
-        load(sm90)
-
-
-def test_an_executor_waits_for_the_table_another_is_measuring_and_reads_it(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Run 6349's four BiRefNet executors each ran the suite. The first measures; the rest
-    wait on its lock and read what it kept."""
-    shipped = table()
-    monkeypatch.setattr(qualification, "SHIPPED", tmp_path / "none")
-    cache = tmp_path / "qualification"
-    cache.mkdir()
-    name = qualification.table_name(shipped.device, shipped.runtime)
-    answers: list[qualification.Qualification] = []
-    with open(cache / f"{name}.lock", "a+") as measuring:
-        fcntl.flock(measuring, fcntl.LOCK_EX)
-        waiter = threading.Thread(target=lambda: answers.append(load(shipped.device, cache)))
-        waiter.start()
-        waiter.join(0.5)
-        assert waiter.is_alive() and not answers
-        ship(cache, shipped)
-    waiter.join()
-    assert [(a.source, a.key) for a in answers] == [("kept", name)]
-
-
-def test_a_kept_table_missing_a_destination_measures(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    shipped = table()
-    monkeypatch.setattr(qualification, "SHIPPED", tmp_path / "none")
-    ship(tmp_path / "qualification", shipped)
-    assert load(shipped.device, tmp_path / "qualification").source == "kept"
-    with pytest.raises(AttributeError):
-        load(shipped.device, tmp_path / "qualification", dtypes=("float64",))
-
-
-def _providers() -> dict[str, Any]:
-    """The launch table less the schemes only the cores' rows serve (each row is qualified on its
-    own in test_encoding_cores): these tests are about keeping tables, and measuring 36 more rows
-    on a CPU three times over would be their whole cost."""
-    return {
-        scheme: candidates
-        for scheme, candidates in launch_providers().items()
-        if not all(isinstance(p, CoreDequant) for p in candidates)
-    }
-
-
-def test_the_gate_writes_the_table_a_load_reads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The release gate's own entry, on this host's CPU: its table answers the next load."""
-    torch = pytest.importorskip("torch")
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    monkeypatch.setattr(qualify, "launch_providers", _providers)
-    monkeypatch.setattr(qualification, "SHIPPED", tmp_path)
-    device, runtime = measure_device(torch, 0), measure_runtime(torch, "any")
-    stale = tmp_path / f"{qualification.table_name(device, runtime).rsplit('-', 2)[0]}-0-v2.json"
-    other = tmp_path / "cpu-torch0.0-0-v2.json"
-    for path in (stale, other):
-        path.write_text("{}")
-    assert qualify.main([str(tmp_path)]) == 0
-    assert not stale.exists() and other.exists()
-    answer = qualification.qualified(
-        NO_TORCH,
-        _providers(),
-        device,
-        ("float16",),
-        release="any",
-        runtime=runtime,
-    )
-    assert answer.source == "shipped" and answer.capabilities.records
-
-
-def test_a_machine_measures_only_what_its_table_lacks_and_keeps_both(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """An unknown card, on this host's CPU: each load measures only its own destinations
-    (no more than before tables shipped), and the machine's table grows to answer both."""
-    torch = pytest.importorskip("torch")
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    monkeypatch.setattr(qualification, "SHIPPED", tmp_path / "none")
-    cache, device = tmp_path / "qualification", measure_device(torch, 0)
-    runtime = measure_runtime(torch, "any")
-
-    def load_here(on: Any, dtypes: tuple[str, ...]) -> qualification.Qualification:
-        return qualification.qualified(
-            on, _providers(), device, dtypes, release="any", runtime=runtime, cache=str(cache)
+    before = sys.getprofile()
+    sys.setprofile(calls)
+    try:
+        result = qualification.qualified(
+            torch,
+            providers,
+            device,
+            options.get("dtypes", ("float32",)),
+            runtime=options.get("runtime", runtime),
+            release="offline-test",
+            tables=directory,
         )
+    finally:
+        sys.setprofile(before)
+    assert not visited, f"consumer ran the offline oracle: {visited}"
+    return result
 
-    first, second = load_here(torch, ("float16",)), load_here(torch, ("bfloat16",))
-    assert (first.source, second.source) == ("measured", "measured")
-    assert {o.output_dtype for o in second.result.observations} == {"bfloat16"}
-    both = load_here(NO_TORCH, ("float16", "bfloat16"))
-    assert both.source == "kept"
-    assert len(both.capabilities.records) == len(first.capabilities.records) + len(
-        second.capabilities.records
+
+def ship(directory: Path, table: Any) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{qualification.table_name(table.device, table.runtime)}.json"
+    qualification.write_table(path, table)
+    return path
+
+
+def test_offline_oracle_output_is_read_without_consumer_measurement(
+    offline: Any, tmp_path: Path
+) -> None:
+    table = offline[3]
+    path = ship(tmp_path, table)
+    original = path.read_bytes()
+    result = load(offline, tmp_path)
+    assert result.source == "shipped" and result.result.suite_ms == table.suite_ms
+    assert result.capabilities.records
+    assert path.read_bytes() == original and list(tmp_path.iterdir()) == [path]
+    assert any(isinstance(o.evidence, probe.DecodeEvidence) for o in result.result.observations)
+
+
+def test_missing_table_admits_declared_decoders_without_inventing_measurements(
+    offline: Any, tmp_path: Path
+) -> None:
+    directory = tmp_path / "absent"
+    result = load(offline, directory)
+    assert result.source == "supported" and result.result.suite_ms == 0
+    assert not directory.exists(), "inference must not create a measurement cache or lock"
+    decoded = [
+        o for o in result.result.observations if isinstance(o.evidence, probe.ReferenceEvidence)
+    ]
+    assert decoded and all(o.delivery_route == "decoded_float" for o in decoded)
+    assert all(o.geometry_class == "declared-format" for o in decoded)
+    assert all(o.evidence.route_axes.deviation_rel < 0 for o in decoded)
+    assert all(
+        r.leaf_speedup_x < 0 and r.kernel_numeric_error < 0 for r in result.capabilities.records
+    )
+    assert all(r.delivery_route != "encoded_gemm" for r in result.capabilities.records)
+    assert any(
+        o.delivery_route == "verbatim" and o.evidence.passed for o in result.result.observations
     )
 
 
-def test_every_shipped_table_is_filed_under_its_own_name() -> None:
-    for path in sorted(qualification.SHIPPED.glob("*.json")):  # the release gate measures them
-        table = qualification._read(path)
-        assert table is not None, path
-        assert f"{qualification.table_name(table.device, table.runtime)}.json" == path.name
+def test_stale_and_partial_tables_keep_only_their_actual_offline_facts(
+    offline: Any, tmp_path: Path
+) -> None:
+    table = offline[3]
+    ship(tmp_path, table)
+    stale = dataclasses.replace(offline[2], source_digest="sha256:" + "0" * 64)
+    assert load(offline, tmp_path, runtime=stale).source == "supported"
+    # A valid partial table retains its facts; another destination uses the declared decoder.
+    result = load(offline, tmp_path, dtypes=("float32", "float16"))
+    assert result.source == "shipped"
+    assert any(
+        o.output_dtype == "float32" and isinstance(o.evidence, probe.DecodeEvidence)
+        for o in result.result.observations
+    )
+    assert any(
+        o.output_dtype == "float16" and isinstance(o.evidence, probe.ReferenceEvidence)
+        for o in result.result.observations
+    )
+
+
+def test_an_offline_decoder_failure_is_not_overridden_by_reference_admission(
+    offline: Any, tmp_path: Path
+) -> None:
+    table = offline[3]
+    # A real format refusal stored by an offline run must remain a refusal at consumption.
+    observed = next(o for o in table.observations if o.delivery_route == "decoded_float")
+    provider = next(
+        p for ps in offline[0].values() for p in ps if p.name == observed.implementation
+    )
+    why = provider.supports((3,), {})
+    assert why
+    refused = msgspec.structs.replace(observed, evidence=probe.UnmeasuredEvidence(note=why))
+    ship(tmp_path, msgspec.structs.replace(table, observations=[refused]))
+    result = load(offline, tmp_path)
+    row = next(o for o in result.result.observations if o.implementation == provider.name)
+    assert not row.evidence.passed and row.evidence.note == why
+
+
+def test_declared_fallback_decoders_pass_the_real_format_vectors(offline: Any) -> None:
+    device = offline[1]
+    supported = [
+        p
+        for group in launch_providers().values()
+        for p in group
+        if reference_decoder(p, device, "float32")
+    ]
+    assert supported
+    for provider in supported:
+        report = probe._spec_vectors(torch, provider, torch.device("cpu"))
+        assert report.passed and not report.skipped, (provider.name, report)
+        assert not reference_decoder(provider, device, "int64")
+    unknown = dataclasses.replace(supported[0], encoding="unknown.future-format")
+    assert not reference_decoder(unknown, device, "float32")

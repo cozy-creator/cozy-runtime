@@ -105,6 +105,7 @@ def test_rich_fixture_spells_the_whole_vocabulary() -> None:
         '"asset": "file"',
         '"encoded_leaves": "accept"',
         '"sequence_parallel": {"degrees": [2, 4]}',
+        '"placeable": ["text_encoder"]',
         '"component_use": {"encode": ["text_encoder"], "render": ["dit", "vae"]}',
         '"normalization_worst_relative_frobenius"',
         '"output_id": "mxfp8"',

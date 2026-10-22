@@ -11,6 +11,7 @@ import re
 import socket
 import time
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
@@ -303,10 +304,15 @@ class _Broker:
         bindings: Mapping[tuple[str, str], _CallType],
         exchange: Exchange,
         watch: Callable[[], int | None] | None = None,
+        yielding: Callable[[], AbstractContextManager[object]] = nullcontext,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
         #: Opens the worker's nudge socket once; None when no peer can nudge.
         self.watch = watch
+        #: While any of its calls waits on a child, the attempt's memory yields its reserved
+        #: room to it (its allocated tensors stay counted): the outermost wait holds this open.
+        self.yielding, self.waiting = yielding, ExitStack()
+        self.waits = 0
         self.nudges: socket.socket | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.nudged = 0
@@ -457,7 +463,7 @@ class _Broker:
                             "child result differs from its interface",
                             call.index,
                         ) from exc
-                await self._changed(seen, call.ctx.deadline)
+                await self._waiting(seen, call.ctx.deadline)
         except asyncio.CancelledError:
             if call.index in self.activated and not self.closed:
                 self.exchange(ChildCancel(call_index=call.index), CallState)
@@ -469,6 +475,18 @@ class _Broker:
             finally:
                 self.activated.discard(call.index)
                 self.calls.pop(call.index, None)
+
+    async def _waiting(self, seen: int, deadline: float) -> None:
+        """`_changed`, the attempt's memory yielding while any call of it waits."""
+        if not self.waits:
+            self.waiting.enter_context(self.yielding())
+        self.waits += 1
+        try:
+            await self._changed(seen, deadline)
+        finally:
+            self.waits -= 1
+            if not self.waits:
+                self.waiting.close()
 
     async def _changed(self, seen: int, deadline: float) -> None:
         """Until the worker nudges this attempt after `seen`: a call moved or it was cancelled."""

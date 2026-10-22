@@ -198,6 +198,14 @@ class UnmeasuredEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="unm
     route_axes: RouteAxes = RouteAxes()
 
 
+class ReferenceEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="reference"):
+    """A shipped decoder's format/API contract, with no measured timing or accuracy axes."""
+
+    note: str
+    passed: bool = True
+    route_axes: RouteAxes = RouteAxes()
+
+
 class NativeEvidence(
     msgspec.Struct, frozen=True, omit_defaults=True, tag_field="kind", tag="native"
 ):
@@ -215,7 +223,9 @@ class DecodeEvidence(msgspec.Struct, frozen=True, tag_field="kind", tag="decode"
     route_axes: RouteAxes = RouteAxes()
 
 
-Evidence = VerbatimEvidence | UnmeasuredEvidence | NativeEvidence | DecodeEvidence
+Evidence = (
+    VerbatimEvidence | ReferenceEvidence | UnmeasuredEvidence | NativeEvidence | DecodeEvidence
+)
 
 
 class Observation(msgspec.Struct, frozen=True):
@@ -1275,7 +1285,11 @@ def make_observation(
         implementation_revision=provider.code_revision,
         device_predicate=device.predicate,
         output_dtype=dtype,
-        geometry_class=geometry_class(BENCH_SHAPE),
+        geometry_class=(
+            "declared-format"
+            if isinstance(evidence, ReferenceEvidence)
+            else geometry_class(BENCH_SHAPE)
+        ),
         delivery_route=provider.route,
         evidence=evidence,
     )

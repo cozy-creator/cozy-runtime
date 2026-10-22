@@ -63,11 +63,8 @@ def rank_main(
     shape: tuple[int, ...],
     plant: bool,
     cuda: bool,
-    room: int,
 ) -> None:
     torch.set_num_threads(1)
-    if room:  # GPU r has r bytes more room: the group sizes from the least of them
-        ulysses._ROOM = lambda device: room + rank
     counted = ulysses._cross
     calls: list[int] = []
 
@@ -169,13 +166,12 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=56)
     parser.add_argument("--plant", action="store_true")
     parser.add_argument("--cuda", action="store_true")
-    parser.add_argument("--room", type=int, default=0)
     args = parser.parse_args()
     shape = (1, args.rows, args.heads, 128)
     start: Any = spawn
     start(
         rank_main,
-        args=(args.degree, args.root, shape, args.plant, args.cuda, args.room),
+        args=(args.degree, args.root, shape, args.plant, args.cuda),
         nprocs=args.degree,
         join=True,
     )

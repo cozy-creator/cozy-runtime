@@ -1,41 +1,31 @@
-"""Model weights (memory-varena.md): Runtime builds each model on meta, and one
+"""Model weights (varena-slim §3): Runtime builds each model on meta, and one
 `tensorfs.varena.torch.Memory` per executor decides where every weight byte lives.
 
 `Backend` is the loader's backend. `fit` judges, `materialize` keeps weights on meta and derived
 buffers real, `fill` checks each destination against its stored row, and `commit` installs
-encoded leaves and loads each component with `Memory.load`. A stored tensor becomes the
-module's through its route (`_Routes`: as stored, decoded, or a native leaf's buffers); a LoRA'd
-linear bakes on page-in (`_Bakes`), both declared on the module (`Declared`). `Residency` is
-what Runtime mechanisms reach a placed component through: graph pins, KV caches and notes.
+encoded leaves, loads each component (`Memory.load`) and puts the execution layer's catch on it.
+A stored tensor becomes the module's through its route (`_Routes`: as stored, decoded, or a
+native leaf's buffers); a LoRA'd linear bakes on page-in (`_Bakes`), named by its fill identity.
+`Placement` is what Runtime mechanisms reach a placed component through: graph pins, KV caches
+and notes.
 """
 
 from __future__ import annotations
 
-import os
 import time
-import weakref
 import zlib
 from collections import Counter
-from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field, fields, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from tensorfs.varena.torch import (
-    Cache,
-    Declared,
-    Memory,
-    Model,
-    Shrink,
-    Unbound,
-    WeightGrant,
-    blocks_of,
-)
+from tensorfs.varena.torch import Cache, Declared, Memory, Model, Weights, blocks_of
 
-from cozy_runtime.author._executor_requests import HostGrant
+from cozy_runtime import graphs, lm
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
-from cozy_runtime.internal import canonical, lora_bake
+from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -71,18 +61,6 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.nn import Module
 
-#: `ReadGrant` by manifest and layout digest.
-type Grant = Callable[[str, str], HostGrant]
-#: Whether this TensorFS seals a host layout only where TensorD admits it (`WeightGrant.seal`,
-#: 0.13.3); an older one seals on every unheld load, as it always did.
-ADMITS = "seal" in {f.name for f in fields(WeightGrant)}
-#: GPU pages varena kept, given to TensorD (`KeepPages`): layout digest, fingerprint, and
-#: `(region, span, fd)` each (the callee's to close).
-type Keep = Callable[[str, str, list[tuple[int, int, int]]], None]
-#: A host layout varena sealed, deposited with TensorD (`Deposit`): manifest, name, layout
-#: digest, the memfd (the callee's to close).
-type Deposit = Callable[[str, str, str, int], None]
-
 
 # ---------------------------------------------------------------------------- the backend
 
@@ -103,14 +81,12 @@ class Backend:
         construction: str,
         qualified: tuple[Capabilities, QualificationResult],
         device_facts: DeviceFacts,
+        release: str,
         custody: str = "canonical",
-        grant: Grant | None = None,
-        deposit: Deposit | None = None,
-        keeper: Keep | None = None,
     ) -> None:
         self.memory = memory
         self.device = device
-        self.grant, self.deposit, self.keeper = grant, deposit, keeper
+        self.release = release
         self.torch = torch
         self.construction = construction
         self.checkpoints = dict(checkpoints)
@@ -122,12 +98,10 @@ class Backend:
         self.skipped: dict[str, list[str]] = {}
         self.enqueued: dict[str, TensorLike] = {}
         self.roots: dict[str, Module] = {}
-        #: each component's registered model, and its LoRA bakes
+        #: each component's loaded model, and its LoRA bakes
         self.models: dict[str, Model] = {}
         self.bakes: dict[str, _Bakes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
-        #: each bound component's grant from TensorD, asked once (`ahead`); its fds are ours
-        self.grants: dict[str, WeightGrant] = {}
         self.stats: dict[str, float] = {}
         self.device_facts = device_facts
         self.providers = launch_providers()
@@ -205,6 +179,7 @@ class Backend:
             construction=construction,
             qualified=(qualification.capabilities, qualification.result),
             device_facts=facts,
+            release=release,
         )
 
     def _select(self, key: str, row: PlanRow) -> Selection:
@@ -264,14 +239,6 @@ class Backend:
     def bound(self) -> frozenset[str]:
         """The components the binding selects; the construction's others stay on meta."""
         return frozenset(self.checkpoints)
-
-    def ahead(self) -> None:
-        """Before the factory runs, each bound component's grant, asked once. The load registers
-        it, held or sealed, the one way it loads any time."""
-        started = time.perf_counter()
-        for name in self.checkpoints:
-            self._granted(name)
-        self.stats["ahead_ms"] = round((time.perf_counter() - started) * 1000, 2)
 
     def expect(self, sets: Mapping[str, Sequence[str]]) -> None:
         """Completeness sets: a destination the census never reaches refuses the commit."""
@@ -425,7 +392,6 @@ class Backend:
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
                 self.models[name] = self._register(name, root, keys)
-        self._release()
         if self.device.type == "cuda" and any(b.bakes for b in self.bakes.values()):
             lora_bake.warm(self.device.index or 0)  # its kernels build at load, in a child
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
@@ -437,10 +403,19 @@ class Backend:
         self.state = "poisoned"
 
     def close(self) -> None:
-        self._release()
         for model in self.models.values():
+            lm.release(model.module)
+            graphs.release(self.torch, model.module)
             model.close()
         self.models.clear()
+
+    def sizes(self) -> dict[str, int]:
+        """Each loaded component's stored bytes."""
+        held: dict[str, int] = {}
+        for row in self.plan.values():
+            if row.component in self.models:
+                held[row.component] = held.get(row.component, 0) + row.stored_nbytes
+        return held
 
     # -- construction internals
 
@@ -459,80 +434,19 @@ class Backend:
 
     def _register(self, name: str, root: Module, keys: list[str]) -> Model:
         """One component loaded into the memory: its stored tensors, bound through their
-        routes, its LoRAs baked on page-in, its bytes the host layout TensorD holds for it, else
-        read from the checkpoint by varena, which seals them and deposits the layout with TensorD
-        for the next load."""
+        routes, its LoRAs baked on page-in, under the execution layer's catch."""
         rows = {self.plan[key].name: self.plan[key] for key in keys}
-        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)), self._owner)
-        grant = replace(self._granted(name), keys=tuple(rows))
-        vars(root)["_varena"] = Declared(  # `_cozy_state`: what the package's forward changes
-            grant,
-            state=tuple(getattr(root, "_cozy_state", ())),
+        bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
+        checkpoint = self.checkpoints[name]
+        vars(root)["_varena"] = Declared(
+            Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
             fill=bakes if bakes.bakes else None,
             bind=_Routes(self, rows),
         )
-        try:
-            model = self.memory.load(root)
-        finally:
-            remaining = self.grants.pop(name, None)
-            if remaining is not None:
-                _close(remaining)
-        for _, sealed in self.memory.sealed():
-            if self.deposit is not None:
-                label = f"{self.construction}/{name}"
-                self.deposit(grant.manifest, label, self._layout(name), sealed)
-            else:
-                os.close(sealed)
+        model = self.memory.load(root)
+        # Install explicit pure cuts and names; arbitrary package code is never replayed.
+        execution.install(root, getattr(root, "_cozy_state", ()))
         return model
-
-    def _layout(self, name: str) -> str:
-        """What a component's host tier is deposited and granted under: its manifest, the
-        construction (release, model class, components, custody) and its name. Known before the
-        module exists; a held tier of other regions is a miss (`Memory.load`)."""
-        return canonical.digest(
-            {
-                "manifest": self.checkpoints[name].id,
-                "construction": self.execution.construction.document(),
-                "component": name,
-            }
-        )
-
-    def _granted(self, name: str) -> WeightGrant:
-        """A component's grant, asked of TensorD once: the sealed host tier it holds for the
-        layout, registered by the load; without one, varena seals one where TensorD admits it,
-        else reads the checkpoint."""
-        grant = self.grants.get(name)
-        if grant is None:
-            checkpoint = self.checkpoints[name]
-            grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
-            if self.grant is not None:
-                held = self.grant(grant.manifest, self._layout(name))
-                admitted: dict[str, Any] = {"seal": held.seal} if ADMITS else {}
-                grant = replace(
-                    grant,
-                    host_fd=held.fd,
-                    pages=held.pages,
-                    fingerprint=held.fingerprint,
-                    **admitted,
-                )
-            self.grants[name] = grant
-        return grant
-
-    def keep(self, *, quiescent: bool = False) -> None:
-        """Its models' GPU pages that landed since the last call, kept past this process:
-        TensorD holds them for the next executor of the same layout. `quiescent` is the
-        executor's fenced, drained end boundary; cached graph pins keep their addresses."""
-        if self.keeper is None:
-            return
-        for name, model in self.models.items():
-            fingerprint, pages = model.kept(quiescent=quiescent)
-            if pages:
-                self.keeper(self._layout(name), fingerprint, pages)
-
-    def _release(self) -> None:
-        """Grants no registration took."""
-        for name in list(self.grants):
-            _close(self.grants.pop(name))
 
     def _install_leaf(self, key: str) -> tuple[Any, Any, tuple[str, ...]]:
         """Replace the linear op that owns `key` with its encoded leaf, on meta. Returns the
@@ -588,12 +502,6 @@ class Backend:
 # ----------------------------------------------------------------- routes and LoRA bakes
 
 
-def _close(grant: WeightGrant) -> None:
-    held = [] if grant.host_fd is None else [grant.host_fd]
-    for fd in held + [f for _, f in grant.pages]:
-        os.close(fd)
-
-
 class _Routes:
     """A stored tensor's parts as the module's tensors (`Declared.bind`): as stored,
     decoded into a fresh float tensor, or a native leaf's role buffers (derived roles made from
@@ -638,11 +546,13 @@ class _Routes:
 class LoRASource(Protocol):
     """A model's forward hook on a linear that adds a LoRA update the model owns (H3's turbo
     overlay). Its `lora_factors()` (identity, down, up, scale; None when it adds nothing now)
-    are baked into the linear's bytes, and `_cozy_baked` is set while they hold it."""
+    are baked into the linear's bytes, and `_cozy_baked` is set while they hold it. The identity
+    names the factors' content the same in every process (the package's declared source and the
+    site), so pages baked with them are kept and found again."""
 
     _cozy_baked: bool
 
-    def lora_factors(self) -> tuple[object, Tensor, Tensor, float] | None: ...
+    def lora_factors(self) -> tuple[str, Tensor, Tensor, float] | None: ...
 
 
 class LoRALayer(Protocol):
@@ -657,6 +567,7 @@ class _Bake:
     (stored keys and scale), and the model's own hooks."""
 
     weight: str
+    #: the stored weight's encoding: what the bake writes into
     encoding: str = ""
     layer: LoRALayer | None = None
     factors: list[tuple[str, str, float]] = field(default_factory=list)
@@ -666,17 +577,13 @@ class _Bake:
 class _Bakes:
     """A component's LoRA'd linears, baked into their weights' bytes as the pages arrive
     (`Declared.fill`), so a resident page carries its delta and an evicted one bakes again on
-    its refault. Each weight's own seed makes every bake of it the same bytes."""
+    its refault. `identity` names what a bake writes the same in every process, and each
+    weight's stochastic rounding is seeded from it: a re-bake is the kept page's bytes."""
 
     def __init__(
-        self,
-        torch: ModuleType,
-        root: Module,
-        rows: Mapping[str, PlanRow],
-        blocks: set[str],
-        owner: Callable[[object], tuple[str, str] | None],
+        self, backend: Backend, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
     ) -> None:
-        self.torch, self.owner = torch, owner
+        self.torch, self.owner = backend.torch, backend._owner
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
         self.baked = 0
@@ -709,31 +616,24 @@ class _Bakes:
             if bake.layer is not None or bake.hooks:
                 self.bakes[stored] = bake
 
-    def prepare(self) -> tuple[object, ...]:
-        """As a forward starts (`Fill.prepare`): each LoRA'd linear told whether its bytes
-        carry its delta, and what baking now adds (the strategy, each linear's graph and hook
-        factors); pages baked for other deltas refill."""
-        baked, rows = self.strategy == "bake", []
-        for bake in self.bakes.values():
+    @property
+    def identity(self) -> str | None:
+        """What a bake writes now, the same in every process (`Filling.identity`): the strategy
+        and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each baked
+        weight's stored name and encoding with each delta's content (a stored factor pair of
+        this checkpoint, or the identity a hook's package declares), dtypes and scale."""
+        torch = self.torch
+        baked = self.strategy == "bake"
+        for bake in self.bakes.values():  # each LoRA'd linear told whether its bytes carry it
             if bake.layer is not None:
                 bake.layer._cozy_baked = baked
             for hook in bake.hooks:
                 hook._cozy_baked = baked
-            hooks = (hook.lora_factors() for hook in bake.hooks)
-            rows.append((bake.layer is not None, *(g and (g[0], g[3]) for g in hooks)))
-        return (self.strategy, *rows)
-
-    def identity(self) -> str | None:
-        """What `prepare()` just named, the same in every process (`Fill.identity`): the
-        recipe, and each baked weight's stored name and encoding with each delta's content (a
-        stored factor pair of this checkpoint, or an overlay checkpoint's component and module
-        path), dtypes and scale. None when an overlay's checkpoint cannot be named."""
-        torch = self.torch
-        if self.strategy != "bake":
+        if not baked:
             return repr((self.strategy,))
-        device = torch.cuda.current_device()
+        device = torch.cuda.current_device() if torch.cuda.is_initialized() else -1
         held: list[object] = [lora_bake.recipe(device), torch.__version__]
-        held.append(torch.cuda.get_device_capability(device))
+        held.append(torch.cuda.get_device_capability(device) if device >= 0 else "cpu")
         for stored, bake in sorted(self.bakes.items()):
             deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
             for hook in bake.hooks:
@@ -748,6 +648,7 @@ class _Bakes:
         return repr(held)
 
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
+        identity = self.identity
         if self.strategy != "bake":
             return
         for stored, bake in self.bakes.items():
@@ -769,26 +670,25 @@ class _Bakes:
                 dict(weight),
                 torch.cat([d.to(kind) for d in downs]),
                 torch.cat([u.to(kind) for u in ups], dim=1),
-                seed=zlib.crc32(stored.encode()),
+                seed=zlib.crc32(f"{identity}\0{stored}".encode()),
             )
             self.baked += 1
 
 
-# ------------------------------------------------------------------------- the residency
+# ------------------------------------------------------------------------- the placement
 
 
-class Residency:
+class Placement:
     """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
     pins and KV caches as the memory's caches, a request's LoRA serving, and notes."""
 
     def __init__(self, memory: Memory, backend: Backend) -> None:
         self.memory = memory
+        self.torch = backend.torch
         self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
-        #: (component, owner) -> its pin and the cache that holds it
-        self.pins: dict[tuple[str, str], tuple[_Pin, Cache]] = {}
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
@@ -796,53 +696,42 @@ class Residency:
         self.attempts += 1
         self.notes.clear()
 
-    def plan(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
-        """The attempt's declared steps (`Context.plan`): varena evicts and restores by them."""
-        self.memory.plan(request_id, list(steps))
-
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""
         for bakes in self.bakes.values():
             bakes.strategy = strategy
 
-    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> _Pin | None:
-        """Every weight of `component` held bound for `owner` (a CUDA graph replays at their
-        addresses, decoded copies included) by a cache of the memory's. When memory asks for
-        room or the component's LoRAs change, `shed` drops what read them there; the weights
-        stay bound until the last reference to the pin goes, so a replay in flight keeps them.
-        None when part of the component streams (a slot's address moves)."""
-        held = self.pins.get((component, owner))
-        if held is not None:
-            return held[0]
-        model = self.models.get(component)
-        if model is None:
-            return None
+    def keep(self, *held: Tensor) -> None:
+        """Tensors a cache or a hold owns (KV slots, a graph's static inputs): never parked."""
+        execution.keep(*held)
 
-        def give(_: int) -> int:
-            self.pins.pop((component, owner), None)
-            cache.close()
-            return shed()
+    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+        """The region's address ownership, independent of its physical replay lease."""
+        return self.models[component].retain(paths)
 
-        cache = self.memory.cache(owner, give)
-        try:
-            hold = cache.hold(model)
-        except Unbound:
-            cache.close()
-            return None
-        token = _Pin()
-        weakref.finalize(token, hold.close)
-        cache.nbytes = model.home_bytes()
-        self.pins[(component, owner)] = (token, cache)
-        return token
+    def graph_pool(self) -> Any:
+        return self.memory.new_pool()
 
-    def unpin(self, component: str, owner: str, token: object) -> None:
-        """Drop this owner's cache; outstanding tokens keep its event-ordered hold alive."""
-        held = self.pins.get((component, owner))
-        if held is not None and held[0] is token:
-            self.pins.pop((component, owner))
-            held[1].close()
+    def graph_domain(self, component: str) -> Any:
+        from cozy_runtime.graphs import capture_domain
 
-    def cache(self, owner: str, shed: Shrink) -> Cache | None:
+        return capture_domain(self.torch, self.models[component].module, self.memory)
+
+    def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
+        return self.memory.allocating(pool, route=route)
+
+    def graph_levels(self) -> tuple[tuple[str, int], ...]:
+        request = execution.catch.CURRENT.get()
+        return tuple(request.levels()) if request is not None else ()
+
+    def graph_segments(self, component: str) -> tuple[str, ...]:
+        """Use the model's declared block topology, including when the full model streams."""
+        return tuple(self.models[component].blocks) or ("",)
+
+    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
+        return self.models[component].passing(entry, args, kwargs)
+
+    def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
         return self.memory.cache(owner, shed) if self.memory.cuda else None
 
@@ -851,12 +740,6 @@ class Residency:
 
     def baked(self) -> int:
         return sum(bakes.baked for bakes in self.bakes.values())
-
-
-class _Pin:
-    """A pinned component's token: its weights stay bound while a reference lives."""
-
-    __slots__ = ("__weakref__",)
 
 
 def _derived_values(root: Module) -> dict[tuple[Module, str], Tensor]:

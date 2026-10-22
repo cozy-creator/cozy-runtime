@@ -560,6 +560,34 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
     return {scheme: tuple(candidates) for scheme, candidates in out.items()}
 
 
+def reference_decoder(provider: Provider, device: DeviceFacts, dtype: str) -> bool:
+    """Shipped format decoders into the declared float dtype, followed by ordinary GEMM.
+
+    This is an implementation contract, not a measured kernel comparison. Every tensor still
+    passes role, parameter and geometry checks. Unknown implementations and encoded GEMMs
+    require their own offline evidence; a matching protocol or name prefix is insufficient.
+    """
+    implementations = (
+        TensorwiseDequant,
+        RowwiseDequant,
+        Int8ConvRotDequant,
+        Nvfp4Dequant,
+        MicroScaledDequant,
+        CoreDequant,
+        ComfyDequant,
+    )
+    return (
+        type(provider) in implementations
+        and provider.encoding in provider.schemes
+        and dtype in ("float16", "bfloat16", "float32")
+        and (
+            device.kind in ("cpu", "cuda")
+            or (device.kind == "mps" and type(provider) is ComfyDequant)
+        )
+        and device.satisfies(provider.device_predicate)
+    )
+
+
 # ------------------------------------------------------------------------------ digests
 
 

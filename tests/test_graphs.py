@@ -1,9 +1,8 @@
-"""`graphs.install`: a component root's calls run as written on a CPU; on CUDA the second call of
-a signature records a graph whose first replay is checked against the call as written, later
-calls replay it, and a call that depends on more than its arguments keeps running as written."""
+"""Development numerical and lifetime qualification for shipped pure CUDA graph regions."""
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pytest
@@ -51,12 +50,9 @@ def test_calls_on_a_cpu_run_as_written() -> None:
     assert type(module).__name__ == "Sequential" and isinstance(module, torch.nn.Sequential)
 
 
-def test_attention_layouts_bypass_graph_pins_on_a_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    """H3 scopes every DiT step: this branch must not create a recording or a lifetime pin."""
+def test_a_cpu_attention_scope_stays_eager() -> None:
     module = _mlp("cpu")
     x = torch.randn(4, 64)
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
     with torch.inference_mode(), attention_scope(AttentionLayout(4, 0, 0)):
         assert torch.equal(module(x), torch.nn.Sequential.__call__(module, x))
     assert module not in graphs._RECORDERS
@@ -94,8 +90,7 @@ def test_a_call_that_depends_on_hidden_state_runs_as_written() -> None:
         x = torch.zeros(3, device="cuda")
         for _ in range(4):
             module(x)
-    assert not graphs._RECORDERS[module].recordings
-    assert [message for message, _ in WARNINGS] == ["a CUDA graph was not used"]
+    assert module not in graphs._RECORDERS
 
 
 def _stepped() -> Any:
@@ -137,23 +132,92 @@ def test_a_first_request_equals_a_warm_one_for_a_module_with_state() -> None:
         warm, again = request()
     assert steps == again == 3
     assert all(torch.equal(a, b) for a, b in zip(first, warm, strict=True))
-    assert not graphs._RECORDERS[module].recordings
+    assert module not in graphs._RECORDERS
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
-def test_a_capture_out_of_memory_leaves_the_calls_serving() -> None:
+def test_an_unknown_python_hook_keeps_the_region_eager() -> None:
     module = _mlp("cuda")
-    armed = [True]
+    called: list[int] = []
 
     def hook(*_: Any) -> None:
-        if armed[0] and torch.cuda.is_current_stream_capturing():
-            armed[0] = False
-            raise torch.OutOfMemoryError("CUDA out of memory (injected)")
+        called.append(1)
 
     module[1].register_forward_pre_hook(hook)
     with torch.inference_mode():
         for _ in range(5):
             x = torch.randn(4, 64, device="cuda")
             assert torch.allclose(module(x), torch.nn.Sequential.__call__(module, x))
+    assert module not in graphs._RECORDERS and len(called) == 10
+
+
+@pytest.mark.real_gpu
+@pytest.mark.skipif(not CUDA, reason="cross-stream graph buffers need a GPU")
+def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
+    module = _mlp("cuda")
+    first, second = torch.cuda.Stream(), torch.cuda.Stream()
+    first.wait_stream(torch.cuda.current_stream())
+    second.wait_stream(torch.cuda.current_stream())
+
+    def run(stream: Any, value: float, rows: int) -> tuple[Any, Any]:
+        with torch.inference_mode(), torch.cuda.stream(stream):
+            x = torch.full((rows, 64), value, device="cuda")
+            expected = torch.nn.Sequential.__call__(module, x)
+            module(x)
+            return module(x), expected
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        a, b = workers.submit(run, first, 1.0, 4), workers.submit(run, second, 2.0, 8)
+        outputs = [a.result(), b.result()]
+    torch.cuda.synchronize()
     recorder = graphs._RECORDERS[module]
-    assert not armed[0] and len(recorder.recordings) == 1 and recorder.replays >= 1
+    assert len(recorder.recordings) == 2
+    for got, expected in outputs:
+        torch.testing.assert_close(got, expected)
+    # Retire one executable/pool while the other still embeds the domain's BLAS pointers.
+    shared = recorder.domain.pool
+    workspace = recorder.domain.nbytes()
+    key = next(k for k, v in recorder.recordings.items() if v.inputs[0].shape[0] == 4)
+    del recorder.recordings[key]
+    torch.cuda.empty_cache()
+    assert recorder.domain.pool is shared and recorder.domain.nbytes() == workspace
+    got, expected = run(second, 3.0, 8)
+    torch.testing.assert_close(got, expected)
+    graphs.release(torch, module)
+    # Returned copies outlive both the executable and its private allocator pool.
+    for got, expected in outputs:
+        torch.testing.assert_close(got, expected)
+
+
+@pytest.mark.real_gpu
+@pytest.mark.skipif(not CUDA, reason="graph retirement needs real completion events")
+def test_a_pool_is_not_shed_until_its_last_output_copy_finishes() -> None:
+    module = _mlp("cuda")
+    with torch.inference_mode():
+        x = torch.ones(4, 64, device="cuda")
+        module(x)
+        module(x)
+        torch.cuda.synchronize()
+        recorder = graphs._RECORDERS[module]
+        torch.cuda._sleep(1 << 29)
+        result = module(x)
+        assert graphs._shed(torch, recorder) == 0 and recorder.recordings
+        torch.cuda.synchronize()
+        assert graphs._shed(torch, recorder) > 0 and not recorder.recordings
+        torch.testing.assert_close(result, torch.nn.Sequential.__call__(module, x))
+
+
+def test_a_custom_call_is_not_given_a_library_purity_contract() -> None:
+    calls: list[int] = []
+    base: Any = torch.nn.Linear
+
+    class CustomCall(base):  # type: ignore[misc]
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            return super().__call__(*args, **kwargs)
+
+    module = CustomCall(4, 4)
+    assert graphs.install(torch, object(), {"custom": module}) == []
+    with torch.inference_mode():
+        module(torch.ones(1, 4))
+    assert calls == [1] and module not in graphs._RECORDERS

@@ -22,8 +22,7 @@ class RunFact:
     """ONE run's observation of ONE resolved plan. Written once, never edited.
 
     Every number came off a real prepare or a real step and says which. `-1` means NOT
-    MEASURED and never zero: a zero fill wall would read as instant and win every latency
-    comparison it was never entitled to enter.
+    MEASURED and never zero: a zero fill wall would incorrectly report an instant fill.
     """
 
     plan_digest: str
@@ -81,8 +80,7 @@ class PlanFact:
 
     @property
     def timed(self) -> bool:
-        """A per-step wall exists. The precondition of a LATENCY score, and the reason a
-        latency objective used to have nothing to stand on at the layer that refused."""
+        """A per-step wall exists for reporting; consumer history never selects kernels."""
         return self.step_ms >= 0.0
 
     @property

@@ -260,30 +260,49 @@ class Residency(Protocol):
 
     Declared here because the contract has one home; implemented nowhere in this package,
     because it needs a device and this package is torch-free by construction. cozy-runtime
-    supplies the body on varena's memory (`internal/weights.py`).
+    supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
     """
 
-    def pin(self, component: str, owner: str, shed: Callable[[], int]) -> object | None:
-        """Every weight of `component` bound at its home address for `owner` (a CUDA graph
-        reads them there) until memory asks for room, when `shed` drops what read them; they
-        stay bound while the returned token lives. None when part of it streams."""
-        ...
-
     def cache(self, owner: str, shed: Callable[[int], int]) -> Any:
-        """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `resize`,
-        `close` and `nbytes`; None off a GPU."""
-        ...
-
-    def unpin(self, component: str, owner: str, token: object) -> None:
-        """Remove the owner's matching pin; weights stay bound while any token reference lives."""
+        """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `cached`
+        and `close`; None off a GPU."""
         ...
 
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
 
-    def plan(self, request_id: str, steps: Sequence[str | Collection[str]]) -> None:
-        """The attempt's declared steps by component name (`Context.plan`)."""
+    def keep(self, *held: Any) -> None:
+        """Tensors a cache or a hold owns (KV slots, a graph's static inputs): memory never
+        parks them."""
+        ...
+
+    def retain(self, component: str, paths: tuple[str, ...]) -> Any:
+        """Retain a region's virtual addresses; prepare() leases backing only during use."""
+        ...
+
+    def graph_pool(self) -> Any:
+        """A distinct allocator pool for one executable's static data and scratch."""
+        ...
+
+    def graph_domain(self, component: str) -> Any:
+        """Shared capture stream and library workspace, serialized across component graphs."""
+        ...
+
+    def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
+        """Prepare allocations in the same pool capture will use, outside capture."""
+        ...
+
+    def graph_levels(self) -> tuple[tuple[str, int], ...]:
+        """The active pass's cut levels, part of its graph variant identity."""
+        ...
+
+    def graph_segments(self, component: str) -> tuple[str, ...]:
+        """Declared model-block paths that bound graph regions independently of residency."""
+        ...
+
+    def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
+        """Open the ordinary model pass before capture; nested regions share its cut state."""
         ...
 
     #: How many attempts (requests) it has opened.

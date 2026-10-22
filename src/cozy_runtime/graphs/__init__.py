@@ -1,37 +1,10 @@
-"""CUDA graphs over a component's weights at their home addresses, on by default.
+"""CUDA graphs of declared-pure regions over retained virtual addresses.
 
-Runtime records each placed component's calls and replays them (`install`, run by the executor
-when it constructs a model); a package declares a component `@uncaptured` to opt out. A graph
-reads weights at their addresses, so its component is pinned for as long as its recordings live
-(`Residency.pin`): wholly bound at home, counted as a cache. When memory needs room, or the
-component's LoRAs change, the pin's shed drops every recording and its pool, and the weights go.
-
-The first call of each signature runs as written; one whose GPU work outlasts its launches
-(`HOST_BOUND`) runs as written for good, since a graph saves only launches. At the second, the
-component is pinned, the call is recorded into the component's one memory pool with its tensor
-inputs in static buffers, and the first replay is checked against the call run as written: on a
-mismatch that signature runs as written from then on, with a run warning, and a recording that
-is not faster (`PAYS`) is dropped with its memory. Every later call copies its inputs in,
-replays, and returns clones of the outputs (a multistep scheduler keeps earlier ones).
-Recordings outlive the request while the pin holds and the module runs the same code
-(`_structure`); otherwise it records again.
-
-A signature is the tensors' shapes, dtypes, devices and strides and every other argument by
-value; a recording also keys on the code each submodule runs (an attention kernel switch, a
-forward swapped between requests). A call with an argument
-that is not a tensor or a plain value (a cache object), with gradients, on a CPU, inside another
-capture, or under `BYPASS` (`cozy_runtime.lm` runs its own) runs as written, and so does one in
-an attention layout's scope (sparse attention reads its step), under an activation capture,
-across GPUs (every GPU's peers must replay alike), whose blocks do not all fit at home (a
-component that streams), or whose capture failed in `TRIES` requests (a run warning: in a freshly
-started process other device work can end a capture, so a failed one waits for the next
-request).
-
-`capture(torch, step, pool, stream)` is the recipe: on a side stream, in thread-local mode so the
-plane's own threads keep working while it records, and outside Runtime's dispatch modes, whose
-out-of-memory recovery copies what an op writes into first, which a graph would then copy on
-every replay. `torch` is the torch module, passed in: this module imports no torch, so a session
-without a GPU, whose executor imports it too, never does.
+Kernel choice is shipped. Runtime prepares memory, captures process-local addresses and
+replays; it neither times competing paths nor compiles kernels. Unsupported Python stays
+eager around safe regions. Every graph has its own static buffers and allocator pool.
+A cached binding owns virtual addresses only; its physical lease covers preparation through
+output copies, and a completion event orders reuse across execution streams.
 """
 
 from __future__ import annotations
@@ -39,48 +12,36 @@ from __future__ import annotations
 import contextvars
 import functools
 import sys
-import time
+import threading
 import weakref
 from collections.abc import Callable, Mapping
+from contextlib import nullcontext
 from typing import Any
 
-from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
-from cozy_runtime.author._errors import is_capacity
+from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
-from cozy_runtime.internal import attention_ulysses, module_state
+from cozy_runtime.graphs import domain
+from cozy_runtime.graphs.regions import regions, safe
+from cozy_runtime.internal import attention_ulysses
 
-#: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
-#: pass straight through.
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
-#: The first replay's largest relative L2 distance from the call run as written. A capture may
-#: take other kernels for the same math: CLIP-G's replay on an RTX 4090 starts exact at its
-#: embeddings and drifts 1e-3 per layer to 2.4e-2 at its 32nd; a replay reading wrong state
-#: is off from its first output.
-TOLERANCE = 5e-2
-#: A signature records only when its first call's launches took at least this share of its time
-#: (a GPU that outruns the launches gains nothing from a graph), and keeps its recording only
-#: when a replay takes at most `PAYS` of the call run as written.
-HOST_BOUND, PAYS = 0.5, 0.9
-#: Requests in which a signature's capture may fail before it runs as written for good.
-TRIES = 4
 _PLAIN = (type(None), bool, int, float, str)
 _SAID: set[str] = set()
 
 
 def say(key: str, line: str) -> None:
-    """`line` on stderr, once per process for `key`."""
     if key not in _SAID:
         _SAID.add(key)
         print(line, file=sys.stderr)
 
 
 def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, str]:
-    """`step` recorded as a CUDA graph into `pool` on `stream`: (graph, "") or (None, why).
-    After a failure the pool is spent: the allocator keeps a released pool until its blocks
-    are free, and a capture into it again trips its use count, so the next try takes a new one
-    (`graph_pool_handle()`). An out-of-memory is said as `OutOfMemoryError`: the caller can run
-    the step eagerly, whose recovery makes room, and try again."""
+    """Record a caller-owned capture-safe computation in its already prepared pool.
+
+    The caller owns purity, residency, static-data lifetime and all consuming streams. No
+    allocation recovery or chunk selection is allowed inside capture.
+    """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
     stream.wait_stream(current)
@@ -93,7 +54,7 @@ def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> t
         else:
             try:
                 step()
-            except Exception as exc:  # the first cause, not the capture's end it spoils
+            except Exception as exc:
                 failure = exc
             try:
                 graph.capture_end()
@@ -103,89 +64,134 @@ def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> t
     if isinstance(failure, Building):
         raise failure
     if failure is not None:
+        if fault(failure) in (Fault.STICKY, Fault.DEVICE):
+            code = getattr(failure, "error_code", None)
+            if code not in (900, 901):  # unsupported or invalidated capture, already ended
+                raise failure
         return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
     return graph, ""
 
 
 class _Recording:
-    """One signature's graph, its static inputs and outputs, the layout it was recorded at, and
-    the attention implementations it serves (a replay reports them as a call would)."""
-
     def __init__(
-        self, torch: Any, graph: Any, inputs: list[Any], outputs: Any, layout: object, served: Any
+        self,
+        torch: Any,
+        graph: Any,
+        pool: Any,
+        inputs: list[Any],
+        outputs: Any,
+        layout: object,
+        served: Any,
+        nbytes: int,
     ) -> None:
-        self.torch, self.graph, self.inputs, self.outputs = torch, graph, inputs, outputs
-        self.layout = layout
+        self.torch, self.graph, self.pool = torch, graph, pool
+        self.inputs, self.outputs, self.layout = inputs, outputs, layout
         self.served = [(b, i) for b, impls in served.items() for i in impls]
+        self.nbytes = nbytes
+        self.done: Any = None
+        self.stream: Any = None
+        self.fenced = True
 
-    def __call__(self, leaves: list[Any]) -> Any:
-        for static, value in zip(self.inputs, leaves, strict=True):
-            if static is not None:
-                static.copy_(value)
-        self.graph.replay()
-        for backend, implementation in self.served:
-            attention_ulysses.record(backend, implementation)
-        tensor = self.torch.Tensor
-        return self.torch.utils._pytree.tree_map(
-            lambda v: v.clone() if isinstance(v, tensor) else v, self.outputs
+    def output(self) -> Any:
+        """Caller-owned outputs allocated before residency admission or graph launch."""
+        torch = self.torch
+        return torch.utils._pytree.tree_map(
+            lambda v: torch.empty_like(v) if isinstance(v, torch.Tensor) else v, self.outputs
         )
+
+    def __call__(self, leaves: list[Any], out: Any) -> Any:
+        torch, stream = self.torch, self.torch.cuda.current_stream()
+        if self.done is None:
+            self.done = torch.cuda.Event()
+            self.done.record(stream)  # instantiate before any replay can be enqueued
+        else:
+            stream.wait_event(self.done)
+        self.stream, self.fenced = stream, False
+        try:
+            for static, value in zip(self.inputs, leaves, strict=True):
+                if static is not None:
+                    static.copy_(value)
+            self.graph.replay()
+            source = torch.utils._pytree.tree_leaves(self.outputs)
+            for dst, src in zip(torch.utils._pytree.tree_leaves(out), source, strict=True):
+                if isinstance(src, torch.Tensor):
+                    dst.copy_(src)
+            for backend, implementation in self.served:
+                attention_ulysses.record(backend, implementation)
+            return out
+        finally:
+            self.done.record(stream)
+            self.fenced = True
+
+    def idle(self) -> bool:
+        return self.fenced and (self.done is None or bool(self.done.query()))
 
 
 class _Recorder:
-    """A component's recordings, kept across requests in one memory pool."""
-
     def __init__(self) -> None:
-        self.seen: set[tuple[object, ...]] = set()
-        #: signatures that run as written for good, and captures that failed so far
-        self.failed: set[tuple[object, ...]] = set()
-        self.tries: dict[tuple[object, ...], int] = {}
-        #: signatures whose capture failed, by the attempt it failed in: tried in the next one
-        self.waiting: dict[tuple[object, ...], int] = {}
+        self.lock = threading.Lock()
         self.recordings: dict[tuple[object, ...], _Recording] = {}
-        self.pool: Any = None
-        self.stream: Any = None
-        #: the pin its structure was read under, and that structure
-        self.structure: tuple[object, tuple[object, ...]] = (None, ())
-        self.pool_bytes = self.replays = 0
-        #: signatures that run as written by choice, by why, and the latest one's detail
-        self.chose: dict[str, int] = {}
-        self.detail = ""
-        self.record_s = 0.0
-        #: `LANDED` when it last started over: a kernel landing since changes what calls run
+        self.seen: set[tuple[object, ...]] = set()
+        self.failed: dict[tuple[object, ...], str] = {}
+        self.waiting: dict[tuple[object, ...], int] = {}
+        self.binding: Any = None
+        self.cache: Any = None
+        self.replays = 0
+        self.attempts = 0
         self.landed = LANDED[0]
+        self.domain: domain.Domain | None = None
 
-    def forget(self) -> None:
-        """Start over: what was recorded or decided ran code a kernel landing replaced."""
-        self.landed = LANDED[0]
+    def forget(self, torch: Any) -> bool:
+        if any(not entry.idle() for entry in self.recordings.values()):
+            return False
+        self.recordings.clear()
+        if self.binding is not None:
+            self.binding.close()
+            self.binding = None
+        if self.cache is not None:
+            self.cache.close()
+            self.cache = None
         self.seen.clear()
         self.failed.clear()
-        self.tries.clear()
         self.waiting.clear()
-        self.recordings.clear()
-        self.pool, self.pool_bytes, self.chose = None, 0, {}
+        self.landed = LANDED[0]
+        torch.cuda.empty_cache()
+        return True
 
 
-#: Every graphed component's recorder in this process.
 _RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionary()
+_REGIONS: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
 _CLASSES: dict[type, type] = {}
 
 
 def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
-    """Record and replay the calls of each of `model`'s component roots (`roots`, name -> module)
-    the Model class does not declare `@uncaptured`. Returns the components installed."""
+    """Install shipped pure regions, including the blocks of a streamed component."""
     skipped = set(getattr(type(model), "__uncaptured__", ()))
     installed = []
     for name, root in roots.items():
         if name in skipped or not isinstance(root, torch.nn.Module):
             continue
-        if not getattr(type(root), "_cozy_graphed", False):
-            root.__class__ = _graphed(torch, type(root))
-        installed.append(name)
+        placed = PLACED.get(root)
+        blocks = placed[0].graph_segments(placed[1]) if placed is not None else ("",)
+        candidates = (
+            candidate
+            for block in blocks
+            for candidate in regions(torch, root.get_submodule(block) if block else root, block)
+        )
+        for path, module in candidates:
+            _REGIONS[module] = (weakref.ref(root), path)
+            if not getattr(type(module), "_cozy_graphed", False):
+                module.__class__ = _graphed(torch, type(module))
+            installed.append(f"{name}.{path}" if path else name)
+        if root not in _REGIONS:
+            # The root reports its explicit eager gap; eligible children still replay.
+            _REGIONS[root] = (weakref.ref(root), "")
+            if not getattr(type(root), "_cozy_graphed", False):
+                root.__class__ = _graphed(torch, type(root))
     return installed
 
 
 def _graphed(torch: Any, cls: type) -> type:
-    """`cls` with a `__call__` that replays recordings: the same name, a subclass of it."""
     made = _CLASSES.get(cls)
     if made is None:
         call = cls.__call__
@@ -199,6 +205,7 @@ def _graphed(torch: Any, cls: type) -> type:
             {
                 "__call__": __call__,
                 "_cozy_graphed": True,
+                "_cozy_original_call": call,
                 "__module__": cls.__module__,
                 "__qualname__": cls.__qualname__,
             },
@@ -206,100 +213,172 @@ def _graphed(torch: Any, cls: type) -> type:
     return made
 
 
-def _shed(torch: Any, recorder: _Recorder) -> int:
-    """Drop a component's recordings and their pool (its pin's shed); the pool's bytes."""
-    freed = recorder.pool_bytes
-    recorder.recordings.clear()  # each holds its pin: the last one dropped lets it go
-    recorder.structure = (None, ())
-    recorder.pool, recorder.pool_bytes = None, 0
-    torch.cuda.empty_cache()
-    return freed
+def _placed(module: Any) -> tuple[Any, str] | None:
+    region = _REGIONS.get(module)
+    return PLACED.get(region[0]()) if region is not None else PLACED.get(module)
+
+
+def _shed(torch: Any, recorder: _Recorder, _want: int = 0) -> int:
+    if not recorder.lock.acquire(blocking=False):
+        return 0
+    try:
+        nbytes = sum(entry.nbytes for entry in recorder.recordings.values())
+        return nbytes if recorder.forget(torch) else 0
+    finally:
+        recorder.lock.release()
+
+
+def release(torch: Any, root: Any) -> None:
+    """A generation's explicit teardown: finish its output copies before releasing addresses."""
+    modules = [module for module, (owner, _) in _REGIONS.items() if owner() is root]
+    for module in modules:
+        recorder = _RECORDERS.pop(module, None)
+        if recorder is not None:
+            with recorder.lock:
+                for entry in recorder.recordings.values():
+                    if not entry.fenced:
+                        entry.stream.synchronize()
+                        entry.fenced = True
+                    elif entry.done is not None:
+                        entry.done.synchronize()
+                recorder.forget(torch)
+        _REGIONS.pop(module, None)
+    domain.release(root)
+
+
+def capture_domain(torch: Any, root: Any, memory: Any = None) -> domain.Domain:
+    """The component owns hidden library scratch independently of its disposable graphs."""
+    return domain.acquire(torch, root, memory)
+
+
+def _unprepared(exc: BaseException) -> bool:
+    return is_capacity(exc) or getattr(exc, "code", None) == "STALE_BINDING"
 
 
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
     if BYPASS.get() or not torch.cuda.is_available() or torch.cuda.is_current_stream_capturing():
         return call(module, *args, **kwargs)
+    placed = _placed(module)
+    scope = (
+        placed[0].graph_pass(placed[1], _REGIONS[module][1], args, kwargs)
+        if placed is not None
+        else nullcontext()
+    )
+    with scope:
+        return _region_call(torch, module, call, args, kwargs, placed)
+
+
+def _region_call(
+    torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any, placed: Any
+) -> Any:
     leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
     why = (
         "with gradients"
         if torch.is_grad_enabled()
-        else "in an attention layout's scope"
-        if _ACTIVE_LAYOUT.get() is not None
-        else "under an activation capture"
+        else "under activation capture"
         if _capture_clock.get() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        else "outside its purity contract"
+        if not safe(torch, module)
         else _unplain(torch, leaves)
     )
     if why:
-        placed = PLACED.get(module)
         if placed is not None:
-            placed[0].note(f"{placed[1]}.graphs", f"runs as written {why}")
+            placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
         return call(module, *args, **kwargs)
-    recorder = _RECORDERS.get(module)
-    if recorder is None:
-        recorder = _RECORDERS[module] = _Recorder()
-    if recorder.landed != LANDED[0]:
-        recorder.forget()
-    key = _signature(torch, leaves, spec)
-    placed = PLACED.get(module)
-    if key in recorder.failed:
+    recorder = _RECORDERS.setdefault(module, _Recorder())
+    levels = placed[0].graph_levels() if placed is not None else ()
+    addresses = (
+        ()
+        if placed is not None
+        else tuple(
+            (value.data_ptr(), tuple(value.shape), value.dtype, value.stride())
+            for value in (*module.parameters(), *module.buffers())
+        )
+    )
+    autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
+    key = (*_signature(torch, leaves, spec), _structure(torch, module), levels, addresses, autocast)
+    if recorder.domain is None:
+        recorder.domain = (
+            placed[0].graph_domain(placed[1])
+            if placed is not None
+            else capture_domain(torch, _REGIONS[module][0]())
+        )
+    with recorder.domain.using(), recorder.lock:
+        if recorder.landed != LANDED[0] and not recorder.forget(torch):
+            return call(module, *args, **kwargs)
+        recorder.attempts += 1
+        attempt = placed[0].attempts if placed is not None else recorder.attempts
+        if key in recorder.failed or recorder.waiting.get(key) == attempt:
+            return call(module, *args, **kwargs)
+        if key not in recorder.seen:
+            recorder.seen.add(key)
+            return call(module, *args, **kwargs)
         if placed is not None:
-            placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
-        return call(module, *args, **kwargs)
-    if key not in recorder.seen:
-        # The first call of a signature: as written.
-        recorder.seen.add(key)
-        torch.cuda.synchronize()
-        started = time.perf_counter()
-        state = module_state.snapshot(module)
-        out = call(module, *args, **kwargs)
-        launched = time.perf_counter() - started
-        if module_state.changed(state, module_state.snapshot(module)):
-            # A replay runs none of its Python: one that changes its own attributes (HiDiffusion's
-            # step counters) runs as written, and is never run again to measure it.
-            _chose(recorder, key, "its state", "it changes its own attributes")
-        torch.cuda.synchronize()
-        took = time.perf_counter() - started
-        if not _clonable(torch, out):
-            _chose(recorder, key, "its output", f"a {type(out).__name__}")
-        elif launched < HOST_BOUND * took:
-            _chose(recorder, key, "GPU-bound", f"launched in {launched:.3f} of {took:.3f} s")
-        if placed and key in recorder.failed:
-            placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
-        return out
-    pin: object = None
-    if placed is not None:
-        residency, name = placed
-        if recorder.waiting.get(key) == residency.attempts:
-            return call(module, *args, **kwargs)
-        pin = residency.pin(name, f"graphs:{name}", functools.partial(_shed, torch, recorder))
-        if pin is None:
-            return call(module, *args, **kwargs)
-    if pin is None or recorder.structure[0] is not pin:  # read once per pin
-        recorder.structure = (pin, _structure(module))
-    layout = (pin, recorder.structure[1])
-    entry = recorder.recordings.get(key)
-    if entry is not None and entry.layout != layout:
-        del recorder.recordings[key]  # its weights moved, or its code: it records again
-        entry = None
-        if not recorder.recordings:  # its pool went with its last graph
-            recorder.pool = None
-    if entry is None:
-        entry = _record(torch, module, call, leaves, spec, recorder, key, layout, placed)
+            if (
+                recorder.binding is not None
+                and not recorder.binding.valid()
+                and not recorder.forget(torch)
+            ):
+                return call(module, *args, **kwargs)
+            if recorder.binding is None:
+                path = _REGIONS[module][1]
+                recorder.binding = placed[0].retain(placed[1], (path,))
+                recorder.cache = placed[0].cache(
+                    f"graphs:{placed[1]}:{path}", functools.partial(_shed, torch, recorder)
+                )
+        binding = recorder.binding
+        entry = recorder.recordings.get(key)
         if entry is None:
-            if not recorder.recordings:
-                _shed(torch, recorder)
-                if placed is not None:
-                    placed[0].unpin(placed[1], f"graphs:{placed[1]}", pin)
-                # Both locals retain the token: let its event-ordered hold go before eager
-                # execution. Other callers' recordings still retain their own references.
-                pin = layout = None
+            # Discovery owns the complete range set and then the admitted free headroom.
+            # Only the declared pure region runs here; this does not select/tune kernels.
+            lease = (
+                binding.prepare(torch.cuda.current_stream(), workspace=None)
+                if binding is not None
+                else nullcontext()
+            )
+            try:
+                lease.__enter__()
+            except Exception as exc:
+                if not _unprepared(exc):
+                    raise
+                recorder.waiting[key] = attempt
+                return call(module, *args, **kwargs)
+            try:
+                entry = _record(torch, module, call, leaves, spec, recorder, key, placed)
+            finally:
+                lease.__exit__(None, None, None)
+            if entry is None:
+                return call(module, *args, **kwargs)
+        # Outputs are real allocations before the physical lease: admission sees their actual
+        # allocator segments. No output allocation can fail after graph launch and cause replay.
+        try:
+            out = entry.output()
+        except Exception as exc:
+            if not _unprepared(exc):
+                raise
+            recorder.waiting[key] = attempt
             return call(module, *args, **kwargs)
-    recorder.replays += 1
-    if placed is not None:
-        placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
-    return entry(leaves)
+        lease = (
+            binding.prepare(torch.cuda.current_stream()) if binding is not None else nullcontext()
+        )
+        try:
+            lease.__enter__()
+        except Exception as exc:
+            if not _unprepared(exc):
+                raise
+            del out
+            recorder.waiting[key] = attempt
+            return call(module, *args, **kwargs)
+        try:
+            result = entry(leaves, out)
+            recorder.replays += 1
+            if placed is not None:
+                placed[0].note(f"{placed[1]}.graphs", _facts(recorder))
+            return result
+        finally:
+            lease.__exit__(None, None, None)
 
 
 def _record(
@@ -310,192 +389,145 @@ def _record(
     spec: Any,
     recorder: _Recorder,
     key: tuple[object, ...],
-    layout: object,
     placed: Any,
 ) -> _Recording | None:
-    """Record the call at `key` into the component's pool, and check its first replay against
-    the call run as written. None, with a run warning, when it cannot be."""
-    started, landed = time.perf_counter(), LANDED[0]
+    # This path is restricted to the shipped pure contracts. Warmup discovers capacity in
+    # the exact capture pool; it does not time or select kernels, or run arbitrary package code.
+    current, stream = torch.cuda.current_stream(), None
     try:
-        if recorder.pool is None:
-            recorder.pool, recorder.stream = torch.cuda.graph_pool_handle(), torch.cuda.Stream()
-        reserved = torch.cuda.memory_reserved()
-        inputs = [leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves]
-        static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
-        cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
-        outputs: list[Any] = []
-        pool = recorder.pool
-        # Measuring restores the attributes and generators advanced by its passes.
-        state = module_state.snapshot(module)
-        cpu, cuda = torch.random.get_rng_state(), torch.cuda.get_rng_state()
-    except Exception as exc:
-        # Preparation has not invoked package code. Never extend this catch around capture,
-        # replay or validation: the model may already have executed by then.
-        if not is_capacity(exc):
-            raise
-        why = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
-        return _failed(torch, recorder, key, placed, why, type(module).__name__)
-    try:
-        graph, why = capture(
-            torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
+        assert recorder.domain is not None
+        recorder.domain.initialize()
+        stream = recorder.domain.stream
+        stream.wait_stream(current)
+        # Library handles cache scratch by stream. Initialize under domain ownership before
+        # any region pool becomes active; every executable sharing that scratch is serialized.
+        recorder.domain.prime_blas()
+        pool = placed[0].graph_pool() if placed is not None else torch.cuda.MemPool()
+        allocating = (
+            placed[0].graph_allocating(pool)
+            if placed is not None
+            else torch.cuda.use_mem_pool(pool)
         )
-    except Building as building:  # as written until a kernel lands: `forget` tries again
-        graph, why, recorder.pool = None, "", None  # the aborted capture spent its pool
-        _chose(recorder, key, "kernel building", f"{building} builds; it records once one lands")
-    if graph is not None and not _clonable(torch, outputs[0]):
-        graph, why = None, f"its output {type(outputs[0]).__name__} is not a tree of tensors"
-    if graph is not None:
-        graph.replay()
-        replayed = _floats(torch, outputs[0])
-        written: list[Any] = []
-        with attention_ulysses.observing() as served:
-            written_s = _seconds(torch, lambda: written.append(call(module, *cargs, **ckwargs)))
-        written = _floats(torch, written[0])
-        error = _distance(replayed, written)
-        if LANDED[0] != landed:
-            graph, why = None, ""  # a kernel landed meanwhile: the next call starts over
-            _chose(recorder, key, "kernel landed", "")
-        elif len(replayed) != len(written) or not error <= TOLERANCE:
-            each = " ".join(
-                f"{_distance([a], [b]):.0e}" for a, b in zip(replayed, written, strict=False)
+        with torch.cuda.stream(stream):
+            with allocating:
+                inputs = [
+                    leaf.clone() if isinstance(leaf, torch.Tensor) else None for leaf in leaves
+                ]
+                static = [s if s is not None else v for s, v in zip(inputs, leaves, strict=True)]
+                cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, spec)
+                with attention_ulysses.observing() as served:
+                    warm = call(module, *cargs, **ckwargs)
+                if not _clonable(torch, warm):
+                    recorder.failed[key] = "output is not a tensor tree"
+                    return None
+            del warm  # preseeded capacity remains in this pool; no reference execution/oracle
+            capturing = (
+                placed[0].graph_allocating(pool, route=False)
+                if placed is not None
+                else nullcontext()
             )
-            why = (
-                f"its first replay is {error:.2e} from the call run as written (by output: {each})"
+            with capturing:
+                outputs: list[Any] = []
+                graph, why = capture(
+                    torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, stream
+                )
+            if graph is None:
+                _failed(recorder, key, placed, why)
+                return None
+            if not _clonable(torch, outputs[0]):
+                recorder.failed[key] = "captured output is not a tensor tree"
+                return None
+        if placed is not None:
+            placed[0].keep(
+                *(
+                    t
+                    for t in [*inputs, *torch.utils._pytree.tree_leaves(outputs[0])]
+                    if isinstance(t, torch.Tensor)
+                )
             )
-            graph = None
-        elif (replay_s := _seconds(torch, graph.replay)) > PAYS * written_s:
-            graph, why = None, ""  # as fast as written: not worth its memory
-            _chose(
-                recorder, key, "no faster", f"replay {replay_s:.4f} s, {written_s:.4f} s as written"
-            )
-    module_state.restore(module, state)
-    torch.random.set_rng_state(cpu)
-    torch.cuda.set_rng_state(cuda)
-    recorder.record_s += time.perf_counter() - started
-    if graph is None:
-        outputs.clear()
-        return _failed(torch, recorder, key, placed, why, type(module).__name__)
-    entry = _Recording(torch, graph, inputs, outputs[0], layout, served)
-    if recorder.pool is pool:  # else the plane released the pool for room meanwhile
-        recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
+        nbytes = sum(segment["total_size"] for segment in pool.snapshot())
+        entry = _Recording(torch, graph, pool, inputs, outputs[0], key, served, nbytes)
         recorder.recordings[key] = entry
-    return entry
+        if recorder.cache is not None:
+            recorder.cache.cached(sum(e.nbytes for e in recorder.recordings.values()))
+        return entry
+    except Exception as exc:
+        if not is_capacity(exc) and not isinstance(exc, Building):
+            raise
+        _failed(recorder, key, placed, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
+        return None
+    finally:
+        if stream is not None:
+            # Warmup can queue reads before refusing an allocation. Join even the failure
+            # path before the caller's physical lease records its completion event.
+            current.wait_stream(stream)
 
 
-def _failed(
-    torch: Any,
-    recorder: _Recorder,
-    key: tuple[object, ...],
-    placed: Any,
-    why: str,
-    name: str,
-) -> None:
-    """Retire an unsuccessful recording and defer this signature before eager execution."""
-    recorder.tries[key] = tries = recorder.tries.get(key, 0) + 1
-    if not why or why.startswith("its ") or tries >= TRIES:
-        recorder.failed.add(key)
-    elif placed is not None:
-        recorder.waiting[key] = placed[0].attempts
-    if why or not recorder.recordings:
-        recorder.pool = None
-        torch.cuda.empty_cache()
-    if why:
-        line = f"{name} runs as written at this signature: {why}"
-        say(f"graphs:{name}:{tries}:{why[:40]}", f"[graphs] {line}")
-        if key in recorder.failed:
-            WARNINGS.append(("a CUDA graph was not used", {"module": name, "why": why}))
-
-
-def _chose(recorder: _Recorder, key: tuple[object, ...], why: str, detail: str) -> None:
-    recorder.failed.add(key)
-    recorder.chose[why] = recorder.chose.get(why, 0) + 1
-    recorder.detail = f"{why}: {detail}" if detail else why
+def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str) -> None:
+    recorder.waiting[key] = placed[0].attempts if placed is not None else recorder.attempts
+    say(f"graph:{key!r}:{why}", f"[graphs] pure region remains eager: {why}")
+    WARNINGS.append(("a CUDA graph was not used", {"why": why}))
 
 
 def _facts(recorder: _Recorder) -> str:
-    chose = ", ".join(f"{n} {why}" for why, n in recorder.chose.items())
+    held = sum(e.nbytes for e in recorder.recordings.values())
+    shared = recorder.domain.nbytes() if recorder.domain is not None else 0
     return (
-        f"{len(recorder.recordings)} recorded in {recorder.record_s:.2f} s, "
-        f"{recorder.replays} replays, pool {recorder.pool_bytes >> 20} MiB"
-        + (f"; as written: {chose} ({recorder.detail})" if chose else "")
+        f"{len(recorder.recordings)} regions, {recorder.replays} replays, {held >> 20} MiB pools, "
+        f"domain {id(recorder.domain):x} {shared >> 20} MiB shared"
     )
-
-
-def _seconds(torch: Any, step: Callable[[], object]) -> float:
-    torch.cuda.synchronize()
-    started = time.perf_counter()
-    step()
-    torch.cuda.synchronize()
-    return time.perf_counter() - started
 
 
 def _unplain(torch: Any, leaves: list[Any]) -> str:
-    """Why a call's arguments cannot be replayed into, or ""."""
     tensors = [leaf for leaf in leaves if isinstance(leaf, torch.Tensor)]
-    if not tensors:
-        return "with no tensor argument"
-    if not all(tensor.is_cuda for tensor in tensors):
-        return "with a tensor argument off the GPU"
-    for leaf in leaves:
-        if (
-            not isinstance(leaf, (torch.Tensor, torch.dtype, torch.device))
-            and type(leaf) not in _PLAIN
-        ):
-            return f"with a {type(leaf).__name__} argument"
+    if not tensors or not all(t.is_cuda for t in tensors):
+        return "without CUDA tensor arguments"
+    if any(
+        not isinstance(v, (torch.Tensor, torch.dtype, torch.device)) and type(v) not in _PLAIN
+        for v in leaves
+    ):
+        return "with opaque arguments"
     return ""
 
 
-def _floats(torch: Any, out: Any) -> list[Any]:
-    return [v.float() for v in torch.utils._pytree.tree_leaves(out) if isinstance(v, torch.Tensor)]
-
-
-def _distance(a: list[Any], b: list[Any]) -> float:
-    """The largest relative L2 distance between corresponding tensors."""
-    return max(
-        (float((x - y).norm() / y.norm().clamp_min(1e-12)) for x, y in zip(a, b, strict=False)),
-        default=0.0,
-    )
-
-
 def _clonable(torch: Any, out: Any) -> bool:
-    """Whether every leaf of `out` is a tensor or a plain value, so a replay can hand clones."""
-    leaves, _ = torch.utils._pytree.tree_flatten(out)
+    leaves = torch.utils._pytree.tree_leaves(out)
     return any(isinstance(v, torch.Tensor) for v in leaves) and all(
         isinstance(v, torch.Tensor) or type(v) in _PLAIN for v in leaves
     )
 
 
-def _structure(module: Any) -> tuple[object, ...]:
-    """Which code each submodule runs: its class, any forward set on the instance (SDXL's
-    hidiffusion swaps them between requests), its attention processor and the kernel that
-    processor calls (a request's pin, or the compiled one replacing SDPA)."""
-    rows = []
-    for m in module.modules():
-        processor = getattr(m, "processor", None)
-        backend = getattr(processor, "_attention_backend", None)
-        rows.append((id(type(m)), id(m.__dict__.get("forward")), id(processor), backend))
-    return tuple(rows)
+def _structure(torch: Any, module: Any) -> tuple[object, ...]:
+    return tuple(
+        (
+            id(type(m).forward),
+            id(vars(m).get("forward")),
+            id(getattr(m, "processor", None)),
+            id(getattr(m, "_cozy_forward", None)),
+            tuple(
+                sorted(
+                    (name, value)
+                    for name, value in vars(m).items()
+                    if type(value) in _PLAIN
+                    or isinstance(value, (torch.dtype, torch.device))
+                    or (isinstance(value, tuple) and all(type(item) in _PLAIN for item in value))
+                )
+            ),
+        )
+        for m in module.modules()
+    )
 
 
 def _signature(torch: Any, leaves: list[Any], spec: Any) -> tuple[object, ...]:
-    """The tensors' geometry and every other argument by value."""
-    key: list[object] = [str(spec)]
-    for leaf in leaves:
-        if isinstance(leaf, torch.Tensor):
-            key.append((tuple(leaf.shape), leaf.dtype, leaf.device, leaf.stride()))
-        else:
-            key.append((type(leaf), leaf))
-    return tuple(key)
+    return (
+        str(spec),
+        *(
+            (tuple(v.shape), v.dtype, v.device, v.stride())
+            if isinstance(v, torch.Tensor)
+            else (type(v), v)
+            for v in leaves
+        ),
+    )
 
 
-__all__ = [
-    "BYPASS",
-    "HOST_BOUND",
-    "PAYS",
-    "TOLERANCE",
-    "TRIES",
-    "capture",
-    "install",
-    "native",
-    "say",
-]
+__all__ = ["BYPASS", "capture", "capture_domain", "install", "release", "say"]

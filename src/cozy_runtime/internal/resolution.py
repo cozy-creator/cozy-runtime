@@ -1,48 +1,13 @@
-"""#549.1 — the ResolvedModelPlan: ONE object, ONE decision, and a label that derives.
+"""Resolve immutable model bytes to one deterministic implementation plan.
 
-**The defect this closes.** Two choosers ran in parallel and neither could see the other.
-`encoding.Selector` picked a provider PER TENSOR — correctly, from that tensor's own spec
-digest — while `delivery.DeliveryChooser` picked ONE artifact-wide RUNG and reported it as
-what the generation was. On a mixed artifact those disagree by construction: since the
-`quantize-mixed` job kind (#543g) one component legitimately holds a native leaf beside a
-decoded float weight beside a verbatim copy, and the plan reported `native_encoded` for all
-of it. The rung was a LABEL WITH NO EXECUTION AUTHORITY — nothing downstream read it to fill
-anything — which made it exactly the kind of field that is wrong without being noticed.
+Hardware, shape, shipped qualification/format contracts, and explicit precision/package
+constraints determine kernel policy. Consumer execution history never chooses a competing
+implementation. Passive fill, step and memory observations stay attached to the exact plan
+for reporting and capacity planning; they do not become a local optimization oracle.
 
-Worse, the rung was hashed into the generation's identity, so two materially different fills
-could share a constructed digest and one materially identical fill could differ.
-
-**What replaces it.** One immutable `ResolvedModelPlan`, resolved once, before a
-destination is reserved:
-
-* the EXACT snapshot map (component -> snapshot digest), not a variant NAME;
-* one `TensorResolution` per destination: encoding digest, implementation digest and
-  revision, route, validated geometry, output dtype, and the REASON that provider won;
-* device identity and runtime identity (#549.9);
-* placement, objective, construction facts;
-* the whole-plan measurements, looked up by THIS PLAN'S DIGEST (#549.2).
-
-`digest()` is what enters generation identity. `label()` DERIVES from the route census, so a
-mixed plan says `mixed(encoded_gemm x743, decoded_float x120, verbatim x937)` and cannot say
-anything else. `delivery.py`'s rung table and `encoding`'s admission are now INPUTS to this
-resolution rather than parallel authorities: rungs describe what a route COSTS and when, and
-admission says which implementations were measured here.
-
-**The objective dead end dissolves here** (#549.3). `Capabilities.admit` used to refuse
-`objective_unranked` whenever the objective was `latency` and two providers qualified —
-which is the DEFAULT objective, so the default path refused as soon as a second
-implementation existed, one layer above the store that holds latency measurements. Now the
-objective ranks WHOLE PLANS, and every axis has somewhere real to stand:
-
-* `latency` — from the plan fact's own `fill_ms + step_ms * steps`. Measured per plan.
-* `footprint` — from the plan fact if banked, else DERIVED from the capability records'
-  measured `resident_bits_per_element` weighted by each tensor's element count.
-* `kernel_numeric_error` — the WORST per-tensor route deviation the records measured. Worst
-  and not mean, because a plan is as wrong as its wrongest tensor.
-
-An objective nothing can score does not refuse: the resolver takes the reference variant's
-DECODE FLOOR and confesses UNCALIBRATED, which is what cr-008b does one axis over and what
-the two-chooser split could not do without an artifact-wide rung to fall back to.
+The plan records every tensor's validated route and implementation, the exact snapshot map,
+construction and runtime identities. Its digest identifies execution and its label derives
+from the route census. Missing fast-kernel evidence uses the supported reference decode path.
 """
 
 from __future__ import annotations
@@ -560,35 +525,12 @@ class ResolvedModelPlan:
 def score(plan: ResolvedModelPlan, objective: str) -> tuple[float, str]:
     """Lower is better. Returns `(score, provenance)`; `(-1.0, why)` means UNSCORABLE.
 
-    Provenance is returned WITH the number because the two are not separable: a footprint
-    score derived from capability records and one folded from four banked prepares are both
-    honest and they are not the same claim, and a walk that printed only the number would let
-    a reader mistake one for the other.
+    Only offline capability axes score implementation policy. Process-local observations
+    remain available on the plan, but never order competing implementations.
     """
-    fact = plan.measurements
     if objective == "latency":
-        # THE AXIS THAT USED TO REFUSE. It is measurable here and nowhere else: a fill wall
-        # and a per-step wall are properties of a whole plan on a whole device, not of one
-        # provider, which is exactly why `Capabilities.admit` had nothing to rank on and was
-        # wrong to refuse instead of deferring (#549.3).
-        if fact is None or not fact.timed or fact.fill_ms < 0:
-            return -1.0, (
-                "no banked fill+step wall for this plan digest; latency is a WHOLE-PLAN "
-                "measurement and this plan has not run"
-            )
-        return (
-            float(fact.fill_ms) + fact.step_ms * plan.steps_basis,
-            f"{fact.fill_ms} ms cold fill + {fact.step_ms:.3f} ms/step x {plan.steps_basis} "
-            f"declared steps, median of {fact.samples} run(s)",
-        )
+        return -1.0, "shipped implementation policy; consumer timings are observations only"
     if objective == "footprint":
-        if fact is not None and fact.resident_bytes >= 0:
-            scratch = max(fact.scratch_bytes, 0)
-            return (
-                float(fact.resident_bytes + scratch),
-                f"{fact.resident_bytes} B resident + {scratch} B scratch, MEASURED, median "
-                f"of {fact.samples} run(s)",
-            )
         derived = plan.derived_resident_bytes()
         if derived <= 0:
             return -1.0, "no measured resident_bits_per_element on any of this plan's tensors"
@@ -785,33 +727,22 @@ def resolve(
             )
         return dataclasses.replace(best, confession=confession, walk=tuple(walk))
 
-    # NOTHING SCORED. This is the path the old design REFUSED on (`objective_unranked`) and
-    # it is the ordinary state of a rig that has never run this plan: the deployment still
-    # has to serve, and the one plan that needs no comparison to justify is the reference
-    # variant's decode floor — the plan every deviation is measured against.
-    #
-    # ONE exception, and it is the encoded lane's reason to exist (cr-086): when the
-    # deployment's REFERENCE variant itself stores encoded bytes, the package consents to
-    # leaf replacement, and this device QUALIFIED the native leaves, the floor would decode
-    # the lane back to float — undoing the exact selection the binding made, forever,
-    # because a plan that never runs never banks the measurement that would let it win.
-    # Same artifact, same bytes; only the route differs, and the confession names it.
+    # A fixed shipped policy when the requested axis has no offline score. Package consent
+    # remains authoritative: use admitted encoded GEMMs only when allowed, else reference
+    # decoding. Consumer timings and allocation history cannot switch these implementations.
     if encoded_leaves == "accept":
         preferred = leaved.get(reference[0].name)
         if preferred is not None:
             for step in walk:
                 if step.plan == preferred.digest():
-                    step.verdict = "chosen_uncalibrated"
+                    step.verdict = "chosen_default"
             return dataclasses.replace(
                 preferred,
                 confession=(
-                    f"UNCALIBRATED: no offered plan has a banked {objective} measurement on "
-                    f"{device.tuple_key()}. The {reference[0].name!r} REFERENCE variant "
-                    "stores encoded bytes, the package declares encoded_leaves='accept' and "
-                    f"this device qualified the native leaves, so resolution serves the lane "
-                    f"through its ENCODED-GEMM plan ({preferred.label()}) rather than "
-                    "decoding it back to the float it was derived from. This prepare banks "
-                    "the facts a later resolution can rank"
+                    f"Shipped policy: the {reference[0].name!r} reference variant uses "
+                    f"offline-qualified encoded GEMMs where its geometry supports them "
+                    f"and the package permits replacement ({preferred.label()}). "
+                    "Consumer timing history does not select the implementation."
                     + _leaf_speed_confession(preferred.derived_leaf_speedup_x())
                 ),
                 walk=tuple(walk),
@@ -820,17 +751,13 @@ def resolve(
     if floor is not None:
         for step in walk:
             if step.plan == floor.digest():
-                step.verdict = "chosen_uncalibrated"
+                step.verdict = "chosen_default"
         return dataclasses.replace(
             floor,
             confession=(
-                f"UNCALIBRATED: no offered plan has a banked {objective} measurement on "
-                f"{device.tuple_key()}, so resolution takes the {reference[0].name!r} "
-                f"REFERENCE variant's DECODE FLOOR ({floor.label()}). An unmeasured plan may "
-                "not be SELECTED over a measured one, and this prepare banks the fact the "
-                "next resolution reads. This is a CONFESSION, not a refusal: the objective "
-                "having no number yet is the ordinary first-run state, and refusing here is "
-                "what #549.3 removed"
+                f"Shipped policy: the {reference[0].name!r} reference variant uses "
+                f"its supported decode floor ({floor.label()}); no permitted fast "
+                "implementation with matching offline facts is available."
             ),
             walk=tuple(walk),
         )
