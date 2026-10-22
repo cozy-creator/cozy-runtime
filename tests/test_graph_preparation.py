@@ -12,7 +12,7 @@ import pytest
 torch = pytest.importorskip("torch")
 tensorfs = pytest.importorskip("tensorfs")
 
-from tensorfs.varena.torch import Memory  # noqa: E402
+from tensorfs.varena.torch import Memory, Placeholder  # noqa: E402
 
 from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.author._model import PLACED  # noqa: E402
@@ -136,3 +136,16 @@ def test_unpin_keeps_the_physical_hold_until_the_last_token_reference(placed: An
     del token
     gc.collect()
     assert model.held == 0
+
+
+def test_a_scope_holds_a_blockless_component_for_every_read_in_it(placed: Any) -> None:
+    """Read outside its forward (H3's turbo factors by the DiT's hooks), a component with no
+    blocks binds whole per op; a scope's hold keeps it bound, so a read is a plain tensor."""
+    module, model, residency, _ = placed
+    assert isinstance(module.weight, Placeholder)
+    release = residency.hold(["identity", "absent"])
+    assert model.held == 1 and not isinstance(module.weight, Placeholder)
+    assert float((module.weight * 2).sum()) == 2.0
+    release()
+    gc.collect()
+    assert model.held == 0 and not residency.pins and isinstance(module.weight, Placeholder)

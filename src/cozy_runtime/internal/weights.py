@@ -11,7 +11,6 @@ what Runtime mechanisms reach a placed component through: graph pins, KV caches 
 
 from __future__ import annotations
 
-import functools
 import os
 import time
 import weakref
@@ -825,7 +824,7 @@ class Residency:
         addresses, decoded copies included) by a cache of the memory's. When memory asks for
         room or the component's LoRAs change, `shed` drops what read them there; the weights
         stay bound until the last reference to the pin goes, so a replay in flight keeps them.
-        None when part of the component streams (a slot's address moves) or it does not fit."""
+        None when part of the component streams (a slot's address moves)."""
         held = self.pins.get((component, owner))
         if held is not None:
             return held[0]
@@ -841,11 +840,9 @@ class Residency:
         cache = self.memory.cache(owner, give)
         try:
             hold = cache.hold(model)
-        except Exception as exc:  # it streams, or it does not fit now
+        except Unbound:
             cache.close()
-            if isinstance(exc, Unbound) or is_capacity(exc):
-                return None
-            raise
+            return None
         token = _Pin()
         weakref.finalize(token, hold.close)
         cache.nbytes = model.home_bytes()
@@ -860,29 +857,29 @@ class Residency:
             held[1].close()
 
     def hold(self, components: Collection[str]) -> Callable[[], None]:
-        """The named components with no blocks pinned until the returned call: a component-use
-        scope's. Varena binds a component with no blocks whole for each op that reads it outside
-        its own forward, so H3's turbo LoRA factors, which the DiT's hooks read on every
-        projection call, bound all ~680 overlay tensors 33 thousand times a run (cr-207). A pin
-        that does not fit is skipped, and memory's ask sheds it like any other."""
-        held: dict[str, object] = {}
-        owner = f"scope:{id(held)}"
-
-        def shed(name: str) -> int:
-            held.pop(name, None)
-            return 0
-
+        """The named components with no blocks bound until the returned call: a component-use
+        scope's use, as a forward's. Varena binds a component with no blocks whole for each op
+        that reads it outside its own forward, so H3's turbo LoRA factors, which the DiT's hooks
+        read on every projection call, bound all ~680 overlay tensors 33 thousand times a run
+        (cr-207). In use, it is never shed; one that does not fit now binds per op as before."""
+        holds: list[tuple[Any, Cache]] = []
         for name in components:
             model = self.models.get(name)
-            if model is not None and not model.blocks:
-                token = self.pin(name, owner, functools.partial(shed, name))
-                if token is not None:
-                    held[name] = token
+            if model is None or model.blocks:
+                continue
+            cache = self.memory.cache(f"scope:{name}", lambda _: 0)
+            try:
+                holds.append((cache.hold(model), cache))
+            except Exception as exc:
+                cache.close()
+                if not (isinstance(exc, Unbound) or is_capacity(exc)):
+                    raise
 
         def release() -> None:
-            for name, token in list(held.items()):
-                self.unpin(name, owner, token)
-            held.clear()
+            for hold, cache in holds:
+                hold.close()
+                cache.close()
+            holds.clear()
 
         return release
 
