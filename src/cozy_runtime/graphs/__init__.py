@@ -309,6 +309,9 @@ class _Recorder:
         #: way it ran
         self.capture_ms = 0.0
         self.capture_each: list[float] = []
+        #: host time of every call through the region (its checks, preparation, replay or eager
+        #: run) and of its replays' preparation: what a call costs beside the work it runs
+        self.call_ms = self.prepare_ms = 0.0
         self.eager, self.replayed = _Timing(), _Timing()
 
     def forget(self, torch: Any) -> bool:
@@ -508,6 +511,8 @@ def describe(root: Any) -> dict[str, Any]:
                     "captures": recorder.captures,
                     "capture_ms": round(recorder.capture_ms, 3),
                     "capture_each_ms": list(recorder.capture_each),
+                    "call_ms": round(recorder.call_ms, 3),
+                    "prepare_ms": round(recorder.prepare_ms, 3),
                     "held": recorder.held,
                     "eager": recorder.eager.document(),
                     "replay": recorder.replayed.document(),
@@ -568,12 +573,15 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         placed[0].graph_pass(placed[1], path, args, kwargs) if placed is not None else nullcontext()
     )
     token = _PASS.set(object()) if owner() is module else None
+    began = time.perf_counter()
     try:
         with scope:
             return _region_call(torch, module, call, args, kwargs, placed)
     finally:
         if token is not None:
             _PASS.reset(token)
+        if (recorder := _RECORDERS.get(module)) is not None:
+            recorder.call_ms += (time.perf_counter() - began) * 1e3
 
 
 def _region_call(
@@ -736,8 +744,11 @@ def _replay(
         return _EAGER
     try:
         root, path = _REGIONS[module][0](), _REGIONS[module][1]
-        lease = _lease(torch, owner, placed, binding, attempt, root, path == "")
+        whole = path == "" or (placed is not None and placed[0].graph_whole(placed[1], binding))
+        began = time.perf_counter()
+        lease = _lease(torch, owner, placed, binding, attempt, root, whole)
         lease.__enter__()
+        recorder.prepare_ms += (time.perf_counter() - began) * 1e3
     except Exception as exc:
         if not _unprepared(exc):
             raise
@@ -894,10 +905,12 @@ def _lease(
     root: Any,
     whole: bool,
 ) -> Any:
-    """A replay's residency: its region's blocks prepared around it. A region that is the whole
-    component instead holds every block bound for the rest of the request from its first replay
-    (design §5: warm resident segments keep their backing), so no replay waits on binding them
-    again; the hold goes at the next request, when the graphs are shed, or when the fill
+    """A replay's residency: its region's blocks prepared around it. A region whose blocks are
+    the whole component (its root, or any region of a one-block component: a text encoder's
+    97 linears) instead holds every block bound for the rest of the request from its first
+    replay (design §5: warm resident segments keep their backing), and while that hold stands no
+    region of the component prepares again (v7: a CLIP replay bound and unbound its whole block,
+    ~6 ms a call). The hold goes at the next request, when the graphs are shed, or when the fill
     changes under it. A component that does not fit refuses the hold as it would the lease."""
     if placed is None or binding is None:
         return nullcontext()
@@ -906,13 +919,14 @@ def _lease(
     if held is not None and held.attempt != attempt:
         owner.unhold(root)
         held = None
-    if not whole and held is None:
+    if held is not None:
+        if held.stream != stream:
+            stream.wait_stream(held.stream)
+        return nullcontext()
+    if not whole:
         return binding.prepare(stream)
-    if held is None:
-        hold = placed[0].graph_hold(placed[1], functools.partial(owner.unhold, root))
-        owner.holds[root] = domain.Hold(hold, attempt, stream)
-    elif held.stream != stream:
-        stream.wait_stream(held.stream)
+    hold = placed[0].graph_hold(placed[1], functools.partial(owner.unhold, root))
+    owner.holds[root] = domain.Hold(hold, attempt, stream)
     return nullcontext()
 
 
