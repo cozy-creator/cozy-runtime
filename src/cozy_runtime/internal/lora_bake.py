@@ -4,8 +4,8 @@ A bake is decode -> add `alpha * up @ down` -> round back to the stored represen
 row chunk at a time, so nothing larger than a chunk exists twice. Plain floats round once to
 their dtype. `fp8.rowwise` re-encodes E4M3, `int8-convrot256/1` its int8 grid in the
 rotated basis, `nvfp4` its E2M1 values under refitted block scales; the rounding is chosen
-because a delta below half a grid step vanishes under nearest rounding. `Stats` is what a quality gate reads: how much of the delta survived
-and how much rounding error the bake added.
+because a delta below half a grid step vanishes under nearest rounding. `Stats` is what a
+quality gate reads: how much of the delta survived and how much rounding error the bake added.
 
 On a GPU, `bake` is one fused Triton kernel per weight (`_bake_kernel`): it reads each stored
 byte once, adds the rank-r product computed in its tile, rounds and writes the byte back, with
@@ -416,9 +416,10 @@ def bake_nvfp4(
 
     `keep` keeps the second level and refits a block's E4M3 scale only where its baked values
     outgrow it past `E2M1_OUTGROWN` (to the smallest scale that holds them), so every other
-    element rounds on the grid it was quantized to and a value just past 6 saturates. `refit` sets the
-    second level from the baked tensor's amax and every block's scale from its baked amax,
-    saturation-free, so every element rounds afresh."""
+    element rounds on the grid it was quantized to and a value just past 6 saturates. `refit`
+    sets the second level from the baked tensor's amax and every block's scale from its baked
+    amax, saturation-free, so every element rounds afresh (H3's turbo LoRA: retention 1.00 but
+    18.2 dB rounding SNR, against `keep`'s 0.945 and 30.6 dB)."""
     began = time.perf_counter()
     raw, blocks = weight.view(torch.uint8), scale.view(torch.uint8)
     rows, cols = raw.shape[0], 2 * raw.shape[1]
@@ -439,10 +440,9 @@ def bake_nvfp4(
         need = target.abs().amax(dim=-1) / (6.0 * second)
         fits = torch.searchsorted(magnitudes, need.contiguous()).clamp(max=126)
         code = blocks[start:stop].long() & 0x7F
-        if grid == "keep":  # past halfway to the 8 E2M1 lacks, the block's scale grows
-            code = torch.where(need * 6 > magnitudes[code] * 7, fits, code)
-        else:
-            code = fits
+        # `keep`: past halfway to the 8 E2M1 lacks (`E2M1_OUTGROWN`), the block's scale grows
+        grown = need * 6 > magnitudes[code] * 7
+        code = torch.where(grown, fits, code) if grid == "keep" else fits
         unit = (magnitudes[code] * second).unsqueeze(-1)
         payload = torch.where(unit > 0, target / torch.where(unit > 0, unit, 1.0), 0.0)
         # A zero keeps its stored sign: a zero delta writes back every byte it read.

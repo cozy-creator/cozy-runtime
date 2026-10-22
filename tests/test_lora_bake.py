@@ -14,8 +14,8 @@ from cozy_runtime.derive.microscale import (
     encode_int8_convrot256,
     encode_nvfp4,
 )
-from cozy_runtime.internal.encoding.formats import nvfp4_values
 from cozy_runtime.internal import lora_bake
+from cozy_runtime.internal.encoding.formats import nvfp4_values
 
 torch = pytest.importorskip("torch")
 
