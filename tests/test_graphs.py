@@ -25,6 +25,11 @@ def _mlp(device: str) -> Any:
     return module
 
 
+def _idle() -> None:
+    """The device idle after a request: the queued signatures record."""
+    assert graphs.capture_idle(lambda: False)
+
+
 def _counting() -> Any:
     """Adds how often it ran: a call that depends on state beside its arguments."""
 
@@ -62,36 +67,45 @@ def test_a_cpu_attention_scope_stays_eager() -> None:
 def test_recordings_replay_across_calls_and_signatures() -> None:
     module = _mlp("cuda")
     with torch.inference_mode():
-        for _ in range(4):
-            x = torch.randn(4, 64, device="cuda")
-            assert torch.allclose(module(x), torch.nn.Sequential.__call__(module, x))
-        recorder = graphs._RECORDERS[module]
-        assert len(recorder.recordings) == 1 and recorder.replays == 3  # calls 2, 3, 4
+        for request in range(2):  # one as written, then one that replays
+            for _ in range(2):
+                x = torch.randn(4, 64, device="cuda")
+                assert torch.allclose(module(x), torch.nn.Sequential.__call__(module, x))
+            recorder = graphs._RECORDERS[module]
+            assert recorder.capture_attempts == request  # nothing records inside a request
+            _idle()
+        assert len(recorder.recordings) == 1 and recorder.replays == 2
         wider = torch.randn(8, 64, device="cuda")
-        for _ in range(2):  # a new signature: as written first, then recorded
-            assert torch.allclose(module(wider), torch.nn.Sequential.__call__(module, wider))
+        assert torch.allclose(module(wider), torch.nn.Sequential.__call__(module, wider))
+        _idle()  # a new signature of a measured region records after its first call
+        assert torch.allclose(module(wider), torch.nn.Sequential.__call__(module, wider))
         assert len(recorder.recordings) == 2
         token = graphs.BYPASS.set(True)
         try:
             module(wider)
         finally:
             graphs.BYPASS.reset(token)
-        assert recorder.replays == 4
+        assert recorder.replays == 3
         facts = graphs.describe(module)
         assert facts["active_graphs"] == facts["captures"] == 2 and facts["graph_pools"] == 1
         assert facts["declared_regions"] == facts["domains"] == 1
-        assert facts["captured_regions"] == [""] and facts["replays"] == 4
+        assert facts["captured_regions"] == [""] and facts["replays"] == 3
         assert facts["graph_pool_bytes"] > 0 and facts["domain_workspace_bytes"] > 0
         assert facts["replay_copy_bytes"] > 0
         torch.cuda.synchronize()
-        # Per region, design §5's measures: captures and their time, and each way it ran (two
-        # first calls eager, four replays), host submission and device time, from events alone.
+        # Per region, design §5's measures: captures and their time, and each way it ran (three
+        # calls as written, three replays), host submission and device time, from events alone;
+        # each idle capture's cost, its launch-bound measure, a replay's saving and its payback.
         region = graphs.describe(module)["regions"][""]
         assert region["captures"] == 2 and region["capture_ms"] > 0
-        assert region["eager"]["calls"] == 2 and region["replay"]["calls"] == 4
+        assert region["eager"]["calls"] == 3 and region["replay"]["calls"] == 3
         for way in ("eager", "replay"):
             assert region[way]["device_timed"] == region[way]["calls"], region
             assert region[way]["host_ms"] > 0 and region[way]["device_ms"] > 0, region
+        graph = region["graph"]
+        assert len(graph["capture_each_ms"]) == 2 and len(graph["measured"]) == 2, graph
+        assert all(m["busy_ms"] < m["submit_ms"] for m in graph["measured"]), graph
+        assert graph["saving_ms"] is not None and not graph["eager"], graph
         assert recorder.domain is not None
         graphs._shed(torch, recorder.domain)
         assert not recorder.recordings
@@ -183,11 +197,13 @@ def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
         with torch.inference_mode(), torch.cuda.stream(stream):
             x = torch.full((rows, 64), value, device="cuda")
             expected = torch.nn.Sequential.__call__(module, x)
-            module(x)
             returned = module(x)
             torch.cuda._sleep(1 << 20)
             return returned.square(), expected.square()
 
+    for stream, rows in ((first, 4), (second, 8), (first, 4)):  # each signature as written
+        run(stream, 0.0, rows)
+    _idle()
     with ThreadPoolExecutor(max_workers=2) as workers:
         a, b = workers.submit(run, first, 1.0, 4), workers.submit(run, second, 2.0, 8)
         outputs = [a.result(), b.result()]
@@ -251,15 +267,16 @@ def test_a_shrink_while_a_call_holds_the_domain_completes_at_once() -> None:
         x = torch.ones(4, 64, device="cuda")
         module(x)
         module(x)
+        _idle()
         torch.cuda.synchronize()
         recorder = graphs._RECORDERS[module]
         owner = recorder.domain
-        assert owner is not None
+        assert owner is not None and recorder.recordings
         with ThreadPoolExecutor(1) as varena, owner.using():
             assert varena.submit(graphs._shed, torch, owner).result() > 0
             assert not recorder.recordings and owner.captures is None
         module(x)
-        module(x)
+        _idle()
         with ThreadPoolExecutor(1) as varena, owner.holding():
             assert varena.submit(graphs._shed, torch, owner).result() == 0
             assert recorder.recordings
@@ -368,19 +385,20 @@ def _as_written(module: Any, x: Any) -> Any:
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
-def test_a_segment_boundary_copies_nothing_and_a_held_output_is_never_overwritten() -> None:
+def test_segments_record_at_idle_and_a_held_output_is_never_overwritten() -> None:
     module = _two_segments()
-    first, second = (graphs._RECORDERS.get(m) for m in (module.first, module.second))
     with torch.inference_mode():
-        for _ in range(4):
+        for _ in range(2):
+            x = torch.randn(4, 64, device="cuda")
+            torch.testing.assert_close(module(x), _as_written(module, x))
+        _idle()
+        for _ in range(2):
             x = torch.randn(4, 64, device="cuda")
             torch.testing.assert_close(module(x), _as_written(module, x))
         first, second = graphs._RECORDERS[module.first], graphs._RECORDERS[module.second]
-        assert first.replays == second.replays == 3  # calls 2 (recorded), 3 and 4
-        producer = next(iter(first.recordings.values()))
-        assert next(iter(second.recordings.values())).chained == [producer]
-        # Only the root's input is copied in; the boundary between the two graphs is read in place.
-        assert first.copy_bytes == 3 * x.nbytes and second.copy_bytes == 0
+        assert first.replays == second.replays == 2
+        # Each graph copies its input in: the second's is the first's lent output.
+        assert first.copy_bytes == second.copy_bytes == 2 * x.nbytes
         # Purity and structure are read once per root call, for every region under it.
         stamps = [graphs._CHECKED[m][0] for m in (module.first, module.second)]
         assert stamps[0] is stamps[1] is not None
@@ -410,11 +428,12 @@ def test_a_reader_on_another_stream_finishes_before_the_next_replay_overwrites_i
     side = torch.cuda.Stream()
     with torch.inference_mode():
         x, other = (torch.randn(4, 64, device="cuda") for _ in range(2))
-        for _ in range(3):
+        for _ in range(2):
             module.first(x)
+        _idle()
         expected = _as_written(module.first, x)
         lent = module.first(x)
-        assert graphs._RECORDERS[module.first].replays == 3
+        assert graphs._RECORDERS[module.first].replays == 1
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             torch.cuda._sleep(1 << 28)  # the reader is still queued when its alias is dropped
@@ -422,7 +441,7 @@ def test_a_reader_on_another_stream_finishes_before_the_next_replay_overwrites_i
         graphs.record_stream(torch, lent, side)
         del lent
         again = module.first(other)
-        assert graphs._RECORDERS[module.first].replays == 4
+        assert graphs._RECORDERS[module.first].replays == 2
         torch.cuda.synchronize()
         assert torch.equal(read, expected)
         torch.testing.assert_close(again, _as_written(module.first, other))
@@ -570,24 +589,62 @@ def test_only_what_a_contract_can_read_keys_a_region() -> None:
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
-def test_twenty_steps_capture_the_root_once_and_replay_it_nineteen_times() -> None:
+def test_a_cold_request_runs_as_written_and_the_next_replays_every_step() -> None:
+    """The owner: nothing records on a request's path. Twenty cold steps run as written, the
+    idle period records the root once (its regions inside it never), and twenty warm steps
+    replay it."""
     unet = _stepping_unet("cuda")
     graphs.install(torch, object(), {"unet": unet})
     gen = torch.Generator(device="cuda").manual_seed(3)
     sample = torch.randn(2, 4, 8, 8, device="cuda", generator=gen)
     context = torch.randn(2, 77, 16, device="cuda", generator=gen)
-    with torch.inference_mode():
+
+    def request() -> Any:
         for step in range(20):
             unet.cozy_step = step
             timestep = torch.tensor(999 - step * 50, device="cuda")  # a scheduler's, a tensor
             got = unet(sample, timestep, encoder_hidden_states=context).sample
+        return got, timestep
+
+    with torch.inference_mode():
+        request()
+        cold = graphs.describe(unet)
+        assert cold["captures"] == cold["capture_attempts"] == cold["replays"] == 0
+        _idle()
+        got, timestep = request()
         token = graphs.BYPASS.set(True)
         want = unet(sample, timestep, encoder_hidden_states=context).sample
         graphs.BYPASS.reset(token)
     recorder = graphs._RECORDERS[unet]
-    assert (recorder.capture_attempts, recorder.replays) == (1, 19)
+    assert (recorder.capture_attempts, recorder.replays) == (1, 20)
+    inner = [
+        r for m, r in graphs._RECORDERS.items() if m is not unet and graphs._REGIONS[m][0]() is unet
+    ]
+    assert inner and not any(r.capture_attempts for r in inner)
     torch.testing.assert_close(got, want)
     graphs.release(torch, unet)
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
+def test_a_device_bound_region_never_records() -> None:
+    """Its eager calls submit faster than the device works: a graph would save nothing, so the
+    idle period measures it and leaves it as written."""
+    torch.manual_seed(0)
+    module = torch.nn.Sequential(torch.nn.Linear(4096, 4096), torch.nn.Linear(4096, 4096)).cuda()
+    graphs.install(torch, object(), {"wide": module})
+    with torch.inference_mode():
+        x = torch.randn(4096, 4096, device="cuda")
+        for _ in range(3):
+            module(x)
+        _idle()
+        module(x)
+    recorder = graphs._RECORDERS[module]
+    assert not recorder.recordings and recorder.replays == 0
+    (why,) = recorder.failed.values()
+    assert why.startswith("device-bound"), why
+    ((submit, busy),) = recorder.bound.values()
+    assert busy > submit
+    graphs.release(torch, module)
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
@@ -620,7 +677,9 @@ def test_a_component_root_copies_its_results_out() -> None:
     with torch.inference_mode():
         x = torch.randn(4, 64, device="cuda")
         module(x)
-        held = module(x)  # recorded and replayed
+        module(x)
+        _idle()
+        held = module(x)  # replayed
         kept = held.clone()
         recorder = graphs._RECORDERS[module]
         other = torch.randn(4, 64, device="cuda")

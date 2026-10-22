@@ -102,8 +102,16 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
     installed = graphs.install(torch, object(), {"network": module})
     assert len(installed) == DEPTH
     assert WIDTH * WIDTH * 4 * DEPTH > CAP
+
+    def graphed() -> dict[Any, Any]:
+        return {
+            layer: next(iter(graphs._RECORDERS[layer].recordings.values())).graph
+            for layer in module.layers
+            if graphs._RECORDERS[layer].recordings
+        }
+
     try:
-        recordings: list[Any] = []
+        recordings: dict[Any, Any] = {}
         for turn in range(4):
             placement.open_attempt()
             with (
@@ -113,23 +121,18 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
                 result = module(source.to(memory.device)).cpu()
                 torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-4)
                 stats = request.stats()
-            if turn == 1:
-                recordings = [
-                    next(iter(graphs._RECORDERS[layer].recordings.values())).graph
-                    for layer in module.layers
-                ]
-                assert len(recordings) == DEPTH
-            if turn >= 2:
-                assert all(
-                    next(iter(graphs._RECORDERS[layer].recordings.values())).graph is saved
-                    for layer, saved in zip(module.layers, recordings, strict=True)
-                )
             domain = placement.graph_domain("network")
             facts = placement.document()["graphs"]["network"]
-            if turn >= 1:  # receipts are per request: turn 1 records, later turns replay
-                assert facts["active_graphs"] == DEPTH and facts["domains"] == 1
-                assert facts["captures"] == (DEPTH if turn == 1 else 0)
-                assert facts["replays"] == DEPTH and facts["retired_graphs"] == 0
+            assert facts["captures"] == facts["capture_attempts"] == 0  # none inside a request
+            if turn >= 2:  # the graphs the idle period recorded replay over evicted backing
+                assert graphed() == recordings
+                assert facts["replays"] == len(recordings) and facts["retired_graphs"] == 0
+            torch.cuda.synchronize()
+            # Idle: the layers measured twice whose pages stayed resident record, in free bytes.
+            assert graphs.capture_idle(lambda: False)
+            if turn == 1:
+                recordings = graphed()
+                assert recordings, placement.document()["graphs"]["network"]["regions"]
             pool_bytes = domain.capture_bytes()
             print(
                 json.dumps(
@@ -164,10 +167,7 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
 
         with ThreadPoolExecutor(max_workers=2) as workers:
             list(workers.map(concurrent, [1.0, 2.0]))
-        assert all(
-            next(iter(graphs._RECORDERS[layer].recordings.values())).graph is saved
-            for layer, saved in zip(module.layers, recordings, strict=True)
-        )
+        assert graphed() == recordings
     finally:
         graphs.release(torch, module)
         PLACED.pop(module, None)
@@ -177,7 +177,8 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
 def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Path) -> None:
     """A region that is the whole component holds every block bound from its first replay to
     the next request: no replay waits on binding again (speed2 13522's idle before each
-    replay). A new request takes a new hold; shedding the graphs lets it go."""
+    replay). A new request takes a new hold; shedding the graphs lets it go. The first request
+    runs as written; the idle period after it records."""
     if not torch.cuda.is_available():
         pytest.skip("native graph residency requires CUDA")
     memory = Memory.open(0, limit=CAP)
@@ -237,21 +238,23 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
     assert graphs.install(torch, object(), {"stack": module})[0] == "stack"
     try:
         holds = []
-        for turn in range(2):
+        for turn in range(3):
             placement.open_attempt()
-            placement.plan(["stack"] * 4)  # ctx.plan: a replay follows the second call
             with torch.inference_mode(), memory.request(f"hold-{turn}", [module] * 4):
                 for _ in range(4):
                     got = module(source.to(memory.device)).cpu()
                     torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
                     domain = placement.graph_domain("stack")
                     held = domain.holds.get(module)
-                    if graphs._RECORDERS[module].replays:
+                    if turn:
                         assert held is not None and held.attempt == placement.attempts
-                assert held is not None
-                holds.append(held.hold)
-        assert graphs._RECORDERS[module].replays == 7  # call 1 eager, then every one replays
-        # the receipt is the request's own: the second request's four replays
+                if turn:
+                    assert held is not None
+                    holds.append(held.hold)
+            torch.cuda.synchronize()
+            assert graphs.capture_idle(lambda: False)
+        assert graphs._RECORDERS[module].replays == 8  # the first request as written
+        # the receipt is the request's own: the third request's four replays
         assert placement.document()["graphs"]["stack"]["replays"] == 4
         assert holds[0] is not holds[1]  # a request takes its own hold
         torch.cuda.synchronize()
@@ -323,13 +326,15 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
     placement = Placement(memory, backend)
     assert {"first", "second"} <= set(graphs.install(torch, object(), modules))
     try:
-        for turn in range(3):
+        for turn in range(4):  # two requests measure; the idle period after the second records
             placement.open_attempt()
             steps = [modules["first"], modules["second"]]
             with torch.inference_mode(), memory.request(f"shared-{turn}", steps):
                 hidden = modules["first"](source.to(memory.device))
                 got = modules["second"](hidden).cpu()
             torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
+            torch.cuda.synchronize()
+            assert graphs.capture_idle(lambda: False)
         domain = placement.graph_domain("first")
         assert domain is placement.graph_domain("second") and domain.captures is not None
         assert [ref() for ref in domain.served] == [modules["first"], modules["second"]]

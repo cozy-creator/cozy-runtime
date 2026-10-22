@@ -16,8 +16,8 @@ import threading
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -787,27 +787,6 @@ class _Bakes:
 # ------------------------------------------------------------------------- the placement
 
 
-class Steps:
-    """An attempt's plan (`ctx.plan`), steps per component, and its components' calls so far."""
-
-    def __init__(self) -> None:
-        self.planned: dict[str, int] = {}
-        self.calls: dict[str, int] = {}
-
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
-        self.planned = {}
-        for step in steps:
-            for name in [step] if isinstance(step, str) else step:
-                self.planned[name] = self.planned.get(name, 0) + 1
-
-    def called(self, component: str) -> None:
-        self.calls[component] = self.calls.get(component, 0) + 1
-
-    def later(self, component: str) -> bool:
-        """The plan runs `component` in a step after its calls so far."""
-        return self.calls.get(component, 0) < self.planned.get(component, 0)
-
-
 class Placement:
     """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
     pins and KV caches as the memory's caches, a request's LoRA serving, and notes."""
@@ -819,25 +798,14 @@ class Placement:
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
-        self.steps = Steps()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
-        self.steps = Steps()
         for model in self.models.values():
             graphs.mark(model.module)
-
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
-        self.steps.plan(steps)
-
-    def graph_called(self, component: str) -> None:
-        self.steps.called(component)
-
-    def graph_later(self, component: str) -> bool:
-        return self.steps.later(component)
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""
@@ -882,6 +850,14 @@ class Placement:
 
     def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
         return self.models[component].passing(entry, args, kwargs)
+
+    def graph_idle(self) -> AbstractContextManager[object]:
+        """An idle capture's request: it fills free bytes only and never evicts."""
+        return self.memory.request("graphs-idle", idle=True)
+
+    def graph_resident(self, binding: Binding) -> bool:
+        """Every page `binding` covers is on the device now (an idle capture never fills one)."""
+        return bool(binding.native.resident())
 
     def cache(self, owner: str, shed: Callable[[int], int], roots: list[Any]) -> Cache | None:
         """Device bytes `owner` keeps for speed for the components `roots`, counted and shed

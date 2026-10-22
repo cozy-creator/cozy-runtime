@@ -647,10 +647,6 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt()
 
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
-        for row in self.rows.values():
-            row.plan(steps)
-
     @property
     def notes(self) -> dict[str, str]:
         return {f"{name}.{k}": v for name, row in self.rows.items() for k, v in row.notes.items()}
@@ -4062,8 +4058,6 @@ class Executor:
         request = self.host.requests.get(request_id)
         if request is not None:
             request.plan(list(steps))
-        if self.residency is not None:  # which regions record graphs reads it (`graph_later`)
-            self.residency.plan(steps)
         if self.group is not None and self.rank == 0:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
@@ -4833,6 +4827,8 @@ class _Order:
         #: ticket -> whether it runs alone, until its command is answered
         self._open: dict[int, bool] = {}
         self._next = 0
+        #: commands answered so far: an idle period follows each (`idle`)
+        self.answered = 0
 
     def ticket(self, alone: bool) -> int:
         with self._changed:
@@ -4860,7 +4856,42 @@ class _Order:
         finally:
             with self._changed:
                 del self._open[ticket]
+                self.answered += 1
                 self._changed.notify_all()
+
+    @contextlib.contextmanager
+    def idle(self, answered: int, ready: Callable[[], bool]) -> Iterator[int]:
+        """Once no command is open, one was answered since `answered` and `ready()`: the order
+        held as a process-wide command holds it, so a command arriving waits for the holder to
+        give it back (`waiting`). Yields the answered count."""
+        with self._changed:
+            self._changed.wait_for(lambda: not self._open and self.answered != answered and ready())
+            self._next += 1
+            ticket, answered = self._next, self.answered
+            self._open[ticket] = True
+        try:
+            yield answered
+        finally:
+            with self._changed:
+                del self._open[ticket]
+                self._changed.notify_all()
+
+    def waiting(self) -> bool:
+        """A command arrived beside the idle holder."""
+        return len(self._open) > 1
+
+
+def _idle(order: _Order) -> None:
+    """Graphs record off the request path (`graphs.capture_idle`): after a command is answered,
+    while no other is open. One arriving makes the capture yield at its next region boundary."""
+    own_thread()
+    answered = 0
+    while True:
+        with order.idle(answered, lambda: bool(graphs.IDLE.jobs)) as answered:
+            try:
+                graphs.capture_idle(order.waiting)
+            except Exception:
+                traceback.print_exc()
 
 
 def serve(executor: Executor, channel: Channel) -> int:
@@ -4871,6 +4902,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
     order = _Order()
+    threading.Thread(target=_idle, args=(order,), name="graphs-idle", daemon=True).start()
     while True:
         try:
             frame = executor.mux.command()

@@ -310,6 +310,14 @@ class Residency(Protocol):
         """Open the ordinary model pass before capture; nested regions share its cut state."""
         ...
 
+    def graph_idle(self) -> Any:
+        """An idle capture's memory request: free bytes only, never an eviction."""
+        ...
+
+    def graph_resident(self, binding: Any) -> bool:
+        """Every page a retained region covers is on the device now."""
+        ...
+
     #: How many attempts (requests) it has opened.
     attempts: int
 
