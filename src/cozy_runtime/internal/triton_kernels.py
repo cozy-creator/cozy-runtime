@@ -19,7 +19,7 @@ import hashlib
 from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import msgspec
 from msgspec import Struct
@@ -50,7 +50,6 @@ try:
     from triton.runtime.cache import get_cache_key, get_cache_manager
     from triton.runtime.jit import JITFunction
 
-    from cozy_runtime.internal.execution import launch
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal
     TRITON_ABSENT = f"torch and triton do not import ({_absent})"
 else:
@@ -223,8 +222,7 @@ class _Launcher:
             operands = list(args)
             for i, value in zip(at, real, strict=True):
                 operands[i] = value
-            # out of memory, a launch did not run: it runs again as an op does (12586)
-            launch([operands[i] for i in at], lambda: found[grid](*operands))
+            found[grid](*operands)
 
 
 #: Loaded sets by (name, device index).

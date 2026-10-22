@@ -65,8 +65,6 @@ def rank_main(
     cuda: bool,
 ) -> None:
     torch.set_num_threads(1)
-    if room:  # GPU r has r bytes more room: the group sizes from the least of them
-        ulysses._ROOM = lambda device: room + rank
     counted = ulysses._cross
     calls: list[int] = []
 

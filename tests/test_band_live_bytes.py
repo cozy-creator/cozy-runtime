@@ -17,9 +17,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from cozy_runtime.internal.execution import catch, cuts  # noqa: E402, F401
+from cozy_runtime.internal.execution import cuts  # noqa: E402
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="live bytes are a GPU's")
+pytestmark = [
+    pytest.mark.real_gpu,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="live bytes are a GPU's"),
+]
 aten = torch.ops.aten
 LEVEL = 2  # four bands: a cut Rust answers on a card that is a little short
 
@@ -58,9 +61,16 @@ def test_a_band_rule_lowers_the_op_s_live_bytes(name: str) -> None:
     with torch.no_grad():
         func(*args)  # the library's handles and plans exist before anything is measured
         whole_peak, whole = _peak(lambda: func(*args))
-        plan = catch.RULES[func.overloadpacket](func, args, {})
-        assert plan is not None and plan.finest >= LEVEL, name
-        banded_peak, got = _peak(lambda: plan(catch.Scope(name, plan.finest, LEVEL)))
+        x, weight, bias, *rest = args
+
+        def conv(part: Any, w: Any, b: Any) -> Any:
+            return func(part, w, b, *rest)
+
+        by_images = x.shape[0] > 1
+        units = x.shape[0] if by_images else weight.shape[0]
+        banded_peak, got = _peak(
+            lambda: cuts._bands(conv, x, weight, bias, by_images, units, LEVEL)
+        )
     error = (got.float() - whole.float()).abs().max().item()
     print(
         f"LIVE {name}: whole {whole_peak / 2**20:.1f} MiB, {1 << LEVEL} bands "

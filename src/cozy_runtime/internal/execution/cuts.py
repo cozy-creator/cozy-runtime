@@ -1,12 +1,6 @@
 """Exact cuts (varena-slim §2): each computes what the whole computes, results on the device, at
 the level Rust holds for its site (`r.cut`). Level L is 2^L pieces, down to the finest.
 
-Op bands (the layer's, `catch.RULES`): conv only, by images, else by output channels (whole
-groups), each band written by the conv's `out` form into its slice of the result, so its
-workspace shrinks with the band (measured on a GPU: tests/test_band_live_bytes.py). Nearest
-upsampling and group norm keep no working memory beyond their results: bands save nothing
-there, and Rust cuts the call around them (a package's `split`). An activation's result beside
-its input is Rust's to park, never an op rewritten in place.
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
 """
@@ -15,18 +9,12 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
-from typing import cast
 
 import torch
 from torch import Tensor, nn
-from torch._ops import OpOverload
-from torch.utils._python_dispatch import _disable_current_modes
 
 from cozy_runtime.internal.execution import catch
-from cozy_runtime.internal.execution.catch import Args, Kwargs, Scope
 
-aten = torch.ops.aten
 type Band = Callable[[int, int], Tensor]
 type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
 #: diffusers' token-wise feed-forwards and the activation projections inside them
@@ -43,117 +31,6 @@ def pieces(units: int, level: int) -> int:
     return -(-units // (1 << level))
 
 
-# ---------------------------------------------------------------------------- op bands
-
-
-#: What a band writes: the op on [lo, hi) of its result's band axis, straight into its slice of
-#: the op's preallocated result, through the op's `out` form.
-type Write = Callable[[int, int, Tensor], None]
-
-
-@dataclass(frozen=True, slots=True)
-class Plan:
-    """An op in bands of its result's outermost axis of more than one (a batch, else the
-    channels: a contiguous slice), `align` of them a unit. `write` runs the op on its operands'
-    matching part straight into its slice of the preallocated result: no band holds a result of
-    its own."""
-
-    x: Tensor
-    made: Tensor  # the op's result, meta
-    axis: int
-    write: Write
-    align: int = 1
-
-    @property
-    def units(self) -> int:
-        return -(-int(self.made.shape[self.axis]) // self.align)
-
-    @property
-    def finest(self) -> int:
-        return levels(self.units)
-
-    def __call__(self, own: Scope) -> Tensor:
-        out = catch.settle(functools.partial(_empty, self.made, self.x.device), None, self.x)
-        operands = (self.x, out)  # never parked while a band writes them
-        at = 0
-        while at < self.units:
-            band = functools.partial(self._band, out, at, own)
-            at = catch.settle(band, own, operands, first=True)
-        return out
-
-    def _band(self, out: Tensor, at: int, own: Scope) -> int:
-        stop = min(at + pieces(self.units, own.level), self.units)
-        self.write(at * self.align, stop * self.align, out)
-        return stop
-
-
-def _plan(made: list[Tensor], x: Tensor, write: Write, align: int = 1) -> Plan | None:
-    """Over the result's outermost axis of more than one unit, when it is contiguous."""
-    if len(made) != 1 or not made[0].is_contiguous():
-        return None
-    axis = next((i for i, n in enumerate(made[0].shape[:2]) if n > 1), None)
-    if axis is None or made[0].shape[axis] < 2 * align:
-        return None
-    return Plan(x, made[0], axis, write, align)
-
-
-def _arguments(func: OpOverload, args: Args, kwargs: Kwargs) -> dict[str, object]:
-    named: dict[str, object] = {}
-    for i, a in enumerate(func._schema.arguments):
-        if i < len(args) or a.name in kwargs or a.has_default_value():
-            default = a.default_value if a.has_default_value() else None
-            named[a.name] = args[i] if i < len(args) else kwargs.get(a.name, default)
-    return named
-
-
-def _meta(func: OpOverload, args: Args, kwargs: Kwargs) -> list[Tensor]:
-    """The op's results as meta tensors (empty: not new tensors, or no meta kernel)."""
-
-    def meta(v: object) -> object:
-        if isinstance(v, Tensor):
-            return torch.empty_strided(v.shape, v.stride(), dtype=v.dtype, device="meta")
-        return type(v)(map(meta, v)) if isinstance(v, list | tuple) else v
-
-    try:
-        with _disable_current_modes():
-            made = func(*map(meta, args), **{k: meta(v) for k, v in kwargs.items()})
-    except Exception:
-        return []
-    return [m for m in (made if isinstance(made, tuple) else (made,)) if isinstance(m, Tensor)]
-
-
-def _empty(like: Tensor, device: torch.device) -> Tensor:
-    return torch.empty_strided(like.shape, like.stride(), dtype=like.dtype, device=device)
-
-
-def _conv(func: OpOverload, args: Args, kwargs: Kwargs) -> Plan | None:
-    """By images, else by output channels (whole groups of them, each reading its groups' input
-    channels): what the whole conv computes for them."""
-    a = _arguments(func, args, kwargs)
-    x, w, bias = a.get("input"), a.get("weight"), a.get("bias")
-    groups = int(cast(int, a.get("groups") or 1))
-    if not isinstance(x, Tensor) or not isinstance(w, Tensor) or a.get("transposed"):
-        return None
-    out, made = cast(OpOverload, aten.convolution.out), _meta(func, args, kwargs)
-    rest = [a[k] for k in ("stride", "padding", "dilation", "transposed", "output_padding")]
-    per_out, per_in = int(w.shape[0]) // groups, int(x.shape[1]) // groups
-    by_image = bool(made) and made[0].shape[0] > 1
-
-    def write(lo: int, hi: int, result: Tensor) -> None:
-        if by_image:
-            out(x[lo:hi], w, bias, *rest, groups, out=result[lo:hi])
-            return
-        part = bias[lo:hi] if isinstance(bias, Tensor) else None
-        g0, g1 = lo // per_out, hi // per_out
-        inputs = x if groups == 1 else x[:, g0 * per_in : g1 * per_in]
-        out(inputs, w[lo:hi], part, *rest, 1 if groups == 1 else g1 - g0, out=result[:, lo:hi])
-
-    return _plan(made, x, write, 1 if by_image or groups == 1 else per_out)
-
-
-catch.RULES[aten.convolution] = _conv
-
-
 # --------------------------------------------------------------------------- call cuts
 
 
@@ -166,19 +43,26 @@ def install(module: nn.Module) -> int:
     the module's path. Returns how many it cut."""
     count = 0
     for path, sub in module.named_modules():
-        if isinstance(sub, nn.Conv2d | nn.Conv3d) and "_cozy_cut" not in vars(sub):
-            own = vars(sub).get("_conv_forward")
-            sub._conv_forward = _conv_bands(f"{path}:bands", sub, own or _conv_of(sub))
+        if (
+            isinstance(sub, nn.Conv2d | nn.Conv3d)
+            and "_cozy_cut" not in vars(sub)
+            and "_conv_forward" not in vars(sub)
+            and type(sub)._conv_forward in (nn.Conv2d._conv_forward, nn.Conv3d._conv_forward)
+        ):
+            sub._conv_forward = _conv_bands(f"{path}:bands", sub, _conv_of(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
+        # A custom subclass/instance forward is package code, even when its base is pure.
+        if "forward" in vars(sub) or not type(sub).forward.__module__.startswith("diffusers."):
+            continue
         kinds = [c.__name__ for c in type(sub).__mro__ if c.__module__.startswith("diffusers.")]
         rms = _rms_contract(sub, kinds)
         if rms is not None and "_cozy_cut" not in vars(sub):
-            sub.forward = _rms(f"{path}:rows", *rms, _forward(sub))
+            sub.forward = _rms(f"{path}:rows", sub, *rms, _forward(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
         if any(k in _FFN for k in kinds) and "_cozy_cut" not in vars(sub):
-            sub.forward = _ffn(f"{path}:tokens", _forward(sub))
+            sub.forward = _ffn(f"{path}:tokens", sub, _forward(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
     return count
@@ -204,7 +88,11 @@ def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
         # its conv; an encoded leaf does not slice
         whole_groups = module.groups == 1 and type(weight) in (Tensor, nn.Parameter)
         units = x.shape[0] if by_images else weight.shape[0] if batched and whole_groups else 1
-        if units < 2 or torch.is_grad_enabled():
+        if (
+            units < 2
+            or torch.is_grad_enabled()
+            or type(module)._conv_forward not in (nn.Conv2d._conv_forward, nn.Conv3d._conv_forward)
+        ):
             return conv(x, weight, bias)
         run = functools.partial(_bands, conv, x, weight, bias, by_images, units)
         shape = "x".join(map(str, x.shape))
@@ -247,11 +135,20 @@ def _forward(module: nn.Module) -> Callable[..., object]:
     return vars(module).get("forward") or catch.current(module)
 
 
-def _ffn(site: str, forward: Callable[..., object]) -> Callable[..., object]:
+def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callable[..., object]:
     whole: list[bool] = []  # a piece returned no tensor: it runs whole from then on
 
     def cut(x: object, *args: object, **kwargs: object) -> object:
-        if args or kwargs or whole or not isinstance(x, Tensor) or x.dim() < 2:
+        if (
+            args
+            or kwargs
+            or whole
+            or not isinstance(x, Tensor)
+            or x.dim() < 2
+            or module.training
+            or torch.is_grad_enabled()
+            or not type(module).forward.__module__.startswith("diffusers.")
+        ):
             return forward(x, *args, **kwargs)
         tokens = x.numel() // max(x.shape[-1], 1)
         if tokens < 2:
@@ -308,11 +205,24 @@ def _rms_contract(module: nn.Module, kinds: Sequence[str]) -> tuple[bool, int, i
 
 
 def _rms(
-    site: str, first: bool, channels: int, affine_dims: int, forward: Callable[..., object]
+    site: str,
+    module: nn.Module,
+    first: bool,
+    channels: int,
+    affine_dims: int,
+    forward: Callable[..., object],
 ) -> Callable[..., object]:
     def cut(x: object, *args: object, **kwargs: object) -> object:
-        if (args or kwargs or not isinstance(x, Tensor) or x.layout is not torch.strided
-                or not x.is_contiguous() or torch.is_grad_enabled() or x.dim() < 3):
+        if (
+            args
+            or kwargs
+            or not isinstance(x, Tensor)
+            or x.layout is not torch.strided
+            or not x.is_contiguous()
+            or torch.is_grad_enabled()
+            or x.dim() < 3
+            or not type(module).forward.__module__.startswith("diffusers.")
+        ):
             return forward(x, *args, **kwargs)
         normalized = 1 if first else x.dim() - 1
         if x.shape[normalized] != channels or (first and x.dim() != affine_dims + 1):
@@ -415,9 +325,3 @@ def split[T](name: str, key: str, total: int, finest: int, run: Callable[[int], 
         return run(max(pieces(total, level), finest))
 
     return catch.cut(f"split:{key}", levels(-(-total // max(finest, 1))), at, (), str(total))
-
-
-def launch[T](operands: Sequence[object], run: Callable[[], T]) -> T:
-    """A launch no dispatch sees (a Triton kernel's): out of memory it did not run, so it runs
-    again as an op does (12586: a glue kernel on a full GPU, after a collective)."""
-    return catch.attempt(run, operands)

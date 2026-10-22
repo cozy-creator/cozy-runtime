@@ -1,17 +1,8 @@
-"""Real models for the execution layer's tests: weights in a TensorFS store, loaded through
-varena's host pages with the catch installed, and a card that runs out of memory.
-
-The card is a dispatch mode under the catch: an op whose result and largest operand pass its
-`limit` raises torch's `OutOfMemoryError` after telling the allocator's OOM observer the bytes,
-as torch does; with a seed, an op runs out at seeded random points (each such op once). With
-`working` it counts operands only for those ops (their working memory spans them, a conv's); any
-other op runs out only when its result alone passes the limit.
-"""
+"""Real torch models stored in TensorFS and loaded through Varena for execution proofs."""
 
 from __future__ import annotations
 
 import os
-import random
 import uuid
 from collections.abc import Callable
 from pathlib import Path
@@ -25,10 +16,8 @@ from diffusers.models.attention_dispatch import AttentionBackendName, dispatch_a
 from tensorfs.varena import GpuId
 from tensorfs.varena.torch import Declared, Memory, Weights
 from torch import nn
-from torch.utils._python_dispatch import TorchDispatchMode
 
 from cozy_runtime.internal import attention_ulysses, execution
-from cozy_runtime.internal.execution import catch
 
 _DTYPES = {torch.float32: "F32", torch.float64: "F64", torch.bfloat16: "BF16"}
 
@@ -60,37 +49,6 @@ def placed[M: nn.Module](
     mem.load(module, "gpu")
     execution.install(module)
     return module
-
-
-class Card(TorchDispatchMode):  # type: ignore[misc]
-    """A device that runs out of memory (module docstring)."""
-
-    def __init__(
-        self,
-        limit: int = 0,
-        seed: int | None = None,
-        rate: float = 0.0,
-        working: Callable[[Any], bool] = lambda func: True,
-    ) -> None:
-        super().__init__()
-        self.limit, self.rate, self.working = limit, rate, working
-        self.random = random.Random(seed) if seed is not None else None
-        self.refused = 0
-
-    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
-        out = func(*args, **(kwargs or {}))
-        if any(r.alias_info is not None for r in func._schema.returns) or func._schema.is_mutable:
-            return out
-        made = sum(t.numel() * t.element_size() for t in catch.tensors(out))
-        sizes = (t.numel() * t.element_size() for t in catch.tensors(args))
-        read = max(sizes, default=0) if self.working(func) else 0
-        short = self.limit and made and made + read > self.limit
-        if short or (self.random is not None and made and self.random.random() < self.rate):
-            self.refused += 1
-            del out
-            catch._refused(0, made, 0, 0)  # the allocator's observer, as torch calls it
-            raise torch.OutOfMemoryError(f"out of memory. Tried to allocate {made} B")
-        return out
 
 
 # --------------------------------------------------------------------- a tiny transformer

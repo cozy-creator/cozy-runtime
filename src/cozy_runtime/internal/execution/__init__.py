@@ -19,7 +19,7 @@ from torch import nn
 from cozy_runtime.internal.execution import agree, catch, cuts
 from cozy_runtime.internal.execution.agree import agreed, sizes
 from cozy_runtime.internal.execution.catch import collective, keep, piece, serving
-from cozy_runtime.internal.execution.cuts import attend, launch, split
+from cozy_runtime.internal.execution.cuts import attend, split
 from cozy_runtime.internal.executor_replies import Allocator, Ceiling, GpuMemory
 from cozy_runtime.internal.executor_replies import Stats as Record
 
@@ -30,7 +30,6 @@ __all__ = [
     "counters",
     "install",
     "keep",
-    "launch",
     "piece",
     "record",
     "serving",
@@ -40,19 +39,15 @@ __all__ = [
 
 
 def install(module: nn.Module, state: Sequence[str] = ()) -> None:
-    """The catch on a loaded model: each block varena binds, and what a pass runs outside them
-    (the model's forward, which agrees its exchanges' level when sharded, and each direct
-    child's, which a method such as `vae.decode` calls), with its FFN and norm cuts. `state`:
-    the attribute paths its forward changes (`_cozy_state`), put back before a block runs
-    again."""
-    kept, blocks = tuple(state), blocks_of(module)
+    """Install known pure cuts and name their enclosing blocks, without replay wrappers."""
+    cuts.install(module)
+    blocks = blocks_of(module)
     for path in blocks:
-        catch.wrap(module.get_submodule(path), catch.Block(path, module, kept))
+        catch.wrap(module.get_submodule(path), path)
     for path, child in module.named_children():
         if path not in blocks:
-            catch.wrap(child, catch.Block(path, module, kept))
-    catch.wrap(module, catch.Block("model", module, kept), agree.passing)
-    cuts.install(module)
+            catch.wrap(child, path)
+    catch.wrap(module, "model", agree.passing)
 
 
 def record(

@@ -11,13 +11,12 @@ reduction (`head_local=False`) is registered without context parallelism.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypedDict
 
 if TYPE_CHECKING:
-    import torch
     from diffusers.models.attention_dispatch import AttentionBackendName
     from torch import Tensor
     from torch.distributed import ProcessGroup
@@ -101,6 +100,7 @@ SITE = "ulysses"
 def install(execution: Execution | None) -> None:
     global _EXECUTION
     _EXECUTION = execution
+
 
 #: the torch side, served only after the executor imports torch.
 _GROUP: Callable[[object], ProcessGroup] | None = None
