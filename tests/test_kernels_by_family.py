@@ -25,14 +25,16 @@ from cozy_runtime.internal.executor import _attention_pin
 from cozy_runtime.internal.executor_commands import Invoke, PrepareRequest
 from test_authored_model_defaults import FIXTURE, imported, project, slots
 
-_8, _88, _884 = frozenset({"int8"}), frozenset({"int8", "fp8"}), frozenset({"int8", "fp8", "fp4"})
+_8, _88 = frozenset({"int8"}), frozenset({"int8", "fp8"})
+#: fp8 beside fp4 is block-scaled fp8 too (`mxfp8`).
+_884 = frozenset({"int8", "fp8", "fp4", "mxfp8"})
 ROWS = {
     80: ("mma.sync", _8),
     86: ("mma.sync", _8),
     89: ("mma.sync", _88),
     90: ("wgmma", _88),
     100: ("tcgen05", _884),
-    103: ("tcgen05", frozenset({"fp8", "fp4"})),
+    103: ("tcgen05", frozenset({"fp8", "fp4", "mxfp8"})),
     120: ("mma.sync", _884),
     121: ("mma.sync", _884),
 }

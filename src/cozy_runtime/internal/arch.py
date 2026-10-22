@@ -28,8 +28,17 @@ class Row:
     inherited: bool = False
 
     def formats(self) -> frozenset[str]:
+        """Its tensor-core formats: what a native leaf's `formats` must be within. `mxfp8` is
+        block-scaled fp8, which comes with the block-scaled fp4 MMA."""
         return frozenset(
-            f for f, on in (("int8", self.int8), ("fp8", self.fp8), ("fp4", self.fp4)) if on
+            f
+            for f, on in (
+                ("int8", self.int8),
+                ("fp8", self.fp8),
+                ("fp4", self.fp4),
+                ("mxfp8", self.fp8 and self.fp4),
+            )
+            if on
         )
 
 
