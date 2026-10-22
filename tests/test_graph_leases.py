@@ -18,12 +18,7 @@ from tensorfs.varena.torch import Declared, Memory, Weights  # noqa: E402
 
 from cozy_runtime import graphs  # noqa: E402
 from cozy_runtime.author._model import PLACED  # noqa: E402
-from cozy_runtime.internal.encoding import (  # noqa: E402
-    Capabilities,
-    measure_device,
-    measure_runtime,
-)
-from cozy_runtime.internal.probe import QualificationResult  # noqa: E402
+from cozy_runtime.internal.encoding import measure_device, measure_runtime  # noqa: E402
 from cozy_runtime.internal.resolution import ConstructionFacts, ResolvedModelPlan  # noqa: E402
 from cozy_runtime.internal.weights import Backend, Placement  # noqa: E402
 
@@ -83,13 +78,11 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
         variant="test",
         store="test",
         snapshots={},
-        reference_variant="test",
         policy="test",
         tensors=(),
         device=facts,
         runtime=runtime,
         placement="block_paging",
-        objective="latency",
         construction=ConstructionFacts("test", "Network", ("network",)),
         encoded_leaves="refuse",
     )
@@ -103,7 +96,6 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
         construction="test",
         release="test",
         device_facts=facts,
-        qualified=(Capabilities(), QualificationResult("test", facts, "", "test", runtime, 0, [])),
     )
     backend.models["network"] = model
     placement = Placement(memory, backend)
@@ -220,13 +212,11 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
         variant="test",
         store="test",
         snapshots={},
-        reference_variant="test",
         policy="test",
         tensors=(),
         device=facts,
         runtime=runtime,
         placement="block_paging",
-        objective="latency",
         construction=ConstructionFacts("test", "Sequential", ("stack",)),
         encoded_leaves="refuse",
     )
@@ -240,7 +230,6 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
         construction="test",
         release="test",
         device_facts=facts,
-        qualified=(Capabilities(), QualificationResult("test", facts, "", "test", runtime, 0, [])),
     )
     backend.models["stack"] = model
     placement = Placement(memory, backend)
@@ -260,6 +249,8 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
                 assert held is not None
                 holds.append(held.hold)
         assert graphs._RECORDERS[module].replays == 7  # call 1 eager, then every one replays
+        # the receipt is the request's own: the second request's four replays
+        assert placement.document()["graphs"]["stack"]["replays"] == 4
         assert holds[0] is not holds[1]  # a request takes its own hold
         torch.cuda.synchronize()
         assert graphs._shed(torch, domain) > 0 and module not in domain.holds
@@ -307,13 +298,11 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
         variant="test",
         store="test",
         snapshots={},
-        reference_variant="test",
         policy="test",
         tensors=(),
         device=facts,
         runtime=runtime,
         placement="block_paging",
-        objective="latency",
         construction=ConstructionFacts("test", "Sequential", names),
         encoded_leaves="refuse",
     )
@@ -327,7 +316,6 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
         construction="test",
         release="test",
         device_facts=facts,
-        qualified=(Capabilities(), QualificationResult("test", facts, "", "test", runtime, 0, [])),
     )
     backend.models.update(models)
     placement = Placement(memory, backend)

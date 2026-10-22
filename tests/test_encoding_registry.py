@@ -6,7 +6,6 @@ import pytest
 
 from cozy_runtime.internal.decode_schemes import ADAPTERS
 from cozy_runtime.internal.encoding import (
-    Capabilities,
     DeviceFacts,
     Encoded,
     EncodingRefusal,
@@ -52,7 +51,7 @@ def test_every_scheme_has_its_parts_and_nothing_else() -> None:
 
 
 def _candidates(encoded: Encoded, shape: tuple[int, ...]) -> TensorCandidates:
-    return Selector(launch_providers(), Capabilities(), CPU).candidates("w", encoded, "bf16", shape)
+    return Selector(launch_providers(), CPU).candidates("w", encoded, "bfloat16", shape)
 
 
 def test_an_unknown_scheme_refuses_by_name() -> None:

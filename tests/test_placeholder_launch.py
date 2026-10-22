@@ -62,7 +62,7 @@ head = net.heads["txt"]
 data = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8).view(OUT, IN).cuda()
 scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.float32).cuda()
 generator = torch.Generator(device="cuda").manual_seed(208)
-with torch.inference_mode():
+with torch.inference_mode(), memory.request("cr-208"):  # a loaded model runs in a request
     assert isinstance(head.data, Placeholder), type(head.data)
     for rows in (1, 8):  # the one-launch GEMV, then quantize and GEMM
         x = torch.randn(rows, IN, generator=generator, device="cuda").to(torch.bfloat16)

@@ -16,13 +16,22 @@ import threading
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from tensorfs.varena.torch import Cache, Declared, Level, Memory, Model, Weights, blocks_of
+from tensorfs.varena.torch import (
+    Binding,
+    Cache,
+    Declared,
+    Level,
+    Memory,
+    Model,
+    Weights,
+    blocks_of,
+)
 
 from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
@@ -31,10 +40,10 @@ from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
-    Capabilities,
     DeviceFacts,
     LeafProvider,
     Selection,
+    admit,
     device_line,
     implementation_digest,
     launch_providers,
@@ -53,9 +62,6 @@ from cozy_runtime.internal.fill import (
 )
 from cozy_runtime.internal.fill import fit as fill_fit
 from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (Ulysses' torch side, served)
-from cozy_runtime.internal.planfacts import PlanFacts
-from cozy_runtime.internal.probe import QualificationResult
-from cozy_runtime.internal.qualification import qualified
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
 if TYPE_CHECKING:
@@ -81,7 +87,6 @@ class Backend:
         memory: Memory,
         device: torch.device,
         construction: str,
-        qualified: tuple[Capabilities, QualificationResult],
         device_facts: DeviceFacts,
         release: str,
         custody: str = "canonical",
@@ -115,7 +120,6 @@ class Backend:
         self.legs: list[tuple[str, float]] = []
         self.device_facts = device_facts
         self.providers = launch_providers()
-        self.capabilities, self.probe = qualified
         self.execution = plan
         self.resolved: dict[str, TensorResolution] = plan.by_key()
         planned, held = set(self.resolved), set(self.plan)
@@ -149,20 +153,12 @@ class Backend:
         device: torch.device,
         construction: str,
         release: str,
-        objective: str = "latency",
         encoded_leaves: str = "accept",
     ) -> Backend:
-        """A backend for a driver script with no model class: measure, qualify, resolve a
-        `script_plan` over these rows, then construct, through the executor's own authority."""
+        """A backend for a driver script with no model class: resolve a `script_plan` over
+        these rows, then construct, through the executor's own authority."""
         facts = measure_device(torch, device.index or 0)
         providers = launch_providers()
-        qualification = qualified(
-            torch,
-            providers,
-            facts,
-            sorted({dtype_name(row.dtype) for row in rows}),
-            release=release,
-        )
         plan = script_plan(
             rows=rows,
             components=sorted({row.component for row in rows}),
@@ -171,11 +167,8 @@ class Backend:
             snapshot=next(iter(checkpoints.values())).id,
             snapshots={name: book.id for name, book in checkpoints.items()},
             providers=providers,
-            capabilities=qualification.capabilities,
             device=facts,
             runtime=measure_runtime(torch, release),
-            facts=PlanFacts(),
-            objective=objective,
             encoded_leaves=encoded_leaves,
             dtype_name=dtype_name,
         )
@@ -187,15 +180,13 @@ class Backend:
             memory=memory,
             device=device,
             construction=construction,
-            qualified=(qualification.capabilities, qualification.result),
             device_facts=facts,
             release=release,
         )
 
     def _select(self, key: str, row: PlanRow) -> Selection:
         """The plan's provider for one destination, matched by digest against this build and
-        this device's capability records. Anything else is `plan_divergence`, never a
-        re-selection."""
+        admitted on this device. Anything else is `plan_divergence`, never a re-selection."""
         resolved = self.resolved.get(key)
         if resolved is None:
             raise _refuse("plan_divergence", f"{key}: the plan names no such destination", [key])
@@ -228,20 +219,15 @@ class Backend:
                 ),
                 [key],
             )
-        records = self.capabilities.qualified(
-            row.encoded.scheme,
-            self.device_facts,
-            resolved.output_dtype,
-            {resolved.implementation_digest: provider},
-        )
-        if not records:
+        why = admit(provider, self.device_facts, resolved.output_dtype, row.encoded)
+        if why:
             raise _refuse(
                 "plan_divergence",
-                f"{key}: {device_line(self.device_facts)} holds no capability record for "
-                f"{resolved.implementation}",
+                f"{key}: {device_line(self.device_facts)} does not serve "
+                f"{resolved.implementation}: {why}",
                 [key],
             )
-        return Selection(provider, records[0], row.encoded, resolved.reason)
+        return Selection(provider, row.encoded, resolved.reason)
 
     # -- the Backend protocol
 
@@ -801,6 +787,27 @@ class _Bakes:
 # ------------------------------------------------------------------------- the placement
 
 
+class Steps:
+    """An attempt's plan (`ctx.plan`), steps per component, and its components' calls so far."""
+
+    def __init__(self) -> None:
+        self.planned: dict[str, int] = {}
+        self.calls: dict[str, int] = {}
+
+    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+        self.planned = {}
+        for step in steps:
+            for name in [step] if isinstance(step, str) else step:
+                self.planned[name] = self.planned.get(name, 0) + 1
+
+    def called(self, component: str) -> None:
+        self.calls[component] = self.calls.get(component, 0) + 1
+
+    def later(self, component: str) -> bool:
+        """The plan runs `component` in a step after its calls so far."""
+        return self.calls.get(component, 0) < self.planned.get(component, 0)
+
+
 class Placement:
     """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
     pins and KV caches as the memory's caches, a request's LoRA serving, and notes."""
@@ -812,21 +819,30 @@ class Placement:
         self.bakes = dict(backend.bakes)
         self.notes: dict[str, str] = {}
         self.attempts = 0
+        self.steps = Steps()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
 
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
+        self.steps = Steps()
+        for model in self.models.values():
+            graphs.mark(model.module)
+
+    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+        self.steps.plan(steps)
+
+    def graph_called(self, component: str) -> None:
+        self.steps.called(component)
+
+    def graph_later(self, component: str) -> bool:
+        return self.steps.later(component)
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """A request's LoRA serving (`lora_mode`): baked, or per step."""
         for bakes in self.bakes.values():
             bakes.strategy = strategy
-
-    def keep(self, *held: Tensor) -> None:
-        """Tensors a cache or a hold owns (KV slots, a graph's static inputs): never parked."""
-        execution.keep(*held)
 
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
         """The region's address ownership, independent of its physical replay lease."""
@@ -841,24 +857,18 @@ class Placement:
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def graph_spare(self) -> int | None:
-        """What the running request could get without evicting its working set or a pinned
-        page (None outside a request)."""
-        request = execution.catch.CURRENT.get()
-        return request.spare() if request is not None else None
-
     def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
         return self.memory.allocating(pool, route=route)
 
-    def graph_levels(self) -> tuple[tuple[str, int], ...]:
-        request = execution.catch.CURRENT.get()
-        return tuple(request.levels()) if request is not None else ()
+    def graph_levels(self) -> tuple[tuple[tuple[str, str], int], ...]:
+        """The process's cut levels: a graph recorded under them replays only under them."""
+        return execution.catch.levels()
 
     def graph_segments(self, component: str) -> tuple[str, ...]:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)
 
-    def graph_whole(self, component: str, binding: Any) -> bool:
+    def graph_whole(self, component: str, binding: Binding) -> bool:
         """`binding` covers every block of the component."""
         model = self.models[component]
         return len(binding.blocks) == sum(

@@ -3,7 +3,7 @@
 Purity alone is insufficient: tensor-global activation scales and RNG state forbid cuts.
 Changing GEMM row geometry may change rounding; bitwise equivalence is not promised.
 The results stay on the device, at
-the level Rust holds for its site (`r.cut`). Level L is 2^L pieces, down to the finest.
+the level the process keeps for its site (`catch`). Level L is 2^L pieces, down to the finest.
 
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
@@ -91,7 +91,7 @@ def _conv_of(module: nn.Module) -> Conv:
 
 
 def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
-    """A conv at the level Rust holds for `site`: whole at 0, else in bands of images, else
+    """A conv at the level the process keeps for `site`: whole at 0, else in bands of images, else
     (one image, ungrouped) of output channels, each band copied into its slice of the result.
     Measured on a GPU (tests/test_band_live_bytes.py): the band's workspace is what shrinks."""
 
@@ -110,7 +110,7 @@ def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
             return conv(x, weight, bias)
         run = functools.partial(_bands, conv, x, weight, bias, by_images, units)
         shape = "x".join(map(str, x.shape))
-        return catch.cut(site, levels(units), run, (x,), shape, measured=False)
+        return catch.cut(site, levels(units), run, (x,), shape)
 
     return cut
 

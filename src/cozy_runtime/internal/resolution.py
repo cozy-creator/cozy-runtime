@@ -1,13 +1,21 @@
-"""Resolve immutable model bytes to one deterministic implementation plan.
+"""#549.1 — the ResolvedModelPlan: ONE object, ONE decision, and a label that derives.
 
-Hardware, shape, shipped qualification/format contracts, and explicit precision/package
-constraints determine kernel policy. Consumer execution history never chooses a competing
-implementation. Passive fill, step and memory observations stay attached to the exact plan
-for reporting and capacity planning; they do not become a local optimization oracle.
+`encoding.Selector` offers each tensor the routes this card admits (`selection.admit`, a rule
+of the card's tensor cores); this takes one route per tensor by the package's consent: the
+encoded GEMM where the package accepts encoded leaves and the card serves the leaf, else the
+decode floor, else verbatim. Nothing measured ranks anything (xs-065, owner 2026-10-22): a
+card no one has benchmarked resolves exactly as a measured one of its row.
 
-The plan records every tensor's validated route and implementation, the exact snapshot map,
-construction and runtime identities. Its digest identifies execution and its label derives
-from the route census. Missing fast-kernel evidence uses the supported reference decode path.
+The plan is resolved once, before a destination is reserved, and holds:
+
+* the EXACT snapshot map (component -> snapshot digest), not a variant NAME;
+* one `TensorResolution` per destination: encoding, implementation digest and revision,
+  route, validated geometry, output dtype, and the REASON;
+* device and runtime identity (#549.9), placement and construction facts.
+
+`digest()` is what enters generation identity. `label()` DERIVES from the route census, so a
+mixed plan says `mixed(encoded_gemm x743, decoded_float x120, verbatim x937)` and cannot say
+anything else. `delivery.py`'s rung table describes what a route costs and when.
 """
 
 from __future__ import annotations
@@ -22,8 +30,8 @@ from typing import Protocol
 import msgspec
 
 from cozy_runtime.internal import canonical
+from cozy_runtime.internal.delivery import DELIVERY_RUNGS, ROUTE_KERNEL
 from cozy_runtime.internal.encoding import (
-    Capabilities,
     DeviceFacts,
     Encoded,
     EncodingRefusal,
@@ -34,34 +42,11 @@ from cozy_runtime.internal.encoding import (
     Selector,
     TensorCandidates,
     device_line,
-    geometry_class,
+    implementation_digest,
 )
-from cozy_runtime.internal.planfacts import PlanFact, PlanFacts
 
-#: WHICH KERNEL each route computes with. The two float routes compute in the destination's
-#: own dtype through the ordinary library GEMM — that is what "kernel-neutral" means, and it
-#: is data so the placement walk can be checked not to have moved it.
-ROUTE_KERNEL: dict[str, str] = {
-    "verbatim": "library_float",
-    "decoded_float": "library_float",
-    "encoded_gemm": "encoded_gemm",
-}
-
-#: The measured axis a deployment optimizes. A property of the DEPLOYMENT, not a request
-#: knob, because the plan is resolved once for the generation.
-#:
-#: `fidelity` is GONE and `kernel_numeric_error` stands where it did (#549.11). The old name
-#: promised model quality and delivered a Frobenius norm over one GEMM; quality is a paired
-#: video+audio eval on real outputs and belongs to the eval plane.
-OBJECTIVES = ("latency", "footprint", "kernel_numeric_error")
-
-#: The ROUTE POLICIES a plan may be resolved under — the closed, ordered replacement for the
-#: artifact-wide rung ladder. A policy says which route a tensor PREFERS when it has more
-#: than one; it never says which route a tensor GETS, because a tensor with no encoded-GEMM
-#: candidate takes the floor under either policy and the plan records that per tensor.
-POLICIES = ("encoded_gemm", "decode_floor")
-
-#: Preference order per policy. First route in the list that this tensor actually has wins.
+#: The route a tensor PREFERS under each policy (the package's consent decides the policy);
+#: the first route in the list that this tensor actually has wins.
 _PREFERENCE: dict[str, tuple[str, ...]] = {
     "encoded_gemm": ("encoded_gemm", "decoded_float", "verbatim"),
     "decode_floor": ("decoded_float", "verbatim", "encoded_gemm"),
@@ -69,14 +54,8 @@ _PREFERENCE: dict[str, tuple[str, ...]] = {
 
 
 def route_label(census: Mapping[str, int]) -> str:
-    """A route census -> the plan's human-facing name. THE derivation, in one place.
-
-    The old rung name was chosen by a chooser that had no per-tensor knowledge, so an
-    artifact with 743 encoded leaves, 120 decoded weights and 937 verbatim copies reported
-    `native_encoded` and every reader downstream believed it. This function cannot: a census
-    carrying more than one route is UNNAMEABLE as a single rung, so it names all of them with
-    counts and the caller gets a label it can print without lying.
-    """
+    """A route census -> the plan's human-facing name. A census carrying more than one route
+    names all of them with counts."""
     present = {route: n for route, n in census.items() if n}
     if not present:
         return "empty"
@@ -91,10 +70,8 @@ def route_label(census: Mapping[str, int]) -> str:
 
 
 class Step(msgspec.Struct, omit_defaults=True):
-    """One line of the resolution walk: a (variant, policy) candidate and its verdict.
-
-    Mutable: the chosen plan's step is promoted to `chosen` once every candidate is scored.
-    """
+    """The resolution's record: the variant, its verdict (`chosen`, or the refusal code)
+    and why."""
 
     variant: str
     verdict: str
@@ -103,10 +80,6 @@ class Step(msgspec.Struct, omit_defaults=True):
     plan: str = ""
     label: str = ""
     routes: dict[str, int] | None = None
-    samples: int | None = None
-    leaf_speedup_x: float | None = None
-    score: float | None = None
-    provenance: str = ""
 
 
 class PlanRefusal(Exception):
@@ -119,26 +92,18 @@ class PlanRefusal(Exception):
         self.steps = tuple(steps)
 
 
-# ------------------------------------------------------------------------ the variants
+# ------------------------------------------------------------------------ the variant
 
 
 @dataclass(frozen=True, slots=True)
 class Variant:
-    """One artifact of ONE logical model — the same tensor schema, different stored bytes.
-
-    `reference` marks the variant every other one is measured AGAINST. It is the deviation
-    origin, so there is exactly one and a candidate set without one has no scale to put
-    deviations on — a refusal, not a default.
-    """
+    """The artifact a plan reads: its store and the snapshot of each component."""
 
     name: str
     store: str
     snapshot: str
     snapshots: Mapping[str, str] = field(default_factory=dict)
-    """component -> snapshot digest. A REAL map: a comma-packed one is a second grammar
-    every reader has to agree about. It is the thing the plan digest binds, which is what
-    stops a re-pointed variant NAME from inheriting the old bytes' measurements (#549.2)."""
-    reference: bool = False
+    """component -> snapshot digest. A REAL map: it is what the plan digest binds (#549.2)."""
 
     def snapshot_map(self) -> dict[str, str]:
         return dict(self.snapshots)
@@ -171,13 +136,8 @@ class ConstructionFacts:
 
 @dataclass(frozen=True, slots=True)
 class TensorResolution:
-    """ONE destination's whole answer. The unit the plan is made of.
-
-    The old plan had no such unit: it had a per-tensor `Selection` that lived only inside the
-    fill backend's dict, and an artifact-wide rung that was reported. This is what a reader
-    and a digest both need — the encoding, the exact implementation, the route, the geometry
-    that was VALIDATED, and why.
-    """
+    """ONE destination's whole answer: the encoding, the exact implementation, the route, the
+    geometry that was VALIDATED, and why."""
 
     key: str
     component: str
@@ -188,25 +148,18 @@ class TensorResolution:
     implementation_revision: str
     route: str
     geometry: tuple[int, ...]
-    geometry_class: str
     output_dtype: str
     numel: int
     stored_bytes: int
-    resident_bits_per_element: float
-    kernel_numeric_error: float
     reason: str
     """One sentence. #549.5's ragged-K case reads: the leaf refused this shape, here is the
     rule, and the decode floor serves it — IN the plan, not in a log nobody keeps."""
-    leaf_speedup_x: float = -1.0
-    """`CapabilityRecord.leaf_speedup_x` of the implementation this row resolved to."""
     refused: Refusal | None = None
-    """Set when this row is served decoded because this device REFUSED its encoded leaf;
-    None when its route is by design (`reason`)."""
+    """Set when this row is served decoded because this card does not serve its encoded
+    leaf; None when its route is by design (`reason`)."""
 
     def identity(self) -> dict[str, str | list[int]]:
-        """What the plan DIGEST takes from this row. Measurements are excluded on purpose:
-        the fact store is keyed BY the digest, so hashing a measurement into it would make
-        every re-measure a different plan."""
+        """What the plan DIGEST takes from this row."""
         return {
             "key": self.key,
             "encoding": self.encoding,
@@ -217,17 +170,13 @@ class TensorResolution:
             "output_dtype": self.output_dtype,
         }
 
-    def document(self) -> dict[str, str | int | float | list[int]]:
+    def document(self) -> dict[str, str | int | list[int]]:
         return {
             **self.identity(),
             "component": self.component,
             "implementation": self.implementation,
-            "geometry_class": self.geometry_class,
             "numel": self.numel,
             "stored_bytes": self.stored_bytes,
-            "resident_bits_per_element": self.resident_bits_per_element,
-            "kernel_numeric_error": self.kernel_numeric_error,
-            "leaf_speedup_x": self.leaf_speedup_x,
             "reason": self.reason,
             "refused": f"{self.refused.leaf}: {self.refused.reason}" if self.refused else "",
         }
@@ -235,8 +184,8 @@ class TensorResolution:
 
 @dataclass(frozen=True, slots=True)
 class RefusedLeaves:
-    """One component's tensors of one lane that serve decoded because this device refused
-    their leaf for one reason. A run served by such a plan says so in its record."""
+    """One component's tensors of one lane that serve decoded because this card does not
+    serve their leaf, for one reason. A run served by such a plan says so in its record."""
 
     component: str
     lane: str
@@ -253,27 +202,19 @@ class RefusedLeaves:
 @dataclass(frozen=True, slots=True)
 class ResolvedModelPlan:
     """The one immutable object a generation is. Resolved once, before anything is reserved.
-
-    Its `digest()` enters generation identity and its `label()` derives from what it actually
-    resolved — which is the inversion #549.1 asked for. Before, a LABEL was hashed into
-    identity and the per-tensor truth was not.
-    """
+    Its `digest()` enters generation identity and its `label()` derives from what it
+    actually resolved."""
 
     variant: str
     store: str
     snapshots: Mapping[str, str]
-    reference_variant: str
     policy: str
     tensors: tuple[TensorResolution, ...]
     device: DeviceFacts
     runtime: RuntimeIdentity
     placement: str
-    objective: str
     construction: ConstructionFacts
     encoded_leaves: str
-    steps_basis: int = 20
-    measurements: PlanFact | None = None
-    confession: str = ""
     walk: tuple[Step, ...] = ()
 
     # ------------------------------------------------------------------ derived facts
@@ -301,45 +242,20 @@ class ResolvedModelPlan:
         return route_label(self.route_census())
 
     def wire_delivery(self) -> str:
-        """The wire's closed `delivery` vocabulary (`native | float`), derived HONESTLY.
-
-        `native` means nothing decoded. One decoded tensor makes the generation a float one,
-        because a float destination exists and is resident — which is what the word is for.
-        """
-        census = self.route_census()
-        return "float" if census.get("decoded_float") else "native"
+        """The wire's closed `delivery` vocabulary (`native | float`): one decoded tensor makes
+        the generation a float one."""
+        return "float" if self.route_census().get("decoded_float") else "native"
 
     def wire_materialization(self) -> str:
-        """`aot_decode | staged_decode | jit_decode`, or empty when nothing decodes.
-
-        Derived from the PLACEMENT, which is where the difference actually lives: the same
-        decode paid once at fill is `aot_decode` and paid again on every stage-in is
-        `staged_decode`. `jit_decode` stays unbuilt — see `delivery.py`.
-        """
+        """`aot_decode | staged_decode`, or empty when nothing decodes: the same decode paid
+        once at fill, or again on every stage-in (`component_staged`)."""
         if not self.route_census().get("decoded_float"):
             return ""
         return "staged_decode" if self.placement == "component_staged" else "aot_decode"
 
     def wire_rung(self) -> str:
-        """The rung NAME the worker's placement fence prices this plan against.
-
-        The worker seam is closed and it needs one: `worker/plan.py` looks the name up in
-        the rung table to decide whether a walk to `component_staged` would change the
-        compute KERNEL, which is §3.2's fence and is exactly the check that must keep
-        working. So this is a DERIVATION, not a chooser's answer: it names the rung whose
-        (delivery, materialization) pair equals this plan's own derived wire fields.
-
-        A mixed plan therefore prices as what it COSTS — one decoded tensor makes the
-        generation pay a decode, which is `aot_decode` or `staged_decode` — and it still
-        REPORTS `label()`, which is the honest name. That is the split #549.1 asked for:
-        the wire's closed vocabulary is satisfied by derivation, and nothing claims to be a
-        single-route generation that is not.
-        """
-        # Imported HERE, not at module scope: `delivery.py` imports `ROUTE_KERNEL` from this
-        # module, so a top-level import back would close the cycle. The dependency is one
-        # way by design — resolution decides, the rung table describes.
-        from cozy_runtime.internal.delivery import DELIVERY_RUNGS
-
+        """The rung NAME whose (delivery, materialization) pair equals this plan's own derived
+        wire fields: a derivation, not a chooser's answer."""
         delivery, materialization = self.wire_delivery(), self.wire_materialization()
         for rung in DELIVERY_RUNGS:
             if (
@@ -351,13 +267,7 @@ class ResolvedModelPlan:
         return "verbatim"
 
     def wire_document(self) -> dict[str, object]:
-        """The `delivery` document the worker reads off a prepare reply.
-
-        Its KEY SET is the worker's, not this module's: `session.py` reads `rung` and
-        `variant` and prints `delivery`/`materialization`/`confession`, and that seam is
-        closed. Every value is derived from the resolution, and `label` and `plan_digest`
-        ride along so a reader of the reply sees the honest name beside the wire's one.
-        """
+        """The `delivery` document a prepare reply carries; every value derives from the plan."""
         return {
             "rung": self.wire_rung(),
             "variant": self.variant,
@@ -367,10 +277,6 @@ class ResolvedModelPlan:
             "plan_digest": self.digest(),
             "routes": self.route_census(),
             "kernels": self.kernels(),
-            "leaf_speedup_x": self.derived_leaf_speedup_x(),
-            "objective": self.objective,
-            "calibrated": self.measurements is not None,
-            "confession": self.confession,
         }
 
     def kernels(self) -> dict[str, int]:
@@ -386,38 +292,6 @@ class ResolvedModelPlan:
     def stored_bytes(self) -> int:
         return sum(row.stored_bytes for row in self.tensors)
 
-    def derived_resident_bytes(self) -> int:
-        """Resident bytes the CAPABILITY RECORDS predict for this plan.
-
-        Every term is a measured number (`resident_bits_per_element`, minted by a probe that
-        actually filled a tensor) times a header fact (`numel`). It is a DERIVATION, and the
-        resolver prefers a banked whole-plan measurement whenever one exists — but it is
-        derivable, which is why `footprint` never has to fall back to uncalibrated.
-        """
-        total = 0.0
-        for row in self.tensors:
-            bits = row.resident_bits_per_element
-            total += (bits if bits >= 0.0 else 0.0) * row.numel
-        return int(total / 8.0)
-
-    def derived_leaf_speedup_x(self) -> float:
-        """The WORST leaf speedup among this plan's encoded-GEMM tensors, against the float
-        GEMM each replaces at the probe shape. -1.0 when the plan replaces no leaf or nothing
-        measured them. Below 1.0 the plan's leaves LOSE to decoding, and every record that
-        serves the plan says so — the number is evidence, not a rank (`score`)."""
-        seen = [row.leaf_speedup_x for row in self.tensors if row.leaf_speedup_x >= 0.0]
-        return min(seen) if seen else -1.0
-
-    def derived_kernel_numeric_error(self) -> float:
-        """The WORST per-tensor route deviation. -1.0 when nothing measured any of them.
-
-        Worst rather than mean: a plan is as numerically wrong as its wrongest tensor, and
-        averaging 743 encoded leaves against 937 verbatim copies would report a plan that
-        replaced every linear op as almost exact.
-        """
-        seen = [row.kernel_numeric_error for row in self.tensors if row.kernel_numeric_error >= 0.0]
-        return max(seen) if seen else -1.0
-
     # --------------------------------------------------------------------- identity
 
     def identity(self) -> dict[str, object]:
@@ -432,50 +306,21 @@ class ResolvedModelPlan:
         }
 
     def digest(self) -> str:
-        """THE plan's canonical digest — what enters generation identity.
-
-        It binds the snapshot BYTES, the runtime build, the per-tensor provider map, the
-        placement, the construction contract and the config, which are the things the old
-        `(variant, rung)` fact key bound none of (#549.2).
-
-        FOUR fields are deliberately ABSENT, and each absence is load-bearing:
-
-        * the VARIANT NAME — two bindings that name the same bytes differently are one plan,
-          and a name that re-points at different bytes is a different one;
-        * the OBJECTIVE — it is the question that was asked, not the answer. Two deployments
-          that state different axes and land on the same tensors, bytes and device are
-          running the SAME execution, and a digest that separated them would file their
-          measurements apart forever — so the resolver could never compare a candidate plan
-          against a fact a differently-stated deployment banked. Found by an arm: with the
-          objective inside, a plan measured under `footprint` was invisible to the `latency`
-          resolution that had just built the identical plan;
-        * the POLICY — a label for how the route assignment was reached. Two policies that
-          reach the same assignment ARE the same plan, which is exactly why resolution dedups
-          candidates by digest rather than by policy name;
-        * CONSENT — it decides which plans get BUILT, never what a built plan does.
-        """
+        """THE plan's canonical digest — what enters generation identity. It binds the snapshot
+        BYTES, the runtime build, the per-tensor provider map, the placement and the
+        construction contract. The variant NAME, the policy and consent are absent: two
+        resolutions that reach the same assignment over the same bytes ARE the same plan."""
         encoded = canonical.write(self.identity())
         return (
             "sha256:" + hashlib.sha256(b"cozy.runtime.resolved-model-plan\0" + encoded).hexdigest()
         )
 
     def seam_document(self) -> dict[str, object]:
-        """The plan as a load reply carries it — everything but the per-destination census.
-
-        `document()` carries a row per destination because a plan's identity is per-tensor
-        and a reader on disk wants all of it; 2,651 destinations is about a megabyte that no
-        reader of the reply wants. The reply carries the DIGEST and the COUNTS, and the digest
-        is over the full document, so identity is not weakened by leaving the rows out.
-        """
+        """The plan as a load reply carries it: everything but the per-destination rows, which
+        `plan_digest` covers."""
         whole = self.document()
         del whole["tensors"], whole["walk"]
         whole["tensors_count"] = len(self.tensors)
-        whole["walk_count"] = len(self.walk)
-        whole["census_elided"] = (
-            "the per-destination rows and the resolution walk are not on this seam: this "
-            f"plan resolves {len(self.tensors)} destinations. `plan_digest` is over the "
-            "WHOLE document"
-        )
         return whole
 
     def document(self) -> dict[str, object]:
@@ -483,7 +328,6 @@ class ResolvedModelPlan:
             "plan_digest": self.digest(),
             "label": self.label(),
             "variant": self.variant,
-            "reference_variant": self.reference_variant,
             "policy": self.policy,
             "store": self.store,
             "snapshots": dict(sorted(self.snapshots.items())),
@@ -494,60 +338,17 @@ class ResolvedModelPlan:
             "replaces_leaves": self.replaces_leaves(),
             "encoded_leaves": self.encoded_leaves,
             "placement": self.placement,
-            "objective": self.objective,
-            "steps_basis": self.steps_basis,
             "device": self.device.document(),
             "runtime": self.runtime.document(),
             "construction": self.construction.document(),
             "stored_bytes": self.stored_bytes(),
-            "derived_resident_bytes": self.derived_resident_bytes(),
-            "derived_kernel_numeric_error": self.derived_kernel_numeric_error(),
-            "derived_leaf_speedup_x": self.derived_leaf_speedup_x(),
-            "calibrated": self.measurements is not None and self.measurements.samples > 0,
-            "measured": self.measurements.document() if self.measurements else None,
-            "confession": self.confession,
             "tensors": [row.document() for row in self.tensors],
             "walk": msgspec.to_builtins(self.walk),
         }
 
     def summary(self) -> str:
         census = ", ".join(f"{r} x{n}" for r, n in sorted(self.route_census().items()))
-        samples = self.measurements.samples if self.measurements else 0
-        return (
-            f"{self.label()} [{self.digest()[:19]}…] over {self.variant!r}: {census}; "
-            f"objective {self.objective}, policy {self.policy}, {samples} banked sample(s)"
-        )
-
-
-# --------------------------------------------------------------------------- scoring
-
-
-def score(plan: ResolvedModelPlan, objective: str) -> tuple[float, str]:
-    """Lower is better. Returns `(score, provenance)`; `(-1.0, why)` means UNSCORABLE.
-
-    Only offline capability axes score implementation policy. Process-local observations
-    remain available on the plan, but never order competing implementations.
-    """
-    if objective == "latency":
-        return -1.0, "shipped implementation policy; consumer timings are observations only"
-    if objective == "footprint":
-        derived = plan.derived_resident_bytes()
-        if derived <= 0:
-            return -1.0, "no measured resident_bits_per_element on any of this plan's tensors"
-        return (
-            float(derived),
-            f"{derived} B resident, DERIVED from each tensor's measured "
-            "resident_bits_per_element x its element count",
-        )
-    if objective == "kernel_numeric_error":
-        worst = plan.derived_kernel_numeric_error()
-        if worst < 0.0:
-            return -1.0, "no measured kernel_numeric_error on any of this plan's tensors"
-        return worst, (
-            f"{worst:.6f} relative, the WORST of this plan's {len(plan.tensors)} tensors, "
-            "each measured against an f64 reference over its own exactly-dequantized weights"
-        )
-    return -1.0, f"{objective!r} names no axis this build can score"
+        return f"{self.label()} [{self.digest()[:19]}…] over {self.variant!r}: {census}"
 
 
 # ------------------------------------------------------------------------ resolution
@@ -571,206 +372,71 @@ class PlanRow(Protocol):
 
 def resolve(
     *,
-    variants: Sequence[Variant],
-    rows_for: Mapping[str, Sequence[PlanRow]],
+    variant: Variant,
+    rows: Sequence[PlanRow],
     providers: Mapping[str, tuple[Provider, ...]],
-    capabilities: Capabilities,
     device: DeviceFacts,
     runtime: RuntimeIdentity,
     construction: ConstructionFacts,
-    facts: PlanFacts,
-    objective: str = "latency",
     placement: str = "all_resident",
     encoded_leaves: str = "refuse",
-    steps_basis: int = 20,
     dtype_name: Callable[[str], str],
 ) -> ResolvedModelPlan:
-    """Offered variants + header rows + capability records + banked facts -> ONE plan.
+    """The variant's header rows -> ONE plan, by rule.
 
-    `rows_for` is variant name -> that variant's header rows. `dtype_name` maps a TensorFS dtype
-    name to the torch dtype NAME a capability record is keyed by — handed in rather than
-    imported, so this module stays free of the fill plane.
-
-    Every candidate is surveyed from its HEADER (cr-006 measured the whole per-tensor
-    encoding plan of the real fp8 UNet at 400,592 B read and 6.7 MiB peak RSS, zero tensor
-    bytes), so offering four variants costs four header reads and no load.
+    `dtype_name` maps a TensorFS dtype name to the torch dtype NAME a provider writes — handed
+    in rather than imported, so this module stays free of the fill plane. The rows come from
+    the HEADER (cr-006 measured the real fp8 UNet's at 400,592 B read, zero tensor bytes).
     """
-    if objective not in OBJECTIVES:
+    if not rows:
         raise PlanRefusal(
-            "unknown_objective",
-            f"{objective!r} is not one of {OBJECTIVES}: the objective names a MEASURED axis, "
-            "and one nothing measures cannot order anything",
+            "no_qualified_plan",
+            f"{variant.name} has no tensor rows: a generation reads bytes or it does not exist",
+            [Step(variant.name, "no_rows", "no tensor rows")],
         )
-    if not variants:
-        raise PlanRefusal(
-            "no_plan_candidates",
-            "this binding offers no artifact variant at all; a generation reads bytes or it "
-            "does not exist",
-        )
-    reference = [v for v in variants if v.reference]
-    if len(reference) != 1:
-        raise PlanRefusal(
-            "reference_variant_unresolved",
-            f"{len(reference)} of {len(variants)} offered variants claim to be the reference "
-            "and exactly one must: deviation is a number ABOUT a reference, so a candidate "
-            "set without one puts every encoded route on no scale at all",
-        )
+    selector = Selector(providers, device)
+    try:
+        found = [
+            (row, selector.candidates(row.key, row.encoded, dtype_name(row.dtype), row.shape))
+            for row in rows
+        ]
+    except EncodingRefusal as exc:
+        step = Step(variant.name, exc.code, str(exc)[:600])
+        raise PlanRefusal("no_qualified_plan", _refusal(variant, device, step), [step]) from exc
+    unserved = next((c for _, c in found if not c.by_route), None)
+    if unserved is not None:
+        step = Step(variant.name, "unqualified", unserved.unqualified[:600])
+        raise PlanRefusal("no_qualified_plan", _refusal(variant, device, step), [step])
+    # THE CONSENT GATE (#549.1): a route that REPLACES the module that computes needs the
+    # package to say so, because code that reads `.weight` finds nothing there.
+    policy = "encoded_gemm" if encoded_leaves == "accept" else "decode_floor"
+    plan = _build(
+        variant=variant,
+        policy=policy,
+        resolved=found,
+        device=device,
+        runtime=runtime,
+        construction=construction,
+        placement=placement,
+        encoded_leaves=encoded_leaves,
+        dtype_name=dtype_name,
+    )
+    step = Step(
+        variant.name,
+        "chosen",
+        policy=policy,
+        plan=plan.digest(),
+        label=plan.label(),
+        routes=plan.route_census(),
+    )
+    return dataclasses.replace(plan, walk=(step,))
 
-    walk: list[Step] = []
-    candidates: list[tuple[ResolvedModelPlan, float, str]] = []
-    floors: dict[str, ResolvedModelPlan] = {}
-    leaved: dict[str, ResolvedModelPlan] = {}
 
-    for variant in variants:
-        rows = list(rows_for.get(variant.name, ()))
-        if not rows:
-            walk.append(Step(variant.name, "no_rows", "no tensor rows"))
-            continue
-        selector = Selector(providers, capabilities, device, objective)
-        try:
-            resolved_candidates = [
-                (
-                    row,
-                    selector.candidates(row.key, row.encoded, dtype_name(row.dtype), row.shape),
-                )
-                for row in rows
-            ]
-        except EncodingRefusal as exc:
-            walk.append(Step(variant.name, exc.code, str(exc)[:600]))
-            continue
-        unqualified = next((c for _, c in resolved_candidates if not c.by_route), None)
-        if unqualified is not None:
-            walk.append(Step(variant.name, "unqualified", unqualified.unqualified[:600]))
-            continue
-        seen: set[str] = set()
-        for policy in POLICIES:
-            if policy == "encoded_gemm" and encoded_leaves != "accept":
-                # THE CONSENT GATE, MOVED INTO RESOLUTION. It used to fire at `materialize`,
-                # with the plan already chosen and the package already imported; a plan the
-                # package cannot consent to is not a candidate, so it is never built.
-                walk.append(
-                    Step(
-                        variant.name,
-                        "unconsented",
-                        f"the package declares encoded_leaves={encoded_leaves!r}; a route that "
-                        "REPLACES the module that computes needs the package to say so, "
-                        "because code that reads `.weight` finds nothing there",
-                        policy=policy,
-                    )
-                )
-                continue
-            plan = _build(
-                variant=variant,
-                reference=reference[0],
-                policy=policy,
-                resolved=resolved_candidates,
-                device=device,
-                runtime=runtime,
-                construction=construction,
-                objective=objective,
-                placement=placement,
-                encoded_leaves=encoded_leaves,
-                steps_basis=steps_basis,
-                dtype_name=dtype_name,
-            )
-            digest = plan.digest()
-            if digest in seen:
-                # The two policies COINCIDE whenever no tensor has a real choice, which is
-                # every single-route artifact. Deduping by digest rather than by policy name
-                # keeps the walk honest about how many DISTINCT plans there were.
-                continue
-            seen.add(digest)
-            plan = _with_facts(plan, facts)
-            if policy == "decode_floor" or not plan.route_census().get("encoded_gemm"):
-                floors.setdefault(variant.name, plan)
-            elif policy == "encoded_gemm":
-                leaved.setdefault(variant.name, plan)
-            value, provenance = score(plan, objective)
-            scored = value >= 0.0
-            walk.append(
-                Step(
-                    variant.name,
-                    "eligible" if scored else "unscored",
-                    "" if scored else provenance,
-                    policy=policy,
-                    plan=digest,
-                    label=plan.label(),
-                    routes=plan.route_census(),
-                    samples=plan.measurements.samples if plan.measurements else 0,
-                    leaf_speedup_x=plan.derived_leaf_speedup_x()
-                    if plan.replaces_leaves()
-                    else None,
-                    score=value if scored else None,
-                    provenance=provenance if scored else "",
-                )
-            )
-            if scored:
-                candidates.append((plan, value, provenance))
-
-    if candidates:
-        best, value, provenance = min(candidates, key=lambda e: (e[1], e[0].digest()))
-        for step in walk:
-            if step.plan == best.digest():
-                step.verdict = "chosen"
-        confession = ""
-        if best.variant != reference[0].name:
-            deviation = best.measurements.reference_deviation_rel_l2 if best.measurements else -1.0
-            confession = (
-                f"PLAN: served from the {best.variant!r} variant rather than the "
-                f"{reference[0].name!r} reference, chosen on the {objective} axis "
-                f"({provenance}); measured deviation from the reference is "
-                + (
-                    f"{deviation:.5f} relative L2 on one denoise step"
-                    if deviation >= 0.0
-                    else "NOT MEASURED"
-                )
-            )
-        return dataclasses.replace(best, confession=confession, walk=tuple(walk))
-
-    # A fixed shipped policy when the requested axis has no offline score. Package consent
-    # remains authoritative: use admitted encoded GEMMs only when allowed, else reference
-    # decoding. Consumer timings and allocation history cannot switch these implementations.
-    if encoded_leaves == "accept":
-        preferred = leaved.get(reference[0].name)
-        if preferred is not None:
-            for step in walk:
-                if step.plan == preferred.digest():
-                    step.verdict = "chosen_default"
-            return dataclasses.replace(
-                preferred,
-                confession=(
-                    f"Shipped policy: the {reference[0].name!r} reference variant uses "
-                    f"offline-qualified encoded GEMMs where its geometry supports them "
-                    f"and the package permits replacement ({preferred.label()}). "
-                    "Consumer timing history does not select the implementation."
-                    + _leaf_speed_confession(preferred.derived_leaf_speedup_x())
-                ),
-                walk=tuple(walk),
-            )
-    floor = floors.get(reference[0].name)
-    if floor is not None:
-        for step in walk:
-            if step.plan == floor.digest():
-                step.verdict = "chosen_default"
-        return dataclasses.replace(
-            floor,
-            confession=(
-                f"Shipped policy: the {reference[0].name!r} reference variant uses "
-                f"its supported decode floor ({floor.label()}); no permitted fast "
-                "implementation with matching offline facts is available."
-            ),
-            walk=tuple(walk),
-        )
-    raise PlanRefusal(
-        "no_qualified_plan",
-        f"no offered artifact variant resolves to an executable plan on "
-        f"{device_line(device)}. The tensor schema is known; what is missing is a "
-        "route from these stored bytes to a kernel this device has. "
-        + " | ".join(
-            f"{step.variant}/{step.policy or '-'}: {step.verdict} — {step.why[:200]}"
-            for step in walk
-        ),
-        walk,
+def _refusal(variant: Variant, device: DeviceFacts, step: Step) -> str:
+    return (
+        f"the {variant.name!r} variant resolves to no executable plan on {device_line(device)}. "
+        f"The tensor schema is known; what is missing is a route from these stored bytes to a "
+        f"kernel this device has. {step.verdict} — {step.why[:200]}"
     )
 
 
@@ -782,47 +448,31 @@ def script_plan(
     store: str,
     snapshot: str,
     providers: Mapping[str, tuple[Provider, ...]],
-    capabilities: Capabilities,
     device: DeviceFacts,
     runtime: RuntimeIdentity,
-    facts: PlanFacts,
     dtype_name: Callable[[str], str],
     snapshots: Mapping[str, str] | None = None,
-    objective: str = "latency",
     placement: str = "all_resident",
     encoded_leaves: str = "accept",
 ) -> ResolvedModelPlan:
-    """MODEL-LESS resolution for a driver script: one reference variant, these header rows.
-
-    cr-025's one-selection-authority law says the fill plane executes a resolved plan and
-    never selects below it. The executor resolves through `resolve()` with the model
-    class's own construction facts; a GPU driver script fills a raw component with no
-    model class at all, so this builds the construction identity from the rows alone
-    (`script:<components>`) and runs THE SAME `resolve()`. Nothing here
-    is a second chooser: every candidate, score and confession is `resolve()`'s.
-    """
+    """MODEL-LESS resolution for a driver script: these header rows, through THE SAME
+    `resolve()`, with the construction identity built from the rows alone
+    (`script:<components>`)."""
     construction = ConstructionFacts(
         release=release,
         model_class="script:" + "+".join(components),
         components=tuple(components),
     )
     variant = Variant(
-        name="script",
-        store=store,
-        snapshot=snapshot,
-        snapshots=dict(snapshots or {}),
-        reference=True,
+        name="script", store=store, snapshot=snapshot, snapshots=dict(snapshots or {})
     )
     return resolve(
-        variants=[variant],
-        rows_for={"script": list(rows)},
+        variant=variant,
+        rows=rows,
         providers=providers,
-        capabilities=capabilities,
         device=device,
         runtime=runtime,
         construction=construction,
-        facts=facts,
-        objective=objective,
         placement=placement,
         encoded_leaves=encoded_leaves,
         dtype_name=dtype_name,
@@ -832,25 +482,21 @@ def script_plan(
 def _build(
     *,
     variant: Variant,
-    reference: Variant,
     policy: str,
     resolved: Sequence[tuple[PlanRow, TensorCandidates]],
     device: DeviceFacts,
     runtime: RuntimeIdentity,
     construction: ConstructionFacts,
-    objective: str,
     placement: str,
     encoded_leaves: str,
-    steps_basis: int,
     dtype_name: Callable[[str], str],
 ) -> ResolvedModelPlan:
-    """One (variant, policy) -> its plan. Pure: no I/O, no device, no allocation."""
+    """One policy -> its plan. Pure: no I/O, no device, no allocation."""
     tensors: list[TensorResolution] = []
     for row, found in resolved:
         selection = _prefer(found.by_route, policy)
-        shape = row.shape
         numel = 1
-        for extent in shape:
+        for extent in row.shape:
             numel *= extent
         tensors.append(
             TensorResolution(
@@ -858,18 +504,14 @@ def _build(
                 component=row.component,
                 encoding=row.encoded.scheme,
                 implementation=selection.provider.name,
-                implementation_digest=selection.record.implementation_digest,
+                implementation_digest=implementation_digest(selection.provider),
                 implementation_revision=selection.provider.code_revision,
                 route=selection.provider.route,
-                geometry=shape,
-                geometry_class=geometry_class(shape),
+                geometry=row.shape,
                 output_dtype=dtype_name(row.dtype),
                 numel=numel,
                 stored_bytes=row.encoded.stored_nbytes,
-                resident_bits_per_element=selection.record.resident_bits_per_element,
-                kernel_numeric_error=selection.record.kernel_numeric_error,
                 reason=_reason(selection, found, policy),
-                leaf_speedup_x=selection.record.leaf_speedup_x,
                 refused=found.refused[0]
                 if found.refused
                 and encoded_leaves == "accept"
@@ -883,16 +525,13 @@ def _build(
         snapshots=dict(
             variant.snapshot_map() or {c: variant.snapshot for c in construction.components}
         ),
-        reference_variant=reference.name,
         policy=policy,
         tensors=tuple(tensors),
         device=device,
         runtime=runtime,
         placement=placement,
-        objective=objective,
         construction=construction,
         encoded_leaves=encoded_leaves,
-        steps_basis=steps_basis,
     )
 
 
@@ -901,54 +540,20 @@ def _prefer(by_route: Mapping[str, Selection], policy: str) -> Selection:
         found = by_route.get(route)
         if found is not None:
             return found
-    # `by_route` is non-empty by construction (the caller refuses an unqualified tensor
-    # before it gets here) and every route in it is one of the three.
+    # `by_route` is non-empty by construction (`resolve` refuses an unserved tensor first).
     return next(iter(by_route.values()))
 
 
 def _reason(selection: Selection, found: TensorCandidates, policy: str) -> str:
-    """WHY this tensor got this route, in one sentence, recorded IN the plan.
-
-    #549.5's geometry case is the one that made this mandatory: a plan that quietly resolves
-    one tensor to the decode floor while its 743 neighbours take the leaf is CORRECT
-    and completely opaque, and an operator looking at a footprint number that did not move
-    has nowhere to look.
-    """
+    """WHY this tensor got this route, in one sentence, recorded IN the plan (#549.5)."""
     parts = [selection.reason]
     if found.geometry_refused:
         parts.append(
             "GEOMETRY: "
             + " | ".join(f"{name} refused — {why}" for name, why in found.geometry_refused)
         )
+    if found.refused:
+        parts.append(" | ".join(f"{one.leaf}: {one.reason}" for one in found.refused))
     if policy == "decode_floor" and "encoded_gemm" in found.by_route:
-        parts.append(
-            "an encoded-GEMM implementation qualified for this tensor and the decode-floor "
-            "policy did not take it"
-        )
+        parts.append("the package declines encoded leaves, so the decode floor serves")
     return "; ".join(p for p in parts if p)
-
-
-def _leaf_speed_confession(speedup: float) -> str:
-    """The leaf-speed evidence, spelled into the uncalibrated confession.
-
-    NOT a rank and NOT a demotion, on purpose. The number is one GEMM shape with the
-    activation quantizer inside it (#515f: shape-dependent), the alternative decodes the
-    weights to float and doubles their residency on a card resolution cannot see the budget
-    of (`ModelFitRefused` has no fallback plan), and the package's consent names the encoded
-    lane as the reference's own bytes (cr-086). What the number IS for is being read: a leaf
-    this card measured losing to its float GEMM says so on the line that reports the route.
-    """
-    if speedup < 0.0:
-        return ""
-    verdict = (
-        " — SLOWER than decoding at the probe shape: this plan is served for the bytes it "
-        "keeps resident, not for speed"
-        if speedup < 1.0
-        else ""
-    )
-    return f". The qualification measured these leaves at {speedup:.2f}x their float GEMM" + verdict
-
-
-def _with_facts(plan: ResolvedModelPlan, facts: PlanFacts) -> ResolvedModelPlan:
-    fact = facts.get(plan.digest())
-    return dataclasses.replace(plan, measurements=fact if fact.samples else None)

@@ -486,11 +486,19 @@ def _import(candidate: Candidate) -> ModuleType:
         ) from exc
 
 
-def _launch(ready: Ready, device: DeviceFacts) -> None:
-    """Require the compiled arm's shipped verdict; only the offline oracle executes its probe.
+def _environment_key(candidate: Candidate) -> str:
+    """A kernel the package environment carries, as its kept self-check knows it: the imported
+    module's file, size and mtime, so an upgraded install is checked again."""
+    found = Path(getattr(_import(candidate), "__file__", "") or "")
+    stat = found.stat() if found.is_file() else None
+    return f"environment:{found}:{stat.st_size if stat else 0}:{stat.st_mtime_ns if stat else 0}"
 
-    Torch's own backends are the supported reference; Sol also requires its model layout.
-    """
+
+def _launch(ready: Ready, device: DeviceFacts) -> None:
+    """`verify_op` for a compiled kernel: each (head dim, dtype) it serves against attention in
+    float64 on this card, kept per machine by its build's key (`verify`). One that fails, or
+    whose probe raises, is not served. Torch's own backends need none; Sol runs only inside its
+    model's layout."""
     candidate = ready.candidate
     if not candidate.artifact or ready.name in attention_sol.NAMES or device.kind != "cuda":
         return
@@ -506,11 +514,8 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
 
     probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, pairs,
                     False)  # fmt: skip
-    # Bind the loaded wrapper/extension, including environment-provided packages. Recipe
-    # names and an empty "environment" key cannot borrow another binary's measurements.
-    implementation = import_module(candidate.import_name.split(".")[0])
-    key = verify.implementation_artifact(implementation)
-    verdict = verify.admitted(f"attention-{candidate.name}", key, device.sm, probe)
+    key = (ready.artifact or {}).get("key", "") or _environment_key(candidate)
+    verdict = verify.verified(f"attention-{candidate.name}", key, device.sm, probe)
     if not verdict.ok:
         raise AttentionRefusal(
             "attention_kernel_failed_verification",

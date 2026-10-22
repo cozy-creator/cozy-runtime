@@ -1,12 +1,11 @@
 """Ulysses' cut level and row counts, agreed once per pass (varena-slim §1, Collectives).
 
 At a sharded model's pass start every GPU of its group sends two int64s in one small async
-all-gather: the most of the levels Rust proposes for the pass's collective sites (`r.levels()`;
-one number whatever sites a GPU knows, so no GPU can wait on a different collective) and a
-digest of its input shapes. The first exchange waits on it and tells Rust the most of them
-(`r.agree`); every exchange of the pass crosses in the same head groups. An OOM on one GPU so
-becomes the same cut on all of them from the next pass; mid-pass a GPU recovers only locally
-(`catch.collective`).
+all-gather: the level this process proposes for the exchanges (its memo, one finer after an
+OOM in one: `catch.collective`) and a digest of its input shapes. The first exchange waits on
+it and every GPU keeps the most of them; every exchange of the pass crosses in the same head
+groups. An OOM on one GPU so becomes the same cut on all of them from the next pass; mid-pass
+a GPU never runs an exchange again.
 
 Every GPU's input shapes fix every exchange's rows on every GPU. So an exchange gathers its
 rows only in the first pass at a group's shapes (`sizes`), and later passes at the same shapes
@@ -25,7 +24,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from cozy_runtime.internal.execution.catch import CURRENT, Args, Kwargs, tensors
+from cozy_runtime.internal.execution.catch import Args, Kwargs, level, set_level, tensors
 
 #: every exchange of a model is one cut site: the same shapes cross in every block
 SITE = "ulysses"
@@ -58,9 +57,7 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
     outer = (_pass.level, _pass.model, _pass.key, _pass.exchanges)
     _pass.level, _pass.model, _pass.key, _pass.exchanges = None, None, None, 0
     if group is not None:
-        request = CURRENT.get()
-        proposed = request.levels() if request is not None else []
-        mine = max((level for _, level in proposed), default=0)
+        mine = level(SITE)  # this process's proposal: one finer after an OOM in an exchange
         shapes = zlib.crc32(repr([(t.shape, t.dtype) for t in tensors((args, kwargs))]).encode())
         sent = torch.tensor([mine, shapes], dtype=torch.int64, device=_device())
         got = torch.empty(2 * group.size(), dtype=torch.int64, device=sent.device)
@@ -73,18 +70,16 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
 
 
 def agreed() -> int:
-    """The level this pass's exchanges cross at (0 outside a sharded pass), told to Rust the
-    first time it is read."""
+    """The level this pass's exchanges cross at (0 outside a sharded pass), kept as this
+    process's the first time it is read."""
     found = _pass.level
     if isinstance(found, tuple):
         work, got = found
         work.wait()
-        level, *_ = gathered = got.view(-1, 2).T.tolist()
-        found = _pass.level = max(level)
+        levels, *_ = gathered = got.view(-1, 2).T.tolist()
+        found = _pass.level = max(levels)
         _pass.key = tuple(gathered[1])
-        request = CURRENT.get()
-        if request is not None:
-            request.agree([(SITE, found)])
+        set_level(SITE, "", found)  # the group's level is every GPU's from now on
     return found or 0
 
 

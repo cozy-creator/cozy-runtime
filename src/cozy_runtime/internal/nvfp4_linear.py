@@ -49,7 +49,7 @@ GEMV_N, GEMV_W = 64, 32
 DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
 
 _MAJOR: dict[int, int] = {}
-# Development oracle records the arm actually returned, including a kitchen fallback.
+# A test reads the arm a call actually served, a kitchen fallback included.
 OBSERVED: ContextVar[list[str] | None] = ContextVar("nvfp4_observed", default=None)
 
 

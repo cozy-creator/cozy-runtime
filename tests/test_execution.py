@@ -55,13 +55,11 @@ def test_without_an_oom_the_catch_changes_nothing(tmp_path: Path) -> None:
     assert r.stats().leftover == 0
 
 
-def test_an_oom_at_a_cut_site_takes_rust_s_cut_and_the_next_request_starts_there(
-    tmp_path: Path,
-) -> None:
+def test_an_oom_at_a_cut_site_cuts_it_and_the_next_request_starts_there(tmp_path: Path) -> None:
     """An FFN projection that cannot allocate for more than 48 tokens (an allocation the
-    allocator could not make room for) runs out inside its FFN's cut site: Rust cuts the site
-    finer, its token pieces give the whole FFN's result, and the next request at that shape
-    starts at the level Rust kept, with nothing running out."""
+    allocator could not make room for) runs out inside its FFN's cut site: the site goes finer,
+    its token pieces give the whole FFN's result, and the next request at that shape starts at
+    the level the process kept, with nothing running out."""
     plain = transformer()
     mem = memory()
     model = placed(mem, checkpoint(tmp_path, "dit", plain), "dit", transformer)
@@ -71,7 +69,6 @@ def test_an_oom_at_a_cut_site_takes_rust_s_cut_and_the_next_request_starts_there
         rows = args[0].numel() // args[0].shape[-1]
         if rows > 48:
             refused.append(rows)
-            catch._refused(0, rows * 256 * 2, 0, 0)
             raise torch.OutOfMemoryError("out of memory. Tried to allocate 48.00 KiB")
 
     model.blocks[0].ff.net[0].proj.register_forward_pre_hook(short)
@@ -80,12 +77,12 @@ def test_an_oom_at_a_cut_site_takes_rust_s_cut_and_the_next_request_starts_there
         want = plain(x)
         with mem.request("short") as r, execution.serving(r):
             got = model(x)
-        assert refused and r.stats().cuts >= 1
+        assert refused and any(n >= 1 for (at, _), n in catch.levels() if at.endswith(":tokens"))
         torch.testing.assert_close(got, want, rtol=2**-6, atol=2**-6)
         refused.clear()
         with mem.request("short again") as r, execution.serving(r):
             again = model(x)
-    assert not refused and r.stats().cuts == r.stats().retries == 0
+    assert not refused
     assert torch.equal(again, got)
 
 
@@ -115,9 +112,9 @@ def _decode_split(mem: Any, tmp_path: Path) -> tuple[Any, Any, tuple[Cut, ...], 
 
 def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> None:
     """v6 13598, on host pages: the VAE's last up block cannot allocate above 10x10 latent
-    windows, so the whole 16x16 decode runs out inside its pass. Run again at the same level
-    and failing at the same point without progress, varena cuts the split finer (never another
-    Retry): the decode completes in tiles. 13598 re-ran the whole decode for 17 minutes."""
+    windows, so the whole 16x16 decode runs out inside its pass: the split goes finer at once
+    (no run again at the same level) and the decode completes in tiles. 13598 re-ran the whole
+    decode for 17 minutes."""
     mem = memory()
     model, z, tiles, levels = _decode_split(mem, tmp_path)
     refused: list[tuple[int, int]] = []
@@ -126,21 +123,17 @@ def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> N
         h, w = (int(n) for n in args[0].shape[-2:])
         if h * w > 20 * 20:  # the last up block runs at twice the latent's size
             refused.append((h, w))
-            # A level fails at most twice (run again, then cut finer); more is the loop.
-            assert len(refused) <= 2 * (levels + 1), f"the decode re-ran without end: {refused}"
-            catch._refused(0, args[0].numel() * args[0].element_size(), 0, 0)
+            # A level fails at most once (then it is cut finer); more is a loop.
+            assert len(refused) <= levels + 1, f"the decode re-ran without end: {refused}"
             raise torch.OutOfMemoryError("out of memory. Tried to allocate 8.00 KiB")
 
     model.decoder.up_blocks[-1].register_forward_pre_hook(short)
     with torch.no_grad(), mem.request("decode") as r, execution.serving(r):
         got = split(lambda x: model.decode(x).sample, z, *tiles)
-    print(f"completed finer after {refused}, {r.stats().cuts} cut(s)")
+    print(f"completed finer after {refused}")
     assert tuple(got.shape) == (1, 3, 32, 32) and bool(torch.isfinite(got).all())
-    assert r.stats().cuts >= 1 and all(refused.count(w) <= 2 for w in set(refused)), refused
-    # The record the reply carries names each decision and what asked for it.
-    row = execution.record(r.stats(), -1, None, tmp_path, None)
-    assert [(d.trigger, d.action) for d in row.stats.decisions] == [("oom", "cut_outside")]
-    assert row.stats.decisions[0].site is not None and row.stats.decisions[0].level == 1
+    assert all(refused.count(w) == 1 for w in set(refused)), refused
+    assert any(at.startswith("split:") and n >= 1 for (at, _), n in catch.levels())
 
 
 def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:
@@ -205,7 +198,6 @@ def test_an_oom_in_an_rms_norm_cuts_it_by_tokens(
         rows = x.numel() // x.shape[-1]
         if rows > 32:
             refused.append(rows)
-            catch._refused(0, rows * 16 * 2, 0, 0)
             raise torch.OutOfMemoryError("out of memory. Tried to allocate 2.00 KiB")
         return cast("torch.Tensor", norm(module, x))
 
@@ -215,7 +207,7 @@ def test_an_oom_in_an_rms_norm_cuts_it_by_tokens(
     monkeypatch.setattr(nn.RMSNorm, "forward", short)
     with torch.no_grad(), mem.request("normed") as r, execution.serving(r):
         got = model(x)
-    assert refused and r.stats().cuts >= 1
+    assert refused and any(n >= 1 for (at, _), n in catch.levels() if at.endswith("1:tokens"))
     assert torch.equal(got, want)
 
 
@@ -290,7 +282,6 @@ def test_arbitrary_package_failure_runs_once() -> None:
     with mem.request("failure") as request, execution.serving(request), pytest.raises(RuntimeError):
         model(torch.ones(1))
     assert calls == [1]
-    assert request.stats().retries == request.stats().cuts == request.stats().parks == 0
 
 
 def test_non_cut_settle_does_not_replay_package_code() -> None:
@@ -302,8 +293,8 @@ def test_non_cut_settle_does_not_replay_package_code() -> None:
 
     mem = memory()
     with mem.request("outside") as request, execution.serving(request), pytest.raises(RuntimeError):
-        catch.settle(package, None, ())
-    assert seen == [1] and request.stats().retries == 0
+        catch.settle(package, None)
+    assert seen == [1]
 
 
 def test_custom_forward_is_not_assumed_to_be_a_pure_cut() -> None:

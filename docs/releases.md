@@ -51,14 +51,12 @@ or retry an already published version to test automation.
 See [tracker #348](https://github.com/cozy-creator/tracker/issues/348) for the source/prebuilt
 entrypoint repair and its rehearsal evidence.
 
-## Qualification tables
+## Kernel conformance
 
-The decode qualification ships as data (`internal/qualification_tables`), one table per card
-architecture and torch minor, valid while `IDENTITY_SOURCES` are unchanged. When a release
-changes them, measure every gate card's table on the candidate before tagging:
+Kernel selection is code rules by tensor-core family (xs-065); no release ships measured data.
+Before a rule names a new family's kernels, run the conformance suite by hand on a real card of
+that family; it prints a report and exits 1 on any failure:
 
 ```sh
-python -m cozy_runtime.cli.qualify src/cozy_runtime/internal/qualification_tables
+python -m cozy_runtime.cli.conformance
 ```
-
-A card without a current table measures what it is asked once per machine and keeps it.

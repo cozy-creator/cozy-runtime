@@ -1,7 +1,7 @@
 """`CoreDequant`: every row of `decode_schemes.ADAPTERS` (one per scheme the decode cores serve) as
 a decode provider, on CUDA by the Triton kernels and elsewhere by their eager reference. The fill
-plane checks a tensor's parts by the same row (`formats.part_rule`), and the probe qualifies each
-row with its own oracle (`probe.py`, suite `cores-decode`): random parts at the row's
+plane checks a tensor's parts by the same row (`formats.part_rule`), and the conformance suite
+checks each row with its own oracle (`probe.py`, suite `cores-decode`): random parts at the row's
 `probe_params`, kernel against eager, bit for bit, plus the scheme's spec vectors.
 """
 

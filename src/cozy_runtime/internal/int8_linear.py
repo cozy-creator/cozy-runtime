@@ -22,7 +22,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import cast
 
-from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, WARNINGS, Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.internal import (
@@ -92,6 +92,8 @@ def _built(
             LANDED[0] += 1
             print(f"[int8] {name} serves sm{sm}", file=sys.stderr)
     except Exception as exc:  # the next path serves this process; said once
+        if is_capacity(exc):  # the device ran out opening it: the memory manager answers
+            raise
         state.final = f"{type(exc).__name__}: {exc}"[:300]
         print(f"[int8] no {name} for this executor: {state.final}", file=sys.stderr)
     return state.served
@@ -133,7 +135,7 @@ def failed(op: str, device: int, exc: Exception) -> None:
 
 
 def library(index: int) -> prebuilt.Prebuilt:
-    """The library admitted by shipped offline facts for this card."""
+    """The library `native` verified for this card."""
     return _LIBS[index]
 
 
@@ -169,7 +171,7 @@ def native(torch: ModuleType, index: int) -> Op | None:
         ops, detail = prebuilt.library(torch, index, sm)
         if ops is None:
             raise kernel_sources.Absent(detail)
-        print(f"[int8] offline-qualified prebuilt kernels on sm{sm}: {detail}", file=sys.stderr)
+        print(f"[int8] prebuilt kernels verified on sm{sm}: {detail}", file=sys.stderr)
         _HALF[:] = (torch.bfloat16, torch.float16)
         _LIBS[index] = ops
         _OPS[index] = ops.int8_linear
@@ -181,13 +183,6 @@ def native(torch: ModuleType, index: int) -> Op | None:
 def kitchen(torch: ModuleType, index: int) -> ModuleType | None:
     """`comfy_kitchen`'s CUDA backend on this card, or None while its build runs (it starts on
     the first ask) and for good when this card or machine cannot have it."""
-
-    from cozy_runtime.internal import verify
-
-    # A format oracle that ran the prebuilt/reference arm cannot admit a kitchen build
-    # that appears later. Its separate int8/fp8/NVFP4 arms need explicit offline facts.
-    if not verify.in_oracle():
-        return None
 
     def opened(sm: int) -> ModuleType | None:
         if not arch.row(sm).family:
