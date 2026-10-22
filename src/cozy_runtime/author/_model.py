@@ -1276,6 +1276,7 @@ class ModelRegistry:
         started = time.perf_counter()
         model = cls()
         loader = self._loader(model, artifact, mode)
+        made = time.perf_counter()
         object.__setattr__(model, "_cozy_loading", True)
         try:
             with ExitStack() as stack:
@@ -1303,7 +1304,8 @@ class ModelRegistry:
             # The package's whole load() beside its constructions' legs: what its own code spent
             # after them (tokenizers, schedulers, its assets).
             legs = {
-                "before_load": began - started,  # the model, its loader, the substrate's entry
+                "model": made - started,  # the package's model and its loader
+                "substrate_enter": began - made,
                 "package_load": loaded - began,
                 "substrate_exit": exited - loaded,
             }
