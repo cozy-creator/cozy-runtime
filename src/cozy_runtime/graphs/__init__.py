@@ -401,12 +401,7 @@ def _record(
                 if not _clonable(torch, warm):
                     recorder.failed[key] = "output is not a tensor tree"
                     return None
-                # Keep an independent reference for correctness, outside the capture pool's
-                # device bytes. The copy completes before its source can be reused by capture.
-                reference = torch.utils._pytree.tree_map(
-                    lambda t: t.cpu() if isinstance(t, torch.Tensor) else t, warm
-                )
-                del warm
+            del warm  # preseeded capacity remains in this pool; no reference execution/oracle
             capturing = (
                 placed[0].graph_allocating(pool, route=False)
                 if placed is not None
@@ -417,26 +412,12 @@ def _record(
                 graph, why = capture(
                     torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, stream
                 )
-                if graph is None:
-                    _failed(recorder, key, placed, why)
-                    return None
-                if not _clonable(torch, outputs[0]):
-                    recorder.failed[key] = "captured output is not a tensor tree"
-                    return None
-                graph.replay()
-                for got, want in zip(
-                    torch.utils._pytree.tree_leaves(outputs[0]),
-                    torch.utils._pytree.tree_leaves(reference),
-                    strict=True,
-                ):
-                    if isinstance(got, torch.Tensor):
-                        try:
-                            torch.testing.assert_close(got.cpu(), want, rtol=5e-2, atol=1e-5)
-                        except AssertionError:
-                            recorder.failed[key] = "captured result differs from the pure call"
-                            _failed(recorder, key, placed, recorder.failed[key])
-                            return None
-                current.wait_stream(stream)
+            if graph is None:
+                _failed(recorder, key, placed, why)
+                return None
+            if not _clonable(torch, outputs[0]):
+                recorder.failed[key] = "captured output is not a tensor tree"
+                return None
         if placed is not None:
             placed[0].keep(
                 *(

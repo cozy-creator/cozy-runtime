@@ -222,12 +222,14 @@ def fault(exc: BaseException) -> Fault:
         if kind == "DistBackendError":
             return Fault.OOM if _NCCL_OOM in str(exc) else Fault.DEVICE
     if module.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):  # varena's errors
+        if exc.sticky:
+            return Fault.STICKY  # includes allocator ownership faults; never cut or reuse
         if kind == "Exhausted":
             return Fault.EXHAUSTED
         if getattr(exc, "code", "") == "DEVICE":
             if getattr(exc, "cuda_code", None) == _CUDA_OOM:
                 return Fault.OOM
-            return Fault.STICKY if exc.sticky else Fault.DEVICE
+            return Fault.DEVICE
         return Fault.OTHER
     if isinstance(exc, RuntimeError):
         text = str(exc)

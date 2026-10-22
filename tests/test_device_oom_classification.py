@@ -102,3 +102,7 @@ def test_varena_s_device_errors_by_their_cuda_code() -> None:
     assert fault(device(2)) is Fault.OOM
     assert fault(device(700, sticky=True)) is Fault.STICKY
     assert fault(device(999)) is Fault.DEVICE
+    ownership = varena.VarenaError("pool free did not establish ownership release")
+    ownership.code, ownership.sticky = "OWNERSHIP", True
+    assert fault(ownership) is Fault.STICKY
+    assert ending(ownership) == ENDED
