@@ -101,6 +101,7 @@ from cozy_runtime.author._executor_requests import (
     Exchange,
     Granted,
     Handoff,
+    HostGrant,
     KeepPages,
     Page,
     Published,
@@ -4430,12 +4431,11 @@ class Executor:
             if member.backend is not None:
                 member.backend.keep(quiescent=quiescent)
 
-    def _read_grant(
-        self, manifest: str, layout: str
-    ) -> tuple[int | None, list[tuple[int, int]], str]:
+    def _read_grant(self, manifest: str, layout: str) -> HostGrant:
         """The host layout the machine holds for `layout` (`ReadGrant`), with the GPU pages a gone
-        executor kept of it `(region, fd)` and their fingerprint; `(None, [], "")` when it holds
-        none. The fds are the caller's to close."""
+        executor kept of it `(region, fd)` and their fingerprint; with none held, whether the
+        machine admits sealing one (an older machine never says so: nothing seals). The fds are
+        the caller's to close."""
         request, pause = ReadGrant(manifest=manifest, layout=layout, rank=self.rank), 0.01
         answer = self._durable(request, Granted)
         # Another process seals this layout: its deposit lands as soon as it opens it, so this
@@ -4447,8 +4447,8 @@ class Executor:
         # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
         # as it is, filled or still filling (memory-varena §5.4, D9's refill).
         if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
-            pages = [(p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)]
-            return answer.fds[0], pages, answer.fingerprint
+            pages = tuple((p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True))
+            return HostGrant(answer.fds[0], pages, answer.fingerprint)
         for fd in answer.fds:
             os.close(fd)
         if answer.held:
@@ -4456,7 +4456,7 @@ class Executor:
                 f"{manifest[:23]}: the machine supplied an invalid kept layout",
                 code="weights_ungranted",
             )
-        return None, [], ""
+        return HostGrant(seal=answer.ok and answer.seal)
 
     def _keep_pages(self, layout: str, fingerprint: str, pages: list[tuple[int, int, int]]) -> None:
         """GPU pages varena kept here go to the machine, which holds them past this process

@@ -225,12 +225,26 @@ class Tier(Answer, frozen=True, kw_only=True):
 
 class Granted(Tier, frozen=True, kw_only=True):
     """A `ReadGrant`'s answer, its descriptors in `fds`: the one sealed host layout deposited
-    for the layout (`held`)."""
+    for the layout (`held`); with none, whether the asker may seal it (`seal`: it fits in the
+    machine's measured host surplus)."""
 
     fds: tuple[int, ...] = ()
     #: held: GPU pages a gone executor kept of the layout, whose fds follow the layout's
     fingerprint: str = ""
     pages: tuple[Page, ...] = ()
+    seal: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class HostGrant:
+    """A `Granted` as the load uses it: the host layout deposited for a weight set, the GPU pages
+    kept of it `(region, fd)` and their fingerprint. With none held, `seal`: the machine admits a
+    new host layout into its measured surplus; else varena reads the checkpoint."""
+
+    fd: int | None = None
+    pages: tuple[tuple[int, int], ...] = ()
+    fingerprint: str = ""
+    seal: bool = False
 
 
 class CallProgress(msgspec.Struct, frozen=True, kw_only=True):

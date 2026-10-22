@@ -32,6 +32,7 @@ from tensorfs.varena.torch import (
     blocks_of,
 )
 
+from cozy_runtime.author._executor_requests import HostGrant
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
 from cozy_runtime.internal import canonical, lora_bake
@@ -70,10 +71,8 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.nn import Module
 
-#: A weight set's held bytes from TensorD (`ReadGrant`), by manifest and layout digest: the host
-#: layout deposited for it, the GPU pages kept of it `(region, fd)` and their fingerprint;
-#: `(None, [], "")` when it holds none, and varena reads the checkpoint.
-type Grant = Callable[[str, str], tuple[int | None, list[tuple[int, int]], str]]
+#: `ReadGrant` by manifest and layout digest.
+type Grant = Callable[[str, str], HostGrant]
 #: GPU pages varena kept, given to TensorD (`KeepPages`): layout digest, fingerprint, and
 #: `(region, span, fd)` each (the callee's to close).
 type Keep = Callable[[str, str, list[tuple[int, int, int]]], None]
@@ -499,14 +498,21 @@ class Backend:
 
     def _granted(self, name: str) -> WeightGrant:
         """A component's grant, asked of TensorD once: the sealed host tier it holds for the
-        layout, registered by the load; without one, varena reads the checkpoint."""
+        layout, registered by the load; without one, varena seals one where TensorD admits it,
+        else reads the checkpoint."""
         grant = self.grants.get(name)
         if grant is None:
             checkpoint = self.checkpoints[name]
             grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
             if self.grant is not None:
-                fd, pages, fingerprint = self.grant(grant.manifest, self._layout(name))
-                grant = replace(grant, host_fd=fd, pages=tuple(pages), fingerprint=fingerprint)
+                held = self.grant(grant.manifest, self._layout(name))
+                grant = replace(
+                    grant,
+                    host_fd=held.fd,
+                    pages=held.pages,
+                    fingerprint=held.fingerprint,
+                    seal=held.seal,
+                )
             self.grants[name] = grant
         return grant
 
