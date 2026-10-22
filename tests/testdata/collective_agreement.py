@@ -30,7 +30,7 @@ from torch.multiprocessing.spawn import spawn
 
 from cozy_runtime.author._errors import classify
 from cozy_runtime.internal import attention_ulysses, execution
-from cozy_runtime.internal.execution import agree, catch
+from cozy_runtime.internal.execution import agree
 from cozy_runtime.internal.parallel import ulysses
 from cozy_runtime.internal.parallel.cp import CpComms, _GroupMesh
 
@@ -82,7 +82,6 @@ def rank_main(rank: int, degree: int, root: Path) -> None:
         def crossing(engines: Any, query: Any, *rest: Any) -> Any:
             if armed[0]:  # its buffers do not fit, before any collective of this exchange
                 armed[0] = False
-                catch._refused(0, query.numel() * query.element_size() * 3, 0, 0)
                 raise torch.OutOfMemoryError("out of memory. Tried to allocate 36.00 KiB")
             exchanged.append(int(query.shape[2]))
             return cross(engines, query, *rest)

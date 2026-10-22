@@ -96,15 +96,16 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     steps: tuple[Step, ...]
     stall_ns: int
     evicted: tuple[int, ...]
-    evicted_lowered: int
-    speculative_evicted_d: int
-    retries: int
-    cuts: int
-    parks: int
-    parked: int
-    lowered: bool
     peak: int
     leftover: int
+    #: the policy's own counters, absent from a core with one make_room loop (varena-slim step 1)
+    evicted_lowered: int = 0
+    speculative_evicted_d: int = 0
+    retries: int = 0
+    cuts: int = 0
+    parks: int = 0
+    parked: int = 0
+    lowered: bool = False
     room: int = 0
     host: int | None = None
     tier: int = 0

@@ -844,10 +844,6 @@ class Placement:
         for bakes in self.bakes.values():
             bakes.strategy = strategy
 
-    def keep(self, *held: Tensor) -> None:
-        """Tensors a cache or a hold owns (KV slots, a graph's static inputs): never parked."""
-        execution.keep(*held)
-
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
         """The region's address ownership, independent of its physical replay lease."""
         return self.models[component].retain(paths)
@@ -861,18 +857,12 @@ class Placement:
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def graph_spare(self) -> int | None:
-        """What the running request could get without evicting its working set or a pinned
-        page (None outside a request)."""
-        request = execution.catch.CURRENT.get()
-        return request.spare() if request is not None else None
-
     def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
         return self.memory.allocating(pool, route=route)
 
-    def graph_levels(self) -> tuple[tuple[str, int], ...]:
-        request = execution.catch.CURRENT.get()
-        return tuple(request.levels()) if request is not None else ()
+    def graph_levels(self) -> tuple[tuple[tuple[str, str], int], ...]:
+        """The process's cut levels: a graph recorded under them replays only under them."""
+        return execution.catch.levels()
 
     def graph_segments(self, component: str) -> tuple[str, ...]:
         """The model's declared block topology, which graph regions align with."""

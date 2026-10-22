@@ -317,8 +317,6 @@ class _Recorder:
         self.recordings: dict[tuple[object, ...], _Recording] = {}
         #: each key's first attempt (a request; a call where nothing is placed)
         self.seen: dict[tuple[object, ...], int] = {}
-        #: per key, the static buffers its graph would hold (measured on its first, eager call)
-        self.statics: dict[tuple[object, ...], int] = {}
         self.failed: dict[tuple[object, ...], str] = {}
         self.waiting: dict[tuple[object, ...], int] = {}
         self.binding: Any = None
@@ -377,7 +375,6 @@ class _Recorder:
             self.binding.close()
             self.binding = None
         self.seen.clear()
-        self.statics.clear()
         self.failed.clear()
         self.waiting.clear()
         self.landed = LANDED[0]
@@ -723,12 +720,7 @@ def _region_call(
             recorder.seen.get(key), attempt, later, placed is not None
         ):
             recorder.seen.setdefault(key, attempt)
-            out = eager()
-            # Its graph's static buffers: the inputs it would copy in and the outputs it keeps.
-            recorder.statics[key] = _nbytes(torch, leaves) + _nbytes(
-                torch, torch.utils._pytree.tree_leaves(out)
-            )
-            return out
+            return eager()
         if placed is not None:
             if (
                 recorder.binding is not None
@@ -769,14 +761,6 @@ def _replay(
         if placed is not None and not placed[0].graph_accounted():
             why = _GAPS[module] = "driver/context memory is unmeasured"
             _failed(recorder, key, placed, why)
-            return _EAGER
-        # Admitted only beside the step's working set: its static buffers must fit in what the
-        # request could get without evicting W or a pinned page (the pool's growth past that is
-        # refused by the allocator, never taken from W).
-        spare = placed[0].graph_spare() if placed is not None else None
-        if spare is not None and spare < recorder.statics.get(key, 0):
-            recorder.waiting[key] = attempt
-            _refused(module, placed, f"graph refused: room ({spare} bytes spare)")
             return _EAGER
         # Discovery owns the complete range set and then the admitted free headroom.
         # Only the declared pure region runs here; this does not select/tune kernels.
@@ -914,14 +898,6 @@ def _record(
             if not _clonable(torch, outputs[0]):
                 recorder.failed[key] = "captured output is not a tensor tree"
                 return None
-        if placed is not None:
-            placed[0].keep(
-                *(
-                    t
-                    for t in [*inputs, *torch.utils._pytree.tree_leaves(outputs[0])]
-                    if isinstance(t, torch.Tensor)
-                )
-            )
         owner = recorder.domain
         entry = _Recording(torch, graph, pool, inputs, chained, outputs[0], key, served, owner)
         recorder.recordings[key] = entry
@@ -1066,10 +1042,6 @@ def records(seen: int | None, attempt: int, later: bool, placed: bool) -> bool:
     only when the plan runs the component again `later` in it (v7: CLIP recorded 97 graphs on its
     last call of the request, each replayed once). Unplaced, every call is its own attempt."""
     return seen is not None and (seen != attempt or later or not placed)
-
-
-def _nbytes(torch: Any, leaves: list[Any]) -> int:
-    return sum(v.numel() * v.element_size() for v in leaves if isinstance(v, torch.Tensor))
 
 
 def _unplain(torch: Any, leaves: list[Any]) -> str:
