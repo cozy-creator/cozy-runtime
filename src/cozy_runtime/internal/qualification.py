@@ -17,6 +17,7 @@ from typing import Any
 
 import msgspec
 
+from cozy_runtime.internal import arch
 from cozy_runtime.internal.encoding import (
     Capabilities,
     DeviceFacts,
@@ -27,6 +28,7 @@ from cozy_runtime.internal.encoding import (
 )
 from cozy_runtime.internal.encoding.selection import reference_decoder
 from cozy_runtime.internal.probe import (
+    FamilyDefaultEvidence,
     Observation,
     QualificationResult,
     ReferenceEvidence,
@@ -46,6 +48,16 @@ SHIPPED = Path(__file__).resolve().parent / "qualification_tables"
 
 #: Bumped when a table's MEANING changes in a way its name does not catch.
 TABLE_FORMAT = 3
+
+#: Native leaves whose lane is one tensor-core format: on a card whose row has it, the family's
+#: default GEMM serves where no offline verdict refines the choice (prebuilt, else cuBLASLt).
+#: The destinations an 8-bit GEMM writes.
+HALF = ("float16", "bfloat16")
+LANE_FORMATS = {
+    "int8-convrot256-native": "int8",
+    "fp8-rowwise-native": "fp8",
+    "mxfp8-native": "fp8",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +147,11 @@ def _missing(encoding: str, provider: Provider, device: DeviceFacts, dtype: str)
             note="NVFP4 native dispatch lacks separate offline qualification for kitchen "
             "W4A4 and both W4A16 arms; the declared reference decoder serves"
         )
+    if evidence is None and dtype in HALF and (family := family_default(provider, device)):
+        evidence = FamilyDefaultEvidence(
+            note=f"no offline verdict refines {provider.name} on {device.predicate}; the "
+            f"{family} family default serves it"
+        )
     if evidence is None and reference_decoder(provider, device, dtype):
         evidence = ReferenceEvidence(
             note=f"shipped {provider.name} format decoder into {dtype}, then ordinary float GEMM; "
@@ -151,6 +168,14 @@ def _missing(encoding: str, provider: Provider, device: DeviceFacts, dtype: str)
             f"with output {dtype}; qualify this implementation in development"
         ),
     )
+
+
+def family_default(provider: Provider, device: DeviceFacts) -> str:
+    """The tensor-core family whose default GEMM serves `provider`'s lane on `device`, or ""
+    where the card lacks the lane's format (only there does a declared decoder serve it)."""
+    lane = LANE_FORMATS.get(provider.suite)
+    row = arch.row(device.sm) if device.kind == "cuda" else arch.NONE
+    return row.family if lane is not None and lane in row.formats() else ""
 
 
 def qualified(

@@ -341,7 +341,8 @@ def lost(f: str, sm: int) -> str:
 
 
 def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, str]:
-    """The shipped family, admitted by offline facts; unknown cards use reference execution.
+    """The shipped family: offline facts refine its kernels, and with none its defaults serve
+    (`admission`); a card no row names uses reference execution.
 
     Probes execute only in the explicit development oracle scope, never while serving.
     """
@@ -355,19 +356,30 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
         return None, f"the cozy-runtime wheel has no shipped {family} GEMM for sm{sm}"
     ops = Prebuilt(torch, index, family, sm in GEMM["fp8"].get(family, ()))
     formats = [f for f in (INT8, FP8) if getattr(row, f.name)]
-    verdicts = {
-        f.name: verify.admitted(
-            f"{KERNELS[f.name]}-{family.replace('.', '')}",
-            artifact(),
-            sm,
-            partial(probe, torch, ops, f),
-        )
-        for f in formats
-    }
+    verdicts = {f.name: admission(torch, ops, f, family, sm) for f in formats}
     failed = [f"{name}: {v.detail}" for name, v in verdicts.items() if not v.ok]
     if failed:
         return None, f"{family}: {'; '.join(failed)}"
     return ops, "; ".join(f"{name} {v.detail}" for name, v in verdicts.items())
+
+
+#: (sm, format) whose GEMM serves as its family's default, no offline verdict refining it ->
+#: what a run says about it (`gemm.family_default`).
+DEFAULTED: dict[tuple[int, str], str] = {}
+
+
+def admission(torch: ModuleType, ops: Prebuilt, f: _Format, family: str, sm: int) -> verify.Verdict:
+    """A format's GEMM on this card: its shipped verdict refines the family's kernel; with none,
+    the family default serves (a verdict never decides whether a lane runs)."""
+    kernel = f"{KERNELS[f.name]}-{family.replace('.', '')}"
+    if verify.in_oracle():
+        return verify.measured(kernel, artifact(), sm, partial(probe, torch, ops, f))
+    found = verify.shipped(kernel, artifact(), sm)
+    if found is not None:
+        return found
+    said = f"no offline verdict for {kernel} on sm{sm}: the {family} family default serves"
+    DEFAULTED[sm, f.name] = said
+    return verify.Verdict(True, said)
 
 
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
