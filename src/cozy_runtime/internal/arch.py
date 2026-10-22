@@ -80,6 +80,13 @@ def row(sm: int, family: str = "") -> Row:
     return Row(f"sm_{sm}", chosen, int8=True, fp8=sm >= 89, fp4=fp4, inherited=True)
 
 
+def hardware(sm: int) -> Row:
+    """The card's row by its compute capability alone: a named row, else the newest family the cc
+    could hold, never what a process has learned since. Admission reads it (`selection.admit`),
+    so a card's lanes are the same on every Load."""
+    return row(sm, (families(sm) or ("",))[0])
+
+
 def learn(sm: int, family: str) -> None:
     _LEARNED[sm] = family
 

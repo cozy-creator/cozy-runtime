@@ -16,7 +16,7 @@ import torch
 from cozy_runtime import __version__
 from cozy_runtime.internal import arch, int8_linear, prebuilt
 from cozy_runtime.internal.encoding import launch_providers, measure_device
-from cozy_runtime.internal.probe import conform
+from cozy_runtime.internal.probe import UnmeasuredEvidence, conform
 
 DTYPES = ("bfloat16", "float16", "float32")
 
@@ -27,7 +27,7 @@ def main() -> int:
     failed = [
         f"{one.implementation}@{one.output_dtype}"
         for one in report.observations
-        if not one.evidence.passed and type(one.evidence).__name__ != "UnmeasuredEvidence"
+        if not one.evidence.passed and not isinstance(one.evidence, UnmeasuredEvidence)
     ]
     kernels: dict[str, str] = {}
     if device.kind == "cuda":
@@ -43,7 +43,9 @@ def main() -> int:
             kernels["fa3"] = "serves" if fa3 is not None else why
             if fa3 is None:
                 failed.append("prebuilt-fa3")
-        if op is None and not prebuilt.ABSENT:
+        # A family the wheel does not carry serves torch's kernels by design; a kernel that
+        # fails its self-check here is the failure.
+        if "failed verification" in kernels["prebuilt"]:
             failed.append("prebuilt")
     print(
         json.dumps(

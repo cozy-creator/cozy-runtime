@@ -45,11 +45,8 @@ from cozy_runtime.internal.encoding import (
     implementation_digest,
 )
 
-#: The ROUTE POLICIES a plan is resolved under, by the package's consent. A policy says which
-#: route a tensor PREFERS when it has more than one; a tensor with one route takes it.
-POLICIES = ("encoded_gemm", "decode_floor")
-
-#: Preference order per policy. First route in the list that this tensor actually has wins.
+#: The route a tensor PREFERS under each policy (the package's consent decides the policy);
+#: the first route in the list that this tensor actually has wins.
 _PREFERENCE: dict[str, tuple[str, ...]] = {
     "encoded_gemm": ("encoded_gemm", "decoded_float", "verbatim"),
     "decode_floor": ("decoded_float", "verbatim", "encoded_gemm"),
