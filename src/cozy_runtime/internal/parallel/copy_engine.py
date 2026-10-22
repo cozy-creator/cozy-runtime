@@ -64,14 +64,17 @@ class CopyEngineExchange:
         """Every GPU's stream reached here: an abortable NCCL collective, never a spin."""
         self.torch.distributed.all_reduce(self.flag, group=self.pg)
 
-    def all_to_all(self, sends: Sequence[Any], matrix: Sequence[Sequence[int]]) -> list[Any]:
+    def all_to_all(
+        self, sends: Sequence[Any], matrix: Sequence[Sequence[int]], chunk: int = 0
+    ) -> list[Any]:
         """`sends[t]` is (rows, ...) contiguous; this GPU sends `matrix[self.rank][p]` rows of
         each to GPU p, in p order, and receives `matrix[s][self.rank]` from each s, stacked in
         s order. Every GPU passes the same matrix and tensors of the same row shapes, so every
-        GPU takes the same rounds: each moves up to `chunk` rows of every pair's block."""
+        GPU takes the same rounds: each moves up to `chunk` rows of every pair's block (0: as
+        many as the buffer holds; the calibration asks for fewer, to cross in rounds)."""
         torch, world, rank = self.torch, self.world, self.rank
         widths = [tensor.element_size() * math.prod(tensor.shape[1:]) for tensor in sends]
-        chunk = self.buffer.numel() // (world * sum(widths))
+        chunk = min(chunk or self.buffer.numel(), self.buffer.numel() // (world * sum(widths)))
         if chunk < 1:
             raise ValueError(f"one row of {sum(widths)} B per GPU exceeds the exchange buffer")
         # where each sender's rows land in the result
@@ -130,9 +133,8 @@ class CopyEngineExchange:
             current.wait_stream(stream)
 
 
-#: Bytes each GPU sends in the calibration: past one buffer, so the exchange it times and
-#: checks against NCCL's bytes crosses in rounds, as an H3 step's does.
-_CALIBRATION_BYTES = BUFFER_BYTES * 3 // 2
+#: Bytes each GPU sends in the calibration: the size class of one Ulysses exchange.
+_CALIBRATION_BYTES = 64 << 20
 
 
 def calibrate(
@@ -150,7 +152,11 @@ def calibrate(
         dist.all_reduce(agreed, op=op, group=pg)
         return float(agreed.item())
 
+    # A formation again (after a call ran short of memory) frees the last one's buffer first.
+    _BY_GROUP.clear()
     rows = _CALIBRATION_BYTES // 2 // 1024 // world * world
+    # Two rounds, the second short: every formation checks the rounds against NCCL's bytes.
+    half = rows // world // 2 + 1
     send = torch.randn(rows, 1024, dtype=torch.bfloat16, device="cuda")
     received = torch.empty_like(send)
     matrix = [[rows // world] * world for _ in range(world)]
@@ -181,8 +187,8 @@ def calibrate(
 
     timings["nccl_gbps"] = timed(lambda: dist.all_to_all_single(received, send, group=pg))
     try:
-        timings["copy_engine_gbps"] = timed(lambda: exchange.all_to_all([send], matrix))
-        exact = torch.equal(received, exchange.all_to_all([send], matrix)[0])
+        timings["copy_engine_gbps"] = timed(lambda: exchange.all_to_all([send], matrix, half))
+        exact = torch.equal(received, exchange.all_to_all([send], matrix, half)[0])
     except Exception:  # the whole group then keeps NCCL, every GPU alike
         exact = False
         timings["copy_engine_gbps"] = 0.0
