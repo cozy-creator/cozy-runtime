@@ -315,7 +315,7 @@ def matmul(
             else None
         )
         if module is not None:
-            amax = flat.abs().amax().float()
+            amax = torch.linalg.vector_norm(flat, float("inf")).float()  # one pass, exact
             tensor_scale = (amax / LEVELS_MAX).clamp(min=SCALE_FLOOR).reshape(1)
             try:
                 with readable(weight, blocked_scale, scale_2) as (w, scales, second):

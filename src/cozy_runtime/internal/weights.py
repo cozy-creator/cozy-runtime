@@ -32,6 +32,7 @@ from tensorfs.varena.torch import (
     blocks_of,
 )
 
+from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._executor_requests import HostGrant
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
@@ -854,6 +855,33 @@ class Residency:
         if held is not None and held[0] is token:
             self.pins.pop((component, owner))
             held[1].close()
+
+    def hold(self, components: Collection[str]) -> Callable[[], None]:
+        """The named components with no blocks bound until the returned call: a component-use
+        scope's use, as a forward's. Varena binds a component with no blocks whole for each op
+        that reads it outside its own forward, so H3's turbo LoRA factors, which the DiT's hooks
+        read on every projection call, bound all ~680 overlay tensors 33 thousand times a run
+        (cr-207). In use, it is never shed; one that does not fit now binds per op as before."""
+        holds: list[tuple[Any, Cache]] = []
+        for name in components:
+            model = self.models.get(name)
+            if model is None or model.blocks:
+                continue
+            cache = self.memory.cache(f"scope:{name}", lambda _: 0)
+            try:
+                holds.append((cache.hold(model), cache))
+            except Exception as exc:
+                cache.close()
+                if not (isinstance(exc, Unbound) or is_capacity(exc)):
+                    raise
+
+        def release() -> None:
+            for hold, cache in holds:
+                hold.close()
+                cache.close()
+            holds.clear()
+
+        return release
 
     def cache(self, owner: str, shed: Shrink) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""

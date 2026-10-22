@@ -278,6 +278,10 @@ class Residency(Protocol):
         """Remove the owner's matching pin; weights stay bound while any token reference lives."""
         ...
 
+    def hold(self, components: Collection[str]) -> Callable[[], None]:
+        """The named components with no blocks bound until the returned call (a scope's use)."""
+        ...
+
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
@@ -967,14 +971,15 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 @final
 class _ComponentScope:
     """A method's declared components, nested or on any of the call's threads (cr-202), each
-    marking its own context (`Model._cozy_active`). It carries no memory meaning: varena sees
-    each forward itself. Calls still take scopes one at a time (`SCOPES`): the sites they read
-    change between turns (cr-202 U4 lifts it).
+    marking its own context (`Model._cozy_active`). Varena sees each forward itself; a declared
+    component with no blocks is also held bound for the scope (`Residency.hold`), since another
+    component's forward may read it by its tensors. Calls still take scopes one at a time
+    (`SCOPES`): the sites they read change between turns (cr-202 U4 lifts it).
 
     A REMOTE scope, whose every declared component the runtime keeps on another GPU of the
     group (`Placement.remote`), uses nothing on this device."""
 
-    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote")
+    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_release", "_remote")
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
@@ -983,6 +988,7 @@ class _ComponentScope:
         self._remote: contextvars.Token[Any] | None = None
         self._local: contextvars.Token[Any] | None = None
         self._call: Context | None = None
+        self._release: Callable[[], None] | None = None
 
     def __enter__(self) -> None:
         model = self._model
@@ -1011,6 +1017,9 @@ class _ComponentScope:
             if model._cozy_harness is not None:
                 model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
             return
+        residency = model._cozy_residency
+        if residency is not None:
+            self._release = residency.hold(self._components)
         self._call = CURRENT.get()
         if self._call is not None:
             SCOPES.enter(self._call)
@@ -1041,6 +1050,9 @@ class _ComponentScope:
             self._local = None
         if self._call is not None:
             SCOPES.leave()
+        if self._release is not None:
+            self._release()
+            self._release = None
 
 
 # --------------------------------------------------------------------------- identity
