@@ -9,6 +9,7 @@ replayed. Its reset frees that stream's cached library pointers before the pool/
 from __future__ import annotations
 
 import ctypes
+import sys
 import threading
 import weakref
 from collections.abc import Iterator
@@ -137,6 +138,10 @@ class Domain:
 
     def finish(self) -> None:
         """Drain all uses, invalidate executables, then free only this domain's resources."""
+        # At interpreter shutdown, pinned-host tensor destructors may still need these
+        # streams. The CUDA process owns final reclamation; ordinary unload calls us early.
+        if sys.is_finalizing():
+            return
         with self.lock:
             if self.closed:
                 return
@@ -178,7 +183,8 @@ def acquire(torch: Any, root: Any, memory: Any = None) -> Domain:
         if found is None:
             found = Domain(torch, memory)
             _OWNERS[root] = found
-            weakref.finalize(root, found.finish)
+            finalizer = weakref.finalize(root, found.finish)
+            finalizer.atexit = False
         return found
 
 

@@ -5,6 +5,7 @@ CUDA the decode runs as replayed graphs."""
 
 from __future__ import annotations
 
+import weakref
 from typing import Any
 
 import pytest
@@ -12,10 +13,29 @@ import pytest
 torch = pytest.importorskip("torch")
 transformers = pytest.importorskip("transformers")
 
-from cozy_runtime import lm  # noqa: E402
+from cozy_runtime import graphs, lm  # noqa: E402
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 HYBRID = ["linear_attention", "linear_attention", "linear_attention", "full_attention"]
+
+
+@pytest.mark.skipif(DEVICE != "cuda", reason="owned CUDA stream and pinned buffer lifetime")
+def test_release_drops_pinned_buffers_before_domain_streams() -> None:
+    model = _qwen3()
+    ids = torch.randint(10, 290, (1, 12), device=DEVICE)
+    result = lm.generate(model, {"input_ids": ids}, max_new_tokens=8, stop=[], pad=0)
+    engine = lm._ENGINES[model]
+    owner, flag = engine.domain, weakref.ref(engine.flag)
+    assert owner is not None and engine.graphs
+    # Actual allocator shedding may precede explicit unload; it must release all its slots.
+    assert engine.idle()
+    assert flag() is None and not engine.graphs and engine.capacity == 0
+    assert all(name not in vars(engine) for name in type(engine).__annotations__)
+    lm.release(model)
+    graphs.release(torch, model)
+    assert owner.closed and owner.stream is owner.control is None
+    assert result.shape == (1, 8)
+    torch.cuda.synchronize()
 
 
 def _qwen3_5() -> Any:

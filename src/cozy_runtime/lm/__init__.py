@@ -1965,6 +1965,10 @@ class _Engine:
         self.cache, self.views = None, {}
         self.slots, self.capacity = [], 0
         self.layout = None
+        # In particular, the pinned host flag must free while the domain stream is alive:
+        # Torch's host allocator records that stream's completion when freeing the tensor.
+        for name in (*type(self).__annotations__, "flag", "rows_index", "dkeys", "dcache"):
+            vars(self).pop(name, None)
         if self.reservation is not None:
             self.reservation.close()
             self.reservation, self.held = None, 0
