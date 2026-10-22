@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from types import ModuleType
 from typing import TYPE_CHECKING
 
@@ -48,6 +49,13 @@ GEMV_N, GEMV_W = 64, 32
 DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
 
 _MAJOR: dict[int, int] = {}
+# Development oracle records the arm actually returned, including a kitchen fallback.
+OBSERVED: ContextVar[list[str] | None] = ContextVar("nvfp4_observed", default=None)
+
+
+def _used(arm: str) -> None:
+    if (observed := OBSERVED.get()) is not None:
+        observed.append(arm)
 
 
 try:
@@ -327,6 +335,7 @@ def matmul(
                     out = module.scaled_mm_nvfp4(
                         payload, w, tensor_scale, second, block, scales, out_dtype=out_dtype
                     )
+                _used("comfy-kitchen-w4a4")
                 return out[:rows].reshape(*x.shape[:-1], rows_out)
             except Exception as exc:  # W4A16 serves this call
                 int8_linear.failed("comfy-kitchen nvfp4", index, exc)
@@ -378,6 +387,7 @@ def matmul(
                             split,
                             1024,
                         )
+                    _used("triton-w4a16-gemv")
                     return out.reshape(*x.shape[:-1], rows_out)
                 decoded = torch.empty(rows_out, cols, dtype=x.dtype, device=x.device)
                 launch(
@@ -394,9 +404,12 @@ def matmul(
                     128,
                 )
             out = torch.nn.functional.linear(flat, decoded).to(out_dtype)
+            _used("triton-w4a16-decode")
             return out.reshape(*x.shape[:-1], rows_out)
     decoded = nvfp4_values(torch, weight, linear_scale(), scale_2).to(x.dtype)
-    return torch.nn.functional.linear(x, decoded).to(out_dtype)
+    out = torch.nn.functional.linear(x, decoded).to(out_dtype)
+    _used("torch-w4a16-decode")
+    return out
 
 
 def serving(index: int) -> str:

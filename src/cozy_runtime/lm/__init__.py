@@ -1719,6 +1719,7 @@ class _Engine:
         )
         reason = (
             ("driver/context memory is unmeasured" if unaccounted else "")
+            or (self.domain.refusal() if cuda and self.domain is not None else "")
             or _capture_contract(self.model)
             or ("draft head has no isolated capture contract" if drafted else "")
         )
@@ -1745,9 +1746,7 @@ class _Engine:
             try:
                 # Warm routing ended: capture enters the SAME pool, not a nested use_mem_pool.
                 with self._graph_memory(pool, route=False):
-                    graph, why = capture(
-                        torch, lambda: self._advance(size), pool, self.domain.stream
-                    )
+                    graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
             except Building:
                 graph, why, self.building = None, "", LANDED[0]
             self.captured[0] += 1
@@ -1778,7 +1777,6 @@ class _Engine:
             self.retired_graphs += len(self.graphs)
             self.graphs, self.warmed, self.unrecorded, self.pools = {}, set(), {}, {}
             self.pool = None
-            torch.cuda.empty_cache()
 
     def _unrecorded(self, key: tuple[int, int, bool], why: str) -> None:
         """That step runs eagerly from now on, with a warning on the calls it serves."""

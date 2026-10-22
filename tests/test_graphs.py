@@ -188,15 +188,42 @@ def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
     for got, expected in outputs:
         torch.testing.assert_close(got, expected)
     # Retire one executable/pool while the other still embeds the domain's BLAS pointers.
-    shared = recorder.domain.pool
-    workspace = recorder.domain.nbytes()
+    owner = recorder.domain
+    shared = owner.pool
+    segments = shared.snapshot(include_traces=False)
+    addresses = {s["address"] for s in segments}
+
+    def live(pool: Any) -> int:
+        return sum(
+            b["size"]
+            for s in pool.snapshot(include_traces=False)
+            for b in s["blocks"]
+            if b["state"] == "active_allocated"
+        )
+
+    active = live(shared)
+    assert active > 0
     key = next(k for k, v in recorder.recordings.items() if v.inputs[0].shape[0] == 4)
-    del recorder.recordings[key]
-    torch.cuda.empty_cache()
-    assert recorder.domain.pool is shared and recorder.domain.nbytes() == workspace
+    recorder.recordings.pop(key).close()
+    assert live(shared) == active, "a sibling graph reset released its library workspace"
+    # Force reuse pressure inside the very pool that owned the workspace, then replay B.
+    with torch.cuda.use_mem_pool(shared):
+        for _ in range(3):
+            churn = torch.empty(active // 4, dtype=torch.float32, device="cuda").fill_(17)
+            del churn
+    torch.cuda.synchronize()
+    assert live(shared) == active
     got, expected = run(second, 3.0, 8)
     torch.testing.assert_close(got, expected)
+    physical = sum(s["total_size"] for s in shared.snapshot(include_traces=False))
+    free_before = torch.cuda.mem_get_info()[0]
     graphs.release(torch, module)
+    assert live(shared) == 0 and owner.closed and owner.stream is owner.control is None
+    del shared
+    torch.cuda.synchronize()
+    # Pool destruction, without a global flush, returns physical segments to the allocator.
+    assert not addresses.intersection(s["address"] for s in torch.cuda.memory_snapshot())
+    assert torch.cuda.mem_get_info()[0] >= free_before + physical
     # Returned copies outlive both the executable and its private allocator pool.
     for got, expected in outputs:
         torch.testing.assert_close(got, expected)

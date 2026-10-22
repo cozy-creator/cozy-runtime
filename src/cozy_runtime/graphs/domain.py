@@ -1,9 +1,9 @@
-"""An owned capture stream and opaque library workspace shared by serialized regions.
+"""Component-owned library scratch, serialized across independently retired graphs.
 
-Torch's ordinary Stream factory draws from a finite pool. A domain uses an external stream
-it created itself, so unrelated eager work cannot borrow its library workspace accidentally.
-Idle domains are reused between component generations, like Torch's process context caches;
-their charged library allocations never belong to one disposable region graph.
+Torch 2.14 resets cuBLAS workspaces on a graph's capture stream. Region graphs therefore
+begin/end on a control stream and fork onto a separate, uniquely owned library stream. A
+small owner graph on the library stream is reset only at final domain teardown; it is never
+replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
 """
 
 from __future__ import annotations
@@ -16,24 +16,38 @@ from contextlib import contextmanager
 from typing import Any
 
 
+class Unavailable(RuntimeError):
+    """This runtime cannot honor the graph domain's workspace lifetime contract."""
+
+
+def unsupported(torch: Any) -> str:
+    return (
+        ""
+        if torch.__version__.split(".")[:2] == ["2", "14"]
+        else ("library-workspace graph lifetime is qualified only on Torch 2.14")
+    )
+
+
 class Domain:
     def __init__(self, torch: Any, memory: Any) -> None:
         self.torch, self.memory = torch, memory
         self.device = torch.cuda.current_device()
         self.lock = threading.RLock()
         self.stream: Any = None
+        self.control: Any = None
         self.pool: Any = None
+        self.owner: Any = None
+        self.fork: Any = None
+        self.join: Any = None
         self.done: Any = None
         self.last_stream: Any = None
         self.fenced = True
-        self.owned = True
-        self.generation = 0
+        self.closed = False
+        self.config: Any = None
+        self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
 
-    def initialize(self) -> None:
-        """Driver/library preparation runs under the caller's admitted discovery budget."""
-        if self.stream is not None:
-            return
+    def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
         status = self.torch.cuda.cudart().cudaStreamCreate(ctypes.addressof(pointer))
         code = int(getattr(status, "value", status))
@@ -42,18 +56,57 @@ class Domain:
             error.error_code = code
             raise error
         try:
-            stream = self.torch.cuda.ExternalStream(pointer.value, device=self.device)
-            pool = self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
-            done = self.torch.cuda.Event()
-            done.record(stream)
+            return self.torch.cuda.ExternalStream(pointer.value, device=self.device)
         except BaseException:
             self.torch.cuda.cudart().cudaStreamDestroy(pointer.value)
             raise
-        self.stream, self.pool, self.done = stream, pool, done
+
+    def configuration(self) -> tuple[Any, ...]:
+        cuda = self.torch.backends.cuda
+        return (
+            cuda.cublas_workspace_size(),
+            cuda.cublaslt_workspace_size(),
+            cuda.preferred_blas_library(),
+        )
+
+    def refusal(self) -> str:
+        if self.closed:
+            return "graph domain is closed"
+        if self.config is not None and self.configuration() != self.config:
+            return "library workspace configuration changed while graphs retain its pointers"
+        return unsupported(self.torch)
+
+    def initialize(self) -> None:
+        """Preparation, including the never-replayed owner, uses the admitted budget."""
+        if why := self.refusal():
+            raise Unavailable(why)
+        if self.stream is not None:
+            return
+        try:
+            self.stream = self._stream()
+            self.control = self._stream()
+            self.pool = (
+                self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
+            )
+            self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
+            self.fork.record(self.control)
+            self.join.record(self.stream)
+            self.done.record(self.stream)
+            self.owner = self.torch.cuda.CUDAGraph()
+            # No library work or allocator routing inside this owner graph. Recording an
+            # event makes its capture stream explicit; reset later clears only this stream.
+            with self.torch.cuda.stream(self.stream):
+                self.owner.capture_begin(capture_error_mode="thread_local")
+                self.join.record(self.stream)
+                self.owner.capture_end()
+            self.config = self.configuration()
+        except BaseException:
+            self.finish()
+            raise
 
     @contextmanager
     def using(self) -> Iterator[None]:
-        """Serialize every use of shared workspace, including output copies across streams."""
+        """Serialize shared workspace and order producers/output copies across streams."""
         with self.lock:
             current = self.torch.cuda.current_stream(self.device)
             depth = getattr(self.local, "depth", 0)
@@ -71,7 +124,9 @@ class Domain:
                     self.fenced = True
 
     def prime_blas(self) -> None:
-        """Initialize this thread's BLAS handle/workspace in the domain's persistent pool."""
+        """Prime the actual capture thread's handle into persistent domain ownership."""
+        if why := self.refusal():
+            raise Unavailable(why)
         context = (
             self.memory.allocating(self.pool)
             if self.memory is not None
@@ -81,45 +136,49 @@ class Domain:
             self.torch.cuda.current_blas_handle()
 
     def finish(self) -> None:
+        """Drain all uses, invalidate executables, then free only this domain's resources."""
         with self.lock:
-            if not self.fenced:
+            if self.closed:
+                return
+            if not self.fenced and self.last_stream is not None:
                 self.last_stream.synchronize()
-                self.fenced = True
-            elif self.done is not None:
+            if self.done is not None:
                 self.done.synchronize()
-            self.owned = False
+            for stream in (self.stream, self.control):
+                if stream is not None:
+                    stream.synchronize()
+            for graph in self.graphs:
+                graph.reset()
+            self.graphs.clear()
+            if self.owner is not None:
+                self.owner.reset()
+                self.owner = None
+            self.pool = None  # MemPool destruction releases this pool, never a global flush.
+            for stream in (self.stream, self.control):
+                if stream is not None:
+                    self.torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
+            self.stream = self.control = self.fork = self.join = self.done = None
+            self.closed = self.fenced = True
 
     def nbytes(self) -> int:
         return (
             0
             if self.pool is None
-            else sum(segment["total_size"] for segment in self.pool.snapshot(include_traces=False))
+            else sum(s["total_size"] for s in self.pool.snapshot(include_traces=False))
         )
 
 
 _LOCK = threading.RLock()
 _OWNERS: weakref.WeakKeyDictionary[Any, Domain] = weakref.WeakKeyDictionary()
-# The stream and the library's cached pointers have process-context lifetime. Reuse an idle
-# domain rather than creating new streams/workspaces for every successive model generation.
-_DOMAINS: list[Domain] = []
 
 
 def acquire(torch: Any, root: Any, memory: Any = None) -> Domain:
     with _LOCK:
         found = _OWNERS.get(root)
         if found is None:
-            device = torch.cuda.current_device()
-            found = next(
-                (d for d in _DOMAINS if not d.owned and d.device == device and d.memory is memory),
-                None,
-            )
-            if found is None:
-                found = Domain(torch, memory)
-                _DOMAINS.append(found)
-            found.owned = True
-            found.generation += 1
+            found = Domain(torch, memory)
             _OWNERS[root] = found
-            weakref.finalize(root, _retire, found, found.generation)
+            weakref.finalize(root, found.finish)
         return found
 
 
@@ -127,16 +186,10 @@ def release(root: Any) -> None:
     with _LOCK:
         found = _OWNERS.pop(root, None)
     if found is not None:
-        _retire(found, found.generation)
+        found.finish()
 
 
 def existing(root: Any) -> Domain | None:
     """Observe an existing owner without creating a domain or touching CUDA."""
     with _LOCK:
         return _OWNERS.get(root)
-
-
-def _retire(found: Domain, generation: int) -> None:
-    with _LOCK:
-        if found.generation == generation and found.owned:
-            found.finish()

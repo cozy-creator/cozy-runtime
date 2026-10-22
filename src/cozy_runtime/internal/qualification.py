@@ -100,6 +100,11 @@ def _covering(
             if evidence is None
             else make_observation(encoding, provider, device, dtype, evidence)
         )
+        # The current NVFP4 oracle observes one dispatch arm. A W4A16 fallback does not
+        # qualify optional kitchen W4A4, nor its tensor-global activation quantizer. Keep
+        # the declared decode route until offline evidence covers the complete dispatcher.
+        if provider.suite == "nvfp4-native":
+            found = None
         observations.append(
             found if found is not None else _missing(encoding, provider, device, dtype)
         )
@@ -125,6 +130,11 @@ def write_table(path: Path, table: QualificationResult) -> None:
 
 def _missing(encoding: str, provider: Provider, device: DeviceFacts, dtype: str) -> Observation:
     evidence = settled(provider, device)
+    if evidence is None and provider.suite == "nvfp4-native":
+        evidence = UnmeasuredEvidence(
+            note="NVFP4 native dispatch lacks separate offline qualification for kitchen "
+            "W4A4 and both W4A16 arms; the declared reference decoder serves"
+        )
     if evidence is None and reference_decoder(provider, device, dtype):
         evidence = ReferenceEvidence(
             note=f"shipped {provider.name} format decoder into {dtype}, then ordinary float GEMM; "

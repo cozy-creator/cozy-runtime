@@ -117,7 +117,7 @@ def unavailable() -> tuple[Unavailable, ...]:
 def failed(op: str, device: int, exc: Exception) -> None:
     """`op` raised on this card: its caller serves a slower path for this one call, and the run
     says so, once per reason. A device OOM raises: it is the memory manager's to answer."""
-    if fault(exc) is Fault.OOM:
+    if fault(exc) in (Fault.OOM, Fault.STICKY, Fault.DEVICE):
         raise exc
     reason = f"{type(exc).__name__}: {exc}"[:300]
     fields: dict[str, str | bool | int | float | None] = {

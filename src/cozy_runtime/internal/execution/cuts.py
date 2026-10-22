@@ -1,4 +1,8 @@
-"""Exact cuts (varena-slim §2): each computes what the whole computes, results on the device, at
+"""Cuts preserve reduction and quantization domains, with floating-point rounding tolerance.
+
+Purity alone is insufficient: tensor-global activation scales and RNG state forbid cuts.
+Changing GEMM row geometry may change rounding; bitwise equivalence is not promised.
+The results stay on the device, at
 the level Rust holds for its site (`r.cut`). Level L is 2^L pieces, down to the finest.
 
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
@@ -148,6 +152,7 @@ def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callab
             or module.training
             or torch.is_grad_enabled()
             or not type(module).forward.__module__.startswith("diffusers.")
+            or not _token_local(module)
         ):
             return forward(x, *args, **kwargs)
         tokens = x.numel() // max(x.shape[-1], 1)
@@ -161,6 +166,18 @@ def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callab
         return forward(x)
 
     return cut
+
+
+def _token_local(module: nn.Module) -> bool:
+    """NVFP4 uses a tensor-global activation scale and changes backend at small M.
+
+    Keep the complete call even if a later kernel build would enable that arm. No chunk
+    may silently select a different quantizer/backend. Other approved row quantizers keep
+    their full channel/block reduction within each token.
+    """
+    from cozy_runtime.internal.encoding.leaves import NVFP4
+
+    return not any(getattr(child, "provider", None) == NVFP4 for child in module.modules())
 
 
 class _Whole(Exception):
@@ -319,7 +336,9 @@ def _attend(
 
 def split[T](name: str, key: str, total: int, finest: int, run: Callable[[int], T]) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
-    most `most` of its `total` elements; `finest` is the least a window can hold."""
+    most `most` of its `total` elements; `finest` is the least a window can hold. Its author
+    must preserve global statistics/quantizers and declare any overlap approximation; merely
+    having no side effects does not make differently sized windows numerically equivalent."""
 
     def at(level: int) -> T:
         return run(max(pieces(total, level), finest))

@@ -186,7 +186,7 @@ def _call(
         if signature not in named:
             named.add(signature)
             seen.setdefault(backend, set()).add(local.impl(query, key, value, options))
-    if _EXECUTION is None:
+    if _EXECUTION is None or options["dropout_p"] != 0.0:
         return local.forward(query, key, value, **options)
     return _EXECUTION.attend(
         lambda q, k, v, mask: local.forward(q, k, v, **{**options, "attn_mask": mask}),

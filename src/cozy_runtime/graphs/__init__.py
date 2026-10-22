@@ -36,7 +36,9 @@ def say(key: str, line: str) -> None:
         print(line, file=sys.stderr)
 
 
-def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, str]:
+def capture(
+    torch: Any, step: Callable[[], object], pool: Any, owner: domain.Domain
+) -> tuple[Any, str]:
     """Record a caller-owned capture-safe computation in its already prepared pool.
 
     The caller owns purity, residency, static-data lifetime and all consuming streams. No
@@ -44,7 +46,9 @@ def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> t
     """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
+    stream, work = owner.control, owner.stream
     stream.wait_stream(current)
+    stream.wait_stream(work)
     failure: BaseException | None = None
     with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
         try:
@@ -53,7 +57,14 @@ def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> t
             failure = exc
         else:
             try:
-                step()
+                owner.fork.record(stream)
+                work.wait_event(owner.fork)
+                with torch.cuda.stream(work):
+                    try:
+                        step()
+                    finally:
+                        owner.join.record(work)
+                        stream.wait_event(owner.join)
             except Exception as exc:
                 failure = exc
             try:
@@ -61,6 +72,7 @@ def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> t
             except Exception as exc:
                 failure = failure or exc
     current.wait_stream(stream)
+    current.wait_stream(work)
     if isinstance(failure, Building):
         raise failure
     if failure is not None:
@@ -69,6 +81,7 @@ def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> t
             if code not in (900, 901):  # unsupported or invalidated capture, already ended
                 raise failure
         return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
+    owner.graphs.add(graph)
     return graph, ""
 
 
@@ -128,6 +141,12 @@ class _Recording:
             self.done.record(stream)
             self.fenced = True
 
+    def close(self) -> None:
+        """After last use: release static tensors and executable before their private pool."""
+        self.inputs, self.outputs = [], None
+        self.graph.reset()
+        self.graph = self.pool = None
+
     def idle(self) -> bool:
         return self.fenced and (self.done is None or bool(self.done.query()))
 
@@ -154,6 +173,8 @@ class _Recorder:
         if any(not entry.idle() for entry in self.recordings.values()):
             return False
         self.retired += len(self.recordings)
+        for entry in self.recordings.values():
+            entry.close()
         self.recordings.clear()
         if self.binding is not None:
             self.binding.close()
@@ -165,7 +186,6 @@ class _Recorder:
         self.failed.clear()
         self.waiting.clear()
         self.landed = LANDED[0]
-        torch.cuda.empty_cache()
         return True
 
 
@@ -523,7 +543,10 @@ def _record(
             with capturing:
                 outputs: list[Any] = []
                 graph, why = capture(
-                    torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, stream
+                    torch,
+                    lambda: outputs.append(call(module, *cargs, **ckwargs)),
+                    pool,
+                    recorder.domain,
                 )
             if graph is None:
                 _failed(recorder, key, placed, why)
@@ -547,7 +570,7 @@ def _record(
             recorder.cache.cached(sum(e.nbytes for e in recorder.recordings.values()))
         return entry
     except Exception as exc:
-        if not is_capacity(exc) and not isinstance(exc, Building):
+        if not is_capacity(exc) and not isinstance(exc, Building | domain.Unavailable):
             raise
         _failed(recorder, key, placed, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
         return None

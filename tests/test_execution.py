@@ -143,3 +143,78 @@ def test_custom_forward_is_not_assumed_to_be_a_pure_cut() -> None:
     assert cuts.install(model) == 0
     model(torch.ones(1, 1, 2, 2))
     assert model.changed == 1
+
+
+def test_nvfp4_ffn_keeps_whole_token_quantization_domain() -> None:
+    import sys
+
+    from diffusers.models.attention import FeedForward
+
+    from cozy_runtime.internal import nvfp4_linear
+    from cozy_runtime.internal.encoding.leaves import Nvfp4NativeLeaf
+
+    module = FeedForward(64, dim_out=64, mult=1, activation_fn="gelu").eval()
+    projection = module.net[0].proj
+    parts = {
+        "weight": torch.full((64, 32), 0x12, dtype=torch.uint8),
+        "scale": torch.ones((64, 4)).to(torch.float8_e4m3fn),
+        "scale_2": torch.tensor(0.125),
+    }
+    module.net[0].proj = Nvfp4NativeLeaf().leaf(torch, parts, projection, torch.float32)
+    forward = module.forward
+    cut = cuts._ffn("nvfp4:tokens", module, forward)
+    x = torch.randn(2, 24, 64)
+    x[:, -1] *= 100  # tensor-global activation extrema would change across token pieces
+    visited: list[str] = []
+    arms: list[str] = []
+
+    def profile(frame: Any, event: str, arg: Any) -> None:
+        if event == "call" and frame.f_code is catch.cut.__code__:
+            visited.append(frame.f_code.co_name)
+
+    token, previous = nvfp4_linear.OBSERVED.set(arms), sys.getprofile()
+    try:
+        sys.setprofile(profile)
+        with torch.inference_mode():
+            got, expected = cut(x), forward(x)
+    finally:
+        sys.setprofile(previous)
+        nvfp4_linear.OBSERVED.reset(token)
+    assert not cuts._token_local(module) and not visited
+    assert arms == ["torch-w4a16-decode", "torch-w4a16-decode"]
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)
+
+
+def test_attention_dropout_preserves_the_whole_calls_rng() -> None:
+    import sys
+
+    q, k, v = (torch.randn(1, 16, 4, 8) for _ in range(3))
+    options = attention_ulysses.Options(
+        attn_mask=None, dropout_p=0.5, is_causal=False, scale=None, enable_gqa=False
+    )
+
+    def dropout(q: Any, k: Any, v: Any, **options: Any) -> Any:
+        return torch.nn.functional.scaled_dot_product_attention(
+            q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), **options
+        ).transpose(1, 2)
+
+    local = attention_ulysses.Local(dropout, lambda *_: "torch-cpu", rows=4)
+    visited: list[str] = []
+
+    def profile(frame: Any, event: str, arg: Any) -> None:
+        if event == "call" and frame.f_code is cuts.attend.__code__:
+            visited.append(frame.f_code.co_name)
+
+    previous = sys.getprofile()
+    try:
+        with torch.inference_mode():
+            torch.manual_seed(55)
+            expected = local.forward(q, k, v, **options)
+            state = torch.get_rng_state()
+            torch.manual_seed(55)
+            sys.setprofile(profile)
+            got = attention_ulysses._call("torch", local, q, k, v, options)
+    finally:
+        sys.setprofile(previous)
+    assert not visited and torch.equal(torch.get_rng_state(), state)
+    torch.testing.assert_close(got, expected, rtol=0, atol=0)

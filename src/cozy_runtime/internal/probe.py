@@ -57,7 +57,7 @@ from tensorfs import UnsupportedError
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
 from cozy_runtime.derive.microscale import encode_nvfp4
-from cozy_runtime.internal import accel, canonical
+from cozy_runtime.internal import accel, canonical, nvfp4_linear
 from cozy_runtime.internal.decode_cores import Cores
 from cozy_runtime.internal.decode_schemes import run, sample
 from cozy_runtime.internal.encoding import (
@@ -650,6 +650,8 @@ def _native_agreement(
     x = _activation(torch, device, dtype)
     reference = _reference_gemm(torch, x, weight)
     replaced = _StandIn(int(weight.shape[1]), int(weight.shape[0]))
+    arms: list[str] = []
+    token = nvfp4_linear.OBSERVED.set(arms)
     try:
         got = provider.leaf(torch, roles, replaced, dtype)(x)
     except Exception as exc:  # the kernel, the dtype or the arch says no — verbatim
@@ -659,6 +661,8 @@ def _native_agreement(
             note="the native kernel refused on this device; no record is minted, and the "
             "encoding falls to whichever decode provider this card DID qualify",
         )
+    finally:
+        nvfp4_linear.OBSERVED.reset(token)
     deviation = _relative(torch, got, reference)
     finite = bool(torch.isfinite(got).all())
     contract = str(got.dtype) == str(x.dtype)
@@ -670,6 +674,12 @@ def _native_agreement(
         finite=finite,
         out_dtype=str(got.dtype).removeprefix("torch."),
         out_dtype_is_contract=contract,
+        kernel="+".join(sorted(set(arms))),
+        note=(
+            "numerics cover only the recorded NVFP4 dispatch arm; other arms remain unqualified"
+            if provider.suite == "nvfp4-native"
+            else ""
+        ),
     )
 
 
