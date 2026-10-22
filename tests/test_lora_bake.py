@@ -12,8 +12,10 @@ from cozy_runtime.derive.microscale import (
     e4m3_decode,
     encode_fp8_rowwise,
     encode_int8_convrot256,
+    encode_nvfp4,
 )
 from cozy_runtime.internal import lora_bake
+from cozy_runtime.internal.encoding.formats import nvfp4_values
 
 torch = pytest.importorskip("torch")
 
@@ -249,3 +251,67 @@ def test_an_int8_convrot_bake_keeps_the_delta_in_its_rotated_grid() -> None:
     merged = decode_int8_convrot256(stored["weight"].numpy(), scale.numpy())
     lane = encode_int8_convrot256("w", target.astype(np.float32)).relative_frobenius()
     assert np.linalg.norm(merged - target) / np.linalg.norm(target) < 2 * lane + 0.01
+
+
+def _nvfp4(values: np.ndarray) -> dict[str, Any]:
+    encoded = encode_nvfp4("w", values)
+    weight = torch.frombuffer(bytearray(encoded.payload), dtype=torch.uint8).view(ROWS, COLS // 2)
+    scale = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.uint8)
+    second = torch.frombuffer(bytearray(encoded.companions[1].raw), dtype=torch.float32)
+    return {
+        "weight": weight.clone(),
+        "scale": scale.view(ROWS, COLS // 16).view(torch.float8_e4m3fn).clone(),
+        "scale_2": second.clone(),
+        "input_scale": torch.ones(1),
+    }
+
+
+def _decoded_nvfp4(stored: dict[str, Any]) -> np.ndarray:
+    weight, scale, second = stored["weight"], stored["scale"], stored["scale_2"]
+    return nvfp4_values(torch, weight, scale.float(), second).numpy()
+
+
+def test_only_a_canonical_nvfp4_weight_is_bakeable() -> None:
+    roles = {"weight": "u8", "scale": "f8_e4m3fn", "scale_2": "f32", "input_scale": "f32"}
+    assert lora_bake.bakeable("nvfp4", lora_bake.NVFP4_PARAMS, roles)
+    assert lora_bake.bakeable("nvfp4", {}, {k: v for k, v in roles.items() if k != "input_scale"})
+    assert not lora_bake.bakeable("nvfp4", {"nibble_order": "high_first"}, roles)
+    assert not lora_bake.bakeable("nvfp4", {"scale_layout": "cublas_128x4"}, roles)
+    assert not lora_bake.bakeable("nvfp4", {"global_scale": "divide"}, roles)
+
+
+def test_an_nvfp4_bake_keeps_the_delta_on_the_kept_grid() -> None:
+    """Stochastic E2M1 keeps the LoRA in expectation where nearest drops it; a zero delta is a
+    fixed point; `refit` sets the second level from the baked weight and never saturates."""
+    values, down, up = _layer(13)
+    zero = _nvfp4(values)
+    before = {k: v.clone() for k, v in zero.items()}
+    lora_bake.bake(torch, zero, down * 0, up, seed=3)
+    assert all(torch.equal(zero[k].view(torch.uint8), before[k].view(torch.uint8)) for k in zero)
+    base, delta = _decoded_nvfp4(before), (up.double() @ down.double()).numpy() * 0.3
+    kept = {}
+    for rounding, grid in (("nearest", "keep"), ("stochastic", "keep"), ("stochastic", "refit")):
+        stored, stats = _nvfp4(values), lora_bake.Stats()
+        lora_bake.bake_nvfp4(
+            torch,
+            stored["weight"],
+            stored["scale"],
+            stored["scale_2"],
+            down,
+            up,
+            0.3,
+            rounding=rounding,
+            grid=grid,
+            generator=torch.Generator().manual_seed(5),
+            stats=stats,
+        )
+        moved = _decoded_nvfp4(stored) - base
+        kept[rounding, grid] = float((moved * delta).sum() / np.square(delta).sum())
+        assert abs(stats.retention - kept[rounding, grid]) < 1e-3
+        if grid == "refit":
+            assert stats.saturated == 0
+            assert float(stored["scale_2"]) == pytest.approx(
+                np.abs(base + delta).max() / lora_bake.NVFP4_LEVELS, rel=1e-3
+            )
+    assert kept["nearest", "keep"] < 0.5
+    assert 0.85 < kept["stochastic", "keep"] < 1.15

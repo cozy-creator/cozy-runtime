@@ -16,6 +16,7 @@ from typing import Any
 
 import pytest
 
+from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.internal import lora_bake
 
 torch = pytest.importorskip("torch")
@@ -205,3 +206,53 @@ def test_a_fused_int8_convrot_bake_stores_a_rotated_neighbour_without_bias() -> 
     lora_bake.fused(torch, {"data": again, "scale": scale}, down, up, 0)
     assert torch.equal(again, first)
     assert abs(sum(bias) / len(bias)) < 0.01
+
+
+def _nvfp4(weight: Any) -> dict[str, Any]:
+    encoded = encode_nvfp4("w", weight.numpy())
+    rows, cols = weight.shape
+    blocks = torch.frombuffer(bytearray(encoded.companions[0].raw), dtype=torch.uint8)
+    return {
+        "weight": torch.frombuffer(bytearray(encoded.payload), dtype=torch.uint8).view(rows, -1),
+        "scale": blocks.view(rows, cols // 16).view(torch.float8_e4m3fn),
+        "scale_2": torch.frombuffer(bytearray(encoded.companions[1].raw), dtype=torch.float32),
+    }
+
+
+def _nvfp4_values(stored: dict[str, Any]) -> Any:
+    second = float(stored["scale_2"])
+    blocks = stored["scale"].view(torch.uint8)
+    return lora_bake._nvfp4_decode(torch, stored["weight"], blocks, second).double()
+
+
+@interpreted
+def test_a_fused_nvfp4_bake_keeps_the_eager_grid_and_the_delta() -> None:
+    """The fused nvfp4 form grows the same block scales as the eager bake, stores each element
+    within a step of its target, keeps the LoRA as the eager bake does, and a zero delta or a
+    seed is a fixed point."""
+    weight, down, up = _layer(3)
+    down, up = down * 4, up * 4
+    stored = _nvfp4(weight)
+    zero = _copy(stored)
+    lora_bake.fused(torch, zero, down * 0, up, 2)
+    assert all(torch.equal(zero[k].view(torch.uint8), stored[k].view(torch.uint8)) for k in zero)
+    base, delta = _nvfp4_values(stored), up.double() @ down.double()
+    kept, eager_kept, first = [], [], None
+    for seed in range(4):
+        fused, eager = _copy(stored), _copy(stored)
+        lora_bake.fused(torch, fused, down, up, seed)
+        lora_bake.bake(torch, eager, down, up, seed=seed, stats=lora_bake.Stats())
+        assert torch.equal(fused["scale"].view(torch.uint8), eager["scale"].view(torch.uint8))
+        got = _nvfp4_values(fused)
+        unit = lora_bake.decode_e4m3(torch, fused["scale"].view(torch.uint8)).double()
+        unit = unit.repeat_interleave(16, dim=1) * float(stored["scale_2"])
+        assert ((got - (base + delta)).abs() <= 2 * unit + 1e-12).all()
+        kept.append(float(((got - base) * delta).sum() / delta.square().sum()))
+        moved = _nvfp4_values(eager) - base
+        eager_kept.append(float((moved * delta).sum() / delta.square().sum()))
+        first = fused if first is None else first
+    again = _copy(stored)
+    lora_bake.fused(torch, again, down, up, 0)
+    assert torch.equal(again["weight"], first["weight"])
+    assert abs(sum(kept) / 4 - sum(eager_kept) / 4) < 0.1
+    assert 0.8 < sum(kept) / 4 < 1.2
