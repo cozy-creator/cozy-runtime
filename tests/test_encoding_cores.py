@@ -62,8 +62,8 @@ def test_a_row_is_a_provider_with_the_schemes_rules() -> None:
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16", "float16"])
 def test_the_probe_passes_every_row_on_this_gpu(dtype: str) -> None:
     """The `cores-decode` oracle (the row's random parts, every byte pattern, by the kernels on
-    the GPU against the eager reference, bit for bit), then the whole decode evidence: oracle,
-    spec vectors, bench and route axes."""
+    the GPU against the eager reference, bit for bit), then the whole decode evidence: oracle
+    and spec vectors."""
     for adapter in ADAPTERS:
         provider = replace(CoreDequant(adapter.scheme), params=params_of(adapter.probe_params))
         target = torch.device("cuda")
