@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# The memory matrix (design varena-slim §5): the shipping line and the candidate on the same rentals, every request
+# The memory matrix (design varena-slim §6): the shipping line and the candidate on the same rentals, every request
 # through `cozy` in the default home. The bar and the receipts are memory_receipts.py's.
 #
 #   gates/memory-matrix.sh [--shipping <runtime>,<tensorfs>[,<cozy>]] [--candidate <runtime>,<tensorfs>[,<cozy>]]
 #                          [--tensorhub <hub>] [--org <org>] [--on wddm=<machine>] [--walls <summary.txt>]... [--plan]
 #                          [card[:group,…]...]
 #
-# A line is its wheels and, if either line names one, the dev `cozy` binary the machine runs (`--tensord`, a local
-# file); wheels are files or https://…#sha256=<hex>. One line runs alone (a shakedown). Two alternate per group: the
+# A line is its wheels and, if either line names one, the `cozy` binary the machine runs (`--tensord`): each a file, a
+# released version (`--shipping 0.30.3,0.13.6,0.11.5`: PyPI's manylinux x86_64 wheels, the cozy release's Linux
+# binary) or, for a wheel, https://…#sha256=<hex>. One line runs alone (a shakedown). Two alternate per group: the
 # rental's even groups run the shipping line first, odd groups the candidate, so neither always meets a warm page cache.
 # Cards (default 24 12 8 6 2x8 2x12): 24, 12, 8 and 6 are GPU memory limits on one rental of the cheapest 24 GB SKU
 # with stock; 2x8 and 2x12 on one 2 × 24 GB rental; real8, real12 and h100 rent that card; wddm runs on the machine
@@ -16,7 +17,8 @@
 # sdxl1 sdxl4 anima seedvr2 birefnet describer; on 2x8 and 2x12 h3long2 (long_form 2 × 5 s at degree 2); the scenarios
 # d9 lora beside pair two cotenant twenty pressure kill on 24, and d9 at degree 2 on 2x12. h3ra5 (ref2va, standard
 # steps; cold, then warm ×3) runs when named, for a Hub without the turbo LoRA.
-# Around every run, hostmem.py reads the machine's cgroup memory.events: a receipt carries the OOM kills between.
+# Around every run, hostmem.py reads the machine's cgroup memory: a receipt carries the OOM kills between and the host
+# memory the container may use (memory.max); each rental's is logged when it starts.
 # --walls: earlier summaries whose measured walls price the plan, printed before anything is rented; --plan stops there.
 # `memory_receipts.py replay <dir>` re-derives every receipt from a run directory's records (this one's or S8's).
 # Results: ./memory-matrix-<stamp>/ (summary.txt: one receipt per run; every run's show JSON; machine logs). Exit
@@ -42,16 +44,18 @@ while [ $# -gt 0 ]; do
 done
 abs() { [ -f "$1" ] && realpath "$1" || echo "$1"; }
 version() { basename "${1%%#*}" | cut -d- -f2; }  # a wheel's version, from its file name
+released() { [[ $1 =~ ^[0-9]+(\.[0-9]+)+([.+-][0-9A-Za-z.]+)?$ ]]; }  # a published version, not a file or URL
 LINES=() BINARIES=0
 for l in shipping candidate; do
   [ -n "${LINE[$l]:-}" ] || continue
   LINES+=("$l")
   IFS=, read -r r t c <<< "${LINE[$l]}"
   [ -n "$t" ] || { echo "$l: <runtime>,<tensorfs>[,<cozy>]" >&2; exit 2; }
-  for f in "$r" "$t"; do [[ $f == https://* ]] || [ -f "$f" ] || { echo "$l: no file $f" >&2; exit 2; }; done
-  [ -z "$c" ] || [ -x "$c" ] || { echo "$l: the cozy binary must be a local executable (its version is checked)" >&2; exit 2; }
+  for f in "$r" "$t" ${c:+"$c"}; do
+    released "$f" || [[ $f == https://* && $f != "$c" ]] || [ -f "$f" ] || { echo "$l: no file or version $f" >&2; exit 2; }
+  done
   [ -n "$c" ] && BINARIES=$((BINARIES + 1))
-  LINE[$l]=$(abs "$r"),$(abs "$t")${c:+,$(realpath "$c")}
+  LINE[$l]=$(abs "$r"),$(abs "$t")${c:+,$(abs "$c")}
 done
 [ ${#LINES[@]} -gt 0 ] || { echo "name a line: --shipping and/or --candidate" >&2; exit 2; }
 [ "$BINARIES" = 0 ] || [ "$BINARIES" = ${#LINES[@]} ] || { echo "both lines name a cozy binary, or neither" >&2; exit 2; }
@@ -71,6 +75,20 @@ chosen() { local spec=$1; [[ $spec == *:* ]] && tr , ' ' <<< "${spec#*:}" || gro
 D=$PWD/memory-matrix-$(date -u +%Y%m%dT%H%M%SZ); mkdir -p "$D"; cd "$D" || exit 1
 TAG=$(basename "$D")
 say() { echo "$(date -u +%T) $*" | tee -a summary.txt; }
+cozy_release() {  # cozy_release <version>: that cozy release's Linux x86_64 binary, checked against its sha256 file
+  local dir=$D/cozy-$1 asset=cozy-x86_64-unknown-linux-gnu.tar.gz
+  gh release download "v$1" -R cozy-creator/cozy-creator -p "$asset*" -D "$dir" > /dev/null &&
+    (cd "$dir" && sha256sum -c "$asset.sha256" > /dev/null && tar xzf "$asset") &&
+    [ "$("$dir/${asset%.tar.gz}/cozy" --version)" = "cozy $1" ] && echo "$dir/${asset%.tar.gz}/cozy"
+}
+for l in "${LINES[@]}"; do  # versions become PyPI's manylinux x86_64 wheels and the cozy release's Linux binary
+  IFS=, read -r r t c <<< "${LINE[$l]}"
+  released "$r" && { r=$(python3 -I "$RECEIPTS" wheel cozy-runtime "$r") || { echo "$l: $r" >&2; exit 2; }; }
+  released "$t" && { t=$(python3 -I "$RECEIPTS" wheel tensorfs "$t") || { echo "$l: $t" >&2; exit 2; }; }
+  if [ -n "$c" ] && released "$c"; then c=$(cozy_release "$c") || { echo "$l: no cozy release binary" >&2; exit 2; }; fi
+  [ -z "$c" ] || [ -x "$c" ] || { echo "$l: the cozy binary must be a local executable (its version is checked)" >&2; exit 2; }
+  LINE[$l]=$r,$t${c:+,$c}
+done
 cozy machine rent --json --tensorhub "$H" > catalog.json 2> catalog.err || { cat catalog.err >&2; exit 1; }
 SPECS=()
 for spec in $CARDS; do
@@ -356,6 +374,7 @@ rental() {  # rental <spec>…: one rental's cards in order, each group on every
   K=${1%%:*}
   install "${LINES[0]}" || return "$FAILED"  # before any limit: the line's machine is the one that applies it
   host "host-$cls-start.json"
+  say "rental $cls on $M: host $(python3 -I "$RECEIPTS" host "host-$cls-start.json")"
   for log in tensord memory; do  # kept here in case the machine is lost mid-run
     cozy machine logs "$M" "$log" -f -n 0 --tensorhub "$H" > "$log-$cls.log" 2>&1 &
     FOLLOW="$FOLLOW $!"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The memory matrix's receipts (design varena-slim §5): one typed record per run from `cozy run show --json`, the
+"""The memory matrix's receipts (design varena-slim §6): one typed record per run from `cozy run show --json`, the
 absolute bar, Belady MIN over the recorded page-reference trace, the matched comparison, and the rentals' plan."""
 
 import hashlib
@@ -9,10 +9,11 @@ import math
 import re
 import statistics
 import sys
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
-#: the bar's slack over the trace's Belady MIN (design §5)
+#: the bar's slack over the trace's Belady MIN (design §6)
 MIN_SLACK = 1.05
 #: varena's eviction classes, in the order `Stats.evicted` counts them (S1 `memory.rs`)
 CLASSES = ("F", "O", "S", "N", "D", "W", "P")
@@ -90,6 +91,7 @@ class Receipt:
     min: float | None  # GB
     bar: str
     steps: dict[str, float]  # mean ms per step, by stage
+    graphs: dict[str, str]  # graph_* fields as printed
 
 
 def count(value, name):
@@ -284,6 +286,40 @@ def kills(before, after):
     return max(deltas) if deltas else None
 
 
+def host_limit(path):
+    """The host memory a hostmem.py reading shows this container may use: the smallest numeric cgroup memory.max on its
+    path, else MemTotal; None without a reading."""
+    try:
+        value = json.loads(Path(path).read_text())["result"]["value"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    limits = [int(v) for k, v in value.items() if k.endswith("/memory.max") and isinstance(v, str) and v.isdigit()]
+    total = re.search(r"MemTotal:\s+(\d+) kB", value.get("meminfo", ""))
+    return min(limits) if limits else int(total[1]) << 10 if total else None
+
+
+#: Runtime 0.31's component graph counters (`graphs.describe`, under `measurements.residency.graphs.<component>`)
+GRAPH_COUNTS = ("declared_regions", "region_calls", "replays", "capture_attempts", "captures", "retired_graphs",
+                "replay_copy_bytes", "graph_pool_bytes", "domain_workspace_bytes")
+
+
+def graph_counts(calls):
+    """The calls' graph counters summed over components (decode graphs are already in a component's own counts), with
+    `captured_regions` and `eager_gaps` counted; None when no call records graphs."""
+    out = None
+    for call in calls:
+        graphs = (((call.get("measurements") or {}).get("residency") or {}).get("graphs") or {})
+        for described in graphs.values() if isinstance(graphs, dict) else ():
+            if not isinstance(described, dict):
+                continue
+            out = out or dict.fromkeys((*GRAPH_COUNTS, "captured_regions", "eager_gaps"), 0)
+            for key in GRAPH_COUNTS:
+                out[key] += described.get(key) if type(described.get(key)) is int else 0
+            out["captured_regions"] += len(described.get("captured_regions") or ())
+            out["eager_gaps"] += len(described.get("eager_gaps") or ())
+    return out
+
+
 def step_times(calls):
     """Per stage with steps (`measurements.attribution.steps`): count, mean and first step in ms, over the calls."""
     out = {}
@@ -343,7 +379,7 @@ def record(path, cell, number, state, line, cap, host_before="", host_after=""):
     killed = kills(host_before, host_after)
     if killed:
         bar.append("host-oom-kill")
-    steps = step_times(calls)
+    steps, graphs, limit = step_times(calls), graph_counts(calls), host_limit(host_after) if host_after else None
     m = [m for _, m in memories]
     total = {f: sum(getattr(x, f) for x in m) for f in ("kept", "tier", "store", "copy_ns", "stall_ns", "retries",
                                                          "cuts", "parks")}
@@ -387,7 +423,16 @@ def record(path, cell, number, state, line, cap, host_before="", host_after=""):
         "leftover": some(leftover), "poisoned": int(poisoned), "min": f"{gb(least)}GB",
         "dit_step_max": f"{max(dit) if dit else '-'}B",
         "step_ms": ",".join(f"{k}:{n}x{mean:.0f}/{first:.0f}" for k, (n, mean, first) in steps.items()) or "-",
-        "oom_kill": "-" if killed is None else f"+{killed}", "bar": ",".join(bar) or "ok",
+        "oom_kill": "-" if killed is None else f"+{killed}", "host_max": f"{gb(limit)}GB",
+        # §5's graph report: captures, replay coverage of region calls, regions captured, pool bytes, replay copies
+        "graph_capture": graphs and f"{graphs['captures']}/{graphs['capture_attempts']}",
+        "graph_replay": graphs and f"{graphs['replays']}/{graphs['region_calls']}"
+                                   f"({pct(graphs['replays'], graphs['region_calls'])}%)",
+        "graph_regions": graphs and f"{graphs['captured_regions']}/{graphs['declared_regions']}"
+                                    f"+{graphs['eager_gaps']}eager",
+        "graph_pool": graphs and f"{gb(graphs['graph_pool_bytes'] + graphs['domain_workspace_bytes'])}GB",
+        "graph_copy": graphs and f"{gb(graphs['replay_copy_bytes'])}GB",
+        "bar": ",".join(bar) or "ok",
     }
     print(f"{cell} run={number} {state} " + " ".join(f"{k}={'-' if v is None else v}" for k, v in fields.items())
           + f" reason={reason[:300]}")
@@ -413,7 +458,8 @@ def receipts(path):
         out.append(Receipt(match[1], match[2], match[3], match[4] == "landed", f.get("line", "?"), f.get("cap", "?"),
                            number(f.get("wall", "0s")) or 0.0, number(f.get("exec", "-")), number(f.get("moved", "-")),
                            number(f.get("min", "-")), f.get("bar", "?"),
-                           {stage: float(mean) for stage, mean in re.findall(r"(\w+):\d+x([\d.]+)/", f.get("step_ms", ""))}))
+                           {stage: float(mean) for stage, mean in re.findall(r"(\w+):\d+x([\d.]+)/", f.get("step_ms", ""))},
+                           {k: v for k, v in f.items() if k.startswith("graph_") and v != "-"}))
     return out
 
 
@@ -453,6 +499,10 @@ def compare(summary, lines):
                 a = statistics.median(r.steps[stage] for r in old if stage in r.steps)
                 b = statistics.median(r.steps[stage] for r in new if stage in r.steps)
                 say.append(f"{stage}/step {a:.0f} -> {b:.0f} ms")
+            for field in ("graph_replay", "graph_capture", "graph_pool", "graph_copy"):
+                a, b = (next((r.graphs[field] for r in rows if field in r.graphs), "-") for rows in (old, new))
+                if a != "-" or b != "-":
+                    say.append(f"{field[6:]} {a} -> {b}")
             least = [r.min for r in new if r.min is not None]
             print(f"{key}: {'; '.join(say)}{f'; MIN {statistics.median(least):.3f} GB' if least else ''}")
     print(f"memory-matrix: {failures} {tested} runs below the absolute bar, {worse} worse than the shipping line")
@@ -491,6 +541,18 @@ def replay(directory):
         if after:
             before[rental] = after
     return failed
+
+
+def wheel(project, version):
+    """`<url>#sha256=<hex>`: PyPI's one manylinux x86_64 abi3 wheel of `project` at exactly `version`, which a rental
+    fetches itself (`cozy machine update --runtime-wheel/--tensorfs-wheel`)."""
+    with urllib.request.urlopen(f"https://pypi.org/pypi/{project}/{version}/json") as answer:
+        files = json.load(answer)["urls"]
+    found = [f for f in files if f["filename"].endswith(".whl") and "abi3" in f["filename"]
+             and "manylinux" in f["filename"] and f["filename"].endswith("x86_64.whl")]
+    if len(found) != 1:
+        raise ValueError(f"{project} {version}: {len(found)} manylinux x86_64 abi3 wheels on PyPI")
+    return f"{found[0]['url']}#sha256={found[0]['digests']['sha256']}"
 
 
 def rental(catalog, card):
@@ -565,6 +627,12 @@ if __name__ == "__main__":
             result = compare(args[0], args[1:])
         elif verb == "replay":
             result = min(replay(args[0]), 255)
+        elif verb == "wheel":
+            print(wheel(*args))
+            result = 0
+        elif verb == "host":
+            print(f"memory.max {gb(host_limit(args[0]))} GB, oom_kill {max(oom_kills(args[0]).values(), default='-')}")
+            result = 0
         elif verb == "rental":
             print(rental(*args))
             result = 0
@@ -573,7 +641,7 @@ if __name__ == "__main__":
             plan(args[0], args[1].split(","), args[2:split], args[split + 1:])
             result = 0
         else:
-            raise ValueError("use record, compare, replay, rental or plan")
+            raise ValueError("use record, compare, replay, wheel, host, rental or plan")
     except (OSError, ValueError, TypeError, KeyError, IndexError) as error:
         print(f"memory receipt refused: {error}")
         result = 1

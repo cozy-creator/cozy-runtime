@@ -168,6 +168,29 @@ class Receipts(unittest.TestCase):
         self.assertIn("reason=executor_invalidated: device executor ended", text)
         self.assertIn("oom_kill=- ", self.record(value, "12-h3ra5", line="candidate", cap="12", state="failed landed")[1])
 
+    def test_graph_report_from_runtime_031s_component_counters(self):
+        # Runtime 0.31's graphs.describe() per component, as the executor reply's residency carries it.
+        value = fixture("sdxl1-candidate-12872")
+        unet = {"declared_regions": 12, "active_graphs": 10, "region_calls": 400, "replays": 360, "capture_attempts": 11,
+                "captures": 10, "retired_graphs": 0, "replay_copy_bytes": 3 * GB, "captured_regions": ["a", "b"] * 5,
+                "eager_gaps": {"up.0": "not plain", "up.1": "not plain"}, "graph_pools": 10,
+                "graph_pool_bytes": GB, "domains": 1, "domain_workspace_bytes": GB // 2}
+        value["measurements"]["residency"] = {"notes": {}, "graphs": {"model": unet, "vae": dict.fromkeys(unet, 0)}}
+        code, text, row = self.record(value, "12-sdxl1", line="candidate", cap="12")
+        self.assertIn("graph_capture=10/11 graph_replay=360/400(90.0%) graph_regions=10/12+2eager "
+                      "graph_pool=1.500GB graph_copy=3.000GB ", text)
+        self.assertEqual(row.graphs["graph_replay"], "360/400(90.0%)")
+        # A line that records no graphs shows none, and the comparison sets the lines side by side.
+        _, plain, _ = self.record(fixture("sdxl1-shipping-12881"), "12-sdxl1", cap="12")
+        self.assertIn("graph_capture=- graph_replay=- ", plain)
+        code, text = self.compare(plain + text, ["shipping", "candidate"])
+        self.assertIn("replay - -> 360/400(90.0%); capture - -> 10/11; pool - -> 1.500GB; copy - -> 3.000GB", text)
+
+    def test_receipts_carry_the_hosts_memory_max(self):
+        host = (str(FIXTURES / "hostmem-before.json"), str(FIXTURES / "hostmem-after.json"))
+        text = self.record(fixture("sdxl1-shipping-12881"), "12-sdxl1", cap="12", host=host)[1]
+        self.assertIn("host_max=31.000GB ", text)  # S8's pod: a 31 GB cgroup on a 134 GB host
+
     def test_candidate_misplaced_evictions_fail(self):
         value = varena(["Tier", "Hit", "Hit"])
         stats = value["calls"][0]["measurements"]["memory"]["stats"]["varena"][0]["stats"]
@@ -225,7 +248,8 @@ class Receipts(unittest.TestCase):
             out = io.StringIO()
             with contextlib.redirect_stdout(out):
                 API["replay"](root)
-        self.assertIn("oom_kill=+6 bar=failed:executor_invalidated,host-oom-kill", out.getvalue())
+        self.assertIn("oom_kill=+6 host_max=31.000GB ", out.getvalue())
+        self.assertIn("bar=failed:executor_invalidated,host-oom-kill ", out.getvalue())
 
     def test_rentals_come_cheapest_first_from_the_catalog(self):
         self.assertEqual(API["rental"](CATALOG, "8"), "1x24 1 8GiB rtx-pro-4000 l4 rtx-4090 rtx-3090")
