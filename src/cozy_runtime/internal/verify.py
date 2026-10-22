@@ -7,7 +7,8 @@ kernel, its artifact's digest, the card's architecture and the driver, so a driv
 re-verifies and never recompiles. One process probes a key while others wait for its verdict, and
 a failing verdict is written before the probe starts: a kernel that ends its process (a sticky
 CUDA error) stays refused. A failure is final for that key: its caller serves the next kernel of
-the family's order and the run says so.
+the family's order and the run says so. A device that ran out of memory during the probe keeps
+no verdict: the error raises for the memory manager, and the next open checks again.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
 
+from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.internal import accel, filelock, kernel_cache
 from cozy_runtime.internal.encoding.formats import Tensor
 
@@ -79,16 +81,24 @@ def verified(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) 
         known = _read(path)
         if known is None:
             _write(path, key, Verdict(False, "its probe ended the process before a verdict"))
-            known = _run(probe)
+            try:
+                known = _run(probe)
+            except BaseException:
+                path.unlink(missing_ok=True)  # the device ran out: no verdict either way
+                raise
             _write(path, key, known)
     _KNOWN[key] = known
     return known
 
 
 def _run(probe: Callable[[], Verdict]) -> Verdict:
+    """The probe's verdict; one that raises fails, except when the device ran out, which says
+    nothing about the kernel and raises for the memory manager to answer."""
     try:
         return probe()
     except Exception as exc:
+        if is_capacity(exc):
+            raise
         return Verdict(False, f"{type(exc).__name__}: {exc}"[:400])
 
 

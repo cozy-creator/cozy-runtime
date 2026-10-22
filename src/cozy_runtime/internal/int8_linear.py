@@ -22,7 +22,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import cast
 
-from cozy_runtime.author._errors import is_device_oom
+from cozy_runtime.author._errors import is_capacity, is_device_oom
 from cozy_runtime.author._model import LANDED, WARNINGS, Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.internal import (
@@ -92,6 +92,8 @@ def _built(
             LANDED[0] += 1
             print(f"[int8] {name} serves sm{sm}", file=sys.stderr)
     except Exception as exc:  # the next path serves this process; said once
+        if is_capacity(exc):  # the device ran out opening it: the memory manager answers
+            raise
         state.final = f"{type(exc).__name__}: {exc}"[:300]
         print(f"[int8] no {name} for this executor: {state.final}", file=sys.stderr)
     return state.served

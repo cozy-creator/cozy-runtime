@@ -486,6 +486,14 @@ def _import(candidate: Candidate) -> ModuleType:
         ) from exc
 
 
+def _environment_key(candidate: Candidate) -> str:
+    """A kernel the package environment carries, as its kept self-check knows it: the imported
+    module's file, size and mtime, so an upgraded install is checked again."""
+    found = Path(getattr(_import(candidate), "__file__", "") or "")
+    stat = found.stat() if found.is_file() else None
+    return f"environment:{found}:{stat.st_size if stat else 0}:{stat.st_mtime_ns if stat else 0}"
+
+
 def _launch(ready: Ready, device: DeviceFacts) -> None:
     """`verify_op` for a compiled kernel: each (head dim, dtype) it serves against attention in
     float64 on this card, kept per machine by its build's key (`verify`). One that fails, or
@@ -506,7 +514,7 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
 
     probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, pairs,
                     False)  # fmt: skip
-    key = (ready.artifact or {}).get("key", "")
+    key = (ready.artifact or {}).get("key", "") or _environment_key(candidate)
     verdict = verify.verified(f"attention-{candidate.name}", key, device.sm, probe)
     if not verdict.ok:
         raise AttentionRefusal(
