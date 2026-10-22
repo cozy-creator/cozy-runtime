@@ -818,6 +818,8 @@ class Placement:
         self.attempts += 1
         self.notes.clear()
         self.steps = Steps()
+        for model in self.models.values():
+            graphs.mark(model.module)
 
     def plan(self, steps: Sequence[str | Collection[str]]) -> None:
         self.steps.plan(steps)

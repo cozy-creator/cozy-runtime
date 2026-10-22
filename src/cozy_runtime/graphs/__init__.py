@@ -279,15 +279,36 @@ class _Timing:
             self.timed += 1
             self.free.append((start, end))
 
-    def document(self) -> dict[str, Any]:
+    def counts(self) -> tuple[int, int, float, float]:
         self.settle()
+        return self.calls, self.timed, self.host_ms, self.device_ms
+
+    def document(self, base: tuple[int, int, float, float] = (0, 0, 0.0, 0.0)) -> dict[str, Any]:
+        calls, timed, host, device = (
+            now - then for now, then in zip(self.counts(), base, strict=True)
+        )
         return {
-            "calls": self.calls,
+            "calls": calls,
             "first_ms": round(self.first_ms or 0.0, 3),
-            "host_ms": round(self.host_ms, 3),
-            "device_ms": round(self.device_ms, 3),
-            "device_timed": self.timed,
+            "host_ms": round(host, 3),
+            "device_ms": round(device, 3),
+            "device_timed": timed,
         }
+
+
+#: a recorder's counters a receipt reports per attempt
+_COUNTERS = (
+    "attempts",
+    "replays",
+    "capture_attempts",
+    "captures",
+    "retired",
+    "copy_bytes",
+    "held",
+    "capture_ms",
+    "call_ms",
+    "prepare_ms",
+)
 
 
 class _Recorder:
@@ -323,7 +344,23 @@ class _Recorder:
         #: every call records again every call)
         self.last: tuple[object, ...] | None = None
         self.changes: dict[str, int] = {}
-        self.eager, self.replayed = _Timing(), _Timing()
+        self.eager: _Timing = _Timing()
+        self.replayed: _Timing = _Timing()
+        #: the counters when the current attempt opened (`mark`): receipts are per request
+        self.base: dict[str, Any] = {}
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            **{name: getattr(self, name) for name in _COUNTERS},
+            "capture_each": len(self.capture_each),
+            "changes": dict(self.changes),
+            "eager": self.eager.counts(),
+            "replayed": self.replayed.counts(),
+        }
+
+    def since(self, name: str) -> Any:
+        """Counter `name` since the attempt opened."""
+        return getattr(self, name) - self.base.get(name, 0)
 
     def forget(self, torch: Any) -> bool:
         if any(not entry.idle() for entry in self.recordings.values()):
@@ -457,6 +494,14 @@ def release(torch: Any, root: Any) -> None:
     domain.release(root)
 
 
+def mark(root: Any) -> None:
+    """A new attempt of `root`'s component opens: its receipts count from here."""
+    for module, (owner, _) in list(_REGIONS.items()):
+        if owner() is root and (recorder := _RECORDERS.get(module)) is not None:
+            with recorder.lock:
+                recorder.base = recorder.snapshot()
+
+
 def capture_domain(torch: Any, root: Any, memory: Any = None) -> domain.Domain:
     """The component owns hidden library scratch independently of its disposable graphs."""
     return domain.acquire(torch, root, memory)
@@ -470,7 +515,8 @@ def capture_device(torch: Any, memory: Any) -> domain.Domain:
 def describe(root: Any) -> dict[str, Any]:
     """One final-reply snapshot, never an aggregate scan on the replay hot path.
 
-    Counts are cumulative for this component generation. Region call counts are not a
+    Counts are this attempt's, since the Placement opened it (`mark`); an unplaced component's
+    are its generation's. Region call counts are not a
     percentage of whole-model work: eager parents may enclose captured children. Pool bytes
     count each live pool once (a device's shared pool under the first component it served);
     driver/context and pending native frees remain ledger facts.
@@ -503,29 +549,35 @@ def describe(root: Any) -> dict[str, Any]:
         if recorder is None:
             continue
         with recorder.lock:
+            since, base = recorder.since, recorder.base
             answer["active_graphs"] += len(recorder.recordings)
-            answer["region_calls"] += recorder.attempts
-            answer["replays"] += recorder.replays
-            answer["capture_attempts"] += recorder.capture_attempts
-            answer["captures"] += recorder.captures
-            answer["retired_graphs"] += recorder.retired
-            answer["replay_copy_bytes"] += recorder.copy_bytes
-            answer["held_calls"] += recorder.held
-            answer["capture_ms"] += round(recorder.capture_ms, 3)
+            answer["region_calls"] += since("attempts")
+            answer["replays"] += since("replays")
+            answer["capture_attempts"] += since("capture_attempts")
+            answer["captures"] += since("captures")
+            answer["retired_graphs"] += since("retired")
+            answer["replay_copy_bytes"] += since("copy_bytes")
+            answer["held_calls"] += since("held")
+            answer["capture_ms"] += round(since("capture_ms"), 3)
             if recorder.recordings:
                 captured.append(path)
-            if recorder.attempts:
+            if since("attempts"):
+                before = base.get("changes", {})
                 timed[path] = {
-                    "capture_attempts": recorder.capture_attempts,
-                    "captures": recorder.captures,
-                    "capture_ms": round(recorder.capture_ms, 3),
-                    "capture_each_ms": list(recorder.capture_each),
-                    "key_changes": dict(recorder.changes),
-                    "call_ms": round(recorder.call_ms, 3),
-                    "prepare_ms": round(recorder.prepare_ms, 3),
-                    "held": recorder.held,
-                    "eager": recorder.eager.document(),
-                    "replay": recorder.replayed.document(),
+                    "capture_attempts": since("capture_attempts"),
+                    "captures": since("captures"),
+                    "capture_ms": round(since("capture_ms"), 3),
+                    "capture_each_ms": recorder.capture_each[base.get("capture_each", 0) :],
+                    "key_changes": {
+                        what: n - before.get(what, 0)
+                        for what, n in recorder.changes.items()
+                        if n > before.get(what, 0)
+                    },
+                    "call_ms": round(since("call_ms"), 3),
+                    "prepare_ms": round(since("prepare_ms"), 3),
+                    "held": since("held"),
+                    "eager": recorder.eager.document(base.get("eager", (0, 0, 0.0, 0.0))),
+                    "replay": recorder.replayed.document(base.get("replayed", (0, 0, 0.0, 0.0))),
                 }
             # A device's shared pool and domain count once, under the first component served.
             first = recorder.domain is None or not recorder.domain.served
@@ -1098,6 +1150,7 @@ __all__ = [
     "capture_domain",
     "describe",
     "install",
+    "mark",
     "record_stream",
     "records",
     "release",
