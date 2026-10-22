@@ -267,6 +267,25 @@ def test_ffn_tokens_and_attention_pieces_against_the_whole(dtype: Any) -> None:
                 torch.testing.assert_close(got, want, rtol=tolerance, atol=tolerance)
 
 
+def test_runtime_wrappers_stand_in_for_the_class_forward_and_say_so() -> None:
+    """v13: H3's glue substitutes a block only when its modules are plain (no instance forward
+    but the memory's own) and refused every block Runtime had wrapped (fusion_block_shape).
+    Runtime installs its wrappers after the execution plan, and marks them as TensorFS's were:
+    each calls its module's class forward at each call, so a class swap still takes effect."""
+    norm = nn.RMSNorm(8)
+    block = nn.Sequential(norm)
+    execution.install(block)
+    assert vars(norm)["forward"]._varena and vars(block)["forward"]._varena
+
+    class Swapped(nn.RMSNorm):
+        def forward(self, x: Any) -> Any:
+            return torch.full_like(x, 7.0)
+
+    norm.__class__ = Swapped
+    with torch.no_grad():
+        assert torch.equal(block(torch.ones(2, 8)), torch.full((2, 8), 7.0))
+
+
 def test_arbitrary_package_failure_runs_once() -> None:
     calls: list[int] = []
 

@@ -869,6 +869,8 @@ class Executor:
         #: by model binding path: the execution plan it installed (its fused glue's identity),
         #: "" when eager
         self.planned: dict[str, str] = {}
+        #: per binding path, what its execution plan reported (`Plan.report`)
+        self.plan_reports: dict[str, dict[str, Mapping[str, object]]] = {}
         #: by request: an attempt's handler outcome, the stage it last reported and its record,
         #: the reason an attempt whose tail raised still answers with (`unsettled`)
         self.handled: dict[str, tuple[Outcome, str, AuthorAttempt]] = {}
@@ -1090,6 +1092,11 @@ class Executor:
             "spread": dict(self.group.spread_log) if self.group is not None else {},
             "executor": dict(self.host.boot),
             "plan": {k: v for m in self.model_executors or [self] for k, v in m.planned.items()},
+            "plan_reports": {
+                k: dict(v)
+                for m in self.model_executors or [self]
+                for k, v in m.plan_reports.items()
+            },
             "construction": {
                 "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
                 "prepare_ms": float(facts.get("prepare_ms", 0)),
@@ -1927,9 +1934,11 @@ class Executor:
         torch: object,
         load: Callable[..., Launch],
         ready: Callable[..., Launch | None],
+        reports: dict[str, Mapping[str, object]],
     ) -> str:
         """The model's own execution plan on its filled components, on this GPU: its
-        identity, "" when it installs none. A raise refuses the construction, typed."""
+        identity, "" when it installs none, and what it reports into `reports`. A raise refuses
+        the construction, typed."""
         if type(model).execution_plan is Model.execution_plan:
             return ""
         device = self._rank_device(torch)
@@ -1942,7 +1951,9 @@ class Executor:
 
         try:
             identity = model.execution_plan(
-                Plan(device, functools.partial(load, device=device), when_ready)
+                Plan(
+                    device, functools.partial(load, device=device), when_ready, reports.__setitem__
+                )
             )
         except Exception as exc:
             code = getattr(exc, "code", "")
@@ -2593,8 +2604,12 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc).splitlines()[0][:900]}
         try:
             # THE MODEL'S OWN EXECUTION PLAN: its fused kernels, glue and hooks.
-            planned = self._execution_plan(model, torch, load_kernels, kernels_ready)
+            reports = self.plan_reports[binding.model_binding_path] = {}
+            planned = self._execution_plan(model, torch, load_kernels, kernels_ready, reports)
             self.planned[binding.model_binding_path] = planned
+            # Runtime's cuts and block names after the plan: its substitutions stand, and cuts
+            # land only on what stays Diffusers (v13: H3's glue refused modules they had wrapped).
+            backend.install_execution()
             roots = backend.roots
             stage("execution_plan")
             # EACH SITE'S KERNEL FROM THE GROUP'S FAMILY CELL AT THE MODEL'S ATTENTION LEVEL,

@@ -56,6 +56,7 @@ def test_a_decoded_tensor_decodes_once_across_twenty_binds(tmp_path: Path) -> No
         net = torch.nn.Linear(512, 64, bias=False)
     model = backend._register("net", net, [r.key for r in rows])
     backend.models["net"] = model
+    assert "forward" not in vars(net)  # Runtime's wrappers come after the plan
     provider = backend.selected["net.weight"].provider
     assert provider.route == "decoded_float"
     decodes: list[int] = []

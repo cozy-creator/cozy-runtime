@@ -478,11 +478,15 @@ class Backend:
         # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).
         model = self.memory.load(root, Level.RAM)
-        leg = self._leg(f"{name}.load", leg)
-        # Install explicit pure cuts and names; arbitrary package code is never replayed.
-        execution.install(root)
-        self._leg(f"{name}.catch", leg)
+        self._leg(f"{name}.load", leg)
         return model
+
+    def install_execution(self) -> None:
+        """Runtime's pure cuts and block names on every registered component, after the
+        construction's execution plan (its fused blocks and glue stand). Arbitrary package code
+        is never replayed."""
+        for name in self.models:
+            execution.install(self.roots[name])
 
     def _leg(self, name: str, since: float) -> float:
         now = time.perf_counter()
@@ -885,7 +889,7 @@ class Placement:
 
     def graph_resident(self, binding: Binding) -> bool:
         """Every page `binding` covers is on the device now (an idle capture never fills one)."""
-        return bool(binding.native.resident())
+        return binding.resident()
 
     def cache(self, owner: str, shed: Callable[[int], int]) -> Cache | None:
         """Device bytes `owner` keeps for speed, counted and shed on ask; None off a GPU."""
