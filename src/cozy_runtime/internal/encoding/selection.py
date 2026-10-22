@@ -230,10 +230,10 @@ class RuntimeIdentity:
     identity and only the device half had one: two runtime builds with different arithmetic
     in `encoding/` produced records that were indistinguishable and therefore interchangeable.
 
-    `source_digest` is over this runtime's own encoding/fill/probe sources, so an edit to a
-    decode or a leaf forward invalidates the records that measured the old one. It is
-    computed from the installed FILES rather than from a version string, because a version
-    string is a promise and a digest is a fact.
+    `source_digest` covers encoding/probe sources and the installed native backend's bytes,
+    platform and loadability. Pure and native wheels cannot share fast-kernel facts. Tables
+    themselves are excluded, so packaging measured facts leaves their implementation key
+    unchanged.
     """
 
     release: str

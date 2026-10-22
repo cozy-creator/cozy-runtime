@@ -369,8 +369,6 @@ def _region_call(
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
         else "outside its purity contract"
         if not safe(torch, module)
-        else "without measured driver/context memory"
-        if placed is not None and not placed[0].graph_accounted()
         else _unplain(torch, leaves)
     )
     if why:
@@ -378,7 +376,6 @@ def _region_call(
         if placed is not None:
             placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
         return call(module, *args, **kwargs)
-    _GAPS.pop(module, None)
     recorder = _RECORDERS.setdefault(module, _Recorder())
     levels = placed[0].graph_levels() if placed is not None else ()
     addresses = (
@@ -423,6 +420,10 @@ def _region_call(
         binding = recorder.binding
         entry = recorder.recordings.get(key)
         if entry is None:
+            if placed is not None and not placed[0].graph_accounted():
+                why = _GAPS[module] = "driver/context memory is unmeasured"
+                _failed(recorder, key, placed, why)
+                return call(module, *args, **kwargs)
             # Discovery owns the complete range set and then the admitted free headroom.
             # Only the declared pure region runs here; this does not select/tune kernels.
             lease = (
@@ -465,6 +466,7 @@ def _region_call(
             return call(module, *args, **kwargs)
         try:
             result = entry(leaves, out)
+            _GAPS.pop(module, None)
             recorder.replays += 1
             recorder.copy_bytes += entry.copy_bytes
             return result

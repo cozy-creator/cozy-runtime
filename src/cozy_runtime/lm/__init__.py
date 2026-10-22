@@ -1710,7 +1710,13 @@ class _Engine:
         drafted = self._drafting(size)
         key = (size, self.cache.window, drafted)
         placed = PLACED.get(self.model)
-        unaccounted = cuda and placed is not None and not placed[0].graph_accounted()
+        unaccounted = (
+            cuda
+            and key not in self.graphs
+            and key not in self.unrecorded
+            and placed is not None
+            and not placed[0].graph_accounted()
+        )
         reason = (
             ("driver/context memory is unmeasured" if unaccounted else "")
             or _capture_contract(self.model)
