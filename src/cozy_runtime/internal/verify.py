@@ -1,14 +1,20 @@
 """`verify_op`: every native kernel is checked on the device before it serves (design §6.3).
 
-A prebuilt, local or JIT kernel runs its probe once against an exact reference on the card it
-will serve: a non-finite output fails before any ratio, then the relative L2 error must be within
-the kernel's budget. The verdict is kept per machine under the kernel store, keyed by the
-kernel, its artifact's digest, the card's architecture and the driver, so a driver update
-re-verifies and never recompiles. One process probes a key while others wait for its verdict, and
-a failing verdict is written before the probe starts: a kernel that ends its process (a sticky
-CUDA error) stays refused. A failure is final for that key: its caller serves the next kernel of
-the family's order and the run says so. A device that ran out of memory during the probe keeps
-no verdict: the error raises for the memory manager, and the next open checks again.
+A prebuilt, local or JIT kernel runs its probe once per process against an exact reference on
+the card it will serve: a non-finite output fails before any ratio, then the relative L2 error
+must be within the kernel's budget. A failure stays in this process: its caller serves the next
+kernel of the family's order, the run says so (`gemm.fallback`), and the next process checks
+again. No stored verdict ever turns a kernel off (owner, 2026-10-22).
+
+The one thing kept on the machine is a probe that never finished: a marker written before the
+probe and removed after it, so a kernel that ends its process (a sticky CUDA error) is refused by
+the next process instead of crash-looping it. The marker is keyed by the kernel, its artifact's
+digest, the card, the driver and the Runtime build, so an upgrade or a driver update checks it
+again. A device that ran out of memory during the probe keeps nothing: the error raises for the
+memory manager.
+
+A kernel first opens at a leaf's bind, inside its model's construction: the probe runs with the
+construction guard stepped aside (`derive.placing`), as the runtime's own placement does.
 """
 
 from __future__ import annotations
@@ -22,12 +28,19 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
 
+from cozy_runtime import __version__
+from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.internal import accel, filelock, kernel_cache
+from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding.formats import Tensor
 
-#: The verdict files under the machine's kernel store.
+#: The unfinished-probe markers under the machine's kernel store.
 VERDICTS = "verified"
+#: The Runtime build a marker belongs to: an upgrade checks every kernel again.
+RUNTIME = f"{__version__}+{COMMIT[:12]}" if COMMIT else __version__
+#: What a kernel whose probe ended a process reads in the next one.
+CRASHED = "its probe ended a process before it finished; this Runtime build will not run it here"
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,8 +50,9 @@ class Verdict:
     detail: str
 
 
-#: (kernel, artifact, sm, driver) -> its verdict, for this process.
-_KNOWN: dict[tuple[str, str, int, str], Verdict] = {}
+#: (kernel, artifact, sm, driver, Runtime build) -> its verdict, for this process only.
+type Key = tuple[str, str, int, str, str]
+_KNOWN: dict[Key, Verdict] = {}
 
 
 def error(torch: ModuleType, got: Tensor, want: Tensor) -> float:
@@ -60,9 +74,9 @@ def within(errors: dict[str, float], budget: float) -> Verdict:
 
 
 def verified(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) -> Verdict:
-    """`kernel`'s verdict on this card: kept, else `probe`d now and kept. A probe that raises
-    fails with its exception."""
-    key = (kernel, artifact, sm, accel.driver_version())
+    """`kernel`'s verdict on this card for this process: probed now, unless a probe of it ended
+    an earlier process of this Runtime build here. A probe that raises fails with its exception."""
+    key = (kernel, artifact, sm, accel.driver_version(), RUNTIME)
     known = _KNOWN.get(key)
     if known is not None:
         return known
@@ -77,16 +91,15 @@ def verified(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) 
         known = _KNOWN[key] = _run(probe)
         return known
     with lock:
-        filelock.lock(lock)
-        known = _read(path)
-        if known is None:
-            _write(path, key, Verdict(False, "its probe ended the process before a verdict"))
+        filelock.lock(lock)  # another process of this machine probing it finishes first
+        if path.exists():  # its marker outlived the probe: that probe ended its process
+            known = Verdict(False, CRASHED)
+        else:
+            _write(path, key, Verdict(False, CRASHED))
             try:
                 known = _run(probe)
-            except BaseException:
-                path.unlink(missing_ok=True)  # the device ran out: no verdict either way
-                raise
-            _write(path, key, known)
+            finally:
+                path.unlink(missing_ok=True)
     _KNOWN[key] = known
     return known
 
@@ -95,14 +108,15 @@ def _run(probe: Callable[[], Verdict]) -> Verdict:
     """The probe's verdict; one that raises fails, except when the device ran out, which says
     nothing about the kernel and raises for the memory manager to answer."""
     try:
-        return probe()
+        with placing():  # the runtime's own allocations, never an author's construction
+            return probe()
     except Exception as exc:
         if is_capacity(exc):
             raise
         return Verdict(False, f"{type(exc).__name__}: {exc}"[:400])
 
 
-def _path(key: tuple[str, str, int, str]) -> Path | None:
+def _path(key: Key) -> Path | None:
     store = kernel_cache.configured()
     if store is None:
         return None
@@ -110,20 +124,11 @@ def _path(key: tuple[str, str, int, str]) -> Path | None:
     return store.own / VERDICTS / f"{key[0]}-{digest}.json"
 
 
-def _read(path: Path | None) -> Verdict | None:
-    if path is None:
-        return None
-    try:
-        row = json.loads(path.read_text())
-        return Verdict(bool(row["ok"]), str(row["detail"]))
-    except (OSError, ValueError, KeyError, TypeError):
-        return None
-
-
-def _write(path: Path, key: tuple[str, str, int, str], verdict: Verdict) -> None:
-    """Kept whole or not at all; a store that cannot take it verifies again next process."""
-    kernel, artifact, sm, driver = key
-    row = {"kernel": kernel, "artifact": artifact, "sm": sm, "driver": driver, **asdict(verdict)}
+def _write(path: Path, key: Key, verdict: Verdict) -> None:
+    """Kept whole or not at all; a store that cannot take it guards nothing next process."""
+    kernel, artifact, sm, driver, runtime = key
+    row = {"kernel": kernel, "artifact": artifact, "sm": sm, "driver": driver, "runtime": runtime,
+           **asdict(verdict)}  # fmt: skip
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
     try:
         temporary.write_text(json.dumps(row))
