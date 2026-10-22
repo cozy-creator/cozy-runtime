@@ -126,9 +126,10 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
                 )
             domain = placement.graph_domain("network")
             facts = placement.document()["graphs"]["network"]
-            if turn >= 1:
-                assert facts["active_graphs"] == facts["captures"] == DEPTH
-                assert facts["domains"] == 1 and facts["retired_graphs"] == 0
+            if turn >= 1:  # receipts are per request: turn 1 records, later turns replay
+                assert facts["active_graphs"] == DEPTH and facts["domains"] == 1
+                assert facts["captures"] == (DEPTH if turn == 1 else 0)
+                assert facts["replays"] == DEPTH and facts["retired_graphs"] == 0
             pool_bytes = domain.capture_bytes()
             print(
                 json.dumps(
@@ -238,6 +239,7 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
         holds = []
         for turn in range(2):
             placement.open_attempt()
+            placement.plan(["stack"] * 4)  # ctx.plan: a replay follows the second call
             with torch.inference_mode(), memory.request(f"hold-{turn}", [module] * 4):
                 for _ in range(4):
                     got = module(source.to(memory.device)).cpu()
