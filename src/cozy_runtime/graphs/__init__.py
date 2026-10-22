@@ -580,7 +580,6 @@ def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> int:
         nbytes = owner.capture_bytes()
         for recorder in list(owner.recorders):
             recorder.drop()
-        owner.unhold()
         owner.drop_captures()
         return nbytes
 
@@ -608,7 +607,6 @@ def release(torch: Any, root: Any) -> None:
         _GAPS.pop(module, None)
         _CHECKED.pop(module, None)
     for owner in shared:
-        owner.unhold(root)
         if not owner.recorders:  # the device's last component: its pool goes with it
             owner.drop_captures()
             owner.close_cache()
@@ -934,10 +932,8 @@ def _replay(
         recorder.waiting[key] = attempt
         return _EAGER
     try:
-        root, path = _REGIONS[module][0](), _REGIONS[module][1]
-        whole = path == "" or (placed is not None and placed[0].graph_whole(placed[1], binding))
         began = time.perf_counter()
-        lease = _lease(torch, owner, placed, binding, attempt, root, whole)
+        lease = _lease(torch, placed, binding)
         lease.__enter__()
         recorder.prepare_ms += (time.perf_counter() - began) * 1e3
     except Exception as exc:
@@ -1202,37 +1198,17 @@ def record_stream(torch: Any, tensor: Any, stream: Any) -> None:
         found.readers[stream] = None
 
 
-def _lease(
-    torch: Any,
-    owner: domain.Domain,
-    placed: Any,
-    binding: Any,
-    attempt: int,
-    root: Any,
-    whole: bool,
-) -> Any:
-    """A replay's residency: its region's blocks prepared around it. A region whose blocks are
-    the whole component (its root, or any region of a one-block component: a text encoder's
-    97 linears) instead holds every block bound for the rest of the request from its first
-    replay (design §5: warm resident segments keep their backing), and while that hold stands no
-    region of the component prepares again (v7: a CLIP replay bound and unbound its whole block,
-    ~6 ms a call). The hold goes at the next request, when the graphs are shed, or when the fill
-    changes under it. A component that does not fit refuses the hold as it would the lease."""
+def _lease(torch: Any, placed: Any, binding: Any) -> Any:
+    """A replay's residency: its region's blocks prepared around it, unless its component's
+    blocks are held for the plan's step (`Placement.using`; v7: a CLIP replay bound and unbound
+    its whole block, ~6 ms a call)."""
     if placed is None or binding is None:
         return nullcontext()
-    stream = torch.cuda.current_stream()
-    held = owner.holds.get(root)
-    if held is not None and held.attempt != attempt:
-        owner.unhold(root)
-        held = None
-    if held is not None:
-        if held.stream != stream:
-            stream.wait_stream(held.stream)
-        return nullcontext()
-    if not whole:
+    stream, held = torch.cuda.current_stream(), placed[0].graph_held(placed[1])
+    if held is None:
         return binding.prepare(stream)
-    hold = placed[0].graph_hold(placed[1], functools.partial(owner.unhold, root))
-    owner.holds[root] = domain.Hold(hold, attempt, stream)
+    if held != stream:
+        stream.wait_stream(held)
     return nullcontext()
 
 

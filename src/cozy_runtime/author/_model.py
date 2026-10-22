@@ -20,6 +20,7 @@ import functools
 import inspect
 import json
 import logging
+import sys
 import threading
 import time
 import weakref
@@ -312,6 +313,14 @@ class Residency(Protocol):
 
     def graph_idle(self) -> Any:
         """An idle capture's memory request: free bytes only, never an eviction."""
+        ...
+
+    def graph_held(self, component: str) -> Any:
+        """The stream `component`'s blocks were held bound on for its plan step, or None."""
+        ...
+
+    def using(self, method: str, components: tuple[str, ...]) -> AbstractContextManager[None]:
+        """A local scope of `components` (`method`'s call): their memory passes and holds."""
         ...
 
     def graph_resident(self, binding: Any) -> bool:
@@ -1017,7 +1026,7 @@ class _ComponentScope:
     A REMOTE scope, whose every declared component the runtime keeps on another GPU of the
     group (`Placement.remote`), uses nothing on this device."""
 
-    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote")
+    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote", "_using")
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
@@ -1026,6 +1035,7 @@ class _ComponentScope:
         self._remote: contextvars.Token[Any] | None = None
         self._local: contextvars.Token[Any] | None = None
         self._call: Context | None = None
+        self._using: AbstractContextManager[None] | None = None
 
     def __enter__(self) -> None:
         model = self._model
@@ -1067,6 +1077,9 @@ class _ComponentScope:
         self._local = _LOCAL_SCOPES.set(
             (*_LOCAL_SCOPES.get(), (model, self._method, self._components))
         )
+        if model._cozy_residency is not None:
+            self._using = model._cozy_residency.using(self._method, self._components)
+            self._using.__enter__()
         if model._cozy_harness is not None:
             model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
 
@@ -1079,6 +1092,9 @@ class _ComponentScope:
             if placement is not None:
                 placement.leave(self._components)
             return
+        if self._using is not None:
+            using, self._using = self._using, None
+            using.__exit__(*sys.exc_info())  # a raise in the scope ends its passes as failed
         if self._local is not None:
             _LOCAL_SCOPES.reset(self._local)
             self._local = None

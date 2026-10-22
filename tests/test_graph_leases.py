@@ -174,11 +174,12 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
         model.close()
 
 
-def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Path) -> None:
-    """A region that is the whole component holds every block bound from its first replay to
-    the next request: no replay waits on binding again (speed2 13522's idle before each
-    replay). A new request takes a new hold; shedding the graphs lets it go. The first request
-    runs as written; the idle period after it records."""
+def test_a_step_holds_its_components_blocks_and_replays_bind_nothing(tmp_path: Path) -> None:
+    """A package method's scope holds its component's blocks bound from free bytes for the
+    plan step (`Placement.using`), so no replay binds again (speed2 13522's idle before each
+    replay; v7: a CLIP replay bound and unbound its whole block, ~6 ms a call). Each request
+    takes its own hold and its end lets it go. The first request runs as written; the idle
+    period after it records."""
     if not torch.cuda.is_available():
         pytest.skip("native graph residency requires CUDA")
     memory = Memory.open(0, limit=CAP)
@@ -241,24 +242,24 @@ def test_a_whole_component_replay_holds_its_blocks_for_the_request(tmp_path: Pat
         for turn in range(3):
             placement.open_attempt()
             with torch.inference_mode(), memory.request(f"hold-{turn}", [module] * 4):
-                for _ in range(4):
-                    got = module(source.to(memory.device)).cpu()
-                    torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
-                    domain = placement.graph_domain("stack")
-                    held = domain.holds.get(module)
-                    if turn:
-                        assert held is not None and held.attempt == placement.attempts
-                if turn:
-                    assert held is not None
-                    holds.append(held.hold)
+                with placement.using("generate", ("stack",)):  # the package method's scope
+                    held = placement.holds.get("stack")
+                    assert held is not None and placement.graph_held("stack") is held[1]
+                    holds.append(held[0])
+                    for _ in range(4):
+                        got = module(source.to(memory.device)).cpu()
+                        torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
+                placement.release()  # the request's end
+                assert not placement.holds
             torch.cuda.synchronize()
             assert graphs.capture_idle(lambda: False)
         assert graphs._RECORDERS[module].replays == 8  # the first request as written
         # the receipt is the request's own: the third request's four replays
-        assert placement.document()["graphs"]["stack"]["replays"] == 4
-        assert holds[0] is not holds[1]  # a request takes its own hold
+        facts = placement.document()["graphs"]["stack"]
+        assert facts["replays"] == 4 and facts["regions"][""]["prepare_ms"] < 1, facts
+        assert len({id(hold) for hold in holds}) == 3  # a request takes its own hold
         torch.cuda.synchronize()
-        assert graphs._shed(torch, domain) > 0 and module not in domain.holds
+        assert graphs._shed(torch, placement.graph_domain("stack")) > 0
     finally:
         graphs.release(torch, module)
         PLACED.pop(module, None)

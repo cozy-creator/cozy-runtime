@@ -647,6 +647,14 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt()
 
+    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+        for row in self.rows.values():
+            row.plan(steps)
+
+    def release(self) -> None:
+        for row in self.rows.values():
+            row.release()
+
     @property
     def notes(self) -> dict[str, str]:
         return {f"{name}.{k}": v for name, row in self.rows.items() for k, v in row.notes.items()}
@@ -3483,6 +3491,8 @@ class Executor:
         d2h_started = time.perf_counter()
         if torch is not None and last:
             accel.drain(torch, self.device_kind)
+        if self.residency is not None and last:
+            self.residency.release()  # the last step's holds
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
         peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
@@ -4058,6 +4068,8 @@ class Executor:
         request = self.host.requests.get(request_id)
         if request is not None:
             request.plan(list(steps))
+        if self.residency is not None:  # a step's components keep their holds (`using`)
+            self.residency.plan(steps)
         if self.group is not None and self.rank == 0:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
