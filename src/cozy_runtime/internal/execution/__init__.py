@@ -12,6 +12,7 @@ from pathlib import Path
 import msgspec
 import tensorfs
 import torch
+from tensorfs.varena import allocator_refusals, allocator_stats
 from tensorfs.varena.torch import Stats, blocks_of
 from torch import nn
 
@@ -19,7 +20,7 @@ from cozy_runtime.internal.execution import agree, catch, cuts
 from cozy_runtime.internal.execution.agree import agreed, sizes
 from cozy_runtime.internal.execution.catch import collective, keep, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, split
-from cozy_runtime.internal.executor_replies import Allocator, Ceiling, GpuMemory
+from cozy_runtime.internal.executor_replies import Allocator, Ceiling, GpuMemory, Refusal
 from cozy_runtime.internal.executor_replies import Stats as Record
 
 __all__ = [
@@ -56,20 +57,33 @@ def record(
     ceilings for CUDA `device` (None: no GPU) and `store`, varena's record of the request, and
     torch's allocator since its start (`counters`)."""
     now = counters(device)
+    delta = None if now is None or since is None else _delta(now, since)
+    # The callback's last refusal per pool is the process's: this request's only when the
+    # device's refusals grew while it ran.
+    refused = () if delta is None or not delta.refused else allocator_refusals(device)
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
         stats=msgspec.json.decode(stats.json(), type=Record),
-        torch=None if now is None or since is None else _delta(now, since),
+        torch=delta,
+        refusals=tuple(
+            Refusal(pool=pool, why=why, size=size, held=held, limit=limit)
+            for _, pool, why, size, held, limit in refused
+        ),
     )
 
 
 def counters(device: int | None) -> Allocator | None:
-    """torch's allocator counters on CUDA `device` now (None: no GPU)."""
+    """torch's allocator counters on CUDA `device` now, and varena's callback's refusals there
+    (None: no GPU)."""
     if device is None:
         return None
     found = torch.cuda.memory_stats(device)
-    return Allocator(**{name: int(found.get(name, 0)) for name in Allocator.__struct_fields__})
+    names = [name for name in Allocator.__struct_fields__ if name != "refused"]
+    return Allocator(
+        **{name: int(found.get(name, 0)) for name in names},
+        refused=allocator_stats(device)[4],
+    )
 
 
 def _delta(now: Allocator, since: Allocator) -> Allocator:

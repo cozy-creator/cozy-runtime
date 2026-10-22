@@ -137,6 +137,10 @@ def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> N
     print(f"completed finer after {refused}, {r.stats().cuts} cut(s)")
     assert tuple(got.shape) == (1, 3, 32, 32) and bool(torch.isfinite(got).all())
     assert r.stats().cuts >= 1 and all(refused.count(w) <= 2 for w in set(refused)), refused
+    # The record the reply carries names each decision and what asked for it.
+    row = execution.record(r.stats(), -1, None, tmp_path, None)
+    assert [(d.trigger, d.action) for d in row.stats.decisions] == [("oom", "cut_outside")]
+    assert row.stats.decisions[0].site is not None and row.stats.decisions[0].level == 1
 
 
 def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:
