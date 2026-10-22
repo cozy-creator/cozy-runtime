@@ -237,6 +237,9 @@ class _Timing:
     def __init__(self) -> None:
         self.calls = self.timed = 0
         self.host_ms = self.device_ms = 0.0
+        #: the first call's wall time apart (a cold run's first eager call: autotune, library
+        #: initialization, page-in)
+        self.first_ms: float | None = None
         self.pending: deque[tuple[Any, Any]] = deque()
         self.free: list[tuple[Any, Any]] = []
 
@@ -255,7 +258,9 @@ class _Timing:
         try:
             return call()
         finally:
-            self.host_ms += (time.perf_counter() - began) * 1e3
+            took = (time.perf_counter() - began) * 1e3
+            self.host_ms += took
+            self.first_ms = took if self.first_ms is None else self.first_ms
             end.record(stream)
             self.calls += 1
             self.pending.append((start, end))
@@ -272,6 +277,7 @@ class _Timing:
         self.settle()
         return {
             "calls": self.calls,
+            "first_ms": round(self.first_ms or 0.0, 3),
             "host_ms": round(self.host_ms, 3),
             "device_ms": round(self.device_ms, 3),
             "device_timed": self.timed,
@@ -299,8 +305,10 @@ class _Recorder:
         self.held = 0
         self.landed = LANDED[0]
         self.domain: domain.Domain | None = None
-        #: host time preparing and capturing (warmup included), and each way it ran
+        #: host time preparing and capturing (warmup included), each capture's apart, and each
+        #: way it ran
         self.capture_ms = 0.0
+        self.capture_each: list[float] = []
         self.eager, self.replayed = _Timing(), _Timing()
 
     def forget(self, torch: Any) -> bool:
@@ -485,6 +493,7 @@ def describe(root: Any) -> dict[str, Any]:
             "retired_graphs",
             "replay_copy_bytes",
             "held_calls",
+            "capture_ms",
         ),
         0,
     )
@@ -507,6 +516,7 @@ def describe(root: Any) -> dict[str, Any]:
             answer["retired_graphs"] += recorder.retired
             answer["replay_copy_bytes"] += recorder.copy_bytes
             answer["held_calls"] += recorder.held
+            answer["capture_ms"] += round(recorder.capture_ms, 3)
             if recorder.recordings:
                 captured.append(path)
             if recorder.attempts:
@@ -514,6 +524,7 @@ def describe(root: Any) -> dict[str, Any]:
                     "capture_attempts": recorder.capture_attempts,
                     "captures": recorder.captures,
                     "capture_ms": round(recorder.capture_ms, 3),
+                    "capture_each_ms": list(recorder.capture_each),
                     "held": recorder.held,
                     "eager": recorder.eager.document(),
                     "replay": recorder.replayed.document(),
@@ -694,7 +705,9 @@ def _region_call(
                 entry = _record(torch, module, call, leaves, spec, recorder, key, placed)
             finally:
                 lease.__exit__(None, None, None)
-                recorder.capture_ms += (time.perf_counter() - began) * 1e3
+                took = (time.perf_counter() - began) * 1e3
+                recorder.capture_ms += took
+                recorder.capture_each.append(round(took, 3))
             if entry is None:
                 return eager()
         verdict = entry.ready(leaves)

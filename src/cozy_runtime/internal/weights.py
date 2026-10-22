@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from tensorfs.varena.torch import Cache, Declared, Memory, Model, Weights, blocks_of
+from tensorfs.varena.torch import Cache, Declared, Level, Memory, Model, Weights, blocks_of
 
 from cozy_runtime import graphs, lm
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
@@ -479,7 +479,9 @@ class Backend:
             fill=bakes if bakes.bakes else None,
             bind=routes,
         )
-        model = self.memory.load(root)
+        # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
+        # never at construction (v6 13633 filled the card with H3's transformer before its TE).
+        model = self.memory.load(root, Level.RAM)
         # Install explicit pure cuts and names; arbitrary package code is never replayed.
         execution.install(root)
         return model
