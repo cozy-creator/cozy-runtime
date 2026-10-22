@@ -434,7 +434,7 @@ def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
         cross_attention_dim=16,
         norm_num_groups=8,
         use_linear_projection=True,
-    ).eval()
+    )  # left in training mode, as Runtime constructs it: no gradients, inert dropouts
     blocks = blocks_of(unet)
     found = [path for path, _ in segments(torch, unet, blocks)]
     top = [p for p in found if not any(p.startswith(f"{q}.") for q in found)]
@@ -465,3 +465,7 @@ def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
     attention.set_processor(PackageProcessor())
     assert not safe(torch, unet.get_submodule("up_blocks.0"))
     assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
+    # A dropout that would act in training mode makes its container impure.
+    unet.get_submodule("up_blocks.0.resnets.0.dropout").p = 0.1
+    assert not safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
+    assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0").eval())
