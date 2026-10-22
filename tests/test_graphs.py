@@ -78,7 +78,7 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
             graphs.BYPASS.reset(token)
         assert recorder.replays == 4
         facts = graphs.describe(module)
-        assert facts["active_graphs"] == facts["captures"] == facts["graph_pools"] == 2
+        assert facts["active_graphs"] == facts["captures"] == 2 and facts["graph_pools"] == 1
         assert facts["declared_regions"] == facts["domains"] == 1
         assert facts["captured_regions"] == [""] and facts["replays"] == 4
         assert facts["graph_pool_bytes"] > 0 and facts["domain_workspace_bytes"] > 0
@@ -92,7 +92,7 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         for way in ("eager", "replay"):
             assert region[way]["device_timed"] == region[way]["calls"], region
             assert region[way]["host_ms"] > 0 and region[way]["device_ms"] > 0, region
-        graphs._shed(torch, recorder)
+        graphs._shed(torch, recorder.domain)
         assert not recorder.recordings
         retired = graphs.describe(module)
         assert retired["active_graphs"] == retired["graph_pools"] == 0
@@ -249,9 +249,9 @@ def test_a_pool_is_not_shed_until_its_last_output_copy_finishes() -> None:
         recorder = graphs._RECORDERS[module]
         torch.cuda._sleep(1 << 29)
         result = module(x)
-        assert graphs._shed(torch, recorder) == 0 and recorder.recordings
+        assert graphs._shed(torch, recorder.domain) == 0 and recorder.recordings
         torch.cuda.synchronize()
-        assert graphs._shed(torch, recorder) > 0 and not recorder.recordings
+        assert graphs._shed(torch, recorder.domain) > 0 and not recorder.recordings
         torch.testing.assert_close(result, torch.nn.Sequential.__call__(module, x))
 
 
@@ -319,3 +319,143 @@ def test_execution_wrapper_does_not_hide_a_package_instance_forward() -> None:
     with torch.inference_mode():
         module(torch.ones(1, 4))
     assert calls == [1] and module not in graphs._RECORDERS
+
+
+def _two_segments() -> Any:
+    """An unknown root (eager) whose two pure children replay, the second reading the first."""
+    torch.manual_seed(0)
+    base: Any = torch.nn.Module
+
+    class TwoSegments(base):  # type: ignore[misc]
+        def __init__(self) -> None:
+            super().__init__()
+            self.first = torch.nn.Sequential(
+                torch.nn.Linear(64, 128), torch.nn.GELU(), torch.nn.Linear(128, 64)
+            )
+            self.second = torch.nn.Sequential(
+                torch.nn.Linear(64, 128), torch.nn.GELU(), torch.nn.Linear(128, 64)
+            )
+
+        def forward(self, x: Any) -> Any:
+            return self.second(self.first(x)) * 2
+
+    module = TwoSegments().cuda()
+    assert graphs.install(torch, object(), {"two": module}) == ["two.first", "two.second"]
+    return module
+
+
+def _as_written(module: Any, x: Any) -> Any:
+    token = graphs.BYPASS.set(True)
+    try:
+        return module(x)
+    finally:
+        graphs.BYPASS.reset(token)
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
+def test_a_segment_boundary_copies_nothing_and_a_held_output_is_never_overwritten() -> None:
+    module = _two_segments()
+    first, second = (graphs._RECORDERS.get(m) for m in (module.first, module.second))
+    with torch.inference_mode():
+        for _ in range(4):
+            x = torch.randn(4, 64, device="cuda")
+            torch.testing.assert_close(module(x), _as_written(module, x))
+        first, second = graphs._RECORDERS[module.first], graphs._RECORDERS[module.second]
+        assert first.replays == second.replays == 3  # calls 2 (recorded), 3 and 4
+        producer = next(iter(first.recordings.values()))
+        assert next(iter(second.recordings.values())).chained == [producer]
+        # Only the root's input is copied in; the boundary between the two graphs is read in place.
+        assert first.copy_bytes == 3 * x.nbytes and second.copy_bytes == 0
+        # Purity and structure are read once per root call, for every region under it.
+        assert first.checked is second.checked is not None
+        stamp = first.checked
+        module(x)
+        assert first.checked is second.checked is not stamp
+        facts = graphs.describe(module)
+        assert facts["graph_pools"] == 1 and facts["captured_regions"] == ["first", "second"]
+        # A caller holding a lent output: the next call runs as written and leaves it intact.
+        held = module.first(x)
+        kept = held.clone()
+        replays = first.replays
+        other = torch.randn(4, 64, device="cuda")
+        torch.testing.assert_close(module.first(other), _as_written(module.first, other))
+        assert first.replays == replays and torch.equal(held, kept) and first.held == 1
+        assert graphs.describe(module)["held_calls"] == 1
+        del held
+        torch.testing.assert_close(module.first(other), _as_written(module.first, other))
+        assert first.replays == replays + 1
+    graphs.release(torch, module)
+
+
+@pytest.mark.real_gpu
+@pytest.mark.skipif(not CUDA, reason="cross-stream readers need a GPU")
+def test_a_reader_on_another_stream_finishes_before_the_next_replay_overwrites_it() -> None:
+    module = _two_segments()
+    side = torch.cuda.Stream()
+    with torch.inference_mode():
+        x, other = (torch.randn(4, 64, device="cuda") for _ in range(2))
+        for _ in range(3):
+            module.first(x)
+        expected = _as_written(module.first, x)
+        lent = module.first(x)
+        assert graphs._RECORDERS[module.first].replays == 3
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            torch.cuda._sleep(1 << 28)  # the reader is still queued when its alias is dropped
+            read = lent * 1
+        graphs.record_stream(torch, lent, side)
+        del lent
+        again = module.first(other)
+        assert graphs._RECORDERS[module.first].replays == 4
+        torch.cuda.synchronize()
+        assert torch.equal(read, expected)
+        torch.testing.assert_close(again, _as_written(module.first, other))
+    graphs.release(torch, module)
+
+
+def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
+    diffusers = pytest.importorskip("diffusers")
+    from tensorfs.varena.torch import blocks_of
+
+    from cozy_runtime.graphs.regions import safe, segments
+
+    unet = diffusers.UNet2DConditionModel(
+        sample_size=8,
+        block_out_channels=(16, 32, 32),
+        layers_per_block=2,
+        down_block_types=("DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"),
+        up_block_types=("CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"),
+        transformer_layers_per_block=(1, 2, 2),
+        attention_head_dim=(2, 4, 4),
+        cross_attention_dim=16,
+        norm_num_groups=8,
+        use_linear_projection=True,
+    ).eval()
+    blocks = blocks_of(unet)
+    found = [path for path, _ in segments(torch, unet, blocks)]
+    top = [p for p in found if not any(p.startswith(f"{q}.") for q in found)]
+    expected = ["mid_block", *(f"{n}_blocks.{i}" for n in ("down", "up") for i in range(3))]
+    assert sorted(top) == sorted(expected)
+    # Every block is a finer region too, and no single op is a region of its own.
+    assert set(blocks) <= set(found)
+    assert all(any(b == p or b.startswith(f"{p}.") for b in blocks) for p in found)
+    # A package hook on one block: the containers above it run as written, its siblings replay.
+    hooked = "down_blocks.1.attentions.0.transformer_blocks.0"
+    unet.get_submodule(hooked).register_forward_pre_hook(lambda *_: None)
+    for path, pure in (
+        ("down_blocks.1", False),
+        ("down_blocks.1.attentions.0", False),
+        (hooked, False),
+        ("down_blocks.1.attentions.1", True),
+        ("down_blocks.1.resnets.0", True),
+        ("down_blocks.2", True),
+    ):
+        assert safe(torch, unet.get_submodule(path)) is pure, path
+
+    class PackageProcessor(diffusers.models.attention_processor.AttnProcessor2_0):
+        pass
+
+    attention = unet.get_submodule("up_blocks.0.attentions.0.transformer_blocks.0.attn1")
+    attention.set_processor(PackageProcessor())
+    assert not safe(torch, unet.get_submodule("up_blocks.0"))
+    assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
