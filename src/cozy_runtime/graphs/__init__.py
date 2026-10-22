@@ -778,6 +778,18 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
     region = _REGIONS.get(module)
     if region is None:  # a copy of a region's module: no region of its own
         return call(module, *args, **kwargs)
+    met = _RECORDERS.get(module)
+    if (
+        _INSIDE.get(None) is not None
+        and met is not None
+        and not met.recordings
+        and met.eager.submit_ms() is not None
+    ):
+        # Under a region running as written and queued to record whole, a region it holds is
+        # queued and measured once it has run twice: more calls would add only the dispatch
+        # (v14: ~1.1 ms a call, 106 a cold SDXL step). Should the enclosing one never record,
+        # the idle period judges this one on what it measured, and its replays dispatch.
+        return call(module, *args, **kwargs)
     placed = _placed(module)
     owner, path = region
     scope = placed[0].graph_pass(placed[1], path) if placed is not None else nullcontext()
