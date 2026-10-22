@@ -85,7 +85,7 @@ def test_a_set_one_gpu_cannot_build_is_dropped_on_every_gpu(tmp_path: Path) -> N
         assert not leader.poisoned
         # never installed: the construction's receipts say why, not only the log
         report = leader.plan_reports["dit"]["test-group-glue"]
-        assert report["code"] == "kernels_failed" and "GPU 1" in str(report["detail"])
+        assert report["code"] == "kernels_failed" and "GPU 1" in str(report["reason"])
 
 
 def test_an_install_only_a_follower_refuses_is_a_divergent_group(tmp_path: Path) -> None:

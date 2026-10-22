@@ -3776,7 +3776,7 @@ class Executor:
         print(f"[kernels] {name}: {detail}"[:600], file=sys.stderr)
         for row in self._installs:
             if row.name == name:
-                row.reports[name] = {"applied": False, "code": code, "detail": detail[:300]}
+                row.reports[name] = {"applied": False, "code": code, "reason": detail[:300]}
 
     def _install_in_group(self, launches: dict[str, Launch]) -> Frame | None:
         """Rank 0's half: each follower names which of these sets it has built (one whose
