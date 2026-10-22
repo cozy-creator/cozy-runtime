@@ -32,6 +32,7 @@ from cozy_runtime.internal import (
     kernel_sources,
     prebuilt,
     tools,
+    tune,
 )
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
 
@@ -175,6 +176,7 @@ def native(torch: ModuleType, index: int) -> Op | None:
         _HALF[:] = (torch.bfloat16, torch.float16)
         _LIBS[index] = ops
         _OPS[index] = ops.int8_linear
+        tune.attach(ops, prebuilt.artifact())
         return _OPS[index]
 
     return cast("Op | None", _built(torch, index, _NATIVE, "cozy int8 op", opened))

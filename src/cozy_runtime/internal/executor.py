@@ -158,6 +158,7 @@ from cozy_runtime.internal import (
     stage_memo,
     tolerant,
     tools,
+    tune,
     zygote,
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
@@ -3669,9 +3670,10 @@ class Executor:
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
         """`gemm.selected`: per component and leaf provider, the kernel its installed leaves serve
-        now (read once a run, never per call). `gemm.fallback`: each that serves below what its
-        lane wanted, and why, also said as a warning line (a machine before TensorD keeps
-        `gemm.*` drops the fact)."""
+        now (read once a run, never per call). `gemm.tuned`: this card's 8-bit GEMM shapes the
+        local tuner measured, made faster, and has waiting. `gemm.fallback`: each that serves
+        below what its lane wanted, and why, also said as a warning line (a machine before
+        TensorD keeps `gemm.*` drops the fact)."""
 
         def fallback(value: str, **fields: Any) -> None:
             record.emit("confession", "gemm.fallback", value, **fields)
@@ -3691,6 +3693,10 @@ class Executor:
             reason = prebuilt.lost(form, sm) or (missing[0].reason if missing else "")
             if reason and kernel != wanted:
                 fallback(kernel, wanted=wanted, served=kernel, reason=reason, **fields)
+        tuned = tune.summary(index)
+        if counted and tuned:
+            # This card's 8-bit GEMM shapes: measured locally, faster than the rule, waiting.
+            record.emit("confession", "gemm.tuned", tuned["faster"], **tuned)
         for group in member.refused_leaves:
             fallback(
                 "torch.linear",
@@ -5115,7 +5121,8 @@ def _reply(executor: Executor, frame: Frame) -> Frame | None:
         # command reads `poisoned_generation` and rebuilds the whole cgroup.
         executor.poisoned = f"group: {executor.group.broken}"[:200]
     try:
-        reply = answer(executor, frame)
+        with tune.command():  # the local tuner yields to every command (xs-065)
+            reply = answer(executor, frame)
         if reply is None:
             return None
     except msgspec.ValidationError as exc:

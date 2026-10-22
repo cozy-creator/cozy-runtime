@@ -24,7 +24,7 @@ from types import ModuleType
 from cozy_runtime import _kernels
 from cozy_runtime._kernels import ABSENT as ABSENT
 from cozy_runtime._kernels import ARCHS, FAMILIES, GEMM, NO_FA3, TMA_GEMM
-from cozy_runtime.internal import arch, verify
+from cozy_runtime.internal import arch, tune, verify
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tensor, hadamard256
 
 #: The verdicts' kernel names, one per format: each verifies on its own.
@@ -120,7 +120,7 @@ class Prebuilt:
         scale: Tensor,
         bias: Tensor | None,
         out_dtype: object,
-        config: int = -1,
+        config: int | None = None,
     ) -> Tensor:
         return self._gemm(INT8, q, scales, data, scale, bias, out_dtype, config)
 
@@ -132,7 +132,7 @@ class Prebuilt:
         scale: Tensor,
         bias: Tensor | None,
         out_dtype: object,
-        config: int = -1,
+        config: int | None = None,
     ) -> Tensor:
         return self._gemm(FP8, q, scales, data, scale, bias, out_dtype, config)
 
@@ -174,8 +174,10 @@ class Prebuilt:
         scale: Tensor,
         bias: Tensor | None,
         out_dtype: object,
-        config: int,
+        config: int | None,
     ) -> Tensor:
+        """`config`: a family table's index, -1 for the kernel's rule, None for this card's tuned
+        config where `tune` measured one, else the rule."""
         torch = self.torch
         want = torch.float8_e4m3fn if f.fp8 else torch.int8
         if q.dtype != want or q.dim() != 2 or not q.is_contiguous() or q.data_ptr() % 16:
@@ -188,7 +190,11 @@ class Prebuilt:
         if rows == 0:
             return out
         code = _kernels._gemm.NOT_SUPPORTED
+        tuned = config is None
         if not f.fp8 or self.cutlass_fp8:
+            if config is None:
+                key = (f.name, self._half(out_dtype), rows, data.shape[0], width)
+                config = tune.config(self.index, key)
             code = _kernels._gemm.gemm(
                 self.index, FAMILIES.index(self.family), f.fp8, q.data_ptr(), scales.data_ptr(),
                 data.data_ptr(), scale.data_ptr(), _ptr(bias), out.data_ptr(),
@@ -199,7 +205,9 @@ class Prebuilt:
             return out
         if code != _kernels._gemm.NOT_SUPPORTED:
             self._check(code, "the GEMM")
-        if config >= 0:
+        if config is not None and config >= 0:
+            if tuned:  # a kept config this shape no longer takes: the rule serves
+                return self._gemm(f, q, scales, data, scale, bias, out_dtype, -1)
             raise ValueError(f"{f.name}_gemm: config {config} cannot take {rows}x{width}")
         if f.fp8 and not self.cutlass_fp8:
             pass  # cuBLASLt is this card's fp8 GEMM
