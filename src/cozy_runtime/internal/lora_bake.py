@@ -3,8 +3,8 @@
 A bake is decode -> add `alpha * up @ down` -> round back to the stored representation, one
 row chunk at a time, so nothing larger than a chunk exists twice. Plain floats round once to
 their dtype. `fp8.rowwise` re-encodes E4M3, `int8-convrot256/1` its int8 grid in the
-rotated basis; the rounding is chosen because a delta below half a grid step vanishes
-under nearest rounding. `Stats` is what a quality gate reads: how much of the delta survived
+rotated basis, `nvfp4` its E2M1 values under refitted block scales; the rounding is chosen
+because a delta below half a grid step vanishes under nearest rounding. `Stats` is what a quality gate reads: how much of the delta survived
 and how much rounding error the bake added.
 
 On a GPU, `bake` is one fused Triton kernel per weight (`_bake_kernel`): it reads each stored
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 
 from cozy_runtime.internal import tools
 from cozy_runtime.internal.encoding import E4M3_MAX
-from cozy_runtime.internal.encoding.formats import hadamard256
+from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, hadamard256
 
 try:
     import triton
@@ -349,6 +349,117 @@ def bake_int8_convrot(
     _finish(torch, data, stats, began)
 
 
+#: The canonical stored `nvfp4` a bake writes (`bakeable`): element 2k in the low nibble,
+#: row-major E4M3 block scales, the f32 second level multiplied.
+NVFP4_PARAMS = {
+    "block_size": NVFP4_BLOCK,
+    "global_scale": "multiply",
+    "nibble_order": "low_first",
+    "scale_layout": "row_major",
+}
+#: The largest product of nvfp4's two levels: E4M3's 448 times E2M1's 6.
+NVFP4_LEVELS = E4M3_MAX * 6.0
+#: A kept block saturates up to 7/6 of its largest value, halfway to the 8 E2M1 lacks: a block
+#: quantized with a clipping scale (`encode_nvfp4`'s min-SSE rule) has its top element at 6,
+#: and any delta that lifts it would otherwise regrid all 16 of its elements.
+E2M1_OUTGROWN = 7.0 / 6.0
+
+
+def _nvfp4_decode(torch: ModuleType, raw: Tensor, blocks: Tensor, second: float) -> Tensor:
+    """Packed u8 `[rows, cols/2]` and E4M3 block bytes `[rows, cols/16]` -> f32 `[rows, cols]`."""
+    rows = raw.shape[0]
+    codes = torch.stack((raw & 0x0F, raw >> 4), dim=-1).reshape(rows, -1).long()
+    values = torch.tensor(E2M1_VALUES, dtype=torch.float32, device=raw.device)[codes]
+    scale = decode_e4m3(torch, blocks) * second
+    return (values.view(rows, -1, NVFP4_BLOCK) * scale.unsqueeze(-1)).view(rows, -1)
+
+
+def _e2m1(
+    torch: ModuleType,
+    payload: Tensor,
+    negative: Tensor,
+    rounding: Rounding,
+    generator: Generator | None,
+) -> Tensor:
+    """f32 in block units -> E2M1 codes (sign `negative` in bit 3), saturating at 6.
+    `stochastic` rounds up with the probability of the distance covered; `nearest` ties to the
+    even code."""
+    grid = torch.tensor(E2M1_VALUES[:8], dtype=torch.float32, device=payload.device)
+    magnitude = payload.abs().clamp(max=6.0)
+    low = (torch.searchsorted(grid, magnitude, right=True) - 1).clamp(0, 7)
+    high = (low + 1).clamp(max=7)
+    gap = grid[high] - grid[low]
+    fraction = torch.where(gap > 0, (magnitude - grid[low]) / gap, torch.zeros_like(gap))
+    if rounding == "stochastic":
+        up = torch.rand(fraction.shape, device=payload.device, generator=generator) < fraction
+    else:
+        up = (fraction > 0.5) | ((fraction == 0.5) & (low % 2 == 1))
+    return (low + up) | (negative.long() << 3)
+
+
+def bake_nvfp4(
+    torch: ModuleType,
+    weight: Tensor,
+    scale: Tensor,
+    scale_2: Tensor,
+    down: Tensor,
+    up: Tensor,
+    alpha: float,
+    *,
+    rounding: Rounding = "stochastic",
+    grid: Grid = "keep",
+    generator: Generator | None = None,
+    stats: Stats | None = None,
+) -> None:
+    """Bake into canonical `nvfp4` (`NVFP4_PARAMS`): `weight` u8 `[out, in/2]`, `scale` E4M3
+    `[out, in/16]`, `scale_2` the f32 second level, written in place.
+
+    `keep` keeps the second level and refits a block's E4M3 scale only where its baked values
+    outgrow it past `E2M1_OUTGROWN` (to the smallest scale that holds them), so every other
+    element rounds on the grid it was quantized to and a value just past 6 saturates. `refit` sets the
+    second level from the baked tensor's amax and every block's scale from its baked amax,
+    saturation-free, so every element rounds afresh."""
+    began = time.perf_counter()
+    raw, blocks = weight.view(torch.uint8), scale.view(torch.uint8)
+    rows, cols = raw.shape[0], 2 * raw.shape[1]
+    down_fp32 = down.float()
+    magnitudes = _magnitudes(torch, raw.device)
+    stored_second = second = float(scale_2.float().reshape(-1)[0])
+    if grid != "keep":
+        amax = 0.0
+        for start, stop in _chunks(rows, cols):
+            base = _nvfp4_decode(torch, raw[start:stop], blocks[start:stop], stored_second)
+            target = base + _delta(up, down_fp32, alpha, start, stop)
+            amax = max(amax, float(target.abs().amax()))
+        second = amax / NVFP4_LEVELS if amax > 0 else 1.0
+    for start, stop in _chunks(rows, cols):
+        base = _nvfp4_decode(torch, raw[start:stop], blocks[start:stop], stored_second)
+        delta = _delta(up, down_fp32, alpha, start, stop)
+        target = (base + delta).view(stop - start, -1, NVFP4_BLOCK)
+        need = target.abs().amax(dim=-1) / (6.0 * second)
+        fits = torch.searchsorted(magnitudes, need.contiguous()).clamp(max=126)
+        code = blocks[start:stop].long() & 0x7F
+        if grid == "keep":  # past halfway to the 8 E2M1 lacks, the block's scale grows
+            code = torch.where(need > magnitudes[code] * E2M1_OUTGROWN, fits, code)
+        else:
+            code = fits
+        unit = (magnitudes[code] * second).unsqueeze(-1)
+        payload = torch.where(unit > 0, target / torch.where(unit > 0, unit, 1.0), 0.0)
+        # A zero keeps its stored sign: a zero delta writes back every byte it read.
+        before = base.view_as(target)
+        negative = torch.where(target == 0, torch.signbit(before), torch.signbit(target))
+        nibbles = _e2m1(torch, payload, negative, rounding, generator).view(stop - start, -1)
+        raw[start:stop].copy_((nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)).to(torch.uint8))
+        if stats is not None:
+            stored = _nvfp4_decode(torch, raw[start:stop], code.to(torch.uint8), second)
+            saturated = (payload.abs() > 6.0).sum()
+            _account(stats, base, delta, stored, saturated, down_fp32)
+        blocks[start:stop].copy_(code.to(torch.uint8))
+    if second != stored_second:
+        scale_2.copy_(torch.full_like(scale_2, second))
+    _finish(torch, weight, stats, began)
+
+
 def _finish(torch: ModuleType, tensor: Tensor, stats: Stats | None, began: float) -> None:
     if stats is None:
         return
@@ -360,12 +471,18 @@ def _finish(torch: ModuleType, tensor: Tensor, stats: Stats | None, began: float
 
 def bakeable(scheme: str, params: Mapping[str, object], roles: Mapping[str, str]) -> bool:
     """Whether a stored weight (its scheme, params and role -> dtype) takes `bake`: a plain
-    float, a per-row `fp8.rowwise` E4M3 or an `int8.convrot` weight. `int8.rowwise` stores the
-    same parts as `int8.convrot` and is not rotated, so the scheme decides, not the parts."""
+    float, a per-row `fp8.rowwise` E4M3, an `int8.convrot` weight or a canonical `nvfp4` one
+    (its activation `input_scale` is not the weight's). `int8.rowwise` stores the same parts
+    as `int8.convrot` and is not rotated, so the scheme decides, not the parts."""
     if scheme == "plain":
         return dict(roles) in ({"value": "bf16"}, {"value": "f16"}, {"value": "f32"})
     if scheme == "fp8.rowwise":
         return dict(roles) == {"weight": "f8_e4m3fn", "scale": "f32"}
+    if scheme == "nvfp4":
+        kept = {role: dtype for role, dtype in roles.items() if role != "input_scale"}
+        return kept == {"weight": "u8", "scale": "f8_e4m3fn", "scale_2": "f32"} and all(
+            params.get(name, value) == value for name, value in NVFP4_PARAMS.items()
+        )
     return scheme == "int8.convrot" and dict(roles) == {"weight": "i8", "scale": "f32"}
 
 
@@ -379,17 +496,30 @@ def bake(
     stats: Stats | None = None,
 ) -> None:
     """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8.rowwise`
-    (E4M3 data, f32 row scale) or `int8-convrot256/1` (int8 data, f32 row scale). bf16, E4M3
-    and int8 round stochastically, scales kept: nearest returns a small delta to where it was,
-    and loses most of a LoRA's effect on fp8 (MEASURE.md, TensorD #26). `seed` names the
-    weight's noise. A GPU bakes fused unless `stats` are asked for (the eager reference
-    measures them)."""
+    (E4M3 data, f32 row scale), `int8-convrot256/1` (int8 data, f32 row scale) or `nvfp4`
+    (`bake_nvfp4`). bf16, E4M3, int8 and E2M1 round stochastically, scales kept: nearest
+    returns a small delta to where it was, and loses most of a LoRA's effect on fp8
+    (MEASURE.md, TensorD #26). `seed` names the weight's noise. A GPU bakes fused unless
+    `stats` are asked for (the eager reference measures them); nvfp4 bakes eagerly."""
     device = next(iter(stored.values())).device
-    if stats is None and device.type == "cuda" and _ready(device.index or 0):
+    nvfp4 = "scale_2" in stored
+    if not nvfp4 and stats is None and device.type == "cuda" and _ready(device.index or 0):
         fused(torch, stored, down, up, seed)
         return
     generator = torch.Generator(device=device).manual_seed(seed & SEED_MASK)
-    if set(stored) == {"value"}:
+    if nvfp4:
+        bake_nvfp4(
+            torch,
+            stored["weight"],
+            stored["scale"],
+            stored["scale_2"],
+            down,
+            up,
+            1.0,
+            generator=generator,
+            stats=stats,
+        )
+    elif set(stored) == {"value"}:
         weight = stored["value"]
         rounding: Rounding = "stochastic" if weight.dtype == torch.bfloat16 else "nearest"
         bake_plain(
