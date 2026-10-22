@@ -22,7 +22,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, cast
 
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import Fault, fault, is_capacity
@@ -312,6 +312,10 @@ class _Recorder:
         #: host time of every call through the region (its checks, preparation, replay or eager
         #: run) and of its replays' preparation: what a call costs beside the work it runs
         self.call_ms = self.prepare_ms = 0.0
+        #: its previous call's key, and what changed in its key between calls (a key that changes
+        #: every call records again every call)
+        self.last: tuple[object, ...] | None = None
+        self.changes: dict[str, int] = {}
         self.eager, self.replayed = _Timing(), _Timing()
 
     def forget(self, torch: Any) -> bool:
@@ -511,6 +515,7 @@ def describe(root: Any) -> dict[str, Any]:
                     "captures": recorder.captures,
                     "capture_ms": round(recorder.capture_ms, 3),
                     "capture_each_ms": list(recorder.capture_each),
+                    "key_changes": dict(recorder.changes),
                     "call_ms": round(recorder.call_ms, 3),
                     "prepare_ms": round(recorder.prepare_ms, 3),
                     "held": recorder.held,
@@ -626,6 +631,9 @@ def _region_call(
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
     key = (*_signature(torch, leaves, spec), structure, levels, addresses, autocast)
+    if recorder.last is not None and recorder.last != key:
+        _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
+    recorder.last = key
     if recorder.domain is None:
         recorder.domain = (
             placed[0].graph_domain(placed[1])
@@ -944,6 +952,42 @@ def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str)
     recorder.waiting[key] = placed[0].attempts if placed is not None else recorder.attempts
     say(f"graph:{key!r}:{why}", f"[graphs] pure region remains eager: {why}")
     WARNINGS.append(("a CUDA graph was not used", {"why": why}))
+
+
+def _changed(
+    torch: Any,
+    module: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    arguments: Any,
+    count: int,
+) -> None:
+    """Count what in the region's key changed since its previous call. A plain argument whose
+    value changes on consecutive calls (a timestep or a guidance scale passed as a Python number)
+    keys every call apart, so the region records again every call: the run says so once, by name."""
+    last = recorder.last
+    assert last is not None
+    if last[0] != key[0]:
+        what = "argument layout"
+    elif (at := next((i for i in range(1, count + 1) if last[i] != key[i]), None)) is not None:
+        paths = torch.utils._pytree.tree_flatten_with_path(arguments)[0]
+        name = torch.utils._pytree.keystr(paths[at - 1][0])
+        plain = len(cast("tuple[object, ...]", key[at])) == 2
+        what = f"{'value' if plain else 'tensor'} {name}"
+        if plain and recorder.changes.get(what):
+            path = _REGIONS[module][1] or "<root>"
+            say(
+                f"scalar:{id(recorder)}:{name}",
+                f"[graphs] region {path} records again every call: its argument {name} is a "
+                "Python number that changes between calls (pass it as a tensor)",
+            )
+            WARNINGS.append(
+                ("a graph region records again every call", {"region": path, "argument": name})
+            )
+    else:
+        names = ("structure", "cut levels", "weight addresses", "autocast")
+        what = next(n for n, i in zip(names, range(-4, 0), strict=True) if last[i] != key[i])
+    recorder.changes[what] = recorder.changes.get(what, 0) + 1
 
 
 def _nbytes(torch: Any, leaves: list[Any]) -> int:
