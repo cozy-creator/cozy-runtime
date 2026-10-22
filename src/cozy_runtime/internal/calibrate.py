@@ -482,7 +482,10 @@ def _gemm(gemm: Callable[..., Tensor], config: Choice, one: _Set, dtype: str) ->
 
 
 def _gemv(ops: prebuilt.Prebuilt, one: _Set, dtype: str) -> Tensor:
-    found = ops.int8_gemv(one.x, one.data, one.scale, one.bias, getattr(ops.torch, dtype))
+    """The GEMV writes its activations' dtype, as a served linear does: bf16 to fp16 is exact
+    at these magnitudes, so its codes are the reference's."""
+    out = getattr(ops.torch, dtype)
+    found = ops.int8_gemv(one.x.to(out), one.data, one.scale, one.bias, out)
     if found is None:
         raise ValueError("the GEMV does not take this shape")
     return found
@@ -595,26 +598,35 @@ def _rules(evidence: Sequence[Measured], sms: int) -> tuple[verify.Rule, ...]:
 
 
 def _best(group: Sequence[Measured]) -> Choice | None:
-    """Of the candidates timed at every shape of a cell and regressing none beyond that shape's
-    spread, the one with the least layer-weighted time, where it beats the family default's by
-    more than the cell's largest spread."""
+    """Of the candidates timed at every shape of a cell and regressing no default there beyond
+    the pair's spread, the one with the least layer-weighted time, where it beats the family
+    default's by more than the cell's largest spread. At a few int8 rows a served linear's
+    default is the GEMV, which quantizes inside: a rule must not regress it either, comparing
+    its time plus the quantizer's. The GEMV is never a rule's choice."""
     timed = [
         {c.choice: c for c in one.candidates if c.ok and c.warm_us and not c.impossible}
         for one in group
     ]
     if not all(DEFAULT in found for found in timed):
         return None
+
+    def holds(choice: Choice, one: Measured, found: dict[Choice, Candidate]) -> bool:
+        if choice not in found:
+            return False
+        it, default = found[choice], found[DEFAULT]
+        if it.warm_us[2] > default.warm_us[2] * (1 + max(_spread(it), _spread(default))):
+            return False
+        gemv = found.get(verify.GEMV)
+        return gemv is None or (
+            it.warm_us[2] + one.quantize_us
+            <= gemv.warm_us[2] * (1 + max(_spread(it), _spread(gemv)))
+        )
+
     held = [
         choice
         for choice in timed[0]
-        if choice != DEFAULT
-        and all(
-            choice in found
-            and found[choice].warm_us[2]
-            <= found[DEFAULT].warm_us[2]
-            * (1 + max(_spread(found[choice]), _spread(found[DEFAULT])))
-            for found in timed
-        )
+        if choice not in (DEFAULT, verify.GEMV)
+        and all(holds(choice, one, found) for one, found in zip(group, timed, strict=True))
     ]
     weighted = {
         choice: sum(

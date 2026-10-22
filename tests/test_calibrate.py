@@ -64,6 +64,15 @@ def test_a_rule_regresses_no_shape_of_its_cell() -> None:
     assert calibrate._rules(evidence, 24) == (verify.Rule(2048, 4096, "square", 0, 16, 32),)
 
 
+def test_at_a_few_rows_a_rule_must_not_regress_the_gemv_leaf() -> None:
+    # Tile 6 beats the GEMM default by far, but with the quantizer (1 us here) it loses to the
+    # GEMV a served linear uses at M <= 4: no rule. Where the GEMV is slower, tile 6 ships.
+    slower = [shape(2, 1024, 4096, timed(DEFAULT, 15.0), timed(6, 11.0), timed(verify.GEMV, 11.5))]
+    assert calibrate._rules(slower, SMS) == ()
+    faster = [shape(2, 1024, 4096, timed(DEFAULT, 15.0), timed(6, 11.0), timed(verify.GEMV, 14.0))]
+    assert calibrate._rules(faster, SMS) == (verify.Rule(1, 2, "down", 6, 128, 256),)
+
+
 def test_only_the_default_and_the_quantizer_fail_the_verdict() -> None:
     good = [shape(154, 1280, 2048, timed(DEFAULT, 9.0), timed(2, 8.0))]
     verdict = calibrate._verdict(good)
