@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -10,9 +11,11 @@ import pytest
 from tensorfs import raw
 
 from cozy_runtime.author import Weights
+from cozy_runtime.author._model import LANDED, STAGED, land
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive.microscale import encode_nvfp4
 from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
+from cozy_runtime.internal import nvfp4_linear
 from cozy_runtime.internal.encoding import params_of
 from store_fixtures import adopted, checkpoint, context, home
 
@@ -160,3 +163,34 @@ def test_leaf_matches_its_exact_weight() -> None:
             error = (got.double().cpu() - reference).norm() / reference.norm()
             # W4A4 on the kitchen path, the exact weight times an unquantized input elsewhere.
             assert error < 0.15, (device, dtype, float(error))
+
+
+def test_a_build_found_mid_request_serves_from_the_next_request() -> None:
+    """Census item 4: a request's kernel choices never change under it (a landing would drop
+    its graphs). A launcher found at the first ask serves at once; one found by a later ask
+    waits for the request boundary (`land`)."""
+    built: list[object] = []
+    launch = object()
+    saved = nvfp4_linear.READY[:], dict(nvfp4_linear._LAUNCH)
+    nvfp4_linear.READY[:] = [lambda kernels, device: built[0] if built else None]
+    try:
+        first: Any = SimpleNamespace(index=90)
+        later: Any = SimpleNamespace(index=91)
+        built.append(launch)
+        assert nvfp4_linear._launcher(first) is launch and not STAGED
+        built.clear()
+        assert nvfp4_linear._launcher(later) is None  # still building at the first ask
+        asked, _ = nvfp4_linear._LAUNCH[91]
+        nvfp4_linear._LAUNCH[91] = (asked - 2 * nvfp4_linear.POLL_SECONDS, None)
+        built.append(launch)
+        assert nvfp4_linear._launcher(later) is None and len(STAGED) == 1  # mid-request
+        assert nvfp4_linear._launcher(later) is None  # asked no more
+        landed = LANDED[0]
+        land()
+        assert nvfp4_linear._launcher(later) is launch and LANDED[0] == landed + 1
+        land()
+        assert LANDED[0] == landed + 1  # nothing staged: graphs keep their recordings
+    finally:
+        nvfp4_linear.READY[:] = saved[0]
+        nvfp4_linear._LAUNCH.clear()
+        nvfp4_linear._LAUNCH.update(saved[1])

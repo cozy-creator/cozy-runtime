@@ -113,11 +113,13 @@ from cozy_runtime.author._invoke import (
     run_prepared,
 )
 from cozy_runtime.author._model import (
+    LANDED,
     SCOPES,
     WARNINGS,
     Model,
     WarningRow,
     component_use,
+    land,
 )
 from cozy_runtime.author._observations import DEVICE, Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
@@ -3105,6 +3107,7 @@ class Executor:
         residency's attempt."""
         turn = object()
         with SCOPES.held(turn):
+            land()  # builds found landed during the last requests serve from this one
             target._upgrade_attention(turn)
             refused = target._install_ready_kernels()
             if refused is not None:
@@ -3716,7 +3719,8 @@ class Executor:
 
     def _install(self, launches: Mapping[str, Launch]) -> list[str]:
         """Every waiting install of these built sets, now: the sets whose installs all ran. One
-        that raises is dropped with its set's others, and the construction serves as it was."""
+        that raises is dropped with its set's others, and the construction serves as it was.
+        Graphs record the new paths again (`LANDED`)."""
         failed: set[str] = set()
         for name, _ready, install in self._installs:
             if name in launches and name not in failed:
@@ -3726,6 +3730,7 @@ class Executor:
                     print(f"[kernels] {name}: install refused: {exc}"[:600], file=sys.stderr)
                     failed.add(name)
         self._drop(launches)
+        LANDED[0] += bool(launches)
         return sorted(set(launches) - failed)
 
     def _drop(self, sets: Collection[str]) -> None:

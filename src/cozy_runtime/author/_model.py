@@ -320,6 +320,17 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: Kernel builds this process loaded after it started (a boot build landing): calls may take a
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
+#: Builds a call found landed during a request: each serves from the next request boundary
+#: (`land`), so a request's kernel choices never change under it nor drop its graphs.
+STAGED: list[Callable[[], None]] = []
+
+
+def land() -> None:
+    """At a request boundary, no call in a scope: every staged build serves from now on."""
+    landed = bool(STAGED)
+    while STAGED:
+        STAGED.pop(0)()
+    LANDED[0] += landed
 
 
 class Building(Exception):
