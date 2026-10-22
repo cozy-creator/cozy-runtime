@@ -52,6 +52,8 @@ OPS_PER_CLOCK = {80: 4096, 86: 2048, 89: 2048, 90: 8192, 100: 16384, 103: 16384,
 #: Twice the widest tile any family's table holds (256): every tile takes it whole.
 TILE_PROBE = 512
 DEFAULT = "default"
+#: The device-clock cycles of sleep that last kept a whole batch queued (`_timed`).
+_SLEEP = [0]
 #: Out dtypes the lanes write (SDXL fp16, the others bf16); timing uses the first.
 DTYPES = ("bfloat16", "float16")
 
@@ -209,6 +211,19 @@ class _Set:
     bias: Tensor
 
 
+@dataclass(slots=True)
+class _Pool:
+    """Operand sets used in turn across every launch at a shape: between two uses of one set,
+    all the others (over twice the L2) were used."""
+
+    sets: list[_Set]
+    turn: int = 0
+
+    def next(self) -> _Set:
+        self.turn += 1
+        return self.sets[self.turn % len(self.sets)]
+
+
 def _pool(
     torch: ModuleType, ops: prebuilt.Prebuilt, f: prebuilt._Format, card: Card, m: int, n: int,
     k: int,
@@ -234,9 +249,14 @@ def _pool(
     return sets
 
 
+def _picked(torch: ModuleType, codes: Tensor, rows: Tensor) -> Tensor:
+    """`codes[rows]` for 8-bit codes, indexed as bytes (torch indexes no float8 dtype)."""
+    return codes.view(torch.uint8)[rows].view(codes.dtype)
+
+
 def _exact(torch: ModuleType, one: _Set, rows: Tensor) -> Tensor:
     """The exact product of the quantized operands at `rows`, in float64 chunks of columns."""
-    q = one.q[rows].double()
+    q = _picked(torch, one.q, rows).double()
     width = max(1, REFERENCE_BYTES // (8 * one.data.shape[1]))
     parts = [
         q @ one.data[start : start + width].double().t()
@@ -255,24 +275,22 @@ def _quantize_law(
     x = one.x[rows]
     if f.fp8:
         law, _ = prebuilt._fp8_law(torch, x)
-        want, got = law.float(), one.q[rows].float()
+        want, got = law.float(), _picked(torch, one.q, rows).float()
         exponent = torch.floor(torch.log2(want.abs().clamp(min=2.0**-6)))
         steps = (got - want).abs() / torch.exp2(exponent - 3)
     else:
         rotated = hadamard256(torch, x.double()) / 16
         row = (rotated.abs().amax(-1, keepdim=True) / 127).clamp(min=1e-12)
         want = torch.round(rotated / row).clamp(-127, 127)
-        steps = (one.q[rows].double() - want).abs()
+        steps = (_picked(torch, one.q, rows).double() - want).abs()
     return float(steps.max()), int((steps > 0).sum())
 
 
-def _timed(
-    torch: ModuleType, launch: Callable[[int], object], reps: int, card: Card
-) -> list[float]:
+def _timed(torch: ModuleType, launch: Callable[[], object], reps: int, card: Card) -> list[float]:
     """Device microseconds of `reps` launches, queued behind a sleep: the batch reruns with a
     doubled sleep until the sleep is still running once the host has queued it all, so no host
-    gap enters a measurement. `launch` gets a running index, never repeated across reruns."""
-    cycles, index = 0, 0
+    gap enters a measurement. The sleep that last sufficed is where the next batch starts."""
+    cycles = _SLEEP[0]
     while True:
         torch.cuda.synchronize()
         marks = [
@@ -285,13 +303,13 @@ def _timed(
         slept.record()
         for begin, end in marks:
             begin.record()
-            launch(index)
+            launch()
             end.record()
-            index += 1
         queued = time.perf_counter() - started
         ahead = not slept.query()
         torch.cuda.synchronize()
         if ahead:
+            _SLEEP[0] = cycles
             return [begin.elapsed_time(end) * 1e3 for begin, end in marks]
         cycles = max(2 * cycles, int(2 * queued * card.clock_hz))
 
@@ -301,6 +319,7 @@ def _shape(
     n: int, k: int, models: list[str],
 ) -> Measured:  # fmt: skip
     sets = _pool(torch, ops, f, card, m, n, k)
+    pool = _Pool(sets)
     rows = torch.tensor(sorted({*range(0, m, ROW_STEP), m - 1}), device=sets[0].x.device)
     exact = _exact(torch, sets[0], rows)
     budget = {
@@ -323,24 +342,18 @@ def _shape(
         config = -1 if choice == DEFAULT else choice
         return gemm(one.q, one.scales, one.data, one.scale, one.bias, out, config)
 
-    candidates = [_candidate(torch, card, call, choice, sets, rows, exact, budget, m, n, k)
+    candidates = [_candidate(torch, card, call, choice, pool, rows, exact, budget, m, n, k)
                   for choice in choices]  # fmt: skip
     quantize = ops.fp8_quantize if f.fp8 else ops.int8_quantize
     step, mismatched = _quantize_law(torch, f, sets[0], rows)
-    quantize_us = statistics.median(
-        _timed(torch, lambda i: quantize(sets[i % len(sets)].x), REPS, card)
-    )
+    quantize_us = statistics.median(_timed(torch, lambda: quantize(pool.next().x), REPS, card))
     weights = [one.data.to(torch.bfloat16) for one in sets[: max(2, len(sets) // 2)]]
-    bf16_us = statistics.median(
-        _timed(
-            torch,
-            lambda i: torch.nn.functional.linear(
-                sets[i % len(sets)].x, weights[i % len(weights)], sets[i % len(sets)].bias
-            ),
-            REPS,
-            card,
-        )
-    )
+
+    def linear() -> Tensor:
+        one = pool.next()
+        return torch.nn.functional.linear(one.x, weights[pool.turn % len(weights)], one.bias)
+
+    bf16_us = statistics.median(_timed(torch, linear, REPS, card))
     return Measured(
         f.name, m, n, k, verify.shape_class(n, k), sorted(models), len(sets), step, mismatched,
         quantize_us, bf16_us, candidates,
@@ -349,22 +362,21 @@ def _shape(
 
 def _candidate(
     torch: ModuleType, card: Card, call: Callable[[int | str, _Set, str], Tensor],
-    choice: int | str, sets: Sequence[_Set], rows: Tensor, exact: Tensor,
+    choice: int | str, pool: _Pool, rows: Tensor, exact: Tensor,
     budget: dict[str, float], m: int, n: int, k: int,
 ) -> Candidate:  # fmt: skip
-    """One candidate at one shape: a cold launch (operands evicted by the pool since their
-    last use), its bf16 and fp16 outputs checked, and only if both pass its warm median and
-    rates."""
+    """One candidate at one shape: a cold launch (its first here, on operands the pool evicted),
+    its bf16 and fp16 outputs checked, and only if both pass its warm median and rates."""
     host: list[float] = []
 
-    def cold(index: int) -> None:
+    def cold() -> None:
         started = time.perf_counter()
-        call(choice, sets[(1 + index) % len(sets)], DTYPES[0])
+        call(choice, pool.next(), DTYPES[0])
         host.append((time.perf_counter() - started) * 1e6)
 
     try:
         (cold_us,) = _timed(torch, cold, 1, card)
-        outputs = [call(choice, sets[0], dtype)[rows] for dtype in DTYPES]
+        outputs = [call(choice, pool.sets[0], dtype)[rows] for dtype in DTYPES]
     except ValueError as refused:  # this tile or the GEMV does not take the shape
         return Candidate(choice, ok=True, note=f"not supported: {refused}"[:200])
     except torch.cuda.OutOfMemoryError:
@@ -385,9 +397,7 @@ def _candidate(
         return found
     found.samples_us = [
         round(sample, 3)
-        for sample in _timed(
-            torch, lambda i: call(choice, sets[i % len(sets)], DTYPES[0]), REPS, card
-        )
+        for sample in _timed(torch, lambda: call(choice, pool.next(), DTYPES[0]), REPS, card)
     ]
     samples = sorted(found.samples_us)
     median = statistics.median(samples)

@@ -236,7 +236,7 @@ class Prebuilt:
             return out
         if code != _kernels._gemm.NOT_SUPPORTED:
             self._check(code, "the GEMM")
-        if strict and native:
+        if strict and choice != verify.CUBLASLT:  # that exact tile did not run here
             raise ValueError(f"{f.name}_gemm: config {config} cannot take {rows}x{width}")
         if native and f.name not in _SAID:
             _SAID.add(f.name)
