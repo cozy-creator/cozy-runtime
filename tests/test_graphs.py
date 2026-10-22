@@ -370,10 +370,11 @@ def test_a_segment_boundary_copies_nothing_and_a_held_output_is_never_overwritte
         # Only the root's input is copied in; the boundary between the two graphs is read in place.
         assert first.copy_bytes == 3 * x.nbytes and second.copy_bytes == 0
         # Purity and structure are read once per root call, for every region under it.
-        assert first.checked is second.checked is not None
-        stamp = first.checked
+        stamps = [graphs._CHECKED[m][0] for m in (module.first, module.second)]
+        assert stamps[0] is stamps[1] is not None
         module(x)
-        assert first.checked is second.checked is not stamp
+        assert graphs._CHECKED[module.first][0] is graphs._CHECKED[module.second][0]
+        assert graphs._CHECKED[module.first][0] is not stamps[0]
         facts = graphs.describe(module)
         assert facts["graph_pools"] == 1 and facts["captured_regions"] == ["first", "second"]
         # A caller holding a lent output: the next call runs as written and leaves it intact.
