@@ -518,6 +518,65 @@ def test_a_package_subclass_takes_its_base_s_contract_only_by_declaring_it() -> 
     assert not safe(torch, declared)
 
 
+def _stepping_unet(device: str) -> Any:
+    """sdxl's HiDiffusion UNet with HiDiffusion off: a declared subclass the package sets a
+    step counter on before every call (v6 13590 recaptured the whole UNet every warm step)."""
+    diffusers = pytest.importorskip("diffusers")
+    base: Any = diffusers.UNet2DConditionModel
+
+    class Stepping(base):  # type: ignore[misc]
+        __cozy_graph_contract__ = base
+        cozy_step = 0
+
+    torch.manual_seed(2)
+    return Stepping.from_config(
+        {
+            "sample_size": 8,
+            "block_out_channels": (16, 32),
+            "layers_per_block": 1,
+            "down_block_types": ("DownBlock2D", "CrossAttnDownBlock2D"),
+            "up_block_types": ("CrossAttnUpBlock2D", "UpBlock2D"),
+            "attention_head_dim": (2, 4),
+            "cross_attention_dim": 16,
+            "norm_num_groups": 8,
+        }
+    ).to(device)
+
+
+def test_only_what_a_contract_can_read_keys_a_region() -> None:
+    """A plain value only package code names (sdxl's `cozy_step`) keys nothing; one the
+    contract's code reads (the UNet's `num_upsamplers`, an attention's `scale`) does."""
+    unet = _stepping_unet("cpu")
+    before = graphs._structure(torch, unet)
+    unet.cozy_step = 7
+    assert graphs._structure(torch, unet) == before
+    unet.num_upsamplers += 1
+    assert graphs._structure(torch, unet) != before
+    unet.num_upsamplers -= 1
+    unet.down_blocks[1].attentions[0].transformer_blocks[0].attn1.scale = 0.5
+    assert graphs._structure(torch, unet) != before
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
+def test_twenty_steps_capture_the_root_once_and_replay_it_nineteen_times() -> None:
+    unet = _stepping_unet("cuda")
+    graphs.install(torch, object(), {"unet": unet})
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    sample = torch.randn(2, 4, 8, 8, device="cuda", generator=gen)
+    context = torch.randn(2, 77, 16, device="cuda", generator=gen)
+    with torch.inference_mode():
+        for step in range(20):
+            unet.cozy_step = step
+            got = unet(sample, 999 - step * 50, encoder_hidden_states=context).sample
+        token = graphs.BYPASS.set(True)
+        want = unet(sample, 999 - 19 * 50, encoder_hidden_states=context).sample
+        graphs.BYPASS.reset(token)
+    recorder = graphs._RECORDERS[unet]
+    assert (recorder.capture_attempts, recorder.replays) == (1, 19)
+    torch.testing.assert_close(got, want)
+    graphs.release(torch, unet)
+
+
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
 def test_a_component_root_copies_its_results_out() -> None:
     """Its results leave the component (a package loop keeps them past its next call): a root

@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import inspect
 import sys
+import types
 from collections.abc import Collection, Iterator
 from typing import Any
 
@@ -145,6 +146,35 @@ def _kind(torch: Any, cls: type) -> str:
             kind = _kind(torch, base)
     _KINDS[cls] = (forward, call, kind)
     return kind
+
+
+def contract(cls: type) -> type:
+    """The class whose code a module of `cls` runs: a declared subclass runs its base's."""
+    cls = WRAPPERS.get(cls, cls)
+    return _declaration(cls) or cls
+
+
+@functools.cache
+def reads(cls: type, stop: type) -> frozenset[str]:
+    """Every attribute name the code of `cls` (its classes below `stop`) can name: the most its
+    contract can read of a module's state. A name only a package's code uses is not here."""
+    names: set[str] = set()
+
+    def scan(code: types.CodeType) -> None:
+        names.update(code.co_names)
+        for const in code.co_consts:
+            if isinstance(const, str):
+                names.add(const)
+            elif isinstance(const, types.CodeType):
+                scan(const)
+
+    for k in cls.__mro__[: cls.__mro__.index(stop)] if stop in cls.__mro__ else cls.__mro__:
+        for value in vars(k).values():
+            for fn in (value, getattr(value, "__func__", None), getattr(value, "fget", None)):
+                code = getattr(inspect.unwrap(fn), "__code__", None) if callable(fn) else None
+                if isinstance(code, types.CodeType):
+                    scan(code)
+    return frozenset(names)
 
 
 def _declaration(cls: type) -> type | None:

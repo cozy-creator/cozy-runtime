@@ -172,11 +172,12 @@ def _capturing() -> bool:
 
 def answer(
     request: Request, nbytes: int | None, own: Scope | None, operands: object, first: bool = False
-) -> None:
+) -> bool:
     """Ask `request` about an OOM and do what it answers. Retry returns (run it again); Park
     moves idle tensors to the host, then returns. Cut goes to the innermost cut that can go
     finer (enclosing cuts first, then `own`; `own` first when `first`): `own`'s new level is
-    set and returns, an enclosing cut's raises `Finer`. Exhausted raises varena's error."""
+    set and returns, an enclosing cut's raises `Finer`. Exhausted raises varena's error. True
+    when it runs again at the same levels (a Retry or a Park)."""
     order = (own, *reversed(_local.scopes)) if first else (*reversed(_local.scopes), own)
     scope = next((s for s in order if s is not None and (s.collective or s.level < s.finest)), None)
     collective = scope is not None and scope.collective
@@ -186,14 +187,16 @@ def answer(
         found = request.oom(nbytes, scope.site, collective, scope.finest, scope.shape)
     match found:
         case Next.Retry():
-            return
+            return True
         case Next.Cut(level=level) if scope is not None and not collective:
             if scope is not own:
                 raise Finer(scope, level)
             scope.level = level
+            return False
         case Next.Park(budget=budget):
             used = [operands, *(s.operands for s in _local.scopes)]
             request.parked(park(_device_of(operands), nbytes, budget, used))
+            return True
         case Next.Exhausted(error=error):
             raise error
         case _:
@@ -201,20 +204,48 @@ def answer(
 
 
 def settle[T](run: Callable[[], T], own: Scope | None, operands: object, first: bool = False) -> T:
-    """`run()` until it runs, each OOM answered (`answer`); `run` reads `own.level`."""
+    """`run()` until it runs, each OOM answered (`answer`); `run` reads `own.level`. varena's
+    Exhausted at a pass start inside a cut that can go finer is that cut's OOM: the cut goes
+    finer before anything reports Exhausted. A run again at the same levels that fails where
+    and as the last did (no measured progress) fails typed: it never runs without end."""
     request = CURRENT.get()
     if request is None or (own is None and not _local.scopes):
         return run()
+    last: tuple[object, ...] | None = None
     while True:
         _local.need = None  # an OOM torch answered itself before this leaves no stale size
         try:
             return run()
         except Exception as exc:
-            if request is None or not short(exc):
+            kind = fault(exc)
+            if _capturing() or not (kind is Fault.OOM or (kind is Fault.EXHAUSTED and _finer(own))):
                 raise
-            nbytes = _need()
+            nbytes = _need() if kind is Fault.OOM else getattr(exc, "need", None)
             _clear(exc)
-        answer(request, nbytes, own, operands, first)
+            failed = exc
+        where = _where(kind, nbytes, own)
+        again = answer(request, nbytes, own, operands, first)
+        if again and where == last:
+            raise failed
+        last = where if again else None
+
+
+def _finer(own: Scope | None) -> bool:
+    """A cut in force (`own` or an enclosing one) that can still go finer."""
+    return any(not s.collective and s.level < s.finest for s in (own, *_local.scopes) if s)
+
+
+def _where(kind: Fault, nbytes: int | None, own: Scope | None) -> tuple[object, ...]:
+    """A failure's measure: its kind and size, every cut's level, and how far the run got (the
+    ops of each kind its current piece reached)."""
+    scopes = (
+        (own, *_local.scopes) if own is not None and own not in _local.scopes else _local.scopes
+    )
+    return (
+        kind,
+        nbytes,
+        tuple((s.site, s.level, tuple(sorted(s.ordinals.items()))) for s in scopes if s),
+    )
 
 
 def cut[T](

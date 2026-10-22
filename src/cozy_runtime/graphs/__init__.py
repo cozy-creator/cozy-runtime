@@ -28,7 +28,7 @@ from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.graphs.regions import WRAPPERS, regions, safe, segments
+from cozy_runtime.graphs.regions import WRAPPERS, contract, reads, regions, safe, segments
 from cozy_runtime.internal import attention_ulysses
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
@@ -873,17 +873,28 @@ def _clonable(torch: Any, out: Any) -> bool:
 
 
 def _structure(torch: Any, module: Any) -> tuple[object, ...]:
-    """The code each module runs and the plain values it reads, its attention processor's too,
-    in attribute order (a reordering only records again)."""
+    """The code each module runs and the plain values its contract can read (the names the
+    region's contract code and attention processors name), in attribute order (a reordering
+    only records again). A value only package code names (a step counter) keys nothing."""
     kinds = (torch.dtype, torch.device, enum.Enum)
+    modules = list(module.modules())
+    processors = [p for m in modules if (p := vars(m).get("processor")) is not None]
+    stop = torch.nn.Module
+    names = frozenset().union(
+        *(reads(c, stop) for c in {contract(type(m)) for m in modules}),
+        *(reads(c, object) for c in {type(p) for p in processors}),
+    )
 
     def plain(owner: object) -> tuple[object, ...]:
         return tuple(
             value
-            for value in vars(owner).values()
-            if type(value) in _PLAIN
-            or isinstance(value, kinds)
-            or (type(value) is tuple and all(type(item) in _PLAIN for item in value))
+            for name, value in vars(owner).items()
+            if name in names
+            and (
+                type(value) in _PLAIN
+                or isinstance(value, kinds)
+                or (type(value) is tuple and all(type(item) in _PLAIN for item in value))
+            )
         )
 
     return tuple(
@@ -894,7 +905,7 @@ def _structure(torch: Any, module: Any) -> tuple[object, ...]:
             plain(m),
             (type(p), plain(p)) if (p := vars(m).get("processor")) is not None else None,
         )
-        for m in module.modules()
+        for m in modules
     )
 
 

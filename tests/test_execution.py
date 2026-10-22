@@ -16,10 +16,13 @@ torch = pytest.importorskip("torch")
 pytest.importorskip("diffusers")
 from torch import nn  # noqa: E402
 
+from cozy_runtime.author import Cut, split  # noqa: E402
+from cozy_runtime.author._errors import is_capacity  # noqa: E402
+from cozy_runtime.author._split import _finest  # noqa: E402
 from cozy_runtime.author._split import install as install_split  # noqa: E402
 from cozy_runtime.internal import attention_ulysses, execution  # noqa: E402
 from cozy_runtime.internal.execution import catch, cuts  # noqa: E402
-from execution_models import checkpoint, memory, placed, scores, transformer  # noqa: E402
+from execution_models import checkpoint, memory, placed, scores, transformer, vae  # noqa: E402
 
 BF16 = torch.bfloat16
 AGREEMENT = Path(__file__).parent / "testdata" / "collective_agreement.py"
@@ -99,6 +102,69 @@ def test_an_oom_in_an_exchange_becomes_the_same_cut_on_every_gpu(tmp_path: Path)
         assert all(p["byte_equal"] for p in passes[1:]), passes
         assert [p["exchanged_heads"] for p in passes] == [[], [4, 4], [4, 4], [4, 4]], passes
         assert [p["gathered"] for p in passes] == [1, 0, 0, 0], passes
+
+
+def _decode_split(mem: Any, tmp_path: Path) -> tuple[Any, Any, tuple[Cut, ...], int]:
+    """SDXL's tiled decode (`split` of the VAE's decode by latent rows and columns) on a small
+    VAE over host pages, and the finest level of its split."""
+    model = placed(mem, checkpoint(tmp_path, "vae", vae()), "vae", vae)
+    z = torch.randn(1, 4, 16, 16, generator=torch.Generator().manual_seed(7)).to(BF16)
+    tiles = (Cut(2, scale=2, overlap=2), Cut(3, scale=2, overlap=2))
+    return model, z, tiles, cuts.levels(-(-z.numel() // _finest(tuple(z.shape), tiles)))
+
+
+def test_a_tiled_decode_that_runs_out_whole_goes_finer_or_fails_typed(tmp_path: Path) -> None:
+    """v6 13598, on host pages: the VAE's last up block cannot allocate above 10x10 latent
+    windows, so the whole 16x16 decode runs out inside its pass. Each answer cuts the split
+    finer or runs it again; a run again that fails where and as the last did is no measured
+    progress and fails typed. Never the whole decode again and again (13598 re-ran it for 17
+    minutes until cancelled)."""
+    mem = memory()
+    model, z, tiles, levels = _decode_split(mem, tmp_path)
+    refused: list[tuple[int, int]] = []
+
+    def short(module: nn.Module, args: tuple[Any, ...]) -> None:
+        h, w = (int(n) for n in args[0].shape[-2:])
+        if h * w > 20 * 20:  # the last up block runs at twice the latent's size
+            refused.append((h, w))
+            # A level fails at most twice (run again, then cut finer); more is the loop.
+            assert len(refused) <= 2 * (levels + 1), f"the decode re-ran without end: {refused}"
+            catch._refused(0, args[0].numel() * args[0].element_size(), 0, 0)
+            raise torch.OutOfMemoryError("out of memory. Tried to allocate 8.00 KiB")
+
+    model.decoder.up_blocks[-1].register_forward_pre_hook(short)
+    with torch.no_grad(), mem.request("decode") as r, execution.serving(r):
+        try:
+            got = split(lambda x: model.decode(x).sample, z, *tiles)
+        except Exception as exc:
+            assert is_capacity(exc), exc
+            print(f"failed typed after {refused}: {exc}")
+            assert refused.count(refused[0]) == len(refused) <= 2
+            return
+    print(f"completed finer after {refused}, {r.stats().cuts} cut(s)")
+    assert tuple(got.shape) == (1, 3, 32, 32) and torch.isfinite(got).all()
+    assert r.stats().cuts >= 1 and max(refused.count(w) for w in refused) <= 2
+
+
+def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:
+    """A pass start varena refuses (Exhausted: the VAE's weights alone exceed the memory) inside
+    the split is the split's out-of-memory: it is asked, and with no cut able to help it fails
+    typed, the pass tried a bounded number of times."""
+    mem = memory(capacity=1 << 16)
+    model, z, tiles, levels = _decode_split(mem, tmp_path)
+    starts: list[int] = []
+    model.decoder.register_forward_pre_hook(lambda *_: starts.append(1), prepend=True)
+    model.post_quant_conv.register_forward_pre_hook(lambda *_: starts.append(0), prepend=True)
+    with (
+        torch.no_grad(),
+        mem.request("decode") as r,
+        execution.serving(r),
+        pytest.raises(Exception) as failed,
+    ):
+        split(lambda x: model.decode(x).sample, z, *tiles)
+    print(f"{failed.value!r} after {len(starts)} pass start(s)")
+    assert is_capacity(failed.value)
+    assert len(starts) <= 2 * (levels + 1)
 
 
 def test_a_conv_cut_site_s_bands_are_the_whole_conv() -> None:
