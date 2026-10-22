@@ -4447,7 +4447,9 @@ class Executor:
         # Held: TensorD's first descriptor is the sealed layout an executor deposited, adopted
         # as it is, filled or still filling (memory-varena §5.4, D9's refill).
         if answer.ok and answer.held and len(answer.fds) == 1 + len(answer.pages):
-            pages = tuple((p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True))
+            pages = tuple(
+                (p.region, fd) for p, fd in zip(answer.pages, answer.fds[1:], strict=True)
+            )
             return HostGrant(answer.fds[0], pages, answer.fingerprint)
         for fd in answer.fds:
             os.close(fd)

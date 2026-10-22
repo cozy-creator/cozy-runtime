@@ -17,7 +17,7 @@ import weakref
 import zlib
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
@@ -73,6 +73,9 @@ if TYPE_CHECKING:
 
 #: `ReadGrant` by manifest and layout digest.
 type Grant = Callable[[str, str], HostGrant]
+#: Whether this TensorFS seals a host layout only where TensorD admits it (`WeightGrant.seal`,
+#: 0.13.1); an older one seals on every unheld load, as it always did.
+ADMITS = "seal" in {f.name for f in fields(WeightGrant)}
 #: GPU pages varena kept, given to TensorD (`KeepPages`): layout digest, fingerprint, and
 #: `(region, span, fd)` each (the callee's to close).
 type Keep = Callable[[str, str, list[tuple[int, int, int]]], None]
@@ -460,9 +463,7 @@ class Backend:
         read from the checkpoint by varena, which seals them and deposits the layout with TensorD
         for the next load."""
         rows = {self.plan[key].name: self.plan[key] for key in keys}
-        bakes = self.bakes[name] = _Bakes(
-            self.torch, root, rows, set(blocks_of(root)), self._owner
-        )
+        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)), self._owner)
         grant = replace(self._granted(name), keys=tuple(rows))
         vars(root)["_varena"] = Declared(  # `_cozy_state`: what the package's forward changes
             grant,
@@ -506,12 +507,13 @@ class Backend:
             grant = WeightGrant(checkpoint.ck, name, checkpoint.id)
             if self.grant is not None:
                 held = self.grant(grant.manifest, self._layout(name))
+                admitted = {"seal": held.seal} if ADMITS else {}
                 grant = replace(
                     grant,
                     host_fd=held.fd,
                     pages=held.pages,
                     fingerprint=held.fingerprint,
-                    seal=held.seal,
+                    **admitted,
                 )
             self.grants[name] = grant
         return grant
