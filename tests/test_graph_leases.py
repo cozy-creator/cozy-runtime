@@ -5,6 +5,7 @@ from __future__ import annotations
 import gc
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,23 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
             )
             torch.cuda.synchronize()
             memory.native.load(model.set, Level.RAM)
+
+        def concurrent(scale: float) -> None:
+            stream = torch.cuda.Stream()
+            with (
+                torch.inference_mode(),
+                torch.cuda.stream(stream),
+                memory.request(f"runtime-concurrent-{scale}", [module]),
+            ):
+                actual = module((source * scale).to(memory.device)).cpu()
+            torch.testing.assert_close(actual, expected * scale, atol=1e-5, rtol=1e-4)
+
+        with ThreadPoolExecutor(max_workers=2) as workers:
+            list(workers.map(concurrent, [1.0, 2.0]))
+        assert all(
+            next(iter(graphs._RECORDERS[layer].recordings.values())).graph is saved
+            for layer, saved in zip(module.layers, recordings, strict=True)
+        )
     finally:
         graphs.release(torch, module)
         PLACED.pop(module, None)
