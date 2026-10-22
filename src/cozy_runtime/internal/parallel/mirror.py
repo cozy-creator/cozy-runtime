@@ -47,7 +47,6 @@ def mirror_component(
     spool: Callable[[], Path | None],
     cancelled: Callable[[], bool] = lambda: False,
     reform: Callable[[], None] | None = None,
-    progress: Callable[[], int] = lambda: 0,
     device: Any = None,
 ) -> None:
     """Wrap the module call outside all torch and diffusers hooks.
@@ -85,32 +84,39 @@ def mirror_component(
                     group.broadcast(msgspec.to_builtins(command))
                     failure: Exception | None = None
                     ended: list[tuple[int, str, str]] = []  # (GPU, `ending`, detail)
-                    with group.watched(name[1], progress):
-                        try:
-                            assert isinstance(payloads, wire.Broadcast)
-                            payloads.send(group.pg, device)
-                            with cp.gated_call():
-                                result = call(*args, **kwargs)
-                        except Exception as exc:
-                            code = ending(exc) if group.rerunnable else None
-                            if code is None and not group.interrupted:
-                                raise
-                            failure = exc
-                            ended.append((0, code or ENDED, f"{type(exc).__name__}: {exc}"))
-                            group.interrupt()  # the followers wait on GPU 0 in a collective
+                    try:
+                        assert isinstance(payloads, wire.Broadcast)
+                        payloads.send(group.pg, device)
+                        with cp.gated_call():
+                            result = call(*args, **kwargs)
+                    except Exception as exc:
+                        code = ending(exc) if group.rerunnable else None
+                        if code is None and not group.interrupted:
+                            raise
+                        failure = exc
+                        ended.append((0, code or ENDED, f"{type(exc).__name__}: {exc}"))
+                        group.interrupt()  # the followers wait on GPU 0 in a collective
+                    try:
                         frames = list(zip(group.followers, group.collect("run"), strict=True))
-                        ended += [
-                            (follower.rank, str(frame["code"]), str(frame.get("detail", "")))
-                            for follower, frame in frames
-                            if "rerun" in frame
-                        ]
-                        for follower, frame in frames:
-                            if not ended or not (frame.get("ok") or "rerun" in frame):
-                                reply = _accept(name, group, follower.rank, frame)
-                                attention_sol.record_rank(follower.rank, reply.sol_calls)
-                        if not ended:
-                            return result
-                        group.interrupt()
+                    except GroupRefusal as lost:
+                        if failure is None:
+                            raise
+                        # GPU 0 ended first: what became of the followers is the consequence
+                        raise GroupRefusal(
+                            f"{group.gpu(0)}: {ended[0][2]}; then {lost}"[:1200]
+                        ) from failure
+                    ended += [
+                        (follower.rank, str(frame["code"]), str(frame.get("detail", "")))
+                        for follower, frame in frames
+                        if "rerun" in frame
+                    ]
+                    for follower, frame in frames:
+                        if not ended or not (frame.get("ok") or "rerun" in frame):
+                            reply = _accept(name, group, follower.rank, frame)
+                            attention_sol.record_rank(follower.rank, reply.sol_calls)
+                    if not ended:
+                        return result
+                    group.interrupt()
                     causes = [row for row in ended if row[1] != ENDED]
                     if reform is None or not causes:
                         raise GroupRefusal(

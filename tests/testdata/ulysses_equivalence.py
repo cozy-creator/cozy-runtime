@@ -133,6 +133,7 @@ def rank_main(
                 _, calibration = copy_engine.calibrate(torch, dist.group.WORLD, rank, degree)
                 world = dist.group.WORLD
                 engines = copy_engine.CopyEngineExchange(torch, symm, world, rank, degree)
+                engines.map()
                 copy_engine.install(engines, dist.group.WORLD)
                 engined = backend(
                     query=shards[0], key=shards[1], value=shards[2], _parallel_config=config
