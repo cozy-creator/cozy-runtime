@@ -941,6 +941,9 @@ class Executor:
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
+            # Two ledger descriptors per GPU and the unified Varena broker contract.
+            # TensorD checks this before transferring Start's memory authority.
+            "memory_protocol": 1,
             #: commands beyond the floor's (`memory` is the invoke reply's own object)
             "capabilities": [
                 "import_only",

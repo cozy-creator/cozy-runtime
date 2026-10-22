@@ -122,6 +122,14 @@ def zygote(tmp_path: Path) -> Iterator[tuple[subprocess.Popen[bytes], Channel, d
         process.wait()
 
 
+def test_memory_protocol_is_advertised_before_start_and_torch_import(zygote: Any) -> None:
+    process, channel, _start = zygote
+    reply = _call(channel, {"cmd": "hello"})
+    assert reply["ok"] and reply["pid"] == process.pid
+    assert reply["memory_protocol"] == 1
+    assert reply["torch_loaded"] is False
+
+
 def test_a_segfaulting_executor_leaves_its_python_stack(tmp_path: Path) -> None:
     (tmp_path / "segvapp.py").write_text(APP)
     sys.path.insert(0, str(tmp_path))
