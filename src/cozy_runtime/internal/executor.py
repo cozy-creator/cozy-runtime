@@ -119,7 +119,7 @@ from cozy_runtime.author._model import (
     WarningRow,
     component_use,
 )
-from cozy_runtime.author._observations import Attribution
+from cozy_runtime.author._observations import DEVICE, Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
@@ -1025,6 +1025,8 @@ class Executor:
         device, ledgers = self._rank_device(torch), host.ledgers
         grant = Grant(*ledgers[:2]) if device.type == "cuda" and ledgers else None
         host.memory, host.execution = Memory.open(device, grant), execution
+        if device.type == "cuda":  # steps report the device's time beside the host's
+            DEVICE[:] = [execution.Steps()]
         _split.install(execution)
         attention_ulysses.install(execution)
 
