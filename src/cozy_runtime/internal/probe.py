@@ -1141,8 +1141,10 @@ def qualify(
     *,
     release: str,
     runtime: RuntimeIdentity | None = None,
+    progress: Callable[[Observation], object] = lambda observation: None,
 ) -> tuple[Capabilities, QualificationResult]:
-    """Run the suite and return this process's admission table.
+    """Run the suite and return this process's admission table; `progress` hears each
+    observation as it is made.
 
     The evidence for a route that decodes nothing (`plain/1`) is the fill plane's own
     byte-identity proof, so its record carries the trivial observation rather than a
@@ -1166,16 +1168,13 @@ def qualify(
         runtime = measure_runtime(torch, release)
     target = torch.device(device.kind)
     started = time.perf_counter_ns()
-    observations = [
-        make_observation(
-            encoding,
-            provider,
-            device,
-            name,
-            settled(provider, device) or _measured(torch, provider, target, getattr(torch, name)),
+    observations = []
+    for encoding, provider, name in cells(providers, output_dtypes):
+        evidence = settled(provider, device) or _measured(
+            torch, provider, target, getattr(torch, name)
         )
-        for encoding, provider, name in cells(providers, output_dtypes)
-    ]
+        observations.append(make_observation(encoding, provider, device, name, evidence))
+        progress(observations[-1])
     result = QualificationResult(
         tuple_key=device.tuple_key(),
         device=device,

@@ -20,6 +20,21 @@ from cozy_runtime.internal.encoding import launch_providers, measure_device, mea
 from cozy_runtime.internal.probe import qualify
 
 
+def said(line: str) -> None:
+    """One progress line: the hand-run oracle's watch ends a run that stops printing them."""
+    print(f"PROGRESS {line}", flush=True)
+
+
+def calibrated(one: calibrate.Measured) -> None:
+    runs = [c for c in one.candidates if c.warm_us]
+    best = min(runs, key=lambda c: c.warm_us[2], default=None)
+    said(
+        f"gemm {one.format} {one.m}x{one.n}x{one.k}: {len(one.candidates)} candidates, "
+        f"{sum(not c.ok for c in one.candidates)} failed, best "
+        f"{best.choice if best else '-'} {best.warm_us[2] if best else 0:.1f} us"
+    )
+
+
 def main(argv: Sequence[str]) -> int:
     import torch
 
@@ -32,7 +47,15 @@ def main(argv: Sequence[str]) -> int:
     calibrations: dict[str, calibrate.Calibration] = {}
     with verify.measuring() as verdicts:
         _, table = qualify(
-            torch, launch_providers(), device, dtypes, release=__version__, runtime=runtime
+            torch,
+            launch_providers(),
+            device,
+            dtypes,
+            release=__version__,
+            runtime=runtime,
+            progress=lambda one: said(
+                f"decode {one.implementation} {one.output_dtype} passed={one.evidence.passed}"
+            ),
         )
         if cuda:
             # The exact prebuilt arm and available optional attention arms are explicit
@@ -44,7 +67,7 @@ def main(argv: Sequence[str]) -> int:
                 ops = prebuilt.Prebuilt(
                     torch, device.index, family, device.sm in GEMM["fp8"].get(family, ())
                 )
-                calibrations = calibrate.run(torch, ops, device.sm)
+                calibrations = calibrate.run(torch, ops, device.sm, progress=calibrated)
                 provenance["clocks_after"] = calibrate.clocks(device.index)
             if device.sm == 90:
                 prebuilt.fa3(torch, device.index, device.sm)

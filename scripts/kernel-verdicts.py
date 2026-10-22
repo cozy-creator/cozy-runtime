@@ -58,6 +58,7 @@ def main(
     tensorfs: Annotated[FileAsset, AssetBound(max_bytes=1 << 28)],
     out: Outputs,
 ) -> Tree:
+    ctx.log("PROGRESS script started", level="warn")
     root = Path(tempfile.mkdtemp(prefix="kernel-verdicts-"))
     results, site = root / "results", root / "site"
     results.mkdir()
@@ -70,6 +71,7 @@ def main(
         [*install, "--target", str(site), "--no-deps", str(runtime_wheel), str(tensorfs_wheel)],
         check=True,
     )
+    ctx.log("PROGRESS wheels installed", level="warn")
     env = {**os.environ, "PYTHONPATH": str(site)}
     facts = subprocess.run(
         [sys.executable, "-c", FACTS], cwd=root, env=env, check=True, capture_output=True, text=True

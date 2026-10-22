@@ -2,9 +2,12 @@
 # kernel-verdicts.sh <sku> <cap minutes> <native runtime wheel> <tensorfs wheel> <out dir>
 # The hand-run offline kernel oracle for one tensor-core family: rents one <sku> card in the
 # default ~/.cozy home, runs kernel-verdicts.py on it through `cozy run --on`, and ends the
-# rental in the EXIT trap, proving it gone from `cozy machine list` and from RunPod. The rental
-# ends at <cap minutes> whatever the run's state: the spend the lead approved. The card's
-# shipped files land in <out dir>/*-value/tables/; copy them to
+# rental in the EXIT trap, proving it gone from `cozy machine list` and from RunPod.
+# Two watches end it early: the wall cap (<cap minutes>, the approved spend), and lack of
+# progress. The oracle prints a PROGRESS line per install step, decode observation and GEMM
+# shape; the run is stalled once no new one arrives for 4x the longest gap measured so far
+# (the first gap, scheduling and install on the pod, sets the initial bound).
+# The card's shipped files land in <out dir>/out/*-value/tables/; copy them to
 # src/cozy_runtime/internal/qualification_tables/.
 set -uo pipefail
 SKU=$1 CAP=$2 RUNTIME=$3 TENSORFS=$4 D=$5
@@ -23,6 +26,7 @@ gone() {
 finish() {
   local rc=$1
   [ -n "${WATCH:-}" ] && kill "$WATCH" 2>/dev/null
+  [ -n "${STALL:-}" ] && kill "$STALL" 2>/dev/null
   [ -n "${RUN:-}" ] && kill "$RUN" 2>/dev/null
   if [ -n "$A" ]; then
     cozy machine show "$A" --json >"$D/show-end.json" 2>&1
@@ -64,11 +68,29 @@ while :; do
 done
 cozy machine show "$A" >"$D/show.txt" 2>&1
 say "run: cozy run kernel-verdicts.py --on $A --gpus 1"
-# In the background so the cap's TERM is handled at once (bash defers traps behind a
-# foreground command).
-cozy run "$HERE/kernel-verdicts.py" --on "$A" --gpus 1 --asset "runtime=$RUNTIME" \
+# NDJSON carries the script's log lines (the PROGRESS the stall watch counts). In the background
+# so a watch's TERM is handled at once (bash defers traps behind a foreground command).
+cozy run "$HERE/kernel-verdicts.py" --on "$A" --gpus 1 --json --asset "runtime=$RUNTIME" \
   --asset "tensorfs=$TENSORFS" --out "$D/out" >"$D/run.txt" 2>&1 &
 RUN=$!
+stalled() {
+  local seen=0 last longest=0 now count
+  last=$(date +%s)
+  while sleep 5; do
+    count=$(grep -c PROGRESS "$D/run.txt" 2>/dev/null)
+    now=$(date +%s)
+    if [ "${count:-0}" -gt "$seen" ]; then
+      [ $((now - last)) -gt "$longest" ] && longest=$((now - last))
+      seen=$count last=$now
+    elif [ "$longest" -gt 0 ] && [ $((now - last)) -gt $((4 * longest)) ]; then
+      say "STALL: no progress for $((now - last))s, over 4x the longest gap so far (${longest}s)"
+      kill -TERM $$
+      return
+    fi
+  done
+}
+stalled &
+STALL=$!
 wait "$RUN"
 rc=$?
 RUN=''

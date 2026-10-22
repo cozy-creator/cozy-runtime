@@ -75,8 +75,9 @@ class Candidate(msgspec.Struct):
     #: the first launch at this shape: device and host microseconds
     cold_us: float = 0.0
     host_first_us: float = 0.0
-    #: warm device microseconds: min, p25, median, p75, max
+    #: warm device microseconds: min, p25, median, p75, max; and every launch, in order
     warm_us: tuple[float, ...] = ()
+    samples_us: list[float] = []
     tops: float = 0.0
     dram_gbps: float = 0.0
     #: a warm rate above the card's peak: a measurement the numeric check already passed but
@@ -150,8 +151,14 @@ def clocks(index: int) -> str:
     return done.stdout.strip() or done.stderr.strip()
 
 
-def run(torch: ModuleType, ops: prebuilt.Prebuilt, sm: int) -> dict[str, Calibration]:
-    """Every format of this card's row, calibrated at its packages' shapes."""
+def run(
+    torch: ModuleType,
+    ops: prebuilt.Prebuilt,
+    sm: int,
+    progress: Callable[[Measured], object] = lambda measured: None,
+) -> dict[str, Calibration]:
+    """Every format of this card's row, calibrated at its packages' shapes; `progress` hears
+    each shape as it is measured."""
     shapes = msgspec.json.decode(SHAPES.read_bytes(), type=list[Shape])
     measured = card(torch, ops.index, sm)
     found = {}
@@ -162,10 +169,10 @@ def run(torch: ModuleType, ops: prebuilt.Prebuilt, sm: int) -> dict[str, Calibra
         for one in shapes:
             if one.format == f.name:
                 cells[one.m, one.n, one.k].append(f"{one.model}/{one.lane} x{one.layers}")
-        evidence = [
-            _shape(torch, ops, f, measured, m, n, k, models)
-            for (m, n, k), models in sorted(cells.items())
-        ]
+        evidence = []
+        for (m, n, k), models in sorted(cells.items()):
+            evidence.append(_shape(torch, ops, f, measured, m, n, k, models))
+            progress(evidence[-1])
         found[f.name] = Calibration(_verdict(evidence), _rules(evidence), evidence)
     return found
 
@@ -376,9 +383,13 @@ def _candidate(
         finite = all(math.isfinite(error) for error in errors.values())
         found.note = f"{'' if finite else 'non-finite output; '}numeric check failed: untimed"
         return found
-    samples = sorted(
-        _timed(torch, lambda i: call(choice, sets[i % len(sets)], DTYPES[0]), REPS, card)
-    )
+    found.samples_us = [
+        round(sample, 3)
+        for sample in _timed(
+            torch, lambda i: call(choice, sets[i % len(sets)], DTYPES[0]), REPS, card
+        )
+    ]
+    samples = sorted(found.samples_us)
     median = statistics.median(samples)
     quartiles = statistics.quantiles(samples, n=4)
     found.warm_us = (samples[0], quartiles[0], median, quartiles[2], samples[-1])

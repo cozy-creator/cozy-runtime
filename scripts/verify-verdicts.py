@@ -45,7 +45,7 @@ def main() -> None:
         tables = {
             name: json.loads(archive.read(name))
             for name in archive.namelist()
-            if name.startswith(TABLES) and name.endswith(".json")
+            if name.startswith((f"{TABLES}kernels-sm", f"{TABLES}cuda.")) and name.endswith(".json")
         }
     binary = {
         name.removeprefix(KERNELS).split(".")[0]: digest
