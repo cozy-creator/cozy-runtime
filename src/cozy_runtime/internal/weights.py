@@ -728,8 +728,8 @@ class Placement:
         return tuple(request.levels()) if request is not None else ()
 
     def graph_segments(self, component: str) -> tuple[str, ...]:
-        """Use the model's declared block topology, including when the full model streams."""
-        return tuple(self.models[component].blocks) or ("",)
+        """The model's declared block topology, which graph regions align with."""
+        return tuple(self.models[component].blocks)
 
     def graph_pass(self, component: str, entry: str, args: Any, kwargs: Any) -> Any:
         return self.models[component].passing(entry, args, kwargs)

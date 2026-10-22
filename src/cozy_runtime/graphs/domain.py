@@ -1,9 +1,14 @@
-"""Component-owned library scratch, serialized across independently retired graphs.
+"""Component-owned library and graph scratch, serialized across its graphs.
 
 Torch 2.14 resets cuBLAS workspaces on a graph's capture stream. Region graphs therefore
 begin/end on a control stream and fork onto a separate, uniquely owned library stream. A
 small owner graph on the library stream is reset only at final domain teardown; it is never
 replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
+
+A component's graphs also share one capture pool. `using` serializes every region call of the
+component on the device (a host lock and a completion event across streams), and each replay
+copies its inputs in and its outputs out inside that interval, so no two graphs' scratch is
+ever live at once: the pool holds one region's working set plus every graph's static buffers.
 """
 
 from __future__ import annotations
@@ -47,6 +52,12 @@ class Domain:
         self.config: Any = None
         self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
+        #: the graphs' shared capture pool, its accounting cache, and the recorders using it
+        self.captures: Any = None
+        self.cache: Any = None
+        self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
+        #: each graph output's address -> (its recording, its index): segment boundaries
+        self.lent: dict[int, tuple[weakref.ref[Any], int]] = {}
 
     def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
@@ -158,6 +169,7 @@ class Domain:
             if self.owner is not None:
                 self.owner.reset()
                 self.owner = None
+            self.drop_captures()
             self.pool = None  # MemPool destruction releases this pool, never a global flush.
             for stream in (self.stream, self.control):
                 if stream is not None:
@@ -165,11 +177,34 @@ class Domain:
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
 
+    def capture_pool(self) -> Any:
+        """The pool every graph of this component records into (made on first use)."""
+        if self.captures is None:
+            self.captures = (
+                self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
+            )
+        return self.captures
+
+    def drop_captures(self) -> None:
+        """After every graph recorded into it is reset and its static buffers dropped."""
+        self.captures = None  # MemPool destruction releases this pool, never a global flush.
+        self.lent.clear()
+        if self.cache is not None:
+            self.cache.close()
+            self.cache = None
+
     def nbytes(self) -> int:
         return (
             0
             if self.pool is None
             else sum(s["total_size"] for s in self.pool.snapshot(include_traces=False))
+        )
+
+    def capture_bytes(self) -> int:
+        return (
+            0
+            if self.captures is None
+            else sum(s["total_size"] for s in self.captures.snapshot(include_traces=False))
         )
 
 
