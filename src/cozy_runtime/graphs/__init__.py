@@ -22,7 +22,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
-from typing import Any
+from typing import Any, cast
 
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import Fault, fault, is_capacity
@@ -309,6 +309,13 @@ class _Recorder:
         #: way it ran
         self.capture_ms = 0.0
         self.capture_each: list[float] = []
+        #: host time of every call through the region (its checks, preparation, replay or eager
+        #: run) and of its replays' preparation: what a call costs beside the work it runs
+        self.call_ms = self.prepare_ms = 0.0
+        #: its previous call's key, and what changed in its key between calls (a key that changes
+        #: every call records again every call)
+        self.last: tuple[object, ...] | None = None
+        self.changes: dict[str, int] = {}
         self.eager, self.replayed = _Timing(), _Timing()
 
     def forget(self, torch: Any) -> bool:
@@ -508,6 +515,9 @@ def describe(root: Any) -> dict[str, Any]:
                     "captures": recorder.captures,
                     "capture_ms": round(recorder.capture_ms, 3),
                     "capture_each_ms": list(recorder.capture_each),
+                    "key_changes": dict(recorder.changes),
+                    "call_ms": round(recorder.call_ms, 3),
+                    "prepare_ms": round(recorder.prepare_ms, 3),
                     "held": recorder.held,
                     "eager": recorder.eager.document(),
                     "replay": recorder.replayed.document(),
@@ -568,12 +578,15 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         placed[0].graph_pass(placed[1], path, args, kwargs) if placed is not None else nullcontext()
     )
     token = _PASS.set(object()) if owner() is module else None
+    began = time.perf_counter()
     try:
         with scope:
             return _region_call(torch, module, call, args, kwargs, placed)
     finally:
         if token is not None:
             _PASS.reset(token)
+        if (recorder := _RECORDERS.get(module)) is not None:
+            recorder.call_ms += (time.perf_counter() - began) * 1e3
 
 
 def _region_call(
@@ -618,6 +631,9 @@ def _region_call(
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
     key = (*_signature(torch, leaves, spec), structure, levels, addresses, autocast)
+    if recorder.last is not None and recorder.last != key:
+        _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
+    recorder.last = key
     if recorder.domain is None:
         recorder.domain = (
             placed[0].graph_domain(placed[1])
@@ -736,8 +752,11 @@ def _replay(
         return _EAGER
     try:
         root, path = _REGIONS[module][0](), _REGIONS[module][1]
-        lease = _lease(torch, owner, placed, binding, attempt, root, path == "")
+        whole = path == "" or (placed is not None and placed[0].graph_whole(placed[1], binding))
+        began = time.perf_counter()
+        lease = _lease(torch, owner, placed, binding, attempt, root, whole)
         lease.__enter__()
+        recorder.prepare_ms += (time.perf_counter() - began) * 1e3
     except Exception as exc:
         if not _unprepared(exc):
             raise
@@ -894,10 +913,12 @@ def _lease(
     root: Any,
     whole: bool,
 ) -> Any:
-    """A replay's residency: its region's blocks prepared around it. A region that is the whole
-    component instead holds every block bound for the rest of the request from its first replay
-    (design §5: warm resident segments keep their backing), so no replay waits on binding them
-    again; the hold goes at the next request, when the graphs are shed, or when the fill
+    """A replay's residency: its region's blocks prepared around it. A region whose blocks are
+    the whole component (its root, or any region of a one-block component: a text encoder's
+    97 linears) instead holds every block bound for the rest of the request from its first
+    replay (design §5: warm resident segments keep their backing), and while that hold stands no
+    region of the component prepares again (v7: a CLIP replay bound and unbound its whole block,
+    ~6 ms a call). The hold goes at the next request, when the graphs are shed, or when the fill
     changes under it. A component that does not fit refuses the hold as it would the lease."""
     if placed is None or binding is None:
         return nullcontext()
@@ -906,13 +927,14 @@ def _lease(
     if held is not None and held.attempt != attempt:
         owner.unhold(root)
         held = None
-    if not whole and held is None:
+    if held is not None:
+        if held.stream != stream:
+            stream.wait_stream(held.stream)
+        return nullcontext()
+    if not whole:
         return binding.prepare(stream)
-    if held is None:
-        hold = placed[0].graph_hold(placed[1], functools.partial(owner.unhold, root))
-        owner.holds[root] = domain.Hold(hold, attempt, stream)
-    elif held.stream != stream:
-        stream.wait_stream(held.stream)
+    hold = placed[0].graph_hold(placed[1], functools.partial(owner.unhold, root))
+    owner.holds[root] = domain.Hold(hold, attempt, stream)
     return nullcontext()
 
 
@@ -930,6 +952,42 @@ def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str)
     recorder.waiting[key] = placed[0].attempts if placed is not None else recorder.attempts
     say(f"graph:{key!r}:{why}", f"[graphs] pure region remains eager: {why}")
     WARNINGS.append(("a CUDA graph was not used", {"why": why}))
+
+
+def _changed(
+    torch: Any,
+    module: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    arguments: Any,
+    count: int,
+) -> None:
+    """Count what in the region's key changed since its previous call. A plain argument whose
+    value changes on consecutive calls (a timestep or a guidance scale passed as a Python number)
+    keys every call apart, so the region records again every call: the run says so once, by name."""
+    last = recorder.last
+    assert last is not None
+    if last[0] != key[0]:
+        what = "argument layout"
+    elif (at := next((i for i in range(1, count + 1) if last[i] != key[i]), None)) is not None:
+        paths = torch.utils._pytree.tree_flatten_with_path(arguments)[0]
+        name = torch.utils._pytree.keystr(paths[at - 1][0])
+        plain = len(cast("tuple[object, ...]", key[at])) == 2
+        what = f"{'value' if plain else 'tensor'} {name}"
+        if plain and recorder.changes.get(what):
+            path = _REGIONS[module][1] or "<root>"
+            say(
+                f"scalar:{id(recorder)}:{name}",
+                f"[graphs] region {path} records again every call: its argument {name} is a "
+                "Python number that changes between calls (pass it as a tensor)",
+            )
+            WARNINGS.append(
+                ("a graph region records again every call", {"region": path, "argument": name})
+            )
+    else:
+        names = ("structure", "cut levels", "weight addresses", "autocast")
+        what = next(n for n, i in zip(names, range(-4, 0), strict=True) if last[i] != key[i])
+    recorder.changes[what] = recorder.changes.get(what, 0) + 1
 
 
 def _nbytes(torch: Any, leaves: list[Any]) -> int:

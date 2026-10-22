@@ -591,6 +591,28 @@ def test_twenty_steps_capture_the_root_once_and_replay_it_nineteen_times() -> No
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
+def test_a_python_number_that_changes_every_call_is_named() -> None:
+    """A timestep passed as a Python number keys every call apart, so the root records again
+    every call: the receipts count the change by argument and the run warns once, by name."""
+    unet = _stepping_unet("cuda")
+    graphs.install(torch, object(), {"unet": unet})
+    gen = torch.Generator(device="cuda").manual_seed(4)
+    sample = torch.randn(2, 4, 8, 8, device="cuda", generator=gen)
+    context = torch.randn(2, 77, 16, device="cuda", generator=gen)
+    WARNINGS.clear()
+    with torch.inference_mode():
+        for step in range(3):
+            unet(sample, 999 - step * 50, encoder_hidden_states=context)
+    changes = graphs.describe(unet)["regions"][""]["key_changes"]
+    assert changes == {"value [0][1]": 2}, changes
+    assert any(
+        what == "a graph region records again every call" and fields["argument"] == "[0][1]"
+        for what, fields in WARNINGS
+    ), WARNINGS
+    graphs.release(torch, unet)
+
+
+@pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
 def test_a_component_root_copies_its_results_out() -> None:
     """Its results leave the component (a package loop keeps them past its next call): a root
     region copies them out, so a held result neither blocks the next replay nor changes."""

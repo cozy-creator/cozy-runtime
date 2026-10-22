@@ -843,6 +843,13 @@ class Placement:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)
 
+    def graph_whole(self, component: str, binding: Any) -> bool:
+        """`binding` covers every block of the component."""
+        model = self.models[component]
+        return len(binding.blocks) == sum(
+            b is not None for b in (model.common, *model.blocks.values())
+        )
+
     def graph_hold(self, component: str, shed: Callable[[], None]) -> Any:
         """Every block of the component bound until released: a request's replays keep their
         backing instead of binding it again around each one."""
