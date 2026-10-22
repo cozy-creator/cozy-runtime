@@ -147,7 +147,16 @@ class _Recording:
                 return "stale" if producer.graph is None else "held"
         return ""
 
-    def __call__(self, leaves: list[Any]) -> Any:
+    def output(self) -> Any:
+        """Caller-owned outputs for a component root's call, whose results leave the
+        component: allocated before residency admission or graph launch."""
+        torch = self.torch
+        return torch.utils._pytree.tree_map(
+            lambda v: torch.empty_like(v) if isinstance(v, torch.Tensor) else v, self.outputs
+        )
+
+    def __call__(self, leaves: list[Any], out: Any = None) -> Any:
+        """Replays; returns lent aliases, or copies into `out` (a component root's call)."""
         torch, stream = self.torch, self.torch.cuda.current_stream()
         if self.done is None:
             self.done = torch.cuda.Event()
@@ -169,9 +178,16 @@ class _Recording:
             self.graph.replay()
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
-            return torch.utils._pytree.tree_map(
-                lambda v: v.detach() if isinstance(v, torch.Tensor) else v, self.outputs
-            )
+            if out is None:
+                return torch.utils._pytree.tree_map(
+                    lambda v: v.detach() if isinstance(v, torch.Tensor) else v, self.outputs
+                )
+            source = torch.utils._pytree.tree_leaves(self.outputs)
+            for dst, src in zip(torch.utils._pytree.tree_leaves(out), source, strict=True):
+                if isinstance(src, torch.Tensor):
+                    dst.copy_(src)
+                    copied += src.nbytes
+            return out
         finally:
             self.copied = copied
             self.done.record(stream)
@@ -623,6 +639,7 @@ def _region_call(
                 if not _unprepared(exc):
                     raise
                 recorder.waiting[key] = attempt
+                _refused(module, placed, f"its weights cannot all be resident at once ({exc})")
                 return eager()
             began = time.perf_counter()
             try:
@@ -638,6 +655,16 @@ def _region_call(
             if verdict == "stale" and entry.idle():
                 recorder.recordings.pop(key).close()
             return eager()
+        # A component root's results leave the component (a package's loop may keep them past
+        # its next call): they are copied out, allocated before the physical lease so admission
+        # sees their segments. Regions inside the call lend theirs.
+        try:
+            out = entry.output() if _REGIONS[module][0]() is module else None
+        except Exception as exc:
+            if not _unprepared(exc):
+                raise
+            recorder.waiting[key] = attempt
+            return eager()
         lease = (
             binding.prepare(torch.cuda.current_stream()) if binding is not None else nullcontext()
         )
@@ -646,10 +673,12 @@ def _region_call(
         except Exception as exc:
             if not _unprepared(exc):
                 raise
+            del out
             recorder.waiting[key] = attempt
+            _refused(module, placed, f"its weights cannot all be resident at once ({exc})")
             return eager()
         try:
-            result = recorder.replayed.run(torch, lambda: entry(leaves))
+            result = recorder.replayed.run(torch, lambda: entry(leaves, out))
             _GAPS.pop(module, None)
             recorder.replays += 1
             recorder.copy_bytes += entry.copied
@@ -781,6 +810,16 @@ def record_stream(torch: Any, tensor: Any, stream: Any) -> None:
     found = _lent(torch, tensor)
     if found is not None:
         found[0].readers[stream] = None
+
+
+def _refused(module: Any, placed: Any, why: str) -> None:
+    """A region whose preparation the memory refused runs as written this request, its finer
+    regions replaying under it; the run says so once."""
+    why = why.splitlines()[0][:300]
+    _GAPS[module] = why
+    if placed is not None:
+        placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
+    say(f"refused:{why}", f"[graphs] a region runs as written, its finer regions replay: {why}")
 
 
 def _failed(recorder: _Recorder, key: tuple[object, ...], placed: Any, why: str) -> None:

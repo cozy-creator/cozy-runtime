@@ -33,6 +33,8 @@ DIFFUSERS = {
     "diffusers.models.attention": {"FeedForward", "BasicTransformerBlock"},
     "diffusers.models.attention_processor": {"Attention"},
     "diffusers.models.resnet": {"ResnetBlock2D"},
+    "diffusers.models.embeddings": {"Timesteps", "TimestepEmbedding"},
+    "diffusers.models.unets.unet_2d_condition": {"UNet2DConditionModel"},
     "diffusers.models.downsampling": {"Downsample2D"},
     "diffusers.models.upsampling": {"Upsample2D"},
     "diffusers.models.transformers.transformer_2d": {"Transformer2DModel"},
@@ -44,6 +46,28 @@ DIFFUSERS = {
         "UpBlock2D",
     },
 }
+#: A package subclass's explicit declaration (design §5): `__cozy_graph_contract__ = Base`, a
+#: contracted class it derives from, says its calls are Base's. Runtime checks that it overrides
+#: nothing of Base's; it may only add.
+CONTRACT = "__cozy_graph_contract__"
+#: Class metadata a subclass always defines, never behaviour.
+_METADATA = frozenset(
+    {
+        "__module__",
+        "__qualname__",
+        "__doc__",
+        "__dict__",
+        "__weakref__",
+        "__annotations__",
+        "__firstlineno__",
+        "__static_attributes__",
+        "__orig_bases__",
+        "__parameters__",
+        "__type_params__",
+        CONTRACT,
+    }
+)
+
 #: Attention processors whose call is SDPA's math through the site's shipped backend.
 PROCESSORS = {
     "cozy_runtime.internal.attention": "ClassicSdpa",
@@ -117,8 +141,22 @@ def _kind(torch: Any, cls: type) -> str:
         elif own and _declared(cls, DIFFUSERS.get(cls.__module__, ())):
             # A subclass's custom forward is excluded even when its base has this name.
             kind = "diffusers"
+        elif (base := _declaration(cls)) is not None:
+            kind = _kind(torch, base)
     _KINDS[cls] = (forward, call, kind)
     return kind
+
+
+def _declaration(cls: type) -> type | None:
+    """The contracted base a package subclass declares itself to be, when it overrides nothing
+    of that base's (every class between them only adds names)."""
+    base = vars(cls).get(CONTRACT)
+    if not isinstance(base, type) or base is cls or not issubclass(cls, base):
+        return None
+    between = cls.__mro__[: cls.__mro__.index(base)]
+    if any(name not in _METADATA and hasattr(base, name) for k in between for name in vars(k)):
+        return None
+    return base
 
 
 def _local(torch: Any, sub: Any) -> bool:
