@@ -16,6 +16,7 @@ from typing import Annotated
 import msgspec
 
 from cozy_runtime.author._assets import ImageAsset
+from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._markers import AssetBound, ImagePreparation, ModelDefault
 from cozy_runtime.author._services import Adjustments
 
@@ -30,6 +31,20 @@ Seed = Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)]
 
 #: Pixels in one megapixel: 1024², as the image packages size their tiers.
 MEGAPIXEL = 1 << 20
+
+#: `[x0, y0, x1, y1]`: a box's corners, 0-1 of the output canvas, origin top-left, x0 < x1, y0 < y1.
+Box = Annotated[
+    list[Annotated[float, msgspec.Meta(ge=0.0, le=1.0)]], msgspec.Meta(min_length=4, max_length=4)
+]
+
+
+class Region(msgspec.Struct):
+    """An element a model places by box without a reference (MOSS-Image, Ideogram, Klein's table):
+    `prompt` says what goes in the box, `text` is a literal string to render there."""
+
+    box: Box
+    prompt: Annotated[str, msgspec.Meta(min_length=1)]
+    text: Annotated[str, msgspec.Meta(min_length=1)] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,6 +71,9 @@ class ImageRequest(msgspec.Struct):
     #: Given, the request is reproducible; omitted, the model draws one and returns it.
     seed: Seed | None = None
     prompt_upsampling: bool | None = None
+    #: One per reference, in order: where it goes in the output, or null for none. A placed
+    #: reference is an element, not the canvas: the size is the model's text-to-image default.
+    reference_boxes: list[Box | None] | None = None
 
     def target(
         self, first: tuple[int, int] | None, *, megapixels: float, ratio: str = "1:1"
@@ -77,6 +95,27 @@ class ImageRequest(msgspec.Struct):
             pixels = megapixels * MEGAPIXEL
         return Target((width, height), pixels)
 
+    def placements(self) -> list[tuple[float, float, float, float] | None]:
+        """`reference_boxes` checked: one entry per reference, each with x0 < x1 and y0 < y1; none
+        given is no placement for any reference."""
+        boxes, count = self.reference_boxes, len(self.reference_images)
+        if boxes is None:
+            return [None] * count
+        if len(boxes) != count:
+            raise InvalidRequest(
+                f"reference_boxes has {len(boxes)} entries for {count} reference_images",
+                code="reference_boxes_length",
+                fields=("reference_boxes",),
+            )
+        for index, box in enumerate(boxes):
+            if box is not None and not (box[0] < box[2] and box[1] < box[3]):
+                raise InvalidRequest(
+                    f"a box is [x0, y0, x1, y1] with x0 < x1 and y0 < y1, got {box}",
+                    code="invalid_box",
+                    fields=(f"reference_boxes.{index}",),
+                )
+        return [None if box is None else (box[0], box[1], box[2], box[3]) for box in boxes]
+
     def drawn_seed(self) -> int:
         """The seed given, else a fresh one the result reports."""
         return self.seed if self.seed is not None else secrets.randbits(53)
@@ -85,7 +124,7 @@ class ImageRequest(msgspec.Struct):
         """A warning for each of `fields` the request set although this model has no use for it;
         None, False and "" ask for nothing and pass silently."""
         for field in fields:
-            if getattr(self, field) not in (None, False, ""):
+            if getattr(self, field) not in (None, False, "", []):
                 adj.warn(field, f"ignored: {reason}")
 
 
