@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -136,3 +137,28 @@ def test_a_construction_fills_what_it_builds_and_skips_the_rest(
             torch.testing.assert_close(hidden[depth], want[depth], rtol=0, atol=0)
     finally:
         backend.close()
+
+
+#: Every first-party package's text encoder config, as upstream ships it.
+TEXT_ENCODERS = sorted((Path(__file__).parent / "testdata" / "text_encoders").glob("*.json"))
+
+
+@pytest.mark.parametrize("path", TEXT_ENCODERS, ids=lambda p: p.stem)
+def test_a_stored_text_encoder_config_builds_its_binding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: Path
+) -> None:
+    """As the store keeps it, canonical JSON writes a whole float as an integer (CLIP's
+    `initializer_factor` 1.0 is 1), which Transformers 5's strict configs refuse for a float
+    field (SDXL runs 15006/15012/15014). The binding builds the model regardless."""
+    config = canonical.parse_canonical(canonical.write(json.loads(path.read_text())))
+    assert isinstance(config, dict)
+    if path.stem.startswith("sdxl-"):
+        assert type(config["initializer_factor"]) is int, "the stored spelling under test"
+    writer = tensorfs.Writer(cache_dir=home(tmp_path, monkeypatch))
+    held = writer.component(
+        "text_encoder", cls=("transformers", "", config["architectures"][0]), config=config
+    )
+    held.put("probe.weight", np.zeros(1, np.float32), dtype="F32", shape=[1])
+    ck = Checkpoint(writer.commit())
+    bind = ck.binding("text_encoder")
+    assert bind("probe.weight")
