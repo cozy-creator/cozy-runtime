@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import functools
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -72,56 +71,65 @@ def _name(fn: Callable[[Any], Any]) -> str:
     return str(getattr(fn, "__qualname__", type(fn).__qualname__))
 
 
+def _step(length: int, cut: Cut, count: int) -> int:
+    """The aligned distance between neighbouring starts of about `count` spans of `length`."""
+    step = max(-(-max(length - cut.overlap, 1) // count), cut.overlap, 1)
+    return -(-step // cut.align) * cut.align
+
+
 def _spans(length: int, cut: Cut, count: int) -> list[tuple[int, int]]:
     """About `count` aligned spans covering `length`, neighbours sharing `overlap`."""
-    step = max(-(-max(length - cut.overlap, 1) // count), cut.overlap, 1)
-    step = -(-step // cut.align) * cut.align
+    step = _step(length, cut, count)
     starts = range(0, max(length - cut.overlap, 1), step)
     return [(a, min(a + step + cut.overlap, length)) for a in starts]
+
+
+def _longest(length: int, cut: Cut, count: int) -> int:
+    """The longest of `count` spans: the first, as every later one is no longer."""
+    return min(_step(length, cut, count) + cut.overlap, length)
+
+
+def _finer(length: int, cut: Cut, count: int) -> int:
+    """The fewest spans above `count` whose longest is shorter, 0 when none is. A span count's
+    step only falls as the count grows, so it is the least count whose step reaches the
+    largest aligned step below the current longest less the overlap: arithmetic, never a scan
+    (a scan rebuilding each count's spans planned 136k tokens for minutes, cr-211)."""
+    target = (_longest(length, cut, count) - cut.overlap - 1) // cut.align * cut.align
+    if target < _step(length, cut, length):
+        return 0
+    more = max(count + 1, -(-max(length - cut.overlap, 1) // target))
+    return more if more <= length else 0
 
 
 def _windows(shape: tuple[int, ...], cuts: tuple[Cut, ...], most: float) -> list[Window]:
     """The fewest windows of at most `most` elements, longest axis cut first."""
     lengths = [shape[c.dim] for c in cuts]
     counts = [1] * len(cuts)
-    spans = [_spans(n, c, 1) for n, c in zip(lengths, cuts, strict=True)]
-    while _largest(shape, cuts, spans) > most:
-        for i in sorted(range(len(cuts)), key=lambda i: -_longest(spans[i])):
-            more = next(
-                (
-                    n
-                    for n in range(counts[i] + 1, lengths[i] + 1)
-                    if _longest(_spans(lengths[i], cuts[i], n)) < _longest(spans[i])
-                ),
-                0,
-            )
+    longest = [_longest(n, c, 1) for n, c in zip(lengths, cuts, strict=True)]
+    while _largest(shape, cuts, longest) > most:
+        for i in sorted(range(len(cuts)), key=lambda i: -longest[i]):
+            more = _finer(lengths[i], cuts[i], counts[i])
             if more:
-                counts[i], spans[i] = more, _spans(lengths[i], cuts[i], more)
+                counts[i], longest[i] = more, _longest(lengths[i], cuts[i], more)
                 break
         else:
             break
     windows: list[Window] = [()]
-    for axis in spans:
-        windows = [(*w, s) for w in windows for s in axis]
+    for n, c, k in zip(lengths, cuts, counts, strict=True):
+        windows = [(*w, s) for w in windows for s in _spans(n, c, k)]
     return windows
 
 
-@functools.cache
 def _finest(shape: tuple[int, ...], cuts: tuple[Cut, ...]) -> int:
-    """Elements in the largest window of the finest cut."""
-    return _largest(shape, cuts, list(zip(*_windows(shape, cuts, 0), strict=True)))
+    """Elements in the largest window of the finest cut: each axis at as many spans as it has
+    elements, which no greater count shortens."""
+    return _largest(shape, cuts, [_longest(shape[c.dim], c, shape[c.dim]) for c in cuts])
 
 
-def _longest(spans: Sequence[tuple[int, int]]) -> int:
-    return max(b - a for a, b in spans)
-
-
-def _largest(
-    shape: tuple[int, ...], cuts: tuple[Cut, ...], spans: Sequence[Sequence[tuple[int, int]]]
-) -> int:
-    """Elements in the largest window."""
+def _largest(shape: tuple[int, ...], cuts: tuple[Cut, ...], longest: Sequence[int]) -> int:
+    """Elements in the largest window, each cut axis at its longest span."""
     rest = math.prod(shape) // math.prod(shape[c.dim] for c in cuts)
-    return rest * math.prod(_longest(s) for s in spans)
+    return rest * math.prod(longest)
 
 
 def _run(fn: Callable[[Any], Any], x: Any, cuts: tuple[Cut, ...], windows: list[Window]) -> Any:
