@@ -194,6 +194,10 @@ _VOCAB_MODULES = {
 _TRUSTED_ROOTS = ("cozy_runtime.derive",)
 
 
+def _author_structs() -> tuple[str, ...]:
+    return tuple(f"author.{name}" for name in _AUTHOR_STRUCTS)
+
+
 def _trusted_module(name: str) -> bool:
     return any(name == root or name.startswith(root + ".") for root in _TRUSTED_ROOTS)
 
@@ -235,8 +239,15 @@ _AUTHOR_TYPES = (
     "QuantizationPlan",
     "SelectionPlan",
     "EncodingRule",
+    "ImageRequest",
+    "ImageResult",
+    "ReferenceImages",
+    "AspectRatio",
+    "Seed",
     *(cls.__name__ for cls in SERVICES.values()),
 )
+#: Author-surface structs a package's struct may extend (cr-219): the image interface.
+_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult")
 #: Author-surface callables a folded constant may reach: each validates its own arguments.
 #: `data_values` reads committed JSON through the same function as the imported app.
 _AUTHOR_VALUES = (
@@ -870,7 +881,7 @@ class Reader:
             target = base.value if isinstance(base, ast.Subscript) else base
             found = self.resolve(module, target)
             if isinstance(found, Vocab):
-                if found.key == "msgspec.Struct":
+                if found.key == "msgspec.Struct" or found.key in _author_structs():
                     return "struct"
                 if found.key == "author.Model":
                     return "model"
@@ -909,6 +920,9 @@ class Reader:
         for base in node.bases:
             found = self.resolve(module, base)
             if isinstance(found, Vocab) and found.key == "msgspec.Struct":
+                continue
+            if isinstance(found, Vocab) and found.key in _author_structs():
+                bases.append(getattr(author, found.key.partition(".")[2]))
                 continue
             if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
                 parent = self.class_type(found.module, found.node, base)
@@ -1914,6 +1928,9 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 if assets is not None:
                     reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
                 assets = assets_binding(arg.arg, reader.translate(module, arg.annotation))
+                continue
+            if found.key in _author_structs():
+                payloads.append(reader.translate(module, arg.annotation))
                 continue
 
         if (
