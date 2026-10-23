@@ -495,6 +495,8 @@ class Backend:
         # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).
         model = self.memory.load(root, Level.RAM)
+        if self.device.type == "cpu":
+            _float32(self.torch, root)
         self._leg(f"{name}.load", leg)
         return model
 
@@ -650,6 +652,36 @@ class _Routes:
         if self.region is not None:
             self.region.close()
             self.region = None
+
+
+def _float32(torch: ModuleType, root: Module) -> None:
+    """A CPU computes 16-bit floats some two hundred times slower than float32 (torch's own CPU
+    kernels: a 1024² matmul takes 2.0 s in bf16 and 9.5 ms in f32 on AVX2), so a CPU executor's
+    module is float32: its placeholders convert, and each bound weight is converted while its
+    block runs (varena's `module.to(dtype)`); the stored bytes stay as they are. Swapped, so a
+    weight read outside its block's forward reads converted too. A package that casts its inputs
+    to the 16-bit dtype it built in runs unchanged: each module owning float tensors widens its
+    16-bit float inputs."""
+    future = torch.__future__
+    swapping = future.get_swap_module_params_on_conversion()
+    future.set_swap_module_params_on_conversion(True)
+    try:
+        root.float()
+    finally:
+        future.set_swap_module_params_on_conversion(swapping)
+    narrow = (torch.float16, torch.bfloat16)
+
+    def widen(_: Module, args: Any, kwargs: Any) -> Any:
+        def up(value: Any) -> Any:
+            narrowed = isinstance(value, torch.Tensor) and value.dtype in narrow
+            return value.float() if narrowed else value
+
+        return torch.utils._pytree.tree_map(up, (args, kwargs))
+
+    for sub in root.modules():
+        owned = (*sub._parameters.values(), *sub._buffers.values())
+        if any(t is not None and t.is_floating_point() for t in owned):
+            sub.register_forward_pre_hook(widen, with_kwargs=True)
 
 
 def _derived(leaf: Any, parts: Mapping[str, Any]) -> tuple[str, ...]:
