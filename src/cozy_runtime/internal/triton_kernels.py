@@ -85,7 +85,7 @@ _BACKENDS: dict[int, BaseBackend] = {}
 def _cache_key(entry: TritonEntry, arch: int) -> str:
     """Triton's own cache hash for (sources, signature, architecture, options, Triton)."""
     backend = _backend(arch)
-    options = backend.parse_options({"num_warps": entry.num_warps})
+    options = backend.parse_options({"num_warps": entry.num_warps, "num_stages": entry.num_stages})
     key = get_cache_key(_source(entry), backend, options, get_cache_invalidating_env_vars())
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
@@ -112,6 +112,7 @@ class _Kernel(Struct, frozen=True):
     constexprs: dict[str, int]
     aligned: tuple[str, ...]
     num_warps: int
+    num_stages: int
 
     @classmethod
     def of(cls, entry: TritonEntry) -> _Kernel:
@@ -124,11 +125,14 @@ class _Kernel(Struct, frozen=True):
             constexprs,
             entry.aligned,
             entry.num_warps,
+            entry.num_stages,
         )
 
     def entry(self) -> TritonEntry:
         kernel = getattr(import_module(self.module), self.name)
-        return TritonEntry(kernel, self.signature, self.constexprs, self.aligned, self.num_warps)
+        return TritonEntry(
+            kernel, self.signature, self.constexprs, self.aligned, self.num_warps, self.num_stages
+        )
 
 
 def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
@@ -164,7 +168,7 @@ def build(
         compiled = triton.compile(
             _source(entry),
             target=GPUTarget("cuda", arch, WARP_SIZE),
-            options={"num_warps": entry.num_warps},
+            options={"num_warps": entry.num_warps, "num_stages": entry.num_stages},
         )
         if compiled.hash != entries[entry.key]:
             raise kernel_compile.CompileFailed(

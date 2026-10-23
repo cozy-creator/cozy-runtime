@@ -37,9 +37,10 @@ LEVELS_MAX = 448.0 * 6.0
 SCALE_FLOOR = 2.0**-9
 #: The ranks the kernels are built for: a branch is padded with zero rows to the next one.
 RANKS = (32, 64, 128)
-#: The tiles: rows quantized per program, and the GEMM's output tile and K step.
+#: The tiles: rows quantized per program, and the GEMM's output tile, K step, warps and stages
+#: (v1's best of its twelve on an sm120 card: 5-12% over 128x128x128 at 3 stages).
 QUANT_ROWS, QUANT_K = 32, 128
-TILE_M, TILE_N, TILE_K, GROUP_M = 128, 128, 128, 8
+TILE_M, TILE_N, TILE_K, GROUP_M, GEMM_WARPS, GEMM_STAGES = 128, 128, 256, 8, 8, 2
 #: The column multiple the kernels need (one K step).
 K_ALIGN = TILE_K
 #: What a run's `gemm.selected` names.
@@ -232,7 +233,8 @@ def _entries() -> list[TritonEntry]:
                         "HALF": code,
                     },
                     aligned=(*u8, "la_ptr", "up_ptr", "out_ptr", "K", "N"),
-                    num_warps=8,
+                    num_warps=GEMM_WARPS,
+                    num_stages=GEMM_STAGES,
                 )
             )
     return entries

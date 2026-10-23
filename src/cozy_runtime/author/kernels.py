@@ -49,13 +49,14 @@ class KernelsUnavailable(RuntimeError):
 class TritonEntry:
     """One compiled specialization of a module-level `@triton.jit` kernel: Triton's signature
     (`{"x_ptr": "*bf16", "n": "i32", "BLOCK": "constexpr"}`), the constexpr values, the pointer
-    and integer arguments it may assume 16-aligned, and its warps."""
+    and integer arguments it may assume 16-aligned, its warps and its pipeline stages."""
 
     kernel: Any
     signature: Mapping[str, str]
     constexprs: Mapping[str, int] = field(default_factory=dict)
     aligned: tuple[str, ...] = ()
     num_warps: int = 4
+    num_stages: int = 3
 
     @property
     def key(self) -> str:
