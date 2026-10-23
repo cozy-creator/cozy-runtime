@@ -1,0 +1,11 @@
+name: e2e
+# CI v2 (tracker/design/ci-v2.md): cozy-creator's e2e suites, selected by what this pull request changes.
+on:
+  pull_request:
+jobs:
+  e2e:
+    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@master
+    with:
+      repo: cozy-runtime
+      ref: ${{ github.event.pull_request.head.sha }}
+      base: ${{ github.event.pull_request.base.sha }}
