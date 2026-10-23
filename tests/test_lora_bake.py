@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import numpy as np
 import pytest
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.derive.microscale import (
     decode_int8_convrot256,
     e4m3_decode,
@@ -14,7 +16,7 @@ from cozy_runtime.derive.microscale import (
     encode_int8_convrot256,
     encode_nvfp4,
 )
-from cozy_runtime.internal import lora_bake
+from cozy_runtime.internal import kernel_ready, lora_bake, weights
 from cozy_runtime.internal.encoding.formats import nvfp4_values
 
 torch = pytest.importorskip("torch")
@@ -315,3 +317,29 @@ def test_an_nvfp4_bake_keeps_the_delta_on_the_kept_grid() -> None:
             )
     assert kept["nearest", "keep"] < 0.5
     assert 0.85 < kept["stochastic", "keep"] < 1.15
+
+
+def test_loras_serve_per_step_while_the_bake_kernels_build_and_baked_once_they_serve(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No forward waits for the bake kernels (cr-217): a component's LoRAs serve per step while
+    the child builds, and baked from the boundary after it ended well (`kernel_ready`)."""
+    pytest.importorskip("triton")
+    monkeypatch.setattr(lora_bake, "_BUILD", None)
+    monkeypatch.setattr(lora_bake, "_CHECK", "import time; time.sleep(1.5)")
+    bakes = weights._Bakes(torch, torch.nn.Module(), {}, set(), lambda _: None, 0)
+    started = time.perf_counter()
+    lora_bake.warm(0)  # at load
+    with request_path.serving():  # a request in flight
+        assert bakes.prepare() == ("per_step",) and bakes.how is None
+        assert time.perf_counter() - started < 1  # nothing waited for the child
+        _built()
+        assert bakes.prepare() == ("per_step",)  # until the request's next boundary
+        assert kernel_ready.boundary() == [lora_bake.KERNEL]
+        assert bakes.prepare() == ("bake",) and bakes.how == "fused"
+
+
+def _built() -> None:
+    """The child's build ended, and its opener (`kernel_ready`) with it."""
+    while kernel_ready._SLOTS[lora_bake.KERNEL].state == "opening":
+        time.sleep(0.05)
