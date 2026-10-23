@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from torch import Tensor, device as Device
     from torch.nn import Module
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._attention import _request
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
@@ -419,6 +420,7 @@ class _Placeholder:
         return capsule
 
 
+@request_path.forbid("kernel build: sol")
 def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
     """Upstream `_compile_<route>`, traced from placeholders; SM90's at a length that IS this
     variant. Every route takes q, k, v, output, kc, vc, threshold and lse."""
@@ -447,6 +449,7 @@ def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
         return path.read_bytes()
 
 
+@request_path.forbid("kernel build: sol")
 def build(spec: dict[str, Any], staging: Path, report: Callable[..., None]) -> dict[str, object]:
     """The compile manager's builder for one object (`kernel_compile.BUILDERS["sol"]`)."""
     data = compile_variant(spec["route"], int(spec.get("blocks", 0)), bool(spec.get("full")))

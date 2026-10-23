@@ -30,6 +30,7 @@ from types import ModuleType
 
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.internal import accel, filelock, kernel_cache
 from cozy_runtime.internal.derive import placing
@@ -78,30 +79,30 @@ def verified(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) 
     an earlier process of this Runtime build here. A probe that raises fails with its exception."""
     key = (kernel, artifact, sm, accel.driver_version(), RUNTIME)
     known = _KNOWN.get(key)
-    if known is not None:
-        return known
+    if known is None:
+        with request_path.forbid(f"kernel self-check: {kernel}"):
+            known = _KNOWN[key] = _probed(key, probe)
+    return known
+
+
+def _probed(key: Key, probe: Callable[[], Verdict]) -> Verdict:
     path = _path(key)
     if path is None:
-        known = _KNOWN[key] = _run(probe)
-        return known
+        return _run(probe)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         lock = path.with_suffix(".lock").open("a+")
     except OSError:
-        known = _KNOWN[key] = _run(probe)
-        return known
+        return _run(probe)
     with lock:
         filelock.lock(lock)  # another process of this machine probing it finishes first
         if path.exists():  # its marker outlived the probe: that probe ended its process
-            known = Verdict(False, CRASHED)
-        else:
-            _write(path, key, Verdict(False, CRASHED))
-            try:
-                known = _run(probe)
-            finally:
-                path.unlink(missing_ok=True)
-    _KNOWN[key] = known
-    return known
+            return Verdict(False, CRASHED)
+        _write(path, key, Verdict(False, CRASHED))
+        try:
+            return _run(probe)
+        finally:
+            path.unlink(missing_ok=True)
 
 
 def _run(probe: Callable[[], Verdict]) -> Verdict:

@@ -43,6 +43,7 @@ from typing import Any
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
@@ -198,7 +199,7 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
         return state
     name = waiter or state.kernel
     pace, sampled = liveness.Pace(), float("-inf")
-    with held.get()(name) as sleep:
+    with request_path.forbid(f"kernel build wait: {name}"), held.get()(name) as sleep:
         while state.state == "compiling":
             now = time.monotonic()
             if now - sampled >= liveness.SAMPLE_SECONDS:
@@ -462,6 +463,7 @@ def compilers(path: Path) -> set[int]:
         return set()
 
 
+@request_path.forbid("kernel build: compiler")
 def run(
     argv: Sequence[str],
     *,

@@ -70,6 +70,7 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _split, describe
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
 from cozy_runtime.author._app import Registration
@@ -3145,7 +3146,7 @@ class Executor:
             or command.capture is not None
             or bool(requested and target._attention_reaches(requested))
         )
-        with self.in_flight.attempt(alone) as slot:
+        with self.in_flight.attempt(alone) as slot, request_path.serving():
             # Admitted only now: an attempt before it may have poisoned the generation. Its
             # record is taken once nothing can refuse it, so a refused call may come again.
             refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
@@ -3383,11 +3384,13 @@ class Executor:
         )
         stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
+        blocking: dict[str, tuple[float, int]] = {}
         request: MemoryRequest | None = None
         rank_memory: list[ReplyMemory] = []
         try:
             with (
                 WARNINGS.attempt() as warnings,
+                request_path.serving() as blocking,
                 self._request(command.request_id) as request,
                 self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
@@ -3477,6 +3480,10 @@ class Executor:
                 )
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
+            for work, (ms, times) in blocking.items():
+                took = {"ms": round(ms, 1), "times": times}
+                record.emit("confession", "request_path.blocking", work, **took)
+                record.emit("log", "kernel work blocked the request", "warn", work=work, **took)
             members = self.model_executors or [self]
             facts = next((m.device_facts for m in members if m.device_facts), None)
             if facts is not None and (unnamed := arch.inherited(facts.sm, facts.name)):
