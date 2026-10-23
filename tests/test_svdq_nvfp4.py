@@ -19,7 +19,6 @@ from cozy_runtime.author import (
     QuantizationPlan,
     Recipe,
     Weights,
-    uses_components,
 )
 from cozy_runtime.author._recipes import DeclaredRecipe, RecipeModel, canonical, fingerprint
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
@@ -207,16 +206,12 @@ class Net(Model[object]):
     def load(self, loader: Loader) -> None:
         return None
 
-    @uses_components("transformer")
-    def denoise(self, x: Any) -> Any:
-        return self.net(x)
-
 
 def three_inputs(ctx: Any, tel: Any, model: Net, record: Any) -> None:
     torch = pytest.importorskip("torch")
     with record({"transformer": model.net}), torch.no_grad():
         for seed in range(3):
-            model.denoise(inputs(torch, seed))
+            model.net(inputs(torch, seed))
 
 
 SVDQ = Recipe(
