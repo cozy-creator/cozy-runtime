@@ -4942,8 +4942,12 @@ def serve(executor: Executor, channel: Channel) -> int:
     # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
     order = _Order()
-    threading.Thread(target=_idle, args=(order,), name="graphs-idle", daemon=True).start()
+    idle = False
     while True:
+        if not idle and executor.started:
+            # After the device Start: a live thread in an import-only executor refuses its forks.
+            threading.Thread(target=_idle, args=(order,), name="graphs-idle", daemon=True).start()
+            idle = True
         try:
             frame = executor.mux.command()
         except SeamError:
