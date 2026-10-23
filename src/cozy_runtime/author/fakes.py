@@ -36,7 +36,7 @@ from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset, GrantedInput, bind, file_state
 from cozy_runtime.author._context import AdapterRef, Context, Device
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
-from cozy_runtime.author._defaults import Clamp, Recipe
+from cozy_runtime.author._defaults import Clamp, DefaultSet
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._invoke import (
     Invocation,
@@ -268,7 +268,7 @@ def invoke_with_fakes(
     models: Mapping[str, Model[Any]] | None = None,
     settings: object = None,
     secrets: object = None,
-    recipes: Sequence[Recipe] = (),
+    default_sets: Sequence[DefaultSet] = (),
     clamps: Sequence[Clamp] = (),
     adapters: tuple[AdapterRef, ...] = (),
     seconds: float = 300.0,
@@ -284,7 +284,7 @@ def invoke_with_fakes(
         prepare(
             registration,
             wire,
-            recipes=recipes,
+            default_sets=default_sets,
             clamps=clamps,
             settings=settings,
             input_metadata=assets or {},
@@ -295,7 +295,7 @@ def invoke_with_fakes(
             deadline=time.monotonic() + seconds,
             cancel=lambda: cancelled,
             models=models or {},
-            recipes=recipes,
+            default_sets=default_sets,
             clamps=clamps,
             settings=settings,
             secrets=secrets,

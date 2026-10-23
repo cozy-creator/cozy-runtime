@@ -2,8 +2,9 @@
 
 Each follower has a framed JSON command socket and joins the group's distributed
 collectives. A failed run or lost follower breaks the group and terminates its
-remaining followers, allowing blocked collectives to unwind. Import/fill progress
-is observed through the existing liveness meter.
+remaining followers, allowing blocked collectives to unwind. Nothing here waits on a clock:
+every wait ends with the reply or the follower's death, and TensorD judges a call that stops
+making progress from outside, on its GPUs' memory traffic, bytes moved, CPU and frames.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from typing import Any, Protocol, TypedDict
 import msgspec
 
 from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED
-from cozy_runtime.internal import execution_evidence, liveness, spawn
+from cozy_runtime.internal import execution_evidence, spawn
 from cozy_runtime.internal.config import inherited_environment, update_environment
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
@@ -243,7 +244,6 @@ class RankGroup:
         backend: str,
         python: str = sys.executable,
         root: str = "",
-        sample_seconds: float = liveness.SAMPLE_SECONDS,
         forward: Callable[[dict[str, object]], None] | None = None,
         launch: Callable[[list[str], int], ChildProcess] | None = None,
         devices: Iterable[str] = (),
@@ -254,7 +254,6 @@ class RankGroup:
         self.backend = backend
         self.python = python
         self.root = root
-        self.sample_seconds = float(sample_seconds)
         #: the seal's `CUDA_VISIBLE_DEVICES` entries: rank r drives entry r
         self.devices = tuple(devices)
         #: where a follower's progress frame goes: rank 0's own seam, so the worker keeps
@@ -279,9 +278,6 @@ class RankGroup:
         #: set once this formation's interrupt has aborted its communicator (set: none due)
         self._ended = threading.Event()
         self._ended.set()
-        #: per mirrored component, the pace of its calls (`watched`): the longest pause any
-        #: call of it showed carries over to the next
-        self.paces: dict[str, liveness.Pace] = {}
         #: per follower rank, the largest working peak its mirrored calls reported this attempt
         self.working_peaks: dict[int, int] = {}
         #: per follower rank, its executor's plane facts as its latest reply stated them
@@ -387,46 +383,9 @@ class RankGroup:
     def _abort_collectives(self) -> None:
         """A dead follower must not park rank 0 on a collective that cannot complete:
         abort the communicator so the collective raises instead of waiting on NCCL's
-        clock. Best effort - the worker's own liveness watch on rank 0 is the authority."""
+        clock. Best effort: TensorD's watch on the call's progress is the authority."""
         if self.pg is not None:
             abort_process_group()
-
-    @contextlib.contextmanager
-    def watched(self, name: str, device: Callable[[], int]) -> Iterator[None]:
-        """A mirrored call in flight, judged by its own pace (`liveness.Pace`), never a clock:
-        the reading is GPU 0's device progress (`device`), the bytes each follower moved and
-        the answers that arrived. Every GPU of a call waits on the others in its collectives,
-        so a GPU stuck in one stops them all; a spinning wait burns CPU, which is why CPU time
-        is not in the reading. Still for longer than STILL_FACTOR times the
-        longest pause any call of this component showed (the first call learns its own, from
-        its device progress) and the noise floor: the group breaks, naming the GPUs that
-        have not answered. NCCL's own watchdog is off (`abortable`): this is the one that
-        ends a wedged call."""
-        pace = self.paces.setdefault(name, liveness.Pace())
-        pace.reading = None  # this call opens its own clock
-        floor = liveness.noise_floor(self.sample_seconds)
-        finished = threading.Event()
-
-        def watch() -> None:
-            while not finished.wait(self.sample_seconds):
-                pace.observe(
-                    (
-                        device(),
-                        tuple((liveness.moved(f.pid), f.replies.qsize()) for f in self.followers),
-                    )
-                )
-                if pace.wedged(floor):
-                    quiet = [f.gpu for f in self.followers if f.replies.empty()] or ["GPU 0"]
-                    self._break(f"{', '.join(quiet)} wedged in {name!r}: {pace.verdict(floor)}")
-                    return
-
-        watcher = threading.Thread(target=watch, name="group-watch", daemon=True)
-        watcher.start()
-        try:
-            yield
-        finally:
-            finished.set()
-            watcher.join()
 
     def interrupt(self) -> None:
         """End the collective in flight on every GPU and keep the group whole: each
@@ -568,12 +527,8 @@ class RankGroup:
         self.broadcast({**command, "ledgers": 0})
 
     def collect(self, name: str) -> list[dict[str, Any]]:
-        """One reply named `name` from every follower, in rank order.
-
-        The wait is on the follower's OWN progress meter: sampled every `sample_seconds`,
-        wedged only against the pauses it has itself shown (`liveness.Pace`). Death is
-        observed through the seam, not inferred from silence.
-        """
+        """One reply named `name` from every follower, in rank order. Each wait ends with the
+        reply or the follower's death, observed through its seam, never inferred from silence."""
         return [self._reply(follower, name) for follower in self.followers]
 
     def call_one(self, rank: int, command: Mapping[str, object]) -> dict[str, Any]:
@@ -629,25 +584,15 @@ class RankGroup:
         return self._reply(self.followers[rank - 1], name)
 
     def _reply(self, follower: Follower, name: str) -> dict[str, Any]:
-        pace = liveness.Pace()
-        floor = liveness.noise_floor(self.sample_seconds)
-        while True:
-            try:
-                frame = follower.replies.get(timeout=self.sample_seconds)
-            except queue.Empty:
-                pace.observe(liveness.burn(follower.pid))
-                if pace.wedged(floor):
-                    self._break(f"{follower.gpu} wedged during {name!r}: {pace.verdict(floor)}")
-                    raise GroupRefusal(self.broken, code="group_broken") from None
-                continue
-            if frame is None:
-                raise GroupRefusal(f"{self.verdict()} during {name!r}", code="group_broken")
-            head, body = frame
-            if head.reply != name:
-                refused = f": {head.code}: {head.detail}"[:600] if head.ok is False else ""
-                self._break(f"{follower.gpu} answered {head.reply!r} to {name!r}{refused}")
-                raise GroupRefusal(self.broken, code="group_broken")
-            return body
+        frame = follower.replies.get()
+        if frame is None:
+            raise GroupRefusal(f"{self.verdict()} during {name!r}", code="group_broken")
+        head, body = frame
+        if head.reply != name:
+            refused = f": {head.code}: {head.detail}"[:600] if head.ok is False else ""
+            self._break(f"{follower.gpu} answered {head.reply!r} to {name!r}{refused}")
+            raise GroupRefusal(self.broken, code="group_broken")
+        return body
 
     def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
         self.broadcast(command)

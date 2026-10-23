@@ -23,6 +23,7 @@ from cozy_runtime.internal.decode_cores import (
     Cores,
     Packing,
     blocks_of,
+    round_into,
     unpack,
 )
 
@@ -424,6 +425,90 @@ NVFP4 = Adapter(
         "scale_layout": "cublas_128x4",
     },
     rule=_nvfp4_rule,
+)
+
+# --------------------------------------------------------------------------- svdq.nvfp4
+
+
+def _svdq_rule(v: View) -> str:
+    """nvfp4's blocks, one matrix, and the two low-rank factors of one rank."""
+    if len(v.shape) != 2:
+        return f"svdq.nvfp4 is one matrix, not {list(v.shape)}"
+    down, up = v.parts.get("lowrank_down"), v.parts.get("lowrank_up")
+    if down is not None and up is not None and down[1][0] != up[1][-1]:
+        return (
+            f"svdq.nvfp4: lowrank_down {list(down[1])} and lowrank_up {list(up[1])} differ in rank"
+        )
+    return _nvfp4_rule(v)
+
+
+def _rank(v: View, role: str, axis: int) -> int:
+    """A factor's rank, as stored; 32 (the producer's) for a part not yet drawn (`sample`)."""
+    got = v.parts.get(role)
+    if got is None:
+        return 32
+    if len(got[1]) != 2 or got[1][axis] < 1:
+        raise ValueError(f"{role} is not a rank-2 factor")
+    return int(got[1][axis])
+
+
+def _svdq(
+    c: Cores,
+    parts: Mapping[str, Tensor],
+    params: Mapping[str, object],
+    shape: tuple[int, ...],
+    out: Tensor,
+) -> None:
+    """nvfp4's value `((T[q] x s) x g)`, `x c_i` (`channel_scale`), `x p_j` (`pre_quant_scale`),
+    then `+ up[i, r] x down[r, j]` in r order, in f32, rounded once."""
+    torch = c.torch
+    n, cols = shape
+    value = torch.empty(n * cols, dtype=torch.float32, device=out.device)
+    c.table(
+        _u8(torch, parts["weight"]),
+        Packing(4, 8, order=str(params["nibble_order"])),
+        n,
+        cols,
+        _table(torch, E2M1, out.device),
+        _f32(torch, parts["scale"]),
+        blocks_of(16, str(params["scale_layout"])),
+        value,
+        scale_2=_f32(torch, parts["scale_2"])[:1],
+        divide=params["global_scale"] == "divide",
+    )
+    value = value.view(n, cols)
+    if "channel_scale" in parts:
+        value = value * _f32(torch, parts["channel_scale"]).view(n, 1)
+    value = value * _f32(torch, parts["pre_quant_scale"]).view(1, cols)
+    up = parts["lowrank_up"].to(torch.float32).reshape(n, -1)
+    down = parts["lowrank_down"].to(torch.float32).reshape(up.shape[1], cols)
+    term = torch.empty_like(value)
+    for r in range(up.shape[1]):  # each product rounded to f32, then added: the law's order
+        value.add_(torch.mul(up[:, r : r + 1], down[r : r + 1, :], out=term))
+    round_into(torch, value, out.reshape(-1))
+
+
+SVDQ_NVFP4 = Adapter(
+    "svdq.nvfp4",
+    NVFP4.params,
+    (
+        *NVFP4.parts[:4],
+        Part("pre_quant_scale", ("f32", "bf16", "f16"), lambda v: ("count", v.cols)),
+        Part("channel_scale", ("f32", "f8_e4m3fn"), lambda v: ("count", v.rows), required=False),
+        Part(
+            "lowrank_down",
+            ("bf16", "f16", "f32"),
+            lambda v: ("exact", (_rank(v, "lowrank_down", 0), v.cols)),
+        ),
+        Part(
+            "lowrank_up",
+            ("bf16", "f16", "f32"),
+            lambda v: ("exact", (v.rows, _rank(v, "lowrank_up", 1))),
+        ),
+    ),
+    _svdq,
+    {**NVFP4.probe_params, "scale_layout": "row_major"},
+    rule=_svdq_rule,
 )
 
 # ------------------------------------------------------------------------------- mxfp8
@@ -1324,6 +1409,7 @@ def _ct(bits: int) -> Adapter:
 #: Every scheme the cores decode, one row each.
 ADAPTERS: tuple[Adapter, ...] = (
     NVFP4,
+    SVDQ_NVFP4,
     MXFP8,
     FP8_BLOCKWISE,
     MXFP4,

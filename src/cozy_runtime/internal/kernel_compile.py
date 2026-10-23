@@ -43,6 +43,8 @@ from typing import Any
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
+from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author import _work as work
 from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
@@ -121,9 +123,12 @@ _STARTED: dict[str, tuple[subprocess.Popen[bytes], threading.Thread]] = {}
 _GUARD = threading.Lock()
 #: How often a wait reads the state it waits on: resolution, never a verdict.
 POLL_SECONDS = 0.5
+#: How often a builder tells the CPU it used, while it moves.
+REPORT_SECONDS = 1.0
 #: Told the state a wait reads, each sample, named for its waiter: an executor reports it to
-#: its machine as the run's progress.
+#: its machine as the run's progress. A wait off every request (`kernel_ready`) is not `told`.
 waiting: Callable[[State], None] | None = None
+told: ContextVar[bool] = ContextVar("cozy_compile_told", default=True)
 
 
 def _sleep(seconds: float) -> bool:
@@ -197,15 +202,21 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     if state.state != "compiling":
         return state
     name = waiter or state.kernel
-    pace, sampled = liveness.Pace(), float("-inf")
-    with held.get()(name) as sleep:
+    pace, sampled, reported = liveness.Pace(), float("-inf"), None
+    with request_path.forbid(f"kernel build wait: {name}"), held.get()(name) as sleep:
         while state.state == "compiling":
             now = time.monotonic()
             if now - sampled >= liveness.SAMPLE_SECONDS:
                 sampled = now
-                if waiting is not None:
+                if waiting is not None and told.get():
                     waiting(replace(state, kernel=name))
-                pace.observe(_activity(store), now)
+                # The call waiting moves as its builder says it moves (cl-648): its share done
+                # and its own CPU, which a sandboxed executor cannot read from its processes.
+                words = _words(store)
+                if words != reported:
+                    reported = words
+                    work.done += 1
+                pace.observe(_activity(words), now)
                 if pace.wedged(liveness.noise_floor(), now):
                     verdict = pace.verdict(liveness.noise_floor(), now)
                     _record_failure(job.key, "compile_stalled", verdict)
@@ -216,25 +227,31 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     return state
 
 
-def _activity(store: kernel_cache.Store) -> object:
-    """The meter a wait is judged by: every live build's word in this machine's store, and
-    the CPU and bytes its process tree has burned. None when no builder's burn is readable."""
+def _words(store: kernel_cache.Store) -> tuple[str, ...]:
+    """Every live build's word in this machine's store: its phase, share done and own CPU."""
     words: list[str] = []
-    pids: set[int] = set()
     for namespace in (store.own, store.trusted):
         for path in sorted(namespace.glob("*/*.state.json")) if namespace is not None else ():
-            with contextlib.suppress(OSError, ValueError, AttributeError):
-                word = path.read_text()
-                pid = json.loads(word).get("pid")
-                words.append(word)
-                if type(pid) is int:
-                    pids.add(pid)
+            with contextlib.suppress(OSError):
+                words.append(path.read_text())
+    return tuple(words)
+
+
+def _activity(words: tuple[str, ...]) -> object:
+    """The meter a wait is judged by: the builders' words, and the CPU and bytes their process
+    trees have burned. None when no builder's burn is readable."""
+    pids: set[int] = set()
+    for word in words:
+        with contextlib.suppress(ValueError, AttributeError):
+            pid = json.loads(word).get("pid")
+            if type(pid) is int:
+                pids.add(pid)
     try:
         tree = {member for pid in pids for member in (pid, *proctree.descendants(pid))}
     except proctree.ProcessTreeUnsupported:
         return None
     burns = [burned for member in tree if (burned := liveness.burn(member)) is not None]
-    return (tuple(words), sum(burns)) if burns else None
+    return (words, sum(burns)) if burns else None
 
 
 def learn(store: kernel_cache.Store, scope: str, job: Job) -> None:
@@ -462,6 +479,7 @@ def compilers(path: Path) -> set[int]:
         return set()
 
 
+@request_path.forbid("kernel build: compiler")
 def run(
     argv: Sequence[str],
     *,
@@ -534,6 +552,48 @@ def run(
     return output
 
 
+class Word:
+    """A builder's word on its key in the store: its phase and share done (`report`), and its
+    own measure beside them, CPU used, its compilers' included, told while it moves. A wait
+    moves as the word does, so one long entry (a Triton GEMM) still says it builds, to a
+    sandboxed executor that cannot read the builder's processes (cl-648)."""
+
+    def __init__(self, store: kernel_cache.Store, key: kernel_cache.Key, started_unix_ms: int) -> None:
+        self.store, self.key = store, key
+        self.word: dict[str, object] = {"pid": os.getpid(), "started_unix_ms": started_unix_ms}
+        self.last, self.lock, self.built = (-1.0, ""), threading.Lock(), threading.Event()
+        self.thread = threading.Thread(target=self._working, name="build-work", daemon=True)
+
+    def tell(self, **changed: object) -> None:
+        with self.lock:
+            self.word.update(changed)
+            self.store.set_state(self.key, self.word)
+
+    def report(self, progress: float, phase: str = "compiling") -> None:
+        # A new phase is always written: the slot's taker must stop reading as queued.
+        if abs(progress - self.last[0]) >= 0.01 or phase != self.last[1]:
+            self.last = (progress, phase)
+            self.tell(progress=progress, phase=phase)
+
+    def start(self) -> None:
+        self.report(0.0)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.built.set()
+        if self.thread.is_alive():
+            self.thread.join()
+
+    def _working(self) -> None:
+        cpu = 0.0
+        while not self.built.wait(REPORT_SECONDS):
+            times = os.times()
+            now = times.user + times.system + times.children_user + times.children_system
+            if now - cpu >= 0.1:
+                cpu = now
+                self.tell(cpu_s=round(now, 1))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m cozy_runtime.internal.kernel_compile")
     parser.add_argument("--store", type=Path, required=True)
@@ -546,23 +606,15 @@ def main(argv: list[str] | None = None) -> int:
     store = kernel_cache.Store(options.store, options.trusted)
     key = kernel_cache.Key.of(raw["kernel"], raw["inputs"])
     started, started_unix_ms = time.perf_counter(), round(time.time() * 1000)
-    last = [(-1.0, "")]
-
-    def report(progress: float, phase: str = "compiling") -> None:
-        # A new phase is always written: the slot's taker must stop reading as queued.
-        if abs(progress - last[0][0]) >= 0.01 or phase != last[0][1]:
-            last[0] = (progress, phase)
-            live = {"pid": os.getpid(), "started_unix_ms": started_unix_ms}
-            store.set_state(key, {**live, "progress": progress, "phase": phase})
-
+    word = Word(store, key, started_unix_ms)
     try:
-        report(0.0)
+        word.start()
         module, name = BUILDERS[raw["kind"]].split(":")
         build = getattr(import_module(module), name)
         spec = {**raw["spec"], "ledger": str(ledger(store)), "key": key.digest}
 
         def fill(staging: Path) -> Mapping[str, object]:
-            facts = dict(build(spec, staging, report))
+            facts = dict(build(spec, staging, word.report))
             elapsed = (time.perf_counter() - started) * 1000
             return {"host": os.uname().nodename, "compile_ms": round(elapsed, 1), **facts}
 
@@ -574,6 +626,7 @@ def main(argv: list[str] | None = None) -> int:
         _record_failure(key, "compile_failed", f"{type(exc).__name__}: {exc}")
         return 1
     finally:
+        word.stop()
         store.set_state(key, None)
     print(json.dumps({"key": key.digest, "ms": round((time.perf_counter() - started) * 1000)}))
     return 0

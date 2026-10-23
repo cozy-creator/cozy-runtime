@@ -64,7 +64,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         if arg.annotation is None:
             reader.refuse(module, arg, "an unannotated invocable parameter")
         annotation = arg.annotation
-        found = reader.model_annotation(module, annotation)
+        override = registration.model_classes.get(arg.arg)
+        found = (override, False) if override else reader.model_annotation(module, annotation)
         if found is not None:
             model, weights = found
             if arg.arg in defaults:

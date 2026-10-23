@@ -11,11 +11,14 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
+import os
 import tempfile
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import IO, NamedTuple
 
 import msgspec
@@ -27,13 +30,16 @@ from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
 from . import safetensors_io as st
+from . import svdq
 from .microscale import (
     CONVROT_GROUP,
     NVFP4_BLOCK,
+    W4A8_GROUP,
     Encoded,
     encode_fp8_rowwise,
     encode_int8_convrot256,
     encode_nvfp4,
+    encode_w4a8,
 )
 
 
@@ -41,7 +47,9 @@ class _Encoding(NamedTuple):
     """A scheme's encoder: its round-trip bound (a multiple of tensor amax), the column multiple
     it needs, its params, and its parts after `weight`, each `(role, dtype, shape)` for an
     `[rows, cols]` tensor. A part shaped `()` is one per tensor (nvfp4's second level), so the
-    tensor's amax is read before any chunk is encoded and every chunk encodes against it."""
+    tensor's amax is read before any chunk is encoded and every chunk encodes against it. A
+    `whole` part is also one per tensor but fixed (w4a8's codebook): every chunk writes it the
+    same. `pack` weights share a stored element (w4a8's codes are `[rows, cols / 2]` bytes)."""
 
     round_trip_bound: float
     encode: Callable[[str, np.ndarray, float], Encoded]
@@ -49,6 +57,10 @@ class _Encoding(NamedTuple):
     block: int
     params: dict[str, object]
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
+    whole: frozenset[str] = frozenset()
+    pack: int = 1
+    #: Encoded whole from a `svdq.Calibration` of the model's own activations (`svdq.fit`).
+    calibrated: bool = False
 
     def tensor_scaled(self) -> bool:
         return any(not shape for _, _, shape in self.companions(1, self.block))
@@ -100,7 +112,46 @@ _ENCODINGS: dict[str, _Encoding] = {
             ("scale_2", "F32", ()),
         ),
     ),
+    # Four bits after the rotation: a tripwire well above a 16-level grid's worst element.
+    "w4a8.convrot": _Encoding(
+        2.0**-1,
+        _rowwise(encode_w4a8),
+        "I8",
+        CONVROT_GROUP,
+        {"group_size": W4A8_GROUP, "rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
+        lambda rows, cols: (
+            ("group_scale", "F8_E4M3", (rows, cols // W4A8_GROUP)),
+            ("scale", "F32", (rows,)),
+            ("codebook", "F32", (16,)),
+        ),
+        whole=frozenset({"codebook"}),
+        pack=2,
+    ),
+    # SVDQuant (xs-066): the bound holds the nvfp4 residual's round trip, in the smoothed domain.
+    "svdq.nvfp4": _Encoding(
+        2.0**-2,
+        lambda key, values, amax: _uncalibrated(key),
+        "F4",
+        svdq.K_ALIGN,
+        {
+            "block_size": NVFP4_BLOCK,
+            "global_scale": "multiply",
+            "nibble_order": "low_first",
+            "scale_layout": "row_major",
+        },
+        svdq.companions,
+        calibrated=True,
+    ),
 }
+
+
+def _uncalibrated(key: str) -> Encoded:
+    raise UnsupportedInput(
+        f"{key}: svdq.nvfp4 is fitted to the model's own activations; pass quantize_into a "
+        "calibration (derive.svdq.Calibration)",
+        code="quantization_plan",
+    )
+
 
 #: RNE fp32->bf16 keeps every element within amax * 2^-8 (8-bit significand, half-ulp).
 BF16_ROUND_TRIP_BOUND = 2.0**-8
@@ -320,6 +371,7 @@ def quantize_component_into(
     plan: ArtifactQuantizationPlan,
     component: str,
     logical_dtype: Callable[[QuantizationTensor], str],
+    calibration: svdq.Calibration | None = None,
 ) -> QuantizationStats:
     """Encode one plan component into the output. Tensors encode ahead on the shared pool and
     are written here, one at a time and in plan order, as a serial encoder would."""
@@ -339,9 +391,20 @@ def quantize_component_into(
     def scheme(tensor: QuantizationTensor) -> str:
         return tensor.encoding or encoding
 
-    results = _in_order(
-        pending, lambda tensor, stop: _encode_tensor(source, scheme(tensor), tensor, stop)
-    )
+    fitted = None
+    if any(_ENCODINGS[scheme(t)].calibrated for t in pending):
+        # Fitted one at a time on this thread: its GPU allocations are the attempt's, which the
+        # memory manager answers by making room (varena serves torch). Each tensor is a step of the
+        # run's record, with the host code any slow one waited in (`author._stalls`).
+        fitted = tel.step_callback(len(pending), stage=f"fitting {component}")
+        stop = threading.Event()
+        results: Generator[_Encoded, None, None] = (
+            _encode_tensor(source, scheme(t), t, stop, calibration) for t in pending
+        )
+    else:
+        results = _in_order(
+            pending, lambda tensor, stop: _encode_tensor(source, scheme(tensor), tensor, stop)
+        )
     with contextlib.closing(results):
         for done, tensor in enumerate(pending, 1 + reused):
             ctx.raise_if_cancelled()
@@ -369,7 +432,7 @@ def quantize_component_into(
                 spill_bytes = spill.tell()
                 spill.seek(0)
                 parts: list[PartData] = [
-                    ("weight", encoder.weight_dtype, (rows, cols), spill),
+                    ("weight", encoder.weight_dtype, (rows, cols // encoder.pack), spill),
                     *(
                         (role, dtype, shape, raw)
                         for (role, dtype, shape), raw in zip(
@@ -386,8 +449,10 @@ def quantize_component_into(
             source_bytes += result.read
             saturated += result.saturated
             tel.log("quantized tensor", level="info", encoding=name, component=component,
-                    key=tensor.key, done=done, total=total)  # fmt: skip
+                    key=tensor.key, done=done, total=total, **(result.fit or {}))  # fmt: skip
             tel.progress(done / total, stage=f"{encoding}-{component}")
+            if fitted is not None:
+                fitted(done - 1 - reused)
     return QuantizationStats(
         encoded_keys=len(pending),
         reused_keys=reused,
@@ -409,16 +474,24 @@ class _Encoded(NamedTuple):
     energy: float
     saturated: int
     read: int
+    #: A calibrated scheme's fit, logged per tensor: its alpha and output errors (`svdq.Fitted`).
+    fit: dict[str, float] | None = None
 
 
 def _encode_tensor(
-    source: Checkpoint, encoding: str, tensor: QuantizationTensor, stop: threading.Event
+    source: Checkpoint,
+    encoding: str,
+    tensor: QuantizationTensor,
+    stop: threading.Event,
+    calibration: svdq.Calibration | None = None,
 ) -> _Encoded:
     encoder = _ENCODINGS[encoding]
     expected = encoder.companions(*tensor.shape)
     read_chunks = functools.partial(
         _read_chunks, source, tensor.component, tensor.key, tensor.logical_dtype, tensor.shape
     )
+    if encoder.calibrated:
+        return _fit_tensor(read_chunks, tensor, calibration)
     amax = max_error = sse = energy = 0.0
     if encoder.tensor_scaled():
         for values in read_chunks():
@@ -437,13 +510,14 @@ def _encode_tensor(
             count = values.shape[0]
             if len(encoded.companions) != len(expected):
                 raise UnsupportedInput(f"{encoding} changed its declared geometry")
-            for got, (_, dtype, shape), chunks in zip(
+            for got, (role, dtype, shape), chunks in zip(
                 encoded.companions, expected, scales, strict=True
             ):
-                want = [count, *shape[1:]] if shape else []
+                whole = not shape or role in encoder.whole
+                want = list(shape) if whole else [count, *shape[1:]]
                 if (got.dtype, got.shape) != (dtype, want):
                     raise UnsupportedInput(f"{encoding} changed its declared geometry")
-                if shape or not chunks:
+                if not whole or not chunks:
                     chunks.append(got.raw)
                 elif got.raw != chunks[0]:
                     raise UnsupportedInput(f"{encoding} encoded one tensor scale two ways")
@@ -466,6 +540,70 @@ def _encode_tensor(
     except BaseException:
         spill.close()
         raise
+
+
+def _fit_tensor(
+    read_chunks: Callable[[], Iterator[np.ndarray]],
+    tensor: QuantizationTensor,
+    calibration: svdq.Calibration | None,
+) -> _Encoded:
+    """A calibrated scheme's whole tensor, fitted to its linear's recorded inputs."""
+    if calibration is None:
+        _uncalibrated(f"{tensor.component}.{tensor.key}")
+    assert calibration is not None
+    started = time.perf_counter()
+    values = np.concatenate(list(read_chunks()))
+    torch = calibration.torch
+    cuda = torch.cuda.is_available()
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
+    read = time.perf_counter()
+    fitted = svdq.fit(
+        torch, tensor.key, values, calibration.stats(tensor.component, tensor.key),
+        "cuda" if cuda else "cpu",
+    )  # fmt: skip
+    measured = {
+        "read_s": read - started,
+        "fit_s": time.perf_counter() - read,
+        "encode_s": fitted.encode_s,
+        **_host_mb(),
+    }
+    if cuda:  # what this fit held, then given back: the model's pages need the room more
+        measured["peak_mb"] = torch.cuda.max_memory_allocated() / 2**20
+        measured["reserved_mb"] = torch.cuda.memory_reserved() / 2**20
+        torch.cuda.empty_cache()
+    spill = tempfile.TemporaryFile()  # noqa: SIM115 - the caller closes it, as _encode_tensor's
+    spill.write(fitted.payload)
+    return _Encoded(
+        spill,
+        fitted.companions,
+        fitted.amax,  # the bound holds the residual's round trip, in the smoothed domain
+        fitted.max_abs_err,
+        fitted.sse,
+        fitted.energy,
+        fitted.saturated,
+        values.size * _WIDTH[tensor.logical_dtype],
+        {"alpha": fitted.alpha, "error": fitted.error, "nvfp4_error": fitted.nvfp4_error}
+        | {name: round(value, 2) for name, value in measured.items()},
+    )
+
+
+def _host_mb() -> dict[str, float]:
+    """The host's memory now, from `/proc` (none where there is no `/proc`): this process's
+    resident set, what the kernel says is available, and its page cache."""
+    out: dict[str, float] = {}
+    try:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+        out["rss_mb"] = pages * os.sysconf("SC_PAGE_SIZE") / 2**20
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            name, _, value = line.partition(":")
+            if name in ("MemAvailable", "Cached"):
+                out[{"MemAvailable": "avail_mb", "Cached": "cache_mb"}[name]] = (
+                    int(value.split()[0]) / 1024
+                )
+    except (OSError, IndexError, ValueError):
+        pass
+    return out
 
 
 class _Stopped(Exception):

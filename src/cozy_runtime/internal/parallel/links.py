@@ -36,6 +36,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from cozy_runtime.graphs import streams
 from cozy_runtime.internal import filelock, kernel_cache, liveness, proctree, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
@@ -189,7 +190,10 @@ def _measure(torch: Any, count: int, emit: Any) -> None:
     pinned = [torch.empty(_CHUNK, dtype=torch.uint8, pin_memory=True) for _ in range(2)]
 
     def staged(src: int, dst: int) -> None:
-        out_stream, in_stream = torch.cuda.Stream(devices[src]), torch.cuda.Stream(devices[dst])
+        out_stream, in_stream = (
+            streams.stream(torch, devices[src]),
+            streams.stream(torch, devices[dst]),
+        )
         landed = [torch.cuda.Event() for _ in pinned]
         drained = [torch.cuda.Event() for _ in pinned]
         for event in drained:
@@ -436,6 +440,7 @@ def _group(torch: Any, rank: int, world: int, port: int, level: str) -> dict[str
         report["nccl_peer"] = bool(torch.equal(received, expected))
         report["nccl_ms"] = round((time.perf_counter() - began) * 1000, 1)
         exchange = copy_engine.CopyEngineExchange(torch, symm, dist.group.WORLD, rank, world)
+        exchange.map()
         matrix = [[rows // world] * world for _ in range(world)]
         report["copy_engines"] = bool(torch.equal(exchange.all_to_all([send], matrix)[0], expected))
     except Exception as exc:  # its first line is why the group keeps the conservative route

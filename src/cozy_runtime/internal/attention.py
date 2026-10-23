@@ -6,11 +6,12 @@ the first kernel of its GPU family's cell (`DENSE`, `SPARSE`, by `arch` row) at 
 level that serves it here: 16 for a request at 16 bits (`EXACT`), else the model's
 `attention_bits` for the site (default 16). A kernel that is not part of torch is compiled on
 this machine for this card (`kernel_sources`, `kernel_compile`) and serves once its artifact is
-published, imports and launches. A run without an override never waits for a compile: a kernel
-still compiling, absent or failed steps to the next one, then up a level, and the selection
-records why (`Applied.fallbacks`) and what it passed over (`Applied.waiting`), so the
-construction selects again once it is ready (`compiled`): at the run's next step or stage
-boundary (a run may mix kernels, owner ruling 2026-10-09). A request's pin
+published, imports and launches, all of it off any request thread (`kernel_ready`). A run
+without an override never waits for a compile or a self-check: a kernel still opening, absent
+or failed steps to the next one, then up a level, and the selection records why
+(`Applied.fallbacks`) and what it passed over (`Applied.waiting`), so the construction selects
+again once it is ready (`compiled`): at the run's next step or stage boundary (a run may mix
+kernels, owner ruling 2026-10-09). A request's pin
 (`--attention-kernel`) is the opposite: it waits for its own kernel's build, holds it for every
 step, and refuses an unsupported or failed kernel (owner ruling 2026-10-10).
 """
@@ -45,6 +46,7 @@ from cozy_runtime.internal import (
     execution_evidence,
     kernel_cache,
     kernel_compile,
+    kernel_ready,
     kernel_sources,
     prebuilt,
     producers,
@@ -106,6 +108,9 @@ class Candidate:
     exact: bool = True
     #: the dense kernel a sparse one computes its dense rows with, built beside it
     dense: str = ""
+    #: the Runtime module whose `warm(index)` builds its Triton kernels for every length, so no
+    #: request compiles one (`kernel_ready`)
+    warm: str = ""
 
 
 _GPU = frozenset({arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05})
@@ -116,6 +121,7 @@ _D64_128 = frozenset({64, 128})
 #: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
 _FA3 = frozenset((d, dtype) for d in (64, 128) for dtype in ("bfloat16", "float16"))
 _PY, _KITCHEN, _SAGE3 = kernel_sources.PYTHON, "comfy-kitchen", "sageattn3"
+_FP8_WARM = "cozy_runtime.internal.attention_fp8"
 
 KERNELS: tuple[Candidate, ...] = (
     Candidate("sdpa", "_cozy_sdpa", upstream.SDPA),
@@ -127,7 +133,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, exact=False,
         dtypes=_HALF, max_head_dim=128, artifact="flash-attn3-full",
-        import_name="flash_attn_interface",
+        import_name="flash_attn_interface", warm=_FP8_WARM,
     ),
     Candidate(
         "flash-attn4", "_cozy_flash_attn4", upstream.FA4, _WGMMA | _TCGEN05, dtypes=_HALF,
@@ -136,6 +142,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "flash-attn4-fp8", "_cozy_flash_attn4_fp8", upstream.FA4_FP8, _TCGEN05, exact=False,
         dtypes=_BF16, max_head_dim=128, artifact=_PY, import_name="flash_attn.cute",
+        warm=_FP8_WARM,
     ),
     Candidate(
         "sageattention", "_cozy_sage_int8_fp8", upstream.SAGE, _MMA | _WGMMA, _FP8, exact=False,
@@ -153,7 +160,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "flashinfer-bf16-fp8", "_cozy_flashinfer_bf16_fp8", upstream.FLASHINFER, _TCGEN05,
         exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128, artifact=_PY,
-        import_name="flashinfer",
+        import_name="flashinfer", warm=_FP8_WARM,
     ),
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, exact=False,
@@ -168,11 +175,13 @@ KERNELS: tuple[Candidate, ...] = (
         "sageattention3-fp4-fixed-means", "_cozy_sage3_fp4_fixed_means",
         upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, exact=False, dtypes=_BF16, max_head_dim=128,
         head_dims=_D128, artifact=_SAGE3, import_name=_SAGE3,
+        warm="cozy_runtime.internal.attention_sage3_fixed",
     ),
     Candidate(
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
         _WGMMA, exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128,
         artifact="sageattention", import_name="sageattention",
+        warm="cozy_runtime.internal.attention_sage2_fixed_mean",
     ),
     Candidate(
         "sol-attn", "_cozy_sol_bf16", attention_sol.SOL, _GPU, _FP8, dtypes=_BF16,
@@ -377,10 +386,6 @@ def _member(candidate: Candidate) -> Any:
 _STATES: dict[str, kernel_compile.State] = {}
 #: A site and the kernel it is given: (component, module path, module, processor, kernel).
 type _Site = tuple[str, str, Any, Any, Ready]
-#: Kernels ready on a device stay ready for the process's life; one whose first launch
-#: raised stays refused for it.
-_READY: dict[tuple[str, DeviceFacts], Ready] = {}
-_BROKEN: dict[tuple[str, DeviceFacts], AttentionRefusal] = {}
 #: module -> the build this process imports it from, fixed by the first import or by `reserve`:
 #: a process holds one build of a module, so a kernel another build serves needs another one.
 _BUILDS: dict[str, str] = {}
@@ -566,17 +571,57 @@ def _compile_dependencies(
     return artifacts
 
 
-def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Ready:
-    """One candidate compiled, imported and launched on this device, or a typed refusal. A
-    site that will run it waits for its build; a selection only asks what is ready."""
-    known = _READY.get((candidate.name, device))
-    if known is not None:
-        return known
-    if (candidate.name, device) in _BROKEN:
-        raise _BROKEN[(candidate.name, device)]
+#: Each candidate's `kernel_ready` name on a device: `_slot`.
+_SLOTS = "attention "
+
+
+def _slot(name: str, device: DeviceFacts) -> str:
+    return f"{_SLOTS}{device.kind}:{device.index} sm{device.sm} {name}"
+
+
+def _opened(candidate: Candidate, device: DeviceFacts) -> Ready:
+    """CANDIDATE once it serves on this device (`kernel_ready`: compiled, imported and launched,
+    off any request thread), else a typed refusal: `attention_kernel_compiling` while it opens,
+    or why it failed, for this process's life."""
+    if not (candidate.artifact or candidate.import_name or candidate.producer):
+        return _waited(candidate, device)  # torch's own: nothing to build or check
+    name = _slot(candidate.name, device)
+    found: Ready | None = kernel_ready.ready(name, partial(_open, candidate, device))
+    if found is not None:
+        return found
+    failed = kernel_ready.failed(name)
+    if isinstance(failed, AttentionRefusal):
+        raise AttentionRefusal(failed.code, str(failed))
+    if failed is not None:
+        raise AttentionRefusal(
+            "attention_kernel_failed", f"{candidate.name}: {type(failed).__name__}: {failed}"
+        )
+    state = _STATES.get(candidate.name)
+    line = state.line() if state is not None and state.state == "compiling" else "opening"
+    raise AttentionRefusal("attention_kernel_compiling", f"{candidate.name}: {line}")
+
+
+def _waited(candidate: Candidate, device: DeviceFacts) -> Ready:
+    """CANDIDATE on this device, after its build: a request that names it waits for it."""
+    return kernel_ready.wait(_slot(candidate.name, device), partial(_open, candidate, device))
+
+
+def _open(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready | None:
+    """`kernel_ready`'s opener: `_resolve`, or None while its build runs and it may not wait."""
+    try:
+        return _resolve(candidate, device, wait)
+    except AttentionRefusal as exc:
+        if exc.code == "attention_kernel_compiling" and not wait:
+            return None
+        raise
+
+
+def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
+    """One candidate compiled, imported and launched on this device, or a typed refusal; its
+    build waited for when `wait`."""
     _registry()
     if candidate.producer is not None:
-        base = _resolve(BY_NAME[candidate.producer.base], device, wait)
+        base = (_waited if wait else _opened)(BY_NAME[candidate.producer.base], device)
         kernel = _import(base.candidate)
         missing = [n for n in candidate.producer.requires if not callable(getattr(kernel, n, None))]
         if missing:
@@ -584,18 +629,15 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
                 "attention_kernel_absent",
                 f"{candidate.name}: {base.candidate.import_name} lacks {', '.join(missing)}",
             )
-        ready = Ready(candidate, _member(candidate), base.artifact)
-        _READY[(candidate.name, device)] = ready
-        return ready
+        return Ready(candidate, _member(candidate), base.artifact)
     prebuilt_ready = _prebuilt_fa3(candidate, device)
     if prebuilt_ready is not None:
-        _READY[(candidate.name, device)] = prebuilt_ready
         return prebuilt_ready
     artifact: dict[str, str] | None
     if candidate.dense:
         dense = BY_NAME[candidate.dense]
         artifacts = _compile_dependencies((candidate, dense), device, wait)
-        dense_artifact = _resolve(dense, device, wait).artifact or {}
+        dense_artifact = (_waited if wait else _opened)(dense, device).artifact or {}
         artifact = {
             **(artifacts[candidate.name] or {}),
             **{f"dense_{key}": value for key, value in dense_artifact.items()},
@@ -622,6 +664,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
             upstream.bind_fa3(
                 cast("upstream.FlashAttn3", module), (artifact or {}).get("key", "environment")
             )
+    if candidate.warm and device.kind == "cuda":
+        import_module(candidate.warm).warm(device.index)
     if candidate.name in {"sol-attn", attention_sage2_fixed.SOL_NAME}:
         _sol_route(device)
         if device.kind == "cuda":
@@ -630,10 +674,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool = True) -> Re
     try:
         _launch(ready, device)
     except AttentionRefusal as exc:
-        _BROKEN[(candidate.name, device)] = exc
         _STATES[candidate.name] = kernel_compile.State(candidate.name, "failed", detail=str(exc))
         raise
-    _READY[(candidate.name, device)] = ready
     if candidate.artifact:
         _STATES.setdefault(candidate.name, kernel_compile.State(candidate.artifact, "ready"))
     return ready
@@ -744,7 +786,7 @@ def _sol_dense(
             continue
         if name not in resolved:
             try:
-                resolved[name] = _resolve(candidate, device, wait=False)
+                resolved[name] = _opened(candidate, device)
             except Exception as exc:
                 refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
                 continue
@@ -790,7 +832,7 @@ def pinned(name: str, device: DeviceFacts, wait: bool = True) -> list[Ready]:
             f"{unsupported}, sm{device.sm}. This environment runs {image_kernels(device)} on "
             f"{device.name}",
         )
-    return [_resolve(candidate, device, wait)]
+    return [(_waited if wait else _opened)(candidate, device)]
 
 
 # ------------------------------------------------------------------------------ the pin
@@ -1278,7 +1320,7 @@ def _first(
             if device is None:
                 continue
             try:
-                resolved[name] = _resolve(candidate, device, wait=False)
+                resolved[name] = _opened(candidate, device)
             except Exception as exc:
                 # BROAD ON PURPOSE: a kernel that fails to resolve for ANY reason steps to the
                 # next, never failing a prepare that only tried to go faster. A PIN keeps its
@@ -1412,7 +1454,9 @@ def install(
     if skipped is not None:
         skipped.update(refused)
     artifacts = {name: entry.artifact for name, entry in resolved.items() if entry.artifact}
-    waiting = tuple(sorted(n for n, state in _STATES.items() if state.state == "compiling"))
+    waiting = tuple(
+        n for n in sorted(refused) if device is not None and kernel_ready.opening(_slot(n, device))
+    )
     return Applied(
         hosts, tuple(resolved), pin, artifacts or None, refused or None, waiting, tuple(fallbacks)
     )
@@ -1472,7 +1516,7 @@ def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
     served = {name for kernels in hosts.values() for name in kernels}
     artifacts = {
         ready.name: ready.artifact
-        for ready in _READY.values()
+        for ready in cast("list[Ready]", kernel_ready.served(_SLOTS))
         if ready.name in served and ready.artifact
     }
     return Applied(hosts, (), pin, artifacts=artifacts or None)
@@ -1780,30 +1824,15 @@ def select(
 
 
 def compiled(names: Iterable[str], device: DeviceFacts) -> bool:
-    """Whether a kernel a selection passed over while it compiled is built now. Reads the
-    store only: it starts no compile and waits for none. A build that ended is on record
-    (`_STATES`), so the next selection no longer waits on it."""
-    store = kernel_cache.configured()
-    found = known()
-    for name in names:
-        candidate = found.get(name)
-        if store is None or candidate is None or not candidate.artifact:
-            continue
-        try:
-            state = kernel_compile.status(store, _job(candidate, device))
-        except AttentionRefusal:
-            continue
-        if state.state != "compiling":
-            _STATES[name] = state
-        if state.state == "ready":
-            return True
-    return False
+    """Whether a kernel a selection passed over while it opened serves now (`kernel_ready`).
+    It starts nothing and waits for nothing."""
+    return any(kernel_ready.ready(_slot(name, device)) is not None for name in names)
 
 
 def image_kernels(device: DeviceFacts) -> str:
     """What this device serves now, for a refusal message (cr-125): every kernel already
     ready here, and each one still compiling with its progress. Starts no compile."""
-    ready = sorted(name for name, held in _READY if held == device)
+    ready = sorted(r.name for r in cast("list[Ready]", kernel_ready.served(_slot("", device))))
     busy = [f"{n} {s.line()}" for n, s in sorted(_STATES.items()) if s.state == "compiling"]
     return ", ".join(ready + busy) or "none"
 

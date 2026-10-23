@@ -21,13 +21,15 @@ import sys
 import threading
 import tomllib
 import traceback
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, ModuleType
 
 from cozy_runtime.author import App, ConformanceError, Surface, describe
+from cozy_runtime.author._recipes import DeclaredRecipe
+from cozy_runtime.derive import recipes as declared_recipes
 from cozy_runtime.internal.static_interface import read_application
 
 #: Author top-level code runs inside the boundary. It may import heavy dependencies; it may
@@ -53,13 +55,20 @@ class Discovered:
     project: Path
     module: ModuleType
     surfaces: tuple[Surface, ...]
+    #: the declared recipes it serves as `quantize`
+    recipes: tuple[DeclaredRecipe, ...] = ()
 
 
-def discover(project: Path, *, seconds: float | None = IMPORT_SECONDS) -> Discovered:
+def discover(
+    project: Path,
+    *,
+    seconds: float | None = IMPORT_SECONDS,
+    recipes: Sequence[DeclaredRecipe] = (),
+) -> Discovered:
     """Import the one configured export inside this environment and freeze it."""
     project = project.resolve()
     application = read_application(project)
-    return _discover(application, project, seconds=seconds, add=project)
+    return _discover(application, project, seconds=seconds, add=project, recipes=recipes)
 
 
 def assert_locked_environment(project: Path) -> str:
@@ -97,7 +106,12 @@ def assert_locked_environment(project: Path) -> str:
     return f"{name} {version} in {sys.executable}"
 
 
-def discover_installed(application: str, *, seconds: float | None = IMPORT_SECONDS) -> Discovered:
+def discover_installed(
+    application: str,
+    *,
+    seconds: float | None = IMPORT_SECONDS,
+    recipes: Sequence[DeclaredRecipe] = (),
+) -> Discovered:
     """Freeze one package interface-named export from the installed package environment.
 
     A materialized rental has an immutable venv, not a copied source tree or package.toml.
@@ -105,7 +119,7 @@ def discover_installed(application: str, *, seconds: float | None = IMPORT_SECON
     or adding a host path would recreate the source/PYTHONPATH authority the fixed worker rejects.
     """
 
-    return _discover(application, Path("/"), seconds=seconds, add=None)
+    return _discover(application, Path("/"), seconds=seconds, add=None, recipes=recipes)
 
 
 def discover_distribution(
@@ -131,8 +145,14 @@ def discover_distribution(
 
 
 def _discover(
-    application: str, project: Path, *, seconds: float | None, add: Path | None
+    application: str,
+    project: Path,
+    *,
+    seconds: float | None,
+    add: Path | None,
+    recipes: Sequence[DeclaredRecipe] = (),
 ) -> Discovered:
+    """The app at `application`, serving the `recipes` its interface declares (`quantize`)."""
     if application.count(":") != 1 or not all(part.strip() for part in application.split(":")):
         raise DiscoveryError(
             f"{application!r} is not one <module>:<attribute> application",
@@ -156,8 +176,10 @@ def _discover(
             "the registry, and nothing else is discovered",
             code="not_an_app",
         )
+    if recipes:
+        declared_recipes.register(app, recipes)
     surfaces = describe(app)  # duplicate names already refused at registration; this freezes
-    return Discovered(app, application, project, module, surfaces)
+    return Discovered(app, application, project, module, surfaces, tuple(recipes))
 
 
 def _import(module_name: str, application: str) -> ModuleType:

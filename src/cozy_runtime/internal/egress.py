@@ -4,8 +4,7 @@ The hazard this module exists against is "there were two downloaders and only on
 check". Artifact bytes move through tensorfs (`tensorfs-core/src/transport/policy.rs` holds
 the port of `blocked()` below); publication moves through the machine (th-241). What stays
 here is `fetch_public_wheel`: a public wheel a lock pins by URL and sha256, fetched anonymously
-— no credential, no Hub authority, nothing naming the run. The `one-address-predicate` fence
-in `checks/architecture.py` reddens if any other urllib/http.client chain appears.
+— no credential, no Hub authority, nothing naming the run.
 
 **The resolution is fail-closed.** A host that resolves to a private, loopback, link-local,
 multicast or reserved address refuses — every address it resolves to, not the first, because

@@ -51,13 +51,14 @@ class KernelsUnavailable(RuntimeError):
 class TritonEntry:
     """One compiled specialization of a module-level `@triton.jit` kernel: Triton's signature
     (`{"x_ptr": "*bf16", "n": "i32", "BLOCK": "constexpr"}`), the constexpr values, the pointer
-    and integer arguments it may assume 16-aligned, and its warps."""
+    and integer arguments it may assume 16-aligned, its warps and its pipeline stages."""
 
     kernel: Any
     signature: Mapping[str, str]
     constexprs: Mapping[str, int] = field(default_factory=dict)
     aligned: tuple[str, ...] = ()
     num_warps: int = 4
+    num_stages: int = 3
 
     @property
     def key(self) -> str:
@@ -203,9 +204,9 @@ def int8_rows(
     `activation` "gelu" or "gelu_tanh"; `scale` and `shift` are `[..., width]` tables, and x's
     row r reads table row `r // (x rows / table rows)`.
 
-    None unless every consumer is an un-hooked int8 encoded leaf of x's width and the op serves
-    this card: the caller then runs its own ops."""
-    if not consumers or getattr(consumers[0], "provider", None) != INT8_CONVROT:
+    None unless every consumer is an un-hooked encoded leaf taking int8.convrot's operand (an int8
+    or w4a8 leaf) of x's width and the op serves this card: the caller then runs its own ops."""
+    if not consumers or getattr(consumers[0], "operand", None) != INT8_CONVROT:
         return None
     rows: PreQuantized | None = consumers[0].int8_prologue(
         x, consumers, norm, eps, scale, shift, activation

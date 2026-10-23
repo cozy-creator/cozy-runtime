@@ -24,6 +24,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
+from . import svdq
 from .quantization import (
     _ENCODINGS,
     ArtifactQuantizationPlan,
@@ -195,6 +196,7 @@ def _quantize(
     output: str,
     selection: ArtifactQuantizationPlan | None = None,
     preserve_precision: bool = False,
+    calibration: svdq.Calibration | None = None,
 ) -> tuple[QuantizeResult, ModelArtifact]:
     opened = source if isinstance(source, Checkpoint) else ctx.tensorfs_source(source)
     keep = (
@@ -230,7 +232,7 @@ def _quantize(
             for component in artifact.components:
                 stats = quantize_component_into(
                     opened, out, ctx, request, tel, encoding=plan.encoding, plan=artifact,
-                    component=component, logical_dtype=logical,
+                    component=component, logical_dtype=logical, calibration=calibration,
                 )  # fmt: skip
                 read += stats.source_bytes_read
                 written += stats.new_bytes_written

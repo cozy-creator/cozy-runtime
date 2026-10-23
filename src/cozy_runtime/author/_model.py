@@ -28,6 +28,7 @@ from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
+from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import (
     Any,
@@ -160,6 +161,36 @@ def attention_bits(owner: str, value: object) -> int | dict[str, int]:
         f"class {owner}(attention_bits={value!r}): 16, 8 or 4, or a mapping of "
         "component-qualified module prefixes to them",
         code="attention_bits_value",
+    )
+
+
+def coverage_patterns(owner: str, keyword: str, value: object) -> tuple[str, ...]:
+    """`unloaded=` / `derived=`: component-qualified key patterns (`fnmatch`) a load does not
+    warn about: stored tensors the model deliberately leaves unloaded (a text encoder's LM
+    head), persistent buffers it deliberately derives instead of reading from the checkpoint."""
+    if isinstance(value, (tuple, list)) and value and all(type(p) is str and p for p in value):
+        return tuple(value)
+    raise ConformanceError(
+        f"class {owner}({keyword}={value!r}): a tuple of component-qualified key patterns "
+        '(`"text_encoder.lm_head.weight"`, `"model.mtp.*"`)',
+        code=f"{keyword}_value",
+    )
+
+
+def uncovered(
+    cls: type, ignored: Sequence[str], unstored: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """What a load of `cls` warns about: the stored tensors it did not load and the persistent
+    buffers no checkpoint supplied (`component/key`), less what the class declares."""
+
+    def declared(names: Sequence[str], patterns: Sequence[str]) -> list[str]:
+        return [
+            n for n in names if not any(fnmatchcase(n.replace("/", ".", 1), p) for p in patterns)
+        ]
+
+    return (
+        declared(ignored, getattr(cls, "__unloaded__", ())),
+        declared(unstored, getattr(cls, "__derived__", ())),
     )
 
 
@@ -329,17 +360,6 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: Kernel builds this process loaded after it started (a boot build landing): calls may take a
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
-#: Builds a call found landed during a request: each serves from the next request boundary
-#: (`land`), so a request's kernel choices never change under it nor drop its graphs.
-STAGED: list[Callable[[], None]] = []
-
-
-def land() -> None:
-    """At a request boundary, no call in a scope: every staged build serves from now on."""
-    landed = bool(STAGED)
-    while STAGED:
-        STAGED.pop(0)()
-    LANDED[0] += landed
 
 
 class Building(Exception):
@@ -774,6 +794,10 @@ class Model[PipelineT]:
     """`phase=`: "decode" for an LM's token loop, else "compute" (`PHASES`)."""
     __attention_bits__: int | dict[str, int] = 16
     """`attention_bits=`: the attention precision its sites tolerate (`attention_bits`)."""
+    __unloaded__: tuple[str, ...] = ()
+    """`unloaded=`: stored tensors a load leaves unloaded on purpose (`coverage_patterns`)."""
+    __derived__: tuple[str, ...] = ()
+    """`derived=`: persistent buffers a load keeps constructed on purpose (`coverage_patterns`)."""
 
     __adapter_compatibility__: tuple[AdapterCompatibility, ...] = ()
     """Closed generic adapter declarations; empty means overlays are refused."""
@@ -827,11 +851,16 @@ class Model[PipelineT]:
                 setattr(cls, attribute, value)
         if "attention_bits" in keywords:
             cls.__attention_bits__ = attention_bits(cls.__name__, keywords.pop("attention_bits"))
+        for keyword in ("unloaded", "derived"):
+            if keyword in keywords:
+                value = coverage_patterns(cls.__name__, keyword, keywords.pop(keyword))
+                setattr(cls, f"__{keyword}__", value)
         if keywords:
             names = ", ".join(f"{key}=…" for key in keywords)
             raise ConformanceError(
                 f"class {cls.__name__}({names}): a Model class carries encoded_leaves, "
-                "min_bits, phase and attention_bits — fusion=, stamps, task=, objective= and "
+                "min_bits, phase, attention_bits, unloaded and derived — fusion=, stamps, task=, "
+                "objective= and "
                 "structure= are deleted (model-code-fit D1); a semantic twin is a component "
                 "name or a config fact",
                 code="class_keyword",
@@ -1037,9 +1066,10 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 @final
 class _ComponentScope:
     """A method's declared components, nested or on any of the call's threads (cr-202), each
-    marking its own context (`Model._cozy_active`). It carries no memory meaning: varena sees
-    each forward itself. Calls still take scopes one at a time (`SCOPES`): the sites they read
-    change between turns (cr-202 U4 lifts it).
+    marking its own context (`Model._cozy_active`). Varena sees each forward itself, and the
+    scope's components are held bound for its plan step (`Residency.using`, which covers a
+    component with no blocks that another's forward reads, cr-207). Calls still take scopes one
+    at a time (`SCOPES`): the sites they read change between turns (cr-202 U4 lifts it).
 
     A REMOTE scope, whose every declared component the runtime keeps on another GPU of the
     group (`Placement.remote`), uses nothing on this device."""
@@ -1345,6 +1375,7 @@ class ModelRegistry:
                     }
                 )
             _prove_components(cls, record)
+            _coverage(cls, record)
             constructed = loader.constructed()
             if adapters and artifact._prepare is None:
                 model.prepare_adapters(tuple(adapters))
@@ -1398,6 +1429,28 @@ class ModelRegistry:
 _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", tensor_schema={}, config=Config({}))
 
 
+def _coverage(cls: type, record: ConstructionRecord) -> None:
+    """A load whose construction and checkpoint disagree says so once, in the next attempt's
+    warnings, naming the tensors, and serves: stored tensors no destination reads were not
+    loaded, and persistent buffers the checkpoint does not store keep their constructed values.
+    What the class declares (`unloaded=`, `derived=`) is not warned about."""
+    ignored, unstored = uncovered(cls, record.ignored_extras, record.unstored)
+    for message, kind, names in (
+        ("checkpoint tensors were not loaded: the model builds no destination for them",
+         "tensors", ignored),
+        ("persistent buffers are not in the checkpoint: they keep their constructed values",
+         "buffers", unstored),
+    ):  # fmt: skip
+        if names:
+            more = f", and {len(names) - 8} more" if len(names) > 8 else ""
+            row: WarningRow = (
+                message,
+                {"model": cls.__name__, "count": len(names), kind: ", ".join(names[:8]) + more},
+            )
+            if row not in WARNINGS:
+                WARNINGS.append(row)
+
+
 def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
     """Several `construct` calls in one `load()` are one construction contract."""
     return ConstructionRecord(
@@ -1408,6 +1461,7 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
         filled_bytes=sum(r.filled_bytes for r in records),
         ignored_extras=tuple(e for r in records for e in r.ignored_extras),
         ignored_warnings=tuple(w for r in records for w in r.ignored_warnings),
+        unstored=tuple(u for r in records for u in r.unstored),
         skipped=tuple(c for r in records for c in r.skipped),
         fit=next((r.fit for r in records if r.fit is not None), None),
     )

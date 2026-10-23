@@ -1,0 +1,1 @@
+A cancel that lands inside a handler's `asyncio.TaskGroup` ends the call CANCELED: an exception group is classified by its tasks' exceptions (a cancel among them first), and a child call that ended because its parent was cancelled raises the parent's cancel. Cancelling an H3 long_form while it made its references ended FAILED `unhandled_exception` (run 13618).

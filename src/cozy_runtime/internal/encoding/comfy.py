@@ -19,7 +19,7 @@ from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, Params, Tensor
 
-SCHEMES = frozenset({"comfy.asym_w4a8_int8", "comfy.w6a8_int8", "int4.convrot"})
+SCHEMES = frozenset({"comfy.asym_w4a8_int8", "w4a8.convrot", "comfy.w6a8_int8", "int4.convrot"})
 _ROTATIONS = frozenset(4**n for n in range(1, 9))
 _FORMAT_DTYPES = {
     TORCH_DTYPES[value]: key for key, value in TENSORFS_DTYPES.items() if value in TORCH_DTYPES
@@ -92,6 +92,8 @@ class ComfyDequant:
     def optional(self) -> frozenset[str]:
         if self.encoding == "comfy.asym_w4a8_int8":
             return frozenset({"codebook", "correction"})
+        if self.encoding == "w4a8.convrot":
+            return frozenset({"codebook"})
         return frozenset()
 
     def supports(self, shape: Sequence[int], params: Mapping[str, object]) -> str:
@@ -121,6 +123,8 @@ class ComfyDequant:
                 return "group_size must be an integer"
             if self.encoding == "comfy.asym_w4a8_int8":
                 valid = group >= 4 and (16 % group == 0 or group % 16 == 0)
+            elif self.encoding == "w4a8.convrot":
+                valid = group == 16
             else:
                 valid = group >= 16 and group % 16 == 0
             if not valid or columns % group:

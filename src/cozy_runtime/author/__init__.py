@@ -5,7 +5,7 @@ typing libraries and the pure canonical-JSON facade only. It cannot import
 cozy_runtime.internal, cozy_runtime.cli, the
 worker protocol, TensorFS, Varena or any RecordOwner; it cannot read environment or config;
 it names no allocator or ingest surface, and a package's own kernels are declarations the
-runtime compiles and hands back (`author.kernels`). `checks/architecture.py` proves it.
+runtime compiles and hands back (`author.kernels`).
 
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and
 everything it DOES rides a typed service parameter it named. A `Model` has two lifecycle
@@ -73,7 +73,7 @@ from cozy_runtime.author._decode import (
     MediaDecodeError,
     VideoProbe,
 )
-from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
+from cozy_runtime.author._defaults import Clamp, DefaultSet, Overlay, decode_request
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import assert_declaration_shape, describe
 from cozy_runtime.author._errors import (
@@ -90,6 +90,16 @@ from cozy_runtime.author._errors import (
     PreflightViolation,
     UnsupportedInput,
     classify,
+)
+from cozy_runtime.author._image import (
+    MEGAPIXEL,
+    AspectRatio,
+    ImageRequest,
+    ImageResult,
+    ReferenceImages,
+    Seed,
+    Target,
+    held,
 )
 from cozy_runtime.author._invoke import (
     Invocation,
@@ -141,6 +151,13 @@ from cozy_runtime.author._model import (
     uncaptured,
     uses_components,
 )
+from cozy_runtime.author._recipes import (
+    DerivationHook,
+    EncodingRule,
+    QuantizationPlan,
+    Recipe,
+    SelectionPlan,
+)
 from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     AdjustmentRow,
@@ -176,6 +193,7 @@ from cozy_runtime.author.publication import (
 __all__ = [
     "DEFAULT_DECODE_LIMITS",
     "MAX_WEIGHTS_NEW_BYTES",
+    "MEGAPIXEL",
     "NEUTRAL_ERROR_SET",
     "ActivationCapture",
     "ActivationCaptureResult",
@@ -185,6 +203,7 @@ __all__ = [
     "Adjustments",
     "App",
     "Artifact",
+    "AspectRatio",
     "AssessmentRef",
     "Asset",
     "AssetBound",
@@ -224,10 +243,13 @@ __all__ = [
     "DecodedVideoFrame",
     "DecoderUnavailable",
     "DefaultResolutionError",
+    "DefaultSet",
+    "DerivationHook",
     "DerivedCache",
     "Device",
     "Egress",
     "EgressResponse",
+    "EncodingRule",
     "ExecutionEnvironment",
     "ExecutionObservation",
     "FileAsset",
@@ -237,6 +259,8 @@ __all__ = [
     "ImageFrame",
     "ImagePreparation",
     "ImageProbe",
+    "ImageRequest",
+    "ImageResult",
     "InvalidRequest",
     "Invocation",
     "InvocationResult",
@@ -264,7 +288,9 @@ __all__ = [
     "PreflightViolation",
     "PreparedRequest",
     "ProducerCall",
+    "QuantizationPlan",
     "Recipe",
+    "ReferenceImages",
     "Registration",
     "RegistrationError",
     "ReleaseReceipt",
@@ -276,9 +302,12 @@ __all__ = [
     "ScopeCall",
     "ScriptContext",
     "Secrets",
+    "Seed",
+    "SelectionPlan",
     "Settings",
     "Shape",
     "Surface",
+    "Target",
     "Telemetry",
     "TensorSpec",
     "ThreadPoolExecutor",
@@ -303,6 +332,7 @@ __all__ = [
     "describe",
     "expect_attention",
     "graph_keys",
+    "held",
     "invocable",
     "invoke",
     "placeable",

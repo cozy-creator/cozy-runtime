@@ -116,6 +116,8 @@ class Attention(Command, frozen=True, kw_only=True, tag="attention"):
     pin: str | UnsetType = UNSET
     model_key: str | None = None
     adopt: Choice | UnsetType = UNSET
+    #: rank 0 asks while it serves a request: this GPU opens no kernel on its own thread
+    serving: bool = False
 
 
 class Kernels(Command, frozen=True, kw_only=True, tag="kernels"):

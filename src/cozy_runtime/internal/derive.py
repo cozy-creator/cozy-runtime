@@ -458,9 +458,10 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     the host, and swaps each PARAMETER to `meta` the moment it is registered. Parameters are
     the bytes that matter — 6.4 GiB of them here — and they are still never allocated for
     real: the transient peak is one leaf's parameters, freed as soon as the swap lands.
-    Buffers are kilobytes and they keep the values their own construction computed, which is
-    what makes `position_ids` a derived table materialized on the target device rather than
-    a shape with garbage in it.
+    Buffers are kilobytes and keep the values their own construction computed, which is what
+    makes `position_ids` a derived table materialized on the target device rather than a shape
+    with garbage in it. The fit decides a persistent buffer: one the checkpoint stores goes to
+    meta and binds like a parameter, one it does not keeps that value (`weights.materialize`).
     """
     torch = torch_module()
     nn = torch.nn

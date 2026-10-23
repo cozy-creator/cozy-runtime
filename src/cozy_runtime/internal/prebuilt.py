@@ -29,6 +29,12 @@ from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, E4M3_MAX, Tens
 
 #: The verdicts' kernel names, one per format: each verifies on its own.
 KERNELS = {"int8": "prebuilt-int8", "fp8": "prebuilt-fp8"}
+#: The w4a8 GEMM's config that unpacks the codes to int8 and runs the 8-bit GEMM, and the rows from
+#: which it serves unasked, by tensor-core family. mma.sync (A40): from 4096 rows 0.91-1.03x int8
+#: against the fused 0.78-0.83x, the fused tiles mostly ahead at 1024. wgmma (H100): from 256 rows
+#: 0.55-1.13x against the fused mma.sync 0.26-0.53x, which keeps only the 16-row tile there.
+UNPACK = 3
+UNPACK_ROWS = {arch.MMA_SYNC: 2048, arch.WGMMA: 32, arch.TCGEN05: 32}
 #: The probe's budget for the relative L2 error against the exact law (the op tests' bound).
 BUDGET = 1e-2
 #: Attention's, against fp32 attention: an exact kernel's bf16 output, and a quantized one's
@@ -135,6 +141,82 @@ class Prebuilt:
         config: int = -1,
     ) -> Tensor:
         return self._gemm(FP8, q, scales, data, scale, bias, out_dtype, config)
+
+    def w4a8_linear(self, x: Tensor, w: W4a8, bias: Tensor | None, out_dtype: object) -> Tensor:
+        q, scales = self.int8_quantize(x)
+        return self.w4a8_gemm(q, scales, w, bias, out_dtype).view(*x.shape[:-1], w.codes.shape[0])
+
+    def w4a8_gemm(
+        self,
+        q: Tensor,
+        scales: Tensor,
+        w: W4a8,
+        bias: Tensor | None,
+        out_dtype: object,
+        config: int = -1,
+    ) -> Tensor:
+        """`q @ unpack(w).T`, both scales and the bias. From `UNPACK_ROWS` rows the codes unpack
+        once to int8 and the 8-bit GEMM multiplies them (config `UNPACK`): the GEMM dominates the
+        unpack there, and the family's int8 GEMM outruns the fused one. Fewer rows take the fused
+        mma.sync GEMM's tiles. Every config is the same law, bit for bit."""
+        torch = self.torch
+        if q.dtype != torch.int8 or q.dim() != 2 or not q.is_contiguous() or q.data_ptr() % 16:
+            raise ValueError("w4a8_gemm: q must be a contiguous, aligned int8 [M, K]")
+        rows, width = q.shape
+        if scales.dtype != torch.float32 or scales.numel() != rows or not scales.is_contiguous():
+            raise ValueError(f"w4a8_gemm: scales must be contiguous float32 with {rows} values")
+        bias = self._w4a8_weight(w, bias, width, out_dtype)
+        n = w.codes.shape[0]
+        if config == UNPACK or (config < 0 and rows >= UNPACK_ROWS.get(self.family, 2048)):
+            levels = torch.empty(n, width, dtype=torch.int8, device=q.device)
+            code = _kernels._gemm.w4a8_unpack(
+                self.index, w.codes.data_ptr(), w.group_scale.data_ptr(), _ptr(w.codebook),
+                levels.data_ptr(), n, width, self._stream(),
+            )  # fmt: skip
+            self._check(code, "the w4a8 unpack")
+            return self.int8_gemm(q, scales, levels, w.scale, bias, out_dtype)
+        out = torch.empty(rows, n, dtype=out_dtype, device=q.device)
+        if rows == 0:
+            return out
+        code = _kernels._gemm.w4a8_gemm(
+            self.index, q.data_ptr(), scales.data_ptr(), w.codes.data_ptr(),
+            w.group_scale.data_ptr(), _ptr(w.codebook), w.scale.data_ptr(), _ptr(bias),
+            out.data_ptr(), self._half(out_dtype), rows, w.codes.shape[0], width, config,
+            self._stream(),
+        )  # fmt: skip
+        if code == _kernels._gemm.NOT_SUPPORTED and config >= 0:
+            raise ValueError(f"w4a8_gemm: config {config} cannot take {rows}x{width}")
+        self._check(code, "the w4a8 GEMM")
+        return out
+
+    def _w4a8_weight(
+        self, w: W4a8, bias: Tensor | None, width: int, out_dtype: object
+    ) -> Tensor | None:
+        torch = self.torch
+        n = w.codes.shape[0]
+        shapes = ((w.codes, (n, width // 2)), (w.group_scale, (n, width // 16)), (w.scale, (n,)))
+        if any(tuple(t.shape) != shape or not t.is_contiguous() for t, shape in shapes):
+            raise ValueError(f"w4a8: codes, group scales and scale must be [{n}, {width // 2}], "
+                             f"[{n}, {width // 16}] and [{n}], contiguous")  # fmt: skip
+        if w.codes.element_size() != 1 or w.group_scale.dtype != torch.float8_e4m3fn:
+            raise ValueError("w4a8: codes are bytes and group scales E4M3")
+        if w.scale.dtype != torch.float32 or n % 8 or w.codes.data_ptr() % 16:
+            raise ValueError("w4a8: scale is float32, N a multiple of 8, codes 16-byte aligned")
+        if w.group_scale.data_ptr() % 4:
+            raise ValueError("w4a8: group scales must be 4-byte aligned")
+        if w.codebook is not None and (
+            w.codebook.dtype != torch.float32 or w.codebook.numel() != 16
+        ):
+            raise ValueError("w4a8: the codebook is 16 float32 levels")
+        on = [t for t in (w.codes, w.group_scale, w.scale, w.codebook, bias) if t is not None]
+        if any(t.get_device() != self.index for t in on):
+            raise ValueError(f"w4a8: the weight's tensors must be on cuda:{self.index}")
+        self._half(out_dtype)
+        if bias is None:
+            return None
+        if bias.numel() != n:
+            raise ValueError(f"w4a8: bias must have {n} values")
+        return bias.to(out_dtype).contiguous()
 
     def _quantize(
         self,
@@ -286,6 +368,42 @@ class Prebuilt:
         raise RuntimeError(detail)
 
 
+@dataclass(frozen=True, slots=True)
+class W4a8:
+    """One `w4a8.convrot` weight as the GEMM reads it: `codes` bytes [N, K/2] (even k in
+    the low nibble), E4M3 `group_scale` [N, K/16], float32 row `scale` [N] and `codebook` [16]
+    (None: the uniform grid `q - 8`)."""
+
+    codes: Tensor
+    group_scale: Tensor
+    scale: Tensor
+    codebook: Tensor | None
+
+
+def unpack(torch: ModuleType, w: W4a8) -> Tensor:
+    """The int8 levels [N, K] the codes stand for (spec §6): `clamp(round(level x group scale))`,
+    one f32 multiply rounded half to even (a NaN product is 0, as the GEMM's table has it). Torch
+    ops: the law, and the slow path, a few million weights at a time."""
+    codes = w.codes.view(torch.uint8)
+    rows, half = int(codes.shape[0]), int(codes.shape[1])
+    if w.codebook is None:
+        levels = torch.arange(-8, 8, dtype=torch.float32, device=codes.device)
+    else:
+        levels = w.codebook.reshape(16).float()
+    out = torch.empty(rows, 2 * half, dtype=torch.int8, device=codes.device)
+    step = max(1, (1 << 22) // max(half, 1))
+    for at in range(0, rows, step):
+        part = codes[at : at + step]
+        q = torch.stack((part & 15, part >> 4), dim=-1).reshape(part.shape[0], -1).long()
+        grouped = levels[q].view(part.shape[0], -1, 16) * w.group_scale[
+            at : at + step
+        ].float().unsqueeze(-1)
+        out[at : at + step] = (
+            torch.round(grouped).nan_to_num_(0.0).clamp_(-127, 127).view(part.shape[0], -1)
+        )
+    return out
+
+
 def _ptr(t: Tensor | None) -> int:
     return 0 if t is None else int(t.data_ptr())
 
@@ -417,6 +535,64 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     produced = _prologue(torch, x.double(), modulation.double(), shift.double(), 1e-6)
     errors["prologue rms+modulation+gelu_tanh"] = verify.error(
         torch, got, _law(torch, f, produced, data, scale, None)
+    )
+    return verify.within(errors, BUDGET)
+
+
+#: comfy-kitchen's frozen 16-level Lloyd-Max codebook, the one our w4a8 producer writes.
+CODEBOOK = (
+    -0.980602, -0.794529, -0.638165, -0.500986, -0.377321, -0.263187, -0.155210, -0.050720,
+    0.052541, 0.156985, 0.265284, 0.379533, 0.502636, 0.638953, 0.794876, 0.980671,
+)  # fmt: skip
+
+
+def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
+    """The w4a8 GEMM against the exact law in float64 (the unpacked levels through the int8
+    law): bf16 and fp16, 3 and 300 rows, every tile, the uniform grid, and a prologue's rows."""
+    device = torch.device("cuda", ops.index)
+    generator = torch.Generator(device=device).manual_seed(20261022)
+
+    def randn(*shape: int, scale: float = 1.0) -> Tensor:
+        return torch.randn(*shape, generator=generator, device=device) * scale
+
+    rows, out_features, width = 300, 520, 1024  # N not a multiple of a tile
+    codes = torch.randint(0, 256, (out_features, width // 2), generator=generator,
+                          device=device, dtype=torch.uint8)  # fmt: skip
+    group_scale = (randn(out_features, width // 16).abs() * 40 + 16).clamp(max=440)
+    w = W4a8(
+        codes,
+        group_scale.to(torch.float8_e4m3fn),
+        randn(out_features).abs_().add_(0.5).mul_(1e-3),
+        torch.tensor(CODEBOOK, dtype=torch.float32, device=device),
+    )
+    errors: dict[str, float] = {}
+    for grid in (w, W4a8(w.codes, w.group_scale, w.scale, None)):
+        name = "codebook" if grid.codebook is not None else "uniform"
+        data = unpack(torch, grid)
+        for dtype in (torch.bfloat16, torch.float16):
+            bias = randn(out_features).to(dtype)
+            label = f"{name} {'bf16' if dtype == torch.bfloat16 else 'fp16'}"
+            for m in (3, rows):
+                x = randn(m, width).to(dtype)
+                want = _law(torch, INT8, x.double(), data, grid.scale, bias)
+                errors[f"{label} linear M={m}"] = verify.error(
+                    torch, ops.w4a8_linear(x, grid, bias, dtype), want
+                )
+            q, scales = ops.int8_quantize(x)
+            for config in range(8):
+                try:
+                    got = ops.w4a8_gemm(q, scales, grid, bias, dtype, config)
+                except ValueError:
+                    continue
+                errors[f"{label} tile {config}"] = verify.error(torch, got, want)
+    x = randn(64, width).to(torch.bfloat16)
+    shift, modulation = randn(2, width, scale=0.1), randn(2, width, scale=0.1)
+    shift, modulation = shift.to(torch.bfloat16), modulation.to(torch.bfloat16)
+    folded = ops.int8_quantize(x, modulation, shift, 2, 1e-6, 2)
+    got = ops.w4a8_gemm(*folded, w, None, torch.bfloat16)
+    produced = _prologue(torch, x.double(), modulation.double(), shift.double(), 1e-6)
+    errors["prologue rms+modulation+gelu_tanh"] = verify.error(
+        torch, got, _law(torch, INT8, produced, unpack(torch, w), w.scale, None)
     )
     return verify.within(errors, BUDGET)
 

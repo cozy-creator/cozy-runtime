@@ -1,8 +1,8 @@
 """Source-authored model defaults; names are resolved by the granting host.
 
 A default names a release, `[org/]model@release`, never a lane: the machine picks the lane
-from the GPU and the request's bits. An org-less default names a model of the package's own
-account; the publishing host writes that account into the published interface."""
+from the GPU and the request's bits. A default with no org, or the org `_`, names a first-party
+model, the root namespace's."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from collections.abc import Mapping, Sequence
 from cozy_runtime.author._errors import ConformanceError
 
 _SLUG = r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?"
-_DEFAULT = re.compile(rf"(?:{_SLUG}/)?{_SLUG}@(?P<release>[A-Za-z0-9][A-Za-z0-9._+!-]{{0,63}})")
+_DEFAULT = re.compile(rf"(?:(?:_|{_SLUG})/)?{_SLUG}@(?P<release>[A-Za-z0-9][A-Za-z0-9._+!-]{{0,63}})")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 
 

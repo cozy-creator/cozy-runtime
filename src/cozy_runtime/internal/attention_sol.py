@@ -7,10 +7,11 @@ model supplies its live layout, step policy and dense module paths explicitly.
 The kernel compiles once per object per machine, out of process (`kernel_compile`): one per
 card, and on SM90 one per 64-token block layout (`variant`), which only the request knows. So
 the first sight of a length (a model's intake statement, or the first dense step) submits its
-compile, and conditioning and the dense steps cover it. A sparse step whose object is still
-compiling waits for it, by the build's measured progress: it never runs the dense reference in
-its place. Upstream's preprocess autotuning is pinned to one configuration, because its
-candidates differ bitwise and a timing race must not choose the output.
+compile, and conditioning and the dense steps cover it. A sparse step never waits for it: while
+the object builds, the step runs the dense reference (`dense_building`), and the object serves
+from the step boundary after it is ready (`kernel_ready`); the run's kernel rows say from which
+step. Upstream's preprocess autotuning is pinned to one configuration, because its candidates
+differ bitwise and a timing race must not choose the output.
 """
 
 from __future__ import annotations
@@ -32,16 +33,17 @@ from importlib import import_module
 from inspect import Parameter, Signature, signature
 from pathlib import Path
 from types import MethodType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from torch import Tensor, device as Device
     from torch.nn import Module
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._attention import _request
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
-from cozy_runtime.internal import accel, arch, config, kernel_cache, kernel_compile
+from cozy_runtime.internal import accel, arch, config, kernel_cache, kernel_compile, kernel_ready
 from cozy_runtime.internal.attention_ulysses import Local
 
 # Tensor and module imports remain type-only, preserving the Torch-free base surface.
@@ -74,6 +76,10 @@ _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
 _KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
     "cozy_sol_kernel_rows", default=None
 )
+#: This request's word on each object it asked for, by key digest: building, served or failed.
+_SAID: ContextVar[dict[str, str] | None] = ContextVar("cozy_sol_said", default=None)
+#: What a step serves in place of a sparse one, by count.
+COUNTS = ("sparse", "dense_step", "dense_building", "dense_path", "dense_prefix")
 
 
 @contextmanager
@@ -86,10 +92,11 @@ def observing(
     """Count successful calls in this request, restoring any outer observation. `kernels`
     receives one row per kernel this request started building or resolved. The request's
     producer states live here too: fresh ones, or a follower attempt's `held` store."""
-    counts = dict.fromkeys(("sparse", "dense_step", "dense_path", "dense_prefix"), 0)
+    counts = dict.fromkeys(COUNTS, 0)
     token = _COUNTS.set(counts)
     rank_token = _RANK_COUNTS.set(ranks)
     kernel_token = _KERNEL_ROWS.set(kernels)
+    said_token = _SAID.set({})
     try:
         with _request(held):
             yield counts
@@ -97,6 +104,7 @@ def observing(
         _COUNTS.reset(token)
         _RANK_COUNTS.reset(rank_token)
         _KERNEL_ROWS.reset(kernel_token)
+        _SAID.reset(said_token)
 
 
 def _kernel_row(row: dict[str, Scalar]) -> None:
@@ -119,7 +127,7 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
     if (
         type(rank) is not int
         or rank < 1
-        or set(counts) != {"sparse", "dense_step", "dense_path", "dense_prefix"}
+        or set(counts) != set(COUNTS)
         or any(type(value) is not int or value < 0 for value in counts.values())
     ):
         raise ValueError("invalid follower Sol attention counts")
@@ -290,10 +298,6 @@ FA4 = "fa4"
 #: one object per card serves every length.
 ROUTES = {"sm89": (8, 9), "sm90": (9, 0), "sm120": (12, 0)}
 _BLOCK = 64
-#: Loaded objects by key digest; one serves every head count, batch and device (h3a-087).
-_KERNELS: dict[str, Loaded] = {}
-#: Keys this process already submitted, so a dense step submits each once.
-_SUBMITTED: set[str] = set()
 _PINNED: list[bool] = []
 KERNEL = "sol-attn"
 OPTIONS = "--enable-tvm-ffi"
@@ -419,6 +423,7 @@ class _Placeholder:
         return capsule
 
 
+@request_path.forbid("kernel build: sol")
 def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
     """Upstream `_compile_<route>`, traced from placeholders; SM90's at a length that IS this
     variant. Every route takes q, k, v, output, kc, vc, threshold and lse."""
@@ -447,6 +452,7 @@ def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
         return path.read_bytes()
 
 
+@request_path.forbid("kernel build: sol")
 def build(spec: dict[str, Any], staging: Path, report: Callable[..., None]) -> dict[str, object]:
     """The compile manager's builder for one object (`kernel_compile.BUILDERS["sol"]`)."""
     data = compile_variant(spec["route"], int(spec.get("blocks", 0)), bool(spec.get("full")))
@@ -493,35 +499,6 @@ def _job_for(tokens: int, capability: tuple[int, int]) -> kernel_compile.Job:
     return _job(shape.get("blocks", 1), shape.get("full", False), capability)
 
 
-def specialize(tokens: int, device: Device, step: int) -> None:
-    """The first sight of a length (a model's intake statement, or a dense step): submit its
-    object's compile to the machine's compile manager, so dense steps cover it."""
-    capability = _capability(device)
-    store = kernel_cache.configured()
-    if capability is None or store is None:
-        return
-    started = time.perf_counter()
-    try:
-        found = _job_for(tokens, capability)
-        if found.key.digest in _SUBMITTED or found.key.digest in _KERNELS:
-            return
-        _SUBMITTED.add(found.key.digest)
-        state = kernel_compile.submit(store, found)
-        if variant(tokens, capability):
-            kernel_compile.learn(store, _scope(capability), found)
-        _kernel_row(_row(tokens, found, state.state, started, step=step))
-    except Exception as exc:
-        # Nothing needs the kernel yet; the sparse step asks again and falls back THERE.
-        _kernel_row(
-            {
-                "source": "submit_failed",
-                "tokens": tokens,
-                "step": step,
-                "detail": f"{type(exc).__name__}: {exc}"[:300],
-            }
-        )
-
-
 def card_jobs(store: kernel_cache.Store, capability: tuple[int, int]) -> list[kernel_compile.Job]:
     """What a card compiles ahead of any request: its one object, or on SM90, whose object is
     per length layout, every layout this machine has served."""
@@ -538,12 +515,10 @@ def submit_card(index: int) -> None:
     if capability is None or store is None:
         return
     if route(capability) != "sm90":
-        specialize(1, device, -2)
+        _ready(1, device, -2)
         return
     for found in card_jobs(store, capability):
-        if found.key.digest not in _SUBMITTED:
-            _SUBMITTED.add(found.key.digest)
-            kernel_compile.submit(store, found)
+        kernel_compile.submit(store, found)
 
 
 def _scope(capability: tuple[int, int]) -> str:
@@ -556,7 +531,7 @@ def _scope(capability: tuple[int, int]) -> str:
 def expect(tokens: int, device: Device) -> None:
     """A model stated its live length at request intake: a whole conditioning ahead of the
     first dense step. Its row carries step -1."""
-    specialize(tokens, device, -1)
+    _ready(tokens, device, -1)
 
 
 def _row(
@@ -573,31 +548,90 @@ def _row(
     }
 
 
-def _ready(tokens: int, device: Device, step: int) -> Loaded | None:
-    """The object for this length, after waiting for its compile when it is not built yet.
-    None only when there is no store or its compile failed this machine run: the step then
-    runs dense and its row says so."""
+def _ready(tokens: int, device: Device, step: int) -> tuple[Loaded | None, str]:
+    """The object for this length once it serves here (`kernel_ready`), else None and the count
+    of the dense step in its place: `dense_building` while it builds, `dense_step` without a
+    store or after its build failed. The first sight of a length (a model's intake statement,
+    or a dense step) starts it opening, so conditioning and the dense steps cover its build.
+    One loaded object serves every head count, batch and device (h3a-087)."""
     capability = _capability(device)
     store = kernel_cache.configured()
     if capability is None or store is None:
-        return None
+        return None, "dense_step"
     found = _job_for(tokens, capability)
-    loaded = _KERNELS.get(found.key.digest)
-    if loaded is not None:
-        return loaded
+    digest, said = found.key.digest, _SAID.get()
     started = time.perf_counter()
-    data, source = store.get(found.key), "store"
-    if data is None:
-        _SUBMITTED.add(found.key.digest)
-        state, source = kernel_compile.wait(store, found), "waited"
+    name = f"{KERNEL} {digest[:16]}"
+    loaded = kernel_ready.ready(name, functools.partial(_open, store, found, capability))
+    word = (said or {}).get(digest, "")
+    if loaded is not None:
+        if word != "served":
+            ms = kernel_compile.status(store, found).ms
+            source = "built" if word == "building" else "store"
+            _kernel_row(_row(tokens, found, source, started, step=step, compile_ms=ms))
+        word = "served"
+    elif why := kernel_ready.failed(name):
+        if word != "failed":
+            state = f"{type(why).__name__}: {why}"[:300]
+            _kernel_row(_row(tokens, found, "failed", started, step=step, state=state))
+        word = "failed"
+    elif word != "building":
+        _kernel_row(_row(tokens, found, "building", started, step=step))
+        word = "building"
+    if said is not None:
+        said[digest] = word
+    return loaded, {"served": "", "failed": "dense_step"}.get(word, "dense_building")
+
+
+def _open(
+    store: kernel_cache.Store, found: kernel_compile.Job, card: tuple[int, int], wait: bool
+) -> Loaded | None:
+    """The object linked (`kernel_ready`'s opener), after its build when `wait`. An SM90 layout
+    is learned, so this machine's next boot builds it ahead (`card_jobs`)."""
+    if json.loads(found.key.inputs)["variant"]:
+        kernel_compile.learn(store, _scope(card), found)
+    data = store.get(found.key)
+    if data is None and wait:
+        state = kernel_compile.wait(store, found)
         data = store.get(found.key)
         if data is None:
-            _kernel_row(_row(tokens, found, "failed", started, step=step, state=state.line()))
-            return None
-    loaded = _KERNELS[found.key.digest] = load(data)
-    entry = kernel_compile.status(store, found)
-    _kernel_row(_row(tokens, found, source, started, step=step, compile_ms=entry.ms))
-    return loaded
+            raise kernel_compile.CompileFailed(state.state, state.line())
+    return None if data is None else load(data)
+
+
+def _preprocessed(tokens: int, query: Tensor) -> bool:
+    """Whether upstream's preprocess kernels are built for this length and head count here
+    (`_warm`, off the request): they take both as constants. A warm that failed lets the step
+    build them itself, as upstream does."""
+    heads, index = query.shape[2], query.device.index or 0
+    name = f"{KERNEL} preprocess {tokens}x{heads} cuda:{index}"
+    opener = functools.partial(_warm, index, tokens, heads)
+    return kernel_ready.ready(name, opener) is not None or kernel_ready.failed(name) is not None
+
+
+def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool:
+    """`_preprocessed`'s opener: upstream's exact-threshold preprocess (`preprocess.prepare`) built
+    for `tokens` and `heads` on GPU `index`, launching nothing. Its operands are small ones in
+    the live ones' class: what compiles is the descriptors' block shapes, the constants and the
+    lengths' residues, never the sizes."""
+    torch = import_module("torch")
+    upstream = import_module("sol_attn.preprocess")
+    descriptor = import_module("triton.tools.tensor_descriptor").TensorDescriptor
+    _pin_preprocess()
+    blocks, bf16, f32 = -(-tokens // _BLOCK), torch.bfloat16, torch.float32
+    with torch.cuda.device(index):
+        rows = torch.empty(1, _BLOCK + tokens % 16, heads, 128, dtype=bf16, device="cuda")
+        tiles = descriptor.from_tensor(rows, [1, _BLOCK, 1, 128])
+        shape = (tokens, heads, blocks, 128, _BLOCK, 128)
+        upstream._reduce_kc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
+        upstream._reduce_vc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
+        upstream._pool_query_kernel.warmup(tiles, bf16, *shape, grid=(1,), num_warps=4,
+                                           num_stages=1)  # fmt: skip
+        upstream._exact_fused_threshold_kernel.warmup(
+            bf16, f32, bf16, f32, _SCALE, heads, blocks, 128, 64, 128, 1.0,
+            grid=(1,), num_warps=4, num_stages=1,
+        )  # fmt: skip
+    return True
 
 
 def _pin_preprocess() -> None:
@@ -773,21 +807,22 @@ def _execute(
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
     card = _card(query.device)
     fa4 = sparse is None and card is not None and route(card) == FA4
-    loaded = None
-    if not dense_path and sparse is None and not fa4:
-        # The dense steps run on the GPU while this length's variant compiles on the CPU.
-        specialize(layout.live_tokens, query.device, layout.step)
+    loaded: object = None
+    instead = "dense_path" if dense_path else "dense_step"
+    if not dense_path and sparse is None:
+        # The first sight of this length starts its kernels opening off the request (a CuTe
+        # route's object, upstream's preprocess), and the dense steps run while they build.
+        built = card is None or _preprocessed(layout.live_tokens, query)
+        ready, waiting = (FA4, "") if fa4 else _ready(layout.live_tokens, query.device, layout.step)
+        if ready is not None and not built:
+            ready, waiting = None, "dense_building"
         if layout.step >= layout.dense_until_step:
-            loaded = _ready(layout.live_tokens, query.device, layout.step)
-    if (
-        dense_path
-        or layout.step < layout.dense_until_step
-        or (sparse is None and not fa4 and loaded is None)
-    ):
-        # A dense step, a dense path, or a sparse step whose variant failed to compile: the
-        # dense reference serves it.
+            loaded, instead = ready, waiting
+    if dense_path or layout.step < layout.dense_until_step or (sparse is None and loaded is None):
+        # A dense step, a dense path, or a sparse step whose variant is not ready: the dense
+        # reference serves it.
         live_output = dense(query=q, key=k, value=v, scale=scale)
-        _count("dense_path" if dense_path else "dense_step")
+        _count(instead)
     elif fa4:
         # The exact tiles take the dense rows' precision; the model's exact paths stay BF16.
         # The protected prefix's query tiles attend every key inside the same call.
@@ -806,7 +841,7 @@ def _execute(
             live_output = sparse(q, k, v, scale, layout.protected_prefix)
         else:
             assert loaded is not None
-            live_output = _native(q, k, v, scale, layout.protected_prefix, loaded)
+            live_output = _native(q, k, v, scale, layout.protected_prefix, cast("Loaded", loaded))
         _validate_result(live_output, q)
         if any(
             live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()

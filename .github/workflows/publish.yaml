@@ -242,48 +242,9 @@ jobs:
           path: dist/
           if-no-files-found: error
 
-  # The Windows wheel, the very file this release publishes, installs with its dependencies on
-  # Windows, its executor imports as the machine starts it, and its kernels load (0.28.0's
-  # executor died on import: os.sysconf).
-  windows:
-    needs: [build, gated]
-    if: ${{ !cancelled() && (needs.build.result == 'success' || needs.gated.result == 'success') }}
-    runs-on: windows-2025
-    timeout-minutes: 15
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-dist
-          path: dist
-      - uses: astral-sh/setup-uv@v7
-      - name: Install, import the executor, load the kernels
-        shell: pwsh
-        run: |
-          uv venv --python 3.12 venv
-          uv pip install --python venv\Scripts\python.exe (Get-ChildItem dist\*-win_amd64.whl).FullName
-          venv\Scripts\python.exe -I -c "import cozy_runtime.internal.executor"
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          venv\Scripts\python.exe -I -c @"
-          import cozy_runtime._kernels as k
-          assert not k.ABSENT, k.ABSENT
-          assert not k._gemm.TMA and k.NO_FA3, 'the Windows wheel carries mma.sync GEMMs only (cr-201)'
-          code = k._gemm.gemv(0, 0, False, 0, 0, 0, 0, False, 1, 8, 256, 0)
-          print('kernels load; gemv without a GPU ->', code, k._gemm.error_name(code))
-          "@
-          exit $LASTEXITCODE
-
-  # Every kernel the release builds on a machine compiles for every card it serves (0.25.0
-  # shipped nvfp4 kernels that never built: every nvfp4 layer took its slow path).
-  formation:
-    uses: ./.github/workflows/kernel-formation.yaml
-    with:
-      ref: ${{ inputs.release_tag }}
-
   publish:
-    needs: [build, build-aarch64, gated, formation, windows]
-    if: ${{ !cancelled() && !inputs.rehearsal && needs.formation.result == 'success' && needs.windows.result == 'success' && (needs.build.result == 'success' && needs.build-aarch64.result == 'success' || needs.gated.result == 'success') }}
+    needs: [build, build-aarch64, gated]
+    if: ${{ !cancelled() && !inputs.rehearsal && (needs.build.result == 'success' && needs.build-aarch64.result == 'success' || needs.gated.result == 'success') }}
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.

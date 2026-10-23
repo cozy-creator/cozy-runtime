@@ -68,6 +68,19 @@ using Fp8Gemm = cudaError_t(const void* q, const void* w, const float* scales,
                             const float* w_scale, const void* bias, void* out, bool out_half,
                             int M, int N, int K, int sms, int config, cudaStream_t stream);
 
+// The w4a8 linear's GEMM (`w4a8.convrot`, group 16, rotation 256): `w` [N, K/2] 4-bit
+// codes (even k in the low nibble), `s` [N, K/16] E4M3 group scales, `codebook` 16 floats or null
+// (`q - 8`); `q`, `scales`, `w_scale`, `bias` and `out` as `Gemm`'s. mma.sync on every target from
+// sm80 (`w4a8.cu`); `config` < 0 picks the tile by M.
+cudaError_t w4a8_gemm(const int8_t* q, const uint8_t* w, const uint8_t* s, const float* codebook,
+                      const float* scales, const float* w_scale, const void* bias, void* out,
+                      bool out_half, int M, int N, int K, int config, cudaStream_t stream);
+
+// The int8 levels the codes stand for, `out` [N, K]: the int8.convrot weight they decode to before
+// its row scale, for a family GEMM to multiply.
+cudaError_t w4a8_unpack(const uint8_t* w, const uint8_t* s, const float* codebook, int8_t* out,
+                        int N, int K, int sms, cudaStream_t stream);
+
 // Each tensor-core family's GEMMs, compiled for that family's targets only and kept apart by
 // namespace, so one module links every family (`CMakeLists.txt`). A unit names its family by its
 // define (`COZY_FAMILY`); `gemm_sm80.cu` is always mma.sync's int8.
