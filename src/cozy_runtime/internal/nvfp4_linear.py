@@ -18,23 +18,19 @@
 
 from __future__ import annotations
 
-import functools
-import math
-import time
+import inspect
 from collections.abc import Callable
-from contextvars import ContextVar
+from functools import partial
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-from cozy_runtime.author._model import STAGED
 from cozy_runtime.author.kernels import (
-    KernelsUnavailable,
     Launch,
     TritonEntry,
     TritonKernels,
     readable,
 )
-from cozy_runtime.internal import int8_linear
+from cozy_runtime.internal import int8_linear, kernel_ready
 from cozy_runtime.internal.encoding.formats import NVFP4_BLOCK, Tensor, nvfp4_values
 
 if TYPE_CHECKING:
@@ -52,13 +48,6 @@ GEMV_N, GEMV_W = 64, 32
 DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
 
 _MAJOR: dict[int, int] = {}
-# A test reads the arm a call actually served, a kitchen fallback included.
-OBSERVED: ContextVar[list[str] | None] = ContextVar("nvfp4_observed", default=None)
-
-
-def _used(arm: str) -> None:
-    if (observed := OBSERVED.get()) is not None:
-        observed.append(arm)
 
 
 try:
@@ -236,12 +225,23 @@ def _entries() -> list[TritonEntry]:
     weight = {"w_ptr": "*u8", "s_ptr": "*u8", "two_ptr": "*fp32", "x_ptr": "*bf16"}
 
     def signature(kernel: triton.JITFunction, **types: str) -> dict[str, str]:
-        # Constexprs by the kernel's own annotations: N and K are runtime sizes.
+        # Constexprs by the kernel's own annotations: N and K are runtime sizes. Read off its
+        # Python function, which a JITFunction and the interpreter's InterpretedFunction both
+        # keep as `fn` (the interpreter's has no `params`).
+        def constexpr(annotation: object) -> bool:
+            return annotation is tl.constexpr or str(annotation).endswith("constexpr")
+
         return {
-            p.name: types.get(p.name)
-            or weight.get(p.name)
-            or ("constexpr" if p.is_constexpr else "*bf16" if p.name.endswith("_ptr") else "i32")
-            for p in kernel.params
+            name: types.get(name)
+            or weight.get(name)
+            or (
+                "constexpr"
+                if constexpr(p.annotation)
+                else "*bf16"
+                if name.endswith("_ptr")
+                else "i32"
+            )
+            for name, p in inspect.signature(kernel.fn).parameters.items()
         }
 
     entries = [
@@ -272,9 +272,6 @@ def _entries() -> list[TritonEntry]:
 
 #: Built on every executor's GPUs when it starts (`author.kernels`): a request never compiles.
 KERNELS = TritonKernels("cozy-nvfp4", _entries())
-#: How often a call asks whether the start's build has landed: resolution, never a verdict.
-POLL_SECONDS = 1.0
-_LAUNCH: dict[int, tuple[float, Launch | None]] = {}
 #: `triton_kernels.ready`, bound by `triton_kernels` itself when it is imported, which the
 #: executor does past its device boundary: this module imports neither Triton nor torch, so
 #: `encoding` imports in a session without a GPU (test_device_session).
@@ -282,23 +279,10 @@ READY: list[Callable[..., Launch | None]] = []
 
 
 def _launcher(device: Device) -> Launch | None:
-    """This GPU's launcher once the executor start's build is loaded, else None (asked again
-    after `POLL_SECONDS`): the caller then decodes eagerly. Found loaded by a later ask, it
-    serves from the next request (`land`)."""
-    index = device.index or 0
-    asked, launch = _LAUNCH.get(index, (-math.inf, None))
-    now = time.monotonic()
-    if launch is None and now - asked >= POLL_SECONDS:
-        try:
-            found = READY[0](KERNELS, device=device) if READY else None
-        except KernelsUnavailable:
-            found = None
-        if found is not None and asked != -math.inf:
-            _LAUNCH[index] = (math.inf, None)  # asked no more: staged
-            STAGED.append(functools.partial(_LAUNCH.__setitem__, index, (now, found)))
-        else:
-            _LAUNCH[index] = (now, launch := found)
-    return launch
+    """This GPU's launcher once the executor start's build serves (`kernel_ready`), else None:
+    the caller then decodes eagerly."""
+    name = f"{KERNELS.name} cuda:{device.index or 0}"
+    return kernel_ready.ready(name, partial(READY[0], KERNELS, device=device)) if READY else None
 
 
 def _major(torch: ModuleType, index: int) -> int:
@@ -331,7 +315,7 @@ def matmul(
             else None
         )
         if module is not None:
-            amax = flat.abs().amax().float()
+            amax = torch.linalg.vector_norm(flat, float("inf")).float()  # one pass, exact
             tensor_scale = (amax / LEVELS_MAX).clamp(min=SCALE_FLOOR).reshape(1)
             try:
                 with readable(weight, blocked_scale, scale_2) as (w, scales, second):
@@ -343,7 +327,6 @@ def matmul(
                     out = module.scaled_mm_nvfp4(
                         payload, w, tensor_scale, second, block, scales, out_dtype=out_dtype
                     )
-                _used("comfy-kitchen-w4a4")
                 return out[:rows].reshape(*x.shape[:-1], rows_out)
             except Exception as exc:  # W4A16 serves this call
                 int8_linear.failed("comfy-kitchen nvfp4", index, exc)
@@ -395,7 +378,6 @@ def matmul(
                             split,
                             1024,
                         )
-                    _used("triton-w4a16-gemv")
                     return out.reshape(*x.shape[:-1], rows_out)
                 decoded = torch.empty(rows_out, cols, dtype=x.dtype, device=x.device)
                 launch(
@@ -412,18 +394,14 @@ def matmul(
                     128,
                 )
             out = torch.nn.functional.linear(flat, decoded).to(out_dtype)
-            _used("triton-w4a16-decode")
             return out.reshape(*x.shape[:-1], rows_out)
     decoded = nvfp4_values(torch, weight, linear_scale(), scale_2).to(x.dtype)
-    out = torch.nn.functional.linear(x, decoded).to(out_dtype)
-    _used("torch-w4a16-decode")
-    return out
+    return torch.nn.functional.linear(x, decoded).to(out_dtype)
 
 
 def serving(index: int) -> str:
     """The kernel this card's nvfp4 leaves serve a product of more than `DECODE_ROWS` rows with
     now (fewer rows take the GEMV): a run's `gemm.selected`, read once a run."""
-    kitchen = int8_linear._KITCHEN.get(index)
-    if _MAJOR.get(index, 0) >= 10 and kitchen is not None and kitchen.served is not None:
+    if _MAJOR.get(index, 0) >= 10 and int8_linear.kitchen_serves(index):
         return int8_linear.ARTIFACT
-    return DECODE if _LAUNCH.get(index, (0.0, None))[1] is not None else EAGER
+    return DECODE if kernel_ready.ready(f"{KERNELS.name} cuda:{index}") is not None else EAGER

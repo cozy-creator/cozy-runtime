@@ -24,6 +24,8 @@ from typing import Any
 import msgspec
 from msgspec import Struct
 
+from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._model import LANDED
 from cozy_runtime.author.kernels import (
     KernelsUnavailable,
     Launch,
@@ -32,7 +34,7 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
-from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, tools
+from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, svdq_linear, tools
 
 try:
     import torch
@@ -45,10 +47,10 @@ try:
         get_cache_invalidating_env_vars,
         make_backend,
     )
+    from triton.knobs import CompileTimes
     from triton.runtime.build import _get_cache_manager
     from triton.runtime.cache import get_cache_key, get_cache_manager
     from triton.runtime.jit import JITFunction
-
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal
     TRITON_ABSENT = f"torch and triton do not import ({_absent})"
 else:
@@ -82,7 +84,7 @@ _BACKENDS: dict[int, BaseBackend] = {}
 def _cache_key(entry: TritonEntry, arch: int) -> str:
     """Triton's own cache hash for (sources, signature, architecture, options, Triton)."""
     backend = _backend(arch)
-    options = backend.parse_options({"num_warps": entry.num_warps})
+    options = backend.parse_options({"num_warps": entry.num_warps, "num_stages": entry.num_stages})
     key = get_cache_key(_source(entry), backend, options, get_cache_invalidating_env_vars())
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
@@ -109,6 +111,7 @@ class _Kernel(Struct, frozen=True):
     constexprs: dict[str, int]
     aligned: tuple[str, ...]
     num_warps: int
+    num_stages: int
 
     @classmethod
     def of(cls, entry: TritonEntry) -> _Kernel:
@@ -121,11 +124,14 @@ class _Kernel(Struct, frozen=True):
             constexprs,
             entry.aligned,
             entry.num_warps,
+            entry.num_stages,
         )
 
     def entry(self) -> TritonEntry:
         kernel = getattr(import_module(self.module), self.name)
-        return TritonEntry(kernel, self.signature, self.constexprs, self.aligned, self.num_warps)
+        return TritonEntry(
+            kernel, self.signature, self.constexprs, self.aligned, self.num_warps, self.num_stages
+        )
 
 
 def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
@@ -147,6 +153,7 @@ def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
     return kernel_compile.Job("triton", kernel_cache.Key.of(kernels.name, inputs), spec)
 
 
+@request_path.forbid("kernel build: triton")
 def build(
     spec: dict[str, Any], staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
@@ -160,7 +167,7 @@ def build(
         compiled = triton.compile(
             _source(entry),
             target=GPUTarget("cuda", arch, WARP_SIZE),
-            options={"num_warps": entry.num_warps},
+            options={"num_warps": entry.num_warps, "num_stages": entry.num_stages},
         )
         if compiled.hash != entries[entry.key]:
             raise kernel_compile.CompileFailed(
@@ -270,9 +277,11 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     return launcher
 
 
-def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
+def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Launch | None:
     """`load`, when this machine's build of `kernels` for `device` is done; None while it
-    compiles (started here when nobody had). Never waits."""
+    compiles (started here when nobody had). Waits for it only when `wait`."""
+    if wait:
+        return load(kernels, device=device)
     _require_triton()
     target = torch.device(device)
     if target.type != "cuda":
@@ -284,7 +293,27 @@ def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
     major, minor = torch.cuda.get_device_capability(target.index or 0)
     if _submit(_store(), job(kernels, major * 10 + minor)).state == "compiling":
         return None
-    return load(kernels, device=device)
+    launch = load(kernels, device=device)
+    LANDED[0] += 1
+    return launch
 
 
 nvfp4_linear.READY[:] = [ready]
+svdq_linear.READY[:] = [ready]
+
+
+def _compiled(*, src: ASTSource, times: CompileTimes, cache_hit: bool, **_: object) -> None:
+    """Triton compiling a kernel at its first launch: on a request thread, it blocked it."""
+    if not cache_hit:
+        request_path.note(f"triton compile: {src.name}", times.total / 1000)
+
+
+def _tuned(*, fn: JITFunction, duration: float | None, cache_hit: bool, **_: object) -> None:
+    """Triton timing an autotuned kernel's configurations to choose one."""
+    if not cache_hit and duration:
+        request_path.note(f"triton autotune: {fn.__name__}", duration * 1000)
+
+
+if not TRITON_ABSENT:
+    triton.knobs.compilation.listener = _compiled
+    triton.knobs.autotuning.listener = _tuned

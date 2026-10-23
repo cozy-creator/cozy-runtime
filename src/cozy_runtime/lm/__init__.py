@@ -42,6 +42,8 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any
 
+from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author import _work as work
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
@@ -1247,6 +1249,7 @@ class _Engine:
                 self.unfenced.discard(stream)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
+        work.done += 1
         for request in {id(row.request): row.request for row in rows}.values():
             request.steps += 1
             request.live += len(rows)
@@ -1708,13 +1711,13 @@ class _Engine:
             pool = self.pool
             capturing = time.perf_counter()
             try:
-                with self._graph_memory():
+                with self._graph_memory(), request_path.known("cozy_runtime.lm._Engine._replay"):
                     context = CURRENT.get()
                     # The driver's request high-water bounds the step's working set (an idle
                     # capture measures it exactly: cr-210 moves this off the request).
                     pool.prepare(context.request_id if context is not None else "")
                     graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
-            except Building:
+            except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             self.captured[0] += 1
             self.captured[1] += time.perf_counter() - capturing

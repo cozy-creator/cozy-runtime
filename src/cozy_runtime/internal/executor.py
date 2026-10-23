@@ -70,7 +70,9 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _split, describe
+from cozy_runtime.author import _work as work
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
@@ -118,7 +120,6 @@ from cozy_runtime.author._model import (
     Model,
     WarningRow,
     component_use,
-    land,
 )
 from cozy_runtime.author._observations import DEVICE, Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
@@ -143,6 +144,7 @@ from cozy_runtime.internal import (
     int8_linear,
     kernel_cache,
     kernel_compile,
+    kernel_ready,
     model_config,
     package_interface,
     prebuilt,
@@ -153,6 +155,7 @@ from cozy_runtime.internal import (
     stage_memo,
     tolerant,
     tools,
+    w4a8_linear,
     zygote,
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
@@ -584,12 +587,6 @@ def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
 
 def _trees(command: Invoke) -> dict[str, tuple[Path, str]]:
     return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
-
-
-def _allocations(memory: Any) -> int:
-    """GPU 0's progress in a group call: its ops' torch bytes as varena holds them
-    (`group.watched`; torch's own counters raise under varena's allocator)."""
-    return accel.allocated(None, "cuda", memory)
 
 
 def _serving(module: str, export: str, surface: Any) -> _CallType:
@@ -1477,7 +1474,6 @@ class Executor:
                     spool=lambda: owner._attempt_spool,
                     cancelled=owner._attempt_cancelled,
                     reform=owner._group_reform,
-                    progress=functools.partial(_allocations, self.host.memory),
                     device=self._rank_device(torch),
                 )
         sharded = {name[1] for name in owner.group_sharded if name[0] == self._group_model_key}
@@ -1665,6 +1661,7 @@ class Executor:
             now = time.perf_counter()
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
+            work.done += 1
 
         imported = self.imported
         warmup_error = ""
@@ -2305,6 +2302,7 @@ class Executor:
             now = time.perf_counter()
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
+            work.done += 1
 
         self._stages = stages
         if not binding.model_class:
@@ -2814,18 +2812,20 @@ class Executor:
                 "code": "model_binding_set_invalid",
                 "detail": "models must be an array of 1 through 16 binding rows with budgets",
             }
+        # The machine sends a function's slots in its declaration order; one order is ours.
+        rows = tuple(sorted(rows, key=lambda row: row.binding.model_binding_path))
         paths = [row.binding.model_binding_path for row in rows]
         parameters = [row.binding.model_parameter_name for row in rows]
         if (
             not all(paths)
-            or paths != sorted(set(paths))
+            or len(paths) != len(set(paths))
             or not all(parameters)
             or len(parameters) != len(set(parameters))
         ):
             return {
                 "ok": False,
                 "code": "model_binding_set_invalid",
-                "detail": "model paths must be sorted unique and parameters must be unique",
+                "detail": "model paths and parameters must be named and unique",
             }
 
         children: list[tuple[str, Executor, dict[str, Any]]] = []
@@ -3024,7 +3024,9 @@ class Executor:
         first import on a busy host is still an import."""
         if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
-        discovered = discover_installed(release.application, seconds=None)
+        path = release.package_interface
+        recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
+        discovered = discover_installed(release.application, seconds=None, recipes=recipes)
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
@@ -3111,7 +3113,7 @@ class Executor:
             or command.capture is not None
             or bool(requested and target._attention_reaches(requested))
         )
-        with self.in_flight.attempt(alone) as slot:
+        with self.in_flight.attempt(alone) as slot, request_path.serving():
             # Admitted only now: an attempt before it may have poisoned the generation. Its
             # record is taken once nothing can refuse it, so a refused call may come again.
             refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
@@ -3133,8 +3135,8 @@ class Executor:
         of whose GPUs may serve otherwise refuses); the first attempt in also opens the
         residency's attempt."""
         turn = object()
+        kernel_ready.boundary()
         with SCOPES.held(turn):
-            land()  # builds found landed during the last requests serve from this one
             target._upgrade_attention(turn)
             refused = target._install_ready_kernels()
             if refused is not None:
@@ -3303,6 +3305,8 @@ class Executor:
         # (`_upgrade_attention`): each selection the run served and from which step.
         segments: list[dict[str, Any]] = []
         later: list[attention.Applied] = []
+        #: each kernel that became ready mid-run, and the step from which it served
+        swapped: list[tuple[str, dict[str, str | int]]] = []
         steps: dict[str, int] = {}
         stage = [""]  # the last stage this attempt itself reported
         handler = threading.get_ident()
@@ -3315,6 +3319,8 @@ class Executor:
                 return
             if frame.position is not None:
                 steps[frame.stage] = frame.position
+            at: dict[str, str | int] = {"stage": frame.stage, "step": steps.get(frame.stage, 0)}
+            swapped.extend((name, at) for name in kernel_ready.boundary())
             if pin or served_attention is None:
                 return  # an override holds its kernel for every step
             if not segments:
@@ -3351,11 +3357,13 @@ class Executor:
         )
         stage_memo.ENGINE.open(exchange, spool)
         warnings: list[WarningRow] = []
+        blocking: dict[str, tuple[float, int]] = {}
         own_memory: list[GpuMemory] = []
         rank_memory: list[GpuMemory] = []
         try:
             with (
                 WARNINGS.attempt() as warnings,
+                request_path.serving() as blocking,
                 self._request(command.request_id) as own_memory,
                 self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
@@ -3381,6 +3389,7 @@ class Executor:
                                 _cancelled, self.host.mux, self.root, command.request_id
                             ),
                             models=self.models,
+                            recipes=self.discovered.recipes,
                             progress=boundary,
                             activity=self._activity_sink(command.request_id),
                             plan=functools.partial(self._plan_request, command.request_id),
@@ -3445,6 +3454,12 @@ class Executor:
                 )
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
+            for work, (ms, times) in blocking.items():
+                took = {"ms": round(ms, 1), "times": times}
+                record.emit("confession", "request_path.blocking", work, **took)
+                record.emit("log", "kernel work blocked the request", "warn", work=work, **took)
+            for name, where in swapped:
+                record.emit("confession", "kernel.ready", name, **where)
             members = self.model_executors or [self]
             facts = next((m.device_facts for m in members if m.device_facts), None)
             if facts is not None and (unnamed := arch.inherited(facts.sm, facts.name)):
@@ -3650,13 +3665,14 @@ class Executor:
         index = member.device_facts.index if member.device_facts is not None else 0
         sm = member.device_facts.sm if member.device_facts is not None else 0
         missing = int8_linear.unavailable()
-        native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP}
+        native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP, "w4a8": w4a8_linear.OP}
         for (component, leaf), sites in sorted(counted.items()):
             kernel, form = serving(leaf, index), FORMATS[leaf]
             fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
             wanted = native.get(form, kernel)
             reason = prebuilt.lost(form, sm) or (missing[0].reason if missing else "")
+            reason = reason or (w4a8_linear.why(index) if form == "w4a8" else "")
             if reason and kernel != wanted:
                 fallback(kernel, wanted=wanted, served=kernel, reason=reason, **fields)
         for group in member.refused_leaves:
@@ -3846,9 +3862,10 @@ class Executor:
         return None if self.rank == 0 else target
 
     def _upgrade_attention(self, call: object = None) -> bool:
-        """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE: at each step or stage boundary
-        of one, and between requests, a kernel the selection passed over while it compiled is
-        ready, so the construction selects again and serves it from the next step on (a run
+        """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE OR A SELF-CHECK: at each step or
+        stage boundary of one, and between requests, a kernel the selection passed over while it
+        opened (`kernel_ready`: built and checked off the request) is ready, so the construction
+        selects again and serves it from the next step on (a run
         may mix kernels, owner ruling 2026-10-09); a group's followers take rank 0's kernels
         once no call holds them. Where a selection or a follower cannot, the prepared one
         stays and is not tried again. Sites every call reads change only while no other call is
@@ -3916,6 +3933,7 @@ class Executor:
                             construction=self.construction,
                             model_key=self._group_model_key,
                             adopt=mine,
+                            serving=request_path.in_flight(),
                         )
                     )
                 )
@@ -3989,7 +4007,8 @@ class Executor:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
         if command.adopt is not UNSET:
-            return self._adopt_attention(command, command.adopt)
+            with request_path.serving() if command.serving else contextlib.nullcontext():
+                return self._adopt_attention(command, command.adopt)
         self._attention_hold.close()
         self._producer_hold = None
         if command.pin is UNSET:
@@ -4765,7 +4784,10 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
             "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
         }
     if name == "run":
-        return executor.run(frame)
+        # A follower's call serves rank 0's request: what landed before it serves in it.
+        with request_path.serving():
+            kernel_ready.boundary()
+            return executor.run(frame)
     if name not in executor_commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
     command = executor_commands.decode(frame)
@@ -4949,6 +4971,8 @@ def serve(executor: Executor, channel: Channel) -> int:
     keeps reading: a call's commands run on the pool, and so does a process-wide one that must
     wait for calls in flight; one that need not runs here, where Start and Fork always ran."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
+    if executor.rank == 0:
+        work.follow(functools.partial(_tell, channel))
     # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
     order = _Order()
@@ -4991,6 +5015,11 @@ def _shut(executor: Executor, channel: Channel) -> int:
     return int(Exit.ok)
 
 
+def _tell(channel: Channel, frame: Frame) -> None:
+    with contextlib.suppress(SeamError):
+        channel.send(frame)
+
+
 def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextManager[None]) -> None:
     """One command on a pool worker, in its turn. A BaseException, or a reply the seam would
     not take, ends the process, as either did when commands ran on the main thread; so does a
@@ -4999,7 +5028,12 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
         with turn:
             call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
             _CALL.set(call)
-            reply = _reply(executor, frame)
+            if call:
+                work.begin(call)
+            try:
+                reply = _reply(executor, frame)
+            finally:
+                work.end(call)
             if reply is None:
                 code = _shut(executor, executor.channel)
                 sys.stdout.flush()

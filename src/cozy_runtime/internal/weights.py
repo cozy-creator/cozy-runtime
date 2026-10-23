@@ -17,7 +17,7 @@ import threading
 import time
 import zlib
 from collections import Counter
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -116,6 +116,8 @@ class Backend:
         #: each component's bind routes, which keep its decoded tensors for the generation
         self.routes: dict[str, _Routes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
+        #: Persistent buffers the checkpoint does not store (full keys): they keep their values.
+        self.unstored: set[str] = set()
         self.stats: dict[str, float] = {}
         #: the registration's own legs (leaves installed, each component's load and catch), in
         #: execution order: what the construction's `fill` leg spent beside validation
@@ -257,6 +259,7 @@ class Backend:
             by_checkpoint.setdefault(checkpoint.id, (checkpoint, []))[1].append(component)
         verdict: dict[str, object] | None = None
         ignored: list[str] = []
+        unstored: list[str] = []
         warnings: list[str] = []
         routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
         for checkpoint, constructed in by_checkpoint.values():
@@ -267,6 +270,7 @@ class Backend:
                     key=d.key[len(d.component) + 1 :],
                     shape=list(d.spec.shape),
                     logical_dtype=tensorfs_requirement_dtype(d.spec.dtype),
+                    buffer=d.buffer,
                 )
                 for d in walked.destinations
                 if d.component in members
@@ -285,6 +289,7 @@ class Backend:
             ignored.extend(extras)
             if extras:
                 warnings.append(str(fit.get("warning") or self._skipped_line(extras)))
+            unstored.extend(str(k) for k in fit.get("unstored", ()))  # type: ignore[attr-defined]
             counted: Mapping[str, int] = fit.get("routes", {})  # type: ignore[assignment]
             for route in routes:
                 routes[route] += int(counted.get(route, 0))
@@ -295,9 +300,16 @@ class Backend:
             self.skipped.setdefault(component, []).append(key)
             if component in self.expected:
                 self.expected[component] -= {f"{component}.{key}"}
+        self.unstored = {full.replace("/", ".", 1) for full in unstored}
+        if unstored:
+            more = f", and {len(unstored) - 5} more" if len(unstored) > 5 else ""
+            warnings.append(
+                f"{len(unstored)} persistent buffer(s) the checkpoint does not store keep their "
+                f"constructed values: {', '.join(unstored[:5])}{more}"
+            )
         if len(by_checkpoint) > 1:
             verdict = {**verdict, "ignored": ignored, "routes": routes}
-        return {**verdict, "warnings": warnings}
+        return {**verdict, "unstored": unstored, "warnings": warnings}
 
     def _skipped_line(self, extras: Sequence[str]) -> str:
         """TensorFS 0.3.90's warning for the stored tensors fit skipped: how many, how many
@@ -313,8 +325,10 @@ class Backend:
     def materialize(
         self, obj: object, walked: Census, *, encoded_leaves: str = "refuse"
     ) -> Mapping[str, TensorLike]:
-        """Weights stay on meta. Derived (non-persistent) buffers, which no checkpoint
-        supplies, move to the device with the values their construction computed."""
+        """Weights go to meta, persistent buffers the checkpoint stores included, so varena binds
+        every stored tensor at every name and a read anywhere gets the checkpoint's value.
+        Derived (non-persistent) buffers, and persistent ones the checkpoint does not store, move
+        to the device with the values their construction computed."""
         self.encoded_leaves = encoded_leaves
         native = sorted(k for k, t in self.resolved.items() if t.route == "encoded_gemm")
         if native and encoded_leaves != "accept":
@@ -327,15 +341,18 @@ class Backend:
                 native[:6],
             )
         roots = dict(_members(obj))
+        live = dict(walked.live)
+        stored = {d.key for d in walked.destinations if d.buffer}
         with placing():
             for name in walked.components:
                 member = roots.get(name)
                 if not isinstance(member, self.torch.nn.Module):
                     continue
                 self.roots[name] = member
-                self.derived[name] = _derived_values(member)
+                live.update(_weightless_buffers(member, name, stored))
+                self.derived[name] = _derived_values(member, name, self.unstored)
                 _restore_derived(self.derived[name], self.device)
-        return walked.live
+        return live
 
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
         """Validate one destination against its stored row. Nothing moves."""
@@ -539,9 +556,7 @@ class Backend:
                 if held is not None:
                     leaf._buffers[name] = torch.empty_like(held, device=self.device)
         setattr(owner, attribute, leaf)
-        kept = leaf.roles()
-        derived = tuple(sorted(role for role in parts if kept.get(role) is not parts[role]))
-        return leaf, replaced, derived
+        return leaf, replaced, _derived(leaf, parts)
 
 
 # ----------------------------------------------------------------- routes and LoRA bakes
@@ -604,14 +619,11 @@ class _Routes:
                 self.decoded[key] = (identity, out)
             return {name: out}
         leaf, replaced, derived = self.leaves[key]
-        path, buffers = name.removesuffix(".weight"), leaf.BUFFERS
-        made = {f"{path}.{buffers.get(r, r)}": t for r, t in parts.items() if r not in derived}
-        if derived:
-            provider = cast(LeafProvider, self.providers[key])
-            fresh = provider.leaf(torch, parts, replaced, leaf.out_dtype)
-            for role in derived:
-                made[f"{path}.{buffers.get(role, role)}"] = fresh._buffers[buffers.get(role, role)]
-        return made
+        provider = cast(LeafProvider, self.providers[key])
+        made = _bound(
+            leaf, derived, parts, lambda: provider.leaf(torch, parts, replaced, leaf.out_dtype)
+        )
+        return {f"{name.removesuffix('.weight')}.{buffer}": t for buffer, t in made.items()}
 
     def _identity(self) -> str:
         """What the stored bytes are now: as stored, or the fill (LoRA bake) identity they were
@@ -638,6 +650,28 @@ class _Routes:
         if self.region is not None:
             self.region.close()
             self.region = None
+
+
+def _derived(leaf: Any, parts: Mapping[str, Any]) -> tuple[str, ...]:
+    """The stored roles `leaf` keeps as other tensors than the stored ones (cast, swizzled): a
+    bind makes them again from the stored bytes. A stored role it does not read is neither."""
+    kept = leaf.roles()
+    return tuple(sorted(role for role in kept if role in parts and kept[role] is not parts[role]))
+
+
+def _bound(
+    leaf: Any, derived: Sequence[str], parts: Mapping[str, Tensor], fresh: Callable[[], Any]
+) -> dict[str, Tensor]:
+    """`leaf`'s role buffers, by buffer name, from one bind's stored `parts`: the roles it keeps
+    as stored, and the `derived` ones from a fresh leaf of the same provider."""
+    buffers = leaf.BUFFERS
+    made = {
+        buffers.get(r, r): t for r, t in parts.items() if r in leaf._cozy_roles and r not in derived
+    }
+    if derived:
+        built = fresh()
+        made.update({buffers.get(r, r): built._buffers[buffers.get(r, r)] for r in derived})
+    return made
 
 
 @runtime_checkable
@@ -670,6 +704,9 @@ class _Bake:
     layer: LoRALayer | None = None
     factors: list[tuple[str, str, float]] = field(default_factory=list)
     hooks: list[LoRASource] = field(default_factory=list)
+    #: An svdq.nvfp4 leaf: its LoRAs join its low-rank branch as more ranks when it runs
+    #: (`SvdqLinear.adopt`), never its bytes, so no page refills for them.
+    leaf: Any = None
 
 
 class _Bakes:
@@ -682,21 +719,30 @@ class _Bakes:
         self, backend: Backend, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
     ) -> None:
         self.torch, self.owner, self.reading = backend.torch, backend._owner, backend._reading
+        device = backend.device
+        self.gpu = (device.index or 0) if device.type == "cuda" else None
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
+        #: what this forward serves (`prepare`): per step while the bake kernels build
+        self.serving: lora_bake.Strategy = "per_step"
+        self.how: lora_bake.How | None = None
         self.baked = 0
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
             encoded = rows[stored].encoded
             site = local.removesuffix(".weight")
             roles = {p.role: p.dtype for p in encoded.parts}
-            if site == local or not lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles):
-                continue
-            bake = _Bake(stored, repr((encoded.scheme, encoded.params)))
             try:
-                hooks = list(root.get_submodule(site)._forward_hooks.values())
+                module = root.get_submodule(site)
             except AttributeError:  # a tensor named `.weight` on no module of its own
-                hooks = []
+                module = None
+            leaf = module if hasattr(module, "adopt") else None
+            if site == local or not (
+                leaf is not None or lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles)
+            ):
+                continue
+            bake = _Bake(stored, repr((encoded.scheme, encoded.params)), leaf=leaf)
+            hooks = list(module._forward_hooks.values()) if module is not None else []
             if any(site.startswith(block + ".") for block in blocks):
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
@@ -719,20 +765,28 @@ class _Bakes:
         """What a bake writes now, the same in every process (`Filling.identity`): the strategy
         and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each baked
         weight's stored name and encoding with each delta's content (a stored factor pair of
-        this checkpoint, or the identity a hook's package declares), dtypes and scale."""
+        this checkpoint, or the identity a hook's package declares), dtypes and scale. A bake
+        waits for no kernel: while its kernels build the LoRAs serve per step, and pages bake
+        once they serve (the identity changes, so varena refills them)."""
         torch = self.torch
-        baked = self.strategy == "bake"
+        gpu = self.gpu if self.strategy == "bake" else None
+        self.how = "eager" if gpu is None else lora_bake.serving(gpu)
+        self.serving = self.strategy if self.how is not None else "per_step"
+        baked = self.serving == "bake"
         for bake in self.bakes.values():  # each LoRA'd linear told whether its bytes carry it
             if bake.layer is not None:
                 bake.layer._cozy_baked = baked
             for hook in bake.hooks:
                 hook._cozy_baked = baked
+            if bake.leaf is not None:
+                bake.leaf.adopt(functools.partial(_deltas, bake) if baked else None)
         if not baked:
-            return repr((self.strategy,))
-        device = torch.cuda.current_device() if torch.cuda.is_initialized() else -1
-        held: list[object] = [lora_bake.recipe(device), torch.__version__]
-        held.append(torch.cuda.get_device_capability(device) if device >= 0 else "cpu")
+            return repr((self.serving,))
+        held: list[object] = [lora_bake.recipe(self.how == "fused"), torch.__version__]
+        held.append(torch.cuda.get_device_capability(self.gpu) if self.gpu is not None else "cpu")
         for stored, bake in sorted(self.bakes.items()):
+            if bake.leaf is not None:
+                continue
             deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
             for hook in bake.hooks:
                 got = hook.lora_factors()
@@ -748,11 +802,13 @@ class _Bakes:
 
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
         identity = self.identity
-        if self.strategy != "bake":
+        if self.serving != "bake":
             return
         for stored, bake in self.bakes.items():
             weight = parts.get(stored)
-            if weight is None or any(a not in parts or b not in parts for a, b, _ in bake.factors):
+            if bake.leaf is not None or weight is None:
+                continue
+            if any(a not in parts or b not in parts for a, b, _ in bake.factors):
                 continue
             downs = [parts[a]["value"] for a, _, _ in bake.factors]
             ups = [parts[b]["value"] * scale for _, b, scale in bake.factors]
@@ -779,9 +835,29 @@ class _Bakes:
             if not delta:
                 continue
             lora_bake.bake(
-                torch, dict(weight), down, up, seed=zlib.crc32(f"{identity}\0{stored}".encode())
+                torch,
+                dict(weight),
+                down,
+                up,
+                seed=zlib.crc32(f"{identity}\0{stored}".encode()),
+                how=self.how,
             )
             self.baked += 1
+
+
+def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:
+    """An svdq leaf's LoRAs as it runs: each `(identity, down, up, scale)`, the bound factors of
+    its PEFT layer's active adapters, then its model's hooks'."""
+    out: list[tuple[object, Tensor, Tensor, float]] = []
+    layer = cast(Any, bake.layer)
+    for adapter in getattr(layer, "active_adapters", ()):
+        down, up = layer.lora_A[adapter], layer.lora_B[adapter]
+        out.append((down, down.weight, up.weight, float(layer.scaling[adapter])))
+    for hook in bake.hooks:
+        got = hook.lora_factors()
+        if got is not None:
+            out.append((got[0], got[1], got[2], float(got[3])))
+    return out
 
 
 # ------------------------------------------------------------------------- the placement
@@ -797,6 +873,7 @@ class Placement:
         self.torch = backend.torch
         self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
+        self.routes = backend.routes
         self.notes: dict[str, str] = {}
         self.attempts = 0
         #: the request's plan (`ctx.plan`): the components each step runs together
@@ -838,7 +915,7 @@ class Placement:
         with ExitStack() as passes:
             for name in sorted(entering):
                 # its decoded tensors stay while it runs; dropped while unused, binds decode again
-                routes = self.backend.routes.get(name)
+                routes = self.routes.get(name)
                 region = routes.region if routes is not None else None
                 if region is not None and passes.enter_context(region.pin()):
                     routes.forget()
@@ -912,15 +989,40 @@ class Placement:
         return sum(bakes.baked for bakes in self.bakes.values())
 
 
-def _derived_values(root: Module) -> dict[tuple[Module, str], Tensor]:
-    """Non-persistent buffers with their constructed values: no checkpoint supplies them."""
+def _derived_values(
+    root: Module, component: str, unstored: Collection[str]
+) -> dict[tuple[Module, str], Tensor]:
+    """Buffers with their constructed values: non-persistent ones, which no checkpoint supplies,
+    and the persistent ones this checkpoint does not store (`unstored`, full keys)."""
     held: dict[tuple[Module, str], Tensor] = {}
-    for _, sub in root.named_modules():
-        for local in getattr(sub, "_non_persistent_buffers_set", ()):
-            value = sub._buffers.get(local)
-            if value is not None and str(value.device) != "meta":
+    for path, sub in root.named_modules(remove_duplicate=False):
+        for local, value in sub._buffers.items():
+            key = f"{component}.{path}.{local}" if path else f"{component}.{local}"
+            derived = local in getattr(sub, "_non_persistent_buffers_set", ()) or key in unstored
+            if derived and value is not None and str(value.device) != "meta":
                 held[(sub, local)] = value.detach()
     return held
+
+
+def _weightless_buffers(root: Module, component: str, stored: Collection[str]) -> dict[str, Tensor]:
+    """Every persistent buffer the checkpoint stores goes to meta at each of its names, as a
+    parameter is built: varena binds a meta tensor only, and a construction value left in place
+    would be what a read outside the module's forward sees (Klein's VAE batch norm, se-074).
+    Returns the destinations' new meta tensors by key."""
+    made: dict[int, Tensor] = {}
+    live: dict[str, Tensor] = {}
+    for path, sub in root.named_modules(remove_duplicate=False):
+        for local, value in list(sub._buffers.items()):
+            key = f"{component}.{path}.{local}" if path else f"{component}.{local}"
+            if value is None or value.device.type == "meta":
+                continue
+            if key not in stored and id(value) not in made:
+                continue
+            meta = made.setdefault(id(value), value.detach().to("meta"))
+            sub._buffers[local] = meta
+            if key in stored:
+                live[key] = meta
+    return live
 
 
 def _restore_derived(held: Mapping[tuple[Module, str], Tensor], device: torch.device) -> None:

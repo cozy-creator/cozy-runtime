@@ -394,7 +394,7 @@ def quantize_component_into(
     fitted = None
     if any(_ENCODINGS[scheme(t)].calibrated for t in pending):
         # Fitted one at a time on this thread: its GPU allocations are the attempt's, which the
-        # memory manager answers by making room (`library_oom`). Each tensor is a step of the
+        # memory manager answers by making room (varena serves torch). Each tensor is a step of the
         # run's record, with the host code any slow one waited in (`author._stalls`).
         fitted = tel.step_callback(len(pending), stage=f"fitting {component}")
         stop = threading.Event()

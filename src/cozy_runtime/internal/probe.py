@@ -39,7 +39,7 @@ from tensorfs import UnsupportedError
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
-from cozy_runtime.derive.microscale import encode_nvfp4
+from cozy_runtime.derive.microscale import encode_nvfp4, encode_w4a8
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.decode_cores import Cores
 from cozy_runtime.internal.decode_schemes import run, sample
@@ -48,6 +48,7 @@ from cozy_runtime.internal.encoding import (
     DeviceFacts,
     Encoded,
     LeafProvider,
+    Nvfp4NativeLeaf,
     Provider,
     RuntimeIdentity,
     admit,
@@ -65,6 +66,7 @@ from cozy_runtime.internal.encoding.formats import (
     hadamard256,
     params_of,
 )
+from cozy_runtime.internal.prebuilt import W4a8, unpack
 
 # `torch`, `device`, `dtype` and tensor values are `Any`: the check venv carries no torch.
 
@@ -385,7 +387,7 @@ def _comfy_fixture(
     group = params.get("group_size")
     if not isinstance(group, int) or type(group) is not int:
         raise AssertionError("the Comfy probe must bind its declared group_size")
-    if provider.encoding == "comfy.asym_w4a8_int8":
+    if provider.encoding in ("comfy.asym_w4a8_int8", "w4a8.convrot"):
         # Unsigned nibble 9 addresses default level 9 - 8 = 1.
         weight = torch.full((rows, columns // 2), -103, dtype=torch.int8, device=device)
     elif provider.encoding == "comfy.w6a8_int8":
@@ -401,7 +403,9 @@ def _comfy_fixture(
         raise AssertionError(f"no Comfy fixture for {provider.encoding}")
     return truth, {
         "weight": weight,
-        "group_scale": torch.ones((rows, columns // group), dtype=torch.float32, device=device),
+        "group_scale": torch.ones((rows, columns // group), dtype=torch.float32, device=device).to(
+            torch.float8_e4m3fn if provider.encoding == "w4a8.convrot" else torch.float32
+        ),
         "scale": channel,
     }
 
@@ -654,6 +658,15 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
         scale = (rotated.abs().amax(dim=-1) / 127.0).clamp(min=1e-12).float()
         payload = torch.round(rotated / scale.double().unsqueeze(-1)).clamp(-127, 127)
         return weight, {"weight": payload.to(torch.int8), "scale": scale}
+    if provider.suite == "svdq-nvfp4-native":  # an nvfp4 residual, smoothing and a rank-32 branch
+        _, roles = _weight_roles(torch, Nvfp4NativeLeaf(), device)
+        roles["pre_quant_scale"] = torch.rand(cols, generator=generator).to(device) + 0.5
+        down = torch.randn(32, cols, generator=generator) * 0.05
+        roles["lowrank_down"] = down.to(torch.bfloat16).to(device)
+        roles["lowrank_up"] = (
+            (torch.randn(rows, 32, generator=generator) * 0.05).to(torch.bfloat16).to(device)
+        )
+        return _exact_weight(torch, provider, roles).float(), roles
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         encoded = encode_nvfp4("probe", weight.cpu().numpy())
         scale, scale_2 = encoded.companions
@@ -668,6 +681,21 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
             "scale_2": torch.frombuffer(bytearray(scale_2.raw), dtype=torch.float32)
             .reshape(())
             .to(device),
+        }
+    if provider.suite == "w4a8-native":
+        encoded = encode_w4a8("probe", weight.cpu().numpy())
+        group_scale, scale, codebook = (
+            torch.frombuffer(bytearray(c.raw), dtype=dtype).reshape(c.shape).to(device)
+            for c, dtype in zip(
+                encoded.companions, (torch.uint8, torch.float32, torch.float32), strict=True
+            )
+        )
+        codes = torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8)
+        return weight, {
+            "weight": codes.reshape(rows, cols // 2).to(device),
+            "group_scale": group_scale.view(torch.float8_e4m3fn),
+            "scale": scale,
+            "codebook": codebook,
         }
     if provider.suite == "int8-rowwise-decode":
         scale = (weight.abs().amax(dim=-1) / 127.0).clamp(min=1e-12)
@@ -723,6 +751,10 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
         rows, packed = (int(n) for n in roles["weight"].shape)
         columns = packed * 4 // 3 if provider.encoding == "comfy.w6a8_int8" else packed * 2
         return _f64(roles["scale"]).reshape(rows, 1).expand(rows, columns)
+    if provider.suite == "svdq-nvfp4-native":
+        nvfp4 = _exact_weight(torch, Nvfp4NativeLeaf(), roles)
+        branch = _f64(roles["lowrank_up"]) @ _f64(roles["lowrank_down"])
+        return nvfp4 * _f64(roles["pre_quant_scale"]).reshape(1, -1) + branch
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         packed = roles["weight"].cpu()
         rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
@@ -731,6 +763,10 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
         blocks = roles["scale"].cpu().double().repeat_interleave(NVFP4_BLOCK, dim=1)
         exact = lut[nibbles] * blocks * roles["scale_2"].cpu().double()
         return exact.to(roles["weight"].device)
+    if provider.suite == "w4a8-native":
+        levels = unpack(torch, W4a8(roles["weight"], roles["group_scale"], roles["scale"],
+                                    roles.get("codebook")))  # fmt: skip
+        return hadamard256(torch, _f64(levels)) * _f64(roles["scale"]).reshape(-1, 1) / 16
     data = _f64(roles["weight"])
     if provider.suite in ("fp8-rowwise-decode", "fp8-rowwise-native", "int8-rowwise-decode"):
         return data * _f64(roles["scale"]).reshape(int(data.shape[0]), 1)
@@ -929,7 +965,14 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
 
 #: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
 NATIVE_SUITES = frozenset(
-    {"fp8-rowwise-native", "int8-convrot256-native", "nvfp4-native", "mxfp8-native"}
+    {
+        "fp8-rowwise-native",
+        "int8-convrot256-native",
+        "nvfp4-native",
+        "mxfp8-native",
+        "w4a8-native",
+        "svdq-nvfp4-native",
+    }
 )
 
 
@@ -970,6 +1013,7 @@ def conform(
 #: layouts). The spec's conformance cases cover the other layouts.
 PROBE_PARAMS: dict[str, dict[str, object]] = {
     "comfy.asym_w4a8_int8": {"group_size": 16, "rotation": "kron_regular_h4", "rotation_size": 256},
+    "w4a8.convrot": {"group_size": 16, "rotation": "kron_regular_h4", "rotation_size": 256},
     "comfy.w6a8_int8": {"group_size": 32, "rotation": "kron_regular_h4", "rotation_size": 256},
     "int4.convrot": {"rotation": "kron_regular_h4", "rotation_size": 256},
     "fp8.tensorwise": {},

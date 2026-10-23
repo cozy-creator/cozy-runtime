@@ -27,7 +27,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
-from cozy_runtime.author import _codec
+from cozy_runtime.author import _codec, _stalls
 from cozy_runtime.author._activity import settle, work_clock
 from cozy_runtime.author._assets import (
     Asset,
@@ -184,6 +184,8 @@ class Attempt:
     _step_mark: float = 0.0
     #: the device's mark at the previous step (`DEVICE`), when a GPU runs the attempt
     _step_device: object = None
+    #: The stepping thread's host-stall sampler while a step loop runs (`_stalls`).
+    _stall_watch: _stalls.Watch | None = None
     #: Sends one publish to the worker, which journals it on the run's output log. None in a
     #: harness with no worker: `published` then records what would have been shown.
     publish: Callable[[Publish], Published] | None = None
@@ -1235,6 +1237,8 @@ class Telemetry(_Bound):
         attempt._step_mark = work_clock()
         clock = DEVICE[0] if DEVICE else None
         attempt._step_device = clock.mark() if clock is not None else None
+        if attempt._stall_watch is None:
+            attempt._stall_watch = _stalls.watch(lambda: not attempt.closed)
         capture = _capture_clock.get()
         if capture is not None:
             capture.schedule(total)
@@ -1247,6 +1251,13 @@ class Telemetry(_Bound):
             if mark and name is not None:
                 marks = (attempt._step_device, ran) if ran is not None else None
                 attempt.attribution.step(name, (now - mark) * 1000, marks)
+            stalls = attempt._stall_watch
+            if stalls is not None:
+                for code, ms in stalls.take().items():
+                    attempt.attribution.stage(f"host · {code}", ms)
+                if step == total - 1:
+                    stalls.stop()
+                    attempt._stall_watch = None
             attempt._step_mark, attempt._step_device = now, ran
             step_ms = (now - mark) * 1000 if mark else 0.0
             if (
@@ -1386,8 +1397,7 @@ class Telemetry(_Bound):
         """Per-stage timing bracket; `stage_ms` feeds the duration model and benchmarks.
 
         Structurally separate from a component-use scope: this records a NUMBER and touches
-        no residency, no placement and no ComponentUseContract — `checks/architecture.py`'s
-        `timing-decides-nothing` fence proves the module cannot reach them.
+        no residency, no placement and no ComponentUseContract.
         """
         self._attempt.check_open("Telemetry.stage")
         self._ctx.raise_if_cancelled()
