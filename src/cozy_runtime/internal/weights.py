@@ -455,6 +455,8 @@ class Backend:
             remaining = self.grants.pop(name, None)
             if remaining is not None:
                 _close(remaining)
+        if self.device.type == "cpu":
+            _float32(self.torch, root)
         for _, sealed in self.memory.sealed():
             if self.deposit is not None:
                 label = f"{self.construction}/{name}"
@@ -562,6 +564,21 @@ class Backend:
 
 
 # ----------------------------------------------------------------- routes and LoRA bakes
+
+
+def _float32(torch: ModuleType, root: Module) -> None:
+    """A CPU computes 16-bit floats some two hundred times slower than float32 (torch's own CPU
+    kernels: a 1024² matmul takes 2.0 s in bf16 and 9.5 ms in f32 on AVX2), so a CPU executor's
+    module is float32: its placeholders convert, and each bound weight is converted while its
+    block runs (varena's `module.to(dtype)`); the stored bytes stay as they are. Swapped, so a
+    weight read outside its block's forward reads converted too."""
+    future = torch.__future__
+    swapping = future.get_swap_module_params_on_conversion()
+    future.set_swap_module_params_on_conversion(True)
+    try:
+        root.float()
+    finally:
+        future.set_swap_module_params_on_conversion(swapping)
 
 
 def _close(grant: WeightGrant) -> None:
