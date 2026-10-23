@@ -87,7 +87,7 @@ conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
 [tool.uv.sources]
 # Dev pin until the cohort release: S3's torch-alloc tensorfs-py (varena as torch's only CUDA allocator, with the lease connect).
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "f3b5fe900d3a9ffff6b7a59635574b56f74606ff", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "a6eaba30584556af2ab1f1ae50eeb56bb3f3faa4", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
