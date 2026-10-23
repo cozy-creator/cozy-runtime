@@ -178,6 +178,31 @@ def row(
     return PlanRow(key, name, component, dtype, shape, nbytes, encoded)
 
 
+def _transformers_binding(config: Mapping[str, object]) -> Callable[[str], str]:
+    """`Checkpoint.binding`'s rename for one component's config (identity without one)."""
+    transformers, torch = sys.modules.get("transformers"), sys.modules.get("torch")
+    mapping = sys.modules.get("transformers.conversion_mapping")
+    loading = sys.modules.get("transformers.core_model_loading")
+    names = config.get("architectures")
+    model_cls = (
+        getattr(transformers, str(names[0]), None) if isinstance(names, list) and names else None
+    )
+    if transformers is None or torch is None or mapping is None or loading is None:
+        return str
+    if model_cls is None:  # a config naming no model: its model type's own rules, unscoped
+        transforms = mapping.get_checkpoint_conversion_mapping(str(config.get("model_type", "")))
+        built, prefix = None, None
+    else:
+        with torch.device("meta"):
+            model = model_cls._from_config(transformers.AutoConfig.for_model(**config))
+        transforms = mapping.get_model_conversion_mapping(model)
+        built, prefix = dict.fromkeys(model.state_dict()), model.base_model_prefix
+    renamings = [t for t in transforms or () if isinstance(t, loading.WeightRenaming)]
+    if not renamings:
+        return str
+    return lambda name: str(loading.rename_source_key(name, renamings, [], prefix, built)[0])
+
+
 class Checkpoint:
     """One opened checkpoint: its rows (in construction order), configs and assets."""
 
@@ -185,6 +210,7 @@ class Checkpoint:
         self.ck = ck
         #: the weight set's identity: the header's ref, `sha256:<hex>`
         self.id: str = ck.id
+        self._bindings: dict[str, Callable[[str], str]] = {}
 
     def has(self, component: str) -> bool:
         return component in self.ck.components
@@ -206,23 +232,18 @@ class Checkpoint:
         return [row(self.ck, component, name, info, bind(name)) for name, info in tensors.items()]
 
     def binding(self, component: str) -> Callable[[str], str]:
-        """Stored name -> the name the component's module tree uses: a Transformers model's
-        own checkpoint conversion mapping, found by its config's class (`CLIPTextModel`
-        drops the `text_model.` its checkpoint stores); a name binds as stored otherwise."""
-        mapping = sys.modules.get("transformers.conversion_mapping")
-        loading = sys.modules.get("transformers.core_model_loading")
-        if mapping is None or loading is None or not self.has(component):
-            return str
-        config = self.ck.components[component].config
-        transforms = None
-        for name in (*config.get("architectures", ())[:1], config.get("model_type")):
-            transforms = mapping.get_checkpoint_conversion_mapping(name) if name else None
-            if transforms:
-                break
-        renamings = [t for t in transforms or () if isinstance(t, loading.WeightRenaming)]
-        if not renamings:
-            return str
-        return lambda name: str(loading.rename_source_key(name, renamings, [])[0])
+        """Stored name -> the name the component's module tree uses, as Transformers loads it:
+        the transforms of the model its config names, each sub-model's scoped to its path
+        (FLUX.2 [dev]'s Mistral3 stored as Transformers 4 named it, `language_model.model.*`,
+        is `model.language_model.*` only through `Mistral3Model`'s own rule, cr-213), and its
+        base-model prefix added or dropped against that model's names (`CLIPTextModel` drops
+        the `text_model.` its checkpoint stores). The model is built once, on the meta device.
+        A name binds as stored when Transformers is not loaded or has no rule for it."""
+        found = self._bindings.get(component)
+        if found is None:
+            config = self.ck.components[component].config if self.has(component) else {}
+            found = self._bindings[component] = _transformers_binding(config)
+        return found
 
     @property
     def metadata(self) -> dict[str, object]:
@@ -353,7 +374,10 @@ def fit(
                 component,
             )
         bind = checkpoint.binding(component)
-        stored = {bind(name): info for name, info in checkpoint.tensors(component).items()}
+        tensors = checkpoint.tensors(component)
+        #: bound name -> the name it is stored under (a renamed tensor's bytes are read by it)
+        names = {bind(name): name for name in tensors}
+        stored = {key: tensors[name] for key, name in names.items()}
         for key, requirement in wanted.items():
             info = stored.get(key)
             if info is None:
@@ -397,7 +421,7 @@ def fit(
             if key not in wanted:
                 ignored.append(f"{component}/{key}")
                 ignored_bytes += sum(
-                    part.length for part in raw.parts(checkpoint.ck, component, key).values()
+                    part.length for part in raw.parts(checkpoint.ck, component, names[key]).values()
                 )
         header = [key for key in stored if key in wanted]
         census = list(wanted)
