@@ -242,6 +242,8 @@ _AUTHOR_TYPES = (
     "ImageRequest",
     "ImageResult",
     "ReferenceImages",
+    "Box",
+    "Region",
     "AspectRatio",
     "Seed",
     *(cls.__name__ for cls in SERVICES.values()),
