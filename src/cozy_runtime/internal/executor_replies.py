@@ -44,7 +44,7 @@ class Ref(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Step(msgspec.Struct, frozen=True, kw_only=True):
-    """One step: the capacity it ran against and what make_room took in it, by class."""
+    """One step: the free bytes at its start and what make_room took in it, by class."""
 
     capacity: int
     evicted: tuple[int, ...]
@@ -75,9 +75,7 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     evicted: tuple[int, ...]
     peak: int
     compute: int
-    host: int | None
     leftover: int
-    keep_pending: int
     make_room: tuple[MakeRoom, ...]
     #: the request-end audit: its arena's torch blocks still live outside any region at its
     #: end, (address, bytes, stream) each; tests fail on any
