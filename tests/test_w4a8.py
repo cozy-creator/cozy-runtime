@@ -209,6 +209,7 @@ def test_the_fused_gemm_verifies_on_the_card_and_keeps_the_law(tmp_path: Path) -
         data = data.to("cuda", torch.int8)
         assert torch.equal(unpack(torch, w), data), "the torch law is the encoder's levels"
         ops = w4a8_linear.native(torch, 0)
+        assert ops is not None, "the prebuilt 8-bit op serves this card"
         for dtype in (torch.bfloat16, torch.float16):
             q, scales = ops.int8_quantize(
                 torch.randn(rows, in_features, generator=generator).to("cuda", dtype)

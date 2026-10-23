@@ -138,10 +138,15 @@ def test_a_scope_holds_a_blockless_component_for_every_read_in_it(placed: Any) -
     """Read outside its forward (H3's turbo factors by the DiT's hooks), a component with no
     blocks binds whole per op; a scope's hold keeps it bound, so a read is a plain tensor."""
     module, model, residency, _ = placed
-    assert isinstance(module.weight, Placeholder)
+    assert isinstance(_weight(module), Placeholder)
     release = residency.hold(["identity", "absent"])
-    assert model.held == 1 and not isinstance(module.weight, Placeholder)
+    assert model.held == 1 and not isinstance(_weight(module), Placeholder)
     assert float((module.weight * 2).sum()) == 2.0
     release()
     gc.collect()
-    assert model.held == 0 and not residency.pins and isinstance(module.weight, Placeholder)
+    assert model.held == 0 and not residency.pins and isinstance(_weight(module), Placeholder)
+
+
+def _weight(module: Any) -> object:
+    """What `module.weight` reads now: binding swaps it under a narrowed attribute."""
+    return module.weight

@@ -99,10 +99,10 @@ def test_a_cancel_inside_a_task_group_ends_the_call_canceled(tmp_path: Path) -> 
         # Both tasks are running before the cancel arrives.
         seen: set[str] = set()
         while len(seen) < 2:
-            frame = channel.recv()
-            assert frame is not None
-            if frame.get("event") == "progress" and str(frame.get("stage", "")).startswith("task-"):
-                seen.add(frame["stage"])
+            got = channel.recv()
+            assert got is not None
+            if got.get("event") == "progress" and str(got.get("stage", "")).startswith("task-"):
+                seen.add(str(got["stage"]))
         time.sleep(0.1)
         channel.send({"cmd": "cancel", "request_id": "grouped"})
         reply = _reply(channel, "invoke", "grouped")

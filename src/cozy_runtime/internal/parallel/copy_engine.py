@@ -20,7 +20,7 @@ import math
 from collections.abc import Sequence
 from typing import Any
 
-from cozy_runtime.internal import streams
+from cozy_runtime.graphs import streams
 from cozy_runtime.internal.config import short_socket_directory
 
 #: The exchange the group formed with, by process group; absent: NCCL.

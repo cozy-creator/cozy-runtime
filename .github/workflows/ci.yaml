@@ -4,9 +4,12 @@ name: ci
 # Every gate runs even when another is red; the final checks job requires all of them.
 # Tests keep real process/cgroup isolation on independent runners. publish.yaml explicitly selects source-build or approved prebuilt release files.
 on:
+  # Docs-only changes run nothing; everything else runs every gate on free runners, cached.
   pull_request:
+    paths-ignore: ['**.md', 'docs/**', 'research/**', 'results/**', 'proofs/**']
   push:
     branches: [master]
+    paths-ignore: ['**.md', 'docs/**', 'research/**', 'results/**', 'proofs/**']
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || github.ref }}

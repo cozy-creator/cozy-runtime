@@ -13,7 +13,8 @@ from pathlib import Path
 from test_concurrent_attempts import Peer
 from test_executor_fork import _accept, _environment, _listener
 
-from cozy_runtime.internal import package_interface, work
+from cozy_runtime.author import _work as work
+from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.discovery import discover_installed
 
 APP = """
@@ -21,7 +22,7 @@ import time
 
 import msgspec
 from cozy_runtime.author import App, Context
-from cozy_runtime.internal import work
+from cozy_runtime.author import _work as work
 
 app = App()
 

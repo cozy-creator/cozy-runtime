@@ -270,7 +270,8 @@ def _nvfp4(values: np.ndarray) -> dict[str, Any]:
 
 def _decoded_nvfp4(stored: dict[str, Any]) -> np.ndarray:
     weight, scale, second = stored["weight"], stored["scale"], stored["scale_2"]
-    return nvfp4_values(torch, weight, scale.float(), second).numpy()
+    values: np.ndarray = nvfp4_values(torch, weight, scale.float(), second).numpy()
+    return values
 
 
 def test_only_a_canonical_nvfp4_weight_is_bakeable() -> None:
@@ -292,7 +293,12 @@ def test_an_nvfp4_bake_keeps_the_delta_on_the_kept_grid() -> None:
     assert all(torch.equal(zero[k].view(torch.uint8), before[k].view(torch.uint8)) for k in zero)
     base, delta = _decoded_nvfp4(before), (up.double() @ down.double()).numpy() * 0.3
     kept = {}
-    for rounding, grid in (("nearest", "keep"), ("stochastic", "keep"), ("stochastic", "refit")):
+    cells: tuple[tuple[lora_bake.Rounding, lora_bake.Grid], ...] = (
+        ("nearest", "keep"),
+        ("stochastic", "keep"),
+        ("stochastic", "refit"),
+    )
+    for rounding, grid in cells:
         stored, stats = _nvfp4(values), lora_bake.Stats()
         lora_bake.bake_nvfp4(
             torch,

@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import own_thread
@@ -35,7 +35,7 @@ type Opener[T] = Callable[[bool], T | None]
 @dataclass(slots=True)
 class _Slot:
     state: str  # opening | landed | ready | failed
-    value: Any = None
+    value: object = None
     error: Exception | None = None
 
 
@@ -55,7 +55,7 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
             if slot is not None and slot.state == "landed" and quiet:
                 slot.state = "ready"
                 LANDED[0] += 1
-            return slot.value if slot is not None and slot.state == "ready" else None
+            return cast("T", slot.value) if slot is not None and slot.state == "ready" else None
         slot = _SLOTS[name] = _Slot("opening")
     if quiet:
         try:
@@ -89,7 +89,7 @@ def wait[T](name: str, opener: Opener[T]) -> T:
     if slot.error is not None:
         raise slot.error
     if slot.state == "ready":
-        return slot.value  # type: ignore[no-any-return]
+        return cast("T", slot.value)
     try:
         value = opener(True)
         if value is None:
@@ -103,7 +103,7 @@ def wait[T](name: str, opener: Opener[T]) -> T:
     return value
 
 
-def _background(name: str, slot: _Slot, opener: Opener[Any]) -> None:
+def _background(name: str, slot: _Slot, opener: Opener[object]) -> None:
     own_thread()
     kernel_compile.told.set(False)  # no one waits for it
     try:
@@ -142,7 +142,7 @@ def opening(name: str) -> bool:
     return slot is not None and slot.state in ("opening", "landed")
 
 
-def served(prefix: str) -> list[Any]:
+def served(prefix: str) -> list[object]:
     """Every kernel serving here whose name starts with `prefix`."""
     with _LOCK:
         return [s.value for n, s in _SLOTS.items() if n.startswith(prefix) and s.state == "ready"]

@@ -44,7 +44,8 @@ from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree, work
+from cozy_runtime.author import _work as work
+from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
 #: function fills `staging` (an `object` file, a `site/` tree, or nothing when the artifact

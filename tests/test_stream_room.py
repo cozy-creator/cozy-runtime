@@ -20,7 +20,7 @@ pytest.importorskip("tensorfs")
 from tensorfs.varena import Ledger, cuts  # noqa: E402
 from tensorfs.varena.torch import LedgerGrant, Memory  # noqa: E402
 
-from cozy_runtime.internal import streams  # noqa: E402
+from cozy_runtime.graphs import streams  # noqa: E402
 
 pytestmark = pytest.mark.real_gpu
 
