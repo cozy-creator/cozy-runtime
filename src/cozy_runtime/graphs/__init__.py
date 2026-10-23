@@ -1,21 +1,22 @@
-"""CUDA graphs of declared-pure regions over retained virtual addresses.
+"""CUDA graphs of whole components over retained virtual addresses.
 
 Kernel choice is shipped. Runtime prepares memory, captures process-local addresses and
-replays; it neither times competing paths nor compiles kernels. Unsupported Python stays
-eager around safe regions. Nothing records on a request's path: a signature's calls run as
-written until the device is idle, when its region records on inputs of its layout if its eager
-calls were launch-bound (`capture_idle`); the next request replays. A placed component's
-regions are its pure subtrees that hold declared blocks, coarsest first (`regions.segments`):
-static inputs and outputs sit at those boundaries only. Every graph has its own static buffers
-in the component's one capture pool (`domain`). A cached binding owns virtual addresses only;
-its physical lease covers preparation through output copies, and a completion event orders
-reuse across execution streams.
+replays; it neither times competing paths nor compiles kernels. A component's region is its
+root call: one graph per signature, keyed by its inputs' layout, the values of the attributes
+its package declares steer its forward (`Model.__graph_keys__`), and the kernels serving
+(`LANDED`). A placed component that streams (no step hold) runs its root as written and graphs
+each declared block instead. Nothing records on a request's path: a signature's calls run as
+written until the device is idle, when it records on seeded inputs of its layout if its eager
+calls were launch-bound, its replay matches eager bit for bit and saves time, and recording
+changed no state of the model (`capture_idle`); the next request replays. Every graph has its
+own static buffers in the device's one capture pool (`domain`). A cached binding owns virtual
+addresses only; its physical lease covers preparation through output copies, and a completion
+event orders reuse across execution streams.
 """
 
 from __future__ import annotations
 
 import contextvars
-import enum
 import functools
 import math
 import sys
@@ -32,18 +33,15 @@ from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.graphs.regions import WRAPPERS, contract, reads, regions, safe, segments
 from cozy_runtime.internal import attention_ulysses
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
-#: The component root call in flight: a region's purity and structure are read once per pass.
-_PASS: contextvars.ContextVar[object | None] = contextvars.ContextVar("cozy_graphs_pass")
+#: The root of a streamed component running as written: its blocks are its regions meanwhile.
+_STREAMING: contextvars.ContextVar[object | None] = contextvars.ContextVar("cozy_graphs_streaming")
 #: The idle period recording on this thread (`capture_idle`): each region boundary checks it.
 _IDLE: contextvars.ContextVar[_Idle | None] = contextvars.ContextVar("cozy_graphs_idle")
-#: The queued signature whose eager call is running: the regions under it queue inside it.
-_INSIDE: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("cozy_graphs_inside")
 _PLAIN = (type(None), bool, int, float, str)
 #: graph owners beside the regions (the LM engine's decode steps), each its (snapshot, release)
 #: of a component root, registered by its module when a package imports it: a Runtime serving no
@@ -410,12 +408,14 @@ _RECORDERS: weakref.WeakKeyDictionary[Any, _Recorder] = weakref.WeakKeyDictionar
 #: each live graph output's address -> (its recording, its index among the outputs)
 _LENT: dict[int, tuple[weakref.ref[_Recording], int]] = {}
 _REGIONS: weakref.WeakKeyDictionary[Any, tuple[Any, str]] = weakref.WeakKeyDictionary()
-_DECLARED: weakref.WeakSet[Any] = weakref.WeakSet()
 _GAPS: weakref.WeakKeyDictionary[Any, str] = weakref.WeakKeyDictionary()
-#: each region's purity and structure, with the root call (pass) they were read in
-_CHECKED: weakref.WeakKeyDictionary[Any, tuple[object, bool, tuple[object, ...]]] = (
-    weakref.WeakKeyDictionary()
-)
+#: each component root's declared control-flow attributes (`Model.__graph_keys__`)
+_KEYS: weakref.WeakKeyDictionary[Any, tuple[str, ...]] = weakref.WeakKeyDictionary()
+#: each component root's plain attributes at its first call, until its second compares them
+_FIRST: weakref.WeakKeyDictionary[Any, dict[str, object] | None] = weakref.WeakKeyDictionary()
+#: per component, the undeclared plain attributes of its root that changed between its first two
+#: calls: each would key its graphs or steer its forward unseen (`task conform` fails on it)
+UNDECLARED: dict[str, set[str]] = {}
 _CLASSES: dict[type, type] = {}
 
 
@@ -514,39 +514,29 @@ class _Pending:
     spec: Any
     #: each argument leaf: a tensor's layout, or the plain value
     leaves: list[object]
-    #: the queued signature whose eager call it ran inside: once that records, this never runs
-    inside: _Pending | None
 
     def __call__(self) -> bool:
         return _capture_pending(self)
 
-    def captured(self) -> bool:
-        module = self.module()
-        recorder = _RECORDERS.get(module) if module is not None else None
-        return recorder is not None and self.key in recorder.recordings
-
 
 def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
-    """Install shipped pure regions, including the blocks of a streamed component."""
+    """Each component root is a region, keyed by the attributes the model declares steer it
+    (`__graph_keys__`: component -> attribute paths); a placed component's declared blocks are
+    regions while it streams."""
     skipped = set(getattr(type(model), "__uncaptured__", ()))
+    declared: Mapping[str, tuple[str, ...]] = getattr(type(model), "__graph_keys__", {})
     installed = []
     for name, root in roots.items():
         if name in skipped or not isinstance(root, torch.nn.Module):
             continue
+        _KEYS[root] = tuple(declared.get(name, ()))
         placed = PLACED.get(root)
         blocks = placed[0].graph_segments(placed[1]) if placed is not None else ()
-        candidates = segments(torch, root, blocks) if blocks else regions(torch, root)
-        for path, module in candidates:
-            _DECLARED.add(module)
+        for path, module in (("", root), *((p, root.get_submodule(p)) for p in blocks)):
             _REGIONS[module] = (weakref.ref(root), path)
             if not getattr(type(module), "_cozy_graphed", False):
                 module.__class__ = _graphed(torch, type(module))
             installed.append(f"{name}.{path}" if path else name)
-        if root not in _REGIONS:
-            # The root reports its explicit eager gap; eligible children still replay.
-            _REGIONS[root] = (weakref.ref(root), "")
-            if not getattr(type(root), "_cozy_graphed", False):
-                root.__class__ = _graphed(torch, type(root))
     return installed
 
 
@@ -569,7 +559,6 @@ def _graphed(torch: Any, cls: type) -> type:
                 "__qualname__": cls.__qualname__,
             },
         )
-        WRAPPERS[made] = cls
     return made
 
 
@@ -612,9 +601,7 @@ def release(torch: Any, root: Any) -> None:
                         entry.done.synchronize()
                 recorder.forget(torch)
         _REGIONS.pop(module, None)
-        _DECLARED.discard(module)
         _GAPS.pop(module, None)
-        _CHECKED.pop(module, None)
     for owner in shared:
         if not owner.recorders:  # the device's last component: its pool goes with it
             owner.drop_captures()
@@ -670,7 +657,7 @@ def describe(root: Any) -> dict[str, Any]:
     for module, (owner, path) in list(_REGIONS.items()):
         if owner() is not root:
             continue
-        answer["declared_regions"] += module in _DECLARED
+        answer["declared_regions"] += 1
         if module in _GAPS:
             gaps[path] = _GAPS[module]
         recorder = _RECORDERS.get(module)
@@ -777,53 +764,73 @@ def _unprepared(exc: BaseException) -> bool:
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
     if (idle := _IDLE.get(None)) is not None:
         idle.check()
+    region = _REGIONS.get(module)
+    if region is not None and not region[1]:
+        _watch(module)
     if (
-        BYPASS.get()
+        region is None  # a copy of a region's module: no region of its own
+        or BYPASS.get()
         or _WARMING.get()
         or not torch.cuda.is_available()
         or torch.cuda.is_current_stream_capturing()
     ):
         return call(module, *args, **kwargs)
-    region = _REGIONS.get(module)
-    if region is None:  # a copy of a region's module: no region of its own
-        return call(module, *args, **kwargs)
-    met = _RECORDERS.get(module)
-    if (
-        _INSIDE.get(None) is not None
-        and met is not None
-        and not met.recordings
-        and met.eager.submit_ms() is not None
-    ):
-        # Under a region running as written and queued to record whole, a region it holds is
-        # queued and measured once it has run twice: more calls would add only the dispatch
-        # (v14: ~1.1 ms a call, 106 a cold SDXL step). Should the enclosing one never record,
-        # the idle period judges this one on what it measured, and its replays dispatch.
-        return call(module, *args, **kwargs)
     placed = _placed(module)
     owner, path = region
+    if path and _STREAMING.get(None) is not owner():
+        return call(module, *args, **kwargs)  # its root's graph or eager run holds it
+    if (
+        not path
+        and placed is not None
+        and placed[0].graph_held(placed[1]) is None
+        and placed[0].graph_segments(placed[1])
+    ):  # it streams: it runs as written, its blocks replay
+        token = _STREAMING.set(module)
+        try:
+            return call(module, *args, **kwargs)
+        finally:
+            _STREAMING.reset(token)
     scope = placed[0].graph_pass(placed[1], path) if placed is not None else nullcontext()
-    token = _PASS.set(object()) if owner() is module else None
     began = time.perf_counter()
     try:
         with scope:
             return _region_call(torch, module, call, args, kwargs, placed)
     finally:
-        if token is not None:
-            _PASS.reset(token)
         if (recorder := _RECORDERS.get(module)) is not None:
             recorder.call_ms += (time.perf_counter() - began) * 1e3
+
+
+def _watch(root: Any) -> None:
+    """At a component root's second call: the undeclared plain attributes that changed since
+    its first (`UNDECLARED`), said once. A step counter set on the root each call keys every
+    call apart once declared, or steers a graph unseen when not: the package decides."""
+    if root in _FIRST and _FIRST[root] is None:
+        return
+    now = {name: value for name, value in vars(root).items() if type(value) in _PLAIN}
+    first = _FIRST.get(root)
+    _FIRST[root] = now if first is None else None
+    if first is None:
+        return
+    keys = {path.split(".")[0] for path in _KEYS.get(root, ())}
+    changed = {n for n in first.keys() | now.keys() if first.get(n) != now.get(n)} - keys
+    if changed:
+        placed = PLACED.get(root)
+        name = placed[1] if placed is not None else type(root).__name__
+        UNDECLARED.setdefault(name, set()).update(changed)
+        say(
+            f"undeclared:{id(root)}",
+            f"[graphs] component {name}'s root attributes {sorted(changed)} changed between its "
+            "first two calls: declare each that steers its forward in Model.__graph_keys__",
+        )
+        WARNINGS.append(
+            ("a component's undeclared state changed between calls", {"component": name})
+        )
 
 
 def _region_call(
     torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any, placed: Any
 ) -> Any:
     leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
-    stamp = _PASS.get(None)
-    checked = _CHECKED.get(module)
-    if checked is None or stamp is None or checked[0] is not stamp:
-        pure = safe(torch, module)
-        checked = _CHECKED[module] = (stamp, pure, _structure(torch, module) if pure else ())
-    _, pure, structure = checked
     why = (
         "with gradients"
         if torch.is_grad_enabled()
@@ -833,8 +840,6 @@ def _region_call(
         if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-        else "outside its purity contract"
-        if not pure
         else _unplain(torch, leaves)
     )
     if why:
@@ -855,7 +860,9 @@ def _region_call(
         )
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
-    key = (*_signature(torch, leaves, spec), structure, levels, addresses, autocast)
+    root = _REGIONS[module][0]()
+    declared = tuple(functools.reduce(getattr, p.split("."), root) for p in _KEYS.get(root, ()))
+    key = (*_signature(torch, leaves, spec), declared, levels, addresses, autocast)
     if recorder.last is not None and recorder.last != key:
         _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
     recorder.last = key
@@ -891,16 +898,9 @@ def _region_call(
                         else v
                         for v in leaves
                     ],
-                    _INSIDE.get(None),
                 )
                 IDLE.add(pending)
-            if pending is None:
-                return eager()
-            inside = _INSIDE.set(pending)
-            try:
-                return eager()
-            finally:
-                _INSIDE.reset(inside)
+            return eager()
         if recorder.waiting.get(key) == attempt:
             return eager()
         if placed is not None:
@@ -980,10 +980,6 @@ def _capture_pending(pending: _Pending) -> bool:
     recorder = _RECORDERS.get(module) if module is not None else None
     if recorder is None or recorder.queued.get(pending.key) is not pending:
         return True  # released, or its graphs dropped since it queued: its next call queues
-    if pending.inside is not None and pending.inside.captured():
-        del recorder.queued[pending.key]
-        recorder.failed[pending.key] = "inside a recorded region"
-        return True
     submit = recorder.eager.submit_ms()
     if submit is None:
         return False
@@ -1025,10 +1021,13 @@ def _record(
     # the exact capture pool; it does not time or select kernels, or run arbitrary package code.
     key, call, owner = pending.key, pending.call, recorder.domain
     assert owner is not None
-    current, stream = torch.cuda.current_stream(), None
+    current, stream, state = torch.cuda.current_stream(), None, None
     recorder.capture_attempts += 1
     began = time.perf_counter()
     try:
+        if why := _hooked(module):
+            recorder.judged[key] = why
+            return True
         if placed is not None and not placed[0].graph_accounted():
             _failed(module, recorder, key, "driver/context memory is unmeasured")
             return True
@@ -1052,6 +1051,7 @@ def _record(
                 if placed is not None
                 else torch.cuda.use_mem_pool(pool)
             )
+            state = _State(torch, module)
             with torch.cuda.stream(stream):
                 with allocating:
                     seeded = torch.Generator(device=current.device).manual_seed(_SEED)
@@ -1093,6 +1093,10 @@ def _record(
                 if graph is None:
                     _failed(module, recorder, key, why)
                     return True
+                if changed := state.restore():
+                    recorder.judged[key] = f"recording it changed the model's state: {changed}"
+                    graph.reset()
+                    return True
                 if not _clonable(torch, outputs[0]):
                     _failed(module, recorder, key, "captured output is not a tensor tree")
                     return True
@@ -1133,11 +1137,63 @@ def _record(
         _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
         return True
     finally:
+        if state is not None:
+            state.restore()
         recorder.capture_ms += (time.perf_counter() - began) * 1e3
         if stream is not None:
             # Warmup can queue reads before refusing an allocation. Join even the failure
             # path before the lease records its completion event.
             current.wait_stream(stream)
+
+
+def _hooked(module: Any) -> str:
+    """Why a component's forward is no graph: a package hook on one of its modules runs Python
+    at every call, which a replay would skip (varena's binds and Runtime's own are served)."""
+    for sub in module.modules():
+        for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
+            for hook in hooks.values():
+                if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
+                    return f"a package forward hook on {type(sub).__name__}"
+    return ""
+
+
+class _State:
+    """What an idle recording must leave as it found it: the component's modules' plain
+    attributes, its buffers (contents and version counters) and the RNG. Package
+    code may keep a counter or a table in them; recording runs the forward twice and captures
+    it once, so a change means the forward has state a replay would not keep (run 11226:
+    measuring must never change a later request)."""
+
+    def __init__(self, torch: Any, module: Any) -> None:
+        self.torch = torch
+        self.modules = list(module.modules())
+        self.plain = [{n: v for n, v in vars(m).items() if type(v) in _PLAIN} for m in self.modules]
+        self.buffers = [
+            (name, tensor, tensor._version, tensor.clone())
+            for m in self.modules
+            for name, tensor in m._buffers.items()
+            if tensor is not None
+        ]
+        self.rng = torch.random.get_rng_state(), torch.cuda.get_rng_state()
+        self.changed: str | None = None
+
+    def restore(self) -> str:
+        """Everything put back; the names that had changed ("" when none)."""
+        if self.changed is None:
+            changed = set()
+            for module, plain in zip(self.modules, self.plain, strict=True):
+                for name, value in plain.items():
+                    if vars(module).get(name, _EAGER) != value:
+                        changed.add(name)
+                        vars(module)[name] = value
+            for name, tensor, version, saved in self.buffers:
+                if tensor._version != version:
+                    changed.add(name)
+                    tensor.copy_(saved)
+            self.torch.random.set_rng_state(self.rng[0])
+            self.torch.cuda.set_rng_state(self.rng[1])
+            self.changed = ", ".join(sorted(changed))
+        return self.changed
 
 
 def _no_gain(torch: Any, entry: _Recording, root: bool, eager: float | None) -> str:
@@ -1295,7 +1351,7 @@ def _changed(
                 ("a graph region records again every call", {"region": path, "argument": name})
             )
     else:
-        names = ("structure", "cut levels", "weight addresses", "autocast")
+        names = ("declared keys", "cut levels", "weight addresses", "autocast")
         what = next(n for n, i in zip(names, range(-4, 0), strict=True) if last[i] != key[i])
     recorder.changes[what] = recorder.changes.get(what, 0) + 1
 
@@ -1318,43 +1374,6 @@ def _clonable(torch: Any, out: Any) -> bool:
     leaves = torch.utils._pytree.tree_leaves(out)
     return any(isinstance(v, torch.Tensor) for v in leaves) and all(
         type(v) in (torch.Tensor, torch.nn.Parameter) or type(v) in _PLAIN for v in leaves
-    )
-
-
-def _structure(torch: Any, module: Any) -> tuple[object, ...]:
-    """The code each module runs and the plain values its contract can read (the names the
-    region's contract code and attention processors name), in attribute order (a reordering
-    only records again). A value only package code names (a step counter) keys nothing."""
-    kinds = (torch.dtype, torch.device, enum.Enum)
-    modules = list(module.modules())
-    processors = [p for m in modules if (p := vars(m).get("processor")) is not None]
-    stop = torch.nn.Module
-    names = frozenset().union(
-        *(reads(c, stop) for c in {contract(type(m)) for m in modules}),
-        *(reads(c, object) for c in {type(p) for p in processors}),
-    )
-
-    def plain(owner: object) -> tuple[object, ...]:
-        return tuple(
-            value
-            for name, value in vars(owner).items()
-            if name in names
-            and (
-                type(value) in _PLAIN
-                or isinstance(value, kinds)
-                or (type(value) is tuple and all(type(item) in _PLAIN for item in value))
-            )
-        )
-
-    return tuple(
-        (
-            id(type(m).forward),
-            id(vars(m).get("forward")),
-            id(vars(m).get("_cozy_forward")),
-            plain(m),
-            (type(p), plain(p)) if (p := vars(m).get("processor")) is not None else None,
-        )
-        for m in modules
     )
 
 
