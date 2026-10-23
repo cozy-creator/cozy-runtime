@@ -1396,7 +1396,11 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
         )
     docs: dict[str, dict[str, Json]] = {}
     modules = reader.reachable(entry)
-    for registration in _registrations(reader, modules, app):
+    recipes = _recipes(reader, modules)
+    registrations = _registrations(reader, modules, app)
+    if recipes:
+        registrations.append(_recipes_registration(reader, recipes))
+    for registration in registrations:
         if registration.name in docs:
             reader.refuse(
                 registration.module,
@@ -1415,15 +1419,6 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
             if identity is not None:
                 declared["operation_identity"] = identity
         docs[registration.name] = doc
-    recipes = _recipes(reader, modules)
-    if recipes:
-        if RECIPES_ENTRYPOINT in docs:
-            raise StaticRefusal(
-                f"{application}: a package with recipes serves them as {RECIPES_ENTRYPOINT!r}; "
-                "rename its own function of that name",
-                code="static_unsupported",
-            )
-        docs[RECIPES_ENTRYPOINT] = _recipes_entrypoint(reader, recipes, installed=installed)
     return package_interface.assemble(
         application, list(docs.values()), installed=installed, recipes=recipes
     )
@@ -1469,25 +1464,16 @@ def _recipes(reader: Reader, modules: Sequence[Module]) -> list[dict[str, Json]]
     return rows
 
 
-def _recipes_entrypoint(
-    reader: Reader, recipes: Sequence[dict[str, Json]], *, installed: bool
-) -> dict[str, Json]:
+def _recipes_registration(reader: Reader, recipes: Sequence[dict[str, Json]]) -> Registration:
     """The Runtime's `quantize` (`cozy_runtime.derive.recipes`), read from its source, writing
-    the lanes of `recipes`."""
+    the lanes of `recipes`: a package with recipes registers it as its own."""
     runtime = reader.module("cozy_runtime.derive.recipes")
     function = runtime.bindings[RECIPES_ENTRYPOINT]
     assert isinstance(function, ast.AsyncFunctionDef)
     found = _registration(reader, runtime, function, "entrypoint", ())
     assert found is not None
     lanes = outputs(str(row["lane"]) for row in recipes)
-    registration = replace(found, weights=lanes, accelerator=False)
-    doc = _callable(reader, registration)
-    declared = doc.get("invocable")
-    if installed and isinstance(declared, dict):
-        identity = _operation_identity(reader, registration)
-        if identity is not None:
-            declared["operation_identity"] = identity
-    return doc
+    return replace(found, weights=lanes, accelerator=False)
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:

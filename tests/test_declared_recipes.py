@@ -180,7 +180,7 @@ def test_quantize_writes_the_recipes_lane_with_its_provenance(
             {"unet": {"a.weight": (8, 256), "q.weight": (8, 256), "z.weight": (8, 256)}},
             "int8",
             "recipe_ambiguous",
-            "int8, int8_q all write int8 from this checkpoint",
+            "2 of acme/tiny-recipes's int8 recipes (int8, int8_q) select from this checkpoint",
         ),
     ],
 )

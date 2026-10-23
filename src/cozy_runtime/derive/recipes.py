@@ -37,7 +37,7 @@ from cozy_runtime.author._recipes import (
     fingerprint,
     outputs,
 )
-from cozy_runtime.weights_store import Checkpoint, Derivation, Output
+from cozy_runtime.weights_store import Checkpoint
 
 from .operations import quantize_into, select_into
 from .quantization import source_rows
@@ -67,51 +67,18 @@ async def quantize(
     recipe: str = "",
     tel: Telemetry,
 ) -> ModelArtifact:
-    """The package's recipe that writes `lane` (or the one named `recipe`) from `source`."""
-    return run(
-        ctx, tel, ctx._recipes, source, lane=lane, recipe=recipe, package=package, release=release
-    )
-
-
-def register(app: App, declared: Sequence[DeclaredRecipe]) -> None:
-    """Serve `declared` from `app` as its `quantize` entrypoint (once)."""
-    if any(registered.name == ENTRYPOINT for registered in app.registrations()):
-        return
-    lanes = outputs(row.lane for row in declared)
-    app.entrypoint(quantize, name=ENTRYPOINT, weights=lanes, accelerator=False)
-
-
-def run(
-    ctx: Context,
-    tel: Telemetry,
-    declared: Sequence[DeclaredRecipe],
-    source: Weights[Any],
-    *,
-    lane: str,
-    recipe: str,
-    package: str,
-    release: str,
-) -> ModelArtifact:
+    """The package's recipe that writes `lane` (or the one named `recipe`) from `source`; the
+    lane's header records it (`provenance`)."""
     opened = ctx.tensorfs_source(source)
-    row, plan = choose(declared, opened, lane=lane, recipe=recipe, package=package)
+    row, plan = choose(ctx._recipes, opened, lane=lane, recipe=recipe, package=package)
     form = canonical(plan)
     digest = fingerprint(form, package, release)
-    provenance: dict[str, object] = {
-        "package": package,
-        "release": release,
-        "recipe": row.name,
-        "fingerprint": digest,
-        "source": opened.id,
-        "plan": form,
-    }
+    provenance = {"package": package, "release": release, "recipe": row.name,
+                  "fingerprint": digest, "source": opened.id, "plan": form}  # fmt: skip
     opener = ctx._tensorfs_output
     if opener is None:
         raise UnsupportedInput("this attempt writes no weights", code="weights_output_ungranted")
-
-    def recorded(slot: str, derivation: Derivation) -> Output:
-        return opener(slot, replace(derivation, provenance=provenance))
-
-    ctx._tensorfs_output = recorded
+    ctx._tensorfs_output = lambda slot, made: opener(slot, replace(made, provenance=provenance))
     tel.log("recipe", recipe=row.name, lane=row.lane, fingerprint=digest)
     try:
         if isinstance(plan, QuantizationPlan):
@@ -121,6 +88,14 @@ def run(
         return plan.function(ctx, tel, source, row.lane)
     finally:
         ctx._tensorfs_output = opener
+
+
+def register(app: App, declared: Sequence[DeclaredRecipe]) -> None:
+    """Serve `declared` from `app` as its `quantize` entrypoint (once)."""
+    if any(registered.name == ENTRYPOINT for registered in app.registrations()):
+        return
+    lanes = outputs(row.lane for row in declared)
+    app.entrypoint(quantize, name=ENTRYPOINT, weights=lanes, accelerator=False)
 
 
 def choose(
@@ -156,19 +131,14 @@ def choose(
         )
     found = [(row, (plan or declared_plan)(row)) for row in reads]
     if len(found) > 1:
-        fitting = [(row, plan) for row, plan in found if fits(source, plan)]
-        names = ", ".join(row.name for row, _ in fitting or found)
-        if not fitting:
-            raise UnsupportedInput(
-                f"none of {package}'s {lane} recipes ({names}) selects from this checkpoint",
-                code="recipe_source",
-            )
-        if len(fitting) > 1:
-            raise UnsupportedInput(
-                f"{names} all write {lane} from this checkpoint; name one with recipe=",
-                code="recipe_ambiguous",
-            )
-        found = fitting
+        found = [(row, plan) for row, plan in found if fits(source, plan)]
+    if len(found) != 1:
+        names = ", ".join(row.name for row in reads)
+        raise UnsupportedInput(
+            f"{len(found)} of {package}'s {lane} recipes ({names}) select from this checkpoint; "
+            "name one with recipe=",
+            code="recipe_ambiguous",
+        )
     return found[0]
 
 
@@ -188,12 +158,11 @@ def fits(source: Checkpoint, plan: Plan) -> bool:
     """Whether every pattern and key of `plan` names a weight of `source`."""
     if isinstance(plan, DerivationHook):
         return True
-    names = [f"{component}.{key}" for component, key, _ in source_rows(source)]
-    if isinstance(plan, SelectionPlan):
-        return all(any(fnmatch.fnmatchcase(n, rule) for n in names) for rule in plan.include)
-    if not set(plan.components) <= set(source.components):
-        return False
-    selected = [n for n in names if n.partition(".")[0] in plan.components]
-    return all(
-        any(fnmatch.fnmatchcase(n, rule) for n in selected) for rule in plan.include
-    ) and all(f"{c}.{key}" in names for c in plan.components for key in plan.keys)
+    within = plan.components if isinstance(plan, QuantizationPlan) else source.components
+    names = [f"{c}.{key}" for c, key, _ in source_rows(source) if c in within]
+    keys = plan.keys if isinstance(plan, QuantizationPlan) else ()
+    return (
+        set(within) <= set(source.components)
+        and all(any(fnmatch.fnmatchcase(n, rule) for n in names) for rule in plan.include)
+        and all(f"{c}.{key}" in names for c in within for key in keys)
+    )
