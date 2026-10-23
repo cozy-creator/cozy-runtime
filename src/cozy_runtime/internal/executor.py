@@ -67,6 +67,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import tensorfs
 from msgspec import UNSET, UnsetType
+from tensorfs.varena import VarenaError
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -683,6 +684,17 @@ class _CompositeResidency:
         }
 
 
+def _construction_record(facts: Mapping[str, Any]) -> dict[str, Any]:
+    """A prepare's run-record entry: when it ended, how long it took and its legs."""
+    return {
+        "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
+        "prepare_ms": float(facts.get("prepare_ms", 0)),
+        "fill_ms": float(facts.get("fill_ms", 0)),
+        "warm_ms": float(facts.get("warm_ms", 0)),
+        "legs_ms": dict(facts.get("stages") or ()),
+    }
+
+
 class _OnDemand:
     """An `on_demand=` model argument: built, and its weights fetched, when the function first
     reads it. Until then the runtime's probes see no model, and a request that never reads it
@@ -819,6 +831,8 @@ class Executor:
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
         self.on_demand: frozenset[str] = frozenset()
+        #: each on-demand model built so far, by parameter: its prepare facts (the run record's)
+        self.built_on_demand: dict[str, dict[str, Any]] = {}
         self.active = ""
         self.started = False
         #: torch, the Runtime and the package are imported (`Start.import_only`); no device yet
@@ -1033,7 +1047,10 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
-        self._open_memory(torch)  # before torch's context, so varena measures its own
+        try:
+            self._open_memory(torch)  # before torch's context, so varena measures its own
+        except VarenaError as exc:  # its torch allocator will not load, or TensorD refused it
+            return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
@@ -1122,13 +1139,9 @@ class Executor:
                 for m in self.model_executors or [self]
                 for k, v in m.plan_reports.items()
             },
-            "construction": {
-                "prepared_unix_ms": int(facts.get("prepared_unix_ms", 0)),
-                "prepare_ms": float(facts.get("prepare_ms", 0)),
-                "fill_ms": float(facts.get("fill_ms", 0)),
-                "warm_ms": float(facts.get("warm_ms", 0)),
-                "legs_ms": dict(facts.get("stages") or ()),
-            },
+            "construction": _construction_record(facts),
+            # Each on-demand model's build, made inside the stage that first read it.
+            "on_demand": {p: _construction_record(f) for p, f in self.built_on_demand.items()},
         }
 
     def _rank_device(self, torch: Any) -> Any:
@@ -3013,6 +3026,7 @@ class Executor:
             detail = f"model {parameter} refused: {reply.get('detail', '')}"
             raise RuntimeFailure(detail[:900], code=str(reply.get("code") or "runtime_failure"))
         member.load_reply = reply
+        self.built_on_demand[parameter] = member.facts
         self.torch = self.torch or member.torch
         if member.residency is not None:
             self.residency.rows[parameter] = member.residency
@@ -4292,7 +4306,13 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
+            functools.partial(self._yielding, request_id),
         )
+
+    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
+        """A wait on a child call: the attempt's step pages are taken before the child's."""
+        request = self.requests.get(request_id)
+        return request.yielding() if request is not None else contextlib.nullcontext()
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:

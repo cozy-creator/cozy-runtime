@@ -11,7 +11,7 @@ reduction (`head_local=False`) is registered without context parallelism.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol, TypedDict
@@ -71,7 +71,7 @@ _MEMBERS: dict[str, AttentionBackendName] = {}
 
 class Execution(Protocol):
     """The execution layer's side (`internal.execution`, installed with the memory): the
-    attention cut, the pass's agreed exchange level, and a collective's extent."""
+    attention cut, the pass's agreed exchange level and its exchanged sizes."""
 
     def attend(
         self,
@@ -88,8 +88,6 @@ class Execution(Protocol):
     def agreed(self) -> int: ...
 
     def sizes(self, gather: Callable[[], list[int]]) -> list[int]: ...
-
-    def collective(self, site: str, finest: int) -> AbstractContextManager[None]: ...
 
 
 _EXECUTION: Execution | None = None
