@@ -36,7 +36,7 @@ class PreparedModel(SyntheticModel):
 
 
 class PreparedComponent:
-    def state_dict(self) -> dict[str, object]:
+    def state_dict(self, *, keep_vars: bool = False) -> dict[str, object]:
         return {}
 
 

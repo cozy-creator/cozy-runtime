@@ -34,7 +34,7 @@ class Reply(msgspec.Struct):
 
 
 class Component:
-    def state_dict(self) -> Mapping[str, object]:
+    def state_dict(self, *, keep_vars: bool = False) -> Mapping[str, object]:
         return {}
 
     def __call__(self) -> str:
