@@ -49,7 +49,7 @@ from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
-from cozy_runtime.internal import attention_ulysses, module_state, streams
+from cozy_runtime.internal import attention_ulysses, module_state, streams, work
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
@@ -125,6 +125,7 @@ class _Recording:
             if static is not None:
                 static.copy_(value)
         self.graph.replay()
+        work.done += 1
         for backend, implementation in self.served:
             attention_ulysses.record(backend, implementation)
         tensor = self.torch.Tensor

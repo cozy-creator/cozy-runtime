@@ -49,7 +49,7 @@ from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, capture, say
-from cozy_runtime.internal import streams
+from cozy_runtime.internal import streams, work
 from cozy_runtime.lm import _kernels
 
 try:
@@ -1155,6 +1155,7 @@ class _Engine:
         run(size)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
+        work.done += 1
         for request in {id(row.request): row.request for row in rows}.values():
             request.steps += 1
             request.live += len(rows)

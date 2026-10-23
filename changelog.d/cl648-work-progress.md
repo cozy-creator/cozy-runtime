@@ -1,0 +1,1 @@
+A call's work is told to its machine once a second while it moves (`kind: work` progress frames): construction legs, graph replays, LM decode steps, a kernel build the call waits on, and the blocks varena binds. A machine that judges a call without its CPU (cl-648) sees a slow phase working.
