@@ -648,7 +648,7 @@ def device_identity(torch: Any, kind: str, index: int = 0) -> dict[str, Any]:
     the SELECTED device index. Both ride the key.
     """
     if kind == "mps":
-        # Apple's GPU is the chip's; its "driver" is the macOS release (bf16 needs 14).
+        # Apple's GPU is the chip's; its "driver" is the macOS release.
         return {
             "name": apple_chip(),
             "sm": 0,
@@ -719,15 +719,18 @@ def hold_pool(torch: ModuleType, cap: int) -> None:
     )
 
 
-def unified_budget(torch: ModuleType) -> int:
-    """The bytes one unified-memory process may hold: Metal's recommended working set, within
-    physical RAM less what the system keeps, and within what it holds plus what the system has
-    available now (shared mode follows memory pressure: past it, macOS swaps)."""
+def unified_ceiling(torch: ModuleType) -> int:
+    """The most one unified-memory process may ever hold: Metal's recommended working set,
+    within physical RAM less what the system keeps."""
     ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    return max(min(int(torch.mps.recommended_max_memory()), ram - HOST_RESERVE), 0)
+
+
+def unified_budget(torch: ModuleType) -> int:
+    """What it may hold now: the ceiling, within what it holds plus what the system has
+    available (shared mode follows memory pressure: past it, macOS swaps)."""
     held = int(torch.mps.driver_allocated_memory())
-    return max(
-        min(int(torch.mps.recommended_max_memory()), ram - HOST_RESERVE, held + _available()), 0
-    )
+    return max(min(unified_ceiling(torch), held + _available()), 0)
 
 
 class _VmStatistics64(ctypes.Structure):
@@ -763,14 +766,6 @@ def _available() -> int:
     return pages * os.sysconf("SC_PAGE_SIZE")
 
 
-def bf16_supported(kind: str) -> bool:
-    """Whether the backend computes bfloat16: MPS does from macOS 14 on."""
-    if kind != "mps":
-        return True
-    major = platform.mac_ver()[0].partition(".")[0]
-    return major.isdigit() and int(major) >= 14
-
-
 def apple_chip() -> str:
     """The Apple chip's own name (`Apple M4 Pro`), or `apple` where sysctl says nothing."""
     with suppress(OSError, subprocess.SubprocessError):
@@ -788,7 +783,7 @@ def apple_chip() -> str:
 #: What a backend serves without, and what serves instead: one run warning each.
 UNAVAILABLE: dict[str, tuple[tuple[str, str], ...]] = {
     "mps": (
-        ("weight plane GPU and pinned tiers", "weights are read from the page cache"),
+        ("weight plane GPU and pinned tiers", "every weight is copied to the GPU once and stays"),
         ("native CUDA kernels and Triton", "PyTorch's own MPS kernels"),
         ("fp8 and nvfp4 lanes", "16-bit weights"),
         ("custom attention kernels", "PyTorch SDPA"),
