@@ -34,6 +34,7 @@ from cozy_runtime.internal import (
     executor,
     kernel_cache,
     kernel_compile,
+    kernel_ready,
     kernel_sources,
     liveness,
     package_interface,
@@ -100,22 +101,27 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[kernel_ca
     monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
     monkeypatch.setitem(attention.BY_NAME, "tiny", TINY)
     monkeypatch.setitem(attention.DENSE, "", {16: ("tiny",)})
-    for table in ("_READY", "_BROKEN", "_STATES"):
-        monkeypatch.setattr(attention, table, {})
+    monkeypatch.setattr(attention, "_STATES", {})
     # Tests in one second build the same wheel, so the same key: each has its own builders.
     monkeypatch.setattr(kernel_compile, "_STARTED", {})
     found = kernel_cache.Store(tmp_path / "u1")
     monkeypatch.setattr(kernel_cache, "_MACHINE_STORE", [found])
     path = list(sys.path)
     yield found
+    for opening in threading.enumerate():  # an opener ending later would import its build
+        if opening.name.startswith(kernel_ready.THREAD):
+            opening.join(30)
     sys.path[:] = path
     sys.modules.pop("tiny_kernel", None)
     importlib.invalidate_caches()
 
 
-def _built(store: kernel_cache.Store, job: kernel_compile.Job) -> None:
+def _built(store: kernel_cache.Store, job: kernel_compile.Job, opened: bool = True) -> None:
+    """The build ends, and when `opened`, the kernel's opener off the request (`kernel_ready`)."""
     kernel_compile.submit(store, job)  # nobody builds it now: this starts the build
     while kernel_compile.status(store, job).state != "ready":
+        time.sleep(kernel_compile.POLL_SECONDS)
+    while opened and kernel_ready._SLOTS[attention._slot("tiny", CPU)].state == "opening":
         time.sleep(kernel_compile.POLL_SECONDS)
 
 
@@ -277,12 +283,14 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNam
     sys.modules.pop("steps_fixture", None)
 
 
-def _finisher(store: kernel_cache.Store, job: kernel_compile.Job, lock: int, builder: Any) -> Any:
+def _finisher(
+    store: kernel_cache.Store, job: kernel_compile.Job, lock: int, builder: Any, opened: bool = True
+) -> Any:
     def finish() -> None:  # the build that was running ends; the real builder takes the key
         os.close(lock)
         builder.kill()
         builder.wait()
-        _built(store, job)
+        _built(store, job, opened)
 
     return finish
 
@@ -434,7 +442,7 @@ def test_a_cancel_ends_an_override_waiting_for_its_compile_at_once_and_the_build
         assert builder.poll() is None and kernel_compile.status(store, job).state == "compiling"
         assert not host.held, reply
         monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
-        _finisher(store, job, lock, builder)()
+        _finisher(store, job, lock, builder, opened=False)()  # its opener polls hourly here
         assert host.run("later", "tiny")["observed"] == "tiny"
         assert host.held == [TINY_SITES] * 4
 

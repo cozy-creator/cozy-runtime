@@ -17,6 +17,7 @@ from cozy_runtime.internal import (
     arch,
     attention,
     kernel_cache,
+    kernel_ready,
     kernel_sources,
     machine_kernels,
     prebuilt,
@@ -347,12 +348,10 @@ def test_bits_16_puts_every_site_at_level_16_for_the_request() -> None:
     attention.install(ready, roots, device=_cuda(90), bits=8)
     prepared = attention.snapshot(roots)
     assert attention.observed(roots).totals() == {"sageattention": 1}
-    attention._READY.update({(entry.name, _cuda(90)): entry for entry in ready})
-    try:
-        swap = attention.plan(_cuda(90), roots, attention.EXACT)
-        with attention.override(prepared, roots, swap, attention.EXACT) as served:
-            assert served.totals() == {"flash-attn3": 1} and served.pin == "exact"
-    finally:
-        for entry in ready:
-            attention._READY.pop((entry.name, _cuda(90)), None)
+    for entry in ready:
+        slot = kernel_ready._Slot("ready", entry)
+        kernel_ready._SLOTS[attention._slot(entry.name, _cuda(90))] = slot
+    swap = attention.plan(_cuda(90), roots, attention.EXACT)
+    with attention.override(prepared, roots, swap, attention.EXACT) as served:
+        assert served.totals() == {"flash-attn3": 1} and served.pin == "exact"
     assert attention.observed(roots).totals() == {"sageattention": 1}

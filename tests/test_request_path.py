@@ -185,14 +185,13 @@ def test_the_known_violations_are_exactly_cr_210s_two_captures_each_marked_where
     assert marked == [(site, site) for site in sorted(request_path.KNOWN)]
 
 
-#: Functions that wait for a kernel's build or run its self-check outside a `kernel_ready`
-#: opener, which runs off the request thread. Each cr-217 line leaves this list as it lands.
+#: Functions that wait for a kernel's build or run its self-check where a request may call them:
+#: not only ever reached from a `kernel_ready` opener, which runs off the request thread. Each
+#: cr-217 line leaves this list as it lands.
 WAITING = {
-    "cozy_runtime.internal.attention._compiled": "cr-217 attention candidates; a pin waits",
-    "cozy_runtime.internal.attention._launch": "cr-217 step-boundary upgrade",
     "cozy_runtime.internal.lora_bake._ready": "cr-217 LoRA bake",
     "cozy_runtime.internal.machine_kernels.main": "the machine's kernel boot, its own process",
-    "cozy_runtime.internal.prebuilt.fa3": "cr-217 step-boundary upgrade",
+    "cozy_runtime.internal.prebuilt.fa3": "the conformance CLI",
     "cozy_runtime.internal.prebuilt.library": "cr-217 first-GEMM self-checks",
     "cozy_runtime.internal.triton_kernels.load": "cr-217 Triton kernels",
     "cozy_runtime.internal.w4a8_linear.native": "cr-217 first-GEMM self-checks",
@@ -200,12 +199,23 @@ WAITING = {
 
 
 class _Waits(ast.NodeVisitor):
-    """One module's functions that wait for a build or self-check, and its openers."""
+    """One module's functions that wait for a build or self-check, its openers, and each of its
+    functions' callees by qualified name."""
 
-    def __init__(self, module: str) -> None:
+    def __init__(self, module: str, tree: ast.Module) -> None:
         self.module, self.scope = module, [module]
+        self.names = {n.name: module for n in tree.body if isinstance(n, ast.FunctionDef)}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.module:
+                self.names.update({a.asname or a.name: node.module for a in node.names})
         self.sites: set[str] = set()
         self.openers: set[str] = set()
+        self.calls: dict[str, set[str]] = {}
+
+    def resolve(self, node: ast.expr) -> str:
+        name = _dotted(node)
+        head = name.partition(".")[0]
+        return f"{self.names[head]}.{name}" if head in self.names else name
 
     def _def(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
         self.scope.append(node.name)
@@ -215,14 +225,15 @@ class _Waits(ast.NodeVisitor):
     visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _def
 
     def visit_Call(self, node: ast.Call) -> None:
-        name, here = _dotted(node.func), ".".join(self.scope)
-        if name.endswith("kernel_ready.ready") and len(node.args) == 2:
+        name, here = self.resolve(node.func), ".".join(self.scope)
+        self.calls.setdefault(here, set()).add(name)
+        if name.endswith(("kernel_ready.ready", "kernel_ready.wait")) and len(node.args) == 2:
             opener = node.args[1]
             if isinstance(opener, ast.Call) and _dotted(opener.func).endswith("partial"):
                 opener = opener.args[0]
-            self.openers.add(f"{self.module}.{_dotted(opener)}")
+            self.openers.add(self.resolve(opener))
         waits = name.endswith(("kernel_compile.wait", "verify.verified"))
-        if name == "request_path.forbid" and node.args:
+        if name.endswith("request_path.forbid") and node.args:
             waits |= "build wait" in ast.unparse(node.args[0])
         if waits and here != "cozy_runtime.internal.kernel_compile.wait":
             self.sites.add(here)
@@ -232,14 +243,30 @@ class _Waits(ast.NodeVisitor):
 def test_build_waits_and_self_checks_run_in_openers_or_a_named_site() -> None:
     sites: set[str] = set()
     openers: set[str] = set()
+    callers: dict[str, set[str]] = {}
     for path in sorted(SRC.rglob("*.py")):
         parts = path.relative_to(SRC.parent).with_suffix("").parts
-        scan = _Waits(".".join(parts[:-1] if parts[-1] == "__init__" else parts))
-        scan.visit(ast.parse(path.read_text()))
+        tree = ast.parse(path.read_text())
+        scan = _Waits(".".join(parts[:-1] if parts[-1] == "__init__" else parts), tree)
+        scan.visit(tree)
         sites |= scan.sites
         openers |= scan.openers
-    assert "cozy_runtime.internal.attention_sol._open" in openers
-    assert sorted(sites - openers) == sorted(WAITING)
+        for caller, callees in scan.calls.items():
+            for callee in callees:
+                callers.setdefault(callee, set()).add(caller)
+
+    def opened(function: str, seen: frozenset[str] = frozenset()) -> bool:
+        """Only ever reached from an opener."""
+        if function in openers:
+            return True
+        found = callers.get(function, set())
+        return bool(found) and all(c not in seen and opened(c, seen | {c}) for c in found)
+
+    assert {
+        "cozy_runtime.internal.attention._open",
+        "cozy_runtime.internal.attention_sol._open",
+    } <= openers
+    assert sorted(site for site in sites if not opened(site)) == sorted(WAITING)
 
 
 MODULE = "request_path_fixture"

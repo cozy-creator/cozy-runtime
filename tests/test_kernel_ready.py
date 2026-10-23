@@ -104,7 +104,6 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleName
     monkeypatch.setattr(liveness, "SAMPLE_SECONDS", 0.05)
     monkeypatch.setattr(kernel_compile, "POLL_SECONDS", 0.01)
     monkeypatch.setattr(kernel_compile, "_STARTED", {})
-    monkeypatch.setattr(kernel_ready, "_SLOTS", {})
     monkeypatch.setattr(attention_sol, "_SUBMITTED", set())
     for name in ("_card", "_capability"):
         monkeypatch.setattr(attention_sol, name, lambda device: (9, 0))

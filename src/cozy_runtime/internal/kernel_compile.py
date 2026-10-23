@@ -123,8 +123,9 @@ _GUARD = threading.Lock()
 #: How often a wait reads the state it waits on: resolution, never a verdict.
 POLL_SECONDS = 0.5
 #: Told the state a wait reads, each sample, named for its waiter: an executor reports it to
-#: its machine as the run's progress.
+#: its machine as the run's progress. A wait off every request (`kernel_ready`) is not `told`.
 waiting: Callable[[State], None] | None = None
+told: ContextVar[bool] = ContextVar("cozy_compile_told", default=True)
 
 
 def _sleep(seconds: float) -> bool:
@@ -204,7 +205,7 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
             now = time.monotonic()
             if now - sampled >= liveness.SAMPLE_SECONDS:
                 sampled = now
-                if waiting is not None:
+                if waiting is not None and told.get():
                     waiting(replace(state, kernel=name))
                 pace.observe(_activity(store), now)
                 if pace.wedged(liveness.noise_floor(), now):

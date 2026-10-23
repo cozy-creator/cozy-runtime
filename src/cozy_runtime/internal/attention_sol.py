@@ -605,7 +605,8 @@ def _ready(tokens: int, device: Device, step: int) -> tuple[Loaded | None, str]:
         word = "served"
     elif why := kernel_ready.failed(name):
         if word != "failed":
-            _kernel_row(_row(tokens, found, "failed", started, step=step, state=why))
+            state = f"{type(why).__name__}: {why}"[:300]
+            _kernel_row(_row(tokens, found, "failed", started, step=step, state=state))
         word = "failed"
     elif word != "building":
         _kernel_row(_row(tokens, found, "building", started, step=step))
