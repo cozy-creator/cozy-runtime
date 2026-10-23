@@ -106,8 +106,10 @@ class ImageResult(msgspec.Struct):
 def held[T: (int, float)](
     adj: Adjustments, field: str, requested: T, low: T, high: T, reason: str = "the model's range"
 ) -> T:
-    """`requested` inside `low`..`high`; a value that had to move is a `clamp` row."""
+    """`requested` inside `low`..`high`; a value that had to move is a `clamp` row (a float shown to
+    three decimals)."""
     applied = min(max(requested, low), high)
     if applied != requested:
-        adj.clamp(field, requested, applied, reason)
+        shown = round(requested, 3) if isinstance(requested, float) else requested
+        adj.clamp(field, shown, applied, reason)
     return applied
