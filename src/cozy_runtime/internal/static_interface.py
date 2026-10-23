@@ -10,8 +10,7 @@ evaluator over literal and arithmetic nodes and values of the package's committe
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
 `Annotated`, cozy-runtime's own asset, marker and service classes. Rendering is then
 `schema.render`, the SAME renderer the import path uses, so the two derivations cannot drift
-by construction. `checks/architecture.py`'s `static-describe-executes-nothing` fence holds
-this module's import list to that.
+by construction.
 
 Anything outside the closed vocabulary — a name bound to no definition in the tree, a
 computed value (call, comprehension, unknown attribute) in an interface position, a dynamic
@@ -57,6 +56,7 @@ from cozy_runtime.author._model import (
     Model,
     attention_bits,
     closed,
+    coverage_patterns,
 )
 from cozy_runtime.author._model_defaults import (
     check_model_arguments,
@@ -64,6 +64,8 @@ from cozy_runtime.author._model_defaults import (
     model_defaults,
     model_on_demand,
 )
+from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
+from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
 from cozy_runtime.author._script_metadata import (
     Unfolded,
     byte_parameter,
@@ -192,6 +194,10 @@ _VOCAB_MODULES = {
 _TRUSTED_ROOTS = ("cozy_runtime.derive",)
 
 
+def _author_structs() -> tuple[str, ...]:
+    return tuple(f"author.{name}" for name in _AUTHOR_STRUCTS)
+
+
 def _trusted_module(name: str) -> bool:
     return any(name == root or name.startswith(root + ".") for root in _TRUSTED_ROOTS)
 
@@ -230,8 +236,18 @@ _AUTHOR_TYPES = (
     "Assets",
     "Settings",
     "Secrets",
+    "QuantizationPlan",
+    "SelectionPlan",
+    "EncodingRule",
+    "ImageRequest",
+    "ImageResult",
+    "ReferenceImages",
+    "AspectRatio",
+    "Seed",
     *(cls.__name__ for cls in SERVICES.values()),
 )
+#: Author-surface structs a package's struct may extend (cr-219): the image interface.
+_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult")
 #: Author-surface callables a folded constant may reach: each validates its own arguments.
 #: `data_values` reads committed JSON through the same function as the imported app.
 _AUTHOR_VALUES = (
@@ -245,6 +261,9 @@ _AUTHOR_VALUES = (
     "Shape",
     "Memoize",
     "data_values",
+    "QuantizationPlan",
+    "SelectionPlan",
+    "EncodingRule",
 )
 
 #: Struct class keywords `msgspec.defstruct` takes verbatim. `rename` and `array_like` change
@@ -590,7 +609,7 @@ class Reader:
             # The one dunder a data asset is addressed from: this module's own file.
             return str(module.path)
         if isinstance(node, ast.Attribute):
-            base = self.resolve(module, node.value)
+            base = self._attribute_base(module, node.value)
             if (
                 isinstance(base, Definition)
                 and isinstance(base.node, ast.ClassDef)
@@ -600,6 +619,14 @@ class Reader:
                 if node.attr in built.__members__:
                     return built.__members__[node.attr]
                 self.refuse(module, node, "unknown enumeration member")
+            if base is None or isinstance(base, Assigned):
+                # A field of a declared value: `INT8.include`, `INT8.plan.components`.
+                value = self.fold(module, node.value, scope)
+                if isinstance(value, (msgspec.Struct, StaticRecipe)) and node.attr in (
+                    getattr(value, "__struct_fields__", None) or StaticRecipe.__slots__
+                ):
+                    return getattr(value, node.attr)
+                self.refuse(module, node, "not a field of a declared value", "static_computed")
         if isinstance(node, (ast.Name, ast.Attribute)):
             found = self.resolve(module, node)
             if isinstance(found, Assigned):
@@ -611,6 +638,8 @@ class Reader:
             self.refuse(module, node, "not a module-level constant")
         if isinstance(node, ast.Call):
             callee = self.resolve(module, node.func)
+            if isinstance(callee, Vocab) and callee.key == "author.Recipe":
+                return self.recipe(module, node, scope)
             if isinstance(callee, Vocab) and callee.key in ("builtins.min", "builtins.max"):
                 if len(node.args) != 1 or node.keywords:
                     self.refuse(
@@ -667,28 +696,102 @@ class Reader:
             module, node, "an expression the constant folder does not evaluate", "static_computed"
         )
 
+    def _attribute_base(self, module: Module, node: ast.expr) -> Resolved | None:
+        """What an attribute's base names, or None for a value that is no name."""
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            return None
+        try:
+            return self.resolve(module, node)
+        except StaticRefusal:
+            if isinstance(node, ast.Attribute):
+                return None
+            raise
+
     def _comprehension(
         self, module: Module, node: ast.GeneratorExp | ast.ListComp, scope: Mapping[str, object]
     ) -> object:
-        """One comprehension over a folded sequence: `tuple(F(x) for x in CONSTANT)`.
+        """A comprehension over folded sequences: `tuple(F(x, y) for x in A for y in B)`.
 
         Deterministic by construction: the element is folded exactly as any other constant
-        is, with the clause's own target bound, and nothing of the package runs.
+        is, with the clauses' own targets bound, and nothing of the package runs.
         """
-        if len(node.generators) != 1:
-            self.refuse(module, node, "a comprehension with several clauses", "static_computed")
-        clause = node.generators[0]
-        if clause.ifs or clause.is_async or not isinstance(clause.target, ast.Name):
-            self.refuse(
-                module, node, "a filtered, async or unpacking comprehension", "static_computed"
-            )
-        items = self.fold(module, clause.iter, scope)
-        if not isinstance(items, (tuple, list, dict)):
-            self.refuse(
-                module, clause.iter, "a comprehension over a non-sequence", "static_computed"
-            )
-        folded = [self.fold(module, node.elt, {**scope, clause.target.id: item}) for item in items]
+
+        def expand(index: int, bound: Mapping[str, object]) -> list[object]:
+            if index == len(node.generators):
+                return [self.fold(module, node.elt, bound)]
+            clause = node.generators[index]
+            if clause.ifs or clause.is_async or not isinstance(clause.target, ast.Name):
+                self.refuse(
+                    module, node, "a filtered, async or unpacking comprehension", "static_computed"
+                )
+            items = self.fold(module, clause.iter, bound)
+            if not isinstance(items, (tuple, list, dict)):
+                self.refuse(
+                    module, clause.iter, "a comprehension over a non-sequence", "static_computed"
+                )
+            name = clause.target.id
+            return [v for item in items for v in expand(index + 1, {**bound, name: item})]
+
+        folded = expand(0, scope)
         return folded if isinstance(node, ast.ListComp) else tuple(folded)
+
+    def recipe(self, module: Module, node: ast.Call, scope: Mapping[str, object]) -> StaticRecipe:
+        """`Recipe(lane=, model=, plan=)` read from source: its model a Model class (`Model`:
+        any layout), its plan a folded plan or a `DerivationHook` naming a module function."""
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        if node.args or not {"lane", "model", "plan"} <= set(keywords) <= {
+            "lane", "model", "plan", "calibrate",
+        }:  # fmt: skip
+            self.refuse(
+                module, node, "Recipe(lane=, model=, plan=[, calibrate=]) by keyword",
+                "static_unsupported",
+            )  # fmt: skip
+        lane = self.fold(module, keywords["lane"], scope)
+        try:
+            author.WeightsOutput(typing.cast(str, lane), max_new_bytes=0)
+        except author.ConformanceError as exc:
+            self.refuse(module, keywords["lane"], f"recipe lane: {exc}", "static_unsupported")
+        found = self.resolve(module, keywords["model"])
+        spec = (
+            _ANY_LAYOUT
+            if isinstance(found, Vocab) and found.key == "author.Model"
+            else self._model_class(found)
+        )
+        if spec is None:
+            self.refuse(module, keywords["model"], "a recipe's model is a Model class")
+        value = keywords["plan"]
+        hook = self.resolve(module, value.func) if isinstance(value, ast.Call) else None
+        if isinstance(hook, Vocab) and hook.key == "author.DerivationHook":
+            function = (
+                self.resolve(module, value.args[0])
+                if isinstance(value, ast.Call) and len(value.args) == 1 and not value.keywords
+                else None
+            )
+            if not (
+                isinstance(function, Definition) and not isinstance(function.node, ast.ClassDef)
+            ):
+                self.refuse(module, value, "DerivationHook(<a module-level function>)")
+            identity = f"{function.module.name}:{function.node.name}"
+            if "calibrate" in keywords:
+                self.refuse(module, node, "a recipe's calibrate is beside a QuantizationPlan")
+            return StaticRecipe(typing.cast(str, lane), spec, identity)
+        plan = self.fold(module, value, scope)
+        if not isinstance(plan, (author.QuantizationPlan, author.SelectionPlan)):
+            self.refuse(module, value, "a recipe's plan is a QuantizationPlan or SelectionPlan")
+        calibrate = ""
+        if "calibrate" in keywords:
+            function = self.resolve(module, keywords["calibrate"])
+            if not (
+                isinstance(plan, author.QuantizationPlan)
+                and isinstance(function, Definition)
+                and not isinstance(function.node, ast.ClassDef)
+            ):
+                self.refuse(
+                    module, keywords["calibrate"],
+                    "calibrate=<a module-level function>, beside a QuantizationPlan",
+                )  # fmt: skip
+            calibrate = f"{function.module.name}:{function.node.name}"
+        return StaticRecipe(typing.cast(str, lane), spec, plan, calibrate)
 
     # ----------------------------------------------------------------- types
 
@@ -796,7 +899,7 @@ class Reader:
             target = base.value if isinstance(base, ast.Subscript) else base
             found = self.resolve(module, target)
             if isinstance(found, Vocab):
-                if found.key == "msgspec.Struct":
+                if found.key == "msgspec.Struct" or found.key in _author_structs():
                     return "struct"
                 if found.key == "author.Model":
                     return "model"
@@ -835,6 +938,9 @@ class Reader:
         for base in node.bases:
             found = self.resolve(module, base)
             if isinstance(found, Vocab) and found.key == "msgspec.Struct":
+                continue
+            if isinstance(found, Vocab) and found.key in _author_structs():
+                bases.append(getattr(author, found.key.partition(".")[2]))
                 continue
             if isinstance(found, Definition) and isinstance(found.node, ast.ClassDef):
                 parent = self.class_type(found.module, found.node, base)
@@ -935,6 +1041,11 @@ class Reader:
             elif keyword.arg == "attention_bits":
                 try:  # Runtime reads it at selection; the interface does not carry it
                     attention_bits(node.name, value)
+                except author.ConformanceError as exc:
+                    self.refuse(module, keyword, str(exc))
+            elif keyword.arg in ("unloaded", "derived"):
+                try:  # Runtime reads them at load; the interface does not carry them
+                    coverage_patterns(node.name, keyword.arg, value)
                 except author.ConformanceError as exc:
                     self.refuse(module, keyword, str(exc))
             else:
@@ -1184,6 +1295,24 @@ class Registration:
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
+    #: A model argument's class where the registration names it, not its annotation.
+    model_classes: Mapping[str, ModelSpec] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class StaticRecipe:
+    """A `Recipe` read from source; a `DerivationHook` plan, and a `calibrate`, is its function's
+    `module:name`."""
+
+    lane: str
+    model: ModelSpec
+    plan: author.QuantizationPlan | author.SelectionPlan | str
+    calibrate: str = ""
+
+    def canonical(self) -> dict[str, object]:
+        if isinstance(self.plan, str):
+            return {"kind": "derivation", "hook": self.plan}
+        return canonical(self.plan)
 
 
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
@@ -1313,7 +1442,12 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
             code="not_an_app",
         )
     docs: dict[str, dict[str, Json]] = {}
-    for registration in _registrations(reader, reader.reachable(entry), app):
+    modules = reader.reachable(entry)
+    recipes, calibrated = _recipes(reader, modules)
+    registrations = _registrations(reader, modules, app)
+    if recipes:
+        registrations.append(_recipes_registration(reader, recipes, calibrated))
+    for registration in registrations:
         if registration.name in docs:
             reader.refuse(
                 registration.module,
@@ -1332,7 +1466,80 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
             if identity is not None:
                 declared["operation_identity"] = identity
         docs[registration.name] = doc
-    return package_interface.assemble(application, list(docs.values()), installed=installed)
+    return package_interface.assemble(
+        application, list(docs.values()), installed=installed, recipes=recipes
+    )
+
+
+def _recipes(
+    reader: Reader, modules: Sequence[Module]
+) -> tuple[list[dict[str, Json]], list[ModelSpec]]:
+    """Every `Recipe` bound at module scope of `modules`, as the interface's `recipes` rows, and
+    the models of those that calibrate."""
+    rows: list[dict[str, Json]] = []
+    calibrated: list[ModelSpec] = []
+    for module in modules:
+        for stmt in _module_scope(module.tree.body):
+            name = _single_target(stmt)
+            value = getattr(stmt, "value", None)
+            if name is None or not isinstance(value, ast.Call):
+                continue
+            if not isinstance(value.func, (ast.Name, ast.Attribute)):
+                continue
+            try:
+                callee = reader.resolve(module, value.func)
+            except StaticRefusal:
+                continue
+            if not (isinstance(callee, Vocab) and callee.key == "author.Recipe"):
+                continue
+            recipe = reader.recipe(module, value, _NO_SCOPE)
+            row: dict[str, Json] = {
+                "name": name.lower(),
+                "lane": recipe.lane,
+                "module": module.name,
+                "export": name,
+                "model": {
+                    "class": recipe.model.name,
+                    "component_use": {
+                        stage: sorted(names)
+                        for stage, names in sorted(recipe.model.components.items())
+                    },
+                },
+                "plan": recipe.canonical(),
+            }
+            if recipe.calibrate:
+                row["calibrate"] = recipe.calibrate
+                if recipe.model not in calibrated:
+                    calibrated.append(recipe.model)
+            elif not isinstance(recipe.plan, str):
+                row["fingerprint"] = fingerprint(recipe.canonical())
+            if any(other["name"] == row["name"] for other in rows):
+                reader.refuse(module, stmt, f"a second recipe named {row['name']!r}")
+            if len(calibrated) > 1:
+                reader.refuse(module, stmt, "calibrated recipes of two model classes")
+            rows.append(row)
+    return rows, calibrated
+
+
+def _recipes_registration(
+    reader: Reader, recipes: Sequence[dict[str, Json]], calibrated: Sequence[ModelSpec]
+) -> Registration:
+    """The Runtime's `quantize` (`cozy_runtime.derive.recipes`), read from its source, writing
+    the lanes of `recipes`: a package with recipes registers it as its own. One with a calibrated
+    recipe registers `quantize_calibrated` under that name: on a GPU, its model built on demand."""
+    runtime = reader.module("cozy_runtime.derive.recipes")
+    entry = CALIBRATED_ENTRYPOINT if calibrated else RECIPES_ENTRYPOINT
+    function = runtime.bindings[entry]
+    assert isinstance(function, ast.AsyncFunctionDef)
+    found = _registration(reader, runtime, function, "entrypoint", ())
+    assert found is not None
+    lanes = outputs(str(row["lane"]) for row in recipes)
+    if not calibrated:
+        return replace(found, weights=lanes, accelerator=False)
+    return replace(
+        found, name=RECIPES_ENTRYPOINT, weights=lanes, model_on_demand=("model",),
+        model_classes={"model": calibrated[0]},
+    )  # fmt: skip
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:
@@ -1770,6 +1977,9 @@ def _callable(reader: Reader, registration: Registration) -> dict[str, Json]:
                 if assets is not None:
                     reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
                 assets = assets_binding(arg.arg, reader.translate(module, arg.annotation))
+                continue
+            if found.key in _author_structs():
+                payloads.append(reader.translate(module, arg.annotation))
                 continue
 
         if (

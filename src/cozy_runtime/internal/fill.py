@@ -10,10 +10,13 @@ assets through the store. Refusals are spoken in `FillRefusal`'s vocabulary.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import sys
+import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from types import ModuleType
 
 import tensorfs
 from tensorfs import raw
@@ -178,6 +181,57 @@ def row(
     return PlanRow(key, name, component, dtype, shape, nbytes, encoded)
 
 
+def _transformers_binding(config: Mapping[str, object]) -> Callable[[str], str]:
+    """`Checkpoint.binding`'s rename for one component's config (identity without one)."""
+    transformers, torch = sys.modules.get("transformers"), sys.modules.get("torch")
+    mapping = sys.modules.get("transformers.conversion_mapping")
+    loading = sys.modules.get("transformers.core_model_loading")
+    names = config.get("architectures")
+    model_cls = (
+        getattr(transformers, str(names[0]), None) if isinstance(names, list) and names else None
+    )
+    if transformers is None or torch is None or mapping is None or loading is None:
+        return str
+    if model_cls is None:  # a config naming no model: its model type's own rules, unscoped
+        transforms = mapping.get_checkpoint_conversion_mapping(str(config.get("model_type", "")))
+        built, prefix = None, None
+    else:
+        with torch.device("meta"):
+            model = model_cls._from_config(
+                transformers.AutoConfig.for_model(**_strict_floats(transformers, config))
+            )
+        transforms = mapping.get_model_conversion_mapping(model)
+        built, prefix = dict.fromkeys(model.state_dict()), model.base_model_prefix
+    renamings = [t for t in transforms or () if isinstance(t, loading.WeightRenaming)]
+    if not renamings:
+        return str
+    return lambda name: str(loading.rename_source_key(name, renamings, [], prefix, built)[0])
+
+
+def _strict_floats(transformers: ModuleType, config: Mapping[str, object]) -> dict[str, object]:
+    """`config` with each whole number its Transformers config class declares a float as a
+    float, sub-configs (`text_config`) by their own model types. Canonical JSON stores 1.0 as 1,
+    and Transformers 5's strict configs refuse an int for a float field (SDXL's CLIP
+    `initializer_factor`, runs 15006/15012/15014); its own loader reads `config.json`'s 1.0."""
+    model_type = str(config.get("model_type", ""))
+    # Indexed: the lazy mapping's `get` reads its unloaded dict and answers None.
+    known = transformers.CONFIG_MAPPING
+    cls = known[model_type] if model_type in known else None  # noqa: SIM401
+    floats = {
+        f.name
+        for f in (dataclasses.fields(cls) if dataclasses.is_dataclass(cls) else ())
+        if float in (typing.get_args(f.type) or (f.type,)) and int not in typing.get_args(f.type)
+    }
+    out: dict[str, object] = {}
+    for name, value in config.items():
+        if isinstance(value, Mapping) and "model_type" in value:
+            value = _strict_floats(transformers, value)
+        elif type(value) is int and name in floats:
+            value = float(value)
+        out[name] = value
+    return out
+
+
 class Checkpoint:
     """One opened checkpoint: its rows (in construction order), configs and assets."""
 
@@ -185,6 +239,7 @@ class Checkpoint:
         self.ck = ck
         #: the weight set's identity: the header's ref, `sha256:<hex>`
         self.id: str = ck.id
+        self._bindings: dict[str, Callable[[str], str]] = {}
 
     def has(self, component: str) -> bool:
         return component in self.ck.components
@@ -206,23 +261,18 @@ class Checkpoint:
         return [row(self.ck, component, name, info, bind(name)) for name, info in tensors.items()]
 
     def binding(self, component: str) -> Callable[[str], str]:
-        """Stored name -> the name the component's module tree uses: a Transformers model's
-        own checkpoint conversion mapping, found by its config's class (`CLIPTextModel`
-        drops the `text_model.` its checkpoint stores); a name binds as stored otherwise."""
-        mapping = sys.modules.get("transformers.conversion_mapping")
-        loading = sys.modules.get("transformers.core_model_loading")
-        if mapping is None or loading is None or not self.has(component):
-            return str
-        config = self.ck.components[component].config
-        transforms = None
-        for name in (*config.get("architectures", ())[:1], config.get("model_type")):
-            transforms = mapping.get_checkpoint_conversion_mapping(name) if name else None
-            if transforms:
-                break
-        renamings = [t for t in transforms or () if isinstance(t, loading.WeightRenaming)]
-        if not renamings:
-            return str
-        return lambda name: str(loading.rename_source_key(name, renamings, [])[0])
+        """Stored name -> the name the component's module tree uses, as Transformers loads it:
+        the transforms of the model its config names, each sub-model's scoped to its path
+        (FLUX.2 [dev]'s Mistral3 stored as Transformers 4 named it, `language_model.model.*`,
+        is `model.language_model.*` only through `Mistral3Model`'s own rule, cr-213), and its
+        base-model prefix added or dropped against that model's names (`CLIPTextModel` drops
+        the `text_model.` its checkpoint stores). The model is built once, on the meta device.
+        A name binds as stored when Transformers is not loaded or has no rule for it."""
+        found = self._bindings.get(component)
+        if found is None:
+            config = self.ck.components[component].config if self.has(component) else {}
+            found = self._bindings[component] = _transformers_binding(config)
+        return found
 
     @property
     def metadata(self) -> dict[str, object]:
@@ -313,6 +363,8 @@ class TensorRequirement:
     key: str
     shape: Sequence[int]
     logical_dtype: str | None = None
+    #: A persistent buffer: one the checkpoint does not store keeps its constructed value.
+    buffer: bool = False
 
 
 def fit(
@@ -324,13 +376,16 @@ def fit(
     device: str = "",
 ) -> dict[str, object]:
     """The construction census against the header: every built tensor is stored with its shape
-    (and its dtype where the census pins one); stored tensors nothing builds are skipped.
+    (and its dtype where the census pins one), except a persistent buffer, which keeps its
+    constructed value when the checkpoint does not store it (`unstored`); stored tensors nothing
+    builds are skipped (`ignored`). Both are coverage gaps the load reports, never refusals.
     `ok` False carries the first disagreement's code, component, key and sentence. The header's
     order is the construction's traversal (#624): `order` names where the census builds in
     another order (weights then stream out of step), "" when it agrees. Whether a device
     serves an encoding is plan resolution's (`Selector`); custody and device echo."""
     routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
     ignored: list[str] = []
+    unstored: list[str] = []
     disorder: list[str] = []
     ignored_bytes = 0
 
@@ -353,9 +408,15 @@ def fit(
                 component,
             )
         bind = checkpoint.binding(component)
-        stored = {bind(name): info for name, info in checkpoint.tensors(component).items()}
+        tensors = checkpoint.tensors(component)
+        #: bound name -> the name it is stored under (a renamed tensor's bytes are read by it)
+        names = {bind(name): name for name in tensors}
+        stored = {key: tensors[name] for key, name in names.items()}
         for key, requirement in wanted.items():
             info = stored.get(key)
+            if info is None and requirement.buffer:
+                unstored.append(f"{component}/{key}")
+                continue
             if info is None:
                 return refused(
                     "tensor_missing",
@@ -397,10 +458,10 @@ def fit(
             if key not in wanted:
                 ignored.append(f"{component}/{key}")
                 ignored_bytes += sum(
-                    part.length for part in raw.parts(checkpoint.ck, component, key).values()
+                    part.length for part in raw.parts(checkpoint.ck, component, names[key]).values()
                 )
         header = [key for key in stored if key in wanted]
-        census = list(wanted)
+        census = [key for key in wanted if key in stored]
         if header != census:
             at = next(i for i, (a, b) in enumerate(zip(header, census, strict=True)) if a != b)
             disorder.append(
@@ -425,6 +486,7 @@ def fit(
         "device": device,
         "ignored": ignored,
         "ignored_bytes": ignored_bytes,
+        "unstored": unstored,
         "routes": routes,
         "warning": warning,
         "order": "; ".join(disorder),

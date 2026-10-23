@@ -52,7 +52,7 @@ def _triton_kernels() -> Any:
         import triton
         import triton.language as tl
 
-        @triton.jit  # type: ignore[untyped-decorator]
+        @triton.jit(do_not_specialize=["seq", "heads"])  # type: ignore[untyped-decorator]
         def _amax(x_ptr, amax_ptr, seq, heads, CHUNK: tl.constexpr, DIM: tl.constexpr):  # type: ignore[no-untyped-def]
             # int64 element offsets: a (seq, heads, dim) tensor may pass 2**31 elements.
             head = tl.program_id(0).to(tl.int64)
@@ -63,7 +63,7 @@ def _triton_kernels() -> Any:
             value = tl.load(x_ptr + offsets, mask=rows[:, None] < seq, other=0.0).to(tl.float32)
             tl.atomic_max(amax_ptr + head, tl.max(tl.abs(value)))
 
-        @triton.jit  # type: ignore[untyped-decorator]
+        @triton.jit(do_not_specialize=["seq", "heads"])  # type: ignore[untyped-decorator]
         def _cast(x_ptr, out_ptr, amax_ptr, seq, heads, CHUNK: tl.constexpr, DIM: tl.constexpr):  # type: ignore[no-untyped-def]
             head = tl.program_id(0).to(tl.int64)
             rows = tl.program_id(1).to(tl.int64) * CHUNK + tl.arange(0, CHUNK)
@@ -108,6 +108,24 @@ def quantise(tensor: Tensor) -> tuple[Tensor, Tensor]:
         amax_kernel[grid](tensor, amax, seq, heads, CHUNK=CHUNK, DIM=dim)
         cast_kernel[grid](tensor, out, amax, seq, heads, CHUNK=CHUNK, DIM=dim)
     return out, (amax / E4M3_TARGET).clamp_(min=SCALE_FLOOR)
+
+
+def warm(index: int) -> None:
+    """Build the fused quantiser on GPU `index` for each dtype and head dimension a model's
+    attention takes, launching nothing: its lengths are not specialized, so no request compiles
+    it (`kernel_ready`)."""
+    import torch
+
+    kernels = _triton_kernels()
+    if kernels is None:
+        return
+    amax_kernel, cast_kernel, _ = kernels
+    with torch.cuda.device(index):
+        for dtype in (torch.bfloat16, torch.float16):
+            for dim in (64, 128):
+                options = {"CHUNK": CHUNK, "DIM": dim, "grid": (1,)}
+                amax_kernel.warmup(dtype, torch.float32, 1, 1, **options)
+                cast_kernel.warmup(dtype, torch.float8_e4m3fn, torch.float32, 1, 1, **options)
 
 
 def quantise_eager(tensor: Tensor) -> tuple[Tensor, Tensor]:

@@ -50,6 +50,7 @@ from packaging.tags import sys_tags
 from packaging.utils import parse_wheel_filename
 
 from cozy_runtime._cpus import cpus
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.internal import config, egress, filelock, kernel_cache, kernel_compile
 
 ROOT = Path("/opt/cozy/kernel-sources")
@@ -687,6 +688,7 @@ def _unpack(source: Mapping[str, Any], site: Path) -> None:
                 target.chmod(0o755)
 
 
+@request_path.forbid("kernel build: python")
 def build_python(
     spec: Mapping[str, Any], staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
@@ -716,6 +718,7 @@ compiler_job(*{job!r})
 """
 
 
+@request_path.forbid("kernel build: setup")
 def build_setup(
     spec: Mapping[str, Any], staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:

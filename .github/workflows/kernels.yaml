@@ -30,27 +30,38 @@ on:
         description: "Whether to build for Windows x86_64: yes or no"
         type: string
         default: 'yes'
-  pull_request:
-    paths: &inputs
+  push:
+    branches: [master]
+    paths:
       - kernels/**
       - src/cozy_runtime/_kernels/__init__.py
       - checks/kernel_modules.py
       - .github/workflows/kernels.yaml
-  push:
-    branches: [master]
-    paths: *inputs
-run-name: kernels ${{ inputs.ref || github.head_ref || github.ref_name }}
+run-name: kernels ${{ inputs.ref || github.ref_name }}
 
 permissions:
   contents: read
 
-# A newer push to the same ref replaces a build still running; a caller's build is its own.
-concurrency:
-  group: kernels-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: true
-
 jobs:
+  # A cached x86_64 build needs no 16-core runner: look the key up on a free one first.
+  probe:
+    if: ${{ inputs.linux != '[]' }}
+    runs-on: ubuntu-latest
+    outputs:
+      x86_64: ${{ steps.cache.outputs.cache-hit == 'true' && 'ubuntu-latest' || 'linux-x64-16core' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+      - id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: modules
+          key: kernels-r1-linux-x86_64-${{ hashFiles('kernels/**', 'src/cozy_runtime/_kernels/__init__.py', 'checks/kernel_modules.py') }}
+          lookup-only: true
+
   linux:
+    needs: probe
     if: ${{ inputs.linux != '[]' }}
     strategy:
       fail-fast: false
@@ -58,7 +69,7 @@ jobs:
         arch: ${{ fromJSON(inputs.linux || '["x86_64", "aarch64"]') }}
     # CUTLASS units peak at ~6 GB each: compile jobs sized by the runner's memory. The arm64 larger
     # runner has no docker; the standard one does.
-    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'linux-x64-16core' }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || needs.probe.outputs.x86_64 }}
     # Hang bound, not a work budget.
     timeout-minutes: 240
     env:

@@ -1,0 +1,1 @@
+A copy-engine group's calibration sends 64 MiB again and checks its rounds by asking for two, and a formation again (after a call ran short of memory) frees the last buffer before mapping the next: 0.30.5 calibrated with 384 MiB a GPU, which a full 24 GB card forming again could not hold.

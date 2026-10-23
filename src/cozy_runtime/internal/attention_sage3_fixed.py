@@ -14,67 +14,20 @@ if TYPE_CHECKING:
     from torch import Tensor
     from triton.runtime.jit import JITFunction
 
-TOKEN_TILE = 256
-CHANNEL_TILE = 32
 CENTER_TILE = 16
 
 
 @functools.cache
 def _kernels() -> tuple[JITFunction, JITFunction, JITFunction]:
+    """The shared fixed means (`attention_sage2_fixed_mean`) and this candidate's centering: one
+    compile per card, whatever the length (`warm`)."""
     import triton
     import triton.language as tl
 
-    @triton.jit(
-        do_not_specialize=["stride_t", "stride_h"],
-        do_not_specialize_on_alignment=["stride_t", "stride_h"],
-    )  # type: ignore[untyped-decorator]
-    def partial_mean(  # type: ignore[no-untyped-def]
-        X,
-        P,
-        stride_t,
-        stride_h,
-        N: tl.constexpr,
-        D: tl.constexpr,
-        TILES: tl.constexpr,
-        BT: tl.constexpr,
-        BC: tl.constexpr,
-    ):
-        head = tl.program_id(0).to(tl.int64)
-        channel_tile, tile = tl.program_id(1), tl.program_id(2)
-        token = (tile * BT + tl.arange(0, BT)).to(tl.int64)
-        channel = channel_tile * BC + tl.arange(0, BC)
-        values = tl.load(
-            X + token[:, None] * stride_t + head * stride_h + channel[None, :],
-            mask=(token[:, None] < N) & (channel[None, :] < D),
-            other=0,
-        ).to(tl.float32)
-        sums = tl.sum(values, axis=0)
-        tl.store(P + (head * TILES + tile) * D + channel, sums, mask=channel < D)
-
-    @triton.jit  # type: ignore[untyped-decorator]
-    def finish_mean(  # type: ignore[no-untyped-def]
-        P,
-        M,
-        D: tl.constexpr,
-        TILES: tl.constexpr,
-        DENOMINATOR: tl.constexpr,
-        REDUCE: tl.constexpr,
-        BC: tl.constexpr,
-    ):
-        head = tl.program_id(0).to(tl.int64)
-        channel_tile = tl.program_id(1)
-        tile = tl.arange(0, REDUCE)
-        channel = channel_tile * BC + tl.arange(0, BC)
-        partial = tl.load(
-            P + (head * TILES + tile[:, None]) * D + channel[None, :],
-            mask=(tile[:, None] < TILES) & (channel[None, :] < D),
-            other=0,
-        )
-        mean = tl.sum(partial, axis=0) * (1.0 / DENOMINATOR)
-        tl.store(M + head * D + channel, mean.to(tl.bfloat16), mask=channel < D)
+    means = import_module("cozy_runtime.internal.attention_sage2_fixed_mean")
 
     @triton.jit(
-        do_not_specialize=["qt", "qh", "kt", "kh", "vt", "vh"],
+        do_not_specialize=["qt", "qh", "kt", "kh", "vt", "vh", "tokens", "padded"],
         do_not_specialize_on_alignment=["qt", "qh", "kt", "kh", "vt", "vh"],
     )  # type: ignore[untyped-decorator]
     def center_and_correct(  # type: ignore[no-untyped-def]
@@ -93,8 +46,8 @@ def _kernels() -> tuple[JITFunction, JITFunction, JITFunction]:
         kh,
         vt,
         vh,
-        N: tl.constexpr,
-        PADDED: tl.constexpr,
+        tokens,
+        padded,
         D: tl.constexpr,
         BT: tl.constexpr,
         FIXED_CORRECTION: tl.constexpr,
@@ -106,7 +59,7 @@ def _kernels() -> tuple[JITFunction, JITFunction, JITFunction]:
         source_q = token[:, None] * qt + head * qh + channel[None, :]
         source_k = token[:, None] * kt + head * kh + channel[None, :]
         source_v = token[:, None] * vt + head * vh + channel[None, :]
-        live = token[:, None] < N
+        live = token[:, None] < tokens
         q = tl.load(Q + source_q, mask=live, other=0).to(tl.float32)
         k = tl.load(K + source_k, mask=live, other=0).to(tl.float32)
         v = tl.load(V + source_v, mask=live, other=0)
@@ -116,19 +69,35 @@ def _kernels() -> tuple[JITFunction, JITFunction, JITFunction]:
         # zero after centering; Q padding participates as original zero minus qm.
         qc = (q - qm[None, :]).to(tl.bfloat16)
         kc = tl.where(live, (k - km[None, :]).to(tl.bfloat16), 0.0).to(tl.bfloat16)
-        destination = (head * PADDED + token[:, None]) * D + channel[None, :]
-        tl.store(QO + destination, qc, mask=token[:, None] < PADDED)
-        tl.store(KO + destination, kc, mask=token[:, None] < PADDED)
-        tl.store(VO + destination, v, mask=token[:, None] < PADDED)
+        destination = (head * padded + token[:, None]) * D + channel[None, :]
+        tl.store(QO + destination, qc, mask=token[:, None] < padded)
+        tl.store(KO + destination, kc, mask=token[:, None] < padded)
+        tl.store(VO + destination, v, mask=token[:, None] < padded)
         # Fixed 128-channel FP32 products/tree; intentionally not claimed cuBLAS-bit
         # identical. Preserve the old BF16 correction rounding before FP32 storage.
         if FIXED_CORRECTION:
             correction = (
                 tl.sum(qm[None, :] * kc.to(tl.float32), axis=1).to(tl.bfloat16).to(tl.float32)
             )
-            tl.store(DELTA + head * PADDED + token, correction, mask=token < PADDED)
+            tl.store(DELTA + head * padded + token, correction, mask=token < padded)
 
-    return partial_mean, finish_mean, center_and_correct
+    return means.partial_mean, means.finish_mean, center_and_correct
+
+
+def warm(index: int) -> None:
+    """Build every kernel `fixed_preprocess` launches on GPU `index`, for every length,
+    launching nothing (`kernel_ready`)."""
+    import torch
+
+    import_module("cozy_runtime.internal.attention_sage2_fixed_mean").warm(index)
+    center_and_correct = _kernels()[2]
+    bf16, f32 = torch.bfloat16, torch.float32
+    with torch.cuda.device(index):
+        for fixed in (False, True):
+            center_and_correct.warmup(
+                *[bf16] * 8, f32, *[1] * 8, 128, CENTER_TILE, fixed,
+                grid=(1,), num_warps=4, enable_fp_fusion=False,
+            )  # fmt: skip
 
 
 def fixed_preprocess(
@@ -138,7 +107,7 @@ def fixed_preprocess(
     import torch
     import triton
 
-    partial_mean, finish_mean, center_and_correct = _kernels()
+    center_and_correct = _kernels()[2]
 
     if (
         q.shape != k.shape
@@ -160,38 +129,8 @@ def fixed_preprocess(
     if tokens < 1 or heads < 1:
         raise ValueError("The input geometry must be nonempty")
     padded = triton.cdiv(tokens, 128) * 128
-    tiles = triton.cdiv(tokens, TOKEN_TILE)
-    means = []
-    for value, denominator in ((q, padded), (k, tokens)):
-        partial = torch.empty((heads, tiles, dim), device=q.device, dtype=torch.float32)
-        mean = torch.empty((1, heads, 1, dim), device=q.device, dtype=torch.bfloat16)
-        partial_mean[(heads, triton.cdiv(dim, CHANNEL_TILE), tiles)](
-            value,
-            partial,
-            value.stride(1),
-            value.stride(2),
-            tokens,
-            dim,
-            tiles,
-            TOKEN_TILE,
-            CHANNEL_TILE,
-            num_warps=8,
-            enable_fp_fusion=False,
-        )
-        finish_mean[(heads, triton.cdiv(dim, CHANNEL_TILE))](
-            partial,
-            mean,
-            dim,
-            tiles,
-            denominator,
-            triton.next_power_of_2(tiles),
-            CHANNEL_TILE,
-            num_warps=8,
-            enable_fp_fusion=False,
-        )
-        means.append(mean)
-        del partial
-    qm, km = means
+    fixed_mean = import_module("cozy_runtime.internal.attention_sage2_fixed_mean").fixed_mean
+    qm, km = (fixed_mean(x, n).view(1, heads, 1, dim) for x, n in ((q, padded), (k, tokens)))
     outputs = [
         torch.empty((1, heads, padded, dim), device=q.device, dtype=torch.bfloat16)
         for _ in range(3)

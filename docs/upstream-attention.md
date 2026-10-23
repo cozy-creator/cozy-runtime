@@ -47,20 +47,3 @@ optional kernel. The kernels are compiled on the machine from pinned source
   `flash_attn.cute.interface._flash_attn_fwd` (`flash_attn_func` takes no descales).
 - SageAttention d1a57a54 `sageattention3_blackwell` (`sageattn3`) refuses every card
   but sm_120/121 in its C++ entry.
-
-## Verification
-
-CPU tests exercise refusal semantics, per-card Sage mode selection and
-registration. They do not run any CUDA kernel.
-The opt-in integration test executes the installed upstream implementation,
-compares FP32 SDPA, verifies unchanged input tensors and repeat equality, and
-uses a nondefault scale (default for Sage3), unequal lengths, two batches, GQA
-where served and a batch-specific Kitchen mask. It is intentionally not a mock of the CUDA library.
-
-```sh
-COZY_TEST_ATTENTION_CUDA=1 uv run pytest tests/test_attention_upstream.py
-```
-
-Only run that command on an owned device with the reviewed optional libraries.
-The small numerical test is an ABI/arithmetic check; long H3 sequences, output
-quality, attention timing and end-to-end videos still need qualification.

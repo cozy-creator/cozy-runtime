@@ -417,3 +417,76 @@ def encode_int8_convrot256(key: str, values: np.ndarray) -> Encoded:
         energy=acc.energy,
         max_abs_err=acc.max_abs,
     )
+
+
+# ------------------------------------------------------------------------------ w4a8
+
+#: comfy-kitchen's frozen Lloyd-Max levels for a group-normalized Gaussian (`_FIXED_LUT`):
+#: ConvRot makes every layer's rotated groups Gaussian, so this one table serves (kitchen fits
+#: its own only past an excess kurtosis of -0.1, which it notes real models never reach).
+W4A8_CODEBOOK = np.array(
+    [-0.980602, -0.794529, -0.638165, -0.500986, -0.377321, -0.263187, -0.155210, -0.050720,
+     0.052541, 0.156985, 0.265284, 0.379533, 0.502636, 0.638953, 0.794876, 0.980671],
+    dtype=np.float32,
+)  # fmt: skip
+W4A8_GROUP = 16
+
+
+def _nearest_level(levels: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """The index of `levels` (ascending) nearest each of `x`, ties to the lower."""
+    pos = np.searchsorted(levels, x)
+    lo, hi = np.clip(pos - 1, 0, 15), np.clip(pos, 0, 15)
+    return np.where(np.abs(x - levels[hi]) < np.abs(x - levels[lo]), hi, lo)
+
+
+def encode_w4a8(key: str, values: np.ndarray) -> Encoded:
+    """`w4a8.convrot` as our producer writes it (design `four-bit-lanes.md` §3-4):
+    comfy-kitchen's symmetric codebook quantizer on int8.convrot's rotated rows. Each 16-group's
+    scale is refined by two ALS passes over the frozen codebook; the row scale makes the largest
+    level 127, the group scale relative to it is stored E4M3; each weight then takes the nearest
+    of its group's int8 levels `round(codebook * group_scale)`, the grid the GEMM multiplies."""
+    rows, cols = _require_2d(key, values, CONVROT_GROUP)
+    groups = cols // W4A8_GROUP
+    codes = np.empty((rows, cols // 2), dtype=np.uint8)
+    group_scale = np.empty((rows, groups), dtype=np.uint8)
+    row_scale = np.empty((rows,), dtype=np.float32)
+    book = W4A8_CODEBOOK.astype(np.float64)
+    acc = _Accum()
+    for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
+        v = np.ascontiguousarray(values[sl], dtype=np.float32)
+        n = v.shape[0]
+        g = (hadamard256(v.astype(np.float64)) / 16.0).reshape(n, groups, W4A8_GROUP)
+        gs = np.maximum(np.abs(g).max(axis=-1, keepdims=True), 1e-8)
+        idx = _nearest_level(book, g / gs)
+        for _ in range(2):
+            c = book[idx]
+            energy = np.maximum((c * c).sum(-1, keepdims=True), 1e-8)
+            gs = np.maximum((g * c).sum(-1, keepdims=True) / energy, 1e-8)
+            idx = _nearest_level(book, g / gs)
+        amax = np.abs(book[idx] * gs).max(axis=(1, 2))
+        scale = np.maximum(amax / INT8_MAX, 1e-8).astype(np.float32)
+        rel = e4m3_encode((gs[..., 0] / scale.astype(np.float64)[:, None]).astype(np.float32))
+        levels = np.clip(np.rint(W4A8_CODEBOOK * e4m3_decode(rel)[..., None]), -INT8_MAX, INT8_MAX)
+        target = g / scale.astype(np.float64)[:, None, None]
+        acc.sat += int(np.count_nonzero(np.abs(target) > INT8_MAX + 0.5))
+        dist = np.abs(target[..., :, None] - levels[..., None, :].astype(np.float64))
+        q = dist.argmin(axis=-1).astype(np.uint8)  # the first of equals: ties to the lower
+        q8 = np.take_along_axis(levels, q.astype(np.intp), axis=-1).reshape(n, cols)
+        acc.add(v, decode_int8_convrot256(q8, scale))
+        codes[sl] = pack_nibbles(q.reshape(n, cols))
+        group_scale[sl] = rel
+        row_scale[sl] = scale
+    return Encoded(
+        payload_dtype="I8",
+        payload_shape=[rows, cols // 2],
+        payload=codes.tobytes(),
+        companions=[
+            Companion(".weight_s_rel", "F8_E4M3", [rows, groups], group_scale.tobytes()),
+            Companion(".weight_s_channel", "F32", [rows], row_scale.tobytes()),
+            Companion(".weight_codebook", "F32", [16], W4A8_CODEBOOK.tobytes()),
+        ],
+        saturated=acc.sat,
+        sse=acc.sse,
+        energy=acc.energy,
+        max_abs_err=acc.max_abs,
+    )

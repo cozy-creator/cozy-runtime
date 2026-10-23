@@ -1,0 +1,1 @@
+The 8-bit ops' self-checks never run at a request's first GEMM (cr-217). When a leaf's bind had not opened the int8/fp8 library or the w4a8 GEMM, their probes ran on the request thread. Now they open off the request (`kernel_ready`), and comfy-kitchen or eager serves until the op takes over at the next boundary.

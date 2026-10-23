@@ -26,9 +26,7 @@ _NAME_RUNS = re.compile(r"[-_.]+")
 _ROOT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _UV_VERSION = re.compile(r"uv ([0-9]+(?:\.[0-9]+){1,3})(?: \([^\n]+\))?")
 # The worker-image-owned families and the import roots each one owns. This mapping is the
-# ONE list; `base-distributions.json` is generated from it (checks/architecture.py) and
-# cozy-creator's upload-side prune list is generated from that, so the client and the worker
-# cannot hold two different opinions about what the image provides.
+# ONE list of what the image provides.
 #
 # numpy and pillow belong here for the reason msgspec already did. numpy shares a compiled
 # ABI with the torch family the image pins; pillow is cozy-runtime's own public dependency

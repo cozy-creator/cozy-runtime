@@ -72,7 +72,7 @@ class ModuleLike(Protocol):
     """A component root. The tensor-schema walk can only see what `state_dict()` reaches
     (§1.1 authoring rules) — `torch.nn.Module` satisfies this structurally."""
 
-    def state_dict(self) -> Mapping[str, TensorLike]: ...
+    def state_dict(self, *, keep_vars: bool = False) -> Mapping[str, TensorLike]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +92,8 @@ class Destination:
     key: str
     component: str
     spec: TensorSpec
+    #: A persistent buffer: the checkpoint's value when it stores one, else its constructed value.
+    buffer: bool = False
 
 
 #: TensorFS dtype name -> torch dtype name. This is the ONE thing the store cannot own: it
@@ -195,9 +197,13 @@ def _without_provenance(data: Mapping[str, object]) -> dict[str, object]:
 
 def _carrier(key: str, value: object) -> str | None:
     """Why this entry is a source carrier, if it is. Keys AND values are checked: a value
-    that is a filesystem path or a URL is one whatever its key is called."""
+    that is a filesystem path or a URL is one whatever its key is called. A key naming a
+    carrier refuses a value that could be one; a flag, number or null names no source (an
+    upstream tokenizer's saved `local_files_only: false`)."""
     lowered = key.lower()
-    if lowered in PATH_KEYS or lowered.endswith(PATH_SUFFIXES):
+    if (lowered in PATH_KEYS or lowered.endswith(PATH_SUFFIXES)) and not (
+        value is None or isinstance(value, (bool, int, float))
+    ):
         return f"{key!r} names a source carrier"
     if isinstance(value, str) and (
         value.startswith(("/", "./", "../", "~/", "file://")) or "://" in value
@@ -737,6 +743,8 @@ class ConstructionRecord:
     """Stored tensors the code does not build: skipped, never loaded, and CONFESSED."""
     ignored_warnings: tuple[str, ...] = ()
     """One line per checkpoint that stores such tensors: count, bytes and the first keys."""
+    unstored: tuple[str, ...] = ()
+    """Persistent buffers the checkpoint does not store: they keep their constructed values."""
     skipped: tuple[str, ...] = ()
     """Built components the binding does not select: on meta, and a scope using one refuses."""
     fit: dict[str, object] | None = None
@@ -857,6 +865,8 @@ class Loader:
             raise ModelFitRefused(fit, self._artifact.unnormalized)
         ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
         warned = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("warnings", ())))
+        unstored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("unstored", ())))
+        walked = walked.without(frozenset(k.replace("/", ".", 1) for k in unstored))
         _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
         filled, filled_bytes = self._fill(walked, obj)
@@ -869,6 +879,7 @@ class Loader:
             filled_bytes=filled_bytes,
             ignored_extras=ignored,
             ignored_warnings=warned,
+            unstored=unstored,
             skipped=skipped,
             fit=dict(fit) if fit is not None else None,
             stage_ms=tuple(_legs),
@@ -976,6 +987,14 @@ class Census:
     schedulers: tuple[str, ...]
     live: Mapping[str, TensorLike]
 
+    def without(self, keys: frozenset[str]) -> Census:
+        """This walk without the destinations `keys` (persistent buffers no checkpoint stores)."""
+        if not keys:
+            return self
+        destinations = tuple(d for d in self.destinations if d.key not in keys)
+        live = {d.key: self.live[d.key] for d in destinations}
+        return Census(destinations, self.components, self.schedulers, live)
+
     def only(self, bound: frozenset[str] | None) -> tuple[Census, tuple[str, ...]]:
         """This walk restricted to the `bound` components, and the components left out."""
         skipped = tuple(c for c in self.components if bound is not None and c not in bound)
@@ -1016,7 +1035,9 @@ def census(obj: object) -> Census:
 
     Components are read from the object's `components` mapping when it has one (diffusers
     pipelines and modular pipelines both expose it) and from its public module-like
-    attributes otherwise. The walk can only see what `state_dict()` reaches (§1.1).
+    attributes otherwise. The walk can only see what `state_dict()` reaches (§1.1). A tied
+    tensor (`tie_word_embeddings`) is one destination, under its first name: a checkpoint
+    stores it once, and varena installs its placeholder at every name (cr-218).
     """
     destinations: list[Destination] = []
     components: list[str] = []
@@ -1029,7 +1050,14 @@ def census(obj: object) -> Census:
         if not isinstance(member, ModuleLike):
             continue
         components.append(name)
-        for key, tensor in member.state_dict().items():
+        seen: set[int] = set()
+        named_buffers = getattr(member, "named_buffers", None)
+        buffers = {id(b) for _, b in named_buffers(remove_duplicate=False)} if named_buffers else set()
+        for key, held in member.state_dict(keep_vars=True).items():
+            if id(held) in seen:
+                continue
+            seen.add(id(held))
+            tensor = held.detach()
             full = f"{name}.{key}"
             live[full] = tensor
             nbytes = getattr(tensor, "nbytes", 0)
@@ -1042,6 +1070,7 @@ def census(obj: object) -> Census:
                         _dtype_of(tensor),
                         nbytes=nbytes if isinstance(nbytes, int) else 0,
                     ),
+                    buffer=id(held) in buffers,
                 )
             )
     return Census(tuple(destinations), tuple(components), tuple(schedulers), live)

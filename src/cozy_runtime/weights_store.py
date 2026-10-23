@@ -183,15 +183,20 @@ class Derivation:
     base: Checkpoint | None
     sources: Sequence[Checkpoint] = ()
     order: Sequence[tuple[str, str]] = ()
+    #: The header's `provenance`: the recipe that writes it (`derive.recipes`).
+    provenance: Mapping[str, object] | None = None
 
     def work(self, max_new_bytes: int) -> dict[str, object]:
         """The derivation as its replay key reads it."""
-        return {
+        work: dict[str, object] = {
             "base": None if self.base is None else self.base.id,
             "sources": [source.id for source in self.sources],
             "order": [[component, key] for component, key in self.order],
             "max_new_bytes": max_new_bytes,
         }
+        if self.provenance is not None:
+            work["provenance"] = dict(self.provenance)
+        return work
 
 
 def replay_key(actor: str, code: str, slot: str, work: Mapping[str, object]) -> str:
@@ -202,6 +207,11 @@ def replay_key(actor: str, code: str, slot: str, work: Mapping[str, object]) -> 
     return "sha256:" + hashlib.sha256(f"{actor}\0{code}\0{slot}\0{body}".encode()).hexdigest()
 
 
+def variant(slot: str) -> str:
+    """Output `slot`'s variant path: a variant is its exact path (TensorFS 0.13.9)."""
+    return f"model.{slot}.cozytensors"
+
+
 def finished(store: Path, transaction: str, slot: str) -> Checkpoint | None:
     """Output `slot`'s variant that a finished derivation of `transaction` committed, if `store`
     has one."""
@@ -209,7 +219,7 @@ def finished(store: Path, transaction: str, slot: str) -> Checkpoint | None:
         return tensorfs.open(
             DERIVED,
             revision=tag(transaction),
-            variant=slot,
+            variant=variant(slot),
             cache_dir=store,
             local_files_only=True,
         )
@@ -251,11 +261,13 @@ class Output:
                 base=derivation.base,
                 repo_id=DERIVED,
                 revision=tag(transaction),
-                variant=slot,
+                variant=variant(slot),
                 resume=transaction.removeprefix("sha256:"),
                 cache_dir=store,
             )
         )
+        if self._writer is not None and derivation.provenance is not None:
+            self._writer.metadata["provenance"] = dict(derivation.provenance)
         self._components: dict[str, tensorfs.ComponentWriter] = {}
 
     def close(self) -> None:
