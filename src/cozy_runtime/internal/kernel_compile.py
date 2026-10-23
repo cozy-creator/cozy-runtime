@@ -44,7 +44,7 @@ from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree
+from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree, work
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
 #: function fills `staging` (an `object` file, a `site/` tree, or nothing when the artifact
@@ -207,7 +207,10 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
                 sampled = now
                 if waiting is not None and told.get():
                     waiting(replace(state, kernel=name))
-                pace.observe(_activity(store), now)
+                # The call waiting moves as its builder moves (cl-648): a build is the machine's
+                # work, judged here by its own measure.
+                if pace.observe(_activity(store), now) == "advancing":
+                    work.done += 1
                 if pace.wedged(liveness.noise_floor(), now):
                     verdict = pace.verdict(liveness.noise_floor(), now)
                     _record_failure(job.key, "compile_stalled", verdict)

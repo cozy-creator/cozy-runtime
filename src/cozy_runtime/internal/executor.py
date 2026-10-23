@@ -162,6 +162,7 @@ from cozy_runtime.internal import (
     tolerant,
     tools,
     w4a8_linear,
+    work,
     zygote,
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
@@ -1636,6 +1637,7 @@ class Executor:
             now = time.perf_counter()
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
+            work.done += 1
 
         imported = self.imported
         warmup_error = ""
@@ -2299,6 +2301,7 @@ class Executor:
             now = time.perf_counter()
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
+            work.done += 1
 
         self._stages = stages
         if not binding.model_class:
@@ -5078,6 +5081,8 @@ def serve(executor: Executor, channel: Channel) -> int:
     keeps reading: a call's commands run on the pool, and so does a process-wide one that must
     wait for calls in flight; one that need not runs here, where Start and Fork always ran."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
+    if executor.rank == 0:
+        work.follow(functools.partial(_tell, channel))
     # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
     order = _Order()
@@ -5113,6 +5118,11 @@ def _shut(executor: Executor, channel: Channel) -> int:
     return int(Exit.ok)
 
 
+def _tell(channel: Channel, frame: Frame) -> None:
+    with contextlib.suppress(SeamError):
+        channel.send(frame)
+
+
 def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextManager[None]) -> None:
     """One command on a pool worker, in its turn. A BaseException, or a reply the seam would
     not take, ends the process, as either did when commands ran on the main thread; so does a
@@ -5121,7 +5131,12 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
         with turn:
             call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
             _CALL.set(call)
-            reply = _reply(executor, frame)
+            if call:
+                work.begin(call)
+            try:
+                reply = _reply(executor, frame)
+            finally:
+                work.end(call)
             if reply is None:
                 code = _shut(executor, executor.channel)
                 sys.stdout.flush()
