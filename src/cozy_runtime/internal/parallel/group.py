@@ -17,7 +17,7 @@ import socket
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Protocol, TypedDict
@@ -412,10 +412,7 @@ class RankGroup:
                 pace.observe(
                     (
                         device(),
-                        tuple(
-                            (liveness.moved(f.pid), f.replies.qsize())
-                            for f in self.followers
-                        ),
+                        tuple((liveness.moved(f.pid), f.replies.qsize()) for f in self.followers),
                     )
                 )
                 if pace.wedged(floor):
@@ -483,17 +480,14 @@ class RankGroup:
         self,
         torch: Any,
         sealed: Mapping[str, str],
-        ledgers: Sequence[int] = (),
         again: bool = False,
         nccl: Mapping[str, str] | None = None,
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
-        follower joining it, rank 0 joining last, one barrier as the proof. `ledgers`, a pair per
-        follower in rank order, are their GPUs' grants (table, row): each follows its `join`,
-        then the
-        socket its watcher reads (`interrupt`). `again` forms it AGAIN after an `interrupt`:
-        every follower joins a new store.
+        follower joining it, rank 0 joining last, one barrier as the proof; each follower's join is
+        followed by the socket its watcher reads (`interrupt`). `again` forms it AGAIN after an
+        `interrupt`: every follower joins a new store.
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
         barrier, while each follower runs its half before it answers the join."""
         dist = torch.distributed
@@ -517,15 +511,13 @@ class RankGroup:
             "nccl": self.nccl,
             "calibrate": formed is not None,
         }
-        for index, follower in enumerate(self.followers):
+        for follower in self.followers:
             if again:
                 self.send_one(follower.rank, {**join, "again": True})
                 continue
             follower.abort, watcher = socket.socketpair()
             try:
-                self.send_one(follower.rank, {**join, "ledger": bool(ledgers), "abort": True})
-                if ledgers:
-                    follower.channel.send_ledger(*ledgers[2 * index : 2 * index + 2])
+                self.send_one(follower.rank, {**join, "abort": True})
                 follower.channel.send_descriptor(watcher)
             except SeamError as exc:
                 raise GroupRefusal(
@@ -570,9 +562,9 @@ class RankGroup:
                 ) from exc
 
     def start(self, command: Mapping[str, object]) -> None:
-        """Hand every follower rank 0's Start. The ledger descriptors that follow TensorD's
-        Start are rank 0's; a follower takes its own at join (`form`), so the Start it gets
-        names none, or it would wait in `start` for descriptors nobody sends."""
+        """Hand every follower rank 0's Start. The descriptors that follow TensorD's Start are
+        rank 0's: the Start a follower gets names none, or it would wait for descriptors nobody
+        sends."""
         self.broadcast({**command, "ledgers": 0})
 
     def collect(self, name: str) -> list[dict[str, Any]]:

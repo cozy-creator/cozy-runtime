@@ -63,9 +63,6 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
-    #: The follower's GPU grant (its table and row descriptions) follows this command: it
-    #: claims its row there.
-    ledger: bool = False
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False
     #: The group forms again after a call ended short of memory (`mirror.mirror_component`).

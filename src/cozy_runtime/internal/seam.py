@@ -192,27 +192,6 @@ class Channel:
             raise
         return received
 
-    def send_ledger(self, table: int, row: int) -> None:
-        """Hand over one GPU's grant (`tensorfs.varena.Grant`): its table, then the table's
-        description for this process's row lock."""
-        for fd in (table, row):
-            _require_table(fd)
-        self._send_fd(table, "ledger table")
-        self._send_fd(row, "ledger row")
-
-    def recv_ledger(self) -> tuple[int, int]:
-        """One GPU's grant: its table and row descriptions; anything else is closed and
-        refused."""
-        table, row = self.recv_fds(2)
-        try:
-            _require_table(table)
-            _require_table(row)
-        except SeamError:
-            os.close(table)
-            os.close(row)
-            raise
-        return table, row
-
     def recv_fds(self, count: int) -> list[int]:
         """`count` descriptors, unopened."""
         received: list[int] = []
@@ -628,15 +607,3 @@ def sealed(name: str, body: bytes) -> int:
         os.close(fd)
         raise
     return fd
-
-
-def _require_table(fd: int) -> None:
-    """A varena table: a regular file open to read and write (varena checks its owner and
-    modes when it adopts it). Linux only, as varena's ledger is."""
-    try:
-        found = os.fstat(fd)
-        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
-    except OSError as exc:
-        raise SeamError("seam_descriptor", f"ledger unreadable: {exc}") from exc
-    if not stat.S_ISREG(found.st_mode) or access != os.O_RDWR:
-        raise SeamError("seam_descriptor", "a ledger must be a regular file open read-write")

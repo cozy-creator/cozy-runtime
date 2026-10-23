@@ -27,7 +27,7 @@ import msgspec
 import pytest
 
 from cozy_runtime.author._signature import ModelBinding
-from cozy_runtime.internal import executor_commands, package_interface, seam, spawn
+from cozy_runtime.internal import executor_commands, package_interface, spawn
 from cozy_runtime.internal.config import seal_snapshot
 from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.parallel import cp, wire
@@ -325,11 +325,11 @@ def test_a_follower_death_breaks_the_group_loudly(tmp_path: Path) -> None:
 
 
 def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one grant per GPU after its Start; rank 0
-    forwards the Start to its followers, which take their own ledger at join. A follower
-    handed the Start as TensorD sent it waited in `start` for descriptors nobody sends, and
-    the group wedged there (runs 11824, 11829). Real follower processes take rank 0's
-    forwarded Start and answer it: here, that its package interface is absent."""
+    """TensorD's descriptors follow rank 0's Start alone; rank 0 forwards the Start to its
+    followers naming none. A follower handed the Start as TensorD sent it waited in `start` for
+    descriptors nobody sends, and the group wedged there (runs 11824, 11829). Real follower
+    processes take rank 0's forwarded Start and answer it: here, that its package interface is
+    absent."""
     env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
     group = RankGroup(
         degree=2,
@@ -477,39 +477,6 @@ def test_rank_0_names_its_followers_in_rank_order_before_they_open_memory(
         process.wait()
         leases.close()
         seam_listener.close()
-
-
-@needs_torch
-@pytest.mark.skipif(sys.platform != "linux", reason="varena's ledger is Linux's")
-def test_a_group_forms_with_each_followers_grant(tmp_path: Path) -> None:
-    """TensorD hands rank 0 one grant (the table and a description for the row's lock) per
-    GPU; rank 0 relays each follower's at join, and the follower opens its memory on it. Both
-    cross the real seam to a real follower process, and the group forms past join (run 11905
-    broke there, a descriptor refused as the wrong kind)."""
-    import torch
-
-    env = {**os.environ, "CUDA_VISIBLE_DEVICES": "4,5"}
-    group = RankGroup(
-        degree=2,
-        backend="gloo",
-        python=sys.executable,
-        root=str(tmp_path),
-        sample_seconds=0.2,
-        launch=_launcher(env),
-        devices=("4", "5"),
-    )
-    table = seam.anonymous("cozy-test-table")
-    row = os.open(f"/proc/self/fd/{table}", os.O_RDWR | os.O_CLOEXEC)
-    try:
-        group.spawn()
-        group.dial_back(seal_snapshot(env))
-        group.form(torch, {"NCCL_NVLS_ENABLE": "0"}, ledgers=[table, row])
-        assert group.formed and torch.distributed.get_world_size() == 2
-    finally:
-        group.close()
-        os.close(table)
-        os.close(row)
-    assert not torch.distributed.is_initialized()
 
 
 @needs_torch

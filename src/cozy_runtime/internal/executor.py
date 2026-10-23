@@ -67,7 +67,6 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import tensorfs
 from msgspec import UNSET, UnsetType
-from tensorfs.varena import Grant
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -799,9 +798,6 @@ class Executor:
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: HOST ONLY: its GPUs' grants from `Start`, a table and an events descriptor per GPU
-        #: (rank 0 hands follower r the r-th, a follower holds its own)
-        self.ledgers: list[int] = []
         #: Why a GPU runs standalone ("" it does not): TensorD asked to lease and no manager
         #: answers (`Memory.standalone`)
         self.standalone = ""
@@ -1044,12 +1040,11 @@ class Executor:
         host = self.host
         if host.memory is not None:
             return
-        device, ledgers = self._rank_device(torch), host.ledgers
-        grant = Grant(*ledgers[:2]) if device.type == "cuda" and ledgers else None
+        device = self._rank_device(torch)
         # TensorD's lease namespace, when it leases this GPU's weight pages. A follower that
         # dials before rank 0's progress frame registers it is held until TensorD has.
         leases = host.leases if device.type == "cuda" else None
-        host.memory, host.execution = Memory.open(device, grant, leases=leases), execution
+        host.memory, host.execution = Memory.open(device, leases=leases), execution
         if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
             host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
         if device.type == "cuda":  # steps report the device's time beside the host's
@@ -1136,14 +1131,6 @@ class Executor:
         """A FOLLOWER joins rank 0's store and forms its half of the process group."""
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
-        if command.ledger:
-            # Its grant follows the frame: taken first, whatever this join answers.
-            fds = self.channel.recv_ledger()
-            if self.host.ledgers:
-                for fd in fds:
-                    os.close(fd)
-            else:
-                self.host.ledgers = list(fds)
         if command.abort:
             watcher = socket.socket(fileno=self.channel.recv_descriptor())
             threading.Thread(
@@ -1595,12 +1582,8 @@ class Executor:
                 f"TensorD supplied {command.memory_protocol}. Upgrade TensorD, Runtime "
                 "and TensorFS together.",
             }
-        ledgers = [fd for _ in range(command.ledgers) for fd in self.channel.recv_ledger()]
-        if self.poisoned or self.ledgers:
-            for fd in ledgers:  # one set per process
-                os.close(fd)
-        else:
-            self.ledgers = ledgers
+        for fd in self.channel.recv_fds(2 * command.ledgers):  # TensorD's rows: leases serve
+            os.close(fd)
         self.leases = command.leases
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
@@ -1765,7 +1748,6 @@ class Executor:
                     self.pg = self.group.form(
                         self.torch,
                         _SEALED,
-                        self.ledgers[2:],
                         nccl=self.transport.nccl,
                         formed=self._calibrated if measured.copy_engines else None,
                     )
