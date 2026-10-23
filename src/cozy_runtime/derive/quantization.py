@@ -566,7 +566,7 @@ def _fit_tensor(
         "read_s": read - started,
         "fit_s": time.perf_counter() - read,
         "encode_s": fitted.encode_s,
-        "rss_mb": _resident_mb(),
+        **_host_mb(),
     }
     if cuda:  # what this fit held, then given back: the model's pages need the room more
         measured["peak_mb"] = torch.cuda.max_memory_allocated() / 2**20
@@ -588,13 +588,22 @@ def _fit_tensor(
     )
 
 
-def _resident_mb() -> float:
-    """This process's resident host memory now, from `/proc` (0 where there is none)."""
+def _host_mb() -> dict[str, float]:
+    """The host's memory now, from `/proc` (none where there is no `/proc`): this process's
+    resident set, what the kernel says is available, and its page cache."""
+    out: dict[str, float] = {}
     try:
         pages = int(Path("/proc/self/statm").read_text().split()[1])
+        out["rss_mb"] = pages * os.sysconf("SC_PAGE_SIZE") / 2**20
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            name, _, value = line.partition(":")
+            if name in ("MemAvailable", "Cached"):
+                out[{"MemAvailable": "avail_mb", "Cached": "cache_mb"}[name]] = (
+                    int(value.split()[0]) / 1024
+                )
     except (OSError, IndexError, ValueError):
-        return 0.0
-    return pages * os.sysconf("SC_PAGE_SIZE") / 2**20
+        pass
+    return out
 
 
 class _Stopped(Exception):
