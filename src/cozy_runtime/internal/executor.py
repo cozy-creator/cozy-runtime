@@ -67,6 +67,7 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import tensorfs
 from msgspec import UNSET, UnsetType
+from tensorfs.varena import VarenaError
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -1033,7 +1034,10 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
-        self._open_memory(torch)  # before torch's context, so varena measures its own
+        try:
+            self._open_memory(torch)  # before torch's context, so varena measures its own
+        except VarenaError as exc:  # its torch allocator will not load, or TensorD refused it
+            return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
@@ -4292,7 +4296,13 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
+            functools.partial(self._yielding, request_id),
         )
+
+    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
+        """A wait on a child call: the attempt's step pages are taken before the child's."""
+        request = self.requests.get(request_id)
+        return request.yielding() if request is not None else contextlib.nullcontext()
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
