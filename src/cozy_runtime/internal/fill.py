@@ -10,10 +10,13 @@ assets through the store. Refusals are spoken in `FillRefusal`'s vocabulary.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import json
 import sys
+import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from types import ModuleType
 
 import tensorfs
 from tensorfs import raw
@@ -194,13 +197,39 @@ def _transformers_binding(config: Mapping[str, object]) -> Callable[[str], str]:
         built, prefix = None, None
     else:
         with torch.device("meta"):
-            model = model_cls._from_config(transformers.AutoConfig.for_model(**config))
+            model = model_cls._from_config(
+                transformers.AutoConfig.for_model(**_strict_floats(transformers, config))
+            )
         transforms = mapping.get_model_conversion_mapping(model)
         built, prefix = dict.fromkeys(model.state_dict()), model.base_model_prefix
     renamings = [t for t in transforms or () if isinstance(t, loading.WeightRenaming)]
     if not renamings:
         return str
     return lambda name: str(loading.rename_source_key(name, renamings, [], prefix, built)[0])
+
+
+def _strict_floats(transformers: ModuleType, config: Mapping[str, object]) -> dict[str, object]:
+    """`config` with each whole number its Transformers config class declares a float as a
+    float, sub-configs (`text_config`) by their own model types. Canonical JSON stores 1.0 as 1,
+    and Transformers 5's strict configs refuse an int for a float field (SDXL's CLIP
+    `initializer_factor`, runs 15006/15012/15014); its own loader reads `config.json`'s 1.0."""
+    model_type = str(config.get("model_type", ""))
+    # Indexed: the lazy mapping's `get` reads its unloaded dict and answers None.
+    known = transformers.CONFIG_MAPPING
+    cls = known[model_type] if model_type in known else None  # noqa: SIM401
+    floats = {
+        f.name
+        for f in (dataclasses.fields(cls) if dataclasses.is_dataclass(cls) else ())
+        if float in (typing.get_args(f.type) or (f.type,)) and int not in typing.get_args(f.type)
+    }
+    out: dict[str, object] = {}
+    for name, value in config.items():
+        if isinstance(value, Mapping) and "model_type" in value:
+            value = _strict_floats(transformers, value)
+        elif type(value) is int and name in floats:
+            value = float(value)
+        out[name] = value
+    return out
 
 
 class Checkpoint:
