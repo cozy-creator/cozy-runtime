@@ -920,7 +920,7 @@ def _inject(
         elif param.role == "preflight":
             kwargs[param.name] = facts
         elif param.role in ("model", "weights"):
-            model = _model(param, inv)
+            model = _model(param, inv, param.name in surface.model_on_demand)
             artifact = getattr(overlay.payload, param.name, None) if surface.invocable else None
             if artifact is not None and (
                 not isinstance(artifact, ModelArtifact)
@@ -941,8 +941,10 @@ def _inject(
     return kwargs
 
 
-def _model(param: Param, inv: Invocation) -> object:
+def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
     model = (inv.sources if param.role == "weights" else inv.models).get(param.name)
+    if model is None and on_demand:
+        return _Unbound(param.name)  # a request may leave it unused: refused only when read
     if model is None:
         raise InvalidRequest(
             f"no model bound for parameter {param.name!r}: the run names none and the slot "
@@ -951,6 +953,23 @@ def _model(param: Param, inv: Invocation) -> object:
             fields=[param.name],
         )
     return model
+
+
+class _Unbound:
+    """An on-demand model slot the run names no model for: reading it refuses the request."""
+
+    __slots__ = ("_name",)
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+
+    def __getattr__(self, attribute: str) -> object:
+        raise InvalidRequest(
+            f"no model bound for parameter {self._name!r}: the run names none, and this request "
+            "reads it",
+            code="unbound_model",
+            fields=[self._name],
+        )
 
 
 def _service(

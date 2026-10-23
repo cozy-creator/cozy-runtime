@@ -433,11 +433,13 @@ def analyze(
     model_defaults: Mapping[str, str] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
+    model_classes: Mapping[str, type[Model[Any]]] | None = None,
 ) -> Surface:
-    """Derive the whole surface from the signature. Every refusal here is a BUILD refusal."""
+    """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
+    `model_classes` names a model argument's class in place of its annotation."""
     where = f"{fn.__module__}:{fn.__qualname__}"
     signature = inspect.signature(fn)
-    hints = _hints(fn)
+    hints = {**_hints(fn), **(model_classes or {})}
     params: list[Param] = []
     wire_fields: list[Any] = []
     for parameter in signature.parameters.values():

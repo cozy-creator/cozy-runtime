@@ -11,11 +11,14 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
+import os
 import tempfile
 import threading
+import time
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from pathlib import Path
 from typing import IO, NamedTuple
 
 import msgspec
@@ -388,9 +391,12 @@ def quantize_component_into(
     def scheme(tensor: QuantizationTensor) -> str:
         return tensor.encoding or encoding
 
+    fitted = None
     if any(_ENCODINGS[scheme(t)].calibrated for t in pending):
         # Fitted one at a time on this thread: its GPU allocations are the attempt's, which the
-        # memory manager answers by making room (`library_oom`).
+        # memory manager answers by making room (`library_oom`). Each tensor is a step of the
+        # run's record, with the host code any slow one waited in (`author._stalls`).
+        fitted = tel.step_callback(len(pending), stage=f"fitting {component}")
         stop = threading.Event()
         results: Generator[_Encoded, None, None] = (
             _encode_tensor(source, scheme(t), t, stop, calibration) for t in pending
@@ -445,6 +451,8 @@ def quantize_component_into(
             tel.log("quantized tensor", level="info", encoding=name, component=component,
                     key=tensor.key, done=done, total=total, **(result.fit or {}))  # fmt: skip
             tel.progress(done / total, stage=f"{encoding}-{component}")
+            if fitted is not None:
+                fitted(done - 1 - reused)
     return QuantizationStats(
         encoded_keys=len(pending),
         reused_keys=reused,
@@ -543,12 +551,27 @@ def _fit_tensor(
     if calibration is None:
         _uncalibrated(f"{tensor.component}.{tensor.key}")
     assert calibration is not None
+    started = time.perf_counter()
     values = np.concatenate(list(read_chunks()))
     torch = calibration.torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cuda = torch.cuda.is_available()
+    if cuda:
+        torch.cuda.reset_peak_memory_stats()
+    read = time.perf_counter()
     fitted = svdq.fit(
-        torch, tensor.key, values, calibration.stats(tensor.component, tensor.key), device
-    )
+        torch, tensor.key, values, calibration.stats(tensor.component, tensor.key),
+        "cuda" if cuda else "cpu",
+    )  # fmt: skip
+    measured = {
+        "read_s": read - started,
+        "fit_s": time.perf_counter() - read,
+        "encode_s": fitted.encode_s,
+        "rss_mb": _resident_mb(),
+    }
+    if cuda:  # what this fit held, then given back: the model's pages need the room more
+        measured["peak_mb"] = torch.cuda.max_memory_allocated() / 2**20
+        measured["reserved_mb"] = torch.cuda.memory_reserved() / 2**20
+        torch.cuda.empty_cache()
     spill = tempfile.TemporaryFile()  # noqa: SIM115 - the caller closes it, as _encode_tensor's
     spill.write(fitted.payload)
     return _Encoded(
@@ -560,8 +583,18 @@ def _fit_tensor(
         fitted.energy,
         fitted.saturated,
         values.size * _WIDTH[tensor.logical_dtype],
-        {"alpha": fitted.alpha, "error": fitted.error, "nvfp4_error": fitted.nvfp4_error},
+        {"alpha": fitted.alpha, "error": fitted.error, "nvfp4_error": fitted.nvfp4_error}
+        | {name: round(value, 2) for name, value in measured.items()},
     )
+
+
+def _resident_mb() -> float:
+    """This process's resident host memory now, from `/proc` (0 where there is none)."""
+    try:
+        pages = int(Path("/proc/self/statm").read_text().split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0.0
+    return pages * os.sysconf("SC_PAGE_SIZE") / 2**20
 
 
 class _Stopped(Exception):

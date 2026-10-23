@@ -120,7 +120,12 @@ def test_the_runtime_operations_still_take_a_callers_plan() -> None:
 
 
 def _run(
-    root: Path, found: Discovered, source: str, request: dict[str, str], lanes: list[str]
+    root: Path,
+    found: Discovered,
+    source: str,
+    request: dict[str, str],
+    lanes: list[str],
+    models: tuple[str, ...] = (),
 ) -> tuple[dict[str, Any], list[CheckpointItem]]:
     shown: list[CheckpointItem] = []
 
@@ -131,7 +136,7 @@ def _run(
         return Answer(ok=True)
 
     spool = root / f"quantize-{request['lane']}"
-    with session(root, found) as host:
+    with session(root, found, models=models) as host:
         host.handler = machine
         reply = host.run(
             "quantize",

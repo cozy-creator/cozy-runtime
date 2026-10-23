@@ -5,6 +5,7 @@ executor's durable requests with `handler`."""
 from __future__ import annotations
 
 import contextlib
+import json
 import socket
 import threading
 from collections.abc import Iterator
@@ -59,9 +60,11 @@ class Session:
 
 
 @contextlib.contextmanager
-def session(root: Path, found: Discovered, *, devices: str = "", **start: Any) -> Iterator[Session]:
+def session(
+    root: Path, found: Discovered, *, devices: str = "", models: tuple[str, ...] = (), **start: Any
+) -> Iterator[Session]:
     """`found`'s release started on `devices` (and `start`'s other fields) with one
-    construction of no constructed model."""
+    construction binding the model slots `models` (paths; none constructed unless used)."""
     interface = root / "package-interface.json"
     interface.write_bytes(package_interface.canonical_bytes(package_interface.build(found)))
     release = {"application": found.application, "package_interface": str(interface)}
@@ -86,7 +89,18 @@ def session(root: Path, found: Discovered, *, devices: str = "", **start: Any) -
         executor = current.executor
         started = executor.start(msgspec.convert({**release, **start, "devices": devices}, Start))
         assert started["ok"], started
-        load = {"devices": devices, "binding": release, "construction": "plan"}
+        slots = {
+            slot["path"]: slot["class"]
+            for entry in json.loads(interface.read_bytes())["entrypoints"]
+            for slot in entry.get("models", ())
+        }
+        rows = [
+            {"binding": {**release, "model_class": slots[path], "model_binding_path": path,
+                         "model_parameter_name": path.rsplit(".", 1)[1]}}
+            for path in models
+        ]  # fmt: skip
+        load = {"devices": devices, "construction": "plan"}
+        load |= {"models": rows} if rows else {"binding": release}
         assert executor.load(msgspec.convert(load, Load))["ok"]
         assert executor.activate(Activate(construction="plan"))["ok"]
         try:

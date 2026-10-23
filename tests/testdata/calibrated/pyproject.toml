@@ -1,0 +1,17 @@
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13"]
+build-backend = "uv_build"
+
+[project]
+name = "tiny-calibrated"
+version = "0.1.0"
+description = "A calibrated quantize recipe beside a plain one"
+requires-python = ">=3.12,<3.13"
+dependencies = ["cozy-runtime", "msgspec>=0.19"]
+
+[project.entry-points."cozy.application"]
+default = "tiny_calibrated:app"
+
+[tool.uv.build-backend]
+module-name = "tiny_calibrated"
+module-root = ""

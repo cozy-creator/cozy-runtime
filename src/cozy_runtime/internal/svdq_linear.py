@@ -422,7 +422,7 @@ def _table(torch: ModuleType, device: object) -> Tensor:
 def _values(torch: ModuleType, codes: Tensor, scales: Tensor, g: Tensor) -> Tensor:
     """nvfp4 codes `[R, C]` (u8, sign in bit 3) with E4M3 scales `[R, C/16]` at second level `g`,
     in f32: `(E2M1 · scale) · g`."""
-    blocks = _table(torch, codes.device)[codes.long()].view(codes.shape[0], -1, NVFP4_BLOCK)
+    blocks = _table(torch, codes.device)[codes.int()].view(codes.shape[0], -1, NVFP4_BLOCK)
     return (blocks * scales.float().unsqueeze(-1) * g.float().reshape(())).view(codes.shape)
 
 

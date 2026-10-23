@@ -8,12 +8,14 @@ The static describe finds every `Recipe` bound at module scope of a module the A
 records it in the package interface (`recipes`), named by its binding in lower case. A plan is
 pure data: its canonical form (`canonical`) and that form's digest (`fingerprint`) identify it.
 Work a plan cannot say is a `DerivationHook`: a plain module-level function, identified by its
-module and name and fingerprinted with the package release that ships it.
+module and name and fingerprinted with the package release that ships it. A plan fitted to the
+model's own activations (`svdq.nvfp4`) names its `calibrate` function the same way: it runs real
+inputs through the model, constructed at the source's 16 bits, while their recorder is open.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -32,6 +34,8 @@ if TYPE_CHECKING:
 
 #: The entrypoint that runs a package's recipes (`cozy_runtime.derive.recipes`).
 ENTRYPOINT = "quantize"
+#: The Runtime function a package with a calibrated recipe registers as its `quantize`.
+CALIBRATED_ENTRYPOINT = "quantize_calibrated"
 
 
 class EncodingRule(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
@@ -94,6 +98,9 @@ class DerivationHook:
 
 
 type Plan = QuantizationPlan | SelectionPlan | DerivationHook
+#: `calibrate(ctx, tel, model, record)`: runs real inputs through `model` inside
+#: `with record(components):`, `components` naming its modules (`{"transformer": module}`).
+type Calibrate = Callable[[Context, Telemetry, Any, Callable[[Mapping[str, Any]], Any]], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +110,8 @@ class Recipe:
     lane: str
     model: type[Model[Any]]
     plan: Plan
+    #: A plan fitted to the model's activations: what runs real inputs through it (`Calibrate`).
+    calibrate: Calibrate | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.lane, str) or _OUTPUT_NAME.fullmatch(self.lane) is None:
@@ -114,6 +123,13 @@ class Recipe:
         if not isinstance(self.plan, (QuantizationPlan, SelectionPlan, DerivationHook)):
             raise ConformanceError(
                 "a recipe's plan is a QuantizationPlan, SelectionPlan or DerivationHook",
+                code="recipe_declaration",
+            )
+        if self.calibrate is not None and not (
+            isinstance(self.plan, QuantizationPlan) and callable(self.calibrate)
+        ):
+            raise ConformanceError(
+                "a recipe's calibrate is a function, beside a QuantizationPlan",
                 code="recipe_declaration",
             )
 
@@ -138,8 +154,10 @@ class DeclaredRecipe(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=Tr
     export: str
     model: RecipeModel
     plan: dict[str, Any]
-    #: a declared plan's; a hook's joins its release, so the run computes it
+    #: a declared plan's; a hook's or a calibrated plan's joins its release, so the run computes it
     fingerprint: str = ""
+    #: `module:name` of a calibrated plan's `calibrate` function; "" for none
+    calibrate: str = ""
 
 
 def outputs(lanes: Iterable[str]) -> tuple[WeightsOutput, ...]:
@@ -152,14 +170,24 @@ def outputs(lanes: Iterable[str]) -> tuple[WeightsOutput, ...]:
 def canonical(plan: Plan) -> dict[str, Any]:
     """`plan` as JSON: its fields without defaults, tagged by `kind`; a hook by its function."""
     if isinstance(plan, DerivationHook):
-        function = plan.function
-        return {"kind": "derivation", "hook": f"{function.__module__}:{function.__name__}"}
+        return {"kind": "derivation", "hook": identity(plan.function)}
     decoded: dict[str, Any] = msgspec.json.decode(msgspec.json.encode(plan))
     return decoded
 
 
-def fingerprint(plan: dict[str, Any], package: str = "", release: str = "") -> str:
-    """The digest of a canonical plan. A hook is code, so its package and release join it."""
+def fingerprint(
+    plan: dict[str, Any], package: str = "", release: str = "", calibrate: str = ""
+) -> str:
+    """The digest of a canonical plan. A hook, or a plan's `calibrate`, is code, so its package
+    and release join it."""
     if plan.get("kind") == "derivation":
         return canonical_json.digest({**plan, "package": package, "release": release})
+    if calibrate:
+        coded = {"calibrate": calibrate, "package": package, "release": release}
+        return canonical_json.digest({**plan, **coded})
     return canonical_json.digest(plan)
+
+
+def identity(function: Callable[..., Any]) -> str:
+    """A module-level function as a recipe names it: `module:name`."""
+    return f"{function.__module__}:{function.__name__}"

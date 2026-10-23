@@ -12,16 +12,20 @@ from typing import Any
 import numpy as np
 import pytest
 
-from cozy_runtime.author import Weights
-from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
-from cozy_runtime.derive import svdq
-from cozy_runtime.derive.microscale import e4m3_decode, unpack_nibbles
-from cozy_runtime.derive.operations import (
+from cozy_runtime.author import (
     EncodingRule,
+    Loader,
+    Model,
     QuantizationPlan,
-    calibrate,
-    quantize_into,
+    Recipe,
+    Weights,
+    uses_components,
 )
+from cozy_runtime.author._recipes import DeclaredRecipe, RecipeModel, canonical, fingerprint
+from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
+from cozy_runtime.derive import recipes, svdq
+from cozy_runtime.derive.microscale import e4m3_decode, unpack_nibbles
+from cozy_runtime.derive.operations import calibrate, quantize_into
 from cozy_runtime.internal import (
     decode_cores,
     decode_schemes,
@@ -156,6 +160,7 @@ def test_a_recipe_writes_the_lane_from_its_calibration_and_tensorfs_decodes_it(
     text = np.random.default_rng(4).standard_normal((64, 256)).astype(np.float32)
     source = checkpoint(store, {"transformer": held, "text_encoder": {"q.weight": text}})
     plan = QuantizationPlan(
+        encoding="int8.convrot",
         components=("transformer", "text_encoder"),
         include=("transformer.*.weight", "text_encoder.*.weight"),
         encodings=(EncodingRule("transformer.*", "svdq.nvfp4"),),
@@ -164,15 +169,14 @@ def test_a_recipe_writes_the_lane_from_its_calibration_and_tensorfs_decodes_it(
     shown: list[tuple[str, str, str, str, str]] = []
     ctx = context(store, shown=shown, outputs={"model": 64 << 20})
     recorder = calibrate(
-        ctx, torch, source=Weights(source), components={"transformer": net}, plan=plan,
-        encoding="int8.convrot",
-    )  # fmt: skip
+        ctx, torch, source=Weights(source), components={"transformer": net}, plan=plan
+    )
     with recorder, torch.no_grad():
         for seed in range(3):
             net(inputs(torch, seed))
     quantize_into(
         ctx, fake_telemetry(fake_attempt("svdq")), source=Weights(source), plan=plan,
-        encoding="int8.convrot", output="model", calibration=recorder,
+        output="model", calibration=recorder,
     )  # fmt: skip
     out = adopted(store, shown)
     assert out.components["text_encoder"].tensors["q.weight"].encoding.scheme == "int8.convrot"
@@ -195,6 +199,73 @@ def test_a_recipe_writes_the_lane_from_its_calibration_and_tensorfs_decodes_it(
             (law(torch, parts) - torch.from_numpy(held[key])).norm() / np.linalg.norm(held[key])
         )
         assert relative < 0.1, (key, relative)
+
+
+class Net(Model[object]):
+    """`model()`'s two linears as a package's model, its `transformer` component."""
+
+    def load(self, loader: Loader) -> None:
+        return None
+
+    @uses_components("transformer")
+    def denoise(self, x: Any) -> Any:
+        return self.net(x)
+
+
+def three_inputs(ctx: Any, tel: Any, model: Net, record: Any) -> None:
+    torch = pytest.importorskip("torch")
+    with record({"transformer": model.net}), torch.no_grad():
+        for seed in range(3):
+            model.denoise(inputs(torch, seed))
+
+
+SVDQ = Recipe(
+    lane="model",
+    model=Net,
+    plan=QuantizationPlan(
+        encoding="int8.convrot",
+        components=("transformer",),
+        include=("transformer.*.weight",),
+        encodings=(EncodingRule("transformer.*", "svdq.nvfp4"),),
+        output_precision="preserve",
+    ),
+    calibrate=three_inputs,
+)
+
+
+def test_a_calibrated_recipe_runs_its_inputs_then_writes_the_lane_with_its_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`quantize_calibrated`'s run: the declared recipe's `calibrate` takes the model and opens
+    the recorder; the lane is fitted to what it recorded, and its provenance names the function."""
+    torch = pytest.importorskip("torch")
+    store = home(tmp_path / "tensorfs", monkeypatch)
+    model = Net()
+    model.net = calibrated(torch)[0]
+    held = {f"{i}.weight": model.net[i].weight.detach().numpy().copy() for i in (0, 2)}
+    source = checkpoint(store, {"transformer": held})
+    shown: list[tuple[str, str, str, str, str]] = []
+    ctx = context(store, shown=shown, outputs={"model": 64 << 20})
+    row = DeclaredRecipe(
+        name="svdq", lane="model", module=__name__, export="SVDQ",
+        model=RecipeModel(class_name="Net"), plan=canonical(SVDQ.plan),
+        calibrate=f"{__name__}:three_inputs",
+    )  # fmt: skip
+    ctx._recipes = (row,)
+    asked = {"package": "acme/net", "release": "1.0.0"}
+    recipes._run(ctx, fake_telemetry(fake_attempt("svdq")), Weights(source), model, lane="model",
+                 recipe="", **asked)  # fmt: skip
+    out = adopted(store, shown)
+    provenance = out.metadata["provenance"]
+    assert provenance["calibrate"] == row.calibrate
+    assert provenance["fingerprint"] == fingerprint(row.plan, calibrate=row.calibrate, **asked)
+    assert provenance["fingerprint"] != fingerprint(row.plan, **asked)
+    for key in held:
+        encoding = out.components["transformer"].tensors[key].encoding
+        assert encoding is not None and encoding.scheme == "svdq.nvfp4", key
+    with pytest.raises(Exception, match="calibrates on its model"):
+        recipes._run(ctx, fake_telemetry(fake_attempt("again")), Weights(source), None,
+                     lane="model", recipe="", **asked)  # fmt: skip
 
 
 def test_the_decode_cores_are_the_spec_law() -> None:
@@ -290,7 +361,7 @@ def test_a_request_lora_joins_the_low_rank_branch() -> None:
             "a": _row("transformer.lin.lora_A.default.weight", "plain", {"value": "bf16"}),
             "b": _row("transformer.lin.lora_B.default.weight", "plain", {"value": "bf16"}),
         }
-        bakes = weights._Bakes(torch, root, rows, set(), lambda module: None)
+        bakes = weights._Bakes(torch, root, rows, set(), lambda module: None, None)
         assert bakes.prepare() == ("bake",) and layer._cozy_baked
         bakes(None, {"w": parts, "a": {"value": down.weight}, "b": {"value": up.weight}})
         assert all(

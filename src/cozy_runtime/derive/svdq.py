@@ -17,6 +17,7 @@ The logical weight is `residual / s + up · down`, which TensorFS decodes.
 from __future__ import annotations
 
 import random
+import time
 import zlib
 from collections.abc import Iterable, Mapping
 from types import ModuleType
@@ -38,6 +39,8 @@ RANK = 32
 ROWS = 512
 #: Rows sampled from each call before the reservoir draw.
 PER_CALL = 32
+#: Weight rows a fit's nvfp4 round trips take at a time: what bounds its temporaries.
+BLOCK = 2048
 #: The column multiple the kernels need (`svdq_linear`'s K step).
 K_ALIGN = svdq_linear.K_ALIGN
 #: `input_scale`'s headroom over the calibrated `|x / s|` max: a request's activations may exceed
@@ -153,6 +156,8 @@ class Fitted(NamedTuple):
     saturated: int
     error: float
     nvfp4_error: float
+    #: Seconds the residual's nvfp4 encode took (on the host).
+    encode_s: float
 
 
 def companions(rows: int, cols: int) -> tuple[tuple[str, str, tuple[int, ...]], ...]:
@@ -173,7 +178,8 @@ def _bf16(torch: ModuleType, t: Any) -> Any:
 
 def fit(torch: ModuleType, key: str, weight: np.ndarray, stats: Stats, device: Any) -> Fitted:
     """`svdq.nvfp4` for one weight: the alpha whose whole scheme best reproduces the reservoir's
-    outputs, token by token; then the stored parts."""
+    outputs, token by token; then the stored parts. A weight's temporaries are bounded by
+    `BLOCK` rows of it at a time beside the weight and its residual."""
     w = torch.from_numpy(np.ascontiguousarray(weight, dtype=np.float32)).to(device)
     rows = stats.rows.to(device).float()
     if len(rows) == 0:
@@ -184,8 +190,10 @@ def fit(torch: ModuleType, key: str, weight: np.ndarray, stats: Stats, device: A
     def off(y: Any) -> float:
         return float(((y - ref).norm(dim=1) / ref.norm(dim=1).clamp(min=1e-30)).mean())
 
-    plain = svdq_linear.fake(torch, _bf16(torch, rows), rows.abs().amax() / svdq_linear.LEVELS_MAX)
-    plain = off(plain @ svdq_linear.fake(torch, w, w.abs().amax() / svdq_linear.LEVELS_MAX).t())
+    def scale(t: Any) -> Any:
+        return (t.abs().amax() / svdq_linear.LEVELS_MAX).clamp(min=1e-30)
+
+    plain = off(_through(torch, svdq_linear.fake(torch, _bf16(torch, rows), scale(rows)), w))
     wmax = w.abs().amax(0).clamp(min=1e-5)
     best: tuple[float, float, Any, Any, Any] | None = None
     for alpha in ALPHAS:
@@ -194,26 +202,27 @@ def fit(torch: ModuleType, key: str, weight: np.ndarray, stats: Stats, device: A
         u, sv, vt = _top(torch, w * s, RANK + 16, zlib.crc32(key.encode()))
         up, down = _bf16(torch, u[:, :RANK] * sv[:RANK]), _bf16(torch, vt[:RANK] / s)
         residual = w * s - up @ (down * s)
-        gw = (residual.abs().amax() / svdq_linear.LEVELS_MAX).clamp(min=1e-30)
         gx = ((xmax / s).amax() * MARGIN / svdq_linear.LEVELS_MAX).clamp(min=1e-30)
-        y = (
-            svdq_linear.fake(torch, _bf16(torch, rows / s), gx)
-            @ svdq_linear.fake(torch, residual, gw).t()
-        )
+        y = _through(torch, svdq_linear.fake(torch, _bf16(torch, rows / s), gx), residual)
         err = off(y + _bf16(torch, rows @ down.t()) @ up.t())
         if best is None or err < best[0]:
             best = (err, alpha, s, up, down)
+        del residual, y
     assert best is not None
     _, alpha, s, up, down = best
     residual = w * s - up @ (down * s)
+    started = time.perf_counter()
     encoded = encode_nvfp4(key, residual.cpu().numpy())
+    encode_s = time.perf_counter() - started
     gx = (xmax / s).amax() * MARGIN / svdq_linear.LEVELS_MAX
     p = 1.0 / s
     stored = _decode(torch, encoded, residual.shape, device)
     y = svdq_linear.fake(torch, _bf16(torch, rows * p), gx) @ stored.t()
     served = off(y + _bf16(torch, rows @ down.t()) @ up.t())
-    error = stored * p + up @ down - w
-    scale, second = encoded.companions
+    amax, round_trip = float(residual.abs().max()), float((stored - residual).abs().max())
+    del residual
+    error = stored.mul_(p).add_(up @ down).sub_(w)
+    scales, second = encoded.companions
 
     def raw(t: Any, dtype: Any) -> bytes:
         return bytes(t.to(dtype).reshape(-1).contiguous().cpu().view(torch.uint8).numpy().tobytes())
@@ -221,7 +230,7 @@ def fit(torch: ModuleType, key: str, weight: np.ndarray, stats: Stats, device: A
     return Fitted(
         encoded.payload,
         (
-            scale.raw,
+            scales.raw,
             second.raw,
             raw(p, torch.float32),
             raw(down, torch.bfloat16),
@@ -229,13 +238,23 @@ def fit(torch: ModuleType, key: str, weight: np.ndarray, stats: Stats, device: A
             raw(gx.reshape(()), torch.float32),
         ),
         alpha,
-        float(residual.abs().max()),
-        float((stored - residual).abs().max()),
-        float((error.double() ** 2).sum()),
-        float((w.double() ** 2).sum()),
+        amax,
+        round_trip,
+        float(error.square().sum(dtype=torch.float64)),
+        float(w.square().sum(dtype=torch.float64)),
         encoded.saturated,
         served,
         plain,
+        encode_s,
+    )
+
+
+def _through(torch: ModuleType, xq: Any, weight: Any) -> Any:
+    """`xq @ fake(weight)ᵀ`: `weight` through nvfp4 at its own second level, `BLOCK` rows at a
+    time."""
+    g = (weight.abs().amax() / svdq_linear.LEVELS_MAX).clamp(min=1e-30)
+    return torch.cat(
+        [xq @ svdq_linear.fake(torch, part, g).t() for part in weight.split(BLOCK)], dim=1
     )
 
 
