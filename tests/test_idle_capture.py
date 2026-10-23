@@ -121,3 +121,22 @@ def test_a_device_bound_signature_never_records() -> None:
     assert graphs._device_bound(submit, busy=3.0).startswith("device-bound")
     assert graphs._device_bound(submit, busy=0.2) == ""
     assert graphs._Timing().submit_ms() is None  # one call: wait for another
+
+
+def test_a_failing_job_goes_and_the_period_goes_on() -> None:
+    """v16: one region's capture raised, which ended every idle period before the UNet's turn.
+    A job's failure is counted and said; the next job still runs, and the failed one goes."""
+    idle, ran = graphs._Idle(), []
+
+    def failing() -> bool:
+        ran.append("failing")
+        raise RuntimeError("CachingHostAllocator: use_count")
+
+    def next_one() -> bool:
+        ran.append("next")
+        return True
+
+    idle.add(failing)
+    idle.add(next_one)
+    assert idle.run(lambda: False) and ran == ["failing", "next"]
+    assert idle.failures == 1 and not idle.jobs

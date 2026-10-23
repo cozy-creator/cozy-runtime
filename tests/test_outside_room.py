@@ -52,7 +52,7 @@ def test_a_request_allocates_before_its_first_pass_after_a_load_filled_the_devic
     vars(module)["_varena"] = Declared(Weights(checkpoint, "stack"))
     model = memory.load(module, "gpu")
     try:
-        print(f"torch may hold {memory.native.torch_limit()} bytes after the load")
+        print(f"{memory.native.free()} bytes free after the load")
         with memory.request("before-its-first-pass"):
             ids = torch.ones(1 << 18, dtype=torch.long, device="cuda")  # 2 MiB, as H3's
             assert int(ids.sum()) == 1 << 18

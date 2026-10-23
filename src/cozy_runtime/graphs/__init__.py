@@ -434,7 +434,7 @@ class _Idle:
         self.jobs: deque[Callable[[], bool]] = deque()
         self.stop: Callable[[], bool] = lambda: False
         self.last = 0.0
-        self.periods = self.yields = 0
+        self.periods = self.yields = self.failures = 0
         self.longest_ms = 0.0
 
     def add(self, job: Callable[[], bool]) -> None:
@@ -469,6 +469,12 @@ class _Idle:
                     with self.lock:
                         self.jobs.appendleft(job)
                     return False
+                except Exception as exc:  # one job's failure never ends the period (v16)
+                    self.failures += 1
+                    say(
+                        f"idle:{type(exc).__name__}:{exc}",
+                        f"[graphs] an idle job failed and goes: {type(exc).__name__}: {exc}"[:400],
+                    )
         finally:
             _IDLE.reset(token)
             self.longest_ms = max(self.longest_ms, (time.perf_counter() - self.last) * 1e3)
@@ -480,6 +486,7 @@ class _Idle:
             "queued": len(self.jobs),
             "periods": self.periods,
             "yields": self.yields,
+            "failures": self.failures,
             "longest_block_ms": round(self.longest_ms, 3),
         }
 
@@ -997,8 +1004,14 @@ def _capture_pending(pending: _Pending) -> bool:
             if not placed[0].graph_resident(recorder.binding):
                 return False
         idle = placed[0].graph_idle() if placed is not None else nullcontext()
-        with idle, owner.holding():
-            done = _record(torch, module, pending, recorder, placed, submit)
+        try:
+            with idle, owner.holding():
+                done = _record(torch, module, pending, recorder, placed, submit)
+        except Yielded:
+            raise
+        except Exception as exc:  # the signature runs as written; the period goes on
+            _failed(module, recorder, pending.key, f"{type(exc).__name__}: {exc}"[:300])
+            done = True
         if done:
             recorder.queued.pop(pending.key, None)
         return done

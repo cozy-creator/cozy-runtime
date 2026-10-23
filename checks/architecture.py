@@ -1017,13 +1017,23 @@ def fence_no_stream_host_functions() -> list[str]:
 
 
 #: Where a CUDA graph is made: the one capture backend and the graph domain's never-replayed
-#: owner; who calls the backend: the idle path (`graphs._record`, a `capture_idle` job) and the
+#: owner and pool anchor (both made at idle, from `_record`); who calls the backend: the idle path (`graphs._record`, a `capture_idle` job) and the
 #: LM engine's decode steps, the one tracked capture on a request's path (cr-210, which the
 #: graph-safety redesign removes); and who calls `_record`: the idle job alone.
 CAPTURE_SITES: dict[str, frozenset[tuple[str, str]]] = {
-    "CUDAGraph": frozenset({("graphs/__init__.py", "capture"), ("graphs/domain.py", "initialize")}),
+    "CUDAGraph": frozenset(
+        {
+            ("graphs/__init__.py", "capture"),
+            ("graphs/domain.py", "initialize"),
+            ("graphs/domain.py", "capture_pool"),
+        }
+    ),
     "capture_begin": frozenset(
-        {("graphs/__init__.py", "capture"), ("graphs/domain.py", "initialize")}
+        {
+            ("graphs/__init__.py", "capture"),
+            ("graphs/domain.py", "initialize"),
+            ("graphs/domain.py", "capture_pool"),
+        }
     ),
     "graph": frozenset(),  # torch.cuda.graph(...)
     "make_graphed_callables": frozenset(),
