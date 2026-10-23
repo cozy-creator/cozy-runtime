@@ -134,6 +134,28 @@ int gemm(int device, int family, bool fp8, uintptr_t q, uintptr_t scales, uintpt
                          M, N, K, sms, config, {&allocate, &scratch}, on(stream));
 }
 
+int w4a8_gemm(int device, uintptr_t q, uintptr_t scales, uintptr_t w, uintptr_t s,
+              uintptr_t codebook, uintptr_t w_scale, uintptr_t bias, uintptr_t out, bool out_half,
+              int M, int N, int K, int config, uintptr_t stream) {
+    if (M < 1 || N < 8 || N % 8 || !fits(false, K)) return cudaErrorInvalidValue;
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    return cozy_int8::w4a8_gemm(at<const int8_t>(q), at<const uint8_t>(w), at<const uint8_t>(s),
+                                at<const float>(codebook), at<const float>(scales),
+                                at<const float>(w_scale), at<const void>(bias), at<void>(out),
+                                out_half, M, N, K, config, on(stream));
+}
+
+int w4a8_unpack(int device, uintptr_t w, uintptr_t s, uintptr_t codebook, uintptr_t out, int N,
+                int K, uintptr_t stream) {
+    if (N < 1 || !fits(false, K)) return cudaErrorInvalidValue;
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    return cozy_int8::w4a8_unpack(at<const uint8_t>(w), at<const uint8_t>(s),
+                                  at<const float>(codebook), at<int8_t>(out), N, K,
+                                  sm_count(device), on(stream));
+}
+
 }  // namespace
 
 NB_MODULE(_gemm, m) {
@@ -152,6 +174,10 @@ NB_MODULE(_gemm, m) {
           "norm"_a, "eps"_a, "activation"_a, "stream"_a);
     m.def("gemv", &gemv, "device"_a, "x"_a, "x_half"_a, "w"_a, "w_scale"_a, "bias"_a, "out"_a,
           "out_half"_a, "M"_a, "N"_a, "K"_a, "stream"_a);
+    m.def("w4a8_gemm", &w4a8_gemm, "device"_a, "q"_a, "scales"_a, "w"_a, "s"_a, "codebook"_a,
+          "w_scale"_a, "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a, "config"_a, "stream"_a);
+    m.def("w4a8_unpack", &w4a8_unpack, "device"_a, "w"_a, "s"_a, "codebook"_a, "out"_a, "N"_a,
+          "K"_a, "stream"_a);
     m.def("gemm", &gemm, "device"_a, "family"_a, "fp8"_a, "q"_a, "scales"_a, "w"_a, "w_scale"_a,
           "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a, "config"_a, "allocate"_a.none(),
           "stream"_a);

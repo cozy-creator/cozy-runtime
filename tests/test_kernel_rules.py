@@ -29,7 +29,7 @@ from cozy_runtime.internal.encoding import (
     RuntimeIdentity,
     launch_providers,
 )
-from cozy_runtime.internal.encoding.leaves import MXFP8, NVFP4
+from cozy_runtime.internal.encoding.leaves import MXFP8, NVFP4, W4A8
 from cozy_runtime.internal.fill import Checkpoint, PlanRow, dtype_name
 from cozy_runtime.internal.probe import vector_cases
 from cozy_runtime.internal.resolution import (
@@ -41,14 +41,18 @@ from cozy_runtime.internal.resolution import (
 )
 from store_fixtures import home
 
-LEAVES = {"int8.convrot": INT8_CONVROT, "fp8.rowwise": ROWWISE_FP8, "nvfp4": NVFP4, "mxfp8": MXFP8}
+LEAVES = {
+    "int8.convrot": INT8_CONVROT, "fp8.rowwise": ROWWISE_FP8, "nvfp4": NVFP4, "mxfp8": MXFP8,
+    "w4a8.convrot": W4A8,
+}  # fmt: skip
 ALL = frozenset(LEAVES)
-EIGHT_AND_FOUR = frozenset({"int8.convrot", "nvfp4"})
+INT8 = frozenset({"int8.convrot", "w4a8.convrot"})
+EIGHT_AND_FOUR = INT8 | {"nvfp4"}
 NOT_MX = ALL - {"mxfp8"}
 
 #: sm -> the lanes that run on their native leaf. fp8 needs sm89+, block-scaled MX sm100+, int8
-#: is absent from sm103, nothing runs natively below the MMA families; 88 and 110 are named by no
-#: row (110 holds tcgen05, as its cc could).
+#: (and w4a8, whose codes multiply as int8) is absent from sm103, nothing runs natively below the
+#: MMA families; 88 and 110 are named by no row (110 holds tcgen05, as its cc could).
 NATIVE = {
     75: frozenset(),
     80: EIGHT_AND_FOUR,
@@ -58,7 +62,7 @@ NATIVE = {
     89: NOT_MX,
     90: NOT_MX,
     100: ALL,
-    103: ALL - {"int8.convrot"},
+    103: ALL - INT8,
     110: ALL,
     120: ALL,
     121: ALL,
@@ -71,6 +75,7 @@ DECODER = {
     "fp8.rowwise": "cozy.fp8-rowwise.dequant/1",
     "nvfp4": "cozy.nvfp4.cores/1",
     "mxfp8": "cozy.mxfp8.cores/1",
+    "w4a8.convrot": "tensorfs.w4a8.convrot.decode/1",
 }
 
 
@@ -82,14 +87,14 @@ class Rows(NamedTuple):
 @pytest.fixture(params=["BF16", "F16", "F32"])
 def lanes(request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Rows:
     """One weight per lane into the fixture's dtype: the producer `cozy model quantize` runs
-    for int8, fp8 and nvfp4, and the spec's producer-mined mxfp8 case."""
+    for int8, fp8, nvfp4 and w4a8, and the spec's producer-mined mxfp8 case."""
     writer = tensorfs.Writer(cache_dir=home(tmp_path, monkeypatch))
     model = writer.component("model", cls=("", "", ""), config={})
     values = np.random.default_rng(65).standard_normal((256, 512)).astype(np.float32)
     for scheme, encoder in _ENCODINGS.items():
         rows, cols = values.shape
         encoded = encoder.encode(scheme, values, float(np.abs(values).max()))
-        parts = {"weight": (encoder.weight_dtype, [rows, cols], encoded.payload)}
+        parts = {"weight": (encoder.weight_dtype, [rows, cols // encoder.pack], encoded.payload)}
         for (role, dtype, shape), companion in zip(
             encoder.companions(rows, cols), encoded.companions, strict=True
         ):
@@ -154,14 +159,14 @@ def test_a_row_no_one_has_measured_runs_every_lane_its_formats_allow(
     lanes: Rows, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A future card with every format serves every lane natively; one without int8 tensor
-    cores decodes int8 alone. No table, verdict or benchmark names either."""
+    cores decodes int8 and w4a8 alone. No table, verdict or benchmark names either."""
     monkeypatch.setitem(arch.ROWS, 130, arch.Row("Future", arch.TCGEN05, True, True, True))
     monkeypatch.setitem(arch.ROWS, 131, arch.Row("No int8", arch.TCGEN05, False, True, True))
     every = ALL - (HALF_ONLY if lanes.dtype == "F32" else frozenset())
     assert native(plan(lanes.rows, card(130))) == every
-    assert native(plan(lanes.rows, card(131))) == every - {"int8.convrot"}
+    assert native(plan(lanes.rows, card(131))) == every - INT8
     refused = {g.lane: g.reason for g in plan(lanes.rows, card(131)).refused_leaves()}
-    assert "has no int8 tensor cores" in refused["int8.convrot"]
+    assert all("has no int8 tensor cores" in refused[lane] for lane in INT8), refused
 
 
 def test_an_unnamed_card_admits_by_its_capability_not_by_what_a_process_learned(

@@ -159,6 +159,7 @@ from cozy_runtime.internal import (
     streams,
     tolerant,
     tools,
+    w4a8_linear,
     zygote,
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
@@ -3684,13 +3685,14 @@ class Executor:
         index = member.device_facts.index if member.device_facts is not None else 0
         sm = member.device_facts.sm if member.device_facts is not None else 0
         missing = int8_linear.unavailable()
-        native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP}
+        native = {"int8": int8_linear.OP, "fp8": fp8_linear.OP, "w4a8": w4a8_linear.OP}
         for (component, leaf), sites in sorted(counted.items()):
             kernel, form = serving(leaf, index), FORMATS[leaf]
             fields: dict[str, Any] = {"component": prefix + component, "sites": sites}
             record.emit("confession", "gemm.selected", kernel, format=form, leaf=leaf, **fields)
             wanted = native.get(form, kernel)
             reason = prebuilt.lost(form, sm) or (missing[0].reason if missing else "")
+            reason = reason or (w4a8_linear.why(index) if form == "w4a8" else "")
             if reason and kernel != wanted:
                 fallback(kernel, wanted=wanted, served=kernel, reason=reason, **fields)
         for group in member.refused_leaves:

@@ -57,3 +57,23 @@ def gemm(
     allocate: object,
     stream: int,
 ) -> int: ...
+def w4a8_gemm(
+    device: int,
+    q: int,
+    scales: int,
+    w: int,
+    s: int,
+    codebook: int,
+    w_scale: int,
+    bias: int,
+    out: int,
+    out_half: bool,
+    M: int,
+    N: int,
+    K: int,
+    config: int,
+    stream: int,
+) -> int: ...
+def w4a8_unpack(
+    device: int, w: int, s: int, codebook: int, out: int, N: int, K: int, stream: int
+) -> int: ...
