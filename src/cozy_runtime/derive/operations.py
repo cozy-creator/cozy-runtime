@@ -23,7 +23,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
-from . import facade
+from . import facade, svdq
 from .quantization import (
     _ENCODINGS,
     ArtifactQuantizationPlan,
@@ -215,8 +215,10 @@ def quantize_into(
     plan: QuantizationPlan,
     output: str,
     max_relative_frobenius: float | None = None,
+    calibration: svdq.Calibration | None = None,
 ) -> ModelArtifact:
-    """`plan`'s lane, written into the CALLING job's weights output `output`."""
+    """`plan`'s lane, written into the CALLING job's weights output `output`. A plan with
+    `svdq.nvfp4` weights takes the `calibration` its recipe recorded (`calibrate`)."""
     ctx.raise_if_cancelled()
     intent = facade.plan(
         plan.components, plan.encoding, max_relative_frobenius=max_relative_frobenius
@@ -230,6 +232,7 @@ def quantize_into(
         output=output,
         selection=None if plan.encoding is None else _selection(opened, plan),
         preserve_precision=plan.output_precision == "preserve",
+        calibration=calibration,
     )
     return facade._artifact_result(result, artifact, tel, output)
 
@@ -276,3 +279,25 @@ app.entrypoint(
     weights=(WeightsOutput("model", max_new_bytes=MAX_QUANTIZED_BYTES),),
     accelerator=False,
 )
+
+
+def calibrate(
+    ctx: Context,
+    torch: Any,
+    *,
+    source: Weights[Any] | Checkpoint,
+    components: dict[str, Any],
+    plan: QuantizationPlan,
+) -> svdq.Calibration:
+    """A recorder of the inputs of every linear `plan` encodes as `svdq.nvfp4` (by its rules or
+    as the lane's encoding): open it (`with`) while the model whose `components` (name -> module)
+    hold those linears runs real inputs, then hand it to `quantize_into`."""
+    selection = _selection(_opened(ctx, source), plan)
+    keys = [
+        f"{t.component}.{t.key}"
+        for t in selection.tensors
+        if (t.encoding or plan.encoding) == "svdq.nvfp4"
+    ]
+    if not keys:
+        raise UnsupportedInput("the plan encodes no weight as svdq.nvfp4", code="quantization_plan")
+    return svdq.Calibration(torch, components, keys)

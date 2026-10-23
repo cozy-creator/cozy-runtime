@@ -42,6 +42,7 @@ from cozy_runtime.internal.encoding.leaves import (
     MicroScaledNativeLeaf,
     Nvfp4NativeLeaf,
     RowwiseNativeLeaf,
+    SvdqNvfp4NativeLeaf,
     W4a8NativeLeaf,
 )
 
@@ -276,6 +277,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Int8ConvRotNativeLeaf,
         Nvfp4Dequant,
         Nvfp4NativeLeaf,
+        SvdqNvfp4NativeLeaf,
         W4a8NativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,

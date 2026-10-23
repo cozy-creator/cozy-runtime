@@ -38,6 +38,10 @@ def test_every_scheme_has_its_parts_and_nothing_else() -> None:
             {"codebook", "correction"},
         ),
         "w4a8.convrot": ({"weight", "group_scale", "scale"}, {"codebook"}),
+        "svdq.nvfp4": (
+            {"weight", "scale", "scale_2", "pre_quant_scale", "lowrank_down", "lowrank_up"},
+            {"input_scale", "channel_scale"},
+        ),
         "comfy.w6a8_int8": ({"weight", "group_scale", "scale"}, set()),
         "int4.convrot": ({"weight", "scale"}, set()),
     }

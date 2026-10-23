@@ -19,13 +19,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal, ParamSpec, TypeVar, overload
+from typing import Any, Literal, ParamSpec, TypeVar, overload
 
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
+from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
@@ -55,6 +56,8 @@ class Registration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
+    #: A model argument's class where the registration names it (`cozy_runtime.derive.recipes`).
+    model_classes: Mapping[str, type[Model[Any]]] = field(default_factory=dict)
     publishes: bool = False
     emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
@@ -91,6 +94,7 @@ class Registration:
                 model_defaults=self.model_defaults,
                 model_components=self.model_components,
                 model_on_demand=self.model_on_demand,
+                model_classes=self.model_classes,
             )
         return self._surface
 
@@ -123,6 +127,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: Literal[False] | None = None,
+        model_classes: Mapping[str, type[Model[Any]]] | None = None,
     ) -> Callable[P, R]: ...
 
     @overload
@@ -145,6 +150,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: Literal[False] | None = None,
+        model_classes: Mapping[str, type[Model[Any]]] | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
@@ -167,6 +173,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: Literal[False] | None = None,
+        model_classes: Mapping[str, type[Model[Any]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
 
@@ -181,7 +188,8 @@ class App:
         `components={"model": ("transformer", "vae")}` names the components each model argument
         uses, so a machine fetches those first; absent means all. `on_demand=("upsampler",)`
         names the model arguments a request may leave unused: each is built, and its weights
-        fetched, when the function first reads it."""
+        fetched, when the function first reads it. `model_classes` names a model argument's class
+        in place of its annotation (the Runtime's own generic functions)."""
         policy = memo_policy(memoize)
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
@@ -232,6 +240,7 @@ class App:
                 model_components=declared_components
                 or (export.components if export is not None else {}),
                 model_on_demand=declared_on_demand,
+                model_classes=dict(model_classes or {}),
                 publishes=publishes,
                 emits_media=emits_media,
                 weights_outputs=weights,

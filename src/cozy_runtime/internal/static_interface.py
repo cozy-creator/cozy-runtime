@@ -65,8 +65,8 @@ from cozy_runtime.author._model_defaults import (
     model_defaults,
     model_on_demand,
 )
+from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
-from cozy_runtime.author._recipes import canonical, fingerprint, outputs
 from cozy_runtime.author._script_metadata import (
     Unfolded,
     byte_parameter,
@@ -740,10 +740,13 @@ class Reader:
         """`Recipe(lane=, model=, plan=)` read from source: its model a Model class (`Model`:
         any layout), its plan a folded plan or a `DerivationHook` naming a module function."""
         keywords = {keyword.arg: keyword.value for keyword in node.keywords}
-        if node.args or set(keywords) != {"lane", "model", "plan"}:
+        if node.args or not {"lane", "model", "plan"} <= set(keywords) <= {
+            "lane", "model", "plan", "calibrate",
+        }:  # fmt: skip
             self.refuse(
-                module, node, "Recipe(lane=, model=, plan=) by keyword", "static_unsupported"
-            )
+                module, node, "Recipe(lane=, model=, plan=[, calibrate=]) by keyword",
+                "static_unsupported",
+            )  # fmt: skip
         lane = self.fold(module, keywords["lane"], scope)
         try:
             author.WeightsOutput(typing.cast(str, lane), max_new_bytes=0)
@@ -770,11 +773,26 @@ class Reader:
             ):
                 self.refuse(module, value, "DerivationHook(<a module-level function>)")
             identity = f"{function.module.name}:{function.node.name}"
+            if "calibrate" in keywords:
+                self.refuse(module, node, "a recipe's calibrate is beside a QuantizationPlan")
             return StaticRecipe(typing.cast(str, lane), spec, identity)
         plan = self.fold(module, value, scope)
         if not isinstance(plan, (author.QuantizationPlan, author.SelectionPlan)):
             self.refuse(module, value, "a recipe's plan is a QuantizationPlan or SelectionPlan")
-        return StaticRecipe(typing.cast(str, lane), spec, plan)
+        calibrate = ""
+        if "calibrate" in keywords:
+            function = self.resolve(module, keywords["calibrate"])
+            if not (
+                isinstance(plan, author.QuantizationPlan)
+                and isinstance(function, Definition)
+                and not isinstance(function.node, ast.ClassDef)
+            ):
+                self.refuse(
+                    module, keywords["calibrate"],
+                    "calibrate=<a module-level function>, beside a QuantizationPlan",
+                )  # fmt: skip
+            calibrate = f"{function.module.name}:{function.node.name}"
+        return StaticRecipe(typing.cast(str, lane), spec, plan, calibrate)
 
     # ----------------------------------------------------------------- types
 
@@ -1275,15 +1293,19 @@ class Registration:
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
+    #: A model argument's class where the registration names it, not its annotation.
+    model_classes: Mapping[str, ModelSpec] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
 class StaticRecipe:
-    """A `Recipe` read from source; a `DerivationHook` plan is its function's `module:name`."""
+    """A `Recipe` read from source; a `DerivationHook` plan, and a `calibrate`, is its function's
+    `module:name`."""
 
     lane: str
     model: ModelSpec
     plan: author.QuantizationPlan | author.SelectionPlan | str
+    calibrate: str = ""
 
     def canonical(self) -> dict[str, object]:
         if isinstance(self.plan, str):
@@ -1419,10 +1441,10 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
         )
     docs: dict[str, dict[str, Json]] = {}
     modules = reader.reachable(entry)
-    recipes = _recipes(reader, modules)
+    recipes, calibrated = _recipes(reader, modules)
     registrations = _registrations(reader, modules, app)
     if recipes:
-        registrations.append(_recipes_registration(reader, recipes))
+        registrations.append(_recipes_registration(reader, recipes, calibrated))
     for registration in registrations:
         if registration.name in docs:
             reader.refuse(
@@ -1447,9 +1469,13 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
     )
 
 
-def _recipes(reader: Reader, modules: Sequence[Module]) -> list[dict[str, Json]]:
-    """Every `Recipe` bound at module scope of `modules`, as the interface's `recipes` rows."""
+def _recipes(
+    reader: Reader, modules: Sequence[Module]
+) -> tuple[list[dict[str, Json]], list[ModelSpec]]:
+    """Every `Recipe` bound at module scope of `modules`, as the interface's `recipes` rows, and
+    the models of those that calibrate."""
     rows: list[dict[str, Json]] = []
+    calibrated: list[ModelSpec] = []
     for module in modules:
         for stmt in _module_scope(module.tree.body):
             name = _single_target(stmt)
@@ -1479,24 +1505,39 @@ def _recipes(reader: Reader, modules: Sequence[Module]) -> list[dict[str, Json]]
                 },
                 "plan": recipe.canonical(),
             }
-            if not isinstance(recipe.plan, str):
+            if recipe.calibrate:
+                row["calibrate"] = recipe.calibrate
+                if recipe.model not in calibrated:
+                    calibrated.append(recipe.model)
+            elif not isinstance(recipe.plan, str):
                 row["fingerprint"] = fingerprint(recipe.canonical())
             if any(other["name"] == row["name"] for other in rows):
                 reader.refuse(module, stmt, f"a second recipe named {row['name']!r}")
+            if len(calibrated) > 1:
+                reader.refuse(module, stmt, "calibrated recipes of two model classes")
             rows.append(row)
-    return rows
+    return rows, calibrated
 
 
-def _recipes_registration(reader: Reader, recipes: Sequence[dict[str, Json]]) -> Registration:
+def _recipes_registration(
+    reader: Reader, recipes: Sequence[dict[str, Json]], calibrated: Sequence[ModelSpec]
+) -> Registration:
     """The Runtime's `quantize` (`cozy_runtime.derive.recipes`), read from its source, writing
-    the lanes of `recipes`: a package with recipes registers it as its own."""
+    the lanes of `recipes`: a package with recipes registers it as its own. One with a calibrated
+    recipe registers `quantize_calibrated` under that name: on a GPU, its model built on demand."""
     runtime = reader.module("cozy_runtime.derive.recipes")
-    function = runtime.bindings[RECIPES_ENTRYPOINT]
+    entry = CALIBRATED_ENTRYPOINT if calibrated else RECIPES_ENTRYPOINT
+    function = runtime.bindings[entry]
     assert isinstance(function, ast.AsyncFunctionDef)
     found = _registration(reader, runtime, function, "entrypoint", ())
     assert found is not None
     lanes = outputs(str(row["lane"]) for row in recipes)
-    return replace(found, weights=lanes, accelerator=False)
+    if not calibrated:
+        return replace(found, weights=lanes, accelerator=False)
+    return replace(
+        found, name=RECIPES_ENTRYPOINT, weights=lanes, model_on_demand=("model",),
+        model_classes={"model": calibrated[0]},
+    )  # fmt: skip
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:
