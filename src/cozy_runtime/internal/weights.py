@@ -441,7 +441,9 @@ class Backend:
         read from the checkpoint by varena, which seals them and deposits the layout with TensorD
         for the next load."""
         rows = {self.plan[key].name: self.plan[key] for key in keys}
-        bakes = self.bakes[name] = _Bakes(self.torch, root, rows, set(blocks_of(root)), self._owner)
+        gpu = (self.device.index or 0) if self.device.type == "cuda" else None
+        bakes = _Bakes(self.torch, root, rows, set(blocks_of(root)), self._owner, gpu)
+        self.bakes[name] = bakes
         grant = replace(self._granted(name), keys=tuple(rows))
         vars(root)["_varena"] = Declared(  # `_cozy_state`: what the package's forward changes
             grant,
@@ -670,10 +672,14 @@ class _Bakes:
         rows: Mapping[str, PlanRow],
         blocks: set[str],
         owner: Callable[[object], tuple[str, str] | None],
+        gpu: int | None,
     ) -> None:
-        self.torch, self.owner = torch, owner
+        self.torch, self.owner, self.gpu = torch, owner, gpu
         self.bakes: dict[str, _Bake] = {}
         self.strategy: lora_bake.Strategy = "bake"
+        #: what this forward serves (`prepare`): per step while the bake kernels build
+        self.serving: lora_bake.Strategy = "per_step"
+        self.how: lora_bake.How | None = None
         self.baked = 0
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
@@ -707,8 +713,12 @@ class _Bakes:
     def prepare(self) -> tuple[object, ...]:
         """As a forward starts (`Fill.prepare`): each LoRA'd linear told whether its bytes
         carry its delta, and what baking now adds (the strategy, each linear's graph and hook
-        factors); pages baked for other deltas refill."""
-        baked, rows = self.strategy == "bake", []
+        factors); pages baked for other deltas refill. A bake waits for no kernel: while its
+        kernels build, the LoRAs serve per step, and baked from the forward after they serve."""
+        gpu = self.gpu if self.strategy == "bake" else None
+        self.how = "eager" if gpu is None else lora_bake.serving(gpu)
+        self.serving = self.strategy if self.how is not None else "per_step"
+        baked, rows = self.serving == "bake", []
         for bake in self.bakes.values():
             if bake.layer is not None:
                 bake.layer._cozy_baked = baked
@@ -716,7 +726,7 @@ class _Bakes:
                 hook._cozy_baked = baked
             hooks = (hook.lora_factors() for hook in bake.hooks)
             rows.append((bake.layer is not None, *(g and (g[0], g[3]) for g in hooks)))
-        return (self.strategy, *rows)
+        return (self.serving, *rows)
 
     def identity(self) -> str | None:
         """What `prepare()` just named, the same in every process (`Fill.identity`): the
@@ -724,11 +734,10 @@ class _Bakes:
         stored factor pair of this checkpoint, or an overlay checkpoint's component and module
         path), dtypes and scale. None when an overlay's checkpoint cannot be named."""
         torch = self.torch
-        if self.strategy != "bake":
-            return repr((self.strategy,))
-        device = torch.cuda.current_device()
-        held: list[object] = [lora_bake.recipe(device), torch.__version__]
-        held.append(torch.cuda.get_device_capability(device))
+        if self.serving != "bake":
+            return repr((self.serving,))
+        held: list[object] = [lora_bake.recipe(self.how == "fused"), torch.__version__]
+        held.append(torch.cuda.get_device_capability(self.gpu))
         for stored, bake in sorted(self.bakes.items()):
             deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
             for hook in bake.hooks:
@@ -743,7 +752,7 @@ class _Bakes:
         return repr(held)
 
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
-        if self.strategy != "bake":
+        if self.serving != "bake":
             return
         for stored, bake in self.bakes.items():
             weight = parts.get(stored)
@@ -765,6 +774,7 @@ class _Bakes:
                 torch.cat([d.to(kind) for d in downs]),
                 torch.cat([u.to(kind) for u in ups], dim=1),
                 seed=zlib.crc32(stored.encode()),
+                how=self.how,
             )
             self.baked += 1
 

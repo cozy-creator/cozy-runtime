@@ -12,12 +12,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from typing import Any
 
 import pytest
 
 from cozy_runtime.derive.microscale import encode_nvfp4
-from cozy_runtime.internal import lora_bake
+from cozy_runtime.internal import kernel_ready, lora_bake
 
 torch = pytest.importorskip("torch")
 
@@ -50,18 +51,23 @@ def test_a_build_that_fails_or_crashes_ends_only_its_child(
     if INTERPRETED:
         pytest.skip("the launcher's")
     pytest.importorskip("triton")
-    fresh = {"FUSED_ERROR": None, "_TRIED": False, "_BUILT": False, "_BUILD": None}
-    for name, value in fresh.items():
-        monkeypatch.setattr(lora_bake, name, value)
+    monkeypatch.setattr(lora_bake, "_BUILD", None)
     monkeypatch.setattr(lora_bake, "_CHECK", script)
     lora_bake.warm(0)
-    assert not lora_bake._ready(0)
-    assert lora_bake.mode() == {"lora_bake": f"eager (bake kernel build {ended})"}
+    _built()
+    assert lora_bake.serving(0) == "eager"
+    assert str(kernel_ready.failed(lora_bake.KERNEL)) == f"bake kernel build {ended}"
     weight, down, up = _layer(1)
     stored, eager = {"value": weight.to(torch.bfloat16)}, {"value": weight.to(torch.bfloat16)}
-    lora_bake.bake(torch, stored, down, up, seed=4)
+    lora_bake.bake(torch, stored, down, up, seed=4, how=lora_bake.serving(0))
     lora_bake.bake(torch, eager, down, up, seed=4, stats=lora_bake.Stats())
     assert torch.equal(stored["value"], eager["value"])
+
+
+def _built() -> None:
+    """The child's build ended, and its opener (`kernel_ready`) with it."""
+    while kernel_ready._SLOTS[lora_bake.KERNEL].state == "opening":
+        time.sleep(0.05)
 
 
 def _layer(seed: int) -> tuple[Any, Any, Any]:

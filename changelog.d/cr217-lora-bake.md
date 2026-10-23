@@ -1,0 +1,1 @@
+A LoRA bake never waits for its kernels (cr-217). The first forward with a LoRA used to wait for the bake kernels' child build. Now, while that build runs, LoRAs serve per step, and from the boundary after it ends they serve baked. A failed build bakes eagerly with its reason, as before.

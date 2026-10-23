@@ -10,9 +10,9 @@ quality gate reads: how much of the delta survived and how much rounding error t
 On a GPU, `bake` is one fused Triton kernel per weight (`_bake_kernel`): it reads each stored
 byte once, adds the rank-r product computed in its tile, rounds and writes the byte back, with
 counter-based noise (one stream per weight, by element index). The kernel is compiled and
-checked in a child process (`warm`); this process only loads it from Triton's cache. The eager
-row-chunk functions are its reference on CPU, what `Stats` measures, and what a GPU bakes with
-when the child failed.
+checked in a child process (`warm`); this process only loads it from Triton's cache, and no
+request waits for it: until it serves, a LoRA serves per step. The eager row-chunk functions are
+its reference on CPU, what `Stats` measures, and what a GPU bakes with when the child failed.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 from types import ModuleType
 from typing import IO, TYPE_CHECKING, Literal
 
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
     from torch import device as Device
 
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.internal import tools
+from cozy_runtime.internal import kernel_ready, tools
 from cozy_runtime.internal.encoding import E4M3_MAX
 from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, hadamard256
 
@@ -44,6 +45,8 @@ except ImportError:  # a host without Triton bakes eagerly
     triton = None
 
 Strategy = Literal["bake", "per_step"]
+#: How a bake runs on a GPU: its fused kernels, or the eager reference.
+How = Literal["fused", "eager"]
 
 #: Names this module's bake to other executors: the same factors and scales baked by the same
 #: rule are the same bytes (one seed per weight). Changed whenever the bytes a bake writes do.
@@ -495,15 +498,17 @@ def bake(
     *,
     seed: int,
     stats: Stats | None = None,
+    how: How | None = "eager",
 ) -> None:
     """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8.rowwise`
     (E4M3 data, f32 row scale), `int8-convrot256/1` (int8 data, f32 row scale) or `nvfp4`
     (`bake_nvfp4`). bf16, E4M3, int8 and E2M1 round stochastically, scales kept: nearest
     returns a small delta to where it was, and loses most of a LoRA's effect on fp8
-    (MEASURE.md, TensorD #26). `seed` names the weight's noise. A GPU bakes fused unless
-    `stats` are asked for (the eager reference measures them)."""
+    (MEASURE.md, TensorD #26). `seed` names the weight's noise. A GPU bakes fused when `how`
+    says its kernels serve (`serving`), unless `stats` are asked for (the eager reference
+    measures them)."""
     device = next(iter(stored.values())).device
-    if stats is None and device.type == "cuda" and _ready(device.index or 0):
+    if stats is None and device.type == "cuda" and how == "fused":
         fused(torch, stored, down, up, seed)
         return
     generator = torch.Generator(device=device).manual_seed(seed & SEED_MASK)
@@ -573,10 +578,9 @@ BF16, F16, F32, ROWWISE, INT8, NVFP4 = range(6)
 SEED_MASK = 0x7FFFFFFF
 _TILE = 64
 _INNER = 16
-#: Why this process bakes eagerly on its GPU, or None; whether a GPU here bakes (`warm`); whether
-#: its kernels are built and checked; the child building them and the file holding its output.
-FUSED_ERROR: str | None = None if triton is not None else "triton does not import"
-_TRIED = _BUILT = False
+#: The bake kernels' `kernel_ready` name: built and checked once per process, in a child (`warm`).
+KERNEL = "lora bake"
+#: That child, and the file holding its output.
 _BUILD: tuple[subprocess.Popen[bytes], IO[bytes]] | None = None
 _CHECK = (
     "import json, sys; boot = json.loads(sys.argv[1]); sys.path[:] = boot['path']\n"
@@ -626,57 +630,50 @@ def warm(device: int) -> None:
     """Start building every fused form for GPU `device`, and checking its numbers (`check`), in
     a child process under this one's interpreter and import path, once per process at load.
     This process then only loads the kernels from Triton's cache: it never runs a compiler, so
-    one that crashes ends the child, and this process bakes eagerly with its reason."""
-    global _BUILD, _TRIED, FUSED_ERROR
-    _TRIED = True
-    if FUSED_ERROR is None and not _BUILT and not tools.triton():
-        FUSED_ERROR = "cc not found"
-    if FUSED_ERROR is None and not _BUILT and _BUILD is None:
-        log = tempfile.TemporaryFile()  # noqa: SIM115 - read and closed with the build (`_ready`)
+    one that crashes ends the child, and this process bakes eagerly with its reason. Nothing
+    waits for it: until it serves, a LoRA serves per step (`serving`)."""
+    serving(device)
+
+
+def serving(device: int) -> How | None:
+    """How a bake on GPU `device` runs now: `fused` once its kernels serve (`kernel_ready`),
+    `eager` (the reference) where they cannot, None while they build."""
+    if kernel_ready.ready(KERNEL, partial(_built, device)) is not None:
+        return "fused"
+    return "eager" if kernel_ready.failed(KERNEL) else None
+
+
+def _built(device: int, wait: bool) -> bool | None:
+    """`kernel_ready`'s opener: True once the child built and checked every form."""
+    global _BUILD
+    if triton is None:
+        raise RuntimeError("triton does not import")
+    if not tools.triton():
+        raise RuntimeError("cc not found")
+    if _BUILD is None:
+        log = tempfile.TemporaryFile()  # noqa: SIM115 - read and closed when the child ends
         boot = json.dumps({"path": sys.path, "device": device})
         command = [sys.executable, "-I", "-c", _CHECK, boot]
         _BUILD = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log), log
+    child, log = _BUILD
+    if child.poll() is None and not wait:
+        return None
+    with request_path.forbid("kernel build wait: lora bake"):
+        code = child.wait()
+    log.seek(0)
+    said = log.read().decode(errors="replace").strip().splitlines()
+    log.close()
+    _BUILD = None
+    if code:
+        how = f"killed by signal {-code}" if code < 0 else f"exit {code}"
+        raise RuntimeError(f"bake kernel build {how}" + (f": {said[-1]}" if said else "")[:300])
+    return True
 
 
-def recipe(device: int) -> str:
-    """What names the bytes a bake writes on `device` to other executors: `VARIANT`, the path
-    this process bakes by (fused, once its build ended well, else the eager reference) and
-    what that path's numerics come from."""
-    if _ready(device):
-        return f"{VARIANT} fused triton {triton.__version__}"
-    return f"{VARIANT} eager"
-
-
-def _ready(device: int, wait: bool = True) -> bool:
-    """Whether this process bakes fused: the build `warm` started (now, when none did) ended
-    well. Waits for it unless `wait` is False."""
-    global FUSED_ERROR, _BUILT, _BUILD
-    if FUSED_ERROR is None and not _BUILT:
-        warm(device)
-        if _BUILD is None:
-            return False
-        child, log = _BUILD
-        if child.poll() is None and not wait:
-            return False
-        with request_path.forbid("kernel build wait: lora bake"):
-            code = child.wait()
-        log.seek(0)
-        said = log.read().decode(errors="replace").strip().splitlines()
-        log.close()
-        _BUILD, _BUILT = None, code == 0
-        if code:
-            how = f"killed by signal {-code}" if code < 0 else f"exit {code}"
-            FUSED_ERROR = f"bake kernel build {how}" + (f": {said[-1]}" if said else "")[:300]
-    return FUSED_ERROR is None
-
-
-def mode() -> dict[str, str]:
-    """How this process bakes on its GPU, once a build has ended (`modes.lora_bake`)."""
-    if _BUILD is not None:
-        _ready(0, wait=False)
-    if _BUILT:
-        return {"lora_bake": "fused"}
-    return {"lora_bake": f"eager ({FUSED_ERROR})"} if FUSED_ERROR and _TRIED else {}
+def recipe(fused: bool) -> str:
+    """What names the bytes a bake writes to other executors: `VARIANT`, the path it bakes by
+    (fused, else the eager reference) and what that path's numerics come from."""
+    return f"{VARIANT} fused triton {triton.__version__}" if fused else f"{VARIANT} eager"
 
 
 def check(torch: ModuleType, device: Device) -> None:

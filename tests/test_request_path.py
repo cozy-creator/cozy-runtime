@@ -48,7 +48,7 @@ OWN = {
     "cozy_runtime.internal.kernel_compile.wait",
     "cozy_runtime.internal.kernel_compile.run",
     "cozy_runtime.internal.verify.verified",
-    "cozy_runtime.internal.lora_bake._ready",
+    "cozy_runtime.internal.lora_bake._built",
     "cozy_runtime.internal.attention_sol_fa4.warm",
     "cozy_runtime.graphs.capture",
 }
@@ -189,7 +189,6 @@ def test_the_known_violations_are_exactly_cr_210s_two_captures_each_marked_where
 #: not only ever reached from a `kernel_ready` opener, which runs off the request thread. Each
 #: cr-217 line leaves this list as it lands.
 WAITING = {
-    "cozy_runtime.internal.lora_bake._ready": "cr-217 LoRA bake",
     "cozy_runtime.internal.machine_kernels.main": "the machine's kernel boot, its own process",
     "cozy_runtime.internal.prebuilt.fa3": "the conformance CLI",
     "cozy_runtime.internal.prebuilt.library": "cr-217 first-GEMM self-checks",
