@@ -125,7 +125,7 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
             block = column_block(chosen or encoding)
             if row is None or (
                 not key.endswith(".weight")
-                or not row.plain
+                or not row.readable
                 or row.logical_dtype not in {"f16", "bf16", "f32"}
                 or len(row.shape) != 2
                 or row.shape[0] <= 0
@@ -154,9 +154,9 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
     schema = []
     for item in selection.tensors:
         tensor = by_key[item.component, item.key]
-        if not tensor.plain:
+        if not tensor.readable:
             raise UnsupportedInput(
-                f"quantization source {item.component}.{item.key} is not plain",
+                f"quantization source {item.component}.{item.key} is neither plain nor per-row",
                 code="quantization_source",
             )
         schema.append([item.component, item.key, tensor.logical_dtype, list(tensor.shape)])
