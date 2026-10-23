@@ -17,8 +17,9 @@ from tensorfs.varena import GpuId  # noqa: E402
 from tensorfs.varena.torch import Memory  # noqa: E402
 
 from cozy_runtime.derive.microscale import encode_int8_convrot256  # noqa: E402
+from cozy_runtime.internal import executor  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
-from cozy_runtime.internal.weights import Backend  # noqa: E402
+from cozy_runtime.internal.weights import Backend, Placement  # noqa: E402
 from test_int8_convrot import weight  # noqa: E402
 
 
@@ -125,3 +126,34 @@ def test_a_component_is_served_in_eval_mode(tmp_path: Path) -> None:
         model.close()
         backend.close()
         native.close()
+
+
+def test_a_many_model_construction_documents_each_slots_placement(tmp_path: Path) -> None:
+    """P1's run 15086: Klein's construction places one model per slot, and the invoke reply read
+    `document()` off their composite, which had none: every Klein request failed after its
+    work. Each slot's notes and graphs come keyed by its slot."""
+    memory = Memory.open(GpuId(f"cozy-composite-{os.getpid()}", "cpu", 1 << 30))
+    writer = tensorfs.Writer(cache_dir=tmp_path / "store")
+    component = writer.component("net", cls=("torch", "", "Linear"), config={"bias": False})
+    component.put("weight", torch.ones(4, 4).numpy().tobytes(), dtype="F32", shape=[4, 4])
+    native = writer.commit()
+    checkpoint = Checkpoint(native)
+    rows = {}
+    for slot in ("transformer", "text_encoder"):
+        backend = Backend.for_script(
+            {"net": checkpoint},
+            checkpoint.rows("net"),
+            torch=torch,
+            memory=memory,
+            device=torch.device("cpu"),
+            construction=slot,
+            release=slot,
+        )
+        rows[slot] = Placement(memory, backend)
+        rows[slot].notes["lane"] = "int8"
+    composite = executor._CompositeResidency(rows)
+    assert composite.document() == {
+        "notes": {"transformer.lane": "int8", "text_encoder.lane": "int8"},
+        "graphs": {},
+    }
+    native.close()
