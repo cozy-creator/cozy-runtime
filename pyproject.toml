@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.30.13"
+version = "0.30.14"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.13.10,<0.14",
+    "tensorfs>=0.13.12,<0.14",
     "cryptography>=45",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -31,7 +31,7 @@ dev = [
     "cozy-eval==0.7.2",
     "ruff>=0.16",
     # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.13.10,<0.14",
+    "tensorfs>=0.13.12,<0.14",
     "av>=19.0.1",
     # CI partitions this unchanged suite across independent delegated runners.
     "pytest-split>=0.11.0",
@@ -160,7 +160,7 @@ media = [
 ]
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
-model-execution = ["tensorfs>=0.13.10,<0.14"]
+model-execution = ["tensorfs>=0.13.12,<0.14"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
