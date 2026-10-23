@@ -24,6 +24,7 @@ from typing import Any, cast
 import msgspec
 from msgspec import Struct
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._model import LANDED
 from cozy_runtime.author.kernels import (
     KernelsUnavailable,
@@ -47,6 +48,7 @@ try:
         get_cache_invalidating_env_vars,
         make_backend,
     )
+    from triton.knobs import CompileTimes
     from triton.runtime.build import _get_cache_manager
     from triton.runtime.cache import get_cache_key, get_cache_manager
     from triton.runtime.jit import JITFunction
@@ -148,6 +150,7 @@ def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
     return kernel_compile.Job("triton", kernel_cache.Key.of(kernels.name, inputs), spec)
 
 
+@request_path.forbid("kernel build: triton")
 def build(
     spec: dict[str, Any], staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
@@ -293,3 +296,20 @@ def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
 
 
 nvfp4_linear.READY[:] = [ready]
+
+
+def _compiled(*, src: ASTSource, times: CompileTimes, cache_hit: bool, **_: object) -> None:
+    """Triton compiling a kernel at its first launch: on a request thread, it blocked it."""
+    if not cache_hit:
+        request_path.note(f"triton compile: {src.name}", times.total / 1000)
+
+
+def _tuned(*, fn: JITFunction, duration: float | None, cache_hit: bool, **_: object) -> None:
+    """Triton timing an autotuned kernel's configurations to choose one."""
+    if not cache_hit and duration:
+        request_path.note(f"triton autotune: {fn.__name__}", duration * 1000)
+
+
+if not TRITON_ABSENT:
+    triton.knobs.compilation.listener = _compiled
+    triton.knobs.autotuning.listener = _tuned

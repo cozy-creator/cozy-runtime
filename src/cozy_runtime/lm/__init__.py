@@ -43,6 +43,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from typing import Any
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
@@ -1580,7 +1581,8 @@ class _Engine:
                 self.pool, self.side = torch.cuda.graph_pool_handle(), streams.stream(torch)
             capturing = time.perf_counter()
             try:
-                graph, why = capture(torch, lambda: self._advance(size), self.pool, self.side)
+                with request_path.known("cozy_runtime.lm._Engine._replay"):  # cr-210
+                    graph, why = capture(torch, lambda: self._advance(size), self.pool, self.side)
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             self.captured[0] += 1

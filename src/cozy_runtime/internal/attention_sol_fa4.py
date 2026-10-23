@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 import triton
 import triton.language as tl
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.internal import attention_sol
 from cozy_runtime.internal import attention_upstream as upstream
 
@@ -70,6 +71,7 @@ def sparse(
     return out
 
 
+@request_path.forbid("kernel build: sol fa4")
 def warm(index: int) -> None:
     """Build this card's FA4 block-sparse forwards (FP8 and BF16) and the merge at preparation,
     one small call each: FA4's and Triton's caches key neither on length nor on head count, so

@@ -44,6 +44,7 @@ import weakref
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import is_capacity
@@ -75,6 +76,7 @@ def say(key: str, line: str) -> None:
         print(line, file=sys.stderr)
 
 
+@request_path.forbid("cuda graph capture")
 def capture(torch: Any, step: Callable[[], object], pool: Any, stream: Any) -> tuple[Any, str]:
     """`step` recorded as a CUDA graph into `pool` on `stream`: (graph, "") or (None, why).
     After a failure the pool is spent: the allocator keeps a released pool until its blocks
@@ -336,9 +338,13 @@ def _record(
         why = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
         return _failed(torch, recorder, key, placed, why, type(module).__name__)
     try:
-        graph, why = capture(
-            torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, recorder.stream
-        )
+        with request_path.known("cozy_runtime.graphs._record"):  # cr-210
+            graph, why = capture(
+                torch,
+                lambda: outputs.append(call(module, *cargs, **ckwargs)),
+                pool,
+                recorder.stream,
+            )
     except Building as building:  # as written until a kernel lands: `forget` tries again
         graph, why, recorder.pool = None, "", None  # the aborted capture spent its pool
         _chose(recorder, key, "kernel building", f"{building} builds; it records once one lands")

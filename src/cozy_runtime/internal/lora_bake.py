@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from torch import Generator, Tensor
     from torch import device as Device
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.internal import tools
 from cozy_runtime.internal.encoding import E4M3_MAX
 from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, hadamard256
@@ -657,7 +658,8 @@ def _ready(device: int, wait: bool = True) -> bool:
         child, log = _BUILD
         if child.poll() is None and not wait:
             return False
-        code = child.wait()
+        with request_path.forbid("kernel build wait: lora bake"):
+            code = child.wait()
         log.seek(0)
         said = log.read().decode(errors="replace").strip().splitlines()
         log.close()
