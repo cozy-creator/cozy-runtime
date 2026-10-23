@@ -72,7 +72,7 @@ class ModuleLike(Protocol):
     """A component root. The tensor-schema walk can only see what `state_dict()` reaches
     (§1.1 authoring rules) — `torch.nn.Module` satisfies this structurally."""
 
-    def state_dict(self) -> Mapping[str, TensorLike]: ...
+    def state_dict(self, *, keep_vars: bool = False) -> Mapping[str, TensorLike]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -978,7 +978,9 @@ def census(obj: object) -> Census:
 
     Components are read from the object's `components` mapping when it has one (diffusers
     pipelines and modular pipelines both expose it) and from its public module-like
-    attributes otherwise. The walk can only see what `state_dict()` reaches (§1.1).
+    attributes otherwise. The walk can only see what `state_dict()` reaches (§1.1). A tied
+    tensor (`tie_word_embeddings`) is one destination, under its first name: a checkpoint
+    stores it once, and varena installs its placeholder at every name (cr-218).
     """
     destinations: list[Destination] = []
     components: list[str] = []
@@ -991,7 +993,12 @@ def census(obj: object) -> Census:
         if not isinstance(member, ModuleLike):
             continue
         components.append(name)
-        for key, tensor in member.state_dict().items():
+        seen: set[int] = set()
+        for key, held in member.state_dict(keep_vars=True).items():
+            if id(held) in seen:
+                continue
+            seen.add(id(held))
+            tensor = held.detach()
             full = f"{name}.{key}"
             live[full] = tensor
             nbytes = getattr(tensor, "nbytes", 0)

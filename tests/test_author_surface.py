@@ -71,7 +71,7 @@ class Component:
     def __init__(self) -> None:
         self.calls = 0
 
-    def state_dict(self) -> Mapping[str, object]:
+    def state_dict(self, *, keep_vars: bool = False) -> Mapping[str, object]:
         return {}
 
     def __call__(self) -> str:
