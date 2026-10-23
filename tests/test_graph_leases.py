@@ -121,6 +121,7 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
                 result = module(source.to(memory.device)).cpu()
                 torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-4)
                 stats = request.stats()
+            assert not request.stats().outlived, request.stats().outlived  # request-end audit
             facts = placement.document()["graphs"]["network"]
             assert facts["captures"] == facts["capture_attempts"] == 0  # none inside a request
             if turn >= 2:  # the graphs the idle period recorded replay over evicted backing
@@ -239,7 +240,7 @@ def test_a_step_holds_its_components_blocks_and_replays_bind_nothing(tmp_path: P
         holds = []
         for turn in range(3):
             placement.open_attempt()
-            with torch.inference_mode(), memory.request(f"hold-{turn}", [module] * 4):
+            with torch.inference_mode(), memory.request(f"hold-{turn}", [module] * 4) as request:
                 with placement.using("generate", ("stack",)):  # the package method's scope
                     held = placement.holds.get("stack")
                     assert held is not None and placement.graph_held("stack") is held[1]
@@ -249,6 +250,7 @@ def test_a_step_holds_its_components_blocks_and_replays_bind_nothing(tmp_path: P
                         torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
                 placement.release()  # the request's end
                 assert not placement.holds
+            assert not request.stats().outlived, request.stats().outlived  # request-end audit
             torch.cuda.synchronize()
             assert graphs.capture_idle(lambda: False)
         assert graphs._RECORDERS[module].replays == 8  # the first request as written
@@ -329,11 +331,12 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
         for turn in range(4):  # two requests measure; the idle period after the second records
             placement.open_attempt()
             steps = [modules["first"], modules["second"]]
-            with torch.inference_mode(), memory.request(f"shared-{turn}", steps):
+            with torch.inference_mode(), memory.request(f"shared-{turn}", steps) as request:
                 with placement.using("generate", ("first",)):  # held: each its root's graph
                     hidden = modules["first"](source.to(memory.device))
                 with placement.using("generate", ("second",)):
                     got = modules["second"](hidden).cpu()
+            assert not request.stats().outlived, request.stats().outlived  # request-end audit
             torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
             torch.cuda.synchronize()
             assert graphs.capture_idle(lambda: False)

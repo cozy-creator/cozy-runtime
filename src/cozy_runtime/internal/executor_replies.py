@@ -23,10 +23,11 @@ class Fills(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Moved(msgspec.Struct, frozen=True, kw_only=True):
-    """Bytes moved by source (kept pages imported, the store through the page cache);
-    `speculative` of them were prefetched."""
+    """Bytes moved by source (kept pages imported, leased chunks adopted, the store through the
+    page cache); `speculative` of them were prefetched."""
 
     kept: Fills
+    leased: Fills
     store: Fills
     speculative: int
 
@@ -78,6 +79,9 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     leftover: int
     keep_pending: int
     make_room: tuple[MakeRoom, ...]
+    #: the request-end audit: its arena's torch blocks still live outside any region at its
+    #: end, (address, bytes, stream) each; tests fail on any
+    outlived: tuple[tuple[int, int, int], ...]
 
 
 class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):

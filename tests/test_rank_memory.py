@@ -125,6 +125,7 @@ def test_one_rank_plans_its_own_request_and_records_it(tmp_path: Path) -> None:
         assert not ranks and not executor.requests
         assert len(rows) == 1 and rows[0].stats.request == "single"
         assert rows[0].torch_peak == 0  # no GPU: no torch block is varena's
+        assert rows[0].stats.outlived == ()  # the request-end audit
     finally:
         left.close()
         right.close()
