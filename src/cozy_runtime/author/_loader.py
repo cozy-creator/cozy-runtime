@@ -25,7 +25,7 @@ import io
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -553,10 +553,21 @@ class DerivedCache:
     inside an active component-use scope, and there is no persistence surface to declare
     (durable derived tables live in pruned-DiT artifacts produced by jobs, §1.3). At its
     bound the least recently used entries leave to admit a new one; an entry larger than
-    the whole bound refuses. cr-008b owns the ledger accounting and lease mechanics.
+    the whole bound refuses. On a placed model its entries live in a latent region of their
+    own, pinned while a component scope of its model is open (`enter`/`leave`): between scopes
+    varena may take it, and the next scope finds the cache empty.
     """
 
-    __slots__ = ("_bytes", "_entries", "_owner", "max_bytes", "max_entries", "name")
+    __slots__ = (
+        "_bytes",
+        "_entries",
+        "_owner",
+        "_pins",
+        "_region",
+        "max_bytes",
+        "max_entries",
+        "name",
+    )
 
     def __init__(self, name: str, *, max_entries: int, max_bytes: int, owner: _ScopeHost) -> None:
         self.name = name
@@ -565,6 +576,8 @@ class DerivedCache:
         self._entries: OrderedDict[object, tuple[object, int]] = OrderedDict()
         self._bytes = 0
         self._owner = owner
+        self._region: _Region | None = None
+        self._pins: list[AbstractContextManager[bool]] = []
 
     def __repr__(self) -> str:
         return (
@@ -593,7 +606,13 @@ class DerivedCache:
         if key in self._entries:
             self._entries.move_to_end(key)
             return cast(V, self._entries[key][0])
-        value = build()
+        region = self._made()
+        if region is not None and not self._pins:
+            self.enter()  # made inside this scope: held for the rest of it
+        with region.allocating() if region is not None else nullcontext(False) as fresh:
+            if fresh:
+                self.drop()
+            value = build()
         _require_immutable(self.name, value)
         size = _entry_bytes(value)
         if size > self.max_bytes or self.max_entries < 1:
@@ -612,6 +631,26 @@ class DerivedCache:
     def drop(self) -> None:
         self._entries.clear()
         self._bytes = 0
+
+    def _made(self) -> _Region | None:
+        """Its region, made with its first entry on a placed model (None unplaced)."""
+        residency = self._owner._cozy_residency
+        if self._region is None and residency is not None:
+            self._region = residency.region(f"cache:{self.name}", "latent", ())
+        return self._region
+
+    def enter(self) -> None:
+        """A component scope of its model opens: its region stays mapped until `leave`; one
+        that came back empty empties the cache."""
+        if self._region is not None:
+            pin = self._region.pin()
+            if pin.__enter__():
+                self.drop()
+            self._pins.append(pin)
+
+    def leave(self) -> None:
+        if self._pins:
+            self._pins.pop().__exit__(None, None, None)
 
 
 def _require_immutable(name: str, value: object) -> None:
@@ -637,8 +676,22 @@ def _entry_bytes(value: object) -> int:
     return 8
 
 
+class _Region(Protocol):
+    """A latent region (`Residency.region`) as a cache uses it."""
+
+    def pin(self) -> AbstractContextManager[bool]: ...
+
+    def allocating(self) -> AbstractContextManager[bool]: ...
+
+
+class _Residency(Protocol):
+    def region(self, owner: str, kind: str, sets: object) -> _Region: ...
+
+
 class _ScopeHost(Protocol):
     """What a cache needs from the model generation that declared it."""
+
+    _cozy_residency: _Residency | None
 
     def _cozy_require_scope(self, what: str) -> None: ...
 

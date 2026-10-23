@@ -16,6 +16,7 @@ tensorfs = pytest.importorskip("tensorfs")
 from tensorfs.varena import GpuId  # noqa: E402
 from tensorfs.varena.torch import Memory  # noqa: E402
 
+from cozy_runtime.author._loader import DerivedCache  # noqa: E402
 from cozy_runtime.derive.microscale import encode_int8_convrot256  # noqa: E402
 from cozy_runtime.internal.fill import Checkpoint  # noqa: E402
 from cozy_runtime.internal.weights import Backend  # noqa: E402
@@ -126,3 +127,32 @@ def test_a_component_is_served_in_eval_mode(tmp_path: Path) -> None:
         model.close()
         backend.close()
         native.close()
+
+
+def test_a_derived_cache_keeps_its_entries_in_a_latent_region_pinned_per_scope() -> None:
+    """A placed model's derived cache (H3's reference latents) builds its entries in a region of
+    its own, pinned for the rest of the scope that made it and for every later scope of its
+    model; leaving the scope unpins it (varena may take it then, and the next scope finds it
+    empty). Real varena memory over host pages."""
+    memory = Memory.open(GpuId(f"cozy-derived-cache-{os.getpid()}", "cpu", 1 << 30))
+
+    class Owner:
+        def __init__(self) -> None:
+            self._cozy_residency = self
+
+        def region(self, owner: str, kind: str, sets: object) -> Any:
+            return memory.region(owner, kind, sets=())
+
+        def _cozy_require_scope(self, what: str) -> None:
+            pass
+
+    cache = DerivedCache("latents", max_entries=4, max_bytes=1 << 20, owner=Owner())
+    with memory.request("latents"):
+        built = cache.get("a", build=lambda: torch.ones(64))
+        assert torch.equal(built, torch.ones(64)) and cache.entries == 1
+        assert cache._region is not None and len(cache._pins) == 1  # held for this scope
+        cache.leave()
+        cache.enter()  # a later scope: pinned again, its entries still there
+        assert cache.entries == 1 and len(cache._pins) == 1
+        cache.leave()
+    assert not cache._pins

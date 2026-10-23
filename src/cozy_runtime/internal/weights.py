@@ -871,7 +871,7 @@ class Placement:
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def region(self, owner: str, kind: str, sets: Module) -> Region:
+    def region(self, owner: str, kind: str, sets: Module | Sequence[Module]) -> Region:
         """A long-lived intermediate's region serving `sets` (`Memory.region`): varena spills
         or drops it between pins, and its next pin says fresh."""
         return self.memory.region(owner, kind, sets=sets)

@@ -1098,6 +1098,8 @@ class _ComponentScope:
         if model._cozy_residency is not None:
             self._using = model._cozy_residency.using(self._method, self._components)
             self._using.__enter__()
+            for cache in model._cozy_caches:
+                cache.enter()
         if model._cozy_harness is not None:
             model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
 
@@ -1112,6 +1114,8 @@ class _ComponentScope:
             return
         if self._using is not None:
             using, self._using = self._using, None
+            for cache in model._cozy_caches:
+                cache.leave()
             using.__exit__(*sys.exc_info())  # a raise in the scope ends its passes as failed
         if self._local is not None:
             _LOCAL_SCOPES.reset(self._local)
