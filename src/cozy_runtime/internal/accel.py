@@ -2,9 +2,10 @@
 
 Backends are `cuda` and `mps`, period — the no-device-zoo rule of #422 stands; what #447
 amends is WHERE the branch lives. A process that sees no GPU computes on `cpu`: the degraded
-tier every model still runs on (owner, 10-23), slowly, with host RAM as its device memory. Every `if backend == "mps"` belongs HERE, not spread
-through lifecycle, fill and ledger paths. Enumerated implementations, no registration
-mechanism: an unimplemented (backend, operation) pair refuses TYPED.
+tier every model still runs on (owner, 10-23), slowly, with host RAM as its device memory.
+Every `if backend == "mps"` belongs HERE, not spread through lifecycle, fill and ledger
+paths. Enumerated implementations, no registration mechanism: an unimplemented (backend,
+operation) pair refuses TYPED.
 
 The surface is exactly the set of device operations the runtime actually performs, and no
 more: context init, the OOM primitive, the memory meters, the eviction fence, quiescence,
