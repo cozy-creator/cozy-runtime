@@ -14,54 +14,59 @@ from __future__ import annotations
 import sys
 from functools import partial
 from types import ModuleType
+from typing import cast
 
 from cozy_runtime.author._model import Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
-from cozy_runtime.internal import int8_linear, prebuilt, verify
+from cozy_runtime.internal import int8_linear, kernel_ready, prebuilt, verify
 from cozy_runtime.internal.encoding.formats import Tensor
 
 OP = "cozy-w4a8"
 #: The activation operand it takes: int8.convrot's.
 OPERAND = INT8_CONVROT
 
-#: Device index -> the verified library, or why its w4a8 GEMM does not serve there.
-_SERVED: dict[int, prebuilt.Prebuilt | str] = {}
-
 
 def native(torch: ModuleType, index: int) -> prebuilt.Prebuilt | None:
-    """The 8-bit library on this card once its w4a8 GEMM verifies here; None while the library
-    loads, and for good where the GEMM fails its probe (said once)."""
-    served = _SERVED.get(index)
-    if isinstance(served, prebuilt.Prebuilt):
-        return served
-    if served is not None or int8_linear.native(torch, index) is None:
+    """The 8-bit library on this card once its w4a8 GEMM verifies here, off any request thread
+    (`kernel_ready`); None until then, and for good where the GEMM fails its probe (said once)."""
+    name = f"{OP} cuda:{index}"
+    if int8_linear.native(torch, index) is None:
         return None
     if torch.cuda.is_current_stream_capturing():
-        raise Building(OP)  # its probe would end the graph being recorded: record once it serves
+        ops = kernel_ready.ready(name)
+        if ops is None and kernel_ready.failed(name) is None:
+            raise Building(
+                OP
+            )  # its probe would end the graph being recorded: record once it serves
+        return cast("prebuilt.Prebuilt | None", ops)
+    return kernel_ready.ready(name, partial(_verified, torch, index))
+
+
+def _verified(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
     ops = int8_linear.library(index)
     major, minor = torch.cuda.get_device_capability(index)
     verdict = verify.verified(
         "prebuilt-w4a8", prebuilt.artifact(), major * 10 + minor,
         partial(prebuilt.probe_w4a8, torch, ops),
     )  # fmt: skip
-    if verdict.ok:
-        print(f"[w4a8] verified on sm{major}{minor}: {verdict.detail}", file=sys.stderr)
-        _SERVED[index] = ops
-        return ops
-    _SERVED[index] = verdict.detail
-    print(f"[w4a8] no w4a8 GEMM on cuda:{index}: {verdict.detail}", file=sys.stderr)
-    return None
+    if not verdict.ok:
+        print(f"[w4a8] no w4a8 GEMM on cuda:{index}: {verdict.detail}", file=sys.stderr)
+        raise RuntimeError(verdict.detail)
+    print(f"[w4a8] verified on sm{major}{minor}: {verdict.detail}", file=sys.stderr)
+    return ops
 
 
 def why(index: int) -> str:
     """Why this card's w4a8 leaves serve a slower path, or ""."""
-    served = _SERVED.get(index)
-    return served if isinstance(served, str) else ""
+    failed = kernel_ready.failed(f"{OP} cuda:{index}")
+    return "" if failed is None else str(failed)
 
 
 def serving(index: int) -> str:
     """The kernel this card's w4a8 leaves serve now: a run's `gemm.selected`."""
-    return OP if isinstance(_SERVED.get(index), prebuilt.Prebuilt) else int8_linear.serving(index)
+    if kernel_ready.ready(f"{OP} cuda:{index}") is not None:
+        return OP
+    return int8_linear.serving(index)
 
 
 def linear(

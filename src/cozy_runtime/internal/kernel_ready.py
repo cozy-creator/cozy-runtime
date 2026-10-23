@@ -148,6 +148,12 @@ def served(prefix: str) -> list[Any]:
         return [s.value for n, s in _SLOTS.items() if n.startswith(prefix) and s.state == "ready"]
 
 
+def failures(prefix: str) -> dict[str, Exception]:
+    """Every kernel whose name starts with `prefix` that failed here, and why."""
+    with _LOCK:
+        return {n: s.error for n, s in _SLOTS.items() if n.startswith(prefix) and s.error}
+
+
 def boundary() -> list[str]:
     """A boundary of a request: every kernel that landed since serves from here on. Their
     names."""
