@@ -33,7 +33,7 @@ from importlib import import_module
 from inspect import Parameter, Signature, signature
 from pathlib import Path
 from types import MethodType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
     from torch import Tensor, device as Device
@@ -599,6 +599,41 @@ def _open(
     return None if data is None else load(data)
 
 
+def _preprocessed(tokens: int, query: Tensor) -> bool:
+    """Whether upstream's preprocess kernels are built for this length and head count here
+    (`_warm`, off the request): they take both as constants. A warm that failed lets the step
+    build them itself, as upstream does."""
+    heads, index = query.shape[2], query.device.index or 0
+    name = f"{KERNEL} preprocess {tokens}x{heads} cuda:{index}"
+    opener = functools.partial(_warm, index, tokens, heads)
+    return kernel_ready.ready(name, opener) is not None or kernel_ready.failed(name) is not None
+
+
+def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool:
+    """`_preprocessed`'s opener: upstream's exact-threshold preprocess (`preprocess.prepare`) built
+    for `tokens` and `heads` on GPU `index`, launching nothing. Its operands are small ones in
+    the live ones' class: what compiles is the descriptors' block shapes, the constants and the
+    lengths' residues, never the sizes."""
+    torch = import_module("torch")
+    upstream = import_module("sol_attn.preprocess")
+    descriptor = import_module("triton.tools.tensor_descriptor").TensorDescriptor
+    _pin_preprocess()
+    blocks, bf16, f32 = -(-tokens // _BLOCK), torch.bfloat16, torch.float32
+    with torch.cuda.device(index):
+        rows = torch.empty(1, _BLOCK + tokens % 16, heads, 128, dtype=bf16, device="cuda")
+        tiles = descriptor.from_tensor(rows, [1, _BLOCK, 1, 128])
+        shape = (tokens, heads, blocks, 128, _BLOCK, 128)
+        upstream._reduce_kc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
+        upstream._reduce_vc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
+        upstream._pool_query_kernel.warmup(tiles, bf16, *shape, grid=(1,), num_warps=4,
+                                           num_stages=1)  # fmt: skip
+        upstream._exact_fused_threshold_kernel.warmup(
+            bf16, f32, bf16, f32, _SCALE, heads, blocks, 128, 64, 128, 1.0,
+            grid=(1,), num_warps=4, num_stages=1,
+        )  # fmt: skip
+    return True
+
+
 def _pin_preprocess() -> None:
     """Upstream autotunes its K/V block reductions over 4 and 8 warps by timing, and the two
     reduce in different orders: measured bitwise-different summaries, which can flip a
@@ -772,17 +807,18 @@ def _execute(
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
     card = _card(query.device)
     fa4 = sparse is None and card is not None and route(card) == FA4
-    loaded, instead = None, "dense_path" if dense_path else "dense_step"
-    if not dense_path and sparse is None and not fa4:
-        # The dense steps run on the GPU while this length's variant compiles on the CPU.
-        ready, waiting = _ready(layout.live_tokens, query.device, layout.step)
+    loaded: object = None
+    instead = "dense_path" if dense_path else "dense_step"
+    if not dense_path and sparse is None:
+        # The first sight of this length starts its kernels opening off the request (a CuTe
+        # route's object, upstream's preprocess), and the dense steps run while they build.
+        built = card is None or _preprocessed(layout.live_tokens, query)
+        ready, waiting = (FA4, "") if fa4 else _ready(layout.live_tokens, query.device, layout.step)
+        if ready is not None and not built:
+            ready, waiting = None, "dense_building"
         if layout.step >= layout.dense_until_step:
             loaded, instead = ready, waiting
-    if (
-        dense_path
-        or layout.step < layout.dense_until_step
-        or (sparse is None and not fa4 and loaded is None)
-    ):
+    if dense_path or layout.step < layout.dense_until_step or (sparse is None and loaded is None):
         # A dense step, a dense path, or a sparse step whose variant is not ready: the dense
         # reference serves it.
         live_output = dense(query=q, key=k, value=v, scale=scale)
@@ -805,7 +841,7 @@ def _execute(
             live_output = sparse(q, k, v, scale, layout.protected_prefix)
         else:
             assert loaded is not None
-            live_output = _native(q, k, v, scale, layout.protected_prefix, loaded)
+            live_output = _native(q, k, v, scale, layout.protected_prefix, cast("Loaded", loaded))
         _validate_result(live_output, q)
         if any(
             live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
