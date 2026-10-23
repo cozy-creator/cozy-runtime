@@ -86,8 +86,8 @@ package = true
 conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
 [tool.uv.sources]
-# Dev pin until the cohort release: the tensorfs-py the varena-two integration builds (step 3).
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "cb9dd63f3fa155275098417f71e5f8179b82a31c", subdirectory = "crates/tensorfs-py" }
+# Dev pin until the cohort release: S3's torch-alloc tensorfs-py (varena as torch's only CUDA allocator, with the lease connect).
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "8658a2ce7787dd784d85e8792d5c48d6d6601fc6", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
