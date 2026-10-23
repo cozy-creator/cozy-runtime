@@ -1107,9 +1107,14 @@ def _record(
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
         for index, tensor in enumerate(entry.statics):
             _LENT[tensor.data_ptr()] = (weakref.ref(entry), index)
-        owner.serve(_REGIONS[module][0]())
-        if placed is not None and owner.cache is None:  # one cache for the device's pool
-            owner.cache = placed[0].cache("graphs", functools.partial(_shed, torch, owner))
+        joined = owner.serve(_REGIONS[module][0]())
+        if placed is not None and (joined or owner.cache is None):
+            # One cache for the device's pool, naming every component recorded into it (its next
+            # use is the nearest of theirs): registered again when one joins.
+            if owner.cache is not None:
+                owner.cache.close()
+            served = [root for root in (ref() for ref in owner.served) if root is not None]
+            owner.cache = placed[0].cache("graphs", functools.partial(_shed, torch, owner), served)
         if owner.cache is not None:
             owner.cache.cached(owner.capture_bytes())
         return True

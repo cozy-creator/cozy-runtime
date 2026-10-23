@@ -23,14 +23,12 @@ class Fills(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Moved(msgspec.Struct, frozen=True, kw_only=True):
-    """Bytes moved by source (kept pages imported, the RAM tier, the store); `speculative` of
-    them were prefetched; `saved`, filled pages copied into the RAM tier afterwards."""
+    """Bytes moved by source (kept pages imported, the store through the page cache);
+    `speculative` of them were prefetched."""
 
     kept: Fills
-    tier: Fills
     store: Fills
     speculative: int
-    saved: Fills = Fills(bytes=0, ns=0)
 
 
 class Ref(msgspec.Struct, frozen=True, kw_only=True):
@@ -40,7 +38,7 @@ class Ref(msgspec.Struct, frozen=True, kw_only=True):
     set: str
     block: int
     bytes: int
-    origin: Literal["Hit", "Kept", "Tier", "Store"]
+    origin: Literal["Hit", "Kept", "Store"]
     speculative: bool
 
 
@@ -61,14 +59,6 @@ class MakeRoom(msgspec.Struct, frozen=True, kw_only=True):
     need: int
     freed: int
     waited: int
-
-
-class Unregisters(msgspec.Struct, frozen=True, kw_only=True):
-    """RAM-tier host ranges unlocked while it ran (each stalls the device until idle)."""
-
-    calls: int
-    bytes: int
-    max_ns: int
 
 
 class Refusal(msgspec.Struct, frozen=True, kw_only=True):
@@ -95,10 +85,8 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     peak: int
     compute: int
     host: int | None
-    tier: int
     leftover: int
     keep_pending: int
-    unregisters: Unregisters
     make_room: tuple[MakeRoom, ...]
 
 

@@ -908,7 +908,7 @@ def _reservation(model: Any, shed: Callable[[int], int]) -> Any:
     """The memory's count of an engine's buffers, shed on ask (`Placement.cache`); None for a
     model Runtime does not place (its tensors are where its caller put them)."""
     placed = PLACED.get(model)
-    return None if placed is None else placed[0].cache(f"lm:{type(model).__name__}", shed)
+    return None if placed is None else placed[0].cache(f"lm:{type(model).__name__}", shed, [model])
 
 
 class _Request:

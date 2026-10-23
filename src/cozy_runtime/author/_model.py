@@ -265,8 +265,9 @@ class Residency(Protocol):
     supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
     """
 
-    def cache(self, owner: str, shed: Callable[[int], int]) -> Any:
-        """Device bytes `owner` keeps for speed (KV slots), counted and shed on ask: `cached`
+    def cache(self, owner: str, shed: Callable[[int], int], served: Sequence[Any]) -> Any:
+        """Device bytes `owner` keeps for the components `served` (their root modules: KV
+        slots, a graph pool), counted and shed on ask in the order of their next use: `cached`
         and `close`; None off a GPU."""
         ...
 
