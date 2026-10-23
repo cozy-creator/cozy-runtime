@@ -2448,7 +2448,7 @@ class Executor:
         rows = [r for name in present for r in checkpoints[name].rows(name)]
         stage("checkpoint_headers")
         if accel.memory_class(self.device_kind) == "unified":
-            # One pool, every weight resident (cr-021): weights past the GPU's working set never fit.
+            # One pool, every weight resident (cr-021): past the GPU's working set never fits.
             need, room = sum(r.stored_nbytes for r in rows), accel.unified_ceiling(torch)
             if need > room:
                 return self._refusal(
