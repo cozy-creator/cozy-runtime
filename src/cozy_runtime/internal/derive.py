@@ -455,12 +455,14 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     derived name is the alternative, and it is not one — the fill plane refuses it by name.
 
     So this substrate does what a real serving loader does: it lets `__init__` EXECUTE, on
-    the host, and swaps each PARAMETER to `meta` the moment it is registered. Parameters are
-    the bytes that matter — 6.4 GiB of them here — and they are still never allocated for
-    real: the transient peak is one leaf's parameters, freed as soon as the swap lands.
-    Buffers are kilobytes and they keep the values their own construction computed, which is
-    what makes `position_ids` a derived table materialized on the target device rather than
-    a shape with garbage in it.
+    the host, and swaps each PARAMETER and PERSISTENT BUFFER to `meta` the moment it is
+    registered: both are checkpoint state, filled and bound by the weight plane alike, so a
+    package that reads a batch norm's `running_mean` outside a forward reads the checkpoint's
+    value, never the construction's. Parameters are the bytes that matter — 6.4 GiB of them
+    here — and they are still never allocated for real: the transient peak is one leaf's
+    parameters, freed as soon as the swap lands. Non-persistent buffers keep the values their
+    own construction computed, which is what makes `position_ids` a derived table
+    materialized on the target device rather than a shape with garbage in it.
     """
     torch = torch_module()
     nn = torch.nn
@@ -483,7 +485,9 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         original_buffer(module, name, value, persistent=persistent)
         held = module._buffers.get(name)
         if persistent and isinstance(held, torch.Tensor):
-            seen.register(held)
+            with placing():
+                module._buffers[name] = held.to("meta")
+            seen.register(module._buffers[name])
 
     swap = torch.__future__.get_swap_module_params_on_conversion()
     with ExitStack() as stack:
