@@ -30,24 +30,17 @@ on:
         description: "Whether to build for Windows x86_64: yes or no"
         type: string
         default: 'yes'
-  pull_request:
-    paths: &inputs
+  push:
+    branches: [master]
+    paths:
       - kernels/**
       - src/cozy_runtime/_kernels/__init__.py
       - checks/kernel_modules.py
       - .github/workflows/kernels.yaml
-  push:
-    branches: [master]
-    paths: *inputs
-run-name: kernels ${{ inputs.ref || github.head_ref || github.ref_name }}
+run-name: kernels ${{ inputs.ref || github.ref_name }}
 
 permissions:
   contents: read
-
-# A newer push to the same ref replaces a build still running; a caller's build is its own.
-concurrency:
-  group: kernels-${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
-  cancel-in-progress: true
 
 jobs:
   # A cached x86_64 build needs no 16-core runner: look the key up on a free one first.

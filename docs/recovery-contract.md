@@ -30,6 +30,3 @@ Owner, 2026-10-05: "I want processes to succeed and be resistant to changes, not
   finest grain with every tensor it does not read on the host. It reports the measured
   shortfall, with the state its blocks found put back, so the executor serves the next call.
   A block shared by a GPU group cannot run again alone; its ops still recover one by one.
-
-Tests: `tests/test_block_replay_contract.py`, `tests/test_recovery_exhaustion.py` (CPU) and
-the weight plane's GPU tests.

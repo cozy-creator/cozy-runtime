@@ -10,8 +10,7 @@ evaluator over literal and arithmetic nodes and values of the package's committe
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
 `Annotated`, cozy-runtime's own asset, marker and service classes. Rendering is then
 `schema.render`, the SAME renderer the import path uses, so the two derivations cannot drift
-by construction. `checks/architecture.py`'s `static-describe-executes-nothing` fence holds
-this module's import list to that.
+by construction.
 
 Anything outside the closed vocabulary — a name bound to no definition in the tree, a
 computed value (call, comprehension, unknown attribute) in an interface position, a dynamic

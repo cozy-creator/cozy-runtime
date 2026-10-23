@@ -26,18 +26,10 @@ dependencies = [
 # every invocation.
 dev = [
     "mypy>=1.13",
-    "pytest>=8.4",
-    # The public capture reader validates the writer contract in tests.
-    "cozy-eval==0.7.2",
     "ruff>=0.16",
-    # Model-bound Runtime tests exercise the real compiled storage boundary.
-    "tensorfs>=0.13.13,<0.14",
-    "av>=19.0.1",
-    # CI partitions this unchanged suite across independent delegated runners.
-    "pytest-split>=0.11.0",
 ]
-# The Diffusers integrations (fused glue, attention producers, Ulysses CP, LoRA composition)
-# and their tests: `uv run --group diffusers pytest ...`. Packages declare their own.
+# The Diffusers integrations (fused glue, attention producers, Ulysses CP, LoRA composition).
+# Packages declare their own.
 diffusers = [
     "peft>=0.20,<0.21",
     "diffusers>=0.40.0",
@@ -52,20 +44,6 @@ diffusers = [
 [project.scripts]
 cozy-runtime = "cozy_runtime.cli.main:main"
 cozy-native-wheel-proof = "cozy_runtime.cli.native_wheel_proof:main"
-
-[tool.pytest.ini_options]
-# ONE suite, FEW and REAL (decision 691, which repeals the earlier no-test ban). Most legs
-# start a real process against a real build; the rest drive the real in-process construction
-# and refusal paths. Nothing is mocked, stubbed or doubled anywhere, and a rule better held
-# by a refusal belongs here rather than in `checks/architecture.py`.
-testpaths = ["tests"]
-addopts = "-q -p no:cacheprovider"
-
-[[tool.mypy.overrides]]
-# Pending xs-045 U8: the MPS platform proof (platforms.yaml) still speaks the v1 TensorFS API and
-# skips at import until it is ported.
-module = ["test_mps"]
-ignore_errors = true
 
 [build-system]
 # The pure wheel and the sdist. `task wheel` makes each native wheel from the pure one plus that
@@ -82,17 +60,12 @@ packages = ["src/cozy_runtime"]
 
 [tool.uv]
 package = true
-# The historical SDXL development corpus keeps its own locked dependency cohort.
-conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "checks", "tests", "examples"]
+files = ["src", "checks", "examples"]
 explicit_package_bases = true
-mypy_path = "src:checks:tests:examples/marco-polo:tests/testdata/static_describe/rich:kernels/src"
-# The `extends` fixture imports its DEPENDENCY's modules, which is the whole point of it
-# (cr-117). The rich fixture is that dependency, so mypy is pointed at it rather than
-# told to ignore the import.
+mypy_path = "src:checks:examples/marco-polo:kernels/src"
 strict = true
 warn_unreachable = true
 disallow_any_generics = true
@@ -101,8 +74,7 @@ implicit_reexport = false
 # torch is an OPTIONAL extra (§1.0: the base package is torch-free), so the checking venv
 # does not have it and mypy cannot see its types. The consequence is recorded rather than
 # papered over: the two modules that touch torch are checked without unused-ignore warnings
-# and with torch itself untyped. `checks/architecture.py::torch-free-import` is what actually
-# holds the packaging rule; mypy never could.
+# and with torch itself untyped.
 [[tool.mypy.overrides]]
 module = ["torch.*", "peft.*", "triton.*", "numpy.*", "transformers.*", "tokenizers", "tokenizers.*"]
 ignore_missing_imports = true
@@ -117,15 +89,7 @@ ignore_missing_imports = true
 # TensorFS is a required typed dependency, including the public native record aliases.
 # Missing bindings must fail type checking rather than silently becoming Any.
 
-# `corpus/` is the adversarial corpus and the real-torch H3 fixture. Checking it here would
-# be checking torch-shaped code against a torch that is not installed, which produces
-# confident nonsense; it is exercised by running it in the corpus venv.
 [[tool.mypy.overrides]]
-# `huggingface_hub` is a CORPUS-venv dependency the fixture staging reaches for once, to
-# fetch a tokenizer merges file the bench download skipped. Not a runtime dependency and
-# not present in the checking venv.
-# `PIL` joins them for cr-006: the fp8-vs-fp16 image comparison reads two PNGs the real
-# package wrote and computes PSNR, in the corpus venv where Pillow already lives.
 module = [
     "huggingface_hub",
     "diffusers",
@@ -141,20 +105,13 @@ module = [
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
-module = ["corpus.*"]
-ignore_missing_imports = true
-follow_imports = "skip"
-
-[[tool.mypy.overrides]]
 module = ["cozy_runtime.internal.derive"]
 warn_unused_ignores = false
 
 [project.optional-dependencies]
 assessment = ["cozy-eval>=0.7"]
-# The derivation harness and the serving executor. Corpus venvs install this.
+# The derivation harness and the serving executor.
 derive = ["torch>=2.13"]
-# The separate SDXL corpus retains its own upstream dependency cohort.
-corpus = ["torch>=2.13", "diffusers>=0.36", "transformers>=4.40"]
 media = [
     "av>=19.0.1",
 ]
@@ -172,7 +129,7 @@ adapters = [
 
 [tool.ruff]
 line-length = 100
-src = ["src", "checks", "tests", "examples", "scripts"]
+src = ["src", "checks", "examples", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]

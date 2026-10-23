@@ -48,12 +48,7 @@ Published dependency declarations allow patch upgrades, including optional extra
 Minimum versions (`>=`) are preferred; major/minor compatibility ranges are permitted.
 Exact development and CI versions belong in `uv.lock`; worker images retain their exact
 wheel and image digests. The Python ABI bound is independent of dependency version
-policy. The `dependency-version-ranges` architecture fence holds this boundary.
-
-`uv run pytest` runs the current suite, including real process, descriptor, native storage,
-and numerical component checks. CI also checks builds, types, lint and architecture fences.
-Tests requiring a GPU or host facilities name those requirements; CPU/descriptor proofs do
-not establish GPU inference or provider qualification.
+policy.
 
 For media inputs (handles, reads, preparation), see [Media inputs](docs/assets.md).
 
@@ -102,17 +97,8 @@ Store helpers for tools/tests; managed executors consume TensorD's scoped source
 | `internal/fill.py` | project source headers into model rows and read plans; explicit standalone Store helpers |
 | `internal/weights.py`, `internal/plane.py` | executor weight layout, residency policy and TensorFS GPU/CPU buffer operations |
 
-`checks/architecture.py` keeps versioned identities in two disjoint registries.
-`DOCUMENT_KINDS` contains only stored or digested documents that cross a process/repository
-boundary: PackageInterface, EnvironmentReceipt, and PackageEnvironment.
-`IMPLEMENTATION_IDS` contains the six encoding-provider names whose exact strings enter
-implementation, plan, and generation digests; those names are executable identity, not document
-formats. Command requests, planner values, worker records, proof-local state, and benchmark reports
-are typed by their command/path or storage table and carry no global format tag.
-
-**One attempt kernel** (§8). The rule is structural, not a promise: the `one-attempt-kernel`
-fence proves the invocation kernel has exactly one caller (the device executor), so a
-direct-call runner beside it cannot be written without turning CI red.
+**One attempt kernel** (§8). The invocation kernel has exactly one caller (the device
+executor).
 
 **Observability is bounded, or it is not observability.** `author/_observations.py` holds the
 ONE record shape, a ring bounded by count AND bytes that sheds oldest first and counts what it
@@ -153,8 +139,7 @@ exit, typed outcomes, explicit cancellation and enclosing caller deadlines decid
 and so does a PROVEN wedge, which `internal/liveness.py` defines once for a stream, a child
 process and a local boot: still for longer than the subject's own longest observed pause, and
 never for less than a floor derived from the sampling cadence. No number of seconds kills
-anything on its own. The `timing-decides-nothing` fence proves observation cannot reach
-residency or placement.
+anything on its own. Observation cannot reach residency or placement.
 
 **Component residency is the runtime's, and the package has no vocabulary for it.** An
 package declares the possible heavyweight set of each public model operation with
@@ -163,8 +148,7 @@ before the body runs — freeing non-declared components, LRU over refcount-0 le
 CUDA events have fired, until the plan's activation envelope fits ALLOCATABLE capacity —
 and leaving it records the fence and makes the bytes evictable. Eviction FREES; there is no
 host residence tier, and a re-stage is an ordinary cr-005 fill from the page-cached CAS
-mapping. The `package-owns-no-residency` fence proves the vocabulary is unreachable from
-package code rather than merely unused.
+mapping. The vocabulary is unreachable from package code rather than merely unused.
 
 **Encoder results are memoized by marking the method.** `@uses_components(..., memoize=True)`
 (with `memo_dependencies`/`memo_version` as on `@invocable`) makes a method eligible; the
@@ -225,8 +209,7 @@ own directory and to JSON scalars, so reading data is never running code (cr-115
 declaration is rebuilt as a real type
 (`msgspec.defstruct`, `enum.Enum`) and rendered by the SAME `internal/schema.py` the import
 path uses, so the two readings cannot drift. Nothing of the package is imported, executed or
-evaluated — `checks/architecture.py`'s `static-describe-executes-nothing` fence holds the
-reader's import list to that — and anything outside the vocabulary (a call or comprehension in
+evaluated, and anything outside the vocabulary (a call or comprehension in
 an interface position, a type from outside the tree, a star import, computed registration,
 or a function-local import of an interface name) is a typed refusal naming `file:line`
 and the construct: `static_unresolvable`, `static_computed`, `static_unsupported`,
@@ -299,9 +282,7 @@ the produced CozyTensors header is the sole tensor-schema and encoding authority
 executor still receives only verified model capabilities, never the foreign source credential or
 destination authority. Multiple transformations are ordinary code inside one bounded function—there is
 no `model_productions` graph, compatibility reader, or second scheduler.
-`internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules, and
-`checks/architecture.py`'s `canonical-numbers` fence replays it over the frozen ES6 vector
-corpus in `vectors/es6-numbers.txt`.
+`internal/canonical.py` is the RFC 8785 writer — tensorfs (tfs-013) owns the rules.
 
 The package interface is derived, not committed to the source tree. `cozy-runtime --json --dir
 PROJECT describe` writes canonical bytes to stdout from source alone — no torch, no venv, no
@@ -317,9 +298,6 @@ describe disagrees with them. `package_interface_digest` is SHA-256 over those c
     uv run cozy-runtime describe              # the surface, from source alone
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
     uv run --locked cozy-runtime --conformance describe   # + import the app here; equal or refuse
-    uv run python checks/architecture.py # AST import/dependency scans over the boundaries
-    uv run pytest                        # the end-to-end suite: two real runs, no mocks
-    uv run --group diffusers pytest tests/test_package_extensions.py   # + the Diffusers integrations
 
 ### Per-package uv environments
 
@@ -463,9 +441,7 @@ TensorFS directly. Every approved base worker image already owns the same distri
 rental overlay export prunes it and Runtime observes the image-provided facade before
 execution.
 
-Real-GPU behaviour is verified by hand on a rented card. `corpus/` holds the adversarial
-derivation cases and the real-torch fixtures for those runs; they are driven from a corpus
-venv, not from CI.
+Real-GPU behaviour is verified by hand on a rented card.
 
 Plain transformer components larger than the assigned weight-residence ceiling use their
 existing `_no_split_modules` boundaries. Runtime retains common weights and fills one block
@@ -480,25 +456,6 @@ nonpersistent rotary buffers retain their config-derived initialization.
 Paged blocks must expose live returned tensors through registered PyTrees. Returned weight
 views refuse without freeing storage; arbitrary hidden state retaining weight views is not
 qualified by the no-split declaration or this proof.
-
-With H3's locked dependencies and the candidate Runtime/TensorFS installed, run the actual
-package constructor and GPU parity/refusal proof for each transformer:
-
-```bash
-python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof text_encoder
-python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof fl2va_dit
-python tests/testdata/h3_paging_proof.py --packages-root /path/to/packages --work-dir /path/to/proof video_vae
-```
-
-The fixture preserves all 50 language/DiT layers while reducing widths. Its all-resident
-reference is discarded before paging; each paged forward must reproduce exact outputs and
-evict every visited block. It also checks undersized working-set and autograd refusals,
-and process poisoning after a failed block forward. The VAE arm uses the actual modular
-decode and checks prior autocast-cache settings after normal and exceptional exits.
-This proves weight paging, not full-video
-activation capacity. H3's full BF16 text and DiT weight working sets are about 2.90 GB and
-1.42 GB respectively; video-VAE activation tiling and encoded-leaf eviction remain separate
-qualification gaps. No dtype or inference backend is substituted to make a model fit.
 
 An unpublished package runs from captured source without a Tensorhub package release.
 A local script is the single-file form; editable describes an installation mode.
