@@ -73,6 +73,11 @@ img = torch.randn(1, 64, 128, 128, generator=g)
 with torch.no_grad():
     cref = conv(img)
     leg("conv2d_fp16_rel", lambda: rel(conv.to(d, torch.float16)(img.to(d, torch.float16)).float(), cref))
+    for ch, side in ((320, 64), (640, 32), (1280, 16)):  # SD UNet widths
+        c, x = torch.nn.Conv2d(ch, ch, 3, padding=1), torch.randn(2, ch, side, side, generator=g)
+        leg(f"conv2d_{ch}_fp16_rel", lambda c=c, x=x: rel(c.to(d, torch.float16)(x.to(d, torch.float16)).float(), c.cpu().float()(x)))
+    lin, x = torch.nn.Linear(320, 1280), torch.randn(2, 4096, 320, generator=g)
+    leg("linear_fp16_rel", lambda: rel(lin.to(d, torch.float16)(x.to(d, torch.float16)).float(), lin.cpu().float()(x)))
 q = torch.randn(1, 10, 4096, 64, generator=g)
 leg("sdpa_fp16_rel", lambda: rel(torch.nn.functional.scaled_dot_product_attention(
     *[q.to(d, torch.float16)] * 3).float(), torch.nn.functional.scaled_dot_product_attention(q, q, q)))
@@ -91,6 +96,9 @@ with torch.no_grad():
     uref = unet_cpu(lat, t, ctx).sample
     pipe.to(d, torch.float16)
     leg("unet_fp16_rel", lambda: rel(pipe.unet(lat.to(d, torch.float16), t.to(d), ctx.to(d, torch.float16)).sample.float(), uref))
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        leg("unet_fp16_math_attention_rel", lambda: rel(pipe.unet(
+            lat.to(d, torch.float16), t.to(d), ctx.to(d, torch.float16)).sample.float(), uref))
     leg("unet_step_s", lambda: round(timed(lambda: pipe.unet(
         lat.to(d, torch.float16), t.to(d), ctx.to(d, torch.float16)), reps=3), 3))
 
@@ -107,4 +115,13 @@ def generate():
 
 
 leg("tiny_sd_512_20_steps", generate)
+# The verdict: fp16 within 1e-2 of CPU fp32 and a picture with contrast (a black or NaN image has none).
+wrong = [k for k, v in facts.items() if k.endswith("_rel") and "bfloat16" not in k
+         and not (isinstance(v, float) and v < 1e-2)]
+image = facts["tiny_sd_512_20_steps"]
+if not (isinstance(image, dict) and image["pixel_std"] > 20):
+    wrong.append("tiny_sd_512_20_steps")
+facts["wrong"] = wrong
 (out / "mps-probe.json").write_text(json.dumps(facts, indent=2))
+print("verdict:", "correct" if not wrong else f"WRONG {wrong}")
+sys.exit(1 if wrong else 0)

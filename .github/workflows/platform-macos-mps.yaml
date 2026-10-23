@@ -1,14 +1,20 @@
 name: platform-macos-mps
 # Manual only. Does a hosted macOS runner expose its Apple GPU to torch (MPS), how much Metal memory,
 # and does a tiny real diffusion model (segmind/tiny-sd) run there? Uploads JSON facts and the image.
-#   gh workflow run platform-macos-mps.yaml -R cozy-creator/cozy-runtime [-f runners='["macos-15"]']
+# The probe fails the job when fp16 on MPS strays from CPU fp32 or the image has no contrast.
+#   gh workflow run platform-macos-mps.yaml -R cozy-creator/cozy-runtime [-f runners='["macos-15"]'] [-f torch=nightly]
 on:
   workflow_dispatch:
     inputs:
       runners:
         description: JSON list of runner labels
         type: string
-        default: '["macos-14", "macos-15", "macos-latest", "macos-26"]'
+        default: '["macos-15", "macos-26", "xcode-27"]'
+      torch:
+        description: stable (PyPI) or nightly
+        type: choice
+        default: stable
+        options: [stable, nightly]
 
 permissions:
   contents: read
@@ -29,13 +35,14 @@ jobs:
       - name: Probe
         run: |
           uv venv --python 3.12 .venv
+          [ "${{ inputs.torch }}" = stable ] || uv pip install --python .venv/bin/python --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
           uv pip install --python .venv/bin/python 'torch>=2.14' 'diffusers>=0.40' 'transformers>=5' accelerate
           .venv/bin/python .github/platforms/mps-probe.py "$RUNNER_TEMP/mps" 2>&1 | tee "$RUNNER_TEMP/mps-transcript.txt"
           mv "$RUNNER_TEMP/mps-transcript.txt" "$RUNNER_TEMP/mps/"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mps-${{ matrix.runner }}
+          name: mps-${{ matrix.runner }}-${{ inputs.torch }}
           path: ${{ runner.temp }}/mps
           if-no-files-found: ignore
           retention-days: 30
