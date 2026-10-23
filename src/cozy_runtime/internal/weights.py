@@ -895,7 +895,9 @@ class Placement:
         """Every page `binding` covers is on the device now (an idle capture never fills one)."""
         return binding.resident()
 
-    def cache(self, owner: str, shed: Callable[[int], int], served: Sequence[Any]) -> Cache | None:
+    def cache(
+        self, owner: str, shed: Callable[[int], int], served: Sequence[Module]
+    ) -> Cache | None:
         """Device bytes `owner` keeps for the components `served` (their roots), counted and
         shed on ask in the order of their next use; None off a GPU."""
         return self.memory.cache(owner, shed, sets=list(served)) if self.memory.cuda else None
