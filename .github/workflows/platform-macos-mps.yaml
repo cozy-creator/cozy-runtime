@@ -33,12 +33,17 @@ jobs:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
       - name: Probe
+        shell: bash -euo pipefail {0}
         run: |
           uv venv --python 3.12 .venv
           [ "${{ inputs.torch }}" = stable ] || uv pip install --python .venv/bin/python --pre torch --index-url https://download.pytorch.org/whl/nightly/cpu
           uv pip install --python .venv/bin/python 'torch>=2.14' 'diffusers>=0.40' 'transformers>=5' accelerate
           .venv/bin/python .github/platforms/mps-probe.py "$RUNNER_TEMP/mps" 2>&1 | tee "$RUNNER_TEMP/mps-transcript.txt"
           mv "$RUNNER_TEMP/mps-transcript.txt" "$RUNNER_TEMP/mps/"
+      # Weights as MPS tensors over an mmap'd file, no copy (cr-021).
+      - name: Mapped weights
+        if: always()
+        run: .venv/bin/python .github/platforms/mps-mmap-probe.py "$RUNNER_TEMP/mps"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
