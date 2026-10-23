@@ -48,6 +48,7 @@ from cozy_runtime.internal.encoding import (
     DeviceFacts,
     Encoded,
     LeafProvider,
+    Nvfp4NativeLeaf,
     Provider,
     RuntimeIdentity,
     admit,
@@ -657,6 +658,15 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
         scale = (rotated.abs().amax(dim=-1) / 127.0).clamp(min=1e-12).float()
         payload = torch.round(rotated / scale.double().unsqueeze(-1)).clamp(-127, 127)
         return weight, {"weight": payload.to(torch.int8), "scale": scale}
+    if provider.suite == "svdq-nvfp4-native":  # an nvfp4 residual, smoothing and a rank-32 branch
+        _, roles = _weight_roles(torch, Nvfp4NativeLeaf(), device)
+        roles["pre_quant_scale"] = torch.rand(cols, generator=generator).to(device) + 0.5
+        down = torch.randn(32, cols, generator=generator) * 0.05
+        roles["lowrank_down"] = down.to(torch.bfloat16).to(device)
+        roles["lowrank_up"] = (
+            (torch.randn(rows, 32, generator=generator) * 0.05).to(torch.bfloat16).to(device)
+        )
+        return _exact_weight(torch, provider, roles).float(), roles
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         encoded = encode_nvfp4("probe", weight.cpu().numpy())
         scale, scale_2 = encoded.companions
@@ -741,6 +751,10 @@ def _exact_weight(torch: Any, provider: Provider, roles: Mapping[str, Any]) -> A
         rows, packed = (int(n) for n in roles["weight"].shape)
         columns = packed * 4 // 3 if provider.encoding == "comfy.w6a8_int8" else packed * 2
         return _f64(roles["scale"]).reshape(rows, 1).expand(rows, columns)
+    if provider.suite == "svdq-nvfp4-native":
+        nvfp4 = _exact_weight(torch, Nvfp4NativeLeaf(), roles)
+        branch = _f64(roles["lowrank_up"]) @ _f64(roles["lowrank_down"])
+        return nvfp4 * _f64(roles["pre_quant_scale"]).reshape(1, -1) + branch
     if provider.suite in ("nvfp4-decode", "nvfp4-native"):
         packed = roles["weight"].cpu()
         rows, cols = int(packed.shape[0]), 2 * int(packed.shape[1])
@@ -951,7 +965,14 @@ DECODE_SUITES: dict[str, Callable[[Any, Provider, Any, Any], Sweep]] = {
 
 #: Native leaves' oracle is their own GEMM against arithmetic (`_native_agreement`).
 NATIVE_SUITES = frozenset(
-    {"fp8-rowwise-native", "int8-convrot256-native", "nvfp4-native", "mxfp8-native", "w4a8-native"}
+    {
+        "fp8-rowwise-native",
+        "int8-convrot256-native",
+        "nvfp4-native",
+        "mxfp8-native",
+        "w4a8-native",
+        "svdq-nvfp4-native",
+    }
 )
 
 

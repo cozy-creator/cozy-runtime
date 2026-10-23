@@ -34,7 +34,7 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
-from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, tools
+from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, svdq_linear, tools
 
 try:
     import torch
@@ -298,6 +298,7 @@ def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Laun
 
 
 nvfp4_linear.READY[:] = [ready]
+svdq_linear.READY[:] = [ready]
 
 
 def _compiled(*, src: ASTSource, times: CompileTimes, cache_hit: bool, **_: object) -> None:

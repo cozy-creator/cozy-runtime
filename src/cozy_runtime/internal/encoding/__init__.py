@@ -30,6 +30,7 @@ from cozy_runtime.internal.encoding.leaves import (
     Int8ConvRotNativeLeaf,
     Nvfp4NativeLeaf,
     RowwiseNativeLeaf,
+    SvdqNvfp4NativeLeaf,
     W4a8NativeLeaf,
 )
 from cozy_runtime.internal.encoding.selection import (
@@ -74,6 +75,7 @@ __all__ = [
     "RuntimeIdentity",
     "Selection",
     "Selector",
+    "SvdqNvfp4NativeLeaf",
     "TensorCandidates",
     "TensorwiseDequant",
     "Verbatim",

@@ -27,6 +27,7 @@ from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
 from . import safetensors_io as st
+from . import svdq
 from .microscale import (
     CONVROT_GROUP,
     NVFP4_BLOCK,
@@ -55,6 +56,8 @@ class _Encoding(NamedTuple):
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
     whole: frozenset[str] = frozenset()
     pack: int = 1
+    #: Encoded whole from a `svdq.Calibration` of the model's own activations (`svdq.fit`).
+    calibrated: bool = False
 
     def tensor_scaled(self) -> bool:
         return any(not shape for _, _, shape in self.companions(1, self.block))
@@ -121,7 +124,31 @@ _ENCODINGS: dict[str, _Encoding] = {
         whole=frozenset({"codebook"}),
         pack=2,
     ),
+    # SVDQuant (xs-066): the bound holds the nvfp4 residual's round trip, in the smoothed domain.
+    "svdq.nvfp4": _Encoding(
+        2.0**-2,
+        lambda key, values, amax: _uncalibrated(key),
+        "F4",
+        svdq.K_ALIGN,
+        {
+            "block_size": NVFP4_BLOCK,
+            "global_scale": "multiply",
+            "nibble_order": "low_first",
+            "scale_layout": "row_major",
+        },
+        svdq.companions,
+        calibrated=True,
+    ),
 }
+
+
+def _uncalibrated(key: str) -> Encoded:
+    raise UnsupportedInput(
+        f"{key}: svdq.nvfp4 is fitted to the model's own activations; pass quantize_into a "
+        "calibration (derive.svdq.Calibration)",
+        code="quantization_plan",
+    )
+
 
 #: RNE fp32->bf16 keeps every element within amax * 2^-8 (8-bit significand, half-ulp).
 BF16_ROUND_TRIP_BOUND = 2.0**-8
@@ -341,6 +368,7 @@ def quantize_component_into(
     plan: ArtifactQuantizationPlan,
     component: str,
     logical_dtype: Callable[[QuantizationTensor], str],
+    calibration: svdq.Calibration | None = None,
 ) -> QuantizationStats:
     """Encode one plan component into the output. Tensors encode ahead on the shared pool and
     are written here, one at a time and in plan order, as a serial encoder would."""
@@ -360,9 +388,17 @@ def quantize_component_into(
     def scheme(tensor: QuantizationTensor) -> str:
         return tensor.encoding or encoding
 
-    results = _in_order(
-        pending, lambda tensor, stop: _encode_tensor(source, scheme(tensor), tensor, stop)
-    )
+    if any(_ENCODINGS[scheme(t)].calibrated for t in pending):
+        # Fitted one at a time on this thread: its GPU allocations are the attempt's, which the
+        # memory manager answers by making room (`library_oom`).
+        stop = threading.Event()
+        results: Generator[_Encoded, None, None] = (
+            _encode_tensor(source, scheme(t), t, stop, calibration) for t in pending
+        )
+    else:
+        results = _in_order(
+            pending, lambda tensor, stop: _encode_tensor(source, scheme(tensor), tensor, stop)
+        )
     with contextlib.closing(results):
         for done, tensor in enumerate(pending, 1 + reused):
             ctx.raise_if_cancelled()
@@ -407,7 +443,7 @@ def quantize_component_into(
             source_bytes += result.read
             saturated += result.saturated
             tel.log("quantized tensor", level="info", encoding=name, component=component,
-                    key=tensor.key, done=done, total=total)  # fmt: skip
+                    key=tensor.key, done=done, total=total, **(result.fit or {}))  # fmt: skip
             tel.progress(done / total, stage=f"{encoding}-{component}")
     return QuantizationStats(
         encoded_keys=len(pending),
@@ -430,16 +466,24 @@ class _Encoded(NamedTuple):
     energy: float
     saturated: int
     read: int
+    #: A calibrated scheme's fit, logged per tensor: its alpha and output errors (`svdq.Fitted`).
+    fit: dict[str, float] | None = None
 
 
 def _encode_tensor(
-    source: Checkpoint, encoding: str, tensor: QuantizationTensor, stop: threading.Event
+    source: Checkpoint,
+    encoding: str,
+    tensor: QuantizationTensor,
+    stop: threading.Event,
+    calibration: svdq.Calibration | None = None,
 ) -> _Encoded:
     encoder = _ENCODINGS[encoding]
     expected = encoder.companions(*tensor.shape)
     read_chunks = functools.partial(
         _read_chunks, source, tensor.component, tensor.key, tensor.logical_dtype, tensor.shape
     )
+    if encoder.calibrated:
+        return _fit_tensor(read_chunks, tensor, calibration)
     amax = max_error = sse = energy = 0.0
     if encoder.tensor_scaled():
         for values in read_chunks():
@@ -488,6 +532,36 @@ def _encode_tensor(
     except BaseException:
         spill.close()
         raise
+
+
+def _fit_tensor(
+    read_chunks: Callable[[], Iterator[np.ndarray]],
+    tensor: QuantizationTensor,
+    calibration: svdq.Calibration | None,
+) -> _Encoded:
+    """A calibrated scheme's whole tensor, fitted to its linear's recorded inputs."""
+    if calibration is None:
+        _uncalibrated(f"{tensor.component}.{tensor.key}")
+    assert calibration is not None
+    values = np.concatenate(list(read_chunks()))
+    torch = calibration.torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    fitted = svdq.fit(
+        torch, tensor.key, values, calibration.stats(tensor.component, tensor.key), device
+    )
+    spill = tempfile.TemporaryFile()  # noqa: SIM115 - the caller closes it, as _encode_tensor's
+    spill.write(fitted.payload)
+    return _Encoded(
+        spill,
+        fitted.companions,
+        fitted.amax,  # the bound holds the residual's round trip, in the smoothed domain
+        fitted.max_abs_err,
+        fitted.sse,
+        fitted.energy,
+        fitted.saturated,
+        values.size * _WIDTH[tensor.logical_dtype],
+        {"alpha": fitted.alpha, "error": fitted.error, "nvfp4_error": fitted.nvfp4_error},
+    )
 
 
 class _Stopped(Exception):

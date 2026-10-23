@@ -21,6 +21,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8
+from cozy_runtime.derive import svdq
 from cozy_runtime.derive.quantization import _ENCODINGS
 from cozy_runtime.internal import arch
 from cozy_runtime.internal.encoding import (
@@ -29,7 +30,7 @@ from cozy_runtime.internal.encoding import (
     RuntimeIdentity,
     launch_providers,
 )
-from cozy_runtime.internal.encoding.leaves import MXFP8, NVFP4, W4A8
+from cozy_runtime.internal.encoding.leaves import MXFP8, NVFP4, SVDQ, W4A8
 from cozy_runtime.internal.fill import Checkpoint, PlanRow, dtype_name
 from cozy_runtime.internal.probe import vector_cases
 from cozy_runtime.internal.resolution import (
@@ -43,12 +44,14 @@ from store_fixtures import home
 
 LEAVES = {
     "int8.convrot": INT8_CONVROT, "fp8.rowwise": ROWWISE_FP8, "nvfp4": NVFP4, "mxfp8": MXFP8,
-    "w4a8.convrot": W4A8,
+    "w4a8.convrot": W4A8, "svdq.nvfp4": SVDQ,
 }  # fmt: skip
 ALL = frozenset(LEAVES)
 INT8 = frozenset({"int8.convrot", "w4a8.convrot"})
 EIGHT_AND_FOUR = INT8 | {"nvfp4"}
-NOT_MX = ALL - {"mxfp8"}
+#: The lanes on the FP4 tensor cores' Triton kernels: tcgen05 or sm120's block-scaled MMA.
+FP4 = frozenset({"svdq.nvfp4"})
+NOT_MX = ALL - {"mxfp8"} - FP4
 
 #: sm -> the lanes that run on their native leaf. fp8 needs sm89+, block-scaled MX sm100+, int8
 #: (and w4a8, whose codes multiply as int8) is absent from sm103, nothing runs natively below the
@@ -67,8 +70,9 @@ NATIVE = {
     120: ALL,
     121: ALL,
 }
-#: The lanes whose kernels write no float32 (`_scaled_mm`'s fp8 scalings): they decode there.
-HALF_ONLY = frozenset({"fp8.rowwise", "mxfp8"})
+#: The lanes whose kernels write no float32 (`_scaled_mm`'s fp8 scalings, svdq's half epilogue):
+#: they decode there.
+HALF_ONLY = frozenset({"fp8.rowwise", "mxfp8", "svdq.nvfp4"})
 #: What a decoded lane decodes with: the decode cores (Triton on CUDA) where they serve it.
 DECODER = {
     "int8.convrot": "cozy.int8-convrot.dequant/1",
@@ -76,6 +80,7 @@ DECODER = {
     "nvfp4": "cozy.nvfp4.cores/1",
     "mxfp8": "cozy.mxfp8.cores/1",
     "w4a8.convrot": "tensorfs.w4a8.convrot.decode/1",
+    "svdq.nvfp4": "cozy.svdq.nvfp4.cores/1",
 }
 
 
@@ -87,18 +92,26 @@ class Rows(NamedTuple):
 @pytest.fixture(params=["BF16", "F16", "F32"])
 def lanes(request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Rows:
     """One weight per lane into the fixture's dtype: the producer `cozy model quantize` runs
-    for int8, fp8, nvfp4 and w4a8, and the spec's producer-mined mxfp8 case."""
+    for int8, fp8, nvfp4, w4a8 and svdq-nvfp4 (fitted to random inputs), and the spec's
+    producer-mined mxfp8 case."""
+    torch = pytest.importorskip("torch")
     writer = tensorfs.Writer(cache_dir=home(tmp_path, monkeypatch))
     model = writer.component("model", cls=("", "", ""), config={})
-    values = np.random.default_rng(65).standard_normal((256, 512)).astype(np.float32)
+    rng = np.random.default_rng(65)
+    values = rng.standard_normal((256, 512)).astype(np.float32)
+    seen = torch.from_numpy(rng.standard_normal((64, 512)).astype(np.float32))
     for scheme, encoder in _ENCODINGS.items():
         rows, cols = values.shape
-        encoded = encoder.encode(scheme, values, float(np.abs(values).max()))
-        parts = {"weight": (encoder.weight_dtype, [rows, cols // encoder.pack], encoded.payload)}
-        for (role, dtype, shape), companion in zip(
-            encoder.companions(rows, cols), encoded.companions, strict=True
-        ):
-            parts[role] = (dtype, list(shape), companion.raw)
+        if encoder.calibrated:
+            stats = svdq.Stats(seen.abs().amax(0), seen.to(torch.bfloat16))
+            fitted = svdq.fit(torch, scheme, values, stats, "cpu")
+            payload, raws = fitted.payload, fitted.companions
+        else:
+            encoded = encoder.encode(scheme, values, float(np.abs(values).max()))
+            payload, raws = encoded.payload, tuple(c.raw for c in encoded.companions)
+        parts = {"weight": (encoder.weight_dtype, [rows, cols // encoder.pack], payload)}
+        for (role, dtype, shape), raw in zip(encoder.companions(rows, cols), raws, strict=True):
+            parts[role] = (dtype, list(shape), raw)
         model.put_encoded(
             f"{scheme}.weight", dtype=request.param, shape=[rows, cols], scheme=scheme,
             parts=parts, params=encoder.params,

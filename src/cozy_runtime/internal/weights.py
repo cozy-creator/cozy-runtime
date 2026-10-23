@@ -11,6 +11,7 @@ what Runtime mechanisms reach a placed component through: graph pins, KV caches 
 
 from __future__ import annotations
 
+import functools
 import os
 import time
 import weakref
@@ -675,6 +676,9 @@ class _Bake:
     layer: LoRALayer | None = None
     factors: list[tuple[str, str, float]] = field(default_factory=list)
     hooks: list[LoRASource] = field(default_factory=list)
+    #: An svdq.nvfp4 leaf: its LoRAs join its low-rank branch as more ranks when it runs
+    #: (`SvdqLinear.adopt`), never its bytes, so no page refills for them.
+    leaf: Any = None
 
 
 class _Bakes:
@@ -703,13 +707,17 @@ class _Bakes:
             encoded = rows[stored].encoded
             site = local.removesuffix(".weight")
             roles = {p.role: p.dtype for p in encoded.parts}
-            if site == local or not lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles):
-                continue
-            bake = _Bake(stored, repr((encoded.scheme, encoded.params)))
             try:
-                hooks = list(root.get_submodule(site)._forward_hooks.values())
+                module = root.get_submodule(site)
             except AttributeError:  # a tensor named `.weight` on no module of its own
-                hooks = []
+                module = None
+            leaf = module if hasattr(module, "adopt") else None
+            if site == local or not (
+                leaf is not None or lora_bake.bakeable(encoded.scheme, dict(encoded.params), roles)
+            ):
+                continue
+            bake = _Bake(stored, repr((encoded.scheme, encoded.params)), leaf=leaf)
+            hooks = list(module._forward_hooks.values()) if module is not None else []
             if any(site.startswith(block + ".") for block in blocks):
                 bake.hooks = [hook for hook in hooks if isinstance(hook, LoRASource)]
             target = site.removesuffix(".base_layer")
@@ -741,6 +749,9 @@ class _Bakes:
                 bake.layer._cozy_baked = baked
             for hook in bake.hooks:
                 hook._cozy_baked = baked
+            if bake.leaf is not None:
+                bake.leaf.adopt(functools.partial(_deltas, bake) if baked else None)
+                continue
             hooks = (hook.lora_factors() for hook in bake.hooks)
             rows.append((bake.layer is not None, *(g and (g[0], g[3]) for g in hooks)))
         return (self.serving, *rows)
@@ -756,6 +767,8 @@ class _Bakes:
         held: list[object] = [lora_bake.recipe(self.how == "fused"), torch.__version__]
         held.append(torch.cuda.get_device_capability(self.gpu))
         for stored, bake in sorted(self.bakes.items()):
+            if bake.leaf is not None:
+                continue
             deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
             for hook in bake.hooks:
                 got = hook.lora_factors()
@@ -773,7 +786,9 @@ class _Bakes:
             return
         for stored, bake in self.bakes.items():
             weight = parts.get(stored)
-            if weight is None or any(a not in parts or b not in parts for a, b, _ in bake.factors):
+            if bake.leaf is not None or weight is None:
+                continue
+            if any(a not in parts or b not in parts for a, b, _ in bake.factors):
                 continue
             downs = [parts[a]["value"] for a, _, _ in bake.factors]
             ups = [parts[b]["value"] * scale for _, b, scale in bake.factors]
@@ -794,6 +809,21 @@ class _Bakes:
                 how=self.how,
             )
             self.baked += 1
+
+
+def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:
+    """An svdq leaf's LoRAs as it runs: each `(identity, down, up, scale)`, the bound factors of
+    its PEFT layer's active adapters, then its model's hooks'."""
+    out: list[tuple[object, Tensor, Tensor, float]] = []
+    layer = cast(Any, bake.layer)
+    for adapter in getattr(layer, "active_adapters", ()):
+        down, up = layer.lora_A[adapter], layer.lora_B[adapter]
+        out.append((down, down.weight, up.weight, float(layer.scaling[adapter])))
+    for hook in bake.hooks:
+        got = hook.lora_factors()
+        if got is not None:
+            out.append((got[0], got[1], got[2], float(got[3])))
+    return out
 
 
 # ------------------------------------------------------------------------- the residency
