@@ -184,6 +184,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: Its GPUs' grants follow the frame, a table and a row description per GPU in `devices`
     #: order: rank 0 opens its memory on the first and hands follower r the r-th.
     ledgers: int = 0
+    #: TensorD's namespace (its uid) each GPU's lease listener is named in: given only when it
+    #: leases this executor's weight pages (memory protocol 2); none, its ledger rows alone.
+    leases: int | None = None
     #: The callables its attempts may call: their proxies are installed before the package is
     #: imported, and every attempt gets the call broker over them.
     call_interfaces: tuple[CallInterface, ...] = ()

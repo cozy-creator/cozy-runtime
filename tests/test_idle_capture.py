@@ -97,6 +97,40 @@ def test_a_capture_yields_at_its_next_boundary_when_a_request_arrives() -> None:
     _drained()
 
 
+def test_a_command_arriving_mid_job_is_served_within_one_op() -> None:
+    """v17: a command waited 386 ms on the UNet's whole-component capture, which has no region
+    boundary inside. Every torch op of an idle job checks: the first op after a command arrives
+    ends the job, which is first again at the next idle period."""
+    torch = pytest.importorskip("torch")
+    _drained()
+    order = _serving()
+    midway, arrived, ran = threading.Event(), threading.Event(), []
+
+    def job() -> bool:
+        x = torch.zeros(1)
+        for op in range(200):
+            if op == 100 and not arrived.is_set():
+                midway.set()
+                arrived.wait(WAIT_S)
+            x = torch.add(x, 1)
+            ran.append(op)
+        return True
+
+    ticket = order.ticket(alone=True)
+    with order.turn(ticket):  # an earlier command, answered: an idle period follows
+        graphs.IDLE.add(job)
+    assert midway.wait(WAIT_S)
+    command = order.ticket(alone=False)
+    arrived.set()
+    with order.turn(command):  # served once the job gave the order back
+        assert ran == list(range(100)), ran[-3:]  # not one op ran after it arrived
+        assert list(graphs.IDLE.jobs) == [job]
+    deadline = time.monotonic() + WAIT_S
+    while graphs.IDLE.jobs and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ran[100:] == list(range(200)) and not graphs.IDLE.jobs  # the next period ran it
+
+
 def test_a_job_not_ready_waits_for_the_next_period_in_order() -> None:
     idle, ran = graphs._Idle(), []
 
