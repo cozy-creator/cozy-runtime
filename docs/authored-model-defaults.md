@@ -14,8 +14,8 @@ async def generate(ctx: Context, *, model: SDXL, prompt: str) -> Image: ...
 - A default is `[org/]model@release`: an explicit release, never a digest, and no lane. The
   machine picks the lane from its GPU and the request's `bits` (tracker design
   `precision-tiers.md`). A pin for one run is `model.<slot>=…`, optionally with `/lane`.
-- An org-less default names a model of the package's own account. Creator writes the
-  publishing account into the published interface. An explicit org is never rewritten.
+- A default with no org names a first-party model, the root namespace's (`sdxl@1.0.0`), whoever
+  publishes the package. Another account's model names its org (`you/my-model@1.0.0`).
 - Declare defaults on one registration layer. Defaults on both `invocable` and its App
   registration are refused. A script's `[tool.cozy.models]` takes the same strings.
 
