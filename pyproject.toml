@@ -61,10 +61,6 @@ packages = ["src/cozy_runtime"]
 [tool.uv]
 package = true
 
-[tool.uv.sources]
-# Dev pin until the cohort release: cozy-creator varena-two/release (varena as torch's only CUDA allocator, leased).
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "42832218d71692f24ab48f1936e87355c742be4a", subdirectory = "crates/tensorfs-py" }
-
 [tool.mypy]
 python_version = "3.12"
 files = ["src", "checks", "examples"]
