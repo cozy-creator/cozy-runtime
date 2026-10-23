@@ -4921,17 +4921,21 @@ class _Order:
         return len(self._open) > 1
 
 
-def _idle(order: _Order) -> None:
+def _idle(executor: Executor, order: _Order) -> None:
     """Graphs record off the request path (`graphs.capture_idle`): after a command is answered,
-    while no other is open. One arriving makes the capture yield at its next region boundary."""
+    while no other is open. One arriving makes the capture yield at its next region boundary. A
+    device fault there poisons the executor, as one in a request does (the machine ends it)."""
     own_thread()
     answered = 0
     while True:
         with order.idle(answered, lambda: bool(graphs.IDLE.jobs)) as answered:
             try:
                 graphs.capture_idle(order.waiting)
-            except Exception:
+            except Exception as exc:
                 traceback.print_exc()
+                if fault(exc) in (Fault.STICKY, Fault.DEVICE):
+                    executor.poisoned = executor.poisoned or f"device fault at idle: {exc}"[:300]
+                    return
 
 
 def serve(executor: Executor, channel: Channel) -> int:
@@ -4946,7 +4950,9 @@ def serve(executor: Executor, channel: Channel) -> int:
     while True:
         if not idle and executor.started:
             # After the device Start: a live thread in an import-only executor refuses its forks.
-            threading.Thread(target=_idle, args=(order,), name="graphs-idle", daemon=True).start()
+            threading.Thread(
+                target=_idle, args=(executor, order), name="graphs-idle", daemon=True
+            ).start()
             idle = True
         try:
             frame = executor.mux.command()

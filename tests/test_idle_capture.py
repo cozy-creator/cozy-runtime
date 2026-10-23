@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Iterator
+from types import SimpleNamespace
 
 import pytest
 
@@ -52,7 +53,9 @@ def alone() -> Iterator[None]:
 
 def _serving() -> executor._Order:
     order = executor._Order()
-    threading.Thread(target=executor._idle, args=(order,), daemon=True).start()
+    threading.Thread(
+        target=executor._idle, args=(SimpleNamespace(poisoned=""), order), daemon=True
+    ).start()
     return order
 
 
@@ -140,3 +143,31 @@ def test_a_failing_job_goes_and_the_period_goes_on() -> None:
     idle.add(next_one)
     assert idle.run(lambda: False) and ran == ["failing", "next"]
     assert idle.failures == 1 and not idle.jobs
+
+
+def test_a_device_fault_at_idle_poisons_the_executor() -> None:
+    """The verifier's MED on v16's fix: only ordinary failures are swallowed. A sticky or
+    device fault during an idle capture ends the period and poisons the executor, as one in a
+    request does, and the idle thread stops."""
+    torch = pytest.importorskip("torch")
+    sticky = torch.AcceleratorError("CUDA error: an illegal memory access was encountered")
+    sticky.error_code = 700  # torch sets it from cudaError_t
+
+    def faulting() -> bool:
+        raise sticky
+
+    idle = graphs._Idle()
+    idle.add(faulting)
+    with pytest.raises(type(sticky)):
+        idle.run(lambda: False)
+    assert idle.failures == 0
+    host = SimpleNamespace(poisoned="")
+    order = executor._Order()
+    thread = threading.Thread(target=executor._idle, args=(host, order), daemon=True)
+    graphs.IDLE.add(faulting)
+    thread.start()
+    ticket = order.ticket(alone=False)
+    with order.turn(ticket):  # a command answered: an idle period follows
+        pass
+    thread.join(WAIT_S)
+    assert not thread.is_alive() and host.poisoned.startswith("device fault at idle")
