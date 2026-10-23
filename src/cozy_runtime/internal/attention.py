@@ -108,6 +108,9 @@ class Candidate:
     exact: bool = True
     #: the dense kernel a sparse one computes its dense rows with, built beside it
     dense: str = ""
+    #: the Runtime module whose `warm(index)` builds its Triton kernels for every length, so no
+    #: request compiles one (`kernel_ready`)
+    warm: str = ""
 
 
 _GPU = frozenset({arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05})
@@ -118,6 +121,7 @@ _D64_128 = frozenset({64, 128})
 #: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
 _FA3 = frozenset((d, dtype) for d in (64, 128) for dtype in ("bfloat16", "float16"))
 _PY, _KITCHEN, _SAGE3 = kernel_sources.PYTHON, "comfy-kitchen", "sageattn3"
+_FP8_WARM = "cozy_runtime.internal.attention_fp8"
 
 KERNELS: tuple[Candidate, ...] = (
     Candidate("sdpa", "_cozy_sdpa", upstream.SDPA),
@@ -129,7 +133,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, exact=False,
         dtypes=_HALF, max_head_dim=128, artifact="flash-attn3-full",
-        import_name="flash_attn_interface",
+        import_name="flash_attn_interface", warm=_FP8_WARM,
     ),
     Candidate(
         "flash-attn4", "_cozy_flash_attn4", upstream.FA4, _WGMMA | _TCGEN05, dtypes=_HALF,
@@ -138,6 +142,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "flash-attn4-fp8", "_cozy_flash_attn4_fp8", upstream.FA4_FP8, _TCGEN05, exact=False,
         dtypes=_BF16, max_head_dim=128, artifact=_PY, import_name="flash_attn.cute",
+        warm=_FP8_WARM,
     ),
     Candidate(
         "sageattention", "_cozy_sage_int8_fp8", upstream.SAGE, _MMA | _WGMMA, _FP8, exact=False,
@@ -155,7 +160,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "flashinfer-bf16-fp8", "_cozy_flashinfer_bf16_fp8", upstream.FLASHINFER, _TCGEN05,
         exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128, artifact=_PY,
-        import_name="flashinfer",
+        import_name="flashinfer", warm=_FP8_WARM,
     ),
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, exact=False,
@@ -170,11 +175,13 @@ KERNELS: tuple[Candidate, ...] = (
         "sageattention3-fp4-fixed-means", "_cozy_sage3_fp4_fixed_means",
         upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, exact=False, dtypes=_BF16, max_head_dim=128,
         head_dims=_D128, artifact=_SAGE3, import_name=_SAGE3,
+        warm="cozy_runtime.internal.attention_sage3_fixed",
     ),
     Candidate(
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
         _WGMMA, exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128,
         artifact="sageattention", import_name="sageattention",
+        warm="cozy_runtime.internal.attention_sage2_fixed_mean",
     ),
     Candidate(
         "sol-attn", "_cozy_sol_bf16", attention_sol.SOL, _GPU, _FP8, dtypes=_BF16,
@@ -657,6 +664,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
             upstream.bind_fa3(
                 cast("upstream.FlashAttn3", module), (artifact or {}).get("key", "environment")
             )
+    if candidate.warm and device.kind == "cuda":
+        import_module(candidate.warm).warm(device.index)
     if candidate.name in {"sol-attn", attention_sage2_fixed.SOL_NAME}:
         _sol_route(device)
         if device.kind == "cuda":
