@@ -11,7 +11,7 @@ Generic model packages declare `cozy-runtime[adapters]` to install the PEFT back
 Model choices travel with a release root, a captured execution, or an authenticated
 private placement. A bare parameter selects the root's own model. A qualified
 `motion_segment_turbo.models.base_model` choice selects that captured H3 child;
-`paul/qwen-image-2/generate_image.models.model` names an external captured callable.
+`paul/qwen-image-2/generate.models.model` names an external captured callable.
 Runtime validates the exact installation, callable and parameter before resolving
 weights. Two children with the same parameter name do not share an override.
 Private placement choices always name the full callable model slot.

@@ -144,16 +144,16 @@ image() { ls "$PWD/out-$1"/*.png "$PWD/out-$1"/*.webp "$PWD/out-$1"/*.jpg 2>/dev
 
 references() {  # two character images for the LM and H3 cells
   local k=$1 r=$2
-  cell "$k-klein-a" $ORG/flux-3-klein/generate prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $TAG $k a" seed=$((r + 1)) prompt_upsampling=false
-  cell "$k-klein-b" $ORG/flux-3-klein/generate prompt="portrait of a woman with short curly auburn hair, navy wool coat, $TAG $k b" seed=$((r + 2)) prompt_upsampling=false
+  cell "$k-klein-a" $ORG/flux-3-klein/generate_turbo prompt="portrait of a young lifeguard with long platinum braids, orange swimsuit, $TAG $k a" seed=$((r + 1)) prompt_upsampling=false
+  cell "$k-klein-b" $ORG/flux-3-klein/generate_turbo prompt="portrait of a woman with short curly auburn hair, navy wool coat, $TAG $k b" seed=$((r + 2)) prompt_upsampling=false
 }
 
 cells() {  # the matrix on one machine; $1 = card, $2 = H3 segments
   local k=$1 segs=$2 r=$RANDOM
   references "$k" "$r"
   cell "$k-sdxl" $ORG/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3))
-  cell "$k-qwen1" $ORG/qwen-image-2/generate_image prompt="a lighthouse on a cliff at dusk, $TAG $k" seed=$((r + 4)) megapixels:=1
-  cell "$k-qwen4" $ORG/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  cell "$k-qwen1" $ORG/qwen-image-2/generate prompt="a lighthouse on a cliff at dusk, $TAG $k" seed=$((r + 4)) megapixels:=1
+  cell "$k-qwen4" $ORG/qwen-image-2/generate prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
   local a b; a=$(image "$k-klein-a") b=$(image "$k-klein-b")
   cell "$k-lm" $ORG/character-describer/describe_character --asset "image=$a"
   pair_sdxl "$k" "$r"
@@ -166,14 +166,14 @@ pair_sdxl() {  # co-resident pair, two runs on one GPU at once: SDXL ∥ Klein
   local k=$1 r=$2 n1 n2
   want "$k-pair-sdxl" || return 0
   n1=$(start "$k-pair-sdxl" $ORG/sdxl/generate prompt="a red kite over dunes, $TAG $k pair" seed=$((r + 6)))
-  n2=$(start "$k-pair-klein" $ORG/flux-3-klein/generate prompt="a teapot on a windowsill, $TAG $k pair" seed=$((r + 7)) prompt_upsampling=false)
+  n2=$(start "$k-pair-klein" $ORG/flux-3-klein/generate_turbo prompt="a teapot on a windowsill, $TAG $k pair" seed=$((r + 7)) prompt_upsampling=false)
   finish "$k-pair-sdxl" "$n1"; finish "$k-pair-klein" "$n2"
 }
 
 pair_qwen() {  # co-resident pair: Qwen 1 MP ∥ LM ($3: the LM's image)
   local k=$1 r=$2 n1 n2
   want "$k-pair-qwen" || return 0
-  n1=$(start "$k-pair-qwen" $ORG/qwen-image-2/generate_image prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
+  n1=$(start "$k-pair-qwen" $ORG/qwen-image-2/generate prompt="a fox in fresh snow, $TAG $k pair" seed=$((r + 8)) megapixels:=1)
   n2=$(start "$k-pair-lm" $ORG/character-describer/describe_character --asset "image=$3")
   finish "$k-pair-qwen" "$n1"; finish "$k-pair-lm" "$n2"
 }
@@ -192,7 +192,7 @@ matrix() {  # the merge matrix on one machine ($1 = card); on 24 each H3 cell ru
   a=$(image "$k-klein-a") b=$(image "$k-klein-b")
   if [ "$k" = 2x8 ]; then h3 "$k-h3" 2 "$a" "$b" "$r" 2; return; fi
   cell "$k-sdxl4" $ORG/sdxl/generate prompt="a brass doorknob on a blue door in morning sun, $TAG $k" seed=$((r + 3)) megapixels:=4
-  cell "$k-qwen4" $ORG/qwen-image-2/generate_image prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
+  cell "$k-qwen4" $ORG/qwen-image-2/generate prompt="a market street in the rain at night, $TAG $k" seed=$((r + 5)) megapixels:=4
   h3ref "$k" "$b" "$r" 5; [ "$k" = 24 ] && h3ref "$k" "$b" $((r + 100)) 5 -warm
   h3ref "$k" "$b" "$r" 15; [ "$k" = 24 ] && h3ref "$k" "$b" $((r + 100)) 15 -warm
   h3 "$k-h3" 2 "$a" "$b" "$r" "" 5; [ "$k" = 24 ] && h3 "$k-h3-warm" 2 "$a" "$b" $((r + 100)) "" 5
