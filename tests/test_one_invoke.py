@@ -15,7 +15,7 @@ import pytest
 import tensorfs
 
 from cozy_runtime import weights_store
-from cozy_runtime.author import ModelArtifact, describe
+from cozy_runtime.author import ModelArtifact, QuantizationPlan, describe
 from cozy_runtime.author._executor_requests import (
     Answer,
     CheckpointItem,
@@ -25,7 +25,7 @@ from cozy_runtime.author._executor_requests import (
     refuse,
 )
 from cozy_runtime.derive import safetensors_io as st
-from cozy_runtime.derive.operations import MAX_QUANTIZED_BYTES, QuantizationPlan, app
+from cozy_runtime.derive.operations import MAX_QUANTIZED_BYTES, app
 from cozy_runtime.internal.discovery import Discovered, discover
 from cozy_runtime.internal.seam import RESULT_DOCUMENT
 from session import session
@@ -38,7 +38,8 @@ from typing import Any
 import array
 import msgspec
 from cozy_runtime.author import App, Context, ModelArtifact, Weights, invocable
-from cozy_runtime.derive.operations import QuantizationPlan, quantize
+from cozy_runtime.author import QuantizationPlan
+from cozy_runtime.derive.operations import quantize
 app = App()
 class Request(msgspec.Struct):
     component: str
@@ -63,10 +64,11 @@ async def calls_child(ctx: Context, *, artifact: ModelArtifact) -> Count:
 app.entrypoint(calls_child, accelerator=False)
 @invocable
 async def calls_quantize(ctx: Context, *, artifact: ModelArtifact) -> ModelArtifact:
-    plan = QuantizationPlan(("unet",))
-    return await quantize(source=artifact, plan=plan, encoding="fp8.rowwise")
+    plan = QuantizationPlan(encoding="fp8.rowwise", components=("unet",))
+    return await quantize(source=artifact, plan=plan)
 app.entrypoint(calls_quantize, accelerator=False)
 """
+FP8 = QuantizationPlan(encoding="fp8.rowwise", components=("unet",))
 VALUES = np.random.default_rng(22).normal(0, 0.05, (8, 64)).astype(np.float32)
 
 
@@ -135,7 +137,7 @@ def test_a_writers_output_lands_only_through_its_grant(
         host.handler = machine
         reply = host.run(
             "quantize",
-            {"plan": msgspec.to_builtins(QuantizationPlan(("unet",))), "encoding": "fp8.rowwise"},
+            {"plan": msgspec.to_builtins(FP8)},
             spool,
             sources={"source": source},
             weights=outputs if granted else {},
@@ -163,8 +165,7 @@ def test_a_writers_output_lands_only_through_its_grant(
             "calls_quantize",
             {"module": QUANTIZE, "export": "quantize", "builtin": "operations"},
             {
-                "plan": json.loads(msgspec.json.encode(QuantizationPlan(("unet",)))),
-                "encoding": "fp8.rowwise",
+                "plan": json.loads(msgspec.json.encode(FP8)),
             },
         ),
     ],

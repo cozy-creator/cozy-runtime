@@ -14,10 +14,10 @@ import tensorfs
 from tensorfs import raw
 
 from cozy_runtime import weights_store
-from cozy_runtime.author import CapabilityError, UnsupportedInput, Weights
+from cozy_runtime.author import CapabilityError, SelectionPlan, UnsupportedInput, Weights
 from cozy_runtime.author.fakes import fake_telemetry
 from cozy_runtime.derive import plan, quantize
-from cozy_runtime.derive.operations import SelectionPlan, select_into
+from cozy_runtime.derive.operations import select_into
 from cozy_runtime.internal.model_values import read_values_into
 from store_fixtures import Shown, adopted, checkpoint, context, home
 

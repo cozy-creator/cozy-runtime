@@ -9,10 +9,10 @@ import numpy as np
 import pytest
 from tensorfs import raw
 
-from cozy_runtime.author import UnsupportedInput, Weights
+from cozy_runtime.author import QuantizationPlan, UnsupportedInput, Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive.microscale import decode_int8_convrot256, encode_int8_convrot256
-from cozy_runtime.derive.operations import QuantizationPlan, quantize_into
+from cozy_runtime.derive.operations import quantize_into
 from cozy_runtime.internal.encoding import params_of
 from store_fixtures import adopted, checkpoint, context, home
 
@@ -58,13 +58,14 @@ def test_include_recipe_encodes_exactly_its_weights(
         },
     )
     plan = QuantizationPlan(
+        encoding=ENCODING,
         components=("transformer",),
         include=("transformer.blocks.*.weight",),
         output_precision="preserve",
     )
     quantize_into(
         context(store, shown=shown), fake_telemetry(fake_attempt("int8")), source=Weights(source),
-        plan=plan, encoding=ENCODING, output="model",
+        plan=plan, output="model",
     )  # fmt: skip
     out = adopted(store, shown)
     encoded = {
@@ -82,11 +83,13 @@ def test_include_recipe_encodes_exactly_its_weights(
     parts = raw.parts(out, "transformer", "blocks.0.attn.to_q.weight")
     assert (parts["weight"].dtype, parts["scale"].shape) == ("I8", (8,))
     assert out.components["transformer"].tensors["proj_out.weight"].dtype == "F32", "preserved"
-    typo = QuantizationPlan(components=("transformer",), include=("transformer.nope.*",))
+    typo = QuantizationPlan(
+        encoding=ENCODING, components=("transformer",), include=("transformer.nope.*",)
+    )
     with pytest.raises(UnsupportedInput, match="match no weight"):
         quantize_into(
             context(store, "typo"), fake_telemetry(fake_attempt("typo")), source=Weights(source),
-            plan=typo, encoding=ENCODING, output="model",
+            plan=typo, output="model",
         )  # fmt: skip
 
 

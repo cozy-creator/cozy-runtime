@@ -64,6 +64,8 @@ from cozy_runtime.author._model_defaults import (
     model_defaults,
     model_on_demand,
 )
+from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
+from cozy_runtime.author._recipes import canonical, fingerprint, outputs
 from cozy_runtime.author._script_metadata import (
     Unfolded,
     byte_parameter,
@@ -245,6 +247,9 @@ _AUTHOR_VALUES = (
     "Shape",
     "Memoize",
     "data_values",
+    "QuantizationPlan",
+    "SelectionPlan",
+    "EncodingRule",
 )
 
 #: Struct class keywords `msgspec.defstruct` takes verbatim. `rename` and `array_like` change
@@ -590,7 +595,7 @@ class Reader:
             # The one dunder a data asset is addressed from: this module's own file.
             return str(module.path)
         if isinstance(node, ast.Attribute):
-            base = self.resolve(module, node.value)
+            base = self._attribute_base(module, node.value)
             if (
                 isinstance(base, Definition)
                 and isinstance(base.node, ast.ClassDef)
@@ -600,6 +605,14 @@ class Reader:
                 if node.attr in built.__members__:
                     return built.__members__[node.attr]
                 self.refuse(module, node, "unknown enumeration member")
+            if base is None or isinstance(base, Assigned):
+                # A field of a declared value: `INT8.include`, `INT8.plan.components`.
+                value = self.fold(module, node.value, scope)
+                if isinstance(value, (msgspec.Struct, StaticRecipe)) and node.attr in (
+                    getattr(value, "__struct_fields__", None) or StaticRecipe.__slots__
+                ):
+                    return getattr(value, node.attr)
+                self.refuse(module, node, "not a field of a declared value", "static_computed")
         if isinstance(node, (ast.Name, ast.Attribute)):
             found = self.resolve(module, node)
             if isinstance(found, Assigned):
@@ -611,6 +624,8 @@ class Reader:
             self.refuse(module, node, "not a module-level constant")
         if isinstance(node, ast.Call):
             callee = self.resolve(module, node.func)
+            if isinstance(callee, Vocab) and callee.key == "author.Recipe":
+                return self.recipe(module, node, scope)
             if isinstance(callee, Vocab) and callee.key in ("builtins.min", "builtins.max"):
                 if len(node.args) != 1 or node.keywords:
                     self.refuse(
@@ -667,28 +682,84 @@ class Reader:
             module, node, "an expression the constant folder does not evaluate", "static_computed"
         )
 
+    def _attribute_base(self, module: Module, node: ast.expr) -> Resolved | None:
+        """What an attribute's base names, or None for a value that is no name."""
+        if not isinstance(node, (ast.Name, ast.Attribute)):
+            return None
+        try:
+            return self.resolve(module, node)
+        except StaticRefusal:
+            if isinstance(node, ast.Attribute):
+                return None
+            raise
+
     def _comprehension(
         self, module: Module, node: ast.GeneratorExp | ast.ListComp, scope: Mapping[str, object]
     ) -> object:
-        """One comprehension over a folded sequence: `tuple(F(x) for x in CONSTANT)`.
+        """A comprehension over folded sequences: `tuple(F(x, y) for x in A for y in B)`.
 
         Deterministic by construction: the element is folded exactly as any other constant
-        is, with the clause's own target bound, and nothing of the package runs.
+        is, with the clauses' own targets bound, and nothing of the package runs.
         """
-        if len(node.generators) != 1:
-            self.refuse(module, node, "a comprehension with several clauses", "static_computed")
-        clause = node.generators[0]
-        if clause.ifs or clause.is_async or not isinstance(clause.target, ast.Name):
-            self.refuse(
-                module, node, "a filtered, async or unpacking comprehension", "static_computed"
-            )
-        items = self.fold(module, clause.iter, scope)
-        if not isinstance(items, (tuple, list, dict)):
-            self.refuse(
-                module, clause.iter, "a comprehension over a non-sequence", "static_computed"
-            )
-        folded = [self.fold(module, node.elt, {**scope, clause.target.id: item}) for item in items]
+
+        def expand(index: int, bound: Mapping[str, object]) -> list[object]:
+            if index == len(node.generators):
+                return [self.fold(module, node.elt, bound)]
+            clause = node.generators[index]
+            if clause.ifs or clause.is_async or not isinstance(clause.target, ast.Name):
+                self.refuse(
+                    module, node, "a filtered, async or unpacking comprehension", "static_computed"
+                )
+            items = self.fold(module, clause.iter, bound)
+            if not isinstance(items, (tuple, list, dict)):
+                self.refuse(
+                    module, clause.iter, "a comprehension over a non-sequence", "static_computed"
+                )
+            name = clause.target.id
+            return [v for item in items for v in expand(index + 1, {**bound, name: item})]
+
+        folded = expand(0, scope)
         return folded if isinstance(node, ast.ListComp) else tuple(folded)
+
+    def recipe(self, module: Module, node: ast.Call, scope: Mapping[str, object]) -> StaticRecipe:
+        """`Recipe(lane=, model=, plan=)` read from source: its model a Model class (`Model`:
+        any layout), its plan a folded plan or a `DerivationHook` naming a module function."""
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+        if node.args or set(keywords) != {"lane", "model", "plan"}:
+            self.refuse(
+                module, node, "Recipe(lane=, model=, plan=) by keyword", "static_unsupported"
+            )
+        lane = self.fold(module, keywords["lane"], scope)
+        try:
+            author.WeightsOutput(typing.cast(str, lane), max_new_bytes=0)
+        except author.ConformanceError as exc:
+            self.refuse(module, keywords["lane"], f"recipe lane: {exc}", "static_unsupported")
+        found = self.resolve(module, keywords["model"])
+        spec = (
+            _ANY_LAYOUT
+            if isinstance(found, Vocab) and found.key == "author.Model"
+            else self._model_class(found)
+        )
+        if spec is None:
+            self.refuse(module, keywords["model"], "a recipe's model is a Model class")
+        value = keywords["plan"]
+        hook = self.resolve(module, value.func) if isinstance(value, ast.Call) else None
+        if isinstance(hook, Vocab) and hook.key == "author.DerivationHook":
+            function = (
+                self.resolve(module, value.args[0])
+                if isinstance(value, ast.Call) and len(value.args) == 1 and not value.keywords
+                else None
+            )
+            if not (
+                isinstance(function, Definition) and not isinstance(function.node, ast.ClassDef)
+            ):
+                self.refuse(module, value, "DerivationHook(<a module-level function>)")
+            identity = f"{function.module.name}:{function.node.name}"
+            return StaticRecipe(typing.cast(str, lane), spec, identity)
+        plan = self.fold(module, value, scope)
+        if not isinstance(plan, (author.QuantizationPlan, author.SelectionPlan)):
+            self.refuse(module, value, "a recipe's plan is a QuantizationPlan or SelectionPlan")
+        return StaticRecipe(typing.cast(str, lane), spec, plan)
 
     # ----------------------------------------------------------------- types
 
@@ -1183,6 +1254,20 @@ class Registration:
     model_on_demand: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class StaticRecipe:
+    """A `Recipe` read from source; a `DerivationHook` plan is its function's `module:name`."""
+
+    lane: str
+    model: ModelSpec
+    plan: author.QuantizationPlan | author.SelectionPlan | str
+
+    def canonical(self) -> dict[str, object]:
+        if isinstance(self.plan, str):
+            return {"kind": "derivation", "hook": self.plan}
+        return canonical(self.plan)
+
+
 def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
     """The package interface from source alone. Executes nothing of the package."""
     project = project.resolve()
@@ -1310,7 +1395,8 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
             code="not_an_app",
         )
     docs: dict[str, dict[str, Json]] = {}
-    for registration in _registrations(reader, reader.reachable(entry), app):
+    modules = reader.reachable(entry)
+    for registration in _registrations(reader, modules, app):
         if registration.name in docs:
             reader.refuse(
                 registration.module,
@@ -1329,7 +1415,79 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
             if identity is not None:
                 declared["operation_identity"] = identity
         docs[registration.name] = doc
-    return package_interface.assemble(application, list(docs.values()), installed=installed)
+    recipes = _recipes(reader, modules)
+    if recipes:
+        if RECIPES_ENTRYPOINT in docs:
+            raise StaticRefusal(
+                f"{application}: a package with recipes serves them as {RECIPES_ENTRYPOINT!r}; "
+                "rename its own function of that name",
+                code="static_unsupported",
+            )
+        docs[RECIPES_ENTRYPOINT] = _recipes_entrypoint(reader, recipes, installed=installed)
+    return package_interface.assemble(
+        application, list(docs.values()), installed=installed, recipes=recipes
+    )
+
+
+def _recipes(reader: Reader, modules: Sequence[Module]) -> list[dict[str, Json]]:
+    """Every `Recipe` bound at module scope of `modules`, as the interface's `recipes` rows."""
+    rows: list[dict[str, Json]] = []
+    for module in modules:
+        for stmt in _module_scope(module.tree.body):
+            name = _single_target(stmt)
+            value = getattr(stmt, "value", None)
+            if name is None or not isinstance(value, ast.Call):
+                continue
+            if not isinstance(value.func, (ast.Name, ast.Attribute)):
+                continue
+            try:
+                callee = reader.resolve(module, value.func)
+            except StaticRefusal:
+                continue
+            if not (isinstance(callee, Vocab) and callee.key == "author.Recipe"):
+                continue
+            recipe = reader.recipe(module, value, _NO_SCOPE)
+            row: dict[str, Json] = {
+                "name": name.lower(),
+                "lane": recipe.lane,
+                "module": module.name,
+                "export": name,
+                "model": {
+                    "class": recipe.model.name,
+                    "component_use": {
+                        stage: sorted(names)
+                        for stage, names in sorted(recipe.model.components.items())
+                    },
+                },
+                "plan": recipe.canonical(),
+            }
+            if not isinstance(recipe.plan, str):
+                row["fingerprint"] = fingerprint(recipe.canonical())
+            if any(other["name"] == row["name"] for other in rows):
+                reader.refuse(module, stmt, f"a second recipe named {row['name']!r}")
+            rows.append(row)
+    return rows
+
+
+def _recipes_entrypoint(
+    reader: Reader, recipes: Sequence[dict[str, Json]], *, installed: bool
+) -> dict[str, Json]:
+    """The Runtime's `quantize` (`cozy_runtime.derive.recipes`), read from its source, writing
+    the lanes of `recipes`."""
+    runtime = reader.module("cozy_runtime.derive.recipes")
+    function = runtime.bindings[RECIPES_ENTRYPOINT]
+    assert isinstance(function, ast.AsyncFunctionDef)
+    found = _registration(reader, runtime, function, "entrypoint", ())
+    assert found is not None
+    lanes = outputs(str(row["lane"]) for row in recipes)
+    registration = replace(found, weights=lanes, accelerator=False)
+    doc = _callable(reader, registration)
+    declared = doc.get("invocable")
+    if installed and isinstance(declared, dict):
+        identity = _operation_identity(reader, registration)
+        if identity is not None:
+            declared["operation_identity"] = identity
+    return doc
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:

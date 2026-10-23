@@ -30,6 +30,7 @@ from cozy_runtime.author._markers import (
 from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.author._model import ENCODED_LEAVES, Model, component_use
 from cozy_runtime.author._model_defaults import model_default
+from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._signature import AssetInputValue, AssetsBinding
 from cozy_runtime.internal import canonical, invocable_interface, schema
 from cozy_runtime.internal.canonical import Json
@@ -176,6 +177,8 @@ class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
     format: str
     application: Annotated[str, msgspec.Meta(min_length=1)]
     entrypoints: tuple[CallableDoc, ...]
+    #: its declared quantize recipes, which its `quantize` entrypoint runs
+    recipes: tuple[DeclaredRecipe, ...] = ()
 
     def function(self, name: str) -> CallableDoc | None:
         return next((entry for entry in self.entrypoints if entry.name == name), None)
@@ -187,11 +190,16 @@ class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
 def build(found: Discovered, *, installed: bool = False) -> dict[str, Json]:
     """Derive one package interface from the frozen (imported) application."""
     docs = [_callable(surface) for surface in found.surfaces if not surface.hidden]
-    return assemble(found.application, docs, installed=installed)
+    recipes = [msgspec.to_builtins(recipe) for recipe in found.recipes]
+    return assemble(found.application, docs, installed=installed, recipes=recipes)
 
 
 def assemble(
-    application: str, docs: Sequence[dict[str, Json]], *, installed: bool = False
+    application: str,
+    docs: Sequence[dict[str, Json]],
+    *,
+    installed: bool = False,
+    recipes: Sequence[dict[str, Json]] = (),
 ) -> dict[str, Json]:
     """One package interface from its callable documents, whichever reader produced them.
 
@@ -212,6 +220,9 @@ def assemble(
     }
     assert set(body) == TOP_LEVEL_KEYS, sorted(set(body) ^ TOP_LEVEL_KEYS)
     _fixed_point(body)
+    if recipes:
+        # Declared data, folded from source: its lanes, models and digests are source-stable.
+        body["recipes"] = sorted(recipes, key=_by_name)
     return body
 
 
@@ -636,6 +647,9 @@ def _validate(interface: PackageInterface, source: str) -> None:
         output_ids = [output.output_id for output in outputs]
         if len(set(output_ids)) != len(output_ids):
             _invalid(source, f"{path}.weights_outputs", "output ids must be unique")
+    recipes = [recipe.name for recipe in interface.recipes]
+    if len(set(recipes)) != len(recipes):
+        _invalid(source, "recipes", "names must be unique")
 
 
 def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:

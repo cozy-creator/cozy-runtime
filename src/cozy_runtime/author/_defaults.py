@@ -34,7 +34,7 @@ Layer = Literal["checkpoint", "adapter"]
 
 
 @dataclass(frozen=True, slots=True)
-class Recipe:
+class DefaultSet:
     """A catalog or adapter default set. Values must NAME an existing marked field."""
 
     source: str
@@ -90,7 +90,7 @@ def _convert(value: object, node: Node, where: str) -> object:
 
 
 def _validate_recipe(
-    recipe: Recipe, marked: Mapping[str, Node], model_params: Sequence[str]
+    recipe: DefaultSet, marked: Mapping[str, Node], model_params: Sequence[str]
 ) -> None:
     if len(model_params) > 1 and recipe.binding_path is None:
         raise DefaultResolutionError(
@@ -121,7 +121,7 @@ def resolve(
     payload_type: object,
     wire: Mapping[str, object],
     *,
-    recipes: Sequence[Recipe] = (),
+    default_sets: Sequence[DefaultSet] = (),
     clamps: Sequence[Clamp] = (),
     model_params: Sequence[str] = (),
 ) -> Overlay:
@@ -133,7 +133,7 @@ def resolve(
     # before any policy has a chance to quietly clamp it into range.
     decode_request(cast("type[Any]", payload_type), wire)
 
-    for recipe in recipes:
+    for recipe in default_sets:
         _validate_recipe(recipe, marked, model_params)
 
     omitted = [name for name in marked if name not in wire]
@@ -147,8 +147,8 @@ def resolve(
             values[name], sources[name] = node.default, "code"
 
     for layer in ("checkpoint", "adapter"):
-        contributors: dict[str, list[Recipe]] = {}
-        for recipe in (r for r in recipes if r.layer == layer):
+        contributors: dict[str, list[DefaultSet]] = {}
+        for recipe in (r for r in default_sets if r.layer == layer):
             for name in (n for n in recipe.values if n in omitted):
                 contributors.setdefault(name, []).append(recipe)
         for name, applying in contributors.items():

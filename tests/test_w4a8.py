@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from tensorfs import raw
 
-from cozy_runtime.author import Weights
+from cozy_runtime.author import EncodingRule, QuantizationPlan, Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.author.kernels import INT8_CONVROT
 from cozy_runtime.derive.microscale import (
@@ -20,7 +20,7 @@ from cozy_runtime.derive.microscale import (
     encode_w4a8,
     unpack_nibbles,
 )
-from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
+from cozy_runtime.derive.operations import quantize_into
 from cozy_runtime.internal import int8_linear, kernel_cache, probe, w4a8_linear
 from cozy_runtime.internal.encoding import LeafProvider, W4a8NativeLeaf, params_of
 from cozy_runtime.internal.encoding.leaves import OPERANDS
@@ -106,6 +106,7 @@ def test_the_producer_writes_kitchens_layout_and_tensorfs_decodes_it(
         },
     )
     plan = QuantizationPlan(
+        encoding="int8.convrot",
         components=("transformer", "text_encoder"),
         include=("transformer.blocks.*.weight", "text_encoder.layers.*.weight"),
         encodings=(EncodingRule("transformer.*", ENCODING),),
@@ -113,8 +114,7 @@ def test_the_producer_writes_kitchens_layout_and_tensorfs_decodes_it(
     )
     quantize_into(
         context(store, shown=shown, outputs={"model": 256 << 20}),
-        fake_telemetry(fake_attempt("w4a8")), source=Weights(source), plan=plan,
-        encoding="int8.convrot", output="model",
+        fake_telemetry(fake_attempt("w4a8")), source=Weights(source), plan=plan, output="model",
     )  # fmt: skip
     out = adopted(store, shown)
     ff = out.components["transformer"].tensors["blocks.0.ff.weight"]

@@ -26,6 +26,7 @@ from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExce
 if TYPE_CHECKING:
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
+    from cozy_runtime.author._recipes import DeclaredRecipe
     from cozy_runtime.author._weights import Weights
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
@@ -135,6 +136,7 @@ class Context:
     _plan: Callable[[Sequence[str | Collection[str]]], None] | None = field(
         default=None, repr=False
     )
+    _recipes: tuple[DeclaredRecipe, ...] = field(default=(), repr=False)
 
     def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored

@@ -9,10 +9,10 @@ import numpy as np
 import pytest
 from tensorfs import raw
 
-from cozy_runtime.author import Weights
+from cozy_runtime.author import EncodingRule, QuantizationPlan, Weights
 from cozy_runtime.author.fakes import fake_attempt, fake_telemetry
 from cozy_runtime.derive.microscale import encode_nvfp4
-from cozy_runtime.derive.operations import EncodingRule, QuantizationPlan, quantize_into
+from cozy_runtime.derive.operations import quantize_into
 from cozy_runtime.internal.encoding import params_of
 from store_fixtures import adopted, checkpoint, context, home
 
@@ -67,6 +67,7 @@ def test_one_lane_carries_nvfp4_beside_int8(
         },
     )
     plan = QuantizationPlan(
+        encoding="int8.convrot",
         components=("transformer", "text_encoder"),
         include=("transformer.blocks.*.weight", "text_encoder.layers.*.weight"),
         encodings=(EncodingRule("transformer.*", ENCODING),),
@@ -74,7 +75,7 @@ def test_one_lane_carries_nvfp4_beside_int8(
     )
     quantize_into(
         context(store, shown=shown), fake_telemetry(fake_attempt("nvfp4")), source=Weights(source),
-        plan=plan, encoding="int8.convrot", output="model",
+        plan=plan, output="model",
     )  # fmt: skip
     out = adopted(store, shown)
     q_proj = out.components["text_encoder"].tensors["layers.0.q_proj.weight"]

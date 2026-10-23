@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
-from typing import Any, Literal
-
-import msgspec
+from typing import Any
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author import (
@@ -15,6 +13,8 @@ from cozy_runtime.author import (
     Context,
     MemoDistribution,
     ModelArtifact,
+    QuantizationPlan,
+    SelectionPlan,
     Telemetry,
     UnsupportedInput,
     Weights,
@@ -33,41 +33,14 @@ from .quantization import (
     source_rows,
 )
 
-
-class EncodingRule(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Selected weights whose `component.key` matches `pattern` take `encoding`."""
-
-    pattern: str
-    encoding: str
-
-
-class QuantizationPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """Closed selection and source compatibility policy for generic quantization.
-
-    `keys` names exact weights in every component; `include` instead selects the weights
-    whose `component.key` matches one of its fnmatch patterns, each of which must match one.
-    Every other tensor keeps its source bytes. A selected weight matching an `encodings` rule
-    (the first that does) takes that rule's encoding instead of the lane's, so one lane can
-    carry, say, an nvfp4 DiT beside an int8 text encoder."""
-
-    components: tuple[str, ...]
-    keys: tuple[str, ...] = ()
-    include: tuple[str, ...] = ()
-    encodings: tuple[EncodingRule, ...] = ()
-    selected_schema_digest: str | None = None
-    source_order_digests: tuple[str, ...] = ()
-    output_precision: Literal["normalize-f32-to-bf16", "preserve"] = "normalize-f32-to-bf16"
-
-
 # This is the platform's representable grant ceiling, not a model-size estimate.
 # Writer admission uses actual remaining added-role geometry (cr-151).
 MAX_QUANTIZED_BYTES = MAX_WEIGHTS_NEW_BYTES
 app = App()
 
 
-def _selection(
-    source: Checkpoint, plan: QuantizationPlan, encoding: str | None = None
-) -> ArtifactQuantizationPlan:
+def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizationPlan:
+    encoding = plan.encoding
     if (
         not 1 <= len(plan.components) <= 64
         or len(set(plan.components)) != len(plan.components)
@@ -216,7 +189,6 @@ async def quantize(
     *,
     source: Weights[Any],
     plan: QuantizationPlan,
-    encoding: str,
     tel: Telemetry,
     max_relative_frobenius: float | None = None,
 ) -> ModelArtifact:
@@ -226,54 +198,53 @@ async def quantize(
         tel,
         source=source,
         plan=plan,
-        encoding=encoding,
         output="model",
         max_relative_frobenius=max_relative_frobenius,
     )
+
+
+def _opened(ctx: Context, source: Weights[Any] | Checkpoint) -> Checkpoint:
+    return source if isinstance(source, Checkpoint) else ctx.tensorfs_source(source)
 
 
 def quantize_into(
     ctx: Context,
     tel: Telemetry,
     *,
-    source: Any,
+    source: Weights[Any] | Checkpoint,
     plan: QuantizationPlan,
-    encoding: str,
     output: str,
     max_relative_frobenius: float | None = None,
 ) -> ModelArtifact:
-    """`quantize`'s lane, written into the CALLING job's weights output `output`: a package's
-    own lane job (`cozy model quantize --int8` runs one) is this with its recipe as `plan`."""
+    """`plan`'s lane, written into the CALLING job's weights output `output`."""
     ctx.raise_if_cancelled()
-    intent = facade.plan(plan.components, encoding, max_relative_frobenius=max_relative_frobenius)
-    opened = ctx.tensorfs_source(source)
+    intent = facade.plan(
+        plan.components, plan.encoding, max_relative_frobenius=max_relative_frobenius
+    )
+    opened = _opened(ctx, source)
     result, artifact = facade._quantize(
         opened,
         intent,
         ctx=ctx,
         tel=tel,
         output=output,
-        selection=_selection(opened, plan, encoding),
+        selection=None if plan.encoding is None else _selection(opened, plan),
         preserve_precision=plan.output_precision == "preserve",
     )
     return facade._artifact_result(result, artifact, tel, output)
 
 
-class SelectionPlan(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """The weights a lane keeps: those whose `component.key` matches one of `include`'s fnmatch
-    patterns, each of which must match one. Every other tensor is dropped; the kept ones keep the
-    source's objects, and the pipeline, every component's config and its assets come along. A
-    small lane of a big checkpoint's part, such as its multi-token-prediction head."""
-
-    include: tuple[str, ...]
-
-
 def select_into(
-    ctx: Context, tel: Telemetry, *, source: Any, plan: SelectionPlan, output: str
+    ctx: Context,
+    tel: Telemetry,
+    *,
+    source: Weights[Any] | Checkpoint,
+    plan: SelectionPlan,
+    output: str,
 ) -> ModelArtifact:
     """`plan`'s weights of `source`, written into the CALLING job's weights output `output`."""
     ctx.raise_if_cancelled()
-    opened = ctx.tensorfs_source(source)
+    opened = _opened(ctx, source)
     rows = [(c, key) for c, key, _ in source_rows(opened)]
 
     def kept(component: str, key: str) -> bool:

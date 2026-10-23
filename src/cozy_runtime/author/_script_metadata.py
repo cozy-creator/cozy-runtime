@@ -48,8 +48,28 @@ def fold_constant(node: ast.expr, other: Callable[[ast.expr], Any]) -> Any:
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, (ast.Tuple, ast.List)):
-        items = [fold_constant(item, other) for item in node.elts]
+        items: list[Any] = []
+        for item in node.elts:
+            if isinstance(item, ast.Starred):
+                spread = fold_constant(item.value, other)
+                if not isinstance(spread, (tuple, list)):
+                    raise Unfolded(item, "a splat of a non-sequence")
+                items.extend(spread)
+            else:
+                items.append(fold_constant(item, other))
         return tuple(items) if isinstance(node, ast.Tuple) else items
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue):
+                if value.conversion != -1 or value.format_spec is not None:
+                    raise Unfolded(value, "a formatted f-string field")
+                value = value.value
+            part = fold_constant(value, other)
+            if not isinstance(part, str):
+                raise Unfolded(value, "an f-string field that is not a string")
+            parts.append(part)
+        return "".join(parts)
     if isinstance(node, ast.Dict):
         if any(key is None for key in node.keys):
             raise Unfolded(node, "a dict splat")
