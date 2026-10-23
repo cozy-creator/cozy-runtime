@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import fnmatch
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
 
@@ -130,8 +130,10 @@ def choose(
     lane: str,
     recipe: str,
     package: str,
+    plan: Callable[[DeclaredRecipe], Plan] | None = None,
 ) -> tuple[DeclaredRecipe, Plan]:
-    """The one recipe of `lane` (named `recipe`, when given) that reads `source`."""
+    """The one recipe of `lane` (named `recipe`, when given) that reads `source`; each row's
+    plan is the one its module binds (`declared_plan`) unless `plan` reads it otherwise."""
     named = recipe.replace("-", "_").lower()
     offered = [r for r in declared if r.lane == lane and (not named or r.name == named)]
     if not offered:
@@ -152,7 +154,7 @@ def choose(
             f"{wants}",
             code="recipe_source",
         )
-    found = [(row, declared_plan(row)) for row in reads]
+    found = [(row, (plan or declared_plan)(row)) for row in reads]
     if len(found) > 1:
         fitting = [(row, plan) for row, plan in found if fits(source, plan)]
         names = ", ".join(row.name for row, _ in fitting or found)
