@@ -21,6 +21,7 @@ import re
 import subprocess
 import sys
 import tomllib
+from collections.abc import Iterator
 
 from packaging.requirements import Requirement
 from packaging.version import Version
@@ -1015,6 +1016,64 @@ def fence_no_stream_host_functions() -> list[str]:
     ]
 
 
+#: Where a CUDA graph is made: the one capture backend and the graph domain's never-replayed
+#: owner; who calls the backend: the idle path (`graphs._record`, a `capture_idle` job) and the
+#: LM engine's decode steps, the one tracked capture on a request's path (cr-210, which the
+#: graph-safety redesign removes); and who calls `_record`: the idle job alone.
+CAPTURE_SITES: dict[str, frozenset[tuple[str, str]]] = {
+    "CUDAGraph": frozenset({("graphs/__init__.py", "capture"), ("graphs/domain.py", "initialize")}),
+    "capture_begin": frozenset(
+        {("graphs/__init__.py", "capture"), ("graphs/domain.py", "initialize")}
+    ),
+    "graph": frozenset(),  # torch.cuda.graph(...)
+    "make_graphed_callables": frozenset(),
+    "capture": frozenset({("graphs/__init__.py", "_record"), ("lm/__init__.py", "_replay")}),
+    "_record": frozenset({("graphs/__init__.py", "_capture_pending")}),
+}
+
+
+def _capture_calls(node: ast.AST, within: str, backend: bool) -> Iterator[tuple[int, str, str]]:
+    """(line, name, enclosing function) of each call that makes a CUDA graph or reaches the
+    Runtime's capture backend (`backend`: the module can name `graphs.capture` bare)."""
+    for child in ast.iter_child_nodes(node):
+        name = within
+        if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+            name = child.name
+        if isinstance(child, ast.Call):
+            func = child.func
+            dotted = _dotted(func)
+            called = func.attr if isinstance(func, ast.Attribute) else dotted
+            ours = called in ("capture", "_record") and (
+                backend or dotted in ("graphs.capture", "graphs._record")
+            )
+            torch = called in ("CUDAGraph", "capture_begin", "make_graphed_callables")
+            if ours or torch or dotted.endswith("cuda.graph"):
+                yield child.lineno, "graph" if dotted.endswith("cuda.graph") else called, within
+        yield from _capture_calls(child, name, backend)
+
+
+def fence_capture_off_request_path() -> list[str]:
+    """The owner's rule: no CUDA graph is captured on a request's path. A cold signature runs
+    as written; recording happens when the device is idle and serves later requests."""
+    bad: list[str] = []
+    for path in py_files():
+        rel = path.relative_to(SRC).as_posix()
+        tree = ast.parse(path.read_text())
+        backend = rel == "graphs/__init__.py" or any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "cozy_runtime.graphs"
+            and any(a.name == "capture" for a in node.names)
+            for node in ast.walk(tree)
+        )
+        for line, called, within in _capture_calls(tree, "", backend):
+            if (rel, within) not in CAPTURE_SITES.get(called, frozenset()):
+                bad.append(
+                    f"{path.relative_to(ROOT)}:{line}: {called} in {within or '<module>'} — a "
+                    "CUDA graph records off the request path only (graphs._record, at idle)"
+                )
+    return bad
+
+
 FENCES = {
     "one-address-predicate": fence_one_address_predicate,
     "forbidden-dependency": fence_forbidden_dependency,
@@ -1037,6 +1096,7 @@ FENCES = {
     "any-ratchet": fence_any_ratchet,
     "no-home-paths": fence_no_home_paths,
     "no-stream-host-functions": fence_no_stream_host_functions,
+    "capture-off-request-path": fence_capture_off_request_path,
 }
 
 
