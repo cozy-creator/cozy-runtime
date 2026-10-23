@@ -673,6 +673,18 @@ class _CompositeResidency:
     def baked(self) -> int:
         return sum(row.baked() for row in self.rows.values())
 
+    def document(self) -> dict[str, Any]:
+        """Each slot's placement's document as one: its notes and graphs keyed by slot."""
+        docs = {name: row.document() for name, row in self.rows.items()}
+        return {
+            part: {
+                f"{name}.{key}": value
+                for name, doc in docs.items()
+                for key, value in doc[part].items()
+            }
+            for part in ("notes", "graphs")
+        }
+
 
 class _OnDemand:
     """An `on_demand=` model argument: built, and its weights fetched, when the function first
