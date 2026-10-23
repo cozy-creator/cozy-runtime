@@ -5,7 +5,7 @@ typing libraries and the pure canonical-JSON facade only. It cannot import
 cozy_runtime.internal, cozy_runtime.cli, the
 worker protocol, TensorFS, Varena or any RecordOwner; it cannot read environment or config;
 it names no allocator or ingest surface, and a package's own kernels are declarations the
-runtime compiles and hands back (`author.kernels`). `checks/architecture.py` proves it.
+runtime compiles and hands back (`author.kernels`).
 
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and
 everything it DOES rides a typed service parameter it named. A `Model` has two lifecycle

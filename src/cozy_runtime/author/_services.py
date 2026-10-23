@@ -1391,8 +1391,7 @@ class Telemetry(_Bound):
         """Per-stage timing bracket; `stage_ms` feeds the duration model and benchmarks.
 
         Structurally separate from a component-use scope: this records a NUMBER and touches
-        no residency, no placement and no ComponentUseContract — `checks/architecture.py`'s
-        `timing-decides-nothing` fence proves the module cannot reach them.
+        no residency, no placement and no ComponentUseContract.
         """
         self._attempt.check_open("Telemetry.stage")
         self._ctx.raise_if_cancelled()

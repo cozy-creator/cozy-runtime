@@ -1,7 +1,6 @@
 name: dev-build
-# Builds publish.yaml's release files for any ref and runs one targeted test command, off the dev box:
-#   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure|none]
-#     [-f test='uv run pytest -q tests/test_x.py']
+# Builds publish.yaml's release files for any ref, off the dev box:
+#   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure]
 # The artifact is cozy-runtime-<sha>[-aarch64]. The files carry the ref's pyproject version; the
 # commit is stamped in cozy_runtime._build_provenance.
 on:
@@ -12,13 +11,9 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with its kernels; pure: sdist and pure wheel; none: tests only"
+        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with its kernels; pure: sdist and pure wheel"
         type: string
         default: wheels
-      test:
-        description: Targeted test command, run with bash at the ref in a delegated cgroup; empty runs none
-        type: string
-        default: ''
       runner:
         description: Runner label
         type: string
@@ -51,15 +46,6 @@ jobs:
     env:
       WHEELS: ${{ inputs.build == 'wheels' }}
     steps:
-      # Bootstrap access belongs to the trusted workflow revision, not the source under test.
-      # Older or newer product refs need not carry this CI helper.
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.workflow_sha }}
-          path: workflow
-          sparse-checkout: |
-            scripts/ci-delegated.sh
-          sparse-checkout-cone-mode: false
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}
@@ -83,7 +69,6 @@ jobs:
       # From here to the wheel check: publish.yaml's build job, step for step.
       # On either arch the Linux wheel is the pure one plus its kernels.
       - name: Build (sdist + pure-py wheel)
-        if: inputs.build != 'none'
         working-directory: source
         env:
           COZY_RUNTIME_BUILD_COMMIT: ${{ steps.pin.outputs.sha }}
@@ -104,23 +89,9 @@ jobs:
         if: env.WHEELS == 'true'
         working-directory: source
         run: uv run --script scripts/verify-wheels.py --dist dist
-      - if: inputs.build != 'none'
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ runner.arch == 'ARM64' && '-aarch64' || '' }}
           path: source/dist/
           if-no-files-found: error
           retention-days: 7
-      # ci.yaml's isolation: Runtime's executor containment needs a delegated cgroup subtree.
-      - if: inputs.test != ''
-        working-directory: source
-        env:
-          TEST: ${{ inputs.test }}
-        run: |
-          bash "$GITHUB_WORKSPACE/workflow/scripts/ci-delegated.sh" "cozy-runtime-dev-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
-            --uid="$(id -u)" --gid="$(id -g)" \
-            --property=Delegate=yes --working-directory="$PWD" \
-            --setenv="PATH=$PATH" --setenv="HOME=$HOME" \
-            --setenv="UV_CACHE_DIR=$UV_CACHE_DIR" \
-            --setenv="UV_PYTHON_INSTALL_DIR=$(uv python dir)" \
-            bash -euo pipefail -c "$TEST"
