@@ -1103,11 +1103,12 @@ def _record(
                     _failed(module, recorder, key, why)
                     WARNINGS.append(("a CUDA graph was not used", {"why": why}))
                     return True
-                if why := _no_gain(torch, graph, recorder.eager.wall_ms()):
+                entry = _Recording(torch, graph, pool, inputs, outputs[0], key, served, owner)
+                root = _REGIONS[module][0]() is module
+                if why := _no_gain(torch, entry, root, recorder.eager.wall_ms()):
                     recorder.judged[key] = why
-                    graph.reset()
+                    entry.close()
                     return True
-        entry = _Recording(torch, graph, pool, inputs, outputs[0], key, served, owner)
         recorder.recordings[key] = entry
         recorder.captures += 1
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
@@ -1139,15 +1140,19 @@ def _record(
             current.wait_stream(stream)
 
 
-def _no_gain(torch: Any, graph: Any, eager: float | None) -> str:
-    """Why a verified graph is dropped: its replay's device time a call (two replays timed at
-    idle) saves no more than the two differ by against its eager calls' (v14: 85 CLIP regions
-    cost 479 ms to record and saved ~0). "" when it gains, or with no eager wall measured."""
+def _no_gain(torch: Any, entry: _Recording, root: bool, eager: float | None) -> str:
+    """Why a verified graph is dropped: a replay as a request makes it (its inputs copied in, a
+    root's outputs copied out), timed twice at idle, saves no more than the two differ by
+    against its eager calls' device time a call (v14/v15: CLIP's tiny regions recorded, then
+    replayed no faster: the copies and the launch were their whole cost). "" when it gains,
+    or with no eager wall measured."""
+    leaves = [t.clone() if t is not None else None for t in entry.inputs]
     walls = []
     for _ in range(2):
+        out = entry.output() if root else None
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
-        graph.replay()
+        entry(leaves, out)
         end.record()
         end.synchronize()
         walls.append(float(start.elapsed_time(end)))
