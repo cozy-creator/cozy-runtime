@@ -33,6 +33,7 @@ ENV = {**os.environ, "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1", "CUDA_VISIB
 def installed() -> Iterator[None]:
     attention_ulysses.install(execution)
     install_split(execution)
+    cuts._MEASURED.clear()  # each test measures its splits afresh
     yield
     attention_ulysses.install(None)
     install_split(None)
@@ -128,6 +129,9 @@ def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> N
             assert len(refused) <= levels + 1, f"the decode re-ran without end: {refused}"
             raise torch.OutOfMemoryError("out of memory. Tried to allocate 8.00 KiB")
 
+    for turn in range(2):  # its op is measured at its two first windows
+        with torch.no_grad(), mem.request(f"measure-{turn}") as r, execution.serving(r):
+            split(lambda x: model.decode(x).sample, z, *tiles)
     model.decoder.up_blocks[-1].register_forward_pre_hook(short)
     with torch.no_grad(), mem.request("decode") as r, execution.serving(r):
         got = split(lambda x: model.decode(x).sample, z, *tiles)
@@ -136,6 +140,29 @@ def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> N
     assert all(refused.count(w) == 1 for w in set(refused)), refused
     rows = catch.cut_rows(r).sites
     assert any(at.site.startswith("split:") and at.descent for at in rows), rows
+
+
+def test_a_split_measures_its_op_at_two_windows_then_plans_from_the_fit(tmp_path: Path) -> None:
+    """The lead's ruling: a split's bytes are measured, not declared and never learned by OOM.
+    Its first call runs at the finest window and its second at the next larger, each measured by
+    the request's section peak; from the third it plans from the fit through both, at a level
+    coarser than the finest. Every call decodes the whole latent (differently sized tiles
+    cross-fade differently: the author declares that approximation)."""
+    mem = memory()
+    model, z, tiles, deepest = _decode_split(mem, tmp_path)
+    key = None
+    got = []
+    for turn in range(3):
+        with torch.no_grad(), mem.request(f"measure-{turn}") as r, execution.serving(r):
+            got.append(split(lambda x: model.decode(x).sample, z, *tiles))
+            (row,) = (at for at in catch.cut_rows(r).sites if at.site.startswith("split:"))
+        key = row.site.removeprefix("split:")
+        if turn < 2:
+            assert len(cuts._MEASURED[key]) == turn + 1, cuts._MEASURED[key]
+    (small, _), (large, _) = cuts._MEASURED[key]
+    assert small < large
+    assert row.level < deepest  # planned from the fit: no longer the finest window
+    assert all(g.shape == (1, 3, 32, 32) and bool(torch.isfinite(g).all()) for g in got)
 
 
 def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:

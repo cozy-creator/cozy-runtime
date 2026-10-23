@@ -28,7 +28,13 @@ class Sizes:
         self.pieces: list[int] = []
 
     def split(
-        self, name: str, key: str, total: int, finest: int, itemsize: int, run: Callable[[int], Any]
+        self,
+        name: str,
+        key: str,
+        total: int,
+        finest: int,
+        out_bytes: int,
+        run: Callable[[int], Any],
     ) -> Any:
         self.asked.append((name, total, finest))
         return run(self.most)

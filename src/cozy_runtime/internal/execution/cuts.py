@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import functools
 import math
+import sys
+import threading
 from collections.abc import Callable, Sequence
 from typing import cast
 
@@ -453,23 +455,56 @@ def _attend(
     return out
 
 
+#: per split key, its op's measured bytes at its first two windows: (window elements, the
+#: section's peak less what was live at its start and the output). A measurement on the live
+#: tensors, never an OOM; fitted once both are in (`sizing.fitted`)
+_MEASURED: dict[str, list[tuple[int, int]]] = {}
+_MEASURED_LOCK = threading.Lock()
+
+
 def split[T](
-    name: str, key: str, total: int, finest: int, itemsize: int, run: Callable[[int], T]
+    name: str, key: str, total: int, finest: int, out_bytes: int, run: Callable[[int], T]
 ) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
-    Until its op's bytes are measured at two windows (the request's section peaks), a window
-    is sized by what it surely holds: the whole output and its own piece of it."""
+    Its op's bytes are measured at its first two calls, at the finest window and the next
+    (the request's section peaks), then fitted: an op quadratic in its window scales as one."""
+    deepest = levels(-(-total // max(finest, 1)))
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
 
-    def need(level: int, granularity: int) -> int:
-        return sizing.peak(granularity, total * itemsize, (window(level) * itemsize,))
-
     def at(level: int) -> T:
         return run(window(level))
 
-    return catch.cut(f"split:{key}", levels(-(-total // max(finest, 1))), need, at)
+    with _MEASURED_LOCK:
+        points = list(_MEASURED.get(key, ()))
+    request = catch.CURRENT.get()
+    if len(points) == 2:
+        fit = sizing.fitted(points[0], points[1])
+
+        def need(level: int, granularity: int) -> int:
+            return sizing.peak(granularity, out_bytes, (fit(window(level)),))
+
+        return catch.cut(f"split:{key}", deepest, need, at)
+    # Unmeasured: the next window to measure (the finest, then the next larger), sized as so.
+    target = next(
+        (lv for lv in range(deepest, -1, -1) if all(window(lv) > w for w, _ in points)), 0
+    )
+
+    def measuring(level: int, granularity: int) -> int:
+        return 0 if level >= target else sys.maxsize  # a coarser window is not yet measured
+
+    if request is None or deepest == 0:
+        return catch.cut(f"split:{key}", deepest, measuring, at)
+    request.reset_peak()
+    start = request.reset_peak()  # what is live now: the restarted high-water
+    result = catch.cut(f"split:{key}", deepest, measuring, at)
+    grew = max(request.reset_peak() - start - out_bytes, 0)
+    with _MEASURED_LOCK:
+        known = _MEASURED.setdefault(key, [])
+        if len(known) < 2 and all(window(target) > w for w, _ in known):
+            known.append((window(target), grew))
+    return result
