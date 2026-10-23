@@ -19,8 +19,13 @@ def _need(per_unit: int, out: int = 0) -> sizing.Need:
 
 def test_the_coarsest_level_that_fits_in_cold_room_evicts_nothing_of_the_step() -> None:
     need = _need(MIB, out=8 * MIB)  # 64 units: whole 72 MiB, halves 40, quarters 24
-    assert sizing.choose(64, need, Room(free=80 * MIB, cold=0, warm=0, floor=0)) == (0, "cold")
-    assert sizing.choose(64, need, Room(free=20 * MIB, cold=20 * MIB, warm=0, floor=0)) == (
+    assert sizing.choose(64, need, Room(free=80 * MIB, cold=0, warm=0, granularity=1, floor=0)) == (
+        0,
+        "cold",
+    )
+    assert sizing.choose(
+        64, need, Room(free=20 * MIB, cold=20 * MIB, warm=0, granularity=1, floor=0)
+    ) == (
         1,
         "cold",
     )
@@ -30,9 +35,12 @@ def test_the_warm_tier_leaves_the_streaming_floor_bindable() -> None:
     """P1: evicting the step's own blocks needs SLOTS of the largest left free, or they cannot
     stream back within the step."""
     need = _need(MIB, out=8 * MIB)
-    room = Room(free=4 * MIB, cold=4 * MIB, warm=40 * MIB, floor=24 * MIB)
+    room = Room(free=4 * MIB, cold=4 * MIB, warm=40 * MIB, granularity=1, floor=24 * MIB)
     assert sizing.choose(64, need, room) == (2, "warm")  # 24 MiB fits 48 - 24, 40 does not
-    assert sizing.choose(64, need, Room(free=1, cold=0, warm=0, floor=0)) == (6, "floor")
+    assert sizing.choose(64, need, Room(free=1, cold=0, warm=0, granularity=1, floor=0)) == (
+        6,
+        "floor",
+    )
 
 
 def test_a_refusal_descends_one_level_at_least_and_rereads_the_room() -> None:
@@ -42,7 +50,9 @@ def test_a_refusal_descends_one_level_at_least_and_rereads_the_room() -> None:
     class Refused(Exception):
         pass
 
-    rooms = iter([Room(100 * MIB, 0, 0, 0), Room(100 * MIB, 0, 0, 0), Room(30 * MIB, 0, 0, 0)])
+    rooms = iter(
+        [Room(100 * MIB, 0, 0, 1, 0), Room(100 * MIB, 0, 0, 1, 0), Room(30 * MIB, 0, 0, 1, 0)]
+    )
     ran: list[int] = []
 
     def run(level: int) -> str:
@@ -62,11 +72,11 @@ def test_a_refusal_descends_one_level_at_least_and_rereads_the_room() -> None:
 
     ran.clear()
     with pytest.raises(Refused):
-        sizing.descend(4, _need(MIB), lambda: Room(1 << 40, 0, 0, 0), always, lambda e: True)
+        sizing.descend(4, _need(MIB), lambda: Room(1 << 40, 0, 0, 1, 0), always, lambda e: True)
     assert ran == [0, 1, 2]  # at most `levels` steps, then the finest raises
 
     with pytest.raises(ValueError):  # anything but a refusal runs once
-        sizing.descend(4, _need(MIB), lambda: Room(1 << 40, 0, 0, 0), _raise, lambda e: False)
+        sizing.descend(4, _need(MIB), lambda: Room(1 << 40, 0, 0, 1, 0), _raise, lambda e: False)
 
 
 def _raise(level: int) -> str:

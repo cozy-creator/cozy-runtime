@@ -18,14 +18,16 @@ type Need = Callable[[int], int]
 
 @dataclass(frozen=True, slots=True)
 class Room:
-    """What this process may hold now (`r.room(step)`): its float and the manager's free (net of
-    the driver headroom), revocable bytes outside the step's plan sets (`cold`), its own inside
-    them (`warm`), and the streaming floor the warm tier leaves: SLOTS times the largest block it
-    would evict (`floor`), so those blocks can bind again within the step."""
+    """What this process may hold now, as varena's `Room` (`r.room(step)`) reports it: its float
+    and the manager's free (net of the driver headroom), revocable bytes outside the step's plan
+    sets (`cold`), its own inside them (`warm`), the allocation granularity every need rounds up
+    to, and the streaming floor the warm tier leaves (SLOTS of the largest block it would evict,
+    so those blocks bind again within the step)."""
 
     free: int
     cold: int
     warm: int
+    granularity: int
     floor: int
 
 
