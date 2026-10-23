@@ -673,7 +673,7 @@ class _CompositeResidency:
     def baked(self) -> int:
         return sum(row.baked() for row in self.rows.values())
 
-    def document(self) -> dict[str, Any]:
+    def document(self) -> dict[str, dict[str, object]]:
         """Each slot's placement's document as one: its notes and graphs keyed by slot."""
         docs = {name: row.document() for name, row in self.rows.items()}
         return {
