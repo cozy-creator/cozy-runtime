@@ -2,8 +2,8 @@
 
 Purity alone is insufficient: tensor-global activation scales and RNG state forbid cuts.
 Changing GEMM row geometry may change rounding; bitwise equivalence is not promised.
-The results stay on the device, at
-the level the process keeps for its site (`catch`). Level L is 2^L pieces, down to the finest.
+The results stay on the device, at the level each call's operands need against the request's
+room (`catch`, `sizing`). Level L is 2^L pieces, down to the finest.
 
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
@@ -19,8 +19,8 @@ from typing import cast
 import torch
 from torch import Tensor, nn
 
-from cozy_runtime.internal.execution import catch
-from cozy_runtime.internal.execution.sizing import levels, pieces
+from cozy_runtime.internal.execution import catch, sizing
+from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
 
 type Band = Callable[[int, int], Tensor]
 type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
@@ -100,10 +100,39 @@ def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
         ):
             return conv(x, weight, bias)
         run = functools.partial(_bands, conv, x, weight, bias, by_images, units)
-        shape = "x".join(map(str, x.shape))
-        return catch.cut(site, levels(units), run, (x,), shape)
+        need = levelled(units, _conv_need(module, x, units, by_images))
+        return catch.cut(site, levels(units), need, run)
 
     return cut
+
+
+def _conv_need(module: nn.Module, x: Tensor, units: int, by_images: bool) -> sizing.Per:
+    """A band's bytes: the whole output, held throughout; the band's output; and, where the conv
+    pads by copying (a padding mode other than zeros), the band's padded input (an image band's
+    images, or the whole input again for a channel band). cuDNN's workspace comes from the
+    agent's float (its bound is the GPU round's measure)."""
+    dims, b = len(module.kernel_size), x.element_size()
+    spatial = [int(n) for n in x.shape[-dims:]]
+    if module.padding == "same":
+        sizes = spatial
+    else:
+        pad = (0,) * dims if module.padding == "valid" else module.padding
+        sizes = [
+            (n + 2 * p - d * (k - 1) - 1) // s + 1
+            for n, p, d, k, s in zip(
+                spatial, pad, module.dilation, module.kernel_size, module.stride, strict=True
+            )
+        ]
+    lead = math.prod(int(n) for n in x.shape[: -dims - 1])
+    out = lead * module.out_channels * math.prod(sizes) * b
+    copied = module.padding_mode != "zeros"
+    whole_in = x.numel() * b
+
+    def piece(n: int, granularity: int) -> int:
+        copy = (n * whole_in // units if by_images else whole_in) if copied else 0
+        return sizing.peak(granularity, out, (copy, n * out // units))
+
+    return piece
 
 
 def _bands(
@@ -161,12 +190,39 @@ def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callab
             return forward(x)
         try:
             run = functools.partial(_tokens, forward, x, tokens)
-            return catch.cut(site, levels(tokens), run, (x,))
+            need = levelled(tokens, _ffn_shape(module, x).need(tokens))
+            return catch.cut(site, levels(tokens), need, run)
         except _Whole:
             whole.append(True)
         return forward(x)
 
     return cut
+
+
+#: activations computing in one kernel (one `n x inner` temporary); the others hold two
+_FUSED = frozenset({"GELU"})
+_GATED = frozenset({"GEGLU", "SwiGLU"})
+
+
+def _ffn_shape(module: nn.Module, x: Tensor) -> sizing.Ffn:
+    """A Diffusers feed-forward's widths (or its activation projection's alone, whose output
+    is its inner width): the projection, the activation's temporaries, the down projection, and
+    whether an encoding leaf quantizes the linears' input rows."""
+    net = getattr(module, "net", None)
+    act = net[0] if isinstance(net, nn.ModuleList) else module
+    kinds = {c.__name__ for c in type(act).__mro__}
+    projected = int(act.proj.out_features)
+    inner = projected // 2 if kinds & _GATED else projected
+    downs = [m for m in net if hasattr(m, "out_features")] if isinstance(net, nn.ModuleList) else []
+    return sizing.Ffn(
+        din=int(x.shape[-1]),
+        dout=int(downs[-1].out_features) if downs else inner,
+        inner=inner,
+        projected=projected,
+        temps=1 if kinds & _FUSED and not kinds & _GATED else 2,
+        itemsize=x.element_size(),
+        quantized=any(getattr(c, "provider", None) is not None for c in module.modules()),
+    )
 
 
 def _token_local(module: nn.Module) -> bool:
@@ -220,7 +276,9 @@ def _norm(site: str, module: nn.Module, forward: Callable[..., object]) -> Calla
             return forward(x)
         flat = x.reshape(tokens, *x.shape[-dims:])
         run = functools.partial(_rows, forward, flat, tokens)
-        out = catch.cut(site, levels(tokens), run, (x,))
+        # torch's rms_norm holds an fp32 upcast of its rows where it is not fused
+        need = levelled(tokens, sizing.norm(tokens, row, x.element_size(), 4))
+        out = catch.cut(site, levels(tokens), need, run)
         return cast(Tensor, out).view(x.shape)
 
     return cut
@@ -289,7 +347,9 @@ def _rms(
             return forward(x)
         try:
             run = functools.partial(_rms_bands, forward, x, axis)
-            return catch.cut(site, levels(height), run, (x,))
+            # Diffusers' channel RMS normalizes, then scales: two fp32-wide temporaries a value
+            need = levelled(height, sizing.norm(height, x.numel() // height, x.element_size(), 8))
+            return catch.cut(site, levels(height), need, run)
         except _Whole:
             return forward(x)
 
@@ -325,12 +385,14 @@ def attend(
     *,
     rows: int = 0,
     heads: bool = True,
+    scratch: str = "flash",
 ) -> Tensor:
-    """`call(q, k, v, mask)` over [batch, sequence, heads, dim], in pieces at its site's level,
-    each computed as the whole computes it. Level L is 2^L pieces of whole K/V groups (their
-    query heads with them) when `heads` (the kernel reduces within a head); past one group a
-    piece, the rows halve: query rows on multiples of `rows` (the kernel's query block; 0:
-    never), each beside every key."""
+    """`call(q, k, v, mask)` over [batch, sequence, heads, dim], in pieces at the level its
+    operands need against the request's room, each computed as the whole computes it. Level L is
+    2^L pieces of whole K/V groups (their query heads with them) when `heads` (the kernel reduces
+    within a head); past one group a piece, the rows halve: query rows on multiples of `rows`
+    (the kernel's query block; 0: never), each beside every key. `scratch` is the backend's
+    working memory (`sizing.Attention`): flash-like, sage's quantized q/k, or math's scores."""
     site = catch.site("attention")
     if site is None:
         return call(q, k, v, mask)
@@ -341,13 +403,31 @@ def attend(
     by_heads = levels(kv) if heads else 0
     blocks = -(-length // rows) if rows else 1
 
-    def piece(level: int) -> Tensor:
+    def cut(level: int) -> tuple[int, int]:
         across = min(level, by_heads)
         hp = pieces(kv, across) * group if heads else count
         rp = pieces(blocks, level - across) * rows if rows else length
-        return _attend(call, q, k, v, mask, group, hp, rp)
+        return hp, rp
 
-    return catch.cut(site, by_heads + levels(blocks), piece, (q, k, v))
+    shape = sizing.Attention(
+        int(q.shape[0]),
+        length,
+        count,
+        kv,
+        int(k.shape[1]),
+        int(q.shape[3]),
+        q.element_size(),
+        scratch,
+        kv_copies=1,
+    )
+
+    def need(level: int, granularity: int) -> int:
+        return shape.need(*cut(level), granularity)
+
+    def piece(level: int) -> Tensor:
+        return _attend(call, q, k, v, mask, group, *cut(level))
+
+    return catch.cut(site, by_heads + levels(blocks), need, piece)
 
 
 def _attend(
@@ -373,13 +453,23 @@ def _attend(
     return out
 
 
-def split[T](name: str, key: str, total: int, finest: int, run: Callable[[int], T]) -> T:
+def split[T](
+    name: str, key: str, total: int, finest: int, itemsize: int, run: Callable[[int], T]
+) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
-    having no side effects does not make differently sized windows numerically equivalent."""
+    having no side effects does not make differently sized windows numerically equivalent.
+    Until its op's bytes are measured at two windows (the request's section peaks), a window
+    is sized by what it surely holds: the whole output and its own piece of it."""
+
+    def window(level: int) -> int:
+        return max(pieces(total, level), finest)
+
+    def need(level: int, granularity: int) -> int:
+        return sizing.peak(granularity, total * itemsize, (window(level) * itemsize,))
 
     def at(level: int) -> T:
-        return run(max(pieces(total, level), finest))
+        return run(window(level))
 
-    return catch.cut(f"split:{key}", levels(-(-total // max(finest, 1))), at, (), str(total))
+    return catch.cut(f"split:{key}", levels(-(-total // max(finest, 1))), need, at)

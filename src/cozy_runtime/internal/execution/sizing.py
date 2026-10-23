@@ -12,8 +12,11 @@ import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
-#: a piece's bytes for its unit count (tokens, rows, images, heads or query rows)
-type Need = Callable[[int], int]
+#: a piece's bytes for its unit count (tokens, rows, images, heads or query rows), each term
+#: in whole allocation granules of the given size
+type Per = Callable[[int, int], int]
+#: a level's bytes (2^level pieces), in whole granules of the given size
+type Need = Callable[[int, int], int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,37 +44,44 @@ def levels(units: int) -> int:
     return max(units - 1, 0).bit_length()
 
 
-def choose(units: int, need: Need, room: Room) -> tuple[int, str]:
-    """The coarsest level whose piece fits, and its tier: within free and cold bytes ("cold": no
-    weight of the step evicted), else within everything revocable less the streaming floor
-    ("warm"), else the finest ("floor"), where only the physical floor refuses."""
-    finest = levels(units)
+def levelled(units: int, per: Per) -> Need:
+    """`per`'s piece bytes at each level of `units` cut into 2^level pieces."""
+    return lambda level, granularity: per(pieces(units, level), granularity)
+
+
+def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
+    """The coarsest level of 0..`finest` that fits, and its tier: within free and cold bytes
+    ("cold": no weight of the step evicted), else within everything revocable less the streaming
+    floor ("warm"), else the finest ("floor"), where only the physical floor refuses."""
     for tier, room_bytes in (
         ("cold", room.free + room.cold),
         ("warm", room.free + room.cold + room.warm - room.floor),
     ):
-        level = next((n for n in range(finest + 1) if need(pieces(units, n)) <= room_bytes), None)
+        level = next(
+            (n for n in range(finest + 1) if need(n, room.granularity) <= room_bytes), None
+        )
         if level is not None:
             return level, tier
     return finest, "floor"
 
 
 def descend[T](
-    units: int,
+    finest: int,
     need: Need,
     room: Callable[[], Room],
     run: Callable[[int], T],
     refused: Callable[[BaseException], bool],
-) -> tuple[T, int, int]:
+) -> tuple[T, int, int, str]:
     """`run(level)` at the level `choose` gives against the room now; a refusal (`refused`) at a
     level above the finest re-reads the room and runs at least one level finer. Each step is a
     smaller need, never the same size again, so at most `levels` steps; the finest's refusal is
-    the floor and raises. Returns the result, its level and the steps taken."""
-    finest, floor, steps = levels(units), 0, 0
+    the floor and raises. Returns the result, its level, the steps taken and the room's tier."""
+    floor, steps = 0, 0
     while True:
-        level = max(choose(units, need, room())[0], floor)
+        chosen, tier = choose(finest, need, room())
+        level = max(chosen, floor)
         try:
-            return run(level), level, steps
+            return run(level), level, steps, tier
         except Exception as exc:
             if level >= finest or not refused(exc):
                 raise
@@ -111,10 +121,10 @@ class Ffn:
     itemsize: int
     quantized: bool
 
-    def need(self, tokens: int, granularity: int) -> Need:
+    def need(self, tokens: int) -> Per:
         b = self.itemsize
 
-        def piece(n: int) -> int:
+        def piece(n: int, granularity: int) -> int:
             def quant(width: int) -> int:
                 return n * width + 4 * n if self.quantized else 0
 
@@ -129,21 +139,19 @@ class Ffn:
         return piece
 
 
-def norm(rows: int, row: int, itemsize: int, intermediate: int, granularity: int) -> Need:
+def norm(rows: int, row: int, itemsize: int, intermediate: int) -> Per:
     """A norm over whole rows: the output held throughout, a piece's output and its op's own
     `intermediate` bytes an element (0 fused; a composite fp32 rms_norm holds an upcast)."""
-    return lambda n: peak(
+    return lambda n, granularity: peak(
         granularity, rows * row * itemsize, (n * row * itemsize, n * row * intermediate)
     )
 
 
-def conv(
-    out: int, per_unit_in: int, per_unit_out: int, halo: int, workspace: int, granularity: int
-) -> Need:
+def conv(out: int, per_unit_in: int, per_unit_out: int, halo: int, workspace: int) -> Per:
     """A conv in bands: the output held throughout; a band's padded input copy (`per_unit_in`
     a unit plus its `halo` rows, 0 when the band is a view), its output, and cuDNN's workspace
     bound for its algorithm."""
-    return lambda n: peak(
+    return lambda n, granularity: peak(
         granularity,
         out,
         (n * per_unit_in + halo if per_unit_in else 0, n * per_unit_out, workspace),

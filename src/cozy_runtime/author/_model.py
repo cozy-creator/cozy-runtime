@@ -295,10 +295,6 @@ class Residency(Protocol):
         """`component`'s graph region of the device's one capture pool."""
         ...
 
-    def graph_levels(self) -> tuple[tuple[str, int], ...]:
-        """The active pass's cut levels, part of its graph variant identity."""
-        ...
-
     def graph_segments(self, component: str) -> tuple[str, ...]:
         """Declared model-block paths that bound graph regions independently of residency."""
         ...

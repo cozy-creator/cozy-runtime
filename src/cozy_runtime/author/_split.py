@@ -27,7 +27,7 @@ class Pieces(Protocol):
     start (the ops inside are numbered per window)."""
 
     def split(
-        self, name: str, key: str, total: int, finest: int, run: Callable[[int], Any]
+        self, name: str, key: str, total: int, finest: int, itemsize: int, run: Callable[[int], Any]
     ) -> Any: ...
 
     def piece(self) -> None: ...
@@ -53,6 +53,7 @@ def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
+        x.element_size(),
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece),
     )
 

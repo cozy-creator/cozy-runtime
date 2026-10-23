@@ -2,8 +2,8 @@
 names, and the exchange around a head-local kernel (`attention_ulysses`). Sequence shards cross
 to whole sequences per head subset, the kernel runs, and its output crosses back; packed H3
 lengths do not divide, so every GPU's rows are gathered once per exchange and every crossing
-uses them. Rust's cut levels are agreed once per pass; an exchange is never rerun locally
-once any rank can have entered its collectives. Importing this module serves the torch-free
+uses them. The exchange's head groups are agreed once per pass (each GPU proposing what its
+room needs); an exchange is never rerun locally once any rank can have entered its collectives. Importing this module serves the torch-free
 attention dispatch boundary.
 """
 
@@ -19,7 +19,7 @@ from torch.distributed import ProcessGroup
 from torch.distributed import _functional_collectives as funcol
 
 from cozy_runtime.internal import attention_ulysses
-from cozy_runtime.internal.execution import agree, catch
+from cozy_runtime.internal.execution import agree, catch, sizing
 from cozy_runtime.internal.parallel import copy_engine
 
 type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
@@ -64,24 +64,48 @@ def exchange(
         {padded, *(n for n in range(world, padded, world) if padded % n == 0)}, reverse=True
     )
     step = groups[min(agree.agreed(), len(groups) - 1)]
+    agree.propose(_level(groups, query, sum(sizes), world))
     engines = copy_engine.for_group(handle)
-    with catch.collective(agree.SITE, len(groups) - 1):
-        if step == padded:
-            out = _cross(engines, query, key, value, handle, sizes, compute)
-        else:
-            out = query.new_empty(query.shape)
-            for at in range(0, padded, step):
-                part = slice(at, at + step)
-                out[:, :, part] = _cross(
-                    engines,
-                    query[:, :, part],
-                    key[:, :, part],
-                    value[:, :, part],
-                    handle,
-                    sizes,
-                    compute,
-                )
+    if step == padded:
+        out = _cross(engines, query, key, value, handle, sizes, compute)
+    else:
+        out = query.new_empty(query.shape)
+        for at in range(0, padded, step):
+            part = slice(at, at + step)
+            out[:, :, part] = _cross(
+                engines,
+                query[:, :, part],
+                key[:, :, part],
+                value[:, :, part],
+                handle,
+                sizes,
+                compute,
+            )
     return out[:, :, :heads] if pad else out
+
+
+def _level(groups: Sequence[int], query: Tensor, rows: int, world: int) -> int:
+    """The finest head group this GPU's room needs for the exchange (P4: the gathered buffer
+    is the group's every row): q, k and v sent and received, and the output, for `step` heads.
+    Proposed for the next pass; mid-pass every GPU keeps the agreed one."""
+    request = catch.CURRENT.get()
+    if request is None:
+        return 0
+    room = request.room()
+    batch, local, dim, b = (
+        int(query.shape[0]),
+        int(query.shape[1]),
+        int(query.shape[3]),
+        query.element_size(),
+    )
+
+    def need(step: int) -> int:
+        sent = 4 * batch * local * step * dim * b
+        gathered = 4 * batch * rows * (step // world) * dim * b
+        return sizing.rounded(sent, room.granularity) + sizing.rounded(gathered, room.granularity)
+
+    fits = room.free + room.cold
+    return next((n for n, step in enumerate(groups) if need(step) <= fits), len(groups) - 1)
 
 
 def _cross(

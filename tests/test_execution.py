@@ -55,11 +55,11 @@ def test_without_an_oom_the_catch_changes_nothing(tmp_path: Path) -> None:
     assert r.stats().leftover == 0
 
 
-def test_an_oom_at_a_cut_site_cuts_it_and_the_next_request_starts_there(tmp_path: Path) -> None:
-    """An FFN projection that cannot allocate for more than 48 tokens (an allocation the
-    allocator could not make room for) runs out inside its FFN's cut site: the site goes finer,
-    its token pieces give the whole FFN's result, and the next request at that shape starts at
-    the level the process kept, with nothing running out."""
+def test_a_refusal_at_a_cut_site_descends_and_nothing_is_remembered(tmp_path: Path) -> None:
+    """An FFN projection refused for more than 48 tokens (the floor: nothing the allocator could
+    make room for) inside its FFN's cut site: the site re-reads the room and runs finer within
+    the call, its token pieces giving the whole FFN's result. Nothing is learned: the next
+    request sizes from its room again, and descends again."""
     plain = transformer()
     mem = memory()
     model = placed(mem, checkpoint(tmp_path, "dit", plain), "dit", transformer)
@@ -77,19 +77,20 @@ def test_an_oom_at_a_cut_site_cuts_it_and_the_next_request_starts_there(tmp_path
         want = plain(x)
         with mem.request("short") as r, execution.serving(r):
             got = model(x)
-        assert refused and any(n >= 1 for (at, _), n in catch.levels() if at.endswith(":tokens"))
+        rows = catch.cut_rows(r).sites
+        assert refused and any(at.site.endswith(":tokens") and at.descent for at in rows)
         torch.testing.assert_close(got, want, rtol=2**-6, atol=2**-6)
         refused.clear()
         with mem.request("short again") as r, execution.serving(r):
             again = model(x)
-    assert not refused
+    assert refused  # nothing learned: it descends again, from the room
     assert torch.equal(again, got)
 
 
-def test_an_oom_in_an_exchange_becomes_the_same_cut_on_every_gpu(tmp_path: Path) -> None:
-    """Two gloo ranks: in the first pass every rank's exchange runs out before any rank enters
-    its collectives. None runs it again; each fails typed and tells Rust, and from the next pass
-    both agree the finer level and cross the heads in halves, each pass degree 1's result byte
+def test_an_exchange_refused_fails_typed_and_every_pass_crosses_as_agreed(tmp_path: Path) -> None:
+    """Two gloo ranks: in the first pass every rank's exchange is refused before any rank
+    enters its collectives. None runs it again; each fails typed. Every pass crosses at the
+    level the ranks agree from their rooms (whole heads here), each pass degree 1's result byte
     for byte. The ranks' rows are gathered once, in the first pass at their shapes."""
     argv = [sys.executable, str(AGREEMENT), str(tmp_path), "--degree", "2"]
     subprocess.run(argv, env=ENV, check=True)
@@ -97,7 +98,7 @@ def test_an_oom_in_an_exchange_becomes_the_same_cut_on_every_gpu(tmp_path: Path)
         passes = json.loads((tmp_path / f"rank-{rank}.json").read_text())["passes"]
         assert passes[0]["failed"] == "device_out_of_memory", passes
         assert all(p["byte_equal"] for p in passes[1:]), passes
-        assert [p["exchanged_heads"] for p in passes] == [[], [4, 4], [4, 4], [4, 4]], passes
+        assert [p["exchanged_heads"] for p in passes] == [[], [8], [8], [8]], passes
         assert [p["gathered"] for p in passes] == [1, 0, 0, 0], passes
 
 
@@ -111,10 +112,10 @@ def _decode_split(mem: Any, tmp_path: Path) -> tuple[Any, Any, tuple[Cut, ...], 
 
 
 def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> None:
-    """v6 13598, on host pages: the VAE's last up block cannot allocate above 10x10 latent
-    windows, so the whole 16x16 decode runs out inside its pass: the split goes finer at once
-    (no run again at the same level) and the decode completes in tiles. 13598 re-ran the whole
-    decode for 17 minutes."""
+    """v6 13598, on host pages: the VAE's last up block is refused above 10x10 latent windows,
+    so the whole 16x16 decode is refused inside its pass: the split goes finer at once (never
+    again at the same level) and the decode completes in tiles. 13598 re-ran the whole decode
+    for 17 minutes."""
     mem = memory()
     model, z, tiles, levels = _decode_split(mem, tmp_path)
     refused: list[tuple[int, int]] = []
@@ -133,7 +134,8 @@ def test_a_tiled_decode_that_runs_out_whole_completes_finer(tmp_path: Path) -> N
     print(f"completed finer after {refused}")
     assert tuple(got.shape) == (1, 3, 32, 32) and bool(torch.isfinite(got).all())
     assert all(refused.count(w) == 1 for w in set(refused)), refused
-    assert any(at.startswith("split:") and n >= 1 for (at, _), n in catch.levels())
+    rows = catch.cut_rows(r).sites
+    assert any(at.site.startswith("split:") and at.descent for at in rows), rows
 
 
 def test_a_decode_whose_pass_cannot_start_fails_typed(tmp_path: Path) -> None:
@@ -179,9 +181,9 @@ def test_an_rms_norm_s_token_pieces_are_the_whole_norm(dtype: Any) -> None:
 def test_an_oom_in_an_rms_norm_cuts_it_by_tokens(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An RMS norm whose op cannot allocate for more than 32 rows runs out inside its own cut
-    site: Rust cuts it finer and its token pieces give the whole norm's result (block code's
-    norm, the allocation 13826 could not make). The op's refusal is torch's, in its forward."""
+    """An RMS norm whose op is refused for more than 32 rows inside its own cut site: it runs
+    finer at once and its token pieces give the whole norm's result (block code's norm, the
+    allocation 13826 could not make). The op's refusal is torch's, in its forward."""
 
     def build() -> nn.Module:
         torch.manual_seed(16)
@@ -207,7 +209,8 @@ def test_an_oom_in_an_rms_norm_cuts_it_by_tokens(
     monkeypatch.setattr(nn.RMSNorm, "forward", short)
     with torch.no_grad(), mem.request("normed") as r, execution.serving(r):
         got = model(x)
-    assert refused and any(n >= 1 for (at, _), n in catch.levels() if at.endswith("1:tokens"))
+    rows = catch.cut_rows(r).sites
+    assert refused and any(at.site.endswith("1:tokens") and at.descent for at in rows)
     assert torch.equal(got, want)
 
 
@@ -301,19 +304,6 @@ def test_arbitrary_package_failure_runs_once() -> None:
     with mem.request("failure") as request, execution.serving(request), pytest.raises(RuntimeError):
         model(torch.ones(1))
     assert calls == [1]
-
-
-def test_non_cut_settle_does_not_replay_package_code() -> None:
-    seen: list[int] = []
-
-    def package() -> None:
-        seen.append(1)
-        torch.empty(1 << 62, dtype=torch.uint8)
-
-    mem = memory()
-    with mem.request("outside") as request, execution.serving(request), pytest.raises(RuntimeError):
-        catch.settle(package, None)
-    assert seen == [1]
 
 
 def test_custom_forward_is_not_assumed_to_be_a_pure_cut() -> None:

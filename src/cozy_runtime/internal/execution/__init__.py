@@ -1,5 +1,5 @@
-"""Torch execution under varena's memory (varena-slim §2): exact pure-site cuts that recover
-from the allocator's OOM, and the Ulysses agreement. varena makes room; this runs finer.
+"""Torch execution under varena's memory (varena-slim §2): exact pure-site cuts sized from
+their operands against the request's room, and the Ulysses agreement.
 
 The executor opens a request (`with mem.request(id, plan=[]) as r, serving(r):`) and installs
 the catch on every model it loads (`install`); nothing else here is the executor's to call.
@@ -17,7 +17,7 @@ from torch import nn
 
 from cozy_runtime.internal.execution import agree, catch, cuts
 from cozy_runtime.internal.execution.agree import agreed, sizes
-from cozy_runtime.internal.execution.catch import collective, piece, serving
+from cozy_runtime.internal.execution.catch import cut_rows, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, split
 from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
 from cozy_runtime.internal.executor_replies import Stats as Record
@@ -26,7 +26,7 @@ __all__ = [
     "Steps",
     "agreed",
     "attend",
-    "collective",
+    "cut_rows",
     "install",
     "piece",
     "record",

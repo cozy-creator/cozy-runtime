@@ -1,12 +1,11 @@
-"""Two or more gloo ranks agree the Ulysses cut level once per pass (varena-slim §1).
+"""Two or more gloo ranks agree the Ulysses head groups once per pass (varena-slim §1).
 
 Each rank loads a tiny sharded attention model through varena's host pages, with the execution
-layer installed, and runs four passes in one request. In the first, every rank's exchange runs
-out of memory before any rank enters its collectives: none runs it again (its peers would wait
-on it), each fails typed, and each tells Rust, which keeps a finer level for the next pass's
-agreement. From the second pass every rank crosses the heads in the same smaller groups, each
-pass equal to degree 1 byte for byte. The ranks' rows are gathered once per shape. One JSON
-report per rank.
+layer installed, and runs four passes in one request. In the first, every rank's exchange is
+refused before any rank enters its collectives: none runs it again (its peers would wait on it),
+and each fails typed. Every pass proposes the level its room needs for the exchange's shapes
+(room to spare here: whole heads), the ranks agree it, and each pass equals degree 1 byte for
+byte. The ranks' rows are gathered once per shape. One JSON report per rank.
 """
 
 from __future__ import annotations

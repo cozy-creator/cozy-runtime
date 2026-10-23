@@ -801,6 +801,8 @@ class Executor:
         #: Why a GPU runs standalone ("" it does not): TensorD asked to lease and no manager
         #: answers (`Memory.standalone`)
         self.standalone = ""
+        #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
+        self.cuts: dict[str, object] = {}
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
         self.leases: int | None = None
@@ -3549,14 +3551,17 @@ class Executor:
             "attention_applied": bool(pin)
             and attention._pin_parts(pin)[1]
             in (served_attention.totals() if served_attention else {}),
-            "execution": self._execution(
-                requested,
-                served_attention,
-                started_us,
-                released_us,
-                attention.implementations(served_impls),
-                segments if len(segments) > 1 else (),
-            ),
+            "execution": {
+                **self._execution(
+                    requested,
+                    served_attention,
+                    started_us,
+                    released_us,
+                    attention.implementations(served_impls),
+                    segments if len(segments) > 1 else (),
+                ),
+                "cuts": self.host.cuts.pop(command.request_id, {"sites": [], "oom_floor": 0}),
+            },
             "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),
@@ -4483,6 +4488,7 @@ class Executor:
                 finally:
                     del host.requests[request_id]
                     peak = accel.arena_peak(host.memory, request_id)  # read while it is open
+                    host.cuts[request_id] = msgspec.to_builtins(host.execution.cut_rows(request))
         finally:
             if request is not None:
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1

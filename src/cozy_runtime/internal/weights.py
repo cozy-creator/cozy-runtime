@@ -883,10 +883,6 @@ class Placement:
         region = self.memory.graph_region(sets=model, retained=model)
         return graphs.domain.Pool(region.pool, region, self.memory)
 
-    def graph_levels(self) -> tuple[tuple[tuple[str, str], int], ...]:
-        """The process's cut levels: a graph recorded under them replays only under them."""
-        return execution.catch.levels()
-
     def graph_segments(self, component: str) -> tuple[str, ...]:
         """The model's declared block topology, which graph regions align with."""
         return tuple(self.models[component].blocks)

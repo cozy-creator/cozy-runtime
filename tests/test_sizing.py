@@ -13,13 +13,13 @@ MIB = 1 << 20
 GRAIN = 2 * MIB
 
 
-def _need(per_unit: int, out: int = 0) -> sizing.Need:
-    return lambda n: out + n * per_unit
+def _need(units: int, per_unit: int, out: int = 0) -> sizing.Need:
+    return sizing.levelled(units, lambda n, granularity: out + n * per_unit)
 
 
 def test_the_coarsest_level_that_fits_in_cold_room_evicts_nothing_of_the_step() -> None:
-    need = _need(MIB, out=8 * MIB)  # 64 units: whole 72 MiB, halves 40, quarters 24
-    assert sizing.choose(64, need, Room(free=80 * MIB, cold=0, warm=0, granularity=1, floor=0)) == (
+    need = _need(64, MIB, out=8 * MIB)  # 64 units: whole 72 MiB, halves 40, quarters 24
+    assert sizing.choose(6, need, Room(free=80 * MIB, cold=0, warm=0, granularity=1, floor=0)) == (
         0,
         "cold",
     )
@@ -34,10 +34,10 @@ def test_the_coarsest_level_that_fits_in_cold_room_evicts_nothing_of_the_step() 
 def test_the_warm_tier_leaves_the_streaming_floor_bindable() -> None:
     """P1: evicting the step's own blocks needs SLOTS of the largest left free, or they cannot
     stream back within the step."""
-    need = _need(MIB, out=8 * MIB)
+    need = _need(64, MIB, out=8 * MIB)
     room = Room(free=4 * MIB, cold=4 * MIB, warm=40 * MIB, granularity=1, floor=24 * MIB)
-    assert sizing.choose(64, need, room) == (2, "warm")  # 24 MiB fits 48 - 24, 40 does not
-    assert sizing.choose(64, need, Room(free=1, cold=0, warm=0, granularity=1, floor=0)) == (
+    assert sizing.choose(6, need, room) == (2, "warm")  # 24 MiB fits 48 - 24, 40 does not
+    assert sizing.choose(6, need, Room(free=1, cold=0, warm=0, granularity=1, floor=0)) == (
         6,
         "floor",
     )
@@ -62,9 +62,9 @@ def test_a_refusal_descends_one_level_at_least_and_rereads_the_room() -> None:
         return "ok"
 
     result = sizing.descend(
-        64, _need(MIB, 8 * MIB), lambda: next(rooms), run, lambda e: isinstance(e, Refused)
+        6, _need(64, MIB, 8 * MIB), lambda: next(rooms), run, lambda e: isinstance(e, Refused)
     )
-    assert result == ("ok", 2, 2) and ran == [0, 1, 2]
+    assert result == ("ok", 2, 2, "cold") and ran == [0, 1, 2]
 
     def always(level: int) -> str:
         ran.append(level)
@@ -72,11 +72,11 @@ def test_a_refusal_descends_one_level_at_least_and_rereads_the_room() -> None:
 
     ran.clear()
     with pytest.raises(Refused):
-        sizing.descend(4, _need(MIB), lambda: Room(1 << 40, 0, 0, 1, 0), always, lambda e: True)
+        sizing.descend(2, _need(4, MIB), lambda: Room(1 << 40, 0, 0, 1, 0), always, lambda e: True)
     assert ran == [0, 1, 2]  # at most `levels` steps, then the finest raises
 
     with pytest.raises(ValueError):  # anything but a refusal runs once
-        sizing.descend(4, _need(MIB), lambda: Room(1 << 40, 0, 0, 1, 0), _raise, lambda e: False)
+        sizing.descend(2, _need(4, MIB), lambda: Room(1 << 40, 0, 0, 1, 0), _raise, lambda e: False)
 
 
 def _raise(level: int) -> str:
@@ -99,18 +99,18 @@ def test_an_ffn_counts_its_widest_phase_and_both_quantized_inputs() -> None:
     gelu = Ffn(
         din=3072, dout=3072, inner=12288, projected=12288, temps=1, itemsize=2, quantized=False
     )
-    need = gelu.need(tokens=4096, granularity=1)
+    need = gelu.need(tokens=4096)
     n = 1024
-    assert need(n) == 4096 * 3072 * 2 + 2 * n * 12288 * 2  # output + projection and activation
-    composite = Ffn(3072, 3072, 12288, 12288, temps=3, itemsize=2, quantized=False).need(4096, 1)
-    assert composite(n) - need(n) == 2 * n * 12288 * 2
-    quantized = Ffn(3072, 3072, 12288, 12288, temps=1, itemsize=2, quantized=True).need(4096, 1)
+    assert need(n, 1) == 4096 * 3072 * 2 + 2 * n * 12288 * 2  # output + projection and activation
+    composite = Ffn(3072, 3072, 12288, 12288, temps=3, itemsize=2, quantized=False).need(4096)
+    assert composite(n, 1) - need(n, 1) == 2 * n * 12288 * 2
+    quantized = Ffn(3072, 3072, 12288, 12288, temps=1, itemsize=2, quantized=True).need(4096)
     down = n * 12288 * 2 + (n * 12288 + 4 * n) + n * 3072 * 2  # act out, its int8 rows, result
-    assert quantized(n) == 4096 * 3072 * 2 + max(down, 2 * n * 12288 * 2)
-    gated = Ffn(3072, 3072, 12288, 2 * 12288, temps=2, itemsize=2, quantized=False).need(4096, 1)
-    assert gated(n) == 4096 * 3072 * 2 + n * 2 * 12288 * 2 + 2 * n * 12288 * 2
-    assert [need(sizing.pieces(4096, level)) for level in range(4)] == sorted(
-        (need(sizing.pieces(4096, level)) for level in range(4)), reverse=True
+    assert quantized(n, 1) == 4096 * 3072 * 2 + max(down, 2 * n * 12288 * 2)
+    gated = Ffn(3072, 3072, 12288, 2 * 12288, temps=2, itemsize=2, quantized=False).need(4096)
+    assert gated(n, 1) == 4096 * 3072 * 2 + n * 2 * 12288 * 2 + 2 * n * 12288 * 2
+    assert [need(sizing.pieces(4096, level), 1) for level in range(4)] == sorted(
+        (need(sizing.pieces(4096, level), 1) for level in range(4)), reverse=True
     )
 
 
@@ -132,16 +132,15 @@ def test_a_conv_band_counts_its_padded_input_copy_and_workspace() -> None:
         per_unit_out=2 * MIB,
         halo=MIB // 2,
         workspace=4 * MIB,
-        granularity=1,
     )
-    assert need(4) == 64 * MIB + 4 * MIB + MIB // 2 + 8 * MIB + 4 * MIB
-    view = sizing.conv(64 * MIB, 0, 2 * MIB, MIB // 2, 0, 1)
-    assert view(4) == 64 * MIB + 8 * MIB
+    assert need(4, 1) == 64 * MIB + 4 * MIB + MIB // 2 + 8 * MIB + 4 * MIB
+    view = sizing.conv(64 * MIB, 0, 2 * MIB, MIB // 2, 0)
+    assert view(4, 1) == 64 * MIB + 8 * MIB
 
 
 def test_a_norm_holds_its_output_its_piece_and_its_intermediate() -> None:
-    need = sizing.norm(rows=8192, row=3072, itemsize=2, intermediate=4, granularity=1)
-    assert need(1024) == 8192 * 3072 * 2 + 1024 * 3072 * (2 + 4)
+    need = sizing.norm(rows=8192, row=3072, itemsize=2, intermediate=4)
+    assert need(1024, 1) == 8192 * 3072 * 2 + 1024 * 3072 * (2 + 4)
 
 
 def test_a_split_measured_at_two_windows_scales_a_quadratic_op() -> None:

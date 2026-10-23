@@ -1,10 +1,10 @@
-"""Pure-site cuts over the allocator's own recovery (varena-slim step 1).
+"""Pure-site cuts sized from their operands against the room varena reports (design
+varena-leases §8 "No learning loop"; `sizing`).
 
-The allocator hook makes room (varena's make_room) without rerunning Python; when it cannot,
-torch raises its OOM. Only an explicitly pure cut site runs again, one level finer, and the
-process keeps each (site, shape)'s level (its memo) for every later call. A collective site's
-finer level waits for the next pass, whose GPUs agree it (`agree`). Anywhere else the OOM ends
-the request, typed (device_out_of_memory). Model blocks and package code always execute once.
+A pure cut site picks its level at dispatch from its op's live shapes (`need`) against the
+request's room (`r.room()`), so its first try fits: no OOM probing, nothing remembered. A refusal
+above the finest re-reads the room and runs finer (`sizing.descend`); only the finest's refusal
+ends the request, typed (device_out_of_memory). Model blocks and package code always run once.
 """
 
 from __future__ import annotations
@@ -17,58 +17,52 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 
+import msgspec
 import torch
+from tensorfs.varena.torch import Request
 from torch import Tensor, nn
 
 from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.internal.execution import sizing
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
 
-#: the attempt being served (`serving`): its pure cut sites recover; outside one nothing does
-CURRENT: ContextVar[object | None] = ContextVar("cozy_execution_request", default=None)
-#: each (site, shape)'s cut level in this process, raised by an OOM at it, never lowered
-_LEVELS: dict[tuple[str, str], int] = {}
-_LEVELS_LOCK = threading.Lock()
+#: the varena request being served (`serving`): its pure cut sites size from its room
+CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
 
 
-def level(site: str, shape: str = "") -> int:
-    return _LEVELS.get((site, shape), 0)
+class Cut(msgspec.Struct, frozen=True, kw_only=True):
+    """A site's dispatch: the level its operands' need fit, that need (bytes, ungranulated),
+    the room's tier it fit in, and the levels it descended after refusals."""
+
+    site: str
+    level: int
+    need: int
+    tier: str
+    descent: int
 
 
-def levels() -> tuple[tuple[tuple[str, str], int], ...]:
-    """Every site's level now: a graph recorded under them replays only under them."""
-    with _LEVELS_LOCK:
-        return tuple(sorted(_LEVELS.items()))
+class Cuts(msgspec.Struct, kw_only=True):
+    """A request's cut sites (`measurements.execution.cuts`): each site's first dispatch and
+    every one that descended, and the refusals at the floor."""
+
+    sites: list[Cut] = msgspec.field(default_factory=list)
+    oom_floor: int = 0
 
 
-def set_level(site: str, shape: str, to: int) -> None:
-    with _LEVELS_LOCK:
-        _LEVELS[(site, shape)] = max(_LEVELS.get((site, shape), 0), to)
-
-
-class Finer(Exception):
-    """An op inside a cut ran out and that cut went finer: it runs again at `level`."""
-
-    def __init__(self, scope: Scope, level: int) -> None:
-        super().__init__(f"{scope.site}: cut to level {level}")
-        self.scope, self.level = scope, level
+#: per request (by identity), its cuts so far
+_ROWS: dict[int, Cuts] = {}
+_ROWS_LOCK = threading.Lock()
 
 
 @dataclass(eq=False, slots=True)
 class Scope:
-    """A cut in force: its site, its level and the finest level it has, and how many ops of each
-    kind its current piece ran (the sites of the ops inside it: the same in every piece,
-    whatever the level). Across a `collective` one no cut goes finer mid-pass (its peers run the
-    same pass)."""
+    """A cut in force: its site, and how many ops of each kind its current piece ran (the sites
+    of the ops inside it: the same in every piece, whatever the level)."""
 
     site: str
-    finest: int
-    level: int = 0
-    collective: bool = False
     ordinals: dict[str, int] = field(default_factory=dict)
-    #: its operands' shape key: the memo keeps a level per (site, shape)
-    shape: str = ""
 
 
 class _Local(threading.local):
@@ -82,13 +76,19 @@ _local = _Local()
 
 
 @contextmanager
-def serving(request: object) -> Iterator[None]:
-    """The attempt's pure cut sites recover while it runs; package code is never retried."""
+def serving(request: Request) -> Iterator[None]:
+    """The attempt's pure cut sites size from `request`'s room while it runs."""
     token = CURRENT.set(request)
     try:
         yield
     finally:
         CURRENT.reset(token)
+
+
+def cut_rows(request: Request) -> Cuts:
+    """`request`'s cuts, taken at its end (`measurements.execution.cuts`)."""
+    with _ROWS_LOCK:
+        return _ROWS.pop(id(request), Cuts())
 
 
 def site(kind: str) -> str | None:
@@ -109,18 +109,13 @@ def piece() -> None:
         _local.scopes[-1].ordinals.clear()
 
 
-def shape_key(operands: object) -> str:
-    """The shapes of the tensors in `operands`, as the memo keys a site's level by them."""
-    return "|".join("x".join(map(str, t.shape)) for t in tensors(operands))
-
-
 def short(exc: BaseException) -> bool:
-    """A pure site's allocation failure outside capture."""
+    """A pure site's allocation refusal outside capture."""
     return fault(exc) is Fault.OOM and not _capturing()
 
 
 def _clear(exc: BaseException) -> None:
-    """The failed attempt's frames go, and with them its tensors."""
+    """The refused attempt's frames go, and with them its tensors."""
     seen: set[int] = set()
     at: BaseException | None = exc
     while at is not None and id(at) not in seen:
@@ -134,76 +129,44 @@ def _capturing() -> bool:
     return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
 
 
-def settle[T](run: Callable[[], T], own: Scope | None, first: bool = False) -> T:
-    """`run()` until it runs; `run` reads `own.level`. An OOM goes to the innermost cut that can
-    go finer (enclosing cuts first, then `own`; `own` first when `first`): `own` runs again at
-    its new level, an enclosing one is raised `Finer`. With none it fails, typed."""
-    if CURRENT.get() is None or (own is None and not _local.scopes):
-        return run()
-    while True:
-        try:
-            return run()
-        except Exception as exc:
-            if not short(exc):
-                raise
-            order = (own, *reversed(_local.scopes)) if first else (*reversed(_local.scopes), own)
-            scope = next(
-                (s for s in order if s is not None and (s.collective or s.level < s.finest)), None
-            )
-            if scope is None or scope.collective:
-                raise
-            _clear(exc)
-            set_level(scope.site, scope.shape, scope.level + 1)
-            if scope is not own:
-                raise Finer(scope, scope.level + 1) from None
-            scope.level += 1
+def _refused(exc: BaseException) -> bool:
+    if not short(exc):
+        return False
+    _clear(exc)
+    return True
 
 
-def cut[T](
-    site: str, finest: int, run: Callable[[int], T], operands: object, shape: str | None = None
-) -> T:
-    """`run(level)` for a call that cuts itself (FFN tokens, attention pieces, a package's
-    split, a norm's or a conv's bands): at the level the memo holds for `site` at its `shape`
-    (its operands' shapes when None), finer when it or an op inside it ran out."""
-    if CURRENT.get() is None:
+def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -> T:
+    """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
+    attention pieces, a package's split, a norm's or a conv's bands), at the coarsest level
+    whose `need` fits the request's room; a refusal descends. Outside a request it runs whole;
+    inside a capture at the level the room gives now (its pool was prepared for it)."""
+    request = CURRENT.get()
+    if request is None:
         return run(0)
-    key = shape_key(operands) if shape is None else shape
-    scope = Scope(site, finest, level(site, key), shape=key)
-    if _capturing():
-        return run(scope.level)  # prepared variant; no recovery inside capture
+    scope = Scope(site)
     _local.scopes.append(scope)
 
-    def whole() -> T:
+    def whole(level: int) -> T:
         scope.ordinals.clear()
-        return run(scope.level)
+        return run(level)
 
     try:
-        while True:
-            try:
-                return settle(whole, scope, first=True)
-            except Finer as finer:
-                if finer.scope is not scope:
-                    raise
-                scope.level = finer.level
-                _clear(finer)
-    finally:
-        _local.scopes.remove(scope)
-
-
-@contextmanager
-def collective(site: str, finest: int) -> Iterator[None]:
-    """A collective's extent, `finest` its finest level; no cut outside it goes finer. An OOM
-    inside (the allocator already made what room it could) is never run again here, since peers
-    may be waiting in its collectives: it fails the request, and this process proposes one level
-    finer for the next pass's agreement (`agree`)."""
-    scope = Scope(site, finest, 0, collective=True)
-    _local.scopes.append(scope)
-    try:
-        yield
-    except Exception as exc:
-        if CURRENT.get() is not None and short(exc):
-            set_level(site, "", min(level(site) + 1, finest))
-        raise
+        if _capturing():
+            return whole(sizing.choose(finest, need, request.room())[0])
+        try:
+            result, level, steps, tier = sizing.descend(finest, need, request.room, whole, _refused)
+        except Exception as exc:
+            if short(exc):
+                with _ROWS_LOCK:
+                    _ROWS.setdefault(id(request), Cuts()).oom_floor += 1
+            raise
+        row = Cut(site=site, level=level, need=need(level, 1), tier=tier, descent=steps)
+        with _ROWS_LOCK:
+            rows = _ROWS.setdefault(id(request), Cuts())
+            if steps or all(r.site != site for r in rows.sites):
+                rows.sites.append(row)
+        return result
     finally:
         _local.scopes.remove(scope)
 

@@ -865,7 +865,6 @@ def _region_call(
     recorder = _RECORDERS.get(module)
     if recorder is None:
         recorder = _RECORDERS.setdefault(module, _Recorder())
-    levels = placed[0].graph_levels() if placed is not None else ()
     addresses = (
         ()
         if placed is not None
@@ -877,7 +876,7 @@ def _region_call(
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
     root = _REGIONS[module][0]()
     declared = tuple(functools.reduce(getattr, p.split("."), root) for p in _KEYS.get(root, ()))
-    key = (*_signature(torch, leaves, spec), declared, levels, addresses, autocast)
+    key = (*_signature(torch, leaves, spec), declared, addresses, autocast)
     if recorder.last is not None and recorder.last != key:
         _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
     recorder.last = key
@@ -1397,8 +1396,8 @@ def _changed(
                 ("a graph region records again every call", {"region": path, "argument": name})
             )
     else:
-        names = ("declared keys", "cut levels", "weight addresses", "autocast")
-        what = next(n for n, i in zip(names, range(-4, 0), strict=True) if last[i] != key[i])
+        names = ("declared keys", "weight addresses", "autocast")
+        what = next(n for n, i in zip(names, range(-3, 0), strict=True) if last[i] != key[i])
     recorder.changes[what] = recorder.changes.get(what, 0) + 1
 
 

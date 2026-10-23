@@ -1,11 +1,10 @@
 """Ulysses' cut level and row counts, agreed once per pass (varena-slim §1, Collectives).
 
 At a sharded model's pass start every GPU of its group sends two int64s in one small async
-all-gather: the level this process proposes for the exchanges (its memo, one finer after an
-OOM in one: `catch.collective`) and a digest of its input shapes. The first exchange waits on
-it and every GPU keeps the most of them; every exchange of the pass crosses in the same head
-groups. An OOM on one GPU so becomes the same cut on all of them from the next pass; mid-pass
-a GPU never runs an exchange again.
+all-gather: the level this process proposes for the exchanges (the finest its room needed for
+the last pass's exchanges, from their shapes: `propose`) and a digest of its input shapes. The
+first exchange waits on it and every GPU keeps the most of them; every exchange of the pass
+crosses in the same head groups. Mid-pass a GPU never runs an exchange again.
 
 Every GPU's input shapes fix every exchange's rows on every GPU. So an exchange gathers its
 rows only in the first pass at a group's shapes (`sizes`), and later passes at the same shapes
@@ -24,7 +23,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from cozy_runtime.internal.execution.catch import Args, Kwargs, level, set_level, tensors
+from cozy_runtime.internal.execution.catch import Args, Kwargs, tensors
 
 #: every exchange of a model is one cut site: the same shapes cross in every block
 SITE = "ulysses"
@@ -42,6 +41,8 @@ class _Pass(threading.local):
 
 
 _pass = _Pass()
+#: the level this process proposes at the next pass: the finest its room needed for an exchange
+_PROPOSED = [0]
 #: per sharded model, the rows each exchange of a pass at the latest shapes gathered, by its
 #: position in the pass
 _ROWS: weakref.WeakKeyDictionary[nn.Module, tuple[tuple[int, ...], list[list[int]]]] = (
@@ -57,7 +58,7 @@ def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
     outer = (_pass.level, _pass.model, _pass.key, _pass.exchanges)
     _pass.level, _pass.model, _pass.key, _pass.exchanges = None, None, None, 0
     if group is not None:
-        mine = level(SITE)  # this process's proposal: one finer after an OOM in an exchange
+        mine, _PROPOSED[0] = _PROPOSED[0], 0  # this process's room's level, from the last pass
         shapes = zlib.crc32(repr([(t.shape, t.dtype) for t in tensors((args, kwargs))]).encode())
         sent = torch.tensor([mine, shapes], dtype=torch.int64, device=_device())
         got = torch.empty(2 * group.size(), dtype=torch.int64, device=sent.device)
@@ -79,8 +80,12 @@ def agreed() -> int:
         levels, *_ = gathered = got.view(-1, 2).T.tolist()
         found = _pass.level = max(levels)
         _pass.key = tuple(gathered[1])
-        set_level(SITE, "", found)  # the group's level is every GPU's from now on
     return found or 0
+
+
+def propose(level: int) -> None:
+    """An exchange's level as this GPU's room sizes it now: the next pass's proposal."""
+    _PROPOSED[0] = max(_PROPOSED[0], level)
 
 
 def sizes(gather: Callable[[], list[int]]) -> list[int]:
