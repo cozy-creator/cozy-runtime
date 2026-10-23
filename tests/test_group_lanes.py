@@ -10,11 +10,16 @@ holding the GPU lock, or where `/dev/nvidia*` is hidden.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import json
 import os
 import signal
+import socket
+import struct
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +29,11 @@ import pytest
 from cozy_runtime.author._signature import ModelBinding
 from cozy_runtime.internal import executor_commands, package_interface, seam, spawn
 from cozy_runtime.internal.config import seal_snapshot
-from cozy_runtime.internal.discovery import discover
+from cozy_runtime.internal.discovery import discover, discover_installed
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import RankGroup
 from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
+from test_executor_fork import _accept, _environment, _listener
 
 PACKAGE = Path(__file__).resolve().parent.parent / "examples" / "marco-polo"
 
@@ -349,6 +355,127 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
         assert reply["code"] == "package_prepare_path_invalid", reply
     finally:
         group.close()
+
+
+GROUP_APP = '''
+import socket
+import time
+from pathlib import Path
+
+import msgspec
+from cozy_runtime.author import App, Context, Loader, Model
+
+LEASES = Path(__file__).with_name("leases.sock")
+
+
+def dial() -> None:
+    """The lease agent's dial (design/varena-leases.md §11): a peer TensorD has not registered
+    yet waits and redials."""
+    while True:
+        with socket.socket(socket.AF_UNIX) as peer:
+            peer.connect(str(LEASES))
+            if peer.recv(1) == b"y":
+                return
+        time.sleep(0.01)
+
+
+if LEASES.exists():
+    dial()
+app = App()
+
+
+class Tiny(Model[object]):
+    def load(self, loader: Loader) -> None:
+        pass
+
+
+class Request(msgspec.Struct):
+    n: int
+
+
+@app.entrypoint
+def generate(ctx: Context, payload: Request, model: Tiny) -> Request:
+    return payload
+'''
+
+
+def _peer_pid(connection: socket.socket) -> int:
+    credentials = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+    return int(struct.unpack("3i", credentials)[0])
+
+
+@needs_torch
+@pytest.mark.skipif(sys.platform != "linux", reason="peer credentials are Linux's")
+def test_rank_0_names_its_followers_in_rank_order_before_they_open_memory(
+    tmp_path: Path,
+) -> None:
+    """TensorD's lease listeners admit only its tenants, and a follower opens its memory in its
+    Start, before rank 0's reply names it. Rank 0 names its followers in a progress frame first,
+    rank 1 first, as TensorD pairs them with GPUs; TensorD registers each one in rank 0's process
+    group (`Formation::register`), and the followers' dials are admitted. A real executor and real
+    followers; the dial stands in the package's import until the lease agent makes it (S3)."""
+    (tmp_path / "groupapp.py").write_text(GROUP_APP)
+    sys.path.insert(0, str(tmp_path))
+    try:
+        interface = package_interface.build(discover_installed("groupapp:app"))
+    finally:
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("groupapp", None)
+    (tmp_path / "interface.json").write_text(json.dumps(interface))
+    tenants: set[int] = set()
+    admitted: list[int] = []
+    leases = _listener(tmp_path / "leases.sock")
+
+    def serve_leases() -> None:
+        with contextlib.suppress(OSError):  # closed at the end
+            while True:
+                connection, _ = leases.accept()
+                with connection:
+                    pid = _peer_pid(connection)
+                    connection.sendall(b"y" if pid in tenants else b"n")
+                    if pid in tenants:
+                        admitted.append(pid)
+
+    threading.Thread(target=serve_leases, daemon=True).start()
+    seam_listener = _listener(tmp_path / "e.sock")
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            str(Path(__file__).parent / "testdata" / "group_leader.py"),
+            str(tmp_path),
+            *("--socket", str(tmp_path / "e.sock"), "--root", str(tmp_path)),
+        ],
+        env={**_environment(tmp_path), "CUDA_VISIBLE_DEVICES": "4,5,6"},
+    )
+    try:
+        channel, leader = _accept(seam_listener)
+        tenants.add(leader)  # the executor TensorD spawned
+        channel.send(
+            {
+                "cmd": "start",
+                "devices": "4,5,6",
+                "sequence_parallel_degree": 3,
+                "import_only": True,
+                "application": "groupapp:app",
+                "package_interface": str(tmp_path / "interface.json"),
+            }
+        )
+        named: list[int] = []
+        while (frame := channel.recv(timeout=300)) is not None and "reply" not in frame:
+            if frame.get("follower_pids"):
+                named = frame["follower_pids"]
+                tenants.update(p for p in named if os.getpgid(p) == os.getpgid(leader))
+        assert frame is not None and frame["ok"], frame
+        ranks = [Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") for pid in named]
+        assert [int(argv[argv.index(b"--rank") + 1]) for argv in ranks] == [1, 2]
+        assert frame["follower_pids"] == named
+        assert sorted(admitted) == sorted([leader, *named]), (admitted, named)
+        channel.send({"cmd": "shutdown"})
+    finally:
+        process.kill()
+        process.wait()
+        leases.close()
+        seam_listener.close()
 
 
 @needs_torch

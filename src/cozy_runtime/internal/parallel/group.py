@@ -681,6 +681,8 @@ class RankGroup:
                 raise GroupRefusal(self.verdict(), code="group_broken")
 
     def pids(self) -> tuple[int, ...]:
+        """The followers' pids in rank order, rank 1 first: TensorD pairs them with GPUs by
+        position."""
         return tuple(follower.pid for follower in self.followers)
 
     def close(self) -> None:

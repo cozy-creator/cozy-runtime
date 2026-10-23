@@ -1693,6 +1693,10 @@ class Executor:
                 if not self.group.followers:
                     self.group.spawn()
                     self.group.dial_back(_SEALED)
+                # TensorD's lease listeners admit only its tenants: it registers each follower
+                # from this frame, before the follower's Start opens its memory, pairing them
+                # with GPUs by position (rank 1 first).
+                self.channel.send({"event": "progress", "follower_pids": list(self.group.pids())})
                 self.group.start(executor_commands.encode(command))
                 stage("followers_spawned")
             if device:
