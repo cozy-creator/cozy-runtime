@@ -172,7 +172,7 @@ class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The session's GPUs; empty runs on the CPU and never opens CUDA (`accelerator=False`).
     devices: str = ""
-    #: Unified Varena broker and two ledger descriptors per GPU; checked before reading either.
+    #: 2: leases beside two ledger descriptors per GPU; checked before reading either.
     memory_protocol: int = 0
     sequence_parallel_degree: int = 1
     application: str = ""

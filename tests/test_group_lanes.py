@@ -342,7 +342,7 @@ def test_a_followers_start_names_no_ledger_descriptors(tmp_path: Path) -> None:
     )
     start = executor_commands.Start(
         devices="4,5",
-        memory_protocol=1,
+        memory_protocol=2,
         sequence_parallel_degree=2,
         ledgers=1,
         package_interface=str(tmp_path / "absent.json"),
@@ -454,6 +454,7 @@ def test_rank_0_names_its_followers_in_rank_order_before_they_open_memory(
             {
                 "cmd": "start",
                 "devices": "4,5,6",
+                "memory_protocol": 2,
                 "sequence_parallel_degree": 3,
                 "import_only": True,
                 "application": "groupapp:app",

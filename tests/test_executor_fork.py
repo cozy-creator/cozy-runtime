@@ -134,36 +134,13 @@ def test_memory_protocol_is_advertised_before_start_and_torch_import(zygote: Any
     assert reply["torch_loaded"] is False
 
 
-@pytest.mark.parametrize("memory_protocol", [None, 0])
-def test_an_older_tensord_s_ledger_closes_and_varena_runs_standalone(
-    zygote: Any, memory_protocol: int | None
+@pytest.mark.parametrize("memory_protocol", [0, 1, 3])
+def test_gpu_start_refuses_another_memory_protocol_before_reading_descriptors(
+    zygote: Any, memory_protocol: int
 ) -> None:
-    """Skew degrades: a TensorD from before the memory protocol hands each GPU's ledger as a
-    memfd and an eventfd. Runtime takes and closes them, says so, and starts on its own table."""
+    """Executors speak leases (protocol 2) alone: another TensorD's descriptors stay unread."""
     _process, channel, start = zygote
-    # 0.30's Start: its `memory_mode`, no `memory_protocol`, a memfd and an eventfd per GPU.
-    command = {**start, "ledgers": 1, "import_only": True, "memory_mode": "shared"}
-    if memory_protocol is not None:
-        command["memory_protocol"] = memory_protocol
-    memfd, eventfd = os.pipe()  # stand-ins: the descriptors' kinds are never read
-    try:
-        channel.send(command)
-        channel._send_fd(memfd, "old ledger memfd")
-        channel._send_fd(eventfd, "old ledger eventfd")
-        reply = channel.recv(timeout=60, total_timeout=60)
-    finally:
-        os.close(memfd)
-        os.close(eventfd)
-    assert reply is not None and reply["ok"], reply
-    assert "standalone" in reply["memory_standalone"]
-    assert _call(channel, {"cmd": "hello"})["torch_loaded"] is False
-
-
-def test_gpu_start_refuses_a_newer_memory_protocol_before_reading_descriptors(
-    zygote: Any,
-) -> None:
-    _process, channel, start = zygote
-    command = {**start, "devices": "0", "ledgers": 1, "memory_protocol": 3}
+    command = {**start, "devices": "0", "ledgers": 1, "memory_protocol": memory_protocol}
     channel.send(command)
     # No GPU or descriptor is supplied. Receiving this frame proves the real executor
     # refused before either the legacy first FD or the incompatible second FD could block.
