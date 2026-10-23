@@ -293,9 +293,8 @@ class Residency(Protocol):
         """Shared capture stream and library workspace, serialized across component graphs."""
         ...
 
-    def graph_prepare(self, pool: Any, request: str) -> None:
-        """Map into capture pool `pool`, before a capture begins, the working set its warm-up
-        reached in open request `request`'s arena."""
+    def graph_pool(self, component: str) -> Any:
+        """`component`'s graph region of the device's one capture pool."""
         ...
 
     def graph_levels(self) -> tuple[tuple[str, int], ...]:

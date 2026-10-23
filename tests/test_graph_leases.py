@@ -121,7 +121,6 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
                 result = module(source.to(memory.device)).cpu()
                 torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-4)
                 stats = request.stats()
-            domain = placement.graph_domain("network")
             facts = placement.document()["graphs"]["network"]
             assert facts["captures"] == facts["capture_attempts"] == 0  # none inside a request
             if turn >= 2:  # the graphs the idle period recorded replay over evicted backing
@@ -133,7 +132,7 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
             if turn == 1:
                 recordings = graphed()
                 assert recordings, placement.document()["graphs"]["network"]["regions"]
-            pool_bytes = domain.capture_bytes()
+            pool_bytes = graphs.describe(module)["graph_pool_bytes"]
             print(
                 json.dumps(
                     {
@@ -258,7 +257,8 @@ def test_a_step_holds_its_components_blocks_and_replays_bind_nothing(tmp_path: P
         assert facts["replays"] == 4 and facts["regions"][""]["prepare_ms"] < 1, facts
         assert len({id(hold) for hold in holds}) == 3  # a request takes its own hold
         torch.cuda.synchronize()
-        assert graphs._shed(torch, placement.graph_domain("stack")) > 0
+        pool = graphs._RECORDERS[module].pool
+        assert pool is not None and pool.nbytes() > 0 and pool.region is not None
     finally:
         graphs.release(torch, module)
         PLACED.pop(module, None)
@@ -337,14 +337,14 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
             torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
             torch.cuda.synchronize()
             assert graphs.capture_idle(lambda: False)
-        domain = placement.graph_domain("first")
-        assert domain is placement.graph_domain("second") and domain.captures is not None
-        assert [ref() for ref in domain.served] == [modules["first"], modules["second"]]
+        assert placement.graph_domain("first") is placement.graph_domain("second")
+        pools = [graphs._RECORDERS[m].pool for m in modules.values()]
+        assert all(pool is not None for pool in pools)
+        assert pools[0].handle == pools[1].handle == memory.graph_pool  # one pool, two regions
+        assert pools[0].region is not pools[1].region
         assert all(graphs._RECORDERS[m].replays == 2 for m in modules.values())
         described = placement.document()["graphs"]
-        assert described["first"]["graph_pool_bytes"] == domain.capture_bytes() > 0
-        assert described["second"]["graph_pool_bytes"] == 0  # the shared pool counts once
-        assert domain.cache is not None
+        assert described["first"]["graph_pool_bytes"] == pools[0].nbytes() > 0
     finally:
         for name, module in modules.items():
             graphs.release(torch, module)
@@ -360,7 +360,7 @@ def test_a_capture_that_fails_to_begin_leaves_the_allocator_serving() -> None:
     memory = Memory.open(0, limit=CAP)
     owner = graphs.capture_device(torch, memory)
     owner.initialize()
-    pool = owner.capture_pool()
+    pool = graphs.domain.Pool(memory.graph_pool, memory=memory)
     outer = torch.cuda.CUDAGraph()
     with torch.cuda.stream(owner.control):
         outer.capture_begin(capture_error_mode="thread_local")

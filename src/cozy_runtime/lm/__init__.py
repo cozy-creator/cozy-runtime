@@ -198,7 +198,7 @@ def _graph_snapshot(model: Any) -> tuple[dict[str, int], list[Any], Any]:
             "replays": engine.replayed,
             "eager_steps": engine.eager,
         },
-        list(engine.pools.values()),
+        [engine.pool] if engine.pool is not None else [],
         engine.domain,
     )
 
@@ -1033,8 +1033,9 @@ class _Engine:
         #: Full shape variants whose real accepted step preseeded their capture pool.
         self.warmed: set[tuple[int, int, bool]] = set()
         self.layout: tuple[object, ...] | None = None
+        #: its decode graphs' capture pool (`domain.Pool`): the model's graph region, or a
+        #: torch pool of its own with no varena memory
         self.pool: Any = None
-        self.pools: dict[tuple[int, int, bool], Any] = {}
         self.addresses: dict[int, Any] = {}
         self.unprepared: BaseException | None = None
         self.completions: dict[Any, Any] = {}
@@ -1710,22 +1711,26 @@ class _Engine:
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             if key not in self.warmed:
-                self.pools[key] = Pool(torch.cuda.graph_pool_handle())
+                if self.pool is None:
+                    self.pool = (
+                        placed[0].graph_pool(placed[1])
+                        if placed is not None
+                        else Pool(torch.cuda.graph_pool_handle())
+                    )
                 # This is the caller's actual next token, never an extra speculative warmup.
                 with self._graph_memory():
                     self._advance(size)
                 self.warmed.add(key)
                 self.eager += 1
                 return
-            pool = self.pools[key]
+            pool = self.pool
             capturing = time.perf_counter()
             try:
                 with self._graph_memory():
                     context = CURRENT.get()
-                    if placed is not None and context is not None:
-                        # The driver's request high-water bounds the step's working set (an
-                        # idle capture measures it exactly: cr-210 moves this off the request).
-                        placed[0].graph_prepare(pool, context.request_id)
+                    # The driver's request high-water bounds the step's working set (an idle
+                    # capture measures it exactly: cr-210 moves this off the request).
+                    pool.prepare(context.request_id if context is not None else "")
                     graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
             except Building:
                 graph, why, self.building = None, "", LANDED[0]
@@ -1734,12 +1739,17 @@ class _Engine:
             if graph is not None:
                 self.graphs[key] = graph
                 self.recorded += 1
-            else:
-                self.pools.pop(key, None)
-                if why:
-                    self._unrecorded(key, why)
+                pool.captured(int((time.perf_counter() - capturing) * 1e9))
+            elif why:
+                self._unrecorded(key, why)
         if graph is not None:
-            graph.replay()
+            with self.pool.replaying(torch.cuda.current_stream()) as ok:
+                if ok:
+                    graph.replay()
+            if not ok:
+                self._forget()  # varena drops the region: its graphs go, recorded again later
+                graph = None
+        if graph is not None:
             self.replayed += 1
         else:
             self._advance(size)
@@ -1747,7 +1757,7 @@ class _Engine:
 
     def _forget(self) -> None:
         """Release recordings only at the driver's already-drained step boundary."""
-        if self.graphs or self.pools:
+        if self.graphs or self.pool is not None:
             for stream in self.unfenced:
                 stream.synchronize()
             self.unfenced.clear()
@@ -1755,8 +1765,10 @@ class _Engine:
                 event.synchronize()
             self.completions.clear()
             self.retired_graphs += len(self.graphs)
-            self.graphs, self.warmed, self.unrecorded, self.pools = {}, set(), {}, {}
-            self.pool = None
+            self.graphs, self.warmed, self.unrecorded = {}, set(), {}
+            if self.pool is not None:
+                self.pool.close()
+                self.pool = None
 
     def _unrecorded(self, key: tuple[int, int, bool], why: str) -> None:
         """That step runs eagerly from now on, with a warning on the calls it serves."""

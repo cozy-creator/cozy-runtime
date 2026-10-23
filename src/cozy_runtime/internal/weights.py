@@ -38,7 +38,7 @@ from tensorfs.varena.torch import (
 from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
-from cozy_runtime.internal import accel, execution, lora_bake
+from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -870,8 +870,12 @@ class Placement:
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def graph_prepare(self, pool: Any, request: str) -> None:
-        pool.prepare(self.memory, accel.arena_peak(self.memory, request))
+    def graph_pool(self, component: str) -> Any:
+        """`component`'s graph region of the device's one capture pool: it holds the
+        component's weights bound while its graphs live, and varena drops it between replays."""
+        model = self.models[component]
+        region = self.memory.graph_region(sets=model, retained=model)
+        return graphs.domain.Pool(region.pool, region, self.memory)
 
     def graph_levels(self) -> tuple[tuple[tuple[str, str], int], ...]:
         """The process's cut levels: a graph recorded under them replays only under them."""

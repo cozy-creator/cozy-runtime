@@ -89,7 +89,7 @@ def capture(
                 began = True
             finally:
                 if not began:
-                    pool.failed(owner.memory)
+                    pool.failed()
         except Exception as exc:
             failure = exc
         else:
@@ -107,7 +107,7 @@ def capture(
             try:
                 graph.capture_end()
             except Exception as exc:
-                pool.failed(owner.memory)
+                pool.failed()
                 failure = failure or exc
     current.wait_stream(stream)
     current.wait_stream(work)
@@ -356,6 +356,8 @@ class _Recorder:
         #: per signature its idle measure: host submission and device-busy ms a call
         self.bound: dict[tuple[object, ...], tuple[float, float]] = {}
         self.binding: Any = None
+        #: its graphs' capture pool (`domain.Pool`), made at its first capture
+        self.pool: domain.Pool | None = None
         self.replays = 0
         self.attempts = 0
         self.capture_attempts = 0
@@ -408,6 +410,9 @@ class _Recorder:
         if self.binding is not None:
             self.binding.close()
             self.binding = None
+        if self.pool is not None:
+            self.pool.close()
+            self.pool = None
         self.queued.clear()
         self.failed.clear()
         self.waiting.clear()
@@ -608,31 +613,12 @@ def _placed(module: Any) -> tuple[Any, str] | None:
     return PLACED.get(region[0]()) if region is not None else PLACED.get(module)
 
 
-def _shed(torch: Any, owner: domain.Domain, _want: int = 0) -> int:
-    """Varena's ask: every graph on the device goes now, with their shared pool. It never asks
-    a held pool, so no call reads, captures or replays a recording of it; a call that took its
-    hold after varena decided finds it held, and nothing goes. Only the pool's own lock is
-    taken: a region call may hold the domain while its bind waits on varena (review 7, K1)."""
-    with owner.pool_lock:
-        if owner.held:
-            return 0
-        nbytes = owner.capture_bytes()
-        for recorder in list(owner.recorders):
-            recorder.drop()
-        owner.drop_captures()
-        return nbytes
-
-
 def release(torch: Any, root: Any) -> None:
     """A generation's explicit teardown: finish its output copies before releasing addresses."""
     modules = [module for module, (owner, _) in _REGIONS.items() if owner() is root]
-    shared: set[domain.Domain] = set()
     for module in modules:
         recorder = _RECORDERS.pop(module, None)
         if recorder is not None:
-            if recorder.domain is not None:
-                shared.add(recorder.domain)
-                recorder.domain.recorders.discard(recorder)
             with recorder.lock:
                 for entry in recorder.recordings.values():
                     if not entry.fenced:
@@ -643,10 +629,6 @@ def release(torch: Any, root: Any) -> None:
                 recorder.forget(torch)
         _REGIONS.pop(module, None)
         _GAPS.pop(module, None)
-    for owner in shared:
-        if not owner.recorders:  # the device's last component: its pool goes with it
-            owner.drop_captures()
-            owner.close_cache()
     domain.release(root)
 
 
@@ -735,16 +717,11 @@ def describe(root: Any) -> dict[str, Any]:
                     "eager": recorder.eager.document(base.get("eager", (0, 0, 0.0, 0.0))),
                     "replay": recorder.replayed.document(base.get("replayed", (0, 0, 0.0, 0.0))),
                 }
-            # A device's shared pool and domain count once, under the first component served.
-            first = recorder.domain is None or not recorder.domain.served
-            if not first and recorder.domain is not None:
-                first = recorder.domain.served[0]() is root
-            if first:
-                pools.update(
-                    (entry.pool.handle, entry.pool) for entry in recorder.recordings.values()
-                )
-                if recorder.domain is not None:
-                    domains[id(recorder.domain)] = recorder.domain
+            # A device's shared pool and domain count once.
+            if recorder.pool is not None and recorder.recordings:
+                pools[recorder.pool.handle] = recorder.pool
+            if recorder.domain is not None:
+                domains[id(recorder.domain)] = recorder.domain
     shared = domain.existing(root)
     if shared is not None:
         domains[id(shared)] = shared
@@ -769,7 +746,7 @@ def describe(root: Any) -> dict[str, Any]:
         regions=dict(sorted(timed.items())),
         eager_gaps=gaps,
         graph_pools=len(pools),
-        graph_pool_bytes=sum(pool.prepared for pool in pools.values()),
+        graph_pool_bytes=sum(pool.nbytes() for pool in pools.values()),
         domains=len(domains),
     )
     return answer
@@ -910,7 +887,6 @@ def _region_call(
             if placed is not None
             else capture_domain(torch, _REGIONS[module][0]())
         )
-        recorder.domain.recorders.add(recorder)
 
     def eager() -> Any:
         return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
@@ -950,10 +926,16 @@ def _region_call(
                 return eager()
             if recorder.binding is None:
                 recorder.binding = placed[0].retain(placed[1], (_REGIONS[module][1],))
-        # The pool is held from reading its recording through preparation and the replay until
-        # the device completes it: varena never shrinks the graph a call is using.
-        with recorder.domain.holding():
-            result = _replay(torch, module, leaves, placed, recorder, key, entry)
+        # The graph region is acquired from reading its recording through the replay, released by
+        # an event after it: varena drops it only between replays. Being dropped, its graphs go
+        # and the call runs as written; an idle period records it again.
+        pool = recorder.pool
+        assert pool is not None
+        with pool.replaying(torch.cuda.current_stream()) as ok:
+            result = _replay(torch, module, leaves, placed, recorder, key, entry) if ok else None
+        if not ok:
+            recorder.drop()
+            return eager()
         return eager() if result is _EAGER else result
 
 
@@ -1038,7 +1020,7 @@ def _capture_pending(pending: _Pending) -> bool:
         try:
             owner.initialize()
             owner.prime_blas()  # before the idle request: torch keeps them, in the process arena
-            with idle, owner.holding():
+            with idle:
                 done = _record(torch, module, pending, recorder, placed, submit)
         except Exception as exc:  # the signature runs as written; the period goes on
             if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
@@ -1089,7 +1071,13 @@ def _record(
         with scope, lease:
             stream = owner.stream
             stream.wait_stream(current)
-            pool = owner.capture_pool()
+            if recorder.pool is None:
+                recorder.pool = (
+                    placed[0].graph_pool(placed[1])
+                    if placed is not None
+                    else domain.Pool(torch.cuda.graph_pool_handle())
+                )
+            pool = recorder.pool
             state = _State(torch, module)
             with torch.cuda.stream(stream):
                 # The warm-up runs in the idle request's arena: its high-water is the capture's.
@@ -1115,8 +1103,7 @@ def _record(
                 if why := _device_bound(submit, busy):
                     recorder.judged[key] = why
                     return True
-                if placed is not None:
-                    placed[0].graph_prepare(pool, IDLE_REQUEST)
+                pool.prepare(IDLE_REQUEST)
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so they live as long as the graph and never in a request's arena.
                 statics: list[Any] = []
@@ -1129,10 +1116,12 @@ def _record(
                     sargs, skwargs = _arguments(torch, pending, statics)
                     outputs.append(call(module, *sargs, **skwargs))
 
+                took = time.perf_counter_ns()
                 graph, why = capture(torch, step, pool, owner)
                 if graph is None:
                     _failed(module, recorder, key, why)
                     return True
+                pool.captured(time.perf_counter_ns() - took)
                 if changed := state.restore():
                     recorder.judged[key] = f"recording it changed the model's state: {changed}"
                     graph.reset()
@@ -1161,16 +1150,6 @@ def _record(
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
         for index, tensor in enumerate(entry.statics):
             _LENT[tensor.data_ptr()] = (weakref.ref(entry), index)
-        joined = owner.serve(_REGIONS[module][0]())
-        if placed is not None and (joined or owner.cache is None):
-            # One cache for the device's pool, naming every component recorded into it (its next
-            # use is the nearest of theirs): registered again when one joins.
-            if owner.cache is not None:
-                owner.cache.close()
-            served = [root for root in (ref() for ref in owner.served) if root is not None]
-            owner.cache = placed[0].cache("graphs", functools.partial(_shed, torch, owner), served)
-        if owner.cache is not None:
-            owner.cache.cached(owner.capture_bytes())
         return True
     except Exception as exc:
         if is_capacity(exc) or _unprepared(exc) or isinstance(exc, Building):

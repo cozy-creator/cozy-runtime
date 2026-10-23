@@ -6,12 +6,11 @@ small owner graph on the library stream is reset only at final domain teardown; 
 replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
 
 A placed model's components run one after another on a device, so all their graphs share the
-device's one domain and capture pool (`device`, a `graph_pool_handle()` varena serves): sized at
-the largest region's working set, not the sum. `using` serializes every region call on the
-device (a host lock and a completion event across streams), and each replay copies its inputs
-in and its outputs out inside that interval,
-so no two graphs' scratch is ever live at once: the pool holds one region's working set plus
-every graph's static buffers.
+device's one domain and its one capture pool (`Memory.graph_pool`), each component's graphs a
+graph region of it (`Pool`). `using` serializes every region call on the device (a host lock and
+a completion event across streams), and each replay copies its inputs in and its outputs out
+inside that interval, so no two graphs' scratch is ever live at once: the pool holds one
+region's working set plus every graph's static buffers.
 """
 
 from __future__ import annotations
@@ -21,7 +20,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,24 +41,52 @@ def unsupported(torch: Any) -> str:
 
 @dataclass(eq=False, slots=True)
 class Pool:
-    """A torch capture pool (`graph_pool_handle()`). varena serves a capture into it from bytes
-    mapped ahead (`Memory.prepare_pool`), never by making room inside the capture; `prepared`
-    counts them (varena reports no figure per pool yet)."""
+    """A component's graphs' capture pool: its graph region of the device's one pool, which
+    varena serves and may drop (`region`), or, with no varena memory, a torch pool of its own.
+    A capture is served from bytes `prepare` mapped ahead, never by making room inside it."""
 
     handle: tuple[int, int]
-    prepared: int = 0
+    region: Any = None
+    memory: Any = None
 
-    def prepare(self, memory: Any, expected: int) -> None:
-        """`expected` bytes mapped into the pool now, before a capture into it begins."""
-        if memory is not None:
-            memory.prepare_pool(self.handle, expected)
-        self.prepared += expected
+    def prepare(self, request: str) -> None:
+        """Before a capture into the pool begins: the working set its warm-up reached in open
+        request `request`'s arena, mapped into the pool now."""
+        if self.region is not None:
+            self.region.prepare(accel.arena_peak(self.memory, request))
 
-    def failed(self, memory: Any) -> None:
+    @contextmanager
+    def replaying(self, stream: Any) -> Iterator[bool]:
+        """Around a replay and its outputs' readers on `stream`: False while varena drops the
+        region (its graphs go, run eager); a True one is released after, by an event on
+        `stream`, even when the replay raises."""
+        if self.region is None:
+            yield True
+            return
+        with self.region.replaying(stream) as ok:
+            yield ok
+
+    def captured(self, ns: int) -> None:
+        """What capturing a graph into it took: varena's drop-versus-keep choice."""
+        if self.region is not None:
+            self.region.captured(ns)
+
+    def failed(self) -> None:
         """A capture into the pool that torch never ended (its begin or end raised): varena
         stops routing the capturing thread into it."""
-        if memory is not None:
-            memory.capture_failed(self.handle)
+        if self.memory is not None:
+            self.memory.capture_failed(self.handle)
+
+    def nbytes(self) -> int:
+        """Bytes varena maps in the pool (the device's, every graph region of it)."""
+        if self.memory is None:
+            return 0
+        return int(self.memory.torch_stats()["pools"].get(self.handle, (0, 0))[0])
+
+    def close(self) -> None:
+        """Its graphs are reset: the region's pins and its use of the pool go."""
+        if self.region is not None:
+            self.region.close()
 
 
 class Domain:
@@ -80,16 +107,6 @@ class Domain:
         self.config: Any = None
         self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
-        #: the graphs' shared capture pool, its accounting cache, the recorders using it, and
-        #: the component roots they serve (the cache's components), first capture first
-        self.captures: Pool | None = None
-        self.anchor: Any = None
-        self.cache: Any = None
-        self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
-        self.served: list[weakref.ref[Any]] = []
-        #: the pool's own lock (never held across a wait): a call's hold count and varena's drop
-        self.pool_lock = threading.Lock()
-        self.held = 0
 
     def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
@@ -197,67 +214,11 @@ class Domain:
             if self.owner is not None:
                 self.owner.reset()
                 self.owner = None
-            self.drop_captures()
-            self.close_cache()
             for stream in (self.stream, self.control):
                 if stream is not None:
                     self.torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
-
-    def capture_pool(self) -> Pool:
-        """The pool every graph of the device records into (made on first use, after
-        `initialize`), held by a never-replayed graph of its own: torch 2.14 releases a pool's
-        host side when its last graph resets, and the next capture into it trips
-        CachingHostAllocator's use_count assert (v16: a no-gain verdict reset the pool's only
-        graph). varena's graph regions own pool lifetime and retire the anchor."""
-        if self.captures is None:
-            self.captures = Pool(self.torch.cuda.graph_pool_handle())
-            self.anchor = self.torch.cuda.CUDAGraph()
-            with self.torch.cuda.stream(self.stream):
-                handle = self.captures.handle
-                self.anchor.capture_begin(pool=handle, capture_error_mode="thread_local")
-                self.join.record(self.stream)
-                self.anchor.capture_end()
-        return self.captures
-
-    def serve(self, root: Any) -> bool:
-        """`root`'s graphs record into the pool from now on; True when it is new to it."""
-        if any(r() is root for r in self.served):
-            return False
-        self.served = [r for r in self.served if r() is not None] + [weakref.ref(root)]
-        return True
-
-    def drop_captures(self) -> None:
-        """After every graph recorded into it is reset and its static buffers dropped (its cache
-        stays registered: the next capture registers it again)."""
-        if self.anchor is not None:
-            self.anchor.reset()
-            self.anchor = None
-        self.captures = None  # its last graph's reset releases the pool to varena
-        self.served = []
-
-    @contextmanager
-    def holding(self) -> Iterator[None]:
-        """The pool is never shrunk inside the block (reading a recording, preparation, a
-        capture, a replay), nor after it until the work queued on the current stream completes:
-        varena never asks a held cache, and a drop it asked before the hold finds it held."""
-        with self.pool_lock:
-            self.held += 1
-        try:
-            with self.cache.holding() if self.cache is not None else nullcontext():
-                yield
-        finally:
-            with self.pool_lock:
-                self.held -= 1
-
-    def close_cache(self) -> None:
-        if self.cache is not None:
-            self.cache.close()
-            self.cache = None
-
-    def capture_bytes(self) -> int:
-        return 0 if self.captures is None else self.captures.prepared
 
 
 _LOCK = threading.RLock()
@@ -267,7 +228,7 @@ _DEVICES: weakref.WeakKeyDictionary[Any, Domain] = weakref.WeakKeyDictionary()
 
 
 def device(torch: Any, memory: Any) -> Domain:
-    """The device's domain: every placed component's graphs, serialized, in one pool."""
+    """The device's domain: every placed component's graphs, serialized."""
     with _LOCK:
         found = _DEVICES.get(memory)
         if found is None:

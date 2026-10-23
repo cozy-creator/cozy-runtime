@@ -137,9 +137,8 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         assert len(graph["capture_each_ms"]) == 2 and len(graph["measured"]) == 2, graph
         assert all(m["busy_ms"] < m["submit_ms"] for m in graph["measured"]), graph
         assert graph["saving_ms"] is not None and not graph["eager"], graph
-        assert recorder.domain is not None
-        graphs._shed(torch, recorder.domain)
-        assert not recorder.recordings
+        recorder.drop()  # varena dropped the region: its graphs go
+        assert not recorder.recordings and recorder.pool is None
         retired = graphs.describe(module)
         assert retired["active_graphs"] == retired["graph_pools"] == 0
         assert retired["retired_graphs"] == retired["captures"] == 2
@@ -260,50 +259,17 @@ def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
     # Retire one executable while the other, in the same pool, still embeds the library
     # stream's workspace pointers (the process's, made outside any capture: `prime_blas`).
     owner = recorder.domain
-    assert owner is not None and owner.primed and owner.captures is not None
+    assert owner is not None and owner.primed and recorder.pool is not None
     key = next(k for k, v in recorder.recordings.items() if v.inputs[0].shape[0] == 4)
     recorder.recordings.pop(key).close()
     got, expected = run(second, 3.0, 8)
     torch.testing.assert_close(got, expected)
     graphs.release(torch, module)
-    assert owner.closed and owner.stream is owner.control is None and owner.captures is None
+    assert owner.closed and owner.stream is owner.control is None and recorder.pool is None
     torch.cuda.synchronize()
     # Returned copies outlive both the executable and its pool.
     for got, expected in outputs:
         torch.testing.assert_close(got, expected)
-
-
-@pytest.mark.real_gpu
-@pytest.mark.skipif(not CUDA, reason="graph retirement needs real completion events")
-def test_a_shrink_while_a_call_holds_the_domain_completes_at_once() -> None:
-    """Review 7 K1's chain: a region call holds the domain while its bind waits on varena,
-    whose demand shrinks the pool on varena's thread. The shrink takes only the pool's own
-    lock: it drops every graph and frees the pool at once, never waiting on the call. A pool a
-    call holds (varena decided before the hold) gives nothing. A drop with the last output copy
-    still in flight leaves the result intact."""
-    module = _mlp("cuda")
-    with torch.inference_mode():
-        x = torch.ones(4, 64, device="cuda")
-        module(x)
-        module(x)
-        _idle()
-        torch.cuda.synchronize()
-        recorder = graphs._RECORDERS[module]
-        owner = recorder.domain
-        assert owner is not None and recorder.recordings
-        with ThreadPoolExecutor(1) as varena, owner.using():
-            assert varena.submit(graphs._shed, torch, owner).result() > 0
-            assert not recorder.recordings and owner.captures is None
-        module(x)
-        _idle()
-        with ThreadPoolExecutor(1) as varena, owner.holding():
-            assert varena.submit(graphs._shed, torch, owner).result() == 0
-            assert recorder.recordings
-        torch.cuda._sleep(1 << 29)
-        result = module(x)
-        assert graphs._shed(torch, owner) > 0 and not recorder.recordings
-        torch.cuda.synchronize()
-        torch.testing.assert_close(result, torch.nn.Sequential.__call__(module, x))
 
 
 def _two_segments() -> Any:
@@ -429,7 +395,7 @@ def test_a_device_bound_region_never_records() -> None:
     assert not recorder.recordings and recorder.replays == 0
     (why,) = recorder.judged.values()
     assert why.startswith("device-bound"), why
-    graphs._shed(torch, recorder.domain)
+    recorder.drop()
     assert recorder.judged  # a measured verdict outlives the graphs: it never queues again
     ((submit, busy),) = recorder.bound.values()
     assert busy > submit
