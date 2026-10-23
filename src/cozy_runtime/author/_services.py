@@ -27,7 +27,7 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
-from cozy_runtime.author import _codec
+from cozy_runtime.author import _codec, _stalls
 from cozy_runtime.author._activity import settle, work_clock
 from cozy_runtime.author._assets import (
     Asset,
@@ -182,6 +182,8 @@ class Attempt:
     metrics_dropped: int = 0
     _counter: int = 0
     _step_mark: float = 0.0
+    #: The stepping thread's host-stall sampler while a step loop runs (`_stalls`).
+    _stall_watch: _stalls.Watch | None = None
     #: Sends one publish to the worker, which journals it on the run's output log. None in a
     #: harness with no worker: `published` then records what would have been shown.
     publish: Callable[[Publish], Published] | None = None
@@ -1231,6 +1233,8 @@ class Telemetry(_Bound):
         # too. Starting it at the first call would silently drop step 0 from the count — and
         # on a one-step request that is the whole measurement.
         attempt._step_mark = work_clock()
+        if attempt._stall_watch is None:
+            attempt._stall_watch = _stalls.watch(lambda: not attempt.closed)
         capture = _capture_clock.get()
         if capture is not None:
             capture.schedule(total)
@@ -1241,6 +1245,13 @@ class Telemetry(_Bound):
             mark = attempt._step_mark
             if mark and name is not None:
                 attempt.attribution.step(name, (now - mark) * 1000)
+            stalls = attempt._stall_watch
+            if stalls is not None:
+                for code, ms in stalls.take().items():
+                    attempt.attribution.stage(f"host · {code}", ms)
+                if step == total - 1:
+                    stalls.stop()
+                    attempt._stall_watch = None
             attempt._step_mark = now
             step_ms = (now - mark) * 1000 if mark else 0.0
             if (
