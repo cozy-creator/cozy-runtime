@@ -78,9 +78,10 @@ def test_a_decoded_tensor_decodes_once_across_twenty_binds(tmp_path: Path) -> No
         assert len(decodes) == 1, "a decoded tensor decodes once a generation"
         assert all(torch.equal(o, outputs[0]) for o in outputs)
         routes = backend.routes["net"]
-        held = 64 * 512 * 4
-        assert routes.shed(0) == held and not routes.decoded  # varena's ask: the next bind decodes
-        with torch.no_grad(), memory.request("after-shed"):
+        assert routes.region is not None  # kept in the component's derived region
+        routes.forget()  # the region came back empty (varena dropped it): the next bind decodes
+        assert not routes.decoded
+        with torch.no_grad(), memory.request("after-drop"):
             assert torch.equal(net(x), outputs[0])
         assert len(decodes) == 2
     finally:
@@ -88,7 +89,7 @@ def test_a_decoded_tensor_decodes_once_across_twenty_binds(tmp_path: Path) -> No
         model.close()
         backend.close()
         native.close()
-    assert not routes.decoded and routes.cache is None
+    assert not routes.decoded and routes.region is None
 
 
 def test_a_component_is_served_in_eval_mode(tmp_path: Path) -> None:

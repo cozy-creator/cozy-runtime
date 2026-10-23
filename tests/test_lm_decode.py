@@ -27,8 +27,8 @@ def test_release_drops_pinned_buffers_before_domain_streams() -> None:
     engine = lm._ENGINES[model]
     owner, flag = engine.domain, weakref.ref(engine.flag)
     assert owner is not None and engine.graphs
-    # Actual allocator shedding may precede explicit unload; it must release all its slots.
-    assert engine.idle()
+    # A reclaimed KV region makes the next drive drop the buffers first: every slot goes.
+    engine._drop()
     assert flag() is None and not engine.graphs and engine.capacity == 0
     assert all(name not in vars(engine) for name in type(engine).__annotations__)
     lm.release(model)

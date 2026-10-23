@@ -17,7 +17,7 @@ import threading
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from types import ModuleType
@@ -25,12 +25,12 @@ from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from tensorfs.varena.torch import (
     Binding,
-    Cache,
     Declared,
     Hold,
     Level,
     Memory,
     Model,
+    Region,
     Weights,
     blocks_of,
 )
@@ -551,8 +551,10 @@ class _Routes:
     """A stored tensor's parts as the module's tensors (`Declared.bind`): as stored, decoded
     into a float tensor, or a native leaf's role buffers (derived roles made from the stored
     ones). A decoded tensor is decoded once a generation (`delivery.cost_class`), not once a
-    bind: it is kept under the fill identity it was decoded from, as the memory's cache, which
-    varena sheds on its ask (the next bind decodes again). Leaf buffers live for that bind."""
+    bind: it is kept under the fill identity it was decoded from, in the component's derived
+    region, pinned while the component is in use (`Placement.using`). Between uses varena may
+    drop the region, and its next pin finds it fresh: the next bind decodes again. Leaf buffers
+    live for that bind."""
 
     def __init__(
         self, backend: Backend, component: str, rows: Mapping[str, PlanRow], root: Module
@@ -572,7 +574,8 @@ class _Routes:
         self.lock = threading.Lock()
         #: stored key -> (the fill identity it was decoded under, the decoded tensor)
         self.decoded: dict[str, tuple[str, Tensor]] = {}
-        self.cache: Cache | None = None
+        #: the decoded tensors' region, made with the first one kept
+        self.region: Region | None = None
 
     def __call__(self, key: str, parts: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
         torch, row = self.torch, self.rows[key]
@@ -587,10 +590,18 @@ class _Routes:
                 if held is not None and held[0] == identity:
                     return {name: held[1]}
             dtype = getattr(torch, TORCH_DTYPES[row.dtype])
-            out = torch.empty(row.shape, dtype=dtype, device=next(iter(parts.values())).device)
-            self.providers[key].decode(torch, parts, out)
-            if identity:
-                self._keep(key, identity, out)
+            device = next(iter(parts.values())).device
+            if not identity:  # never kept: the bind's own
+                out = torch.empty(row.shape, dtype=dtype, device=device)
+                self.providers[key].decode(torch, parts, out)
+                return {name: out}
+            with self._region().allocating() as fresh:
+                if fresh:
+                    self.forget()
+                out = torch.empty(row.shape, dtype=dtype, device=device)
+                self.providers[key].decode(torch, parts, out)
+            with self.lock:
+                self.decoded[key] = (identity, out)
             return {name: out}
         leaf, replaced, derived = self.leaves[key]
         path, buffers = name.removesuffix(".weight"), leaf.BUFFERS
@@ -610,38 +621,23 @@ class _Routes:
             return "stored"
         return model.identity or ""
 
-    def _keep(self, key: str, identity: str, out: Tensor) -> None:
-        with self.lock:
-            self.decoded[key] = (identity, out)
-            if self.cache is None:
-                self.cache = self.backend.memory.cache(
-                    f"decoded:{self.component}", self.shed, sets=self.root
-                )
-            self.cache.cached(self._held())
+    def _region(self) -> Region:
+        if self.region is None:
+            memory = self.backend.memory
+            self.region = memory.region(f"decoded:{self.component}", "derived", self.root, False)
+        return self.region
 
-    def _held(self) -> int:
-        return sum(t.numel() * t.element_size() for _, t in self.decoded.values())
-
-    def shed(self, want: int) -> int:
-        """Varena's ask: decoded tensors go until `want` bytes have (every one for `want` <= 0)."""
-        with self.lock:
-            freed = 0
-            for key in list(self.decoded):
-                if want > 0 and freed >= want:
-                    break
-                tensor = self.decoded.pop(key)[1]
-                freed += tensor.numel() * tensor.element_size()
-            if self.cache is not None:
-                self.cache.cached(self._held())
-            return freed
-
-    def close(self) -> None:
-        """The generation ends: every decoded tensor, and the cache that accounted for them."""
+    def forget(self) -> None:
+        """Its region came back empty: every decoded tensor goes (the next bind decodes)."""
         with self.lock:
             self.decoded.clear()
-            if self.cache is not None:
-                self.cache.close()
-                self.cache = None
+
+    def close(self) -> None:
+        """The generation ends: every decoded tensor, and their region."""
+        self.forget()
+        if self.region is not None:
+            self.region.close()
+            self.region = None
 
 
 @runtime_checkable
@@ -841,6 +837,11 @@ class Placement:
                 self.holds[name] = (hold, stream)
         with ExitStack() as passes:
             for name in sorted(entering):
+                # its decoded tensors stay while it runs; dropped while unused, binds decode again
+                routes = self.backend.routes.get(name)
+                region = routes.region if routes is not None else None
+                if region is not None and passes.enter_context(region.pin()):
+                    routes.forget()
                 passes.enter_context(self.models[name].passing(method))
             yield
 
@@ -870,7 +871,12 @@ class Placement:
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def graph_pool(self, component: str) -> Any:
+    def region(self, owner: str, kind: str, sets: Module) -> Region:
+        """A long-lived intermediate's region serving `sets` (`Memory.region`): varena spills
+        or drops it between pins, and its next pin says fresh."""
+        return self.memory.region(owner, kind, sets=sets)
+
+    def graph_pool(self, component: str) -> graphs.domain.Pool:
         """`component`'s graph region of the device's one capture pool: it holds the
         component's weights bound while its graphs live, and varena drops it between replays."""
         model = self.models[component]
@@ -895,13 +901,6 @@ class Placement:
     def graph_resident(self, binding: Binding) -> bool:
         """Every page `binding` covers is on the device now (an idle capture never fills one)."""
         return binding.resident()
-
-    def cache(
-        self, owner: str, shed: Callable[[int], int], served: Sequence[Module]
-    ) -> Cache | None:
-        """Device bytes `owner` keeps for the components `served` (their roots), counted and
-        shed on ask in the order of their next use; None off a GPU."""
-        return self.memory.cache(owner, shed, sets=list(served)) if self.memory.cuda else None
 
     def note(self, key: str, value: str) -> None:
         self.notes[key] = value

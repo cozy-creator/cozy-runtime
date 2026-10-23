@@ -177,6 +177,9 @@ def release(model: Any) -> None:
             _ENGINES[model] = engine
             raise RuntimeError("cannot unload a language model while decode is active")
         engine._drop()
+        if engine.region is not None:
+            engine.region.close()
+            engine.region = None
         for binding in engine.addresses.values():
             binding.close()
         engine.addresses.clear()
@@ -872,24 +875,6 @@ class _Prefill:
         )
 
 
-def _slot_bytes(fresh: _Prefill, capacity: int, drafted: bool, text: Any) -> int:
-    """The device bytes a slot of `capacity` positions takes."""
-    total = 0
-    rows = int(fresh.token.shape[0])
-    for layer in fresh.cache.layers:
-        if isinstance(layer, _Keys):
-            for buffer in (layer.keys, layer.values):
-                total += buffer[0, :, :1].numel() * buffer.element_size() * capacity
-        else:
-            for state in (*layer.conv_states.values(), *layer.recurrent_states.values()):
-                if state is not None:
-                    total += state.numel() * state.element_size() // rows
-    keys = fresh.drafted[0] if drafted else None
-    if keys is not None and keys.keys is not None:
-        total += 2 * keys.keys[0, :, :1].numel() * keys.keys.element_size() * capacity
-    return total + capacity * 18 + 4 * int(getattr(text, "vocab_size", 0) or 0)
-
-
 def _derived(models: Iterable[Any]) -> list[Any]:
     """The non-persistent buffers of `models` on a device: built from config (a rotary table),
     never a checkpoint's, so the plane neither places nor pins them."""
@@ -903,13 +888,6 @@ def _derived(models: Iterable[Any]) -> list[Any]:
         and tensor.device.type != "meta"
         and tensor.device.type != "cpu"
     ]
-
-
-def _reservation(model: Any, shed: Callable[[int], int]) -> Any:
-    """The memory's count of an engine's buffers, shed on ask (`Placement.cache`); None for a
-    model Runtime does not place (its tensors are where its caller put them)."""
-    placed = PLACED.get(model)
-    return None if placed is None else placed[0].cache(f"lm:{type(model).__name__}", shed, [model])
 
 
 class _Request:
@@ -1047,9 +1025,8 @@ class _Engine:
         self.stale = False
         #: seconds the last admission took: decoding gets as long before the next one
         self.debt = 0.0
-        self.reservation: Any = None
-        #: the bytes `reservation` counts
-        self.held = 0
+        #: its buffers' KV region (varena reclaims it between drives, never during one)
+        self.region: Any = None
         self.retire = False
         self.cache_device: Any = None
         self.open: bool | float
@@ -1128,6 +1105,14 @@ class _Engine:
     def _drive(self, mine: _Request) -> None:
         try:
             with _PLANE, ExitStack() as stack:
+                # The KV region is pinned while this drive lasts, so no live row is lost; between
+                # drives varena may take it, and then the buffers are made again.
+                if self.region is None and (placed := PLACED.get(self.model)) is not None:
+                    self.region = placed[0].region(
+                        f"lm:{type(self.model).__name__}", "kv", self.model
+                    )
+                if self.region is not None and stack.enter_context(self.region.pin()):
+                    self._drop()
                 held = self._hold(stack)
                 while True:
                     if self.rehold:  # another head: its blocks are held instead
@@ -1502,13 +1487,10 @@ class _Engine:
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
 
     def _grow(self, size: int, capacity: int, fresh: _Prefill) -> None:
-        """Allocate slots after prefill; a refusal is final, never a repeated prefill."""
-        if self.reservation is None:
-            self.reservation = _reservation(self.model, self._shed)
-        self._buffers(size, capacity, fresh)
-        if self.reservation is not None:
-            self.held = _slot_bytes(fresh, capacity, self.draft is not None, self.text) * size
-            self.reservation.cached(self.held)
+        """Allocate slots after prefill, in the KV region; a refusal is final, never a repeated
+        prefill."""
+        with self.region.allocating() if self.region is not None else nullcontext():
+            self._buffers(size, capacity, fresh)
 
     def _buffers(self, size: int, capacity: int, fresh: _Prefill) -> None:
         device = fresh.token.device
@@ -1961,34 +1943,6 @@ class _Engine:
         # Torch's host allocator records that stream's completion when freeing the tensor.
         for name in (*type(self).__annotations__, "flag", "rows_index", "dkeys", "dcache"):
             vars(self).pop(name, None)
-        if self.reservation is not None:
-            self.reservation.close()
-            self.reservation, self.held = None, 0
-
-    def idle(self) -> bool:
-        """Its buffers and graphs go back when no call holds it: what the plane takes before
-        it unmaps weights. Whether it had any."""
-        if not self.cond.acquire(blocking=False):
-            return False
-        try:
-            if (
-                self.driver is not None
-                or self.pending
-                or self.cache is None
-                or self.unfenced
-                or any(not event.query() for event in self.completions.values())
-            ):
-                return False
-            self._drop()
-            return True
-        finally:
-            self.cond.release()
-
-    def _shed(self, nbytes: int) -> int:
-        """Room the memory manager asks for under pressure: an idle engine drops its buffers;
-        a busy one gives nothing (its rows are mid-flight)."""
-        before = self.held
-        return before if self.idle() else 0
 
 
 __all__ = [

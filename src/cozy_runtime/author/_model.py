@@ -266,12 +266,6 @@ class Residency(Protocol):
     supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
     """
 
-    def cache(self, owner: str, shed: Callable[[int], int], served: Sequence[Any]) -> Any:
-        """Device bytes `owner` keeps for the components `served` (their root modules: KV
-        slots, a graph pool), counted and shed on ask in the order of their next use: `cached`
-        and `close`; None off a GPU."""
-        ...
-
     def note(self, key: str, value: str) -> None:
         """A fact about how this attempt executed, reported with its memory facts."""
         ...
@@ -291,6 +285,10 @@ class Residency(Protocol):
 
     def graph_domain(self, component: str) -> Any:
         """Shared capture stream and library workspace, serialized across component graphs."""
+        ...
+
+    def region(self, owner: str, kind: str, sets: Any) -> Any:
+        """A long-lived intermediate's region (KV, latents, derived weights) serving `sets`."""
         ...
 
     def graph_pool(self, component: str) -> Any:
