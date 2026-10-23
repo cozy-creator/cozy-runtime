@@ -41,8 +41,9 @@ concurrency:
 jobs:
   form:
     # Every card in one process: one image pull, one cache, and the compile manager admits
-    # compiler jobs within these 16 CPUs and 64 GB (2-core runners swap on CUTLASS units).
-    runs-on: linux-x64-16core
+    # compiler jobs within the runner's CPUs and memory. A free runner: the ledger cache carries
+    # every unchanged kernel, so only a new one compiles here.
+    runs-on: ubuntu-latest
     # Hang bound, not a work budget: an empty cache compiles every kernel of every card.
     timeout-minutes: 240
     env:
