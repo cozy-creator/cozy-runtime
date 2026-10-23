@@ -53,7 +53,7 @@ from cozy_runtime.author._decode import (
     VideoProbe,
     image_decoded_bytes,
 )
-from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, resolve
+from cozy_runtime.author._defaults import Clamp, DefaultSet, Overlay, resolve
 from cozy_runtime.author._demand import RequestFeatures, normalize
 from cozy_runtime.author._describe import check
 from cozy_runtime.author._errors import (
@@ -72,6 +72,7 @@ from cozy_runtime.author._markers import AssetBound, ImagePreparation, Preparati
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
+from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
     AdjustmentRow,
@@ -102,7 +103,9 @@ class Invocation:
     device: Device = field(default_factory=Device)
     cancel: Callable[[], bool] = field(default=lambda: False)
     models: Mapping[str, Model[Any]] = field(default_factory=dict)
-    recipes: Sequence[Recipe] = ()
+    default_sets: Sequence[DefaultSet] = ()
+    #: The package's declared recipes, which its `quantize` runs.
+    recipes: tuple[DeclaredRecipe, ...] = ()
     clamps: Sequence[Clamp] = ()
     settings: object = None
     secrets: object = None
@@ -202,7 +205,7 @@ def prepare(
     registration: Registration,
     wire: Mapping[str, object],
     *,
-    recipes: Sequence[Recipe] = (),
+    default_sets: Sequence[DefaultSet] = (),
     clamps: Sequence[Clamp] = (),
     settings: object = None,
     input_metadata: Mapping[str, InputMetadata] = {},
@@ -213,7 +216,7 @@ def prepare(
     overlay = resolve(
         surface.payload_type,
         wire,
-        recipes=recipes,
+        default_sets=default_sets,
         clamps=clamps,
         model_params=surface.model_params,
     )
@@ -314,6 +317,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt = record
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel, inv.adapters)
+    ctx._recipes = inv.recipes
     placed = next((m._cozy_residency for m in models if m._cozy_residency is not None), None)
     if inv.plan is not None:
         ctx._plan = inv.plan
@@ -413,7 +417,7 @@ def attempt(
         prepared = prepare(
             registration,
             wire,
-            recipes=inv.recipes,
+            default_sets=inv.default_sets,
             clamps=inv.clamps,
             settings=inv.settings,
             input_metadata=inv.assets,

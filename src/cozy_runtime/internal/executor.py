@@ -3068,7 +3068,9 @@ class Executor:
         first import on a busy host is still an import."""
         if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
-        discovered = discover_installed(release.application, seconds=None)
+        path = release.package_interface
+        recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
+        discovered = discover_installed(release.application, seconds=None, recipes=recipes)
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
@@ -3424,6 +3426,7 @@ class Executor:
                                 _cancelled, self.host.mux, self.root, command.request_id
                             ),
                             models=self.models,
+                            recipes=self.discovered.recipes,
                             progress=boundary,
                             activity=self._activity_sink(command.request_id),
                             plan=functools.partial(self._plan_request, command.request_id),

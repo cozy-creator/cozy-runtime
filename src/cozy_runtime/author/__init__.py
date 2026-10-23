@@ -73,7 +73,7 @@ from cozy_runtime.author._decode import (
     MediaDecodeError,
     VideoProbe,
 )
-from cozy_runtime.author._defaults import Clamp, Overlay, Recipe, decode_request
+from cozy_runtime.author._defaults import Clamp, DefaultSet, Overlay, decode_request
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import assert_declaration_shape, describe
 from cozy_runtime.author._errors import (
@@ -139,6 +139,13 @@ from cozy_runtime.author._model import (
     sequence_parallel,
     uncaptured,
     uses_components,
+)
+from cozy_runtime.author._recipes import (
+    DerivationHook,
+    EncodingRule,
+    QuantizationPlan,
+    Recipe,
+    SelectionPlan,
 )
 from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
@@ -223,10 +230,13 @@ __all__ = [
     "DecodedVideoFrame",
     "DecoderUnavailable",
     "DefaultResolutionError",
+    "DefaultSet",
+    "DerivationHook",
     "DerivedCache",
     "Device",
     "Egress",
     "EgressResponse",
+    "EncodingRule",
     "ExecutionEnvironment",
     "ExecutionObservation",
     "FileAsset",
@@ -263,6 +273,7 @@ __all__ = [
     "PreflightViolation",
     "PreparedRequest",
     "ProducerCall",
+    "QuantizationPlan",
     "Recipe",
     "Registration",
     "RegistrationError",
@@ -275,6 +286,7 @@ __all__ = [
     "ScopeCall",
     "ScriptContext",
     "Secrets",
+    "SelectionPlan",
     "Settings",
     "Shape",
     "Surface",
