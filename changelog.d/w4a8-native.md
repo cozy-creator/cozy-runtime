@@ -1,0 +1,1 @@
+The `w4a8.convrot` lane (W4A8, xs-062) runs natively: a fused mma.sync GEMM unpacks its 4-bit codes to int8 in registers and multiplies them with int8.convrot's activation, verified on the card before it serves; `quantize_into` writes the lane with a numpy encoder TensorFS decodes.

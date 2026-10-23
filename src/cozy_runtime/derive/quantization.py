@@ -30,10 +30,12 @@ from . import safetensors_io as st
 from .microscale import (
     CONVROT_GROUP,
     NVFP4_BLOCK,
+    W4A8_GROUP,
     Encoded,
     encode_fp8_rowwise,
     encode_int8_convrot256,
     encode_nvfp4,
+    encode_w4a8,
 )
 
 
@@ -41,7 +43,9 @@ class _Encoding(NamedTuple):
     """A scheme's encoder: its round-trip bound (a multiple of tensor amax), the column multiple
     it needs, its params, and its parts after `weight`, each `(role, dtype, shape)` for an
     `[rows, cols]` tensor. A part shaped `()` is one per tensor (nvfp4's second level), so the
-    tensor's amax is read before any chunk is encoded and every chunk encodes against it."""
+    tensor's amax is read before any chunk is encoded and every chunk encodes against it. A
+    `whole` part is also one per tensor but fixed (w4a8's codebook): every chunk writes it the
+    same. `pack` weights share a stored element (w4a8's codes are `[rows, cols / 2]` bytes)."""
 
     round_trip_bound: float
     encode: Callable[[str, np.ndarray, float], Encoded]
@@ -49,6 +53,8 @@ class _Encoding(NamedTuple):
     block: int
     params: dict[str, object]
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
+    whole: frozenset[str] = frozenset()
+    pack: int = 1
 
     def tensor_scaled(self) -> bool:
         return any(not shape for _, _, shape in self.companions(1, self.block))
@@ -99,6 +105,21 @@ _ENCODINGS: dict[str, _Encoding] = {
             ("scale", "F8_E4M3", (rows, cols // NVFP4_BLOCK)),
             ("scale_2", "F32", ()),
         ),
+    ),
+    # Four bits after the rotation: a tripwire well above a 16-level grid's worst element.
+    "w4a8.convrot": _Encoding(
+        2.0**-1,
+        _rowwise(encode_w4a8),
+        "I8",
+        CONVROT_GROUP,
+        {"group_size": W4A8_GROUP, "rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
+        lambda rows, cols: (
+            ("group_scale", "F8_E4M3", (rows, cols // W4A8_GROUP)),
+            ("scale", "F32", (rows,)),
+            ("codebook", "F32", (16,)),
+        ),
+        whole=frozenset({"codebook"}),
+        pack=2,
     ),
 }
 
@@ -369,7 +390,7 @@ def quantize_component_into(
                 spill_bytes = spill.tell()
                 spill.seek(0)
                 parts: list[PartData] = [
-                    ("weight", encoder.weight_dtype, (rows, cols), spill),
+                    ("weight", encoder.weight_dtype, (rows, cols // encoder.pack), spill),
                     *(
                         (role, dtype, shape, raw)
                         for (role, dtype, shape), raw in zip(
@@ -437,13 +458,14 @@ def _encode_tensor(
             count = values.shape[0]
             if len(encoded.companions) != len(expected):
                 raise UnsupportedInput(f"{encoding} changed its declared geometry")
-            for got, (_, dtype, shape), chunks in zip(
+            for got, (role, dtype, shape), chunks in zip(
                 encoded.companions, expected, scales, strict=True
             ):
-                want = [count, *shape[1:]] if shape else []
+                whole = not shape or role in encoder.whole
+                want = list(shape) if whole else [count, *shape[1:]]
                 if (got.dtype, got.shape) != (dtype, want):
                     raise UnsupportedInput(f"{encoding} changed its declared geometry")
-                if shape or not chunks:
+                if not whole or not chunks:
                     chunks.append(got.raw)
                 elif got.raw != chunks[0]:
                     raise UnsupportedInput(f"{encoding} encoded one tensor scale two ways")

@@ -42,6 +42,7 @@ from cozy_runtime.internal.encoding.leaves import (
     MicroScaledNativeLeaf,
     Nvfp4NativeLeaf,
     RowwiseNativeLeaf,
+    W4a8NativeLeaf,
 )
 
 # `torch: Any` is the torch module, which the check venv does not carry.
@@ -275,6 +276,7 @@ def launch_providers() -> dict[str, tuple[Provider, ...]]:
         Int8ConvRotNativeLeaf,
         Nvfp4Dequant,
         Nvfp4NativeLeaf,
+        W4a8NativeLeaf,
         MicroScaledDequant,
         MicroScaledNativeLeaf,
         ComfyDequant,

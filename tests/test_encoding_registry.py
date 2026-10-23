@@ -37,6 +37,7 @@ def test_every_scheme_has_its_parts_and_nothing_else() -> None:
             {"weight", "group_scale", "scale"},
             {"codebook", "correction"},
         ),
+        "w4a8.convrot": ({"weight", "group_scale", "scale"}, {"codebook"}),
         "comfy.w6a8_int8": ({"weight", "group_scale", "scale"}, set()),
         "int4.convrot": ({"weight", "scale"}, set()),
     }

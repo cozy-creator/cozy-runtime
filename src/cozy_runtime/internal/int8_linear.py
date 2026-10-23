@@ -280,7 +280,8 @@ def prologue(
     activation: str | None,
 ) -> PreQuantized | None:
     """`activation(norm(x) * (1 + scale) + shift)`, rotated and quantized in one pass, when each
-    of `consumers` is an un-hooked int8 leaf of x's width the op serves on this card; else None."""
+    of `consumers` is an un-hooked leaf of x's width taking int8.convrot's operand and the op
+    serves this card; else None."""
     if not x.is_cuda or x.dtype not in _HALF or _OPS.get(x.get_device()) is None:
         return None
     if any(t is not None and t.dtype != x.dtype for t in (scale, shift)):
@@ -290,7 +291,7 @@ def prologue(
         return None
     for module in consumers:
         if (
-            getattr(module, "provider", None) != INT8_CONVROT
+            getattr(module, "operand", None) != INT8_CONVROT
             or getattr(module, "in_features", None) != x.shape[-1]
             or module._forward_hooks  # type: ignore[attr-defined]
             or module._forward_pre_hooks  # type: ignore[attr-defined]

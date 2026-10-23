@@ -25,7 +25,7 @@ torch = pytest.importorskip("torch")
 CASES = [row for row in probe.vector_cases() if row.encoding.scheme in SCHEMES]
 POSITIVE = [row for row in CASES if not row.refuse]
 NEGATIVE = [row for row in CASES if row.refuse]
-COUNTS = {"comfy.asym_w4a8_int8": 10, "comfy.w6a8_int8": 5, "int4.convrot": 3}
+COUNTS = {"comfy.asym_w4a8_int8": 10, "w4a8.convrot": 4, "comfy.w6a8_int8": 5, "int4.convrot": 3}
 
 
 def provider(case: probe.VectorCase) -> ComfyDequant:
@@ -45,11 +45,11 @@ def vectors(device: str) -> None:
         assert got is not None and got.device.type == device
         assert probe.same_bits(torch, got, case.expect) == 0, f"{case.component}/{case.key}"
         checked[case.encoding.scheme] += 1
-    assert dict(checked) == COUNTS and sum(checked.values()) == 18
+    assert dict(checked) == COUNTS and sum(checked.values()) == 22
 
 
 def test_cpu_vectors_through_registered_native_consumers() -> None:
-    assert len(POSITIVE) == 18 and len(NEGATIVE) == 16
+    assert len(POSITIVE) == 22 and len(NEGATIVE) == 19
     vectors("cpu")
 
 
