@@ -4,9 +4,8 @@ on:
   pull_request:
 jobs:
   e2e:
-    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@ci-v2-e2e
+    uses: cozy-creator/cozy-creator/.github/workflows/e2e.yaml@master
     with:
       repo: cozy-runtime
       ref: ${{ github.event.pull_request.head.sha }}
       base: ${{ github.event.pull_request.base.sha }}
-      creator_ref: ci-v2-e2e
