@@ -25,12 +25,12 @@ def leg(name, fn):
     try:
         facts[name] = fn()
     except Exception as e:  # a refusal is a result here
-        facts[name] = f"REFUSED {type(e).__name__}: {e}"
+        facts[name] = f"REFUSED {type(e).__name__}: {str(e)[:300]}"
     print(f"{name}: {facts[name]}", flush=True)
 
 
 def rel(a: torch.Tensor, b: torch.Tensor) -> float:
-    a, b = a.double().cpu(), b.double().cpu()
+    a, b = a.cpu().double(), b.cpu().double()
     return float((a - b).norm() / b.norm())
 
 
