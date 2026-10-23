@@ -12,6 +12,14 @@ from pathlib import Path
 
 import pytest
 
+from cozy_runtime.internal import kernel_ready
+
+
+@pytest.fixture(autouse=True)
+def _kernels_open_per_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each test opens its own kernels: `kernel_ready` holds them for a process's life."""
+    monkeypatch.setattr(kernel_ready, "_SLOTS", {})
+
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(

@@ -3890,9 +3890,10 @@ class Executor:
         return None if self.rank == 0 else target
 
     def _upgrade_attention(self, call: object = None) -> bool:
-        """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE: at each step or stage boundary
-        of one, and between requests, a kernel the selection passed over while it compiled is
-        ready, so the construction selects again and serves it from the next step on (a run
+        """A RUN WITHOUT AN OVERRIDE NEVER WAITS FOR A COMPILE OR A SELF-CHECK: at each step or
+        stage boundary of one, and between requests, a kernel the selection passed over while it
+        opened (`kernel_ready`: built and checked off the request) is ready, so the construction
+        selects again and serves it from the next step on (a run
         may mix kernels, owner ruling 2026-10-09); a group's followers take rank 0's kernels
         once no call holds them. Where a selection or a follower cannot, the prepared one
         stays and is not tried again. Sites every call reads change only while no other call is
@@ -3960,6 +3961,7 @@ class Executor:
                             construction=self.construction,
                             model_key=self._group_model_key,
                             adopt=mine,
+                            serving=request_path.in_flight(),
                         )
                     )
                 )
@@ -4033,7 +4035,8 @@ class Executor:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
         if command.adopt is not UNSET:
-            return self._adopt_attention(command, command.adopt)
+            with request_path.serving() if command.serving else contextlib.nullcontext():
+                return self._adopt_attention(command, command.adopt)
         self._attention_hold.close()
         self._producer_hold = None
         if command.pin is UNSET:
