@@ -1,7 +1,8 @@
 """AcceleratorOps: the device boundary, the second of exactly two platform seams (#447).
 
 Backends are `cuda` and `mps`, period — the no-device-zoo rule of #422 stands; what #447
-amends is WHERE the branch lives. Every `if backend == "mps"` belongs HERE, not spread
+amends is WHERE the branch lives. A process that sees no GPU computes on `cpu`: the degraded
+tier every model still runs on (owner, 10-23), slowly, with host RAM as its device memory. Every `if backend == "mps"` belongs HERE, not spread
 through lifecycle, fill and ledger paths. Enumerated implementations, no registration
 mechanism: an unimplemented (backend, operation) pair refuses TYPED.
 
@@ -27,6 +28,7 @@ from types import ModuleType
 from typing import Any, Literal
 
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
+from cozy_runtime.internal.hostfacts import available_memory, physical_memory
 
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
 #: silently runs unsupported operations on CPU, which violates the CPU-refusal law. Forced,
@@ -87,7 +89,7 @@ def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
     """
     if not pids:
         return {}
-    if kind == "mps":
+    if kind in ("mps", "cpu"):
         return {pid: ProcessMemory("unreadable") for pid in pids}
     table = _nvml_compute_table()
     if table is None:
@@ -245,7 +247,7 @@ def process_memories_by_device(
     reports HOST pids, so a row here can only ever confirm the OS-state half, never
     replace it.
     """
-    if not pids or kind == "mps":
+    if not pids or kind in ("mps", "cpu"):
         return {device: {pid: ProcessMemory("unreadable") for pid in pids} for device in devices}
     library = _nvml_library()
     out: dict[str, dict[int, ProcessMemory]] = {}
@@ -376,6 +378,15 @@ def drives_display(index: int) -> bool:
     return bool(active == _NVML_SUCCESS and state.value == 1)
 
 
+def host_memory() -> DeviceMemory:
+    """The host's RAM as a CPU device's memory: what the OS can give now, and all of it."""
+    if sys.platform == "darwin":
+        return _device_memory_of(_available(), physical_memory())
+    if sys.platform == "win32":
+        return _device_memory_of(available_memory(), physical_memory())
+    return _host_pool()
+
+
 def _device_memory_of(free: int, total: int) -> DeviceMemory:
     if total <= 0 or free < 0 or free > total:
         return DeviceMemory("unreadable")
@@ -397,6 +408,8 @@ def device_memory(device: str, kind: str) -> DeviceMemory:
     whose capacity cannot be read cannot be shown to fit anything. MPS has no per-device
     driver query.
     """
+    if kind == "cpu":
+        return host_memory()
     if kind == "mps" or not device:
         return DeviceMemory("unreadable")
     through_nvml = _nvml_device_memory(device)
@@ -503,6 +516,14 @@ def allocation(torch: Any, kind: str, device: Any = None) -> dict[str, int]:
     """The allocator's live numbers plus the driver's own view — the only number that sees
     other processes. On unified memory the device is this process's budget
     (`unified_budget`) and the driver's figure counts this process's Metal buffers only."""
+    if kind == "cpu":
+        host = host_memory()
+        return {
+            "allocated_bytes": 0,
+            "reserved_bytes": 0,
+            "driver_free_bytes": host.free_bytes,
+            "driver_total_bytes": host.total_bytes,
+        }
     if kind == "mps":
         driver, total = int(torch.mps.driver_allocated_memory()), unified_budget(torch)
         return {
@@ -523,7 +544,10 @@ def allocation(torch: Any, kind: str, device: Any = None) -> dict[str, int]:
 def allocated(torch: Any, kind: str, device: Any = None) -> int:
     """The allocator's live bytes ALONE. Separate from `allocation` on purpose: the
     residency plane reads this on every stage and every eviction, and the driver query
-    `allocation` also makes is far too expensive to ride along on that path."""
+    `allocation` also makes is far too expensive to ride along on that path. A CPU keeps no
+    device allocator: none."""
+    if kind == "cpu":
+        return 0
     if kind == "mps":
         return int(torch.mps.current_allocated_memory())
     return int(torch.cuda.memory_allocated(device))
@@ -536,6 +560,8 @@ _HELD = [0, 0]
 
 def reserved(torch: ModuleType, kind: str) -> int:
     """The allocator's reserved bytes ALONE: live tensors plus its idle cache."""
+    if kind == "cpu":
+        return 0
     if kind == "mps":
         return int(torch.mps.driver_allocated_memory())
     return int(torch.cuda.memory_reserved())
@@ -565,6 +591,8 @@ def drop_peak(torch: ModuleType, kind: str) -> None:
 
 def section_peak(torch: ModuleType, kind: str) -> int:
     """The high-water mark since `hold_peak`."""
+    if kind == "cpu":
+        return 0
     if kind == "mps":
         return allocated(torch, kind)
     return int(torch.cuda.max_memory_allocated())
@@ -573,7 +601,7 @@ def section_peak(torch: ModuleType, kind: str) -> int:
 def peak_allocated(torch: Any, kind: str) -> int:
     """The high-water mark since the last `reset_peak` — the number the ledger prices an
     attempt's activations from, which the live figure structurally cannot give."""
-    if kind == "mps":
+    if kind in ("mps", "cpu"):
         return max(allocated(torch, kind), _HELD[0])
     return max(int(torch.cuda.max_memory_allocated()), _HELD[0])
 
@@ -581,7 +609,7 @@ def peak_allocated(torch: Any, kind: str) -> int:
 def peak_reserved(torch: Any, kind: str) -> int:
     """The allocator's reserved high-water mark since the last `reset_peak`: live tensors plus
     the segments torch held for them, which is what a stage takes from the device."""
-    if kind == "mps":
+    if kind in ("mps", "cpu"):
         return max(reserved(torch, kind), _HELD[1])
     return max(int(torch.cuda.max_memory_reserved()), _HELD[1])
 
@@ -618,7 +646,9 @@ def completion_event(torch: Any, kind: str) -> Any:
 
 def streams_idle(torch: Any, kind: str) -> bool:
     """Whether the device has nothing outstanding. The device's OWN answer to quiescence,
-    which is why a terminal may be recorded on it rather than on a timer."""
+    which is why a terminal may be recorded on it rather than on a timer. Host code is done."""
+    if kind == "cpu":
+        return True
     if kind == "mps":
         return bool(completion_event(torch, kind).query())
     return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
@@ -626,7 +656,10 @@ def streams_idle(torch: Any, kind: str) -> bool:
 
 def present(torch: Any, kind: str) -> bool:
     """Whether THIS backend is actually usable in this process. `False` is a fact, not a
-    refusal: a torch-bearing process with no card is a legitimate weightless executor."""
+    refusal: a torch-bearing process with no card is a legitimate weightless executor, and a
+    CPU executor has no accelerator to be present."""
+    if kind == "cpu":
+        return False
     if kind == "mps":
         return not sees_no_gpu() and bool(torch.backends.mps.is_available())
     return not sees_no_gpu() and bool(torch.cuda.is_available())
@@ -647,6 +680,8 @@ def device_identity(torch: Any, kind: str, index: int = 0) -> dict[str, Any]:
     display driver version proper is an NVML query that `encoding.measure_device` makes with
     the SELECTED device index. Both ride the key.
     """
+    if kind == "cpu":
+        return {"name": cpu_name(), "sm": 0, "cuda_runtime": "", "driver_api": ""}
     if kind == "mps":
         # Apple's GPU is the chip's; its "driver" is the macOS release (bf16 needs 14).
         return {
@@ -668,13 +703,14 @@ def device_identity(torch: Any, kind: str, index: int = 0) -> dict[str, Any]:
     }
 
 
-def host_backend_family() -> Literal["cuda", "mps"]:
-    """The accelerator FAMILY this host could serve — `mps` on Apple silicon, else `cuda`.
-    A platform fact, not a capability claim (present-but-unqualified, #446); cheap enough
-    for the spawn path, unlike hostfacts' nvidia-smi measurement."""
+def host_backend_family() -> Literal["cuda", "mps", "cpu"]:
+    """The device FAMILY this process serves — `mps` on Apple silicon, `cpu` where it sees no
+    GPU (the degraded tier: every model runs, slowly), else `cuda`. A platform fact, not a
+    capability claim (present-but-unqualified, #446); cheap enough for the spawn path, unlike
+    hostfacts' nvidia-smi measurement."""
     if sys.platform == "darwin" and platform.machine() == "arm64":
         return "mps"
-    return "cuda"
+    return "cpu" if sees_no_gpu() else "cuda"
 
 
 def child_env_law(kind: str) -> dict[str, str]:
@@ -702,8 +738,8 @@ def memory_class(kind: str) -> Literal["discrete", "unified"]:
     """How the device's memory relates to the host's (design §6.2). `unified`: one pool, so
     weights never page between a host and a device tier and "offload to CPU" frees nothing.
     Apple GPUs are unified; CUDA cards are discrete here (coherent and integrated CUDA
-    machines are TensorD's to detect)."""
-    return "unified" if kind == "mps" else "discrete"
+    machines are TensorD's to detect). A CPU's device memory is the host's own: unified."""
+    return "unified" if kind in ("mps", "cpu") else "discrete"
 
 
 #: torch's own MPS high watermark, as a fraction of Metal's recommended working set
@@ -771,6 +807,18 @@ def bf16_supported(kind: str) -> bool:
     return major.isdigit() and int(major) >= 14
 
 
+def cpu_name() -> str:
+    """The host CPU's own name (`AMD EPYC 7763 64-Core Processor`), or `cpu` where the OS says
+    nothing."""
+    with suppress(OSError):
+        for line in Path("/proc/cpuinfo").read_text().splitlines():
+            if line.startswith("model name"):
+                return line.partition(":")[2].strip() or "cpu"
+    if sys.platform == "darwin":
+        return apple_chip()
+    return platform.processor() or "cpu"
+
+
 def apple_chip() -> str:
     """The Apple chip's own name (`Apple M4 Pro`), or `apple` where sysctl says nothing."""
     with suppress(OSError, subprocess.SubprocessError):
@@ -787,6 +835,11 @@ def apple_chip() -> str:
 
 #: What a backend serves without, and what serves instead: one run warning each.
 UNAVAILABLE: dict[str, tuple[tuple[str, str], ...]] = {
+    "cpu": (
+        ("GPU execution", "degraded mode on the CPU, many times slower; `--on new` rents a GPU"),
+        ("fp8, int8 and nvfp4 lanes", "16-bit weights"),
+        ("custom attention kernels", "PyTorch SDPA"),
+    ),
     "mps": (
         ("weight plane GPU and pinned tiers", "weights are read from the page cache"),
         ("native CUDA kernels and Triton", "PyTorch's own MPS kernels"),

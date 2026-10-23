@@ -50,6 +50,13 @@ if sys.platform == "win32":
             return 0
         return int(status.ullTotalPhys)
 
+    def available_memory() -> int:
+        """What the host can give without paging, in bytes; 0 where it cannot be read."""
+        status = _MemoryStatus(dwLength=ctypes.sizeof(_MemoryStatus))
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return 0
+        return int(status.ullAvailPhys)
+
 else:
 
     def physical_memory() -> int:
@@ -58,6 +65,17 @@ else:
             return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
         except (ValueError, OSError):
             return 0
+
+    def available_memory() -> int:
+        """What the host can give without paging (`MemAvailable`), in bytes; 0 where it cannot
+        be read. macOS counts its own pages (`accel`)."""
+        try:
+            for line in Path("/proc/meminfo").read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+        return 0
 
 
 @dataclass(frozen=True, slots=True)
