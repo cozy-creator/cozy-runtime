@@ -232,6 +232,9 @@ _AUTHOR_TYPES = (
     "Assets",
     "Settings",
     "Secrets",
+    "QuantizationPlan",
+    "SelectionPlan",
+    "EncodingRule",
     *(cls.__name__ for cls in SERVICES.values()),
 )
 #: Author-surface callables a folded constant may reach: each validates its own arguments.

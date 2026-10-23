@@ -16,9 +16,10 @@ import numpy as np
 import pytest
 import tensorfs
 
-from cozy_runtime.author import ModelArtifact
+from cozy_runtime.author import ModelArtifact, describe
 from cozy_runtime.author._executor_requests import Answer, CheckpointItem, Reply, Request, refuse
 from cozy_runtime.author._recipes import fingerprint
+from cozy_runtime.derive import operations
 from cozy_runtime.derive import safetensors_io as st
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.discovery import Discovered, discover
@@ -102,6 +103,18 @@ def test_the_static_describe_records_recipes_and_the_quantize_that_runs_them(
     assert lanes == ["bf16", "head", "int8", "w4a8", "z"]
     assert entry["invocable"]["module"] == "cozy_runtime.derive.recipes"
     # The imported app serves the same entrypoint, from the same declarations.
+    imported = package_interface.source_facts(package_interface.build(found))
+    package_interface.compare(document, imported, ("the source reading", "the imported app"))
+
+
+def test_the_runtime_operations_still_take_a_callers_plan() -> None:
+    """The builtin `quantize` a job calls with its own plan reads the plan type from the author
+    surface, statically as on import (every environment describes it)."""
+    document = static_interface.build_builtin("operations")
+    module = sys.modules[operations.app.get("quantize").fn.__module__]
+    found = Discovered(
+        operations.app, document["application"], PROJECT, module, describe(operations.app)
+    )
     imported = package_interface.source_facts(package_interface.build(found))
     package_interface.compare(document, imported, ("the source reading", "the imported app"))
 
