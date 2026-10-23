@@ -191,9 +191,7 @@ def test_the_known_violations_are_exactly_cr_210s_two_captures_each_marked_where
 WAITING = {
     "cozy_runtime.internal.machine_kernels.main": "the machine's kernel boot, its own process",
     "cozy_runtime.internal.prebuilt.fa3": "the conformance CLI",
-    "cozy_runtime.internal.prebuilt.library": "cr-217 first-GEMM self-checks",
-    "cozy_runtime.internal.triton_kernels.load": "cr-217 Triton kernels",
-    "cozy_runtime.internal.w4a8_linear.native": "cr-217 first-GEMM self-checks",
+    "cozy_runtime.internal.triton_kernels.load": "a package's `Plan.load`, at its preparation",
 }
 
 

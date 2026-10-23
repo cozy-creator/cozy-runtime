@@ -16,7 +16,7 @@ from cozy_runtime import _kernels
 from cozy_runtime.author._services import Attempt
 from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8
 from cozy_runtime.derive.microscale import encode_int8_convrot256
-from cozy_runtime.internal import fp8_linear, int8_linear, prebuilt, probe
+from cozy_runtime.internal import fp8_linear, int8_linear, kernel_ready, prebuilt, probe
 from cozy_runtime.internal.encoding import (
     DeviceFacts,
     Encoded,
@@ -209,18 +209,16 @@ def test_a_run_names_each_components_gemm_kernel_and_each_fallback(tmp_path: Pat
         refused,
     ]
 
-    int8_linear._NATIVE[0] = int8_linear._Build(final="RuntimeError: no nvcc")
-    try:
-        assert emitted() == [
-            int8_row("text_encoder", 1),
-            int8_fallback("text_encoder", 1),
-            int8_row("transformer", 2),
-            int8_fallback("transformer", 2),
-            nvfp4_row,
-            refused,
-        ]
-    finally:
-        del int8_linear._NATIVE[0]
+    failed = kernel_ready._Slot("failed", error=RuntimeError("no nvcc"))
+    kernel_ready._SLOTS[f"{int8_linear.NATIVE} cuda:0"] = failed
+    assert emitted() == [
+        int8_row("text_encoder", 1),
+        int8_fallback("text_encoder", 1),
+        int8_row("transformer", 2),
+        int8_fallback("transformer", 2),
+        nvfp4_row,
+        refused,
+    ]
 
 
 def test_a_windows_wheel_names_the_gemm_that_served_and_why(

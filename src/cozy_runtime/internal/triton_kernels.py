@@ -276,9 +276,11 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     return launcher
 
 
-def ready(kernels: TritonKernels, *, device: object) -> Launch | None:
+def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Launch | None:
     """`load`, when this machine's build of `kernels` for `device` is done; None while it
-    compiles (started here when nobody had). Never waits."""
+    compiles (started here when nobody had). Waits for it only when `wait`."""
+    if wait:
+        return load(kernels, device=device)
     _require_triton()
     target = torch.device(device)
     if target.type != "cuda":

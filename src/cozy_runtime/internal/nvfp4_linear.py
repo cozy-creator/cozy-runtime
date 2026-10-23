@@ -18,19 +18,18 @@
 
 from __future__ import annotations
 
-import time
 from collections.abc import Callable
+from functools import partial
 from types import ModuleType
 from typing import TYPE_CHECKING
 
 from cozy_runtime.author.kernels import (
-    KernelsUnavailable,
     Launch,
     TritonEntry,
     TritonKernels,
     readable,
 )
-from cozy_runtime.internal import int8_linear
+from cozy_runtime.internal import int8_linear, kernel_ready
 from cozy_runtime.internal.encoding.formats import NVFP4_BLOCK, Tensor, nvfp4_values
 
 if TYPE_CHECKING:
@@ -261,9 +260,6 @@ def _entries() -> list[TritonEntry]:
 
 #: Built on every executor's GPUs when it starts (`author.kernels`): a request never compiles.
 KERNELS = TritonKernels("cozy-nvfp4", _entries())
-#: How often a call asks whether the start's build has landed: resolution, never a verdict.
-POLL_SECONDS = 1.0
-_LAUNCH: dict[int, tuple[float, Launch | None]] = {}
 #: `triton_kernels.ready`, bound by `triton_kernels` itself when it is imported, which the
 #: executor does past its device boundary: this module imports neither Triton nor torch, so
 #: `encoding` imports in a session without a GPU (test_device_session).
@@ -271,18 +267,10 @@ READY: list[Callable[..., Launch | None]] = []
 
 
 def _launcher(device: Device) -> Launch | None:
-    """This GPU's launcher once the executor start's build is loaded, else None (asked again
-    after `POLL_SECONDS`): the caller then decodes eagerly."""
-    index = device.index or 0
-    asked, launch = _LAUNCH.get(index, (float("-inf"), None))
-    now = time.monotonic()
-    if launch is None and now - asked >= POLL_SECONDS:
-        try:
-            launch = READY[0](KERNELS, device=device) if READY else None
-        except KernelsUnavailable:
-            launch = None
-        _LAUNCH[index] = (now, launch)
-    return launch
+    """This GPU's launcher once the executor start's build serves (`kernel_ready`), else None:
+    the caller then decodes eagerly."""
+    name = f"{KERNELS.name} cuda:{device.index or 0}"
+    return kernel_ready.ready(name, partial(READY[0], KERNELS, device=device)) if READY else None
 
 
 def _major(torch: ModuleType, index: int) -> int:
@@ -402,7 +390,6 @@ def matmul(
 def serving(index: int) -> str:
     """The kernel this card's nvfp4 leaves serve a product of more than `DECODE_ROWS` rows with
     now (fewer rows take the GEMV): a run's `gemm.selected`, read once a run."""
-    kitchen = int8_linear._KITCHEN.get(index)
-    if _MAJOR.get(index, 0) >= 10 and kitchen is not None and kitchen.served is not None:
+    if _MAJOR.get(index, 0) >= 10 and int8_linear.kitchen_serves(index):
         return int8_linear.ARTIFACT
-    return DECODE if _LAUNCH.get(index, (0.0, None))[1] is not None else EAGER
+    return DECODE if kernel_ready.ready(f"{KERNELS.name} cuda:{index}") is not None else EAGER
