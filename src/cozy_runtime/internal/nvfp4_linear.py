@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Callable
 from functools import partial
 from types import ModuleType
@@ -224,12 +225,23 @@ def _entries() -> list[TritonEntry]:
     weight = {"w_ptr": "*u8", "s_ptr": "*u8", "two_ptr": "*fp32", "x_ptr": "*bf16"}
 
     def signature(kernel: triton.JITFunction, **types: str) -> dict[str, str]:
-        # Constexprs by the kernel's own annotations: N and K are runtime sizes.
+        # Constexprs by the kernel's own annotations: N and K are runtime sizes. Read off its
+        # Python function, which a JITFunction and the interpreter's InterpretedFunction both
+        # keep as `fn` (the interpreter's has no `params`).
+        def constexpr(annotation: object) -> bool:
+            return annotation is tl.constexpr or str(annotation).endswith("constexpr")
+
         return {
-            p.name: types.get(p.name)
-            or weight.get(p.name)
-            or ("constexpr" if p.is_constexpr else "*bf16" if p.name.endswith("_ptr") else "i32")
-            for p in kernel.params
+            name: types.get(name)
+            or weight.get(name)
+            or (
+                "constexpr"
+                if constexpr(p.annotation)
+                else "*bf16"
+                if name.endswith("_ptr")
+                else "i32"
+            )
+            for name, p in inspect.signature(kernel.fn).parameters.items()
         }
 
     entries = [

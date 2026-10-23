@@ -83,7 +83,7 @@ def _stored(form: int, weight: Any) -> tuple[dict[str, Any], Any]:
     if form == lora_bake.ROWWISE:
         scale = (weight.abs().amax(dim=1) / 448).clamp(min=1e-12)
         data = (weight / scale[:, None]).to(torch.float8_e4m3fn)
-        return {"data": data, "scale": scale}, scale[:, None].double()
+        return {"weight": data, "scale": scale}, scale[:, None].double()
     dtype = (torch.bfloat16, torch.float16, torch.float32)[form]
     return {"value": weight.to(dtype)}, torch.ones(())
 
@@ -91,7 +91,7 @@ def _stored(form: int, weight: Any) -> tuple[dict[str, Any], Any]:
 def _values(stored: dict[str, Any], unit: Any) -> Any:
     if "value" in stored:
         return stored["value"].double()
-    return lora_bake.decode_e4m3(torch, stored["data"]).double() * unit
+    return lora_bake.decode_e4m3(torch, stored["weight"]).double() * unit
 
 
 def _copy(stored: dict[str, Any]) -> dict[str, Any]:
@@ -99,7 +99,7 @@ def _copy(stored: dict[str, Any]) -> dict[str, Any]:
 
 
 def _bytes(stored: dict[str, Any]) -> Any:
-    tensor = stored["data"] if "data" in stored else stored["value"]
+    tensor = stored["weight"] if "weight" in stored else stored["value"]
     return tensor.view(torch.uint8) if tensor.dtype == torch.float8_e4m3fn else tensor
 
 
@@ -171,13 +171,13 @@ def test_the_build_check_passes_a_correct_kernel() -> None:
 @interpreted
 def test_the_reserved_codes_decode_to_their_signed_maximum() -> None:
     codes = torch.arange(256, dtype=torch.int32).to(torch.uint8).view(8, 32)
-    stored = {"data": codes.clone().view(torch.float8_e4m3fn), "scale": torch.ones(8)}
+    stored = {"weight": codes.clone().view(torch.float8_e4m3fn), "scale": torch.ones(8)}
     lora_bake.fused(torch, stored, torch.zeros(1, 32), torch.zeros(8, 1), 0)
     # As the eager bake: the reserved codes saturate and a negative zero adds to a positive one.
     expected = codes.clone()
     for code, stays in ((0x7F, 0x7E), (0xFF, 0xFE), (0x80, 0)):
         expected[codes == code] = stays
-    assert torch.equal(stored["data"].view(torch.uint8), expected)
+    assert torch.equal(stored["weight"].view(torch.uint8), expected)
 
 
 @interpreted
@@ -196,20 +196,20 @@ def test_a_fused_int8_convrot_bake_stores_a_rotated_neighbour_without_bias() -> 
     )
     payload = payload.clamp(-127, 127)  # beyond the grid an element saturates
     zero = data.clone()
-    lora_bake.fused(torch, {"data": zero, "scale": scale}, down * 0, up, 1)
+    lora_bake.fused(torch, {"weight": zero, "scale": scale}, down * 0, up, 1)
     assert torch.equal(zero, data)
     bias, first = [], None
     for seed in range(4):
         fused, eager = data.clone(), data.clone()
-        lora_bake.fused(torch, {"data": fused, "scale": scale}, down, up, seed)
+        lora_bake.fused(torch, {"weight": fused, "scale": scale}, down, up, seed)
         stats = lora_bake.Stats()
-        lora_bake.bake(torch, {"data": eager, "scale": scale}, down, up, seed=seed, stats=stats)
+        lora_bake.bake(torch, {"weight": eager, "scale": scale}, down, up, seed=seed, stats=stats)
         for got in (fused, eager):
             assert ((got.double() - payload).abs() < 1 + 1e-6).all()
         bias.append(float((fused.double() - payload).mean()))
         first = fused if first is None else first
     again = data.clone()
-    lora_bake.fused(torch, {"data": again, "scale": scale}, down, up, 0)
+    lora_bake.fused(torch, {"weight": again, "scale": scale}, down, up, 0)
     assert torch.equal(again, first)
     assert abs(sum(bias) / len(bias)) < 0.01
 
