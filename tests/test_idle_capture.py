@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Iterator
+
+import pytest
 
 from cozy_runtime import graphs
 from cozy_runtime.internal import executor
@@ -36,6 +39,17 @@ class _Capture:
         return True
 
 
+@pytest.fixture(autouse=True)
+def alone() -> Iterator[None]:
+    """The process's idle queue holds only this test's jobs (an earlier test's stay aside)."""
+    with graphs.IDLE.lock:
+        earlier = list(graphs.IDLE.jobs)
+        graphs.IDLE.jobs.clear()
+    yield
+    with graphs.IDLE.lock:
+        graphs.IDLE.jobs.extend(earlier)
+
+
 def _serving() -> executor._Order:
     order = executor._Order()
     threading.Thread(target=executor._idle, args=(order,), daemon=True).start()
@@ -43,7 +57,7 @@ def _serving() -> executor._Order:
 
 
 def _drained() -> None:
-    assert not graphs.IDLE.jobs, "an earlier test left idle work queued"
+    assert not graphs.IDLE.jobs
 
 
 def test_nothing_records_inside_a_request_and_the_idle_period_after_it_does() -> None:

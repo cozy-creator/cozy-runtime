@@ -620,7 +620,7 @@ def test_a_cold_request_runs_as_written_and_the_next_replays_every_step() -> Non
     inner = [
         r for m, r in graphs._RECORDERS.items() if m is not unet and graphs._REGIONS[m][0]() is unet
     ]
-    assert inner and not any(r.capture_attempts for r in inner)
+    assert not any(r.capture_attempts for r in inner)  # unplaced, its root is its one region
     torch.testing.assert_close(got, want)
     graphs.release(torch, unet)
 
@@ -640,8 +640,10 @@ def test_a_device_bound_region_never_records() -> None:
         module(x)
     recorder = graphs._RECORDERS[module]
     assert not recorder.recordings and recorder.replays == 0
-    (why,) = recorder.failed.values()
+    (why,) = recorder.judged.values()
     assert why.startswith("device-bound"), why
+    graphs._shed(torch, recorder.domain)
+    assert recorder.judged  # a measured verdict outlives the graphs: it never queues again
     ((submit, busy),) = recorder.bound.values()
     assert busy > submit
     graphs.release(torch, module)
