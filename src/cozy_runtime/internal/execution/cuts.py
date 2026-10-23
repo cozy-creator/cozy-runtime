@@ -20,21 +20,12 @@ import torch
 from torch import Tensor, nn
 
 from cozy_runtime.internal.execution import catch
+from cozy_runtime.internal.execution.sizing import levels, pieces
 
 type Band = Callable[[int, int], Tensor]
 type Attention = Callable[[Tensor, Tensor, Tensor, Tensor | None], Tensor]
 #: diffusers' token-wise feed-forwards and the activation projections inside them
 _FFN = frozenset({"FeedForward", "GELU", "GEGLU", "SwiGLU", "ApproximateGELU", "LinearActivation"})
-
-
-def levels(units: int) -> int:
-    """The finest level of `units` pieces: one unit a piece."""
-    return max(units - 1, 0).bit_length()
-
-
-def pieces(units: int, level: int) -> int:
-    """Units a piece holds at `level` (2^level pieces, the last one short)."""
-    return -(-units // (1 << level))
 
 
 # --------------------------------------------------------------------------- call cuts
