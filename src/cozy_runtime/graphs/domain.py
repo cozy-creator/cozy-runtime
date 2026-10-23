@@ -57,6 +57,7 @@ class Domain:
         #: the graphs' shared capture pool, its accounting cache, the recorders using it, and
         #: the component roots they serve (the cache's components), first capture first
         self.captures: Any = None
+        self.anchor: Any = None
         self.cache: Any = None
         self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
         self.served: list[weakref.ref[Any]] = []
@@ -184,11 +185,20 @@ class Domain:
             self.closed = self.fenced = True
 
     def capture_pool(self) -> Any:
-        """The pool every graph of this component records into (made on first use)."""
+        """The pool every graph of the device records into (made on first use, after
+        `initialize`), held by a never-replayed graph of its own: torch 2.14 releases a pool's
+        host side when its last graph resets, and the next capture into it trips
+        CachingHostAllocator's use_count assert (v16: a no-gain verdict reset the pool's only
+        graph). Step 6's allocator hooks own pool lifetime and retire the anchor."""
         if self.captures is None:
             self.captures = (
                 self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
             )
+            self.anchor = self.torch.cuda.CUDAGraph()
+            with self.torch.cuda.stream(self.stream):
+                self.anchor.capture_begin(pool=self.captures, capture_error_mode="thread_local")
+                self.join.record(self.stream)
+                self.anchor.capture_end()
         return self.captures
 
     def serve(self, root: Any) -> bool:
@@ -201,6 +211,9 @@ class Domain:
     def drop_captures(self) -> None:
         """After every graph recorded into it is reset and its static buffers dropped (its cache
         stays registered: the next capture registers it again)."""
+        if self.anchor is not None:
+            self.anchor.reset()
+            self.anchor = None
         self.captures = None  # MemPool destruction releases this pool, never a global flush.
         self.served = []
 

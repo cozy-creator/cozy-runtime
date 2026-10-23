@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -10,6 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from cozy_runtime import graphs  # noqa: E402
+from cozy_runtime.author import ConformanceError, Model, graph_keys  # noqa: E402
 from cozy_runtime.author._attention_scope import AttentionLayout, attention_scope  # noqa: E402
 from cozy_runtime.author._model import WARNINGS  # noqa: E402
 
@@ -45,6 +47,35 @@ def _counting() -> Any:
             return x + self.calls
 
     return Counting()
+
+
+def test_a_root_attribute_that_changes_undeclared_is_reported() -> None:
+    """Between a component root's first two calls, a plain attribute that changed and is not
+    declared in `__graph_keys__` is reported (`task conform` fails on it); a declared one keys
+    its graphs, and later calls are not watched."""
+
+    class Declares:
+        __graph_keys__ = MappingProxyType({"net": ("mode",)})
+
+    net = torch.nn.Linear(4, 4)
+    graphs.install(torch, Declares(), {"net": net})
+    graphs.UNDECLARED.clear()
+    with torch.inference_mode():
+        for mode, step in ((1, 0), (2, 1), (2, 2)):
+            net.mode, net.step = mode, step
+            net(torch.ones(1, 4))
+    assert {"Linear": {"step"}} == graphs.UNDECLARED
+
+
+def test_graph_keys_declares_the_attributes_that_steer_a_component() -> None:
+    class Piped(Model[object]):
+        pass
+
+    assert graph_keys(unet=("hidiffusion_active", "config.mode"))(Piped).__graph_keys__ == {
+        "unet": ("hidiffusion_active", "config.mode")
+    }
+    with pytest.raises(ConformanceError):
+        graph_keys(unet="hidiffusion_active")(Piped)  # type: ignore[arg-type]
 
 
 def test_calls_on_a_cpu_run_as_written() -> None:
@@ -116,15 +147,23 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
-def test_a_call_that_depends_on_hidden_state_runs_as_written() -> None:
+def test_a_forward_that_changes_its_own_state_never_records() -> None:
+    """A replay would not keep its count: the idle period finds the state the recording runs
+    changed, puts it back and leaves the component as written."""
     module = _counting().cuda()
     graphs.install(torch, object(), {"counting": module})
-    WARNINGS.clear()
     with torch.inference_mode():
         x = torch.zeros(3, device="cuda")
-        for _ in range(4):
+        for _ in range(2):
             module(x)
-    assert module not in graphs._RECORDERS
+        _idle()
+        for _ in range(2):
+            module(x)
+    recorder = graphs._RECORDERS[module]
+    assert not recorder.recordings and recorder.replays == 0
+    (why,) = recorder.judged.values()
+    assert "calls" in why, why
+    assert module.calls.item() == 4  # the four real calls' count: recording left none of its own
 
 
 def _stepped() -> Any:
@@ -163,14 +202,17 @@ def test_a_first_request_equals_a_warm_one_for_a_module_with_state() -> None:
 
     with torch.inference_mode():
         first, steps = request()
+        _idle()
         warm, again = request()
     assert steps == again == 3
     assert all(torch.equal(a, b) for a, b in zip(first, warm, strict=True))
-    assert module not in graphs._RECORDERS
+    recorder = graphs._RECORDERS[module]
+    assert not recorder.recordings and "timestep" in next(iter(recorder.judged.values()))
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
-def test_an_unknown_python_hook_keeps_the_region_eager() -> None:
+def test_a_package_hook_keeps_a_component_as_written() -> None:
+    """A hook runs Python at every call, which a replay would skip."""
     module = _mlp("cuda")
     called: list[int] = []
 
@@ -179,10 +221,14 @@ def test_an_unknown_python_hook_keeps_the_region_eager() -> None:
 
     module[1].register_forward_pre_hook(hook)
     with torch.inference_mode():
-        for _ in range(5):
+        for turn in range(5):
             x = torch.randn(4, 64, device="cuda")
             assert torch.allclose(module(x), torch.nn.Sequential.__call__(module, x))
-    assert module not in graphs._RECORDERS and len(called) == 10
+            if turn == 2:
+                _idle()
+    recorder = graphs._RECORDERS[module]
+    assert not recorder.recordings and len(called) == 10
+    assert "hook" in next(iter(recorder.judged.values()))
 
 
 @pytest.mark.real_gpu
@@ -287,74 +333,8 @@ def test_a_shrink_while_a_call_holds_the_domain_completes_at_once() -> None:
         torch.testing.assert_close(result, torch.nn.Sequential.__call__(module, x))
 
 
-def test_a_custom_call_is_not_given_a_library_purity_contract() -> None:
-    calls: list[int] = []
-    base: Any = torch.nn.Linear
-
-    class CustomCall(base):  # type: ignore[misc]
-        def __call__(self, *args: Any, **kwargs: Any) -> Any:
-            calls.append(1)
-            return super().__call__(*args, **kwargs)
-
-    module = CustomCall(4, 4)
-    assert graphs.install(torch, object(), {"custom": module}) == []
-    with torch.inference_mode():
-        module(torch.ones(1, 4))
-    assert calls == [1] and module not in graphs._RECORDERS
-
-
-def test_inherited_forward_does_not_grant_a_custom_call_impl_purity() -> None:
-    calls: list[int] = []
-    base: Any = torch.nn.Linear
-
-    class PackageLinear(base):
-        def _call_impl(self, *args: Any, **kwargs: Any) -> Any:
-            calls.append(1)
-            return super()._call_impl(*args, **kwargs)
-
-    module = PackageLinear(4, 4)
-    assert graphs.install(torch, object(), {"custom": module}) == []
-    with torch.inference_mode():
-        for _ in range(4):
-            module(torch.ones(1, 4))
-    assert calls == [1] * 4 and module not in graphs._RECORDERS
-
-
-def test_only_runtime_generated_classes_unwrap_to_known_contracts() -> None:
-    module = torch.nn.Linear(4, 4)
-    assert graphs.install(torch, object(), {"plain": module}) == ["plain"]
-    assert graphs.safe(torch, module)
-    base: Any = type(module)
-
-    class PackageSubclass(base):
-        pass
-
-    inherited = PackageSubclass(4, 4)
-    assert not graphs.safe(torch, inherited)
-    assert graphs.install(torch, object(), {"inherited": inherited}) == []
-
-
-def test_execution_wrapper_does_not_hide_a_package_instance_forward() -> None:
-    from cozy_runtime.internal import execution
-
-    calls: list[int] = []
-    module = torch.nn.Linear(4, 4)
-    original = module.forward
-
-    def package(x: Any) -> Any:
-        calls.append(1)
-        return original(x)
-
-    module.forward = package
-    execution.install(module)
-    assert graphs.install(torch, object(), {"package": module}) == []
-    with torch.inference_mode():
-        module(torch.ones(1, 4))
-    assert calls == [1] and module not in graphs._RECORDERS
-
-
 def _two_segments() -> Any:
-    """An unknown root (eager) whose two pure children replay, the second reading the first."""
+    """A package's root module of its own, the second segment reading the first."""
     torch.manual_seed(0)
     base: Any = torch.nn.Module
 
@@ -372,7 +352,7 @@ def _two_segments() -> Any:
             return self.second(self.first(x)) * 2
 
     module = TwoSegments().cuda()
-    assert graphs.install(torch, object(), {"two": module}) == ["two.first", "two.second"]
+    assert graphs.install(torch, object(), {"two": module}) == ["two"]
     return module
 
 
@@ -385,7 +365,9 @@ def _as_written(module: Any, x: Any) -> Any:
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
-def test_segments_record_at_idle_and_a_held_output_is_never_overwritten() -> None:
+def test_a_component_of_package_code_records_whole() -> None:
+    """No purity contract: a component's root is its region whatever code it runs, and its
+    replay is served once it matches eager bit for bit."""
     module = _two_segments()
     with torch.inference_mode():
         for _ in range(2):
@@ -395,168 +377,19 @@ def test_segments_record_at_idle_and_a_held_output_is_never_overwritten() -> Non
         for _ in range(2):
             x = torch.randn(4, 64, device="cuda")
             torch.testing.assert_close(module(x), _as_written(module, x))
-        first, second = graphs._RECORDERS[module.first], graphs._RECORDERS[module.second]
-        assert first.replays == second.replays == 2
-        # Each graph copies its input in: the second's is the first's lent output.
-        assert first.copy_bytes == second.copy_bytes == 2 * x.nbytes
-        # Purity and structure are read once per root call, for every region under it.
-        stamps = [graphs._CHECKED[m][0] for m in (module.first, module.second)]
-        assert stamps[0] is stamps[1] is not None
-        module(x)
-        assert graphs._CHECKED[module.first][0] is graphs._CHECKED[module.second][0]
-        assert graphs._CHECKED[module.first][0] is not stamps[0]
-        facts = graphs.describe(module)
-        assert facts["graph_pools"] == 1 and facts["captured_regions"] == ["first", "second"]
-        # A caller holding a lent output: the next call runs as written and leaves it intact.
-        held = module.first(x)
-        kept = held.clone()
-        replays = first.replays
-        other = torch.randn(4, 64, device="cuda")
-        torch.testing.assert_close(module.first(other), _as_written(module.first, other))
-        assert first.replays == replays and torch.equal(held, kept) and first.held == 1
-        assert graphs.describe(module)["held_calls"] == 1
-        del held
-        torch.testing.assert_close(module.first(other), _as_written(module.first, other))
-        assert first.replays == replays + 1
+    recorder = graphs._RECORDERS[module]
+    assert recorder.replays == 2 and module.first not in graphs._RECORDERS
+    assert graphs.describe(module)["captured_regions"] == [""]
     graphs.release(torch, module)
-
-
-@pytest.mark.real_gpu
-@pytest.mark.skipif(not CUDA, reason="cross-stream readers need a GPU")
-def test_a_reader_on_another_stream_finishes_before_the_next_replay_overwrites_it() -> None:
-    module = _two_segments()
-    side = torch.cuda.Stream()
-    with torch.inference_mode():
-        x, other = (torch.randn(4, 64, device="cuda") for _ in range(2))
-        for _ in range(2):
-            module.first(x)
-        _idle()
-        expected = _as_written(module.first, x)
-        lent = module.first(x)
-        assert graphs._RECORDERS[module.first].replays == 1
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            torch.cuda._sleep(1 << 28)  # the reader is still queued when its alias is dropped
-            read = lent * 1
-        graphs.record_stream(torch, lent, side)
-        del lent
-        again = module.first(other)
-        assert graphs._RECORDERS[module.first].replays == 2
-        torch.cuda.synchronize()
-        assert torch.equal(read, expected)
-        torch.testing.assert_close(again, _as_written(module.first, other))
-    graphs.release(torch, module)
-
-
-def test_a_unet_s_regions_are_its_pure_containers_coarsest_first() -> None:
-    diffusers = pytest.importorskip("diffusers")
-    from tensorfs.varena.torch import blocks_of
-
-    from cozy_runtime.graphs.regions import safe, segments
-
-    unet = diffusers.UNet2DConditionModel(
-        sample_size=8,
-        block_out_channels=(16, 32, 32),
-        layers_per_block=2,
-        down_block_types=("DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D"),
-        up_block_types=("CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"),
-        transformer_layers_per_block=(1, 2, 2),
-        attention_head_dim=(2, 4, 4),
-        cross_attention_dim=16,
-        norm_num_groups=8,
-        use_linear_projection=True,
-    )  # left in training mode, as Runtime constructs it: no gradients, inert dropouts
-    blocks = blocks_of(unet)
-    found = [path for path, _ in segments(torch, unet, blocks)]
-    # The whole UNet first, then its containers: one replay a call while it can be prepared.
-    assert found[0] == ""
-    below = [p for p in found if p and "." not in p.replace("_blocks.", "_blocks:")]
-    expected = ["mid_block", *(f"{n}_blocks.{i}" for n in ("down", "up") for i in range(3))]
-    assert sorted(below) == sorted(expected)
-    # Every block is a finer region too, and no single op is a region of its own.
-    assert set(blocks) <= set(found)
-    assert all(not p or any(b == p or b.startswith(f"{p}.") for b in blocks) for p in found)
-    # A package hook on one block: the containers above it run as written, its siblings replay.
-    hooked = "down_blocks.1.attentions.0.transformer_blocks.0"
-    unet.get_submodule(hooked).register_forward_pre_hook(lambda *_: None)
-    for path, pure in (
-        ("", False),
-        ("down_blocks.1", False),
-        ("down_blocks.1.attentions.0", False),
-        (hooked, False),
-        ("down_blocks.1.attentions.1", True),
-        ("down_blocks.1.resnets.0", True),
-        ("down_blocks.2", True),
-    ):
-        assert safe(torch, unet.get_submodule(path)) is pure, path
-
-    base: Any = diffusers.models.attention_processor.AttnProcessor2_0
-
-    class PackageProcessor(base):  # type: ignore[misc]
-        pass
-
-    attention = unet.get_submodule("up_blocks.0.attentions.0.transformer_blocks.0.attn1")
-    attention.set_processor(PackageProcessor())
-    assert not safe(torch, unet.get_submodule("up_blocks.0"))
-    assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
-    # A dropout that would act in training mode makes its container impure.
-    unet.get_submodule("up_blocks.0.resnets.0.dropout").p = 0.1
-    assert not safe(torch, unet.get_submodule("up_blocks.0.resnets.0"))
-    assert safe(torch, unet.get_submodule("up_blocks.0.resnets.0").eval())
-
-
-def test_a_package_subclass_takes_its_base_s_contract_only_by_declaring_it() -> None:
-    diffusers = pytest.importorskip("diffusers")
-    from cozy_runtime.graphs.regions import safe
-
-    base: Any = diffusers.UNet2DConditionModel
-    config = {
-        "sample_size": 8,
-        "block_out_channels": (16, 32),
-        "layers_per_block": 1,
-        "down_block_types": ("DownBlock2D", "CrossAttnDownBlock2D"),
-        "up_block_types": ("CrossAttnUpBlock2D", "UpBlock2D"),
-        "attention_head_dim": (2, 4),
-        "cross_attention_dim": 16,
-        "norm_num_groups": 8,
-    }
-
-    class Silent(base):  # type: ignore[misc]
-        steps = 0
-
-        def begin(self) -> None:
-            self.steps = 0
-
-    class Declared(Silent):
-        __cozy_graph_contract__ = base  # adds nothing of its own; declares its base's calls
-
-    class Overriding(base):  # type: ignore[misc]
-        def get_time_embed(self, sample: Any, timestep: Any) -> Any:  # a method forward calls
-            return super().get_time_embed(sample, timestep)
-
-    Overriding.__cozy_graph_contract__ = base
-    assert not safe(torch, Silent.from_config(config))  # undeclared: its own code, eager
-    declared = Declared.from_config(config)
-    assert safe(torch, declared)
-    # Runtime's execution layer wraps the root's forward, which Diffusers decorates: still pure
-    # (speed2 13522 kept the whole UNet eager on exactly this).
-    from cozy_runtime.internal import execution
-
-    execution.install(declared)
-    assert safe(torch, declared)
-    assert not safe(torch, Overriding.from_config(config))  # overrides the base: refused
-    declared.register_forward_pre_hook(lambda *_: None)  # HiDiffusion's size hook
-    assert not safe(torch, declared)
 
 
 def _stepping_unet(device: str) -> Any:
-    """sdxl's HiDiffusion UNet with HiDiffusion off: a declared subclass the package sets a
-    step counter on before every call (v6 13590 recaptured the whole UNet every warm step)."""
+    """sdxl's HiDiffusion UNet with HiDiffusion off: a package subclass the package sets a step
+    counter on before every call (v6 13590 recaptured the whole UNet every warm step)."""
     diffusers = pytest.importorskip("diffusers")
     base: Any = diffusers.UNet2DConditionModel
 
     class Stepping(base):  # type: ignore[misc]
-        __cozy_graph_contract__ = base
         cozy_step = 0
 
     torch.manual_seed(2)
@@ -574,25 +407,10 @@ def _stepping_unet(device: str) -> Any:
     ).to(device)
 
 
-def test_only_what_a_contract_can_read_keys_a_region() -> None:
-    """A plain value only package code names (sdxl's `cozy_step`) keys nothing; one the
-    contract's code reads (the UNet's `num_upsamplers`, an attention's `scale`) does."""
-    unet = _stepping_unet("cpu")
-    before = graphs._structure(torch, unet)
-    unet.cozy_step = 7
-    assert graphs._structure(torch, unet) == before
-    unet.num_upsamplers += 1
-    assert graphs._structure(torch, unet) != before
-    unet.num_upsamplers -= 1
-    unet.down_blocks[1].attentions[0].transformer_blocks[0].attn1.scale = 0.5
-    assert graphs._structure(torch, unet) != before
-
-
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
 def test_a_cold_request_runs_as_written_and_the_next_replays_every_step() -> None:
     """The owner: nothing records on a request's path. Twenty cold steps run as written, the
-    idle period records the root once (its regions inside it never), and twenty warm steps
-    replay it."""
+    idle period records the root once, and twenty warm steps replay it."""
     unet = _stepping_unet("cuda")
     graphs.install(torch, object(), {"unet": unet})
     gen = torch.Generator(device="cuda").manual_seed(3)
@@ -617,10 +435,6 @@ def test_a_cold_request_runs_as_written_and_the_next_replays_every_step() -> Non
         graphs.BYPASS.reset(token)
     recorder = graphs._RECORDERS[unet]
     assert (recorder.capture_attempts, recorder.replays) == (1, 20)
-    inner = [
-        r for m, r in graphs._RECORDERS.items() if m is not unet and graphs._REGIONS[m][0]() is unet
-    ]
-    assert not any(r.capture_attempts for r in inner)  # unplaced, its root is its one region
     torch.testing.assert_close(got, want)
     graphs.release(torch, unet)
 

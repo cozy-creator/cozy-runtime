@@ -28,6 +28,7 @@ from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 from typing import (
     Any,
     Concatenate,
@@ -467,6 +468,30 @@ class _Scopes:
 SCOPES = _Scopes()
 
 
+def graph_keys(**components: tuple[str, ...]) -> Callable[[type[ModelT]], type[ModelT]]:
+    """Declare, per component, the attributes of its root module whose values steer its forward
+    (`unet=("hidiffusion_active",)`; a dotted path reaches a submodule's): Runtime keys the
+    component's CUDA graphs by their values at each call. An attribute that changes between
+    calls and is not declared is reported (`task conform` fails on it)."""
+    for name, paths in components.items():
+        if not isinstance(paths, tuple) or not all(
+            isinstance(p, str) and all(part.isidentifier() for part in p.split(".")) for p in paths
+        ):
+            raise ConformanceError(
+                f"@graph_keys({name}=...): a tuple of attribute paths (`a` or `a.b`)",
+                code="graph_keys",
+                fields=[name],
+            )
+
+    def decorate(cls: type[ModelT]) -> type[ModelT]:
+        if not (inspect.isclass(cls) and issubclass(cls, Model)):
+            raise ConformanceError("@graph_keys decorates a Model class", code="graph_keys")
+        cls.__graph_keys__ = dict(components)
+        return cls
+
+    return decorate
+
+
 def uncaptured(*names: str) -> Callable[[type[ModelT]], type[ModelT]]:
     """Declare components whose calls Runtime never records as CUDA graphs: a component whose
     calls depend on state outside their arguments (a cache it mutates, a host-side branch on
@@ -742,6 +767,8 @@ class Model[PipelineT]:
     """`@placeable(...)`: components the runtime may host on another GPU of the group."""
     __uncaptured__: tuple[str, ...] = ()
     """`@uncaptured(...)`: components whose calls are never recorded as CUDA graphs."""
+    __graph_keys__: Mapping[str, tuple[str, ...]] = MappingProxyType({})
+    """`@graph_keys(...)`: per component, the root attributes that key its CUDA graphs."""
 
     __encoded_leaves__: str = "refuse"
     """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.

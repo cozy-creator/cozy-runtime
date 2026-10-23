@@ -100,7 +100,7 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
     backend.models["network"] = model
     placement = Placement(memory, backend)
     installed = graphs.install(torch, object(), {"network": module})
-    assert len(installed) == DEPTH
+    assert len(installed) == DEPTH + 1  # the root, and each block for while it streams
     assert WIDTH * WIDTH * 4 * DEPTH > CAP
 
     def graphed() -> dict[Any, Any]:
@@ -331,8 +331,10 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
             placement.open_attempt()
             steps = [modules["first"], modules["second"]]
             with torch.inference_mode(), memory.request(f"shared-{turn}", steps):
-                hidden = modules["first"](source.to(memory.device))
-                got = modules["second"](hidden).cpu()
+                with placement.using("generate", ("first",)):  # held: each its root's graph
+                    hidden = modules["first"](source.to(memory.device))
+                with placement.using("generate", ("second",)):
+                    got = modules["second"](hidden).cpu()
             torch.testing.assert_close(got, expected, atol=1e-5, rtol=1e-4)
             torch.cuda.synchronize()
             assert graphs.capture_idle(lambda: False)

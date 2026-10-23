@@ -159,7 +159,7 @@ class Backend:
     ) -> Backend:
         """A backend for a driver script with no model class: resolve a `script_plan` over
         these rows, then construct, through the executor's own authority."""
-        facts = measure_device(torch, device.index or 0)
+        facts = measure_device(torch, device.index or 0, device.type)
         providers = launch_providers()
         plan = script_plan(
             rows=rows,
