@@ -66,7 +66,9 @@ def capture(
     """Record a caller-owned capture-safe computation in its already prepared pool.
 
     The caller owns purity, residency, static-data lifetime and all consuming streams. No
-    allocation recovery or chunk selection is allowed inside capture.
+    allocation recovery or chunk selection is allowed inside capture. While it is open the
+    memory knows (`Memory.capturing`): torch skips its release-and-retry during any capture on
+    the device, so another thread's refused allocation makes room at once (A1).
     """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
@@ -74,7 +76,11 @@ def capture(
     stream.wait_stream(current)
     stream.wait_stream(work)
     failure: BaseException | None = None
-    with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
+    with (
+        owner.memory.capturing() if owner.memory is not None else nullcontext(),
+        torch.utils._python_dispatch._disable_current_modes(),
+        torch.cuda.stream(stream),
+    ):
         try:
             graph.capture_begin(pool=pool, capture_error_mode="thread_local")
         except Exception as exc:
