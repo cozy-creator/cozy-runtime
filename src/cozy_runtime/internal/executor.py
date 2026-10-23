@@ -147,6 +147,7 @@ from cozy_runtime.internal import (
     int8_linear,
     kernel_cache,
     kernel_compile,
+    kernel_ready,
     library_oom,
     model_config,
     package_interface,
@@ -3170,6 +3171,7 @@ class Executor:
         of whose GPUs may serve otherwise refuses); the first attempt in also opens the
         residency's attempt."""
         turn = object()
+        kernel_ready.boundary()
         with SCOPES.held(turn):
             target._upgrade_attention(turn)
             refused = target._install_ready_kernels()
@@ -3338,6 +3340,8 @@ class Executor:
         # (`_upgrade_attention`): each selection the run served and from which step.
         segments: list[dict[str, Any]] = []
         later: list[attention.Applied] = []
+        #: each kernel that became ready mid-run, and the step from which it served
+        swapped: list[tuple[str, dict[str, Any]]] = []
         steps: dict[str, int] = {}
         stage = [""]  # the last stage this attempt itself reported
         handler = threading.get_ident()
@@ -3350,6 +3354,8 @@ class Executor:
                 return
             if frame.position is not None:
                 steps[frame.stage] = frame.position
+            at = {"stage": frame.stage, "step": steps.get(frame.stage, 0)}
+            swapped.extend((name, at) for name in kernel_ready.boundary())
             if pin or served_attention is None:
                 return  # an override holds its kernel for every step
             if not segments:
@@ -3486,6 +3492,8 @@ class Executor:
                 took = {"ms": round(ms, 1), "times": times}
                 record.emit("confession", "request_path.blocking", work, **took)
                 record.emit("log", "kernel work blocked the request", "warn", work=work, **took)
+            for name, where in swapped:
+                record.emit("confession", "kernel.ready", name, **where)
             members = self.model_executors or [self]
             facts = next((m.device_facts for m in members if m.device_facts), None)
             if facts is not None and (unnamed := arch.inherited(facts.sm, facts.name)):
@@ -4918,7 +4926,10 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
             "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
         }
     if name == "run":
-        return executor.run(frame)
+        # A follower's call serves rank 0's request: what landed before it serves in it.
+        with request_path.serving():
+            kernel_ready.boundary()
+            return executor.run(frame)
     if name not in executor_commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
     command = executor_commands.decode(frame)

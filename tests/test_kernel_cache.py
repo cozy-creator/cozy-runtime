@@ -250,7 +250,7 @@ _SERVE = """
                dtype=torch.bfloat16) for _ in range(3))
     rows = []
     with attention_sol.observing(kernels=rows):
-        while (loaded := attention_sol._ready(4097, q.device, 5)) is None:
+        while (loaded := attention_sol._ready(4097, q.device, 5)[0]) is None:
             job = attention_sol._job_for(4097, torch.cuda.get_device_capability())
             while kernel_compile.status(store, job).state in ("compiling", "pending"):
                 time.sleep(0.2)
@@ -273,7 +273,7 @@ def test_a_second_process_loads_the_sol_object_the_first_compiled(tmp_path: Path
     own = str(tmp_path / "u1")
     first = json.loads(_run(_SERVE, str(tmp_path / "out0.pt"), own).stdout.splitlines()[-1])
     second = json.loads(_run(_SERVE, str(tmp_path / "out1.pt"), own).stdout.splitlines()[-1])
-    assert first["sources"][0] == "cold_compile" and first["sources"][-1] == "store"
+    assert first["sources"] == ["building", "built"]
     assert first["compiles"] == 0  # the builder process compiled, never this one
     assert second == {"compiles": 0, "sources": ["store"]}
     assert torch.equal(torch.load(tmp_path / "out0.pt"), torch.load(tmp_path / "out1.pt"))

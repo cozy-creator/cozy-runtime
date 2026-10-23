@@ -7,10 +7,11 @@ model supplies its live layout, step policy and dense module paths explicitly.
 The kernel compiles once per object per machine, out of process (`kernel_compile`): one per
 card, and on SM90 one per 64-token block layout (`variant`), which only the request knows. So
 the first sight of a length (a model's intake statement, or the first dense step) submits its
-compile, and conditioning and the dense steps cover it. A sparse step whose object is still
-compiling waits for it, by the build's measured progress: it never runs the dense reference in
-its place. Upstream's preprocess autotuning is pinned to one configuration, because its
-candidates differ bitwise and a timing race must not choose the output.
+compile, and conditioning and the dense steps cover it. A sparse step never waits for it: while
+the object builds, the step runs the dense reference (`dense_building`), and the object serves
+from the step boundary after it is ready (`kernel_ready`); the run's kernel rows say from which
+step. Upstream's preprocess autotuning is pinned to one configuration, because its candidates
+differ bitwise and a timing race must not choose the output.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._attention import _request
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
-from cozy_runtime.internal import accel, arch, config, kernel_cache, kernel_compile
+from cozy_runtime.internal import accel, arch, config, kernel_cache, kernel_compile, kernel_ready
 from cozy_runtime.internal.attention_ulysses import Local
 
 # Tensor and module imports remain type-only, preserving the Torch-free base surface.
@@ -75,6 +76,10 @@ _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
 _KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
     "cozy_sol_kernel_rows", default=None
 )
+#: This request's word on each object it asked for, by key digest: building, served or failed.
+_SAID: ContextVar[dict[str, str] | None] = ContextVar("cozy_sol_said", default=None)
+#: What a step serves in place of a sparse one, by count.
+COUNTS = ("sparse", "dense_step", "dense_building", "dense_path", "dense_prefix")
 
 
 @contextmanager
@@ -87,10 +92,11 @@ def observing(
     """Count successful calls in this request, restoring any outer observation. `kernels`
     receives one row per kernel this request started building or resolved. The request's
     producer states live here too: fresh ones, or a follower attempt's `held` store."""
-    counts = dict.fromkeys(("sparse", "dense_step", "dense_path", "dense_prefix"), 0)
+    counts = dict.fromkeys(COUNTS, 0)
     token = _COUNTS.set(counts)
     rank_token = _RANK_COUNTS.set(ranks)
     kernel_token = _KERNEL_ROWS.set(kernels)
+    said_token = _SAID.set({})
     try:
         with _request(held):
             yield counts
@@ -98,6 +104,7 @@ def observing(
         _COUNTS.reset(token)
         _RANK_COUNTS.reset(rank_token)
         _KERNEL_ROWS.reset(kernel_token)
+        _SAID.reset(said_token)
 
 
 def _kernel_row(row: dict[str, Scalar]) -> None:
@@ -120,7 +127,7 @@ def record_rank(rank: int, counts: dict[str, int]) -> None:
     if (
         type(rank) is not int
         or rank < 1
-        or set(counts) != {"sparse", "dense_step", "dense_path", "dense_prefix"}
+        or set(counts) != set(COUNTS)
         or any(type(value) is not int or value < 0 for value in counts.values())
     ):
         raise ValueError("invalid follower Sol attention counts")
@@ -291,8 +298,6 @@ FA4 = "fa4"
 #: one object per card serves every length.
 ROUTES = {"sm89": (8, 9), "sm90": (9, 0), "sm120": (12, 0)}
 _BLOCK = 64
-#: Loaded objects by key digest; one serves every head count, batch and device (h3a-087).
-_KERNELS: dict[str, Loaded] = {}
 #: Keys this process already submitted, so a dense step submits each once.
 _SUBMITTED: set[str] = set()
 _PINNED: list[bool] = []
@@ -506,7 +511,7 @@ def specialize(tokens: int, device: Device, step: int) -> None:
     started = time.perf_counter()
     try:
         found = _job_for(tokens, capability)
-        if found.key.digest in _SUBMITTED or found.key.digest in _KERNELS:
+        if found.key.digest in _SUBMITTED:
             return
         _SUBMITTED.add(found.key.digest)
         state = kernel_compile.submit(store, found)
@@ -576,31 +581,49 @@ def _row(
     }
 
 
-def _ready(tokens: int, device: Device, step: int) -> Loaded | None:
-    """The object for this length, after waiting for its compile when it is not built yet.
-    None only when there is no store or its compile failed this machine run: the step then
-    runs dense and its row says so."""
+def _ready(tokens: int, device: Device, step: int) -> tuple[Loaded | None, str]:
+    """The object for this length once it serves here (`kernel_ready`), else None and the count
+    of the dense step in its place: `dense_building` while it builds, `dense_step` without a
+    store or after its build failed. One loaded object serves every head count, batch and
+    device (h3a-087)."""
     capability = _capability(device)
     store = kernel_cache.configured()
     if capability is None or store is None:
-        return None
+        return None, "dense_step"
     found = _job_for(tokens, capability)
-    loaded = _KERNELS.get(found.key.digest)
-    if loaded is not None:
-        return loaded
+    digest, said = found.key.digest, _SAID.get()
+    _SUBMITTED.add(digest)
     started = time.perf_counter()
-    data, source = store.get(found.key), "store"
-    if data is None:
-        _SUBMITTED.add(found.key.digest)
-        state, source = kernel_compile.wait(store, found), "waited"
+    name = f"{KERNEL} {digest[:16]}"
+    loaded = kernel_ready.ready(name, functools.partial(_open, store, found))
+    word = (said or {}).get(digest, "")
+    if loaded is not None:
+        if word != "served":
+            ms = kernel_compile.status(store, found).ms
+            source = "built" if word == "building" else "store"
+            _kernel_row(_row(tokens, found, source, started, step=step, compile_ms=ms))
+        word = "served"
+    elif why := kernel_ready.failed(name):
+        if word != "failed":
+            _kernel_row(_row(tokens, found, "failed", started, step=step, state=why))
+        word = "failed"
+    elif word != "building":
+        _kernel_row(_row(tokens, found, "building", started, step=step))
+        word = "building"
+    if said is not None:
+        said[digest] = word
+    return loaded, {"served": "", "failed": "dense_step"}.get(word, "dense_building")
+
+
+def _open(store: kernel_cache.Store, found: kernel_compile.Job, wait: bool) -> Loaded | None:
+    """The object linked (`kernel_ready`'s opener), after its build when `wait`."""
+    data = store.get(found.key)
+    if data is None and wait:
+        state = kernel_compile.wait(store, found)
         data = store.get(found.key)
         if data is None:
-            _kernel_row(_row(tokens, found, "failed", started, step=step, state=state.line()))
-            return None
-    loaded = _KERNELS[found.key.digest] = load(data)
-    entry = kernel_compile.status(store, found)
-    _kernel_row(_row(tokens, found, source, started, step=step, compile_ms=entry.ms))
-    return loaded
+            raise kernel_compile.CompileFailed(state.state, state.line())
+    return None if data is None else load(data)
 
 
 def _pin_preprocess() -> None:
@@ -776,21 +799,21 @@ def _execute(
     q, k, v = (t[:, : layout.live_tokens] for t in (query, key, value))
     card = _card(query.device)
     fa4 = sparse is None and card is not None and route(card) == FA4
-    loaded = None
+    loaded, instead = None, "dense_path" if dense_path else "dense_step"
     if not dense_path and sparse is None and not fa4:
         # The dense steps run on the GPU while this length's variant compiles on the CPU.
         specialize(layout.live_tokens, query.device, layout.step)
         if layout.step >= layout.dense_until_step:
-            loaded = _ready(layout.live_tokens, query.device, layout.step)
+            loaded, instead = _ready(layout.live_tokens, query.device, layout.step)
     if (
         dense_path
         or layout.step < layout.dense_until_step
         or (sparse is None and not fa4 and loaded is None)
     ):
-        # A dense step, a dense path, or a sparse step whose variant failed to compile: the
-        # dense reference serves it.
+        # A dense step, a dense path, or a sparse step whose variant is not ready: the dense
+        # reference serves it.
         live_output = dense(query=q, key=k, value=v, scale=scale)
-        _count("dense_path" if dense_path else "dense_step")
+        _count(instead)
     elif fa4:
         # The exact tiles take the dense rows' precision; the model's exact paths stay BF16.
         # The protected prefix's query tiles attend every key inside the same call.
