@@ -298,8 +298,6 @@ FA4 = "fa4"
 #: one object per card serves every length.
 ROUTES = {"sm89": (8, 9), "sm90": (9, 0), "sm120": (12, 0)}
 _BLOCK = 64
-#: Keys this process already submitted, so a dense step submits each once.
-_SUBMITTED: set[str] = set()
 _PINNED: list[bool] = []
 KERNEL = "sol-attn"
 OPTIONS = "--enable-tvm-ffi"
@@ -501,35 +499,6 @@ def _job_for(tokens: int, capability: tuple[int, int]) -> kernel_compile.Job:
     return _job(shape.get("blocks", 1), shape.get("full", False), capability)
 
 
-def specialize(tokens: int, device: Device, step: int) -> None:
-    """The first sight of a length (a model's intake statement, or a dense step): submit its
-    object's compile to the machine's compile manager, so dense steps cover it."""
-    capability = _capability(device)
-    store = kernel_cache.configured()
-    if capability is None or store is None:
-        return
-    started = time.perf_counter()
-    try:
-        found = _job_for(tokens, capability)
-        if found.key.digest in _SUBMITTED:
-            return
-        _SUBMITTED.add(found.key.digest)
-        state = kernel_compile.submit(store, found)
-        if variant(tokens, capability):
-            kernel_compile.learn(store, _scope(capability), found)
-        _kernel_row(_row(tokens, found, state.state, started, step=step))
-    except Exception as exc:
-        # Nothing needs the kernel yet; the sparse step asks again and falls back THERE.
-        _kernel_row(
-            {
-                "source": "submit_failed",
-                "tokens": tokens,
-                "step": step,
-                "detail": f"{type(exc).__name__}: {exc}"[:300],
-            }
-        )
-
-
 def card_jobs(store: kernel_cache.Store, capability: tuple[int, int]) -> list[kernel_compile.Job]:
     """What a card compiles ahead of any request: its one object, or on SM90, whose object is
     per length layout, every layout this machine has served."""
@@ -546,12 +515,10 @@ def submit_card(index: int) -> None:
     if capability is None or store is None:
         return
     if route(capability) != "sm90":
-        specialize(1, device, -2)
+        _ready(1, device, -2)
         return
     for found in card_jobs(store, capability):
-        if found.key.digest not in _SUBMITTED:
-            _SUBMITTED.add(found.key.digest)
-            kernel_compile.submit(store, found)
+        kernel_compile.submit(store, found)
 
 
 def _scope(capability: tuple[int, int]) -> str:
@@ -564,7 +531,7 @@ def _scope(capability: tuple[int, int]) -> str:
 def expect(tokens: int, device: Device) -> None:
     """A model stated its live length at request intake: a whole conditioning ahead of the
     first dense step. Its row carries step -1."""
-    specialize(tokens, device, -1)
+    _ready(tokens, device, -1)
 
 
 def _row(
@@ -584,18 +551,18 @@ def _row(
 def _ready(tokens: int, device: Device, step: int) -> tuple[Loaded | None, str]:
     """The object for this length once it serves here (`kernel_ready`), else None and the count
     of the dense step in its place: `dense_building` while it builds, `dense_step` without a
-    store or after its build failed. One loaded object serves every head count, batch and
-    device (h3a-087)."""
+    store or after its build failed. The first sight of a length (a model's intake statement,
+    or a dense step) starts it opening, so conditioning and the dense steps cover its build.
+    One loaded object serves every head count, batch and device (h3a-087)."""
     capability = _capability(device)
     store = kernel_cache.configured()
     if capability is None or store is None:
         return None, "dense_step"
     found = _job_for(tokens, capability)
     digest, said = found.key.digest, _SAID.get()
-    _SUBMITTED.add(digest)
     started = time.perf_counter()
     name = f"{KERNEL} {digest[:16]}"
-    loaded = kernel_ready.ready(name, functools.partial(_open, store, found))
+    loaded = kernel_ready.ready(name, functools.partial(_open, store, found, capability))
     word = (said or {}).get(digest, "")
     if loaded is not None:
         if word != "served":
@@ -616,8 +583,13 @@ def _ready(tokens: int, device: Device, step: int) -> tuple[Loaded | None, str]:
     return loaded, {"served": "", "failed": "dense_step"}.get(word, "dense_building")
 
 
-def _open(store: kernel_cache.Store, found: kernel_compile.Job, wait: bool) -> Loaded | None:
-    """The object linked (`kernel_ready`'s opener), after its build when `wait`."""
+def _open(
+    store: kernel_cache.Store, found: kernel_compile.Job, card: tuple[int, int], wait: bool
+) -> Loaded | None:
+    """The object linked (`kernel_ready`'s opener), after its build when `wait`. An SM90 layout
+    is learned, so this machine's next boot builds it ahead (`card_jobs`)."""
+    if json.loads(found.key.inputs)["variant"]:
+        kernel_compile.learn(store, _scope(card), found)
     data = store.get(found.key)
     if data is None and wait:
         state = kernel_compile.wait(store, found)
@@ -803,9 +775,9 @@ def _execute(
     loaded, instead = None, "dense_path" if dense_path else "dense_step"
     if not dense_path and sparse is None and not fa4:
         # The dense steps run on the GPU while this length's variant compiles on the CPU.
-        specialize(layout.live_tokens, query.device, layout.step)
+        ready, waiting = _ready(layout.live_tokens, query.device, layout.step)
         if layout.step >= layout.dense_until_step:
-            loaded, instead = _ready(layout.live_tokens, query.device, layout.step)
+            loaded, instead = ready, waiting
     if (
         dense_path
         or layout.step < layout.dense_until_step
