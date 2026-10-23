@@ -92,6 +92,8 @@ class Destination:
     key: str
     component: str
     spec: TensorSpec
+    #: A persistent buffer: the checkpoint's value when it stores one, else its constructed value.
+    buffer: bool = False
 
 
 #: TensorFS dtype name -> torch dtype name. This is the ONE thing the store cannot own: it
@@ -696,6 +698,8 @@ class ConstructionRecord:
     """Stored tensors the code does not build: skipped, never loaded, and CONFESSED."""
     ignored_warnings: tuple[str, ...] = ()
     """One line per checkpoint that stores such tensors: count, bytes and the first keys."""
+    unstored: tuple[str, ...] = ()
+    """Persistent buffers the checkpoint does not store: they keep their constructed values."""
     skipped: tuple[str, ...] = ()
     """Built components the binding does not select: on meta, and a scope using one refuses."""
     fit: dict[str, object] | None = None
@@ -819,6 +823,8 @@ class Loader:
             raise ModelFitRefused(fit, self._artifact.unnormalized)
         ignored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("ignored", ())))
         warned = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("warnings", ())))
+        unstored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("unstored", ())))
+        walked = walked.without(frozenset(k.replace("/", ".", 1) for k in unstored))
         _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
         filled, filled_bytes = self._fill(walked, obj)
@@ -831,6 +837,7 @@ class Loader:
             filled_bytes=filled_bytes,
             ignored_extras=ignored,
             ignored_warnings=warned,
+            unstored=unstored,
             skipped=skipped,
             fit=dict(fit) if fit is not None else None,
             stage_ms=tuple(_legs),
@@ -938,6 +945,14 @@ class Census:
     schedulers: tuple[str, ...]
     live: Mapping[str, TensorLike]
 
+    def without(self, keys: frozenset[str]) -> Census:
+        """This walk without the destinations `keys` (persistent buffers no checkpoint stores)."""
+        if not keys:
+            return self
+        destinations = tuple(d for d in self.destinations if d.key not in keys)
+        live = {d.key: self.live[d.key] for d in destinations}
+        return Census(destinations, self.components, self.schedulers, live)
+
     def only(self, bound: frozenset[str] | None) -> tuple[Census, tuple[str, ...]]:
         """This walk restricted to the `bound` components, and the components left out."""
         skipped = tuple(c for c in self.components if bound is not None and c not in bound)
@@ -994,6 +1009,8 @@ def census(obj: object) -> Census:
             continue
         components.append(name)
         seen: set[int] = set()
+        named_buffers = getattr(member, "named_buffers", None)
+        buffers = {id(b) for _, b in named_buffers(remove_duplicate=False)} if named_buffers else set()
         for key, held in member.state_dict(keep_vars=True).items():
             if id(held) in seen:
                 continue
@@ -1011,6 +1028,7 @@ def census(obj: object) -> Census:
                         _dtype_of(tensor),
                         nbytes=nbytes if isinstance(nbytes, int) else 0,
                     ),
+                    buffer=id(held) in buffers,
                 )
             )
     return Census(tuple(destinations), tuple(components), tuple(schedulers), live)

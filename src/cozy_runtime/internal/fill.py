@@ -334,6 +334,8 @@ class TensorRequirement:
     key: str
     shape: Sequence[int]
     logical_dtype: str | None = None
+    #: A persistent buffer: one the checkpoint does not store keeps its constructed value.
+    buffer: bool = False
 
 
 def fit(
@@ -345,13 +347,16 @@ def fit(
     device: str = "",
 ) -> dict[str, object]:
     """The construction census against the header: every built tensor is stored with its shape
-    (and its dtype where the census pins one); stored tensors nothing builds are skipped.
+    (and its dtype where the census pins one), except a persistent buffer, which keeps its
+    constructed value when the checkpoint does not store it (`unstored`); stored tensors nothing
+    builds are skipped (`ignored`). Both are coverage gaps the load reports, never refusals.
     `ok` False carries the first disagreement's code, component, key and sentence. The header's
     order is the construction's traversal (#624): `order` names where the census builds in
     another order (weights then stream out of step), "" when it agrees. Whether a device
     serves an encoding is plan resolution's (`Selector`); custody and device echo."""
     routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
     ignored: list[str] = []
+    unstored: list[str] = []
     disorder: list[str] = []
     ignored_bytes = 0
 
@@ -380,6 +385,9 @@ def fit(
         stored = {key: tensors[name] for key, name in names.items()}
         for key, requirement in wanted.items():
             info = stored.get(key)
+            if info is None and requirement.buffer:
+                unstored.append(f"{component}/{key}")
+                continue
             if info is None:
                 return refused(
                     "tensor_missing",
@@ -424,7 +432,7 @@ def fit(
                     part.length for part in raw.parts(checkpoint.ck, component, names[key]).values()
                 )
         header = [key for key in stored if key in wanted]
-        census = list(wanted)
+        census = [key for key in wanted if key in stored]
         if header != census:
             at = next(i for i, (a, b) in enumerate(zip(header, census, strict=True)) if a != b)
             disorder.append(
@@ -449,6 +457,7 @@ def fit(
         "device": device,
         "ignored": ignored,
         "ignored_bytes": ignored_bytes,
+        "unstored": unstored,
         "routes": routes,
         "warning": warning,
         "order": "; ".join(disorder),

@@ -123,6 +123,8 @@ class Backend:
         self.models: dict[str, Model] = {}
         self.bakes: dict[str, _Bakes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
+        #: Persistent buffers the checkpoint does not store (full keys): they keep their values.
+        self.unstored: set[str] = set()
         #: each bound component's grant from TensorD, asked once (`ahead`); its fds are ours
         self.grants: dict[str, WeightGrant] = {}
         self.stats: dict[str, float] = {}
@@ -270,6 +272,7 @@ class Backend:
             by_checkpoint.setdefault(checkpoint.id, (checkpoint, []))[1].append(component)
         verdict: dict[str, object] | None = None
         ignored: list[str] = []
+        unstored: list[str] = []
         warnings: list[str] = []
         routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
         for checkpoint, constructed in by_checkpoint.values():
@@ -280,6 +283,7 @@ class Backend:
                     key=d.key[len(d.component) + 1 :],
                     shape=list(d.spec.shape),
                     logical_dtype=tensorfs_requirement_dtype(d.spec.dtype),
+                    buffer=d.buffer,
                 )
                 for d in walked.destinations
                 if d.component in members
@@ -298,6 +302,7 @@ class Backend:
             ignored.extend(extras)
             if extras:
                 warnings.append(str(fit.get("warning") or self._skipped_line(extras)))
+            unstored.extend(str(k) for k in fit.get("unstored", ()))  # type: ignore[attr-defined]
             counted: Mapping[str, int] = fit.get("routes", {})  # type: ignore[assignment]
             for route in routes:
                 routes[route] += int(counted.get(route, 0))
@@ -308,9 +313,16 @@ class Backend:
             self.skipped.setdefault(component, []).append(key)
             if component in self.expected:
                 self.expected[component] -= {f"{component}.{key}"}
+        self.unstored = {full.replace("/", ".", 1) for full in unstored}
+        if unstored:
+            more = f", and {len(unstored) - 5} more" if len(unstored) > 5 else ""
+            warnings.append(
+                f"{len(unstored)} persistent buffer(s) the checkpoint does not store keep their "
+                f"constructed values: {', '.join(unstored[:5])}{more}"
+            )
         if len(by_checkpoint) > 1:
             verdict = {**verdict, "ignored": ignored, "routes": routes}
-        return {**verdict, "warnings": warnings}
+        return {**verdict, "unstored": unstored, "warnings": warnings}
 
     def _skipped_line(self, extras: Sequence[str]) -> str:
         """TensorFS 0.3.90's warning for the stored tensors fit skipped: how many, how many
@@ -326,8 +338,10 @@ class Backend:
     def materialize(
         self, obj: object, walked: Census, *, encoded_leaves: str = "refuse"
     ) -> Mapping[str, TensorLike]:
-        """Weights stay on meta. Derived (non-persistent) buffers, which no checkpoint
-        supplies, move to the device with the values their construction computed."""
+        """Weights go to meta, persistent buffers the checkpoint stores included, so varena binds
+        every stored tensor at every name and a read anywhere gets the checkpoint's value.
+        Derived (non-persistent) buffers, and persistent ones the checkpoint does not store, move
+        to the device with the values their construction computed."""
         self.encoded_leaves = encoded_leaves
         native = sorted(k for k, t in self.resolved.items() if t.route == "encoded_gemm")
         if native and encoded_leaves != "accept":
@@ -340,15 +354,18 @@ class Backend:
                 native[:6],
             )
         roots = dict(_members(obj))
+        live = dict(walked.live)
+        stored = {d.key for d in walked.destinations if d.buffer}
         with placing():
             for name in walked.components:
                 member = roots.get(name)
                 if not isinstance(member, self.torch.nn.Module):
                     continue
                 self.roots[name] = member
-                self.derived[name] = _derived_values(member)
+                live.update(_weightless_buffers(member, name, stored))
+                self.derived[name] = _derived_values(member, name, self.unstored)
                 _restore_derived(self.derived[name], self.device)
-        return walked.live
+        return live
 
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
         """Validate one destination against its stored row. Nothing moves."""
@@ -891,15 +908,40 @@ class _Pin:
     __slots__ = ("__weakref__",)
 
 
-def _derived_values(root: Module) -> dict[tuple[Module, str], Tensor]:
-    """Non-persistent buffers with their constructed values: no checkpoint supplies them."""
+def _derived_values(
+    root: Module, component: str, unstored: Collection[str]
+) -> dict[tuple[Module, str], Tensor]:
+    """Buffers with their constructed values: non-persistent ones, which no checkpoint supplies,
+    and the persistent ones this checkpoint does not store (`unstored`, full keys)."""
     held: dict[tuple[Module, str], Tensor] = {}
-    for _, sub in root.named_modules():
-        for local in getattr(sub, "_non_persistent_buffers_set", ()):
-            value = sub._buffers.get(local)
-            if value is not None and str(value.device) != "meta":
+    for path, sub in root.named_modules(remove_duplicate=False):
+        for local, value in sub._buffers.items():
+            key = f"{component}.{path}.{local}" if path else f"{component}.{local}"
+            derived = local in getattr(sub, "_non_persistent_buffers_set", ()) or key in unstored
+            if derived and value is not None and str(value.device) != "meta":
                 held[(sub, local)] = value.detach()
     return held
+
+
+def _weightless_buffers(root: Module, component: str, stored: Collection[str]) -> dict[str, Tensor]:
+    """Every persistent buffer the checkpoint stores goes to meta at each of its names, as a
+    parameter is built: varena binds a meta tensor only, and a construction value left in place
+    would be what a read outside the module's forward sees (Klein's VAE batch norm, se-074).
+    Returns the destinations' new meta tensors by key."""
+    made: dict[int, Tensor] = {}
+    live: dict[str, Tensor] = {}
+    for path, sub in root.named_modules(remove_duplicate=False):
+        for local, value in list(sub._buffers.items()):
+            key = f"{component}.{path}.{local}" if path else f"{component}.{local}"
+            if value is None or value.device.type == "meta":
+                continue
+            if key not in stored and id(value) not in made:
+                continue
+            meta = made.setdefault(id(value), value.detach().to("meta"))
+            sub._buffers[local] = meta
+            if key in stored:
+                live[key] = meta
+    return live
 
 
 def _restore_derived(held: Mapping[tuple[Module, str], Tensor], device: torch.device) -> None:
