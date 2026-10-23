@@ -87,7 +87,7 @@ conflicts = [[{ extra = "corpus" }, { group = "diffusers" }]]
 
 [tool.uv.sources]
 # Dev pin until the cohort release: the tensorfs-py the varena-two integration builds (step 3).
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "1db51e5cbbae68032f85817ab61662db6b6e370e", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator.git", rev = "e740824b194765ef5a071ee3804be0c9cc8a2bc9", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
