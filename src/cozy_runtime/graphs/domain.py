@@ -55,6 +55,12 @@ class Pool:
             memory.prepare_pool(self.handle, expected)
         self.prepared += expected
 
+    def failed(self, memory: Any) -> None:
+        """A capture into the pool that torch never ended (its begin or end raised): varena
+        stops routing the capturing thread into it."""
+        if memory is not None:
+            memory.capture_failed(self.handle)
+
 
 class Domain:
     def __init__(self, torch: Any, memory: Any) -> None:

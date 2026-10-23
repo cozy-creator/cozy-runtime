@@ -350,3 +350,26 @@ def test_a_devices_components_share_one_capture_pool(tmp_path: Path) -> None:
             graphs.release(torch, module)
             PLACED.pop(module, None)
             models[name].close()
+
+
+def test_a_capture_that_fails_to_begin_leaves_the_allocator_serving() -> None:
+    """The verifier's HIGH: torch ends no capture whose begin raised after its pool's begin hook
+    ran, and varena kept routing the thread into the pool, so its next allocation waited
+    forever. Here the domain's control stream is already capturing, so the capture's begin fails
+    after the hook: varena is told, and an allocation on this thread is served at once."""
+    memory = Memory.open(0, limit=CAP)
+    owner = graphs.capture_device(torch, memory)
+    owner.initialize()
+    pool = owner.capture_pool()
+    outer = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(owner.control):
+        outer.capture_begin(capture_error_mode="thread_local")
+        try:
+            graph, why = graphs.capture(torch, lambda: None, pool, owner)
+        finally:
+            outer.capture_end()
+    assert graph is None and why, why
+    served = torch.empty(1 << 20, device="cuda")  # not routed into the failed capture's pool
+    torch.cuda.synchronize()
+    assert served.numel() == 1 << 20
+    outer.reset()

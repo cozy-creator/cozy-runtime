@@ -71,7 +71,9 @@ def capture(
 
     The caller owns purity, residency, static-data lifetime and all consuming streams. No
     allocation recovery or chunk selection is allowed inside capture: varena serves it from the
-    bytes `Pool.prepare` mapped, or refuses.
+    bytes `Pool.prepare` mapped, or refuses. torch ends no capture that failed to begin or end
+    after its pool's begin hook ran: varena is told (`capture_failed`), or its routing of this
+    thread into the pool never clears and its later allocations wait forever.
     """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
@@ -81,7 +83,13 @@ def capture(
     failure: BaseException | None = None
     with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
         try:
-            graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
+            began = False
+            try:
+                graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
+                began = True
+            finally:
+                if not began:
+                    pool.failed(owner.memory)
         except Exception as exc:
             failure = exc
         else:
@@ -99,6 +107,7 @@ def capture(
             try:
                 graph.capture_end()
             except Exception as exc:
+                pool.failed(owner.memory)
                 failure = failure or exc
     current.wait_stream(stream)
     current.wait_stream(work)
