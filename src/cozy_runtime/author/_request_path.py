@@ -19,6 +19,9 @@ KNOWN = {
     "cozy_runtime.lm._Engine._replay": "cr-210",
 }
 _LOCAL = threading.local()
+#: This process's threads serving a request now.
+_SERVING = [0]
+_COUNTED = threading.Lock()
 
 
 @contextmanager
@@ -27,10 +30,19 @@ def serving() -> Iterator[dict[str, tuple[float, int]]]:
     request's own rows."""
     held = getattr(_LOCAL, "rows", None)
     rows = _LOCAL.rows = {} if held is None else held
+    with _COUNTED:
+        _SERVING[0] += 1
     try:
         yield rows
     finally:
         _LOCAL.rows = held
+        with _COUNTED:
+            _SERVING[0] -= 1
+
+
+def in_flight() -> bool:
+    """Whether any thread of this process serves a request now."""
+    return _SERVING[0] > 0
 
 
 def note(work: str, ms: float) -> None:

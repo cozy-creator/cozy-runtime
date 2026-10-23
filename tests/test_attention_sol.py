@@ -126,10 +126,10 @@ def test_observations_are_request_local_and_restore_after_failure() -> None:
                 q, q, q, None, AttentionLayout(4, 0, 0, dense_paths=("blocks.2",)), site
             )
             raise RuntimeError("request failed")
-        assert inner == dict(sparse=0, dense_step=0, dense_path=1, dense_prefix=0)
-        assert outer == dict(sparse=0, dense_step=1, dense_path=0, dense_prefix=0)
+        assert inner == dict(sparse=0, dense_step=0, dense_building=0, dense_path=1, dense_prefix=0)
+        assert outer == dict(sparse=0, dense_step=1, dense_building=0, dense_path=0, dense_prefix=0)
         attention_sol._execute(q, q, q, None, AttentionLayout(4, 0, 1, 10), site)
-    assert outer == dict(sparse=0, dense_step=2, dense_path=0, dense_prefix=0)
+    assert outer == dict(sparse=0, dense_step=2, dense_building=0, dense_path=0, dense_prefix=0)
     assert attention_sol._COUNTS.get() is None
     with attention_sol.observing() as following:
         assert sum(following.values()) == 0
@@ -193,7 +193,7 @@ def test_native_sol_preserves_protected_queries_and_input_bytes() -> None:
     torch.testing.assert_close(output[:, :33], expected, rtol=0, atol=0)
     assert torch.count_nonzero(output[:, 501:]) == 0
     assert torch.isfinite(output).all()
-    assert counts == dict(sparse=1, dense_step=0, dense_path=0, dense_prefix=1)
+    assert counts == dict(sparse=1, dense_step=0, dense_building=0, dense_path=0, dense_prefix=1)
     for tensor, before in zip((q, k, v), original, strict=True):
         assert torch.equal(tensor.view(torch.uint8), before.view(torch.uint8))
 

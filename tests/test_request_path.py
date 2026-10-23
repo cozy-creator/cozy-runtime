@@ -185,6 +185,63 @@ def test_the_known_violations_are_exactly_cr_210s_two_captures_each_marked_where
     assert marked == [(site, site) for site in sorted(request_path.KNOWN)]
 
 
+#: Functions that wait for a kernel's build or run its self-check outside a `kernel_ready`
+#: opener, which runs off the request thread. Each cr-217 line leaves this list as it lands.
+WAITING = {
+    "cozy_runtime.internal.attention._compiled": "cr-217 attention candidates; a pin waits",
+    "cozy_runtime.internal.attention._launch": "cr-217 step-boundary upgrade",
+    "cozy_runtime.internal.lora_bake._ready": "cr-217 LoRA bake",
+    "cozy_runtime.internal.machine_kernels.main": "the machine's kernel boot, its own process",
+    "cozy_runtime.internal.prebuilt.fa3": "cr-217 step-boundary upgrade",
+    "cozy_runtime.internal.prebuilt.library": "cr-217 first-GEMM self-checks",
+    "cozy_runtime.internal.triton_kernels.load": "cr-217 Triton kernels",
+    "cozy_runtime.internal.w4a8_linear.native": "cr-217 first-GEMM self-checks",
+}
+
+
+class _Waits(ast.NodeVisitor):
+    """One module's functions that wait for a build or self-check, and its openers."""
+
+    def __init__(self, module: str) -> None:
+        self.module, self.scope = module, [module]
+        self.sites: set[str] = set()
+        self.openers: set[str] = set()
+
+    def _def(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef) -> None:
+        self.scope.append(node.name)
+        self.generic_visit(node)
+        self.scope.pop()
+
+    visit_FunctionDef = visit_AsyncFunctionDef = visit_ClassDef = _def
+
+    def visit_Call(self, node: ast.Call) -> None:
+        name, here = _dotted(node.func), ".".join(self.scope)
+        if name.endswith("kernel_ready.ready") and len(node.args) == 2:
+            opener = node.args[1]
+            if isinstance(opener, ast.Call) and _dotted(opener.func).endswith("partial"):
+                opener = opener.args[0]
+            self.openers.add(f"{self.module}.{_dotted(opener)}")
+        waits = name.endswith(("kernel_compile.wait", "verify.verified"))
+        if name == "request_path.forbid" and node.args:
+            waits |= "build wait" in ast.unparse(node.args[0])
+        if waits and here != "cozy_runtime.internal.kernel_compile.wait":
+            self.sites.add(here)
+        self.generic_visit(node)
+
+
+def test_build_waits_and_self_checks_run_in_openers_or_a_named_site() -> None:
+    sites: set[str] = set()
+    openers: set[str] = set()
+    for path in sorted(SRC.rglob("*.py")):
+        parts = path.relative_to(SRC.parent).with_suffix("").parts
+        scan = _Waits(".".join(parts[:-1] if parts[-1] == "__init__" else parts))
+        scan.visit(ast.parse(path.read_text()))
+        sites |= scan.sites
+        openers |= scan.openers
+    assert "cozy_runtime.internal.attention_sol._open" in openers
+    assert sorted(sites - openers) == sorted(WAITING)
+
+
 MODULE = "request_path_fixture"
 SOURCE = """
 import threading

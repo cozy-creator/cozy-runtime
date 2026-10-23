@@ -55,7 +55,7 @@ def test_hybrid_dense_steps_and_prefix_use_the_same_fixed_local(monkeypatch: Any
     monkeypatch.setattr(sol, "_card", lambda _device: (9, 0))
     monkeypatch.setattr(sol, "_DENSE", wrong)
     monkeypatch.setattr(sol, "specialize", lambda *_args: None)
-    monkeypatch.setattr(sol, "_ready", lambda *_args: object())
+    monkeypatch.setattr(sol, "_ready", lambda *_args: (object(), ""))
     monkeypatch.setattr(sol, "_native", lambda _q, _k, v, *_args: v.clone() + 2)
     q = torch.zeros(1, 19, 2, 128, dtype=torch.bfloat16)
     k = q.clone()
@@ -70,7 +70,13 @@ def test_hybrid_dense_steps_and_prefix_use_the_same_fixed_local(monkeypatch: Any
             else:
                 assert torch.equal(output[:, :3], q[:, :3] + 1)
                 assert torch.equal(output[:, 3:], v[:, 3:] + 2)
-                assert counts == {"sparse": 1, "dense_step": 0, "dense_path": 0, "dense_prefix": 1}
+                assert counts == {
+                    "sparse": 1,
+                    "dense_step": 0,
+                    "dense_building": 0,
+                    "dense_path": 0,
+                    "dense_prefix": 1,
+                }
     finally:
         sol._SITE.reset(site)
     assert calls == [(19, 19), (3, 19)]
