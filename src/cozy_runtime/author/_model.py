@@ -26,6 +26,7 @@ from collections import deque
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
+from fnmatch import fnmatchcase
 from typing import (
     Any,
     Concatenate,
@@ -157,6 +158,34 @@ def attention_bits(owner: str, value: object) -> int | dict[str, int]:
         f"class {owner}(attention_bits={value!r}): 16, 8 or 4, or a mapping of "
         "component-qualified module prefixes to them",
         code="attention_bits_value",
+    )
+
+
+def coverage_patterns(owner: str, keyword: str, value: object) -> tuple[str, ...]:
+    """`unloaded=` / `derived=`: component-qualified key patterns (`fnmatch`) a load does not
+    warn about: stored tensors the model deliberately leaves unloaded (a text encoder's LM
+    head), persistent buffers it deliberately derives instead of reading from the checkpoint."""
+    if isinstance(value, (tuple, list)) and value and all(type(p) is str and p for p in value):
+        return tuple(value)
+    raise ConformanceError(
+        f"class {owner}({keyword}={value!r}): a tuple of component-qualified key patterns "
+        '(`"text_encoder.lm_head.weight"`, `"model.mtp.*"`)',
+        code=f"{keyword}_value",
+    )
+
+
+def uncovered(
+    cls: type, ignored: Sequence[str], unstored: Sequence[str]
+) -> tuple[list[str], list[str]]:
+    """What a load of `cls` warns about: the stored tensors it did not load and the persistent
+    buffers no checkpoint supplied (`component/key`), less what the class declares."""
+
+    def declared(names: Sequence[str], patterns: Sequence[str]) -> list[str]:
+        return [n for n in names if not any(fnmatchcase(n.replace("/", ".", 1), p) for p in patterns)]
+
+    return (
+        declared(ignored, getattr(cls, "__unloaded__", ())),
+        declared(unstored, getattr(cls, "__derived__", ())),
     )
 
 
@@ -708,6 +737,10 @@ class Model[PipelineT]:
     """`phase=`: "decode" for an LM's token loop, else "compute" (`PHASES`)."""
     __attention_bits__: int | dict[str, int] = 16
     """`attention_bits=`: the attention precision its sites tolerate (`attention_bits`)."""
+    __unloaded__: tuple[str, ...] = ()
+    """`unloaded=`: stored tensors a load leaves unloaded on purpose (`coverage_patterns`)."""
+    __derived__: tuple[str, ...] = ()
+    """`derived=`: persistent buffers a load keeps constructed on purpose (`coverage_patterns`)."""
 
     __adapter_compatibility__: tuple[AdapterCompatibility, ...] = ()
     """Closed generic adapter declarations; empty means overlays are refused."""
@@ -761,11 +794,16 @@ class Model[PipelineT]:
                 setattr(cls, attribute, value)
         if "attention_bits" in keywords:
             cls.__attention_bits__ = attention_bits(cls.__name__, keywords.pop("attention_bits"))
+        for keyword in ("unloaded", "derived"):
+            if keyword in keywords:
+                value = coverage_patterns(cls.__name__, keyword, keywords.pop(keyword))
+                setattr(cls, f"__{keyword}__", value)
         if keywords:
             names = ", ".join(f"{key}=…" for key in keywords)
             raise ConformanceError(
                 f"class {cls.__name__}({names}): a Model class carries encoded_leaves, "
-                "min_bits, phase and attention_bits — fusion=, stamps, task=, objective= and "
+                "min_bits, phase, attention_bits, unloaded and derived — fusion=, stamps, task=, "
+                "objective= and "
                 "structure= are deleted (model-code-fit D1); a semantic twin is a component "
                 "name or a config fact",
                 code="class_keyword",
@@ -1259,6 +1297,7 @@ class ModelRegistry:
                     }
                 )
             _prove_components(cls, record)
+            _coverage(cls, record)
             constructed = loader.constructed()
             if adapters and artifact._prepare is None:
                 model.prepare_adapters(tuple(adapters))
@@ -1308,6 +1347,28 @@ class ModelRegistry:
 _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", tensor_schema={}, config=Config({}))
 
 
+def _coverage(cls: type, record: ConstructionRecord) -> None:
+    """A load whose construction and checkpoint disagree says so once, in the next attempt's
+    warnings, naming the tensors, and serves: stored tensors no destination reads were not
+    loaded, and persistent buffers the checkpoint does not store keep their constructed values.
+    What the class declares (`unloaded=`, `derived=`) is not warned about."""
+    ignored, unstored = uncovered(cls, record.ignored_extras, record.unstored)
+    for message, kind, names in (
+        ("checkpoint tensors were not loaded: the model builds no destination for them",
+         "tensors", ignored),
+        ("persistent buffers are not in the checkpoint: they keep their constructed values",
+         "buffers", unstored),
+    ):  # fmt: skip
+        if names:
+            more = f", and {len(names) - 8} more" if len(names) > 8 else ""
+            row: WarningRow = (
+                message,
+                {"model": cls.__name__, "count": len(names), kind: ", ".join(names[:8]) + more},
+            )
+            if row not in WARNINGS:
+                WARNINGS.append(row)
+
+
 def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
     """Several `construct` calls in one `load()` are one construction contract."""
     return ConstructionRecord(
@@ -1318,6 +1379,7 @@ def _merge(records: Sequence[ConstructionRecord]) -> ConstructionRecord:
         filled_bytes=sum(r.filled_bytes for r in records),
         ignored_extras=tuple(e for r in records for e in r.ignored_extras),
         ignored_warnings=tuple(w for r in records for w in r.ignored_warnings),
+        unstored=tuple(u for r in records for u in r.unstored),
         skipped=tuple(c for r in records for c in r.skipped),
         fit=next((r.fit for r in records if r.fit is not None), None),
     )

@@ -57,6 +57,7 @@ from cozy_runtime.author._model import (
     Model,
     attention_bits,
     closed,
+    coverage_patterns,
 )
 from cozy_runtime.author._model_defaults import (
     check_model_arguments,
@@ -1023,6 +1024,11 @@ class Reader:
             elif keyword.arg == "attention_bits":
                 try:  # Runtime reads it at selection; the interface does not carry it
                     attention_bits(node.name, value)
+                except author.ConformanceError as exc:
+                    self.refuse(module, keyword, str(exc))
+            elif keyword.arg in ("unloaded", "derived"):
+                try:  # Runtime reads them at load; the interface does not carry them
+                    coverage_patterns(node.name, keyword.arg, value)
                 except author.ConformanceError as exc:
                     self.refuse(module, keyword, str(exc))
             else:
