@@ -121,7 +121,7 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         assert facts["active_graphs"] == facts["captures"] == 2 and facts["graph_pools"] == 1
         assert facts["declared_regions"] == facts["domains"] == 1
         assert facts["captured_regions"] == [""] and facts["replays"] == 3
-        assert facts["graph_pool_bytes"] > 0 and facts["domain_workspace_bytes"] > 0
+        assert facts["graph_pool_bytes"] == 0  # unplaced: no varena memory prepares its pool
         assert facts["replay_copy_bytes"] > 0
         torch.cuda.synchronize()
         # Per region, design §5's measures: captures and their time, and each way it ran (three
@@ -143,7 +143,6 @@ def test_recordings_replay_across_calls_and_signatures() -> None:
         retired = graphs.describe(module)
         assert retired["active_graphs"] == retired["graph_pools"] == 0
         assert retired["retired_graphs"] == retired["captures"] == 2
-        assert retired["domain_workspace_bytes"] == facts["domain_workspace_bytes"]
 
 
 @pytest.mark.skipif(not CUDA, reason="CUDA graphs need a GPU")
@@ -258,44 +257,18 @@ def test_replays_on_two_streams_preserve_each_callers_outputs() -> None:
     assert len(recorder.recordings) == 2
     for got, expected in outputs:
         torch.testing.assert_close(got, expected)
-    # Retire one executable/pool while the other still embeds the domain's BLAS pointers.
+    # Retire one executable while the other, in the same pool, still embeds the library
+    # stream's workspace pointers (the process's, made outside any capture: `prime_blas`).
     owner = recorder.domain
-    shared = owner.pool
-    segments = shared.snapshot(include_traces=False)
-    addresses = {s["address"] for s in segments}
-
-    def live(pool: Any) -> int:
-        return sum(
-            b["size"]
-            for s in pool.snapshot(include_traces=False)
-            for b in s["blocks"]
-            if b["state"] == "active_allocated"
-        )
-
-    active = live(shared)
-    assert active > 0
+    assert owner is not None and owner.primed and owner.captures is not None
     key = next(k for k, v in recorder.recordings.items() if v.inputs[0].shape[0] == 4)
     recorder.recordings.pop(key).close()
-    assert live(shared) == active, "a sibling graph reset released its library workspace"
-    # Force reuse pressure inside the very pool that owned the workspace, then replay B.
-    with torch.cuda.use_mem_pool(shared):
-        for _ in range(3):
-            churn = torch.empty(active // 4, dtype=torch.float32, device="cuda").fill_(17)
-            del churn
-    torch.cuda.synchronize()
-    assert live(shared) == active
     got, expected = run(second, 3.0, 8)
     torch.testing.assert_close(got, expected)
-    physical = sum(s["total_size"] for s in shared.snapshot(include_traces=False))
-    free_before = torch.cuda.mem_get_info()[0]
     graphs.release(torch, module)
-    assert live(shared) == 0 and owner.closed and owner.stream is owner.control is None
-    del shared
+    assert owner.closed and owner.stream is owner.control is None and owner.captures is None
     torch.cuda.synchronize()
-    # Pool destruction, without a global flush, returns physical segments to the allocator.
-    assert not addresses.intersection(s["address"] for s in torch.cuda.memory_snapshot())
-    assert torch.cuda.mem_get_info()[0] >= free_before + physical
-    # Returned copies outlive both the executable and its private allocator pool.
+    # Returned copies outlive both the executable and its pool.
     for got, expected in outputs:
         torch.testing.assert_close(got, expected)
 

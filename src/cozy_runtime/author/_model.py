@@ -285,10 +285,6 @@ class Residency(Protocol):
         """Retain a region's virtual addresses; prepare() leases backing only during use."""
         ...
 
-    def graph_pool(self) -> Any:
-        """A distinct allocator pool for one executable's static data and scratch."""
-        ...
-
     def graph_accounted(self) -> bool:
         """Whether per-process driver/context bytes can be included in graph admission."""
         ...
@@ -297,8 +293,9 @@ class Residency(Protocol):
         """Shared capture stream and library workspace, serialized across component graphs."""
         ...
 
-    def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
-        """Prepare allocations in the same pool capture will use, outside capture."""
+    def graph_prepare(self, pool: Any, request: str) -> None:
+        """Map into capture pool `pool`, before a capture begins, the working set its warm-up
+        reached in open request `request`'s arena."""
         ...
 
     def graph_levels(self) -> tuple[tuple[str, int], ...]:

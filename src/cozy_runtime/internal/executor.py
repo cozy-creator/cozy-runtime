@@ -587,9 +587,10 @@ def _trees(command: Invoke) -> dict[str, tuple[Path, str]]:
     return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
 
 
-def _allocations(torch: Any) -> int:
-    """GPU 0's progress in a group call: the allocations its ops made (`group.watched`)."""
-    return int(torch.cuda.memory_stats().get("allocation.all.allocated", 0))
+def _allocations(memory: Any) -> int:
+    """GPU 0's progress in a group call: its ops' torch bytes as varena holds them
+    (`group.watched`; torch's own counters raise under varena's allocator)."""
+    return accel.allocated(None, "cuda", memory)
 
 
 def _serving(module: str, export: str, surface: Any) -> _CallType:
@@ -820,7 +821,7 @@ class Executor:
         #: this generation's load reply
         self.load_reply: dict[str, Any] = {}
         #: follower only: the attempt spool and allocator bytes at its first mirrored call
-        self._run_entry: tuple[Path, int] | None = None
+        self._run_entry: Path | None = None
         #: follower only: every kernel its processors held across that attempt's calls
         self._run_held = attention.Applied({}, ())
         self._rank_request: _RankRequest | None = None
@@ -1027,7 +1028,6 @@ class Executor:
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
-        accel.reset_peak(torch, self.device_kind)
         self._device_ready = True
         return None
 
@@ -1264,9 +1264,8 @@ class Executor:
             held = attention.observed(
                 {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
             )
-            if self._run_entry is None or self._run_entry[0] != spool:
-                accel.reset_peak(self.torch, self.device_kind)
-                self._run_entry = (spool, accel.allocated(self.torch, self.device_kind))
+            if self._run_entry != spool:
+                self._run_entry = spool
                 self._run_held = held
             # A run takes rank 0's kernel at a step boundary (`_upgrade_attention`).
             self._run_held = self._run_held.joined(held)
@@ -1346,9 +1345,8 @@ class Executor:
                     component(*args, **kwargs)
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
-            working = max(
-                accel.peak_allocated(self.torch, self.device_kind) - self._run_entry[1], 0
-            )
+            ranked = self.host._rank_request
+            working = accel.arena_peak(self.host.memory, ranked.id) if ranked is not None else 0
         except Exception as exc:
             ending = mirror.ending(exc)
             # where it was raised, innermost first: a GPU's own traceback stays on that GPU
@@ -1470,7 +1468,7 @@ class Executor:
                     spool=lambda: owner._attempt_spool,
                     cancelled=owner._attempt_cancelled,
                     reform=owner._group_reform,
-                    progress=functools.partial(_allocations, torch),
+                    progress=functools.partial(_allocations, self.host.memory),
                     device=self._rank_device(torch),
                 )
         sharded = {name[1] for name in owner.group_sharded if name[0] == self._group_model_key}
@@ -1895,7 +1893,7 @@ class Executor:
     ) -> dict[str, Any]:
         total = free = -1
         if self.torch is not None and accel.present(self.torch, self.device_kind):
-            memory = accel.allocation(self.torch, self.device_kind)
+            memory = accel.allocation(self.torch, self.device_kind, self.host.memory)
             total, free = memory["driver_total_bytes"], memory["driver_free_bytes"]
         return {
             "ok": True,
@@ -2208,7 +2206,9 @@ class Executor:
     def residency_document(self) -> dict[str, Any]:
         free = -1
         if self.torch is not None and accel.present(self.torch, self.device_kind):
-            free = accel.allocation(self.torch, self.device_kind)["driver_free_bytes"]
+            free = accel.allocation(self.torch, self.device_kind, self.host.memory)[
+                "driver_free_bytes"
+            ]
         return {
             "ok": True,
             "constructions": [
@@ -2761,7 +2761,7 @@ class Executor:
                 }
         self.attention_defaults = attention.snapshot(dict(backend.roots))
         group_facts = dict(self.facts)
-        memory = accel.allocation(torch, self.device_kind)
+        memory = accel.allocation(torch, self.device_kind, self.host.memory)
         self.ready = True
         self.facts = {
             **group_facts,
@@ -3148,8 +3148,6 @@ class Executor:
                 return {**refused, "poisoned": target.poisoned}
             if first and target.residency is not None:
                 target.residency.open_attempt()
-            if first and target.torch is not None:
-                accel.reset_peak(target.torch, target.device_kind)
         return None
 
     def prepare_request(self, command: PrepareRequest) -> dict[str, Any]:
@@ -3296,7 +3294,10 @@ class Executor:
         # exact case triage exists for. A seam refusal there is dropped live output, the ONE
         # loss this lane may incur.
         progress = self._progress_sink(command.request_id)
-        allocated_at_start = accel.allocated(torch, self.device_kind) if torch is not None else 0
+        own = self.host.memory
+        allocated_at_start = (
+            accel.allocated(torch, self.device_kind, own) if torch is not None else 0
+        )
         lease_acquired = time.perf_counter()
         started_wall = time.time()
         started_us = execution_evidence.now_us()
@@ -3525,8 +3526,11 @@ class Executor:
             self.residency.release()  # the last step's holds
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
-        peak_vram = accel.peak_allocated(torch, self.device_kind) if torch is not None else 0
-        peak_reserved = accel.peak_reserved(torch, self.device_kind) if torch is not None else 0
+        # On CUDA the request's own arena high-water (varena's); MPS keeps no mark: its figures now.
+        arena = own_memory[0].torch_peak if own_memory else 0
+        live = accel.allocated(torch, self.device_kind, own) if torch is not None else 0
+        peak_vram = allocated_at_start + arena if self.device_kind == "cuda" else live
+        peak_reserved = accel.reserved(torch, self.device_kind, own) if torch is not None else 0
         residency_document = self.residency.document() if self.residency else {}
         working_peak = max(peak_vram - allocated_at_start, 0)
         if self.group is not None:
@@ -4491,7 +4495,7 @@ class Executor:
         request: MemoryRequest | None = None
         cuda = host.memory.cuda
         device = host.memory.device.index if cuda else None
-        since = host.execution.counters(device)
+        peak = 0
         try:
             with host.memory.request(request_id) as request, host.execution.serving(request):
                 host.requests[request_id] = request
@@ -4499,10 +4503,11 @@ class Executor:
                     yield rows
                 finally:
                     del host.requests[request_id]
+                    peak = accel.arena_peak(host.memory, request_id)  # read while it is open
         finally:
             if request is not None:
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
-                rows.append(host.execution.record(request, gpu, device, self._store(), since))
+                rows.append(host.execution.record(request, gpu, device, self._store(), peak))
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
@@ -4565,7 +4570,7 @@ class Executor:
             return {}
         if not accel.present(self.torch, self.device_kind):
             return {}
-        memory = accel.allocation(self.torch, self.device_kind)
+        memory = accel.allocation(self.torch, self.device_kind, self.host.memory)
         return {
             "device_free_bytes": memory["driver_free_bytes"],
             "device_total_bytes": memory["driver_total_bytes"],

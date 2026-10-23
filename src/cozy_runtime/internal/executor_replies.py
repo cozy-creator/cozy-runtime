@@ -61,16 +61,6 @@ class MakeRoom(msgspec.Struct, frozen=True, kw_only=True):
     waited: int
 
 
-class Refusal(msgspec.Struct, frozen=True, kw_only=True):
-    """varena's allocator hook's last refusal on a pool during the request: why, the bytes
-    refused, and the row's free bytes then."""
-
-    pool: tuple[int, int]
-    why: str
-    size: int
-    free: int
-
-
 class Stats(msgspec.Struct, frozen=True, kw_only=True):
     """varena's record of one request (varena-slim §5), as its core writes it: what make_room
     took (`evicted`, by class F, O, S, N, D, W, P), the most it held at a pass end (pages and
@@ -90,34 +80,15 @@ class Stats(msgspec.Struct, frozen=True, kw_only=True):
     make_room: tuple[MakeRoom, ...]
 
 
-class Allocator(msgspec.Struct, frozen=True, kw_only=True):
-    """torch's caching allocator over a request on one GPU (`torch.cuda.memory_stats` deltas,
-    the device's: a request beside it on that GPU counts too): allocations retried after it
-    freed its cache, cudaMalloc and cudaFree calls, and the all-stream syncs those frees took;
-    and the allocations varena's callback refused on the device."""
-
-    num_alloc_retries: int
-    num_device_alloc: int
-    num_device_free: int
-    num_sync_all_streams: int
-    refused: int = 0
-
-
 class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
     """One GPU's part of a request: its physical number, the fill ceilings there (None: not
-    measured yet), varena's record of the request, and torch's allocator over it (None: no
-    GPU)."""
+    measured yet), varena's record of the request, and its arena's torch high-water (bytes:
+    torch's own statistics don't see varena's allocator)."""
 
     gpu: int
     ceiling: Ceiling | None
     stats: Stats
-    torch: Allocator | None
-    #: varena's allocator hook's refusals during the request, one per pool (its last)
-    refusals: tuple[Refusal, ...]
-    #: the request's pool's drop at its end (torch syncs its events), and per pass that made
-    #: room its pool's free blocks then: (model, key, bytes, the largest)
-    flush_ms: float
-    pool_free: tuple[tuple[str, str, int, int], ...]
+    torch_peak: int
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):

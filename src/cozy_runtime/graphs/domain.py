@@ -6,9 +6,10 @@ small owner graph on the library stream is reset only at final domain teardown; 
 replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
 
 A placed model's components run one after another on a device, so all their graphs share the
-device's one domain and capture pool (`device`): sized at the largest region's working set, not
-the sum. `using` serializes every region call on the device (a host lock and a completion event
-across streams), and each replay copies its inputs in and its outputs out inside that interval,
+device's one domain and capture pool (`device`, a `graph_pool_handle()` varena serves): sized at
+the largest region's working set, not the sum. `using` serializes every region call on the
+device (a host lock and a completion event across streams), and each replay copies its inputs
+in and its outputs out inside that interval,
 so no two graphs' scratch is ever live at once: the pool holds one region's working set plus
 every graph's static buffers.
 """
@@ -21,7 +22,10 @@ import threading
 import weakref
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any
+
+from cozy_runtime.internal import accel
 
 
 class Unavailable(RuntimeError):
@@ -36,6 +40,22 @@ def unsupported(torch: Any) -> str:
     )
 
 
+@dataclass(eq=False, slots=True)
+class Pool:
+    """A torch capture pool (`graph_pool_handle()`). varena serves a capture into it from bytes
+    mapped ahead (`Memory.prepare_pool`), never by making room inside the capture; `prepared`
+    counts them (varena reports no figure per pool yet)."""
+
+    handle: tuple[int, int]
+    prepared: int = 0
+
+    def prepare(self, memory: Any, expected: int) -> None:
+        """`expected` bytes mapped into the pool now, before a capture into it begins."""
+        if memory is not None:
+            memory.prepare_pool(self.handle, expected)
+        self.prepared += expected
+
+
 class Domain:
     def __init__(self, torch: Any, memory: Any) -> None:
         self.torch, self.memory = torch, memory
@@ -43,7 +63,7 @@ class Domain:
         self.lock = threading.RLock()
         self.stream: Any = None
         self.control: Any = None
-        self.pool: Any = None
+        self.primed = False
         self.owner: Any = None
         self.fork: Any = None
         self.join: Any = None
@@ -56,7 +76,7 @@ class Domain:
         self.local = threading.local()
         #: the graphs' shared capture pool, its accounting cache, the recorders using it, and
         #: the component roots they serve (the cache's components), first capture first
-        self.captures: Any = None
+        self.captures: Pool | None = None
         self.anchor: Any = None
         self.cache: Any = None
         self.recorders: weakref.WeakSet[Any] = weakref.WeakSet()
@@ -103,16 +123,13 @@ class Domain:
         try:
             self.stream = self._stream()
             self.control = self._stream()
-            self.pool = (
-                self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
-            )
             self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
             self.fork.record(self.control)
             self.join.record(self.stream)
             self.done.record(self.stream)
             self.owner = self.torch.cuda.CUDAGraph()
-            # No library work or allocator routing inside this owner graph. Recording an
-            # event makes its capture stream explicit; reset later clears only this stream.
+            # No library work or allocation inside this owner graph. Recording an event makes
+            # its capture stream explicit; reset later clears only this stream.
             with self.torch.cuda.stream(self.stream):
                 self.owner.capture_begin(capture_error_mode="thread_local")
                 self.join.record(self.stream)
@@ -142,16 +159,15 @@ class Domain:
                     self.fenced = True
 
     def prime_blas(self) -> None:
-        """Prime the actual capture thread's handle into persistent domain ownership."""
+        """The library stream's cuBLAS and cuDNN handles and workspaces, which torch keeps per
+        stream for the process's life: made once, outside any request, so they live in the
+        process arena and never in a request's or a capture's."""
         if why := self.refusal():
             raise Unavailable(why)
-        context = (
-            self.memory.allocating(self.pool)
-            if self.memory is not None
-            else self.torch.cuda.use_mem_pool(self.pool)
-        )
-        with context, self.torch.cuda.stream(self.stream):
-            self.torch.cuda.current_blas_handle()
+        if not self.primed:
+            with self.torch.cuda.stream(self.stream):
+                accel.first_launches(self.torch, "cuda")
+            self.primed = True
 
     def finish(self) -> None:
         """Drain all uses, invalidate executables, then free only this domain's resources."""
@@ -177,26 +193,24 @@ class Domain:
                 self.owner = None
             self.drop_captures()
             self.close_cache()
-            self.pool = None  # MemPool destruction releases this pool, never a global flush.
             for stream in (self.stream, self.control):
                 if stream is not None:
                     self.torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
 
-    def capture_pool(self) -> Any:
+    def capture_pool(self) -> Pool:
         """The pool every graph of the device records into (made on first use, after
         `initialize`), held by a never-replayed graph of its own: torch 2.14 releases a pool's
         host side when its last graph resets, and the next capture into it trips
         CachingHostAllocator's use_count assert (v16: a no-gain verdict reset the pool's only
-        graph). Step 6's allocator hooks own pool lifetime and retire the anchor."""
+        graph). varena's graph regions own pool lifetime and retire the anchor."""
         if self.captures is None:
-            self.captures = (
-                self.memory.new_pool() if self.memory is not None else self.torch.cuda.MemPool()
-            )
+            self.captures = Pool(self.torch.cuda.graph_pool_handle())
             self.anchor = self.torch.cuda.CUDAGraph()
             with self.torch.cuda.stream(self.stream):
-                self.anchor.capture_begin(pool=self.captures, capture_error_mode="thread_local")
+                handle = self.captures.handle
+                self.anchor.capture_begin(pool=handle, capture_error_mode="thread_local")
                 self.join.record(self.stream)
                 self.anchor.capture_end()
         return self.captures
@@ -214,7 +228,7 @@ class Domain:
         if self.anchor is not None:
             self.anchor.reset()
             self.anchor = None
-        self.captures = None  # MemPool destruction releases this pool, never a global flush.
+        self.captures = None  # its last graph's reset releases the pool to varena
         self.served = []
 
     @contextmanager
@@ -236,19 +250,8 @@ class Domain:
             self.cache.close()
             self.cache = None
 
-    def nbytes(self) -> int:
-        return (
-            0
-            if self.pool is None
-            else sum(s["total_size"] for s in self.pool.snapshot(include_traces=False))
-        )
-
     def capture_bytes(self) -> int:
-        return (
-            0
-            if self.captures is None
-            else sum(s["total_size"] for s in self.captures.snapshot(include_traces=False))
-        )
+        return 0 if self.captures is None else self.captures.prepared
 
 
 _LOCK = threading.RLock()

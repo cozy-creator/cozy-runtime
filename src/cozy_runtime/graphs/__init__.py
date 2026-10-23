@@ -50,6 +50,8 @@ DECODERS: list[
     tuple[Callable[[Any], tuple[dict[str, int], list[Any], Any]], Callable[[Any], None]]
 ] = []
 _SAID: set[str] = set()
+#: the request an idle capture runs in (`graph_idle`): its warm-up's arena sizes the capture
+IDLE_REQUEST = "graphs-idle"
 
 
 def say(key: str, line: str) -> None:
@@ -59,14 +61,13 @@ def say(key: str, line: str) -> None:
 
 
 def capture(
-    torch: Any, step: Callable[[], object], pool: Any, owner: domain.Domain
+    torch: Any, step: Callable[[], object], pool: domain.Pool, owner: domain.Domain
 ) -> tuple[Any, str]:
     """Record a caller-owned capture-safe computation in its already prepared pool.
 
     The caller owns purity, residency, static-data lifetime and all consuming streams. No
-    allocation recovery or chunk selection is allowed inside capture. While it is open the
-    memory knows (`Memory.capturing`): torch skips its release-and-retry during any capture on
-    the device, so another thread's refused allocation makes room at once (A1).
+    allocation recovery or chunk selection is allowed inside capture: varena serves it from the
+    bytes `Pool.prepare` mapped, or refuses.
     """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
@@ -74,13 +75,9 @@ def capture(
     stream.wait_stream(current)
     stream.wait_stream(work)
     failure: BaseException | None = None
-    with (
-        owner.memory.capturing() if owner.memory is not None else nullcontext(),
-        torch.utils._python_dispatch._disable_current_modes(),
-        torch.cuda.stream(stream),
-    ):
+    with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
         try:
-            graph.capture_begin(pool=pool, capture_error_mode="thread_local")
+            graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
         except Exception as exc:
             failure = exc
         else:
@@ -708,7 +705,9 @@ def describe(root: Any) -> dict[str, Any]:
             if not first and recorder.domain is not None:
                 first = recorder.domain.served[0]() is root
             if first:
-                pools.update((entry.pool.id, entry.pool) for entry in recorder.recordings.values())
+                pools.update(
+                    (entry.pool.handle, entry.pool) for entry in recorder.recordings.values()
+                )
                 if recorder.domain is not None:
                     domains[id(recorder.domain)] = recorder.domain
     shared = domain.existing(root)
@@ -716,7 +715,7 @@ def describe(root: Any) -> dict[str, Any]:
         domains[id(shared)] = shared
     for snapshot, _ in DECODERS:
         decode, decode_pools, decode_domain = snapshot(root)
-        pools.update((pool.id, pool) for pool in decode_pools)
+        pools.update((pool.handle, pool) for pool in decode_pools)
         if decode_domain is not None:
             domains[id(decode_domain)] = decode_domain
         if decode:
@@ -735,13 +734,8 @@ def describe(root: Any) -> dict[str, Any]:
         regions=dict(sorted(timed.items())),
         eager_gaps=gaps,
         graph_pools=len(pools),
-        graph_pool_bytes=sum(
-            segment["total_size"]
-            for pool in pools.values()
-            for segment in pool.snapshot(include_traces=False)
-        ),
+        graph_pool_bytes=sum(pool.prepared for pool in pools.values()),
         domains=len(domains),
-        domain_workspace_bytes=sum(d.nbytes() for d in domains.values()),
     )
     return answer
 
@@ -1007,11 +1001,15 @@ def _capture_pending(pending: _Pending) -> bool:
                 return False
         idle = placed[0].graph_idle() if placed is not None else nullcontext()
         try:
+            owner.initialize()
+            owner.prime_blas()  # before the idle request: torch keeps them, in the process arena
             with idle, owner.holding():
                 done = _record(torch, module, pending, recorder, placed, submit)
         except Exception as exc:  # the signature runs as written; the period goes on
             if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
                 raise
+            if is_capacity(exc):
+                return False
             _failed(module, recorder, pending.key, f"{type(exc).__name__}: {exc}"[:300])
             done = True
         if done:
@@ -1054,57 +1052,49 @@ def _record(
         # Discovery owns the complete range set and then the admitted free headroom.
         lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
         with scope, lease:
-            owner.initialize()
             stream = owner.stream
             stream.wait_stream(current)
-            # Library handles cache scratch by stream. Initialize under domain ownership before
-            # any region pool becomes active; every executable sharing that scratch is serialized.
-            owner.prime_blas()
             pool = owner.capture_pool()
-            allocating = (
-                placed[0].graph_allocating(pool)
-                if placed is not None
-                else torch.cuda.use_mem_pool(pool)
-            )
             state = _State(torch, module)
             with torch.cuda.stream(stream):
-                with allocating:
-                    seeded = torch.Generator(device=current.device).manual_seed(_SEED)
-                    inputs = [
-                        _input(torch, v, seeded) if isinstance(v, _Leaf) else None
-                        for v in pending.leaves
-                    ]
-                    static = [
-                        s if s is not None else v
-                        for s, v in zip(inputs, pending.leaves, strict=True)
-                    ]
-                    cargs, ckwargs = torch.utils._pytree.tree_unflatten(static, pending.spec)
-                    warming = _WARMING.set(True)
-                    try:
-                        with attention_ulysses.observing() as served:
-                            took = time.perf_counter()
-                            eager = call(module, *cargs, **ckwargs)
-                            took = (time.perf_counter() - took) * 1e3
-                            if not _clonable(torch, eager):
-                                _failed(module, recorder, key, "output is not a tensor tree")
-                                return True
-                            busy = _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
-                    finally:
-                        _WARMING.reset(warming)
+                # The warm-up runs in the idle request's arena: its high-water is the capture's.
+                seeded = torch.Generator(device=current.device).manual_seed(_SEED)
+                inputs = [
+                    _input(torch, v, seeded) if isinstance(v, _Leaf) else None
+                    for v in pending.leaves
+                ]
+                cargs, ckwargs = _arguments(torch, pending, inputs)
+                warming = _WARMING.set(True)
+                try:
+                    with attention_ulysses.observing() as served:
+                        took = time.perf_counter()
+                        eager = call(module, *cargs, **ckwargs)
+                        took = (time.perf_counter() - took) * 1e3
+                        if not _clonable(torch, eager):
+                            _failed(module, recorder, key, "output is not a tensor tree")
+                            return True
+                        busy = _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
+                finally:
+                    _WARMING.reset(warming)
                 recorder.bound[key] = (submit, busy)
                 if why := _device_bound(submit, busy):
                     recorder.judged[key] = why
                     return True
-                capturing = (
-                    placed[0].graph_allocating(pool, route=False)
-                    if placed is not None
-                    else nullcontext()
-                )
-                with capturing:
-                    outputs: list[Any] = []
-                    graph, why = capture(
-                        torch, lambda: outputs.append(call(module, *cargs, **ckwargs)), pool, owner
+                if placed is not None:
+                    placed[0].graph_prepare(pool, IDLE_REQUEST)
+                # Its static inputs are the pool's, made in the capture (an allocation launches
+                # nothing), so they live as long as the graph and never in a request's arena.
+                statics: list[Any] = []
+                outputs: list[Any] = []
+
+                def step() -> None:
+                    statics.extend(
+                        _static(torch, v) if isinstance(v, _Leaf) else None for v in pending.leaves
                     )
+                    sargs, skwargs = _arguments(torch, pending, statics)
+                    outputs.append(call(module, *sargs, **skwargs))
+
+                graph, why = capture(torch, step, pool, owner)
                 if graph is None:
                     _failed(module, recorder, key, why)
                     return True
@@ -1115,6 +1105,9 @@ def _record(
                 if not _clonable(torch, outputs[0]):
                     _failed(module, recorder, key, "captured output is not a tensor tree")
                     return True
+                for target, value in zip(statics, inputs, strict=True):
+                    if target is not None:
+                        target.copy_(value)
                 graph.replay()  # served only when it reproduces the eager run bit for bit
                 pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
                 if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
@@ -1122,7 +1115,7 @@ def _record(
                     _failed(module, recorder, key, why)
                     WARNINGS.append(("a CUDA graph was not used", {"why": why}))
                     return True
-                entry = _Recording(torch, graph, pool, inputs, outputs[0], key, served, owner)
+                entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner)
                 root = _REGIONS[module][0]() is module
                 if why := _no_gain(torch, entry, root, recorder.eager.wall_ms()):
                     recorder.judged[key] = why
@@ -1244,6 +1237,19 @@ def _device_bound(submit: float, busy: float) -> str:
 
 #: the idle inputs' seed: any fixed one (the verify needs the same inputs twice, not these)
 _SEED = 0
+
+
+def _arguments(torch: Any, pending: Any, tensors: list[Any]) -> tuple[Any, Any]:
+    """The call's arguments with `tensors` at its leaves' places (None keeps the leaf)."""
+    leaves = [t if t is not None else v for t, v in zip(tensors, pending.leaves, strict=True)]
+    return torch.utils._pytree.tree_unflatten(leaves, pending.spec)
+
+
+def _static(torch: Any, leaf: _Leaf) -> Any:
+    """A static input of `leaf`'s layout, uninitialized: made inside a capture, from its pool."""
+    span = 1 + sum((n - 1) * s for n, s in zip(leaf.shape, leaf.stride, strict=True))
+    flat = torch.empty(span if all(leaf.shape) else 0, dtype=leaf.dtype, device=leaf.device)
+    return flat.as_strided(leaf.shape, leaf.stride)
 
 
 def _input(torch: Any, leaf: _Leaf, generator: Any) -> Any:

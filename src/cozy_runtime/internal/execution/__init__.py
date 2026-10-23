@@ -12,7 +12,6 @@ from pathlib import Path
 import msgspec
 import tensorfs
 import torch
-from tensorfs.varena import allocator_refusals, allocator_stats
 from tensorfs.varena.torch import Request, blocks_of
 from torch import nn
 
@@ -20,7 +19,7 @@ from cozy_runtime.internal.execution import agree, catch, cuts
 from cozy_runtime.internal.execution.agree import agreed, sizes
 from cozy_runtime.internal.execution.catch import collective, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, split
-from cozy_runtime.internal.executor_replies import Allocator, Ceiling, GpuMemory, Refusal
+from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
 from cozy_runtime.internal.executor_replies import Stats as Record
 
 __all__ = [
@@ -28,7 +27,6 @@ __all__ = [
     "agreed",
     "attend",
     "collective",
-    "counters",
     "install",
     "piece",
     "record",
@@ -66,46 +64,17 @@ class Steps:
 
 
 def record(
-    request: Request, gpu: int, device: int | None, store: Path, since: Allocator | None
+    request: Request, gpu: int, device: int | None, store: Path, torch_peak: int
 ) -> GpuMemory:
     """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`: TensorFS's fill
-    ceilings for CUDA `device` (None: no GPU) and `store`, varena's record of the request, its
-    pool's drop, and torch's allocator since its start (`counters`)."""
-    now = counters(device)
-    delta = None if now is None or since is None else _delta(now, since)
-    # The callback's last refusal per pool is the process's: this request's only when the
-    # device's refusals grew while it ran.
-    refused = () if delta is None or not delta.refused else allocator_refusals(device)
+    ceilings for CUDA `device` (None: no GPU) and `store`, varena's record of the request and its
+    arena's torch high-water."""
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
         stats=msgspec.json.decode(request.stats().json(), type=Record),
-        torch=delta,
-        refusals=tuple(
-            Refusal(pool=pool, why=why, size=size, free=free)
-            for _, pool, why, size, free in refused
-        ),
-        flush_ms=round(request.flush_ms, 3),
-        pool_free=tuple(request.pool_free),
+        torch_peak=torch_peak,
     )
-
-
-def counters(device: int | None) -> Allocator | None:
-    """torch's allocator counters on CUDA `device` now, and varena's callback's refusals there
-    (None: no GPU)."""
-    if device is None:
-        return None
-    found = torch.cuda.memory_stats(device)
-    names = [name for name in Allocator.__struct_fields__ if name != "refused"]
-    return Allocator(
-        **{name: int(found.get(name, 0)) for name in names},
-        refused=allocator_stats(device)[4],
-    )
-
-
-def _delta(now: Allocator, since: Allocator) -> Allocator:
-    fields = Allocator.__struct_fields__
-    return Allocator(**{f: getattr(now, f) - getattr(since, f) for f in fields})
 
 
 #: each (device, store)'s measured ceilings, once per executor

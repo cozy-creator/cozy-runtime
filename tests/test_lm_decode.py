@@ -186,7 +186,7 @@ def test_decode_replays_graphs_on_cuda() -> None:
     _same(model, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, 64)
     engine = lm._ENGINES[model]
     assert len(engine.graphs) == 1 and engine.captured[0] == 1
-    assert engine.eager == 1  # the real first token initializes the exact capture pool
+    assert engine.eager == 1  # the real first token runs before the capture
     recorded = next(iter(engine.graphs.values()))
     _same(model, {"input_ids": ids, "attention_mask": torch.ones_like(ids)}, 64)
     assert next(iter(engine.graphs.values())) is recorded
@@ -196,7 +196,8 @@ def test_decode_replays_graphs_on_cuda() -> None:
     facts = graphs.describe(model)
     assert facts["active_graphs"] == facts["captures"] == facts["graph_pools"] == 1
     assert facts["domains"] == 1 and facts["decode"]["eager_steps"] == 1
-    assert facts["replays"] > 1 and facts["graph_pool_bytes"] > 0
+    # unplaced: no varena memory prepares the pool
+    assert facts["replays"] > 1 and facts["graph_pool_bytes"] == 0
 
 
 def test_running_out_of_memory_never_restarts_a_prefill() -> None:

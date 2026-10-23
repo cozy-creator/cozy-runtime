@@ -47,6 +47,7 @@ from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, say
+from cozy_runtime.graphs.domain import Pool
 from cozy_runtime.lm import _kernels
 
 try:
@@ -1660,10 +1661,10 @@ class _Engine:
         self.retire = True
 
     @contextmanager
-    def _graph_memory(self, pool: Any, *, route: bool) -> Iterator[None]:
-        """Prepare the exact pool and join the side stream before the driver lease can end."""
+    def _graph_memory(self) -> Iterator[None]:
+        """The weights' lease and the domain's side stream, joined back before the lease can
+        end."""
         current = torch.cuda.current_stream()
-        placed = PLACED.get(self.model)
         binding = self.addresses.get(id(self.model))
         side = None
         try:
@@ -1675,13 +1676,6 @@ class _Engine:
                 side.wait_stream(current)
                 self.domain.prime_blas()
                 stack.enter_context(torch.cuda.stream(side))
-                stack.enter_context(
-                    placed[0].graph_allocating(pool, route=route)
-                    if placed is not None
-                    else torch.cuda.use_mem_pool(pool)
-                    if route
-                    else nullcontext()
-                )
                 try:
                     yield
                 finally:
@@ -1716,11 +1710,9 @@ class _Engine:
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             if key not in self.warmed:
-                placed = PLACED.get(self.model)
-                pool = placed[0].graph_pool() if placed is not None else torch.cuda.MemPool()
-                self.pools[key] = pool
+                self.pools[key] = Pool(torch.cuda.graph_pool_handle())
                 # This is the caller's actual next token, never an extra speculative warmup.
-                with self._graph_memory(pool, route=True):
+                with self._graph_memory():
                     self._advance(size)
                 self.warmed.add(key)
                 self.eager += 1
@@ -1728,8 +1720,12 @@ class _Engine:
             pool = self.pools[key]
             capturing = time.perf_counter()
             try:
-                # Warm routing ended: capture enters the SAME pool, not a nested use_mem_pool.
-                with self._graph_memory(pool, route=False):
+                with self._graph_memory():
+                    context = CURRENT.get()
+                    if placed is not None and context is not None:
+                        # The driver's request high-water bounds the step's working set (an
+                        # idle capture measures it exactly: cr-210 moves this off the request).
+                        placed[0].graph_prepare(pool, context.request_id)
                     graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
             except Building:
                 graph, why, self.building = None, "", LANDED[0]

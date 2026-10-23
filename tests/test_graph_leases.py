@@ -139,7 +139,6 @@ def test_runtime_replays_same_graphs_after_backing_eviction(tmp_path: Path) -> N
                     {
                         "turn": turn,
                         "graph_pools": pool_bytes,
-                        "domain_workspace": domain.nbytes(),
                         "store_bytes": stats.moved.store.bytes,
                         "graphs": len(recordings),
                         "context_measurable": memory.native.context_measurable(),

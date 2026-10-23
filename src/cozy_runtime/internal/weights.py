@@ -38,7 +38,7 @@ from tensorfs.varena.torch import (
 from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
 from cozy_runtime.author._model import PLACED
-from cozy_runtime.internal import execution, lora_bake
+from cozy_runtime.internal import accel, execution, lora_bake
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
     TORCH_DTYPES,
@@ -864,17 +864,14 @@ class Placement:
         """The region's address ownership, independent of its physical replay lease."""
         return self.models[component].retain(paths)
 
-    def graph_pool(self) -> Any:
-        return self.memory.new_pool()
-
     def graph_accounted(self) -> bool:
         return self.memory.cuda and self.memory.native.context_measurable()
 
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def graph_allocating(self, pool: Any, *, route: bool = True) -> Any:
-        return self.memory.allocating(pool, route=route)
+    def graph_prepare(self, pool: Any, request: str) -> None:
+        pool.prepare(self.memory, accel.arena_peak(self.memory, request))
 
     def graph_levels(self) -> tuple[tuple[tuple[str, str], int], ...]:
         """The process's cut levels: a graph recorded under them replays only under them."""
@@ -889,7 +886,7 @@ class Placement:
 
     def graph_idle(self) -> AbstractContextManager[object]:
         """An idle capture's request: it fills free bytes only and never evicts."""
-        return self.memory.request("graphs-idle", idle=True)
+        return self.memory.request(graphs.IDLE_REQUEST, idle=True)
 
     def graph_resident(self, binding: Binding) -> bool:
         """Every page `binding` covers is on the device now (an idle capture never fills one)."""
