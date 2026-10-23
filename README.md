@@ -282,8 +282,7 @@ annotation (cr-077): `model: M` is constructed in a warm session; `source: Weigh
 `ctx.tensorfs_source` and `derive.quantize_artifact`. Authors may name
 a slot's default release through `@invocable(defaults={"model": "sdxl@1.0.0"})` or
 `@app.entrypoint(defaults=...)`: `[org/]model@release`, never a lane. Omitting the org names a
-model of the package's own account; the publishing Creator writes that account into the
-published interface. A run's `model.<slot>=` wins over the default. Selection resolves before
+first-party model, the root namespace's (`sdxl@1.0.0`). A run's `model.<slot>=` wins over the default. Selection resolves before
 dispatch; the executor receives exact artifacts. See [authored defaults](docs/authored-model-defaults.md).
 The same decorators take `components={"model": ("dit", "vae")}`: the slot's `components` names
 the components that callable runs (absent means all), so a machine fetches those first. A
