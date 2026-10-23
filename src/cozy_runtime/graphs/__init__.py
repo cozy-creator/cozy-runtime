@@ -470,6 +470,8 @@ class _Idle:
                         self.jobs.appendleft(job)
                     return False
                 except Exception as exc:  # one job's failure never ends the period (v16)
+                    if fault(exc) in (Fault.STICKY, Fault.DEVICE):
+                        raise  # the device itself failed: the executor ends (`_idle`)
                     self.failures += 1
                     say(
                         f"idle:{type(exc).__name__}:{exc}",
@@ -1007,9 +1009,9 @@ def _capture_pending(pending: _Pending) -> bool:
         try:
             with idle, owner.holding():
                 done = _record(torch, module, pending, recorder, placed, submit)
-        except Yielded:
-            raise
         except Exception as exc:  # the signature runs as written; the period goes on
+            if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
+                raise
             _failed(module, recorder, pending.key, f"{type(exc).__name__}: {exc}"[:300])
             done = True
         if done:
