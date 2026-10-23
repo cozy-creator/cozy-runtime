@@ -640,8 +640,10 @@ def test_a_device_bound_region_never_records() -> None:
         module(x)
     recorder = graphs._RECORDERS[module]
     assert not recorder.recordings and recorder.replays == 0
-    (why,) = recorder.failed.values()
+    (why,) = recorder.judged.values()
     assert why.startswith("device-bound"), why
+    graphs._shed(torch, recorder.domain)
+    assert recorder.judged  # a measured verdict outlives the graphs: it never queues again
     ((submit, busy),) = recorder.bound.values()
     assert busy > submit
     graphs.release(torch, module)

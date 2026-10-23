@@ -333,8 +333,11 @@ class _Recorder:
         self.recordings: dict[tuple[object, ...], _Recording] = {}
         #: each signature waiting for an idle period to record (`capture_idle`)
         self.queued: dict[tuple[object, ...], _Pending] = {}
-        #: why a signature runs as written from now on (a refusal, or device-bound)
+        #: why a signature runs as written until its graphs are dropped (a refusal)
         self.failed: dict[tuple[object, ...], str] = {}
+        #: why one runs as written for the process: measured, it would save nothing
+        #: (device-bound, or a replay no faster than its eager call)
+        self.judged: dict[tuple[object, ...], str] = {}
         self.waiting: dict[tuple[object, ...], int] = {}
         #: per signature its idle measure: host submission and device-busy ms a call
         self.bound: dict[tuple[object, ...], tuple[float, float]] = {}
@@ -757,7 +760,7 @@ def _receipt(recorder: _Recorder) -> dict[str, Any]:
         ],
         "saving_ms": None if saving is None else round(saving, 3),
         "payback_calls": math.ceil(cost / saving) if saving and saving > 0 else None,
-        "eager": sorted(set(recorder.failed.values())),
+        "eager": sorted({*recorder.failed.values(), *recorder.judged.values()}),
     }
 
 
@@ -869,7 +872,7 @@ def _region_call(
         entry = recorder.recordings.get(key)
         if entry is None:  # as written; an idle period records it
             pending = recorder.queued.get(key)
-            if pending is None and key not in recorder.failed:
+            if pending is None and key not in recorder.failed and key not in recorder.judged:
                 pending = recorder.queued[key] = _Pending(
                     torch,
                     weakref.ref(module),
@@ -1069,7 +1072,7 @@ def _record(
                         _WARMING.reset(warming)
                 recorder.bound[key] = (submit, busy)
                 if why := _device_bound(submit, busy):
-                    recorder.failed[key] = why
+                    recorder.judged[key] = why
                     return True
                 capturing = (
                     placed[0].graph_allocating(pool, route=False)
@@ -1093,6 +1096,10 @@ def _record(
                     why = "its replay differs from the eager run on the same inputs"
                     _failed(module, recorder, key, why)
                     WARNINGS.append(("a CUDA graph was not used", {"why": why}))
+                    return True
+                if why := _no_gain(torch, graph, recorder.eager.wall_ms()):
+                    recorder.judged[key] = why
+                    graph.reset()
                     return True
         entry = _Recording(torch, graph, pool, inputs, outputs[0], key, served, owner)
         recorder.recordings[key] = entry
@@ -1119,6 +1126,24 @@ def _record(
             # Warmup can queue reads before refusing an allocation. Join even the failure
             # path before the lease records its completion event.
             current.wait_stream(stream)
+
+
+def _no_gain(torch: Any, graph: Any, eager: float | None) -> str:
+    """Why a verified graph is dropped: its replay's device time a call (two replays timed at
+    idle) saves no more than the two differ by against its eager calls' (v14: 85 CLIP regions
+    cost 479 ms to record and saved ~0). "" when it gains, or with no eager wall measured."""
+    walls = []
+    for _ in range(2):
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        graph.replay()
+        end.record()
+        end.synchronize()
+        walls.append(float(start.elapsed_time(end)))
+    replay = sum(walls) / len(walls)
+    if eager is None or eager - replay > abs(walls[0] - walls[1]):
+        return ""
+    return f"no gain: replay {replay:.3f} ms a call against eager {eager:.3f} ms"
 
 
 def _device_bound(submit: float, busy: float) -> str:
