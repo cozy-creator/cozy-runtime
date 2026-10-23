@@ -44,6 +44,7 @@ import contextvars
 import ctypes
 import dataclasses
 import faulthandler
+import signal
 import functools
 import gc
 import hashlib
@@ -4933,6 +4934,7 @@ def _remember_distributions() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     faulthandler.enable(all_threads=True)
+    faulthandler.register(signal.SIGUSR2, all_threads=True)  # DIAGNOSTIC (h3 step 1), never merged
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
     parser.add_argument("--socket", default="")
     parser.add_argument("--root", required=True)
