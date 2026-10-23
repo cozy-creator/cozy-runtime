@@ -144,7 +144,6 @@ from cozy_runtime.internal import (
     int8_linear,
     kernel_cache,
     kernel_compile,
-    liveness,
     model_config,
     package_interface,
     prebuilt,
@@ -586,22 +585,6 @@ def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
 
 def _trees(command: Invoke) -> dict[str, tuple[Path, str]]:
     return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
-
-
-def _redial() -> Callable[[], bool]:
-    """A follower's wait before it dials its lease listener again: TensorD registers it from
-    rank 0's progress frame, which can land after its first dial. The wait doubles from a
-    millisecond to liveness's sample and always dials again; a follower never registered shows
-    no progress, so rank 0's watch over the Start ends the group (`group_unformed`) and with it
-    this process. No clock decides it."""
-    delay = [0.001]
-
-    def redial() -> bool:
-        time.sleep(delay[0])
-        delay[0] = min(delay[0] * 2, liveness.SAMPLE_SECONDS)
-        return True
-
-    return redial
 
 
 def _allocations(torch: Any) -> int:
@@ -1063,12 +1046,10 @@ class Executor:
             return
         device, ledgers = self._rank_device(torch), host.ledgers
         grant = Grant(*ledgers[:2]) if device.type == "cuda" and ledgers else None
-        # TensorD's lease namespace, when it leases this GPU's weight pages. A follower can dial
-        # before rank 0's progress frame has registered it: it dials again (`_redial`).
+        # TensorD's lease namespace, when it leases this GPU's weight pages. A follower that
+        # dials before rank 0's progress frame registers it is held until TensorD has.
         leases = host.leases if device.type == "cuda" else None
-        redial = _redial() if leases is not None and self.rank > 0 else None
-        memory = Memory.open(device, grant, leases=leases, redial=redial)
-        host.memory, host.execution = memory, execution
+        host.memory, host.execution = Memory.open(device, grant, leases=leases), execution
         if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
             host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
         if device.type == "cuda":  # steps report the device's time beside the host's
