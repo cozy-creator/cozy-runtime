@@ -76,7 +76,11 @@ def _call(channel: Channel, frame: dict[str, Any]) -> dict[str, Any]:
 
 def _wait_zombie(pid: int) -> None:
     deadline = time.monotonic() + 30
-    while Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
+    # A leader is a zombie before its other threads end; its exit is reapable once they have.
+    while (
+        Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+        or len(os.listdir(f"/proc/{pid}/task")) > 1
+    ):
         assert time.monotonic() < deadline, f"{pid} did not exit"
         time.sleep(0.02)
 
@@ -234,6 +238,7 @@ def test_a_forked_child_is_a_sealed_executor_with_the_imports_done(
     hello = _call(channel, {"cmd": "hello"})
     assert "fork/1" in hello["capabilities"]
     assert _call(channel, {**start, "import_only": True})["ok"]
+    assert os.listdir(f"/proc/{process.pid}/task") == [str(process.pid)], "a thread blocks forks"
     listener = _listener(tmp_path / "a.sock")
     began = time.monotonic()
     forked = _fork(tmp_path, channel, "a")
