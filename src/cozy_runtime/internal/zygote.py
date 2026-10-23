@@ -115,7 +115,8 @@ def unsafe(torch: Any) -> str:
         return "torch initialized CUDA"
     threads = _threads()
     if len(threads) > 1 or threading.active_count() > 1:
-        return f"threads alive: {threads}"
+        named = [t.name for t in threading.enumerate() if t is not threading.main_thread()]
+        return f"threads alive: {threads}, Python's: {named}"
     files = _device_files()
     if files:
         return f"NVIDIA device files open: {files}"

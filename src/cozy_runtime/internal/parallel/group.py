@@ -18,17 +18,17 @@ import socket
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Annotated, Any, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 import msgspec
 
 from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED
 from cozy_runtime.internal import execution_evidence, spawn
 from cozy_runtime.internal.config import inherited_environment, update_environment
-from cozy_runtime.internal.parallel.plan import GpuDivergence, GroupPlan, GroupRefusal
+from cozy_runtime.internal.parallel.plan import GroupRefusal
 from cozy_runtime.internal.seam import Channel, SeamError
 
 #: NCCL reads this once, at communicator creation. NVLink SHARP multicast needs a privilege
@@ -70,8 +70,7 @@ class ChildProcess(Protocol):
 
 class Frame(msgspec.Struct, frozen=True):
     """What rank 0 reads of every follower frame to route it: a progress event is
-    forwarded, a request is relayed to the machine, anything else is the reply to the
-    command in flight."""
+    forwarded, anything else is the reply to the command in flight."""
 
     event: str = ""
     name: str = ""
@@ -88,40 +87,6 @@ class _Hello(msgspec.Struct, frozen=True):
     rank: int
     world: int
     sealed: dict[str, str]
-
-
-_Bytes = Annotated[int, msgspec.Meta(ge=0)]
-
-
-class _Offer(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_budget"):
-    """A follower's plan and the bytes it needs, for `agree_residence`."""
-
-    rank: int
-    model: str
-    plan: GroupPlan
-    required: _Bytes
-
-
-class _Parking(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_budget"):
-    """Rank 0's answer to the offers: the constructions every rank parks."""
-
-    model: str
-    park: list[str]
-
-
-class _Measured(msgspec.Struct, frozen=True, tag_field="reply", tag="resident_ceiling"):
-    """A follower's ceiling, measured after it parked."""
-
-    rank: int
-    model: str
-    ceiling: _Bytes
-
-
-class _Ceiling(msgspec.Struct, frozen=True, tag_field="cmd", tag="resident_ceiling"):
-    """The group's ceiling: the smallest any rank measured."""
-
-    model: str
-    ceiling: _Bytes
 
 
 class SpreadLog(TypedDict):
@@ -235,16 +200,25 @@ def _device(torch: ModuleType, backend: str) -> object:
 
 
 def warm(torch: ModuleType, backend: str, rank: int, world: int) -> None:
-    """GPU 0 and each follower exchange one element, so the pair's point-to-point communicator
-    (a request's broadcasts and results ride it) exists from the group's start too."""
+    """One of each collective a request uses, so NCCL connects them all as the group forms
+    (varena counts what they hold as context): GPU 0 and each follower exchange one element
+    (a request's broadcasts and results ride that pair's communicator), then the pass's level
+    agreement (an int64 max), the Ulysses row gather and its all-to-all."""
     if "nccl" not in backend:
         return
-    dist, one = torch.distributed, torch.zeros(1, device=_device(torch, backend))
+    dist, device = torch.distributed, _device(torch, backend)
+    one = torch.zeros(1, device=device)
     for peer in range(1, world) if rank == 0 else (0,):
         if rank == 0:
             dist.send(one, peer)
         else:
             dist.recv(one, peer)
+    level = torch.zeros(1, dtype=torch.int64, device=device)
+    dist.all_reduce(level, op=dist.ReduceOp.MAX)
+    rows = torch.zeros(world, dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(rows, level)
+    sent = torch.zeros(world, dtype=torch.bfloat16, device=device)
+    dist.all_to_all_single(torch.empty_like(sent), sent)
     torch.cuda.synchronize()
 
 
@@ -260,48 +234,6 @@ def abort_process_group() -> None:
         return
 
 
-def _decode[T](
-    frame: Mapping[str, object] | None, kind: type[T], gpu: str, field_name: str, what: str
-) -> T:
-    """One residence message, or a divergence naming the GPU and the field it broke."""
-    try:
-        return msgspec.convert(frame, kind)
-    except msgspec.ValidationError as exc:
-        raise GpuDivergence(gpu, field_name, f"{what}: {exc}") from exc
-
-
-def receive_residence(
-    channel: Channel,
-    *,
-    rank: int,
-    model: str,
-    plan: Mapping[str, object],
-    required: int,
-    park: Callable[[list[str]], None],
-    ceiling: Callable[[], int],
-) -> int:
-    """A follower's half of `RankGroup.agree_residence`.
-
-    Offer this rank's plan and need, park what rank 0 parked, offer the ceiling measured
-    after that, and accept only a matching, no-larger group ceiling.
-    """
-    offer = _Offer(rank, model, GroupPlan.read(plan), required)
-    gpu = execution_evidence.gpu_name(offer.plan.devices, rank)
-    channel.send(msgspec.to_builtins(offer))
-    what = "invalid group parking decision"
-    parking = _decode(channel.recv(timeout=None), _Parking, gpu, "parked_constructions", what)
-    if parking.model != model:
-        raise GpuDivergence(gpu, "parked_constructions", f"{what} for {parking.model!r}")
-    park(parking.park)
-    local = ceiling()
-    channel.send(msgspec.to_builtins(_Measured(rank, model, local)))
-    what = "invalid group residence ceiling"
-    shared = _decode(channel.recv(timeout=None), _Ceiling, gpu, "resident_budget_bytes", what)
-    if shared.model != model or shared.ceiling > local:
-        raise GpuDivergence(gpu, "resident_budget_bytes", what)
-    return shared.ceiling
-
-
 class RankGroup:
     """Rank 0's handle on the K-1 followers of one generation."""
 
@@ -313,7 +245,6 @@ class RankGroup:
         python: str = sys.executable,
         root: str = "",
         forward: Callable[[dict[str, object]], None] | None = None,
-        relay: Callable[[Channel, dict[str, Any]], None] | None = None,
         launch: Callable[[list[str], int], ChildProcess] | None = None,
         devices: Iterable[str] = (),
     ) -> None:
@@ -328,8 +259,6 @@ class RankGroup:
         #: where a follower's progress frame goes: rank 0's own seam, so the worker keeps
         #: reading movement while rank 0 waits on its followers
         self.forward = forward
-        #: answers a follower's own request to the machine on its channel (rank 0's `_relay`)
-        self.relay = relay
         #: how a follower's program is started: the trampoline's `inherit` backend under
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
@@ -426,13 +355,6 @@ class RankGroup:
                     with contextlib.suppress(SeamError):
                         self.forward({**frame, "name": f"{follower.gpu}:{head.name}"})
                 continue
-            if head.event == "request" and self.relay is not None:
-                try:
-                    self.relay(follower.channel, {**frame, "rank": follower.rank})
-                except SeamError as exc:
-                    follower.gone = f"{follower.gpu}'s request was not relayed: {exc}"
-                    break
-                continue
             follower.replies.put((head, frame))
             if head.reply != "run" or head.ok:
                 continue
@@ -517,17 +439,14 @@ class RankGroup:
         self,
         torch: Any,
         sealed: Mapping[str, str],
-        ledgers: Sequence[int] = (),
         again: bool = False,
         nccl: Mapping[str, str] | None = None,
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group: the store on a kernel-chosen loopback port, every
-        follower joining it, rank 0 joining last, one barrier as the proof. `ledgers`, a pair
-        per follower in rank order, are their GPUs' ledger memfds and eventfds: each pair follows
-        its `join`, then the
-        socket its watcher reads (`interrupt`). `again` forms it AGAIN after an `interrupt`:
-        every follower joins a new store.
+        follower joining it, rank 0 joining last, one barrier as the proof; each follower's join is
+        followed by the socket its watcher reads (`interrupt`). `again` forms it AGAIN after an
+        `interrupt`: every follower joins a new store.
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
         barrier, while each follower runs its half before it answers the join."""
         dist = torch.distributed
@@ -551,15 +470,13 @@ class RankGroup:
             "nccl": self.nccl,
             "calibrate": formed is not None,
         }
-        for index, follower in enumerate(self.followers):
+        for follower in self.followers:
             if again:
                 self.send_one(follower.rank, {**join, "again": True})
                 continue
             follower.abort, watcher = socket.socketpair()
             try:
-                self.send_one(follower.rank, {**join, "ledger": bool(ledgers), "abort": True})
-                if ledgers:
-                    follower.channel.send_ledger(*ledgers[2 * index : 2 * index + 2])
+                self.send_one(follower.rank, {**join, "abort": True})
                 follower.channel.send_descriptor(watcher)
             except SeamError as exc:
                 raise GroupRefusal(
@@ -604,9 +521,9 @@ class RankGroup:
                 ) from exc
 
     def start(self, command: Mapping[str, object]) -> None:
-        """Hand every follower rank 0's Start. The ledger descriptors that follow TensorD's
-        Start are rank 0's; a follower takes its own at join (`form`), so the Start it gets
-        names none, or it would wait in `start` for descriptors nobody sends."""
+        """Hand every follower rank 0's Start. The descriptors that follow TensorD's Start are
+        rank 0's: the Start a follower gets names none, or it would wait for descriptors nobody
+        sends."""
         self.broadcast({**command, "ledgers": 0})
 
     def collect(self, name: str) -> list[dict[str, Any]]:
@@ -677,51 +594,6 @@ class RankGroup:
             raise GroupRefusal(self.broken, code="group_broken")
         return body
 
-    def agree_residence(
-        self,
-        *,
-        model: str,
-        plan: Mapping[str, object],
-        required: int,
-        park: Callable[[int], list[str]],
-        ceiling: Callable[[], int],
-    ) -> tuple[int, list[str]]:
-        """Agree the plan, the constructions to park, and the ceiling, before any fill.
-
-        Every rank resolved on its own card; each offer carries its plan and the bytes it
-        needs. A plan that differs is divergence, refused before a destination exists. Rank
-        0 parks for the largest need any rank reported and every rank parks the same
-        constructions; each then measures its own ceiling and the group fills under the
-        smallest. The control seam also observes an early load failure or rank death,
-        without parking the leader in a device collective.
-        """
-        need = int(required)
-        mine = GroupPlan.read(plan)
-        for follower, reply in zip(self.followers, self.collect("resident_budget"), strict=True):
-            offer = _decode(reply, _Offer, follower.gpu, "resident_budget", "invalid GPU offer")
-            if (offer.rank, offer.model) != (follower.rank, model):
-                raise GpuDivergence(follower.gpu, "resident_budget", "invalid GPU offer")
-            offer.plan.assert_agrees(mine, rank=follower.rank)
-            need = max(need, offer.required)
-        parked = park(need)
-        self.broadcast(msgspec.to_builtins(_Parking(model, parked)))
-        shared = ceiling()
-        for follower, reply in zip(self.followers, self.collect("resident_ceiling"), strict=True):
-            measured = _decode(
-                reply,
-                _Measured,
-                follower.gpu,
-                "resident_budget_bytes",
-                "invalid GPU residence ceiling",
-            )
-            if (measured.rank, measured.model) != (follower.rank, model):
-                raise GpuDivergence(
-                    follower.gpu, "resident_budget_bytes", "invalid GPU residence ceiling"
-                )
-            shared = min(shared, measured.ceiling)
-        self.broadcast(msgspec.to_builtins(_Ceiling(model, shared)))
-        return shared, parked
-
     def call(self, command: Mapping[str, object]) -> list[dict[str, Any]]:
         self.broadcast(command)
         return self.collect(str(command["cmd"]))
@@ -746,6 +618,8 @@ class RankGroup:
                 raise GroupRefusal(self.verdict(), code="group_broken")
 
     def pids(self) -> tuple[int, ...]:
+        """The followers' pids in rank order, rank 1 first: TensorD pairs them with GPUs by
+        position."""
         return tuple(follower.pid for follower in self.followers)
 
     def close(self) -> None:

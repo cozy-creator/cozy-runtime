@@ -117,18 +117,20 @@ class DeviceFacts:
         }
 
 
-def measure_device(torch: Any, index: int = 0) -> DeviceFacts:
+def measure_device(torch: Any, index: int = 0, kind: str = "") -> DeviceFacts:
     """Read the SELECTED device once, as the facts a plan names it by.
 
     `index` is honoured all the way down (#549.9): torch is asked about that device and NVML
     is queried with `-i index`. Passing 0 and reading card 0 while filling card 3 is the
-    defect this signature always looked like it did not have.
+    defect this signature always looked like it did not have. `kind` is the device the plan
+    serves on (the host's accelerator by default): a CPU backend on a GPU host plans for the
+    CPU, never the card.
 
     An unreadable knob is SPELLED rather than defaulted.
     """
-    kind = accel.host_backend_family()
+    kind = kind or accel.host_backend_family()
     os_arch = f"{platform.system()}/{platform.machine()}"
-    if not accel.present(torch, kind):
+    if kind == "cpu" or not accel.present(torch, kind):
         return DeviceFacts(
             "cpu", "cpu", 0, "", "default", index=0, cuda_runtime="", os_arch=os_arch
         )

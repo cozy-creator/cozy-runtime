@@ -1,5 +1,5 @@
-"""`split`: the package says how an op cuts (`Cut`); the memory says how finely (varena's
-`cuts.split`, installed with it): whole, else in the windows that fit, remembered per op."""
+"""`split`: the package says how an op cuts (`Cut`); the memory says how finely (the execution
+layer's `split`, installed with it): whole, else in the windows the level Rust holds gives."""
 
 from __future__ import annotations
 
@@ -22,12 +22,21 @@ class Cut:
 
 
 class Pieces(Protocol):
-    """The memory's side of `split`: `run(most)` in windows of at most `most` of `total`
-    elements, the least `finest`, retried finer while out of memory."""
+    """The memory's side of `split`: `split` runs `run(most)` in windows of at most `most` of
+    `total` elements, the least `finest`, finer while out of memory; `piece` marks each window's
+    start (the ops inside are numbered per window)."""
 
-    def __call__(
-        self, name: str, key: str, device: Any, total: int, finest: int, run: Callable[[int], Any]
+    def split(
+        self,
+        name: str,
+        key: str,
+        total: int,
+        finest: int,
+        out_bytes: int,
+        run: Callable[[int], Any],
     ) -> Any: ...
+
+    def piece(self) -> None: ...
 
 
 _RUNTIME: Pieces | None = None
@@ -45,13 +54,13 @@ def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
     if runtime is None or not cuts:
         return fn(x)
     shape = tuple(int(n) for n in x.shape)
-    return runtime(
+    return runtime.split(
         _name(fn),
         _key(fn, shape, cuts, x.dtype),
-        x.device,
         math.prod(shape),
         _finest(shape, cuts),
-        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most)),
+        int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size()),
+        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece),
     )
 
 
@@ -132,7 +141,13 @@ def _largest(shape: tuple[int, ...], cuts: tuple[Cut, ...], longest: Sequence[in
     return rest * math.prod(longest)
 
 
-def _run(fn: Callable[[Any], Any], x: Any, cuts: tuple[Cut, ...], windows: list[Window]) -> Any:
+def _run(
+    fn: Callable[[Any], Any],
+    x: Any,
+    cuts: tuple[Cut, ...],
+    windows: list[Window],
+    piece: Callable[[], None],
+) -> Any:
     if len(windows) == 1:
         return fn(x)
     ndim = x.dim()
@@ -145,6 +160,7 @@ def _run(fn: Callable[[Any], Any], x: Any, cuts: tuple[Cut, ...], windows: list[
         index = [slice(None)] * ndim
         for d, (a, b) in zip(dims, window, strict=True):
             index[d] = slice(a, b)
+        piece()
         part = fn(x[tuple(index)])
         place = [slice(None)] * part.dim()
         for d, c, (a, _), size in zip(dims, cuts, window, sizes, strict=True):

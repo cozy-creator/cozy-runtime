@@ -79,6 +79,8 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     min_bits: Literal[16, 8, 4] = 8
     phase: Literal["compute", "decode"] = "compute"
     sequence_parallel: SequenceParallel | msgspec.UnsetType = msgspec.UNSET
+    #: the components (`@placeable`) the machine may keep on another GPU of a group
+    placeable: tuple[str, ...] = ()
     #: the components this callable runs; unset means all of them
     components: tuple[str, ...] | msgspec.UnsetType = msgspec.UNSET
     #: a `Weights[M]` argument: raw checkpoint data, never constructed
@@ -336,6 +338,7 @@ class ModelSpec:
     phase: str = "compute"
     sequence_parallel: tuple[int, ...] = ()
     components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    placeable: tuple[str, ...] = ()
 
     @classmethod
     def of(cls, model: type[Model[Any]]) -> ModelSpec:
@@ -346,6 +349,7 @@ class ModelSpec:
             model.__phase__,
             tuple(model.__sequence_parallel__),
             component_use(model),
+            tuple(model.__placeable__),
         )
 
 
@@ -395,6 +399,9 @@ def model_slot(
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
         doc["sequence_parallel"] = {"degrees": list(spec.sequence_parallel)}
+    if spec.placeable:
+        # TensorD names each one's GPU in a group's Load (`Binding.homes`).
+        doc["placeable"] = sorted(spec.placeable)
     if weights:
         doc["weights"] = True
     if on_demand:
@@ -662,6 +669,8 @@ def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
         _invalid(source, f"{path}.sequence_parallel.degrees", "must be non-empty, sorted, unique")
     if slot.default is not msgspec.UNSET:
         model_default(slot.default)
+    if list(slot.placeable) != sorted(set(slot.placeable)) or not all(slot.placeable):
+        _invalid(source, f"{path}.placeable", "must be sorted, unique component names")
     if slot.components is not msgspec.UNSET and (
         not slot.components
         or len(set(slot.components)) != len(slot.components)

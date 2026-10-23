@@ -1,89 +1,102 @@
-"""One request's memory, as its invoke reply states it (memory-varena §5.8, xs-046 B4's wire)."""
+"""One request's memory, as its invoke reply states it: `measurements.memory.varena`."""
 
 from __future__ import annotations
+
+from typing import Literal
 
 import msgspec
 
 
-class Step(msgspec.Struct, frozen=True, kw_only=True):
-    """One pass of a model: bytes at home and resident, copied home and streamed through slots,
-    the GPU-timed prefetch stall, torch's allocated peak above the pass's start, and torch's
-    allocated bytes at that start (a leak shows as their growth)."""
+class Ceiling(msgspec.Struct, frozen=True, kw_only=True):
+    """TensorFS's measured ceilings for a GPU's fills: host to device (None: no GPU), and
+    disk."""
 
-    model: str
-    gpu: int
-    step: int
-    home: int
-    resident: int
-    paged_in: int
-    streamed: int
-    stall_ns: int
-    activations: int
-    allocated: int = 0
+    h2d_gbps: float | None
+    disk_gbps: float
 
 
-class Eviction(msgspec.Struct, frozen=True, kw_only=True):
-    model: str
-    gpu: int
-    rung: int
-    reason: str
-    nbytes: int
+class Fills(msgspec.Struct, frozen=True, kw_only=True):
+    """Bytes filled from one source and the time the fills took."""
 
-
-class Peak(msgspec.Struct, frozen=True, kw_only=True):
-    """A model's measured activation peak at one shape key, and the cuts in force there (B3)."""
-
-    model: str
-    shape: str
-    peak: int
-    cuts: list[str] = []
-
-
-class Copy(msgspec.Struct, frozen=True, kw_only=True):
-    """A run of weight copies since the last request (`tensorfs.varena.torch.Copy`): to a GPU
-    (`h2d`: a restore, refill or fill) or a host layout read from disk (`disk`), in GB/s and %
-    of its measured ceiling (None while unmeasured), with the PCIe link, GPU copy and page-lock
-    seconds."""
-
-    kind: str
-    gpu: int
     bytes: int
-    seconds: float
-    gbps: float
-    ceiling: float
-    pct: float | None
-    link: str = ""
-    busy_s: float = 0.0
-    pin_s: float = 0.0
-    staged: int = 0
-    cached: int = 0
+    ns: int
 
 
-class Memory(msgspec.Struct, frozen=True, kw_only=True):
-    """The invoke reply's `memory`, which `cozy run show` states as `measurements.memory.stats`
-    and the merge gate reads: torch bytes package state still held at the request's end
-    (`leftover`), weight bytes copied to the device while it ran (`paged_in`, home or through
-    slots), and each model's bytes copied per step (`steps`). Then the detail: every step's
-    row, the evictions it made, the peaks and cuts per shape key, its out-of-memory retries,
-    `leftover` by GPU, and the copy runs against their ceilings."""
+class Moved(msgspec.Struct, frozen=True, kw_only=True):
+    """Bytes moved by source (kept pages imported, leased chunks adopted, the store through the
+    page cache); `speculative` of them were prefetched."""
 
-    leftover: int = 0
-    paged_in: int = 0
-    steps: dict[str, list[int]] = {}
-    rows: list[Step] = []
-    evictions: list[Eviction] = []
-    peaks: list[Peak] = []
-    retries: int = 0
-    leftover_by_gpu: list[tuple[int, int]] = []
-    #: the declared plan (`Context.plan`), each step's components
-    plan: list[list[str]] = []
-    copies: list[Copy] = []
+    kept: Fills
+    leased: Fills
+    store: Fills
+    speculative: int
+
+
+class Ref(msgspec.Struct, frozen=True, kw_only=True):
+    """One bind: the page reference trace the gates compute Belady MIN from."""
+
+    step: int
+    set: str
+    block: int
+    bytes: int
+    origin: Literal["Hit", "Kept", "Store"]
+    speculative: bool
+
+
+class Step(msgspec.Struct, frozen=True, kw_only=True):
+    """One step: the free bytes at its start and what make_room took in it, by class."""
+
+    capacity: int
+    evicted: tuple[int, ...]
+
+
+class MakeRoom(msgspec.Struct, frozen=True, kw_only=True):
+    """One make_room that had to take bytes: the plan step, what asked (the allocator hook, a
+    bind, a range's preparation), the free bytes asked and taken, and the release events it
+    waited on first."""
+
+    step: int
+    trigger: str
+    need: int
+    freed: int
+    waited: int
+
+
+class Stats(msgspec.Struct, frozen=True, kw_only=True):
+    """varena's record of one request (varena-slim §5), as its core writes it: what make_room
+    took (`evicted`, by class F, O, S, N, D, W, P), the most it held at a pass end (pages and
+    segments) and its passes' compute bytes."""
+
+    request: str
+    moved: Moved
+    trace: tuple[Ref, ...]
+    steps: tuple[Step, ...]
+    stall_ns: int
+    evicted: tuple[int, ...]
+    peak: int
+    compute: int
+    leftover: int
+    make_room: tuple[MakeRoom, ...]
+    #: the request-end audit: its arena's torch blocks still live outside any region at its
+    #: end, (address, bytes, stream) each; tests fail on any
+    outlived: tuple[tuple[int, int, int], ...]
+
+
+class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
+    """One GPU's part of a request: its physical number, the fill ceilings there (None: not
+    measured yet), varena's record of the request, and its arena's torch high-water (bytes:
+    torch's own statistics don't see varena's allocator)."""
+
+    gpu: int
+    ceiling: Ceiling | None
+    stats: Stats
+    torch_peak: int
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):
     ok: bool
     rank: int
     request_id: str
-    memory: Memory | None = None
+    memory: GpuMemory | None = None
     code: str = ""
     detail: str = ""

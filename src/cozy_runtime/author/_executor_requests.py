@@ -130,53 +130,8 @@ class TreeMember(_Request, frozen=True, kw_only=True, tag="tree_member"):
     media_types: tuple[str, ...] = ()
 
 
-class ReadGrant(_Request, frozen=True, kw_only=True, tag="read_grant"):
-    """One weight set's held bytes (memory-varena §5.4): `Granted` answers with the host layout
-    deposited for `layout` (`held`), else nothing. TensorD never fills one."""
-
-    manifest: str
-    #: what the host layout is kept under: manifest, construction and component, known before
-    #: the module is built (`weights.Backend._layout`); a held layout of other regions is a miss
-    layout: str
-    rank: int = 0
-
-
-class Deposit(_Request, frozen=True, kw_only=True, tag="deposit"):
-    """A host layout varena sealed in this process, its memfd following: TensorD keeps it
-    opaquely by (manifest, layout) and grants it to the next `ReadGrant` of that layout."""
-
-    manifest: str
-    name: str
-    layout: str
-    #: the memfd; never on the wire
-    memfd: int = -1
-
-
-class Page(msgspec.Struct, frozen=True, kw_only=True):
-    """One kept GPU page: a home region and the bytes its allocation spans."""
-
-    region: int
-    nbytes: int
-
-
-class KeepPages(_Request, frozen=True, kw_only=True, tag="keep_pages"):
-    """GPU pages of weight regions varena kept here (`WeightSet.kept`), one container fd per
-    page following: TensorD holds them past this process and grants them, after `layout`'s held
-    host tier, to the next executor, which maps them when `fingerprint` matches."""
-
-    layout: str
-    fingerprint: str
-    pages: tuple[Page, ...]
-    rank: int = 0
-    #: the containers; never on the wire
-    fds: tuple[int, ...] = ()
-
-
 type _Tagged = (
-    ReadGrant
-    | Deposit
-    | KeepPages
-    | ChildEvents
+    ChildEvents
     | ChildCall
     | ChildPoll
     | ChildCancel
@@ -214,37 +169,6 @@ class Handoff(Answer, frozen=True, kw_only=True):
     """An answer the worker follows with one connected socket, whose received fd this is."""
 
     descriptor: int = -1
-
-
-class Tier(Answer, frozen=True, kw_only=True):
-    """A memfd the machine holds, following when `held`."""
-
-    held: bool = False
-    descriptor: int = -1
-
-
-class Granted(Tier, frozen=True, kw_only=True):
-    """A `ReadGrant`'s answer, its descriptors in `fds`: the one sealed host layout deposited
-    for the layout (`held`); with none, whether the asker may seal it (`seal`: it fits in the
-    machine's measured host surplus)."""
-
-    fds: tuple[int, ...] = ()
-    #: held: GPU pages a gone executor kept of the layout, whose fds follow the layout's
-    fingerprint: str = ""
-    pages: tuple[Page, ...] = ()
-    seal: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class HostGrant:
-    """A `Granted` as the load uses it: the host layout deposited for a weight set, the GPU pages
-    kept of it `(region, fd)` and their fingerprint. With none held, `seal`: the machine admits a
-    new host layout into its measured surplus; else varena reads the checkpoint."""
-
-    fd: int | None = None
-    pages: tuple[tuple[int, int], ...] = ()
-    fingerprint: str = ""
-    seal: bool = False
 
 
 class CallProgress(msgspec.Struct, frozen=True, kw_only=True):

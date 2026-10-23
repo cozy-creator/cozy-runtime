@@ -216,7 +216,11 @@ def compute_processes(device: str) -> dict[int, int] | None:
     None where the driver will not say."""
     library = _nvml_library()
     handle = _nvml_handle(library, device) if library is not None and device else None
-    return _nvml_device_compute_table(library, handle) if library is not None and handle is not None else None
+    return (
+        _nvml_device_compute_table(library, handle)
+        if library is not None and handle is not None
+        else None
+    )
 
 
 def _table_rows(pids: set[int], table: dict[int, int]) -> dict[int, ProcessMemory]:
@@ -491,18 +495,18 @@ def initialized(torch: Any, kind: str) -> bool:
 
 def oom_error(torch: Any, kind: str) -> type[BaseException]:
     """The OOM exception CLASS, for an `except` clause that must name the type before an
-    instance exists. An instance is classified by `author._errors.is_device_oom`: MPS also
-    refuses a buffer larger than Metal allows as a plain RuntimeError."""
+    instance exists. An instance is classified by `author._errors.fault`."""
     cls = getattr(torch, "OutOfMemoryError", None)
     if not isinstance(cls, type):  # pragma: no cover - a torch without the class
         raise AcceleratorUnsupported(kind, "oom_error")
     return cls
 
 
-def allocation(torch: Any, kind: str, device: Any = None) -> dict[str, int]:
+def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) -> dict[str, int]:
     """The allocator's live numbers plus the driver's own view — the only number that sees
-    other processes. On unified memory the device is this process's budget
-    (`unified_budget`) and the driver's figure counts this process's Metal buffers only."""
+    other processes. On CUDA the allocator is varena's (`memory`), whose figures these are:
+    torch's own statistics raise under it. On unified memory the device is this process's
+    budget (`unified_budget`) and the driver's figure counts this process's Metal buffers only."""
     if kind == "mps":
         driver, total = int(torch.mps.driver_allocated_memory()), unified_budget(torch)
         return {
@@ -512,78 +516,43 @@ def allocation(torch: Any, kind: str, device: Any = None) -> dict[str, int]:
             "driver_total_bytes": total,
         }
     free, total = torch.cuda.mem_get_info(device)
+    held = varena_torch(memory)
     return {
-        "allocated_bytes": int(torch.cuda.memory_allocated(device)),
-        "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+        "allocated_bytes": int(held["allocated"]),
+        "reserved_bytes": int(held["mapped"]),
         "driver_free_bytes": int(free),
         "driver_total_bytes": int(total),
     }
 
 
-def allocated(torch: Any, kind: str, device: Any = None) -> int:
+def varena_torch(memory: Any) -> dict[str, Any]:
+    """varena's figures for torch's blocks on a CUDA `memory`: allocated, mapped and peak bytes,
+    and per open request its (allocated, peak). None without one (no torch block is varena's)."""
+    if memory is None or not memory.cuda:
+        return {"allocated": 0, "mapped": 0, "peak": 0, "requests": {}}
+    return dict(memory.torch_stats())
+
+
+def allocated(torch: Any, kind: str, memory: Any = None) -> int:
     """The allocator's live bytes ALONE. Separate from `allocation` on purpose: the
     residency plane reads this on every stage and every eviction, and the driver query
     `allocation` also makes is far too expensive to ride along on that path."""
     if kind == "mps":
         return int(torch.mps.current_allocated_memory())
-    return int(torch.cuda.memory_allocated(device))
+    return int(varena_torch(memory)["allocated"])
 
 
-#: The high-water marks (allocated, reserved) kept across a section measured on its own
-#: (`hold_peak`): the attempt around it still sees them.
-_HELD = [0, 0]
-
-
-def reserved(torch: ModuleType, kind: str) -> int:
-    """The allocator's reserved bytes ALONE: live tensors plus its idle cache."""
+def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
+    """The allocator's reserved bytes ALONE: live tensors plus what it holds mapped for them."""
     if kind == "mps":
         return int(torch.mps.driver_allocated_memory())
-    return int(torch.cuda.memory_reserved())
+    return int(varena_torch(memory)["mapped"])
 
 
-def reset_peak(torch: Any, kind: str) -> None:
-    """Zero the high-water mark, so the next `peak_allocated` measures ONE attempt. MPS keeps
-    no high-water mark: its peaks are the figures read when asked."""
-    _HELD[:] = [0, 0]
-    if kind == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-
-
-def hold_peak(torch: ModuleType, kind: str) -> None:
-    """Keep the high-water marks so far for `peak_allocated`/`peak_reserved` and zero torch's:
-    what runs next is measured on its own (`section_peak`)."""
-    _HELD[:] = [peak_allocated(torch, kind), peak_reserved(torch, kind)]
-    if kind == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-
-
-def drop_peak(torch: ModuleType, kind: str) -> None:
-    """Forget the high-water mark since `hold_peak`: that section failed."""
-    if kind == "cuda":
-        torch.cuda.reset_peak_memory_stats()
-
-
-def section_peak(torch: ModuleType, kind: str) -> int:
-    """The high-water mark since `hold_peak`."""
-    if kind == "mps":
-        return allocated(torch, kind)
-    return int(torch.cuda.max_memory_allocated())
-
-
-def peak_allocated(torch: Any, kind: str) -> int:
-    """The high-water mark since the last `reset_peak` — the number the ledger prices an
-    attempt's activations from, which the live figure structurally cannot give."""
-    if kind == "mps":
-        return max(allocated(torch, kind), _HELD[0])
-    return max(int(torch.cuda.max_memory_allocated()), _HELD[0])
-
-
-def peak_reserved(torch: Any, kind: str) -> int:
-    """The allocator's reserved high-water mark since the last `reset_peak`: live tensors plus
-    the segments torch held for them, which is what a stage takes from the device."""
-    if kind == "mps":
-        return max(reserved(torch, kind), _HELD[1])
-    return max(int(torch.cuda.max_memory_reserved()), _HELD[1])
+def arena_peak(memory: Any, request: str) -> int:
+    """Open request `request`'s torch high-water in its arena (varena keeps it per request,
+    so concurrent requests never share a mark); 0 off CUDA."""
+    return int(varena_torch(memory)["requests"].get(request, (0, 0))[1])
 
 
 #: This process's own cache releases that returned something, by the function that asked:
@@ -592,11 +561,12 @@ RELEASED: dict[str, list[int]] = {}
 
 
 def release_cached(torch: Any, kind: str) -> None:
-    """Return the caching allocator's UNUSED segments to the driver. Frees nothing the
-    process still holds; it is what makes an eviction visible to other processes."""
-    if kind in BACKENDS:
+    """Return MPS's caching allocator's UNUSED segments to the driver. Frees nothing the
+    process still holds; it is what makes an eviction visible to other processes. CUDA's
+    allocator is varena's, which returns what it doesn't hold itself."""
+    if kind == "mps":
         before = reserved(torch, kind)
-        (torch.mps if kind == "mps" else torch.cuda).empty_cache()
+        torch.mps.empty_cache()
         if (freed := before - reserved(torch, kind)) > 0:
             row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
             row[0] += 1

@@ -2,35 +2,25 @@
 names, and the exchange around a head-local kernel (`attention_ulysses`). Sequence shards cross
 to whole sequences per head subset, the kernel runs, and its output crosses back; packed H3
 lengths do not divide, so every GPU's rows are gathered once per exchange and every crossing
-uses them. Heads cross all at once when their buffers fit the room every GPU of the group has
-(`tensorfs.varena.cuts.available`), else in the largest groups that do, each group's output back
-before the next group's Q/K/V cross. Importing this module serves `attention_ulysses.group` and
-`.exchange`; only code that already runs torch imports it (`internal.weights`).
+uses them. The exchange's head groups are agreed once per pass (each GPU proposing what its
+room needs); an exchange is never rerun locally once any rank can have entered its collectives. Importing this module serves the torch-free
+attention dispatch boundary.
 """
 
 from __future__ import annotations
 
-import sys
 from collections.abc import Callable, Sequence
 from typing import cast
 
 import torch
 import torch.distributed as dist
-from tensorfs.varena import cuts
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed import _functional_collectives as funcol
 
 from cozy_runtime.internal import attention_ulysses
+from cozy_runtime.internal.execution import agree, catch, sizing
 from cozy_runtime.internal.parallel import copy_engine
-
-#: an exchange's buffers at their most, in GPU shares of the heads crossing: Q, K and V in
-#: flight, each in its exchange's layout and its result (6), and the next one being laid out
-_BUFFERS = 7
-#: what one allocation may take on a device now; a TensorFS without it crosses every head at once
-_ROOM: Callable[[torch.device], int] | None = getattr(cuts, "available", None)
-#: (heads, rows, group) already said on stderr, once each
-_SAID: set[tuple[int, int, int]] = set()
 
 type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
 
@@ -56,19 +46,25 @@ def exchange(
 ) -> Tensor:
     """`compute` over whole sequences per head subset, back to this GPU's rows of every head."""
     heads, world = int(query.shape[2]), handle.size()
-    room = _ROOM(query.device) if _ROOM is not None else 0
-    mine = torch.tensor([int(query.shape[1]), room or 1 << 62], device=query.device)
-    every = [torch.empty_like(mine) for _ in range(world)]
-    dist.all_gather(every, mine, group=handle)  # every GPU sizes from the same facts
-    sizes, room = [int(e[0]) for e in every], min(int(e[1]) for e in every)
-    pad = -heads % world  # Diffusers' rule: whole heads per GPU, the padding computed and dropped
+
+    def gather() -> list[int]:
+        mine = torch.tensor([int(query.shape[1])], device=query.device)
+        every = [torch.empty_like(mine) for _ in range(world)]
+        dist.all_gather(every, mine, group=handle)
+        return [int(e[0]) for e in every]
+
+    sizes = agree.sizes(gather)
+    pad = -heads % world
     if pad:
         query, key, value = (
             torch.nn.functional.pad(t, (0, 0, 0, pad)) for t in (query, key, value)
         )
     padded = heads + pad
-    step = _heads(padded, world, sum(sizes) * int(query.shape[3]) * query.element_size(), room)
-    _say(padded, sum(sizes), step, room)
+    groups = sorted(
+        {padded, *(n for n in range(world, padded, world) if padded % n == 0)}, reverse=True
+    )
+    step = groups[min(agree.agreed(), len(groups) - 1)]
+    agree.propose(_level(groups, query, sum(sizes), world))
     engines = copy_engine.for_group(handle)
     if step == padded:
         out = _cross(engines, query, key, value, handle, sizes, compute)
@@ -88,28 +84,28 @@ def exchange(
     return out[:, :, :heads] if pad else out
 
 
-def _heads(heads: int, world: int, per_head: int, room: int) -> int:
-    """Heads one exchange moves: all of them when their buffers (`_BUFFERS` GPU shares of
-    `per_head` bytes a head, every row) fit `room`, else the largest group of whole heads on
-    each GPU, dividing them, whose buffers fit beside the output the groups fill, else the
-    smallest such group."""
-    whole = heads // world * per_head
-    groups = [s for s in range(world, heads, world) if heads % s == 0]
-    if not groups or _BUFFERS * whole <= room:
-        return heads
-    fits = (s for s in groups if whole + _BUFFERS * (s // world) * per_head <= room)
-    return max(fits, default=groups[0])
+def _level(groups: Sequence[int], query: Tensor, rows: int, world: int) -> int:
+    """The finest head group this GPU's room needs for the exchange (P4: the gathered buffer
+    is the group's every row): q, k and v sent and received, and the output, for `step` heads.
+    Proposed for the next pass; mid-pass every GPU keeps the agreed one."""
+    request = catch.CURRENT.get()
+    if request is None:
+        return 0
+    room = request.room()
+    batch, local, dim, b = (
+        int(query.shape[0]),
+        int(query.shape[1]),
+        int(query.shape[3]),
+        query.element_size(),
+    )
 
+    def need(step: int) -> int:
+        sent = 4 * batch * local * step * dim * b
+        gathered = 4 * batch * rows * (step // world) * dim * b
+        return sizing.rounded(sent, room.granularity) + sizing.rounded(gathered, room.granularity)
 
-def _say(heads: int, rows: int, step: int, room: int) -> None:
-    if step < heads and (heads, rows, step) not in _SAID:
-        _SAID.add((heads, rows, step))
-        print(
-            f"[ulysses] {heads} heads cross in groups of {step} ({rows} rows, room "
-            f"{room >> 20} MiB)",
-            file=sys.stderr,
-            flush=True,
-        )
+    fits = room.free + room.cold
+    return next((n for n, step in enumerate(groups) if need(step) <= fits), len(groups) - 1)
 
 
 def _cross(

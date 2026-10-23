@@ -303,10 +303,13 @@ class _Broker:
         bindings: Mapping[tuple[str, str], _CallType],
         exchange: Exchange,
         watch: Callable[[], int | None] | None = None,
+        yielding: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
         #: Opens the worker's nudge socket once; None when no peer can nudge.
         self.watch = watch
+        #: Around each wait on a child: the attempt's memory yields its step to the child's.
+        self.yielding = yielding
         self.nudges: socket.socket | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.nudged = 0
@@ -457,7 +460,8 @@ class _Broker:
                             "child result differs from its interface",
                             call.index,
                         ) from exc
-                await self._changed(seen, call.ctx.deadline)
+                with self.yielding() if self.yielding is not None else contextlib.nullcontext():
+                    await self._changed(seen, call.ctx.deadline)
         except asyncio.CancelledError:
             if call.index in self.activated and not self.closed:
                 self.exchange(ChildCancel(call_index=call.index), CallState)

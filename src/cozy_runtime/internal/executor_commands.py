@@ -63,8 +63,6 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
 class Join(Command, frozen=True, kw_only=True, tag="join"):
     port: int
     backend: str = "nccl"
-    #: The follower's GPU ledger memfd and eventfd follow this command: it claims its row there.
-    ledger: bool = False
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
     abort: bool = False
     #: The group forms again after a call ended short of memory (`mirror.mirror_component`).
@@ -93,10 +91,6 @@ class Map(Command, frozen=True, kw_only=True, tag="map"):
 
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
-    construction: str
-
-
-class KeepWeights(Command, frozen=True, kw_only=True, tag="keep_weights"):
     construction: str
 
 
@@ -177,6 +171,8 @@ class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The session's GPUs; empty runs on the CPU and never opens CUDA (`accelerator=False`).
     devices: str = ""
+    #: 2: leases beside two ledger descriptors per GPU; checked before reading either.
+    memory_protocol: int = 0
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
@@ -184,10 +180,12 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
-    #: Its GPUs' ledgers follow the frame, a memfd and an eventfd per GPU in `devices` order
-    #: (memory-varena §5.6): rank 0 claims its row in the first and hands follower r the r-th.
+    #: Its GPUs' grants follow the frame, a table and a row description per GPU in `devices`
+    #: order: rank 0 opens its memory on the first and hands follower r the r-th.
     ledgers: int = 0
-    memory_mode: Literal["shared", "dedicated"] = "shared"
+    #: TensorD's namespace (its uid) each GPU's lease listener is named in: given only when it
+    #: leases this executor's weight pages (memory protocol 2); none, its ledger rows alone.
+    leases: int | None = None
     #: The callables its attempts may call: their proxies are installed before the package is
     #: imported, and every attempt gets the call broker over them.
     call_interfaces: tuple[CallInterface, ...] = ()
@@ -231,6 +229,9 @@ class Binding(Release, frozen=True, kw_only=True):
     package: str = ""
     model: str = ""
     adapters: tuple[Adapter, ...] = ()
+    #: In a group, each placeable component's GPU (an index within it): 0 keeps it beside the
+    #: serial scope, g >= 1 keeps it resident on GPU g, where its calls and remote scopes run.
+    homes: dict[str, int] = {}
 
     def parameter_names(self) -> tuple[str, ...]:
         """Every declared name for this shared construction, its primary first."""
@@ -334,6 +335,8 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     #: None honors installed per-field bounds; zero retains the older default ceiling.
     max_input_bytes: int | None = None
     construction: str = ""
+    #: The family whose GPUs its calls share: a wait on a child call yields its room to it.
+    family: str = ""
     attention_kernel: str = ""
     bits: int = 0  # as `PrepareRequest.bits`
     #: Each `Weights[M]` parameter's checkpoint, opened directly through TensorFS.
@@ -353,7 +356,6 @@ type KnownCommand = (
     | Fork
     | Map
     | Unload
-    | KeepWeights
     | RequestMemory
     | Activate
     | Attention

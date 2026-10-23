@@ -2,7 +2,9 @@
 
 Model code lives in the model's package and the Runtime stays generic (owner ruling,
 2026-10-14); kernels are hand-written, never `torch.compile`, and compile on the GPU that runs
-them while the executor starts. A package declares its Triton kernels once, at import, as a
+them while the executor starts. Compiling fixed shipped source is permitted; consumer
+benchmarking, autotuning, torch.compile and competing implementation search are not.
+A package declares its Triton kernels once, at import, as a
 `TritonKernels`. Each executor that imports the package submits their build for its GPUs'
 architectures when it starts, beside the weight download; the machine's compile manager builds
 each key once, niced, out of process. `Model.execution_plan` receives a `Plan` whose `load`
@@ -108,10 +110,14 @@ Launch = Callable[..., None]
 argument positional as the kernel declares it."""
 
 
+def _unreported(name: str, document: Mapping[str, object]) -> None:
+    """A plan run outside an executor (a test, a conformance script) reports nowhere."""
+
+
 @dataclass(frozen=True, slots=True)
 class Plan:
-    """What Runtime hands `Model.execution_plan`: the GPU this construction serves on, and the
-    package's compiled kernels for it."""
+    """What Runtime hands `Model.execution_plan`: the GPU this construction serves on, the
+    package's compiled kernels for it, and where its outcome is reported."""
 
     device: Any
     load: Callable[[TritonKernels], Launch]
@@ -123,6 +129,10 @@ class Plan:
     A construction serves while its kernels compile, and a run never waits for one. True when
     this GPU's build is done now. Raises `KernelsUnavailable` as `load` does; an install that
     fails leaves the construction as it was. None: `load`, then install."""
+    report: Callable[[str, Mapping[str, object]], None] = _unreported
+    """What the plan installed under `name`: applied or not, with its code and detail. The
+    construction's receipts carry it (`measurements.execution.plan_reports`), so a refusal shows
+    in `run show`, not only in the executor's log."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -1029,7 +1029,7 @@ class Reader:
                 spec = self.model(found.module, found.node)
                 components.update(spec.components)
         encoded_leaves, min_bits, phase = spec.encoded_leaves, spec.min_bits, spec.phase
-        degrees = spec.sequence_parallel
+        degrees, placeable = spec.sequence_parallel, spec.placeable
         for keyword in node.keywords:
             value = self.fold(module, keyword.value)
             if keyword.arg == "encoded_leaves" and closed(ENCODED_LEAVES, value):
@@ -1054,7 +1054,8 @@ class Reader:
             call = decorator if isinstance(decorator, ast.Call) else None
             found = self.resolve(module, call.func if call else decorator)
             if isinstance(found, Vocab) and found.key == "author.placeable" and call:
-                continue  # a runtime placement capability; the interface does not carry it
+                placeable = tuple(dict.fromkeys(str(self.fold(module, a)) for a in call.args))
+                continue
             if not (isinstance(found, Vocab) and found.key == "author.sequence_parallel" and call):
                 self.refuse(module, decorator, "a Model class decorator outside the closed set")
             for keyword in call.keywords:
@@ -1073,7 +1074,9 @@ class Reader:
                 if isinstance(found, Vocab) and found.key == "author.uses_components":
                     names = tuple(str(self.fold(module, arg)) for arg in decorator.args)
                     components[stmt.name] = names
-        spec = ModelSpec(node.name, encoded_leaves, min_bits, phase, degrees, components)
+        spec = ModelSpec(
+            node.name, encoded_leaves, min_bits, phase, degrees, components, placeable
+        )
         self.models[key] = spec
         return spec
 

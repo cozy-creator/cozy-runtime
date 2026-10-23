@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal
 
 
@@ -159,66 +160,87 @@ SUCCEEDED = Outcome("succeeded", "runtime", "ok")
 #: say. Measured: cl-003 watched a plan-arithmetic defect arrive as
 #: `AUTHOR_EXCEPTION/CAUSE_ORIGIN_AUTHOR` on a package that made no memory call.
 DEVICE_OOM = "device_out_of_memory"
-#: The one memory refusal (`tensorfs.varena.torch.Exhausted`): it did not fit with every other
-#: evictable byte gone. Capacity, like DEVICE_OOM: it fails the attempt, never the process.
+#: The one memory refusal (varena's `Exhausted`): it did not fit with every other evictable
+#: byte gone. Capacity, like DEVICE_OOM: it fails the attempt, never the process.
 MEMORY_EXHAUSTED = "memory_exhausted"
+#: CUDA's or NCCL's own error: the executor serves nothing more (its context may be gone).
+DEVICE_FAULT = "device_fault"
 
 
-def is_device_oom(exc: BaseException) -> bool:
-    """A device allocation failure, recognized WITHOUT importing torch: torch's
-    `OutOfMemoryError`, an asynchronous `AcceleratorError` for cudaErrorMemoryAllocation, an
-    allocation that failed inside a CUDA library call (cuBLAS, cuDNN, cuFFT, cuSOLVER,
-    cuSPARSE, NCCL), a TensorFS driver call that found none, or MPS's plain RuntimeError for a
-    pool past its limit or one buffer larger than Metal allows.
+class Fault(Enum):
+    """What an exception says about the device (`fault`)."""
 
-    This module is the author kernel's and it is deliberately dependency-free — the
-    worker imports it and the worker has no torch. The identity is therefore structural:
-    the class's own module and name, or the library's own status text.
-    """
-    name, text = type(exc).__name__, str(exc)
-    torch_error = type(exc).__module__.split(".")[0] == "torch"
-    if torch_error and name == "OutOfMemoryError":
-        return True
-    if torch_error and name == "AcceleratorError":
-        return getattr(exc, "error_code", None) == 2 or "out of memory" in text
-    if type(exc).__module__ == "tensorfs.varena":  # a driver call of the plane's (run 10996)
-        return name == "CudaError" and "CUDA_ERROR_OUT_OF_MEMORY" in text
-    if not isinstance(exc, RuntimeError):
-        return False
-    if "NCCL" in text and "out of memory" in text:
-        return True
-    return any(
-        mark in text
-        for mark in (
-            "CUDA error: out of memory",
-            "CUDA driver error: out of memory",
-            "Triton Error [CUDA]: out of memory",
-            "CUBLAS_STATUS_ALLOC_FAILED",
-            "CUDNN_STATUS_ALLOC_FAILED",
-            "CUFFT_ALLOC_FAILED",
-            "CUSOLVER_STATUS_ALLOC_FAILED",
-            "CUSPARSE_STATUS_ALLOC_FAILED",
-            "MPS backend out of memory",
-            "Invalid buffer size",
-        )
-    )
+    OOM = "oom"  # an allocation failed: the execution layer's catch asks the memory
+    EXHAUSTED = "exhausted"  # varena found no room with everything evictable gone
+    STICKY = "sticky"  # the CUDA context is gone: the process ends
+    DEVICE = "device"  # CUDA's or NCCL's own error: the executor is not reused
+    OTHER = "other"
+
+
+#: cudaErrorMemoryAllocation
+_CUDA_OOM = 2
+#: CUDA's sticky errors (cudaError_t): ECC uncorrectable, NVLink uncorrectable, illegal
+#: address, launch timeout, context destroyed, device assert, hardware stack, illegal
+#: instruction, misaligned address, invalid address space, invalid PC, launch failure.
+_STICKY = frozenset({214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719})
+#: The one documented list of how libraries that raise no typed error name running out of
+#: memory. The CUDA libraries name their allocation status (their code) in torch's message.
+_ALLOC_FAILED = (
+    "CUBLAS_STATUS_ALLOC_FAILED",
+    "CUDNN_STATUS_ALLOC_FAILED",
+    "CUFFT_ALLOC_FAILED",
+    "CUSOLVER_STATUS_ALLOC_FAILED",
+    "CUSPARSE_STATUS_ALLOC_FAILED",
+)
+#: NCCL reports the CUDA code its own allocation returned.
+_NCCL_OOM = "Cuda failure 2 'out of memory'"
+#: The libraries that give no code, by their message's prefix: Triton's launcher, and torch's
+#: MPS allocator (a pool past its limit, and one buffer larger than Metal allows).
+_OOM_PREFIXES = (
+    "Triton Error [CUDA]: out of memory",
+    "MPS backend out of memory",
+    "Invalid buffer size",
+)
+
+
+def fault(exc: BaseException) -> Fault:
+    """THE classifier, structural so it needs no torch: torch's `OutOfMemoryError`, an
+    `AcceleratorError` by its CUDA code (2: out of memory; sticky codes; any other), a CUDA
+    library's alloc-failed status, the prefixes of the libraries that give no code (Triton's
+    launch, MPS's allocator), NCCL's `DistBackendError` (out of memory by the CUDA code it
+    reports, else a device error), and varena's `Exhausted` and device errors (out of memory
+    by their CUDA code)."""
+    kind, module = type(exc).__name__, type(exc).__module__
+    if module.partition(".")[0] == "torch":
+        if kind == "OutOfMemoryError":
+            return Fault.OOM
+        if kind == "AcceleratorError":
+            code = getattr(exc, "error_code", None)
+            if code == _CUDA_OOM:
+                return Fault.OOM
+            return Fault.STICKY if code in _STICKY else Fault.DEVICE
+        if kind == "DistBackendError":
+            return Fault.OOM if _NCCL_OOM in str(exc) else Fault.DEVICE
+    if module.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):  # varena's errors
+        if exc.sticky:
+            return Fault.STICKY  # includes allocator ownership faults; never cut or reuse
+        if kind == "Exhausted":
+            return Fault.EXHAUSTED
+        if getattr(exc, "code", "") == "DEVICE":
+            if getattr(exc, "cuda_code", None) == _CUDA_OOM:
+                return Fault.OOM
+            return Fault.DEVICE
+        return Fault.OTHER
+    if isinstance(exc, RuntimeError):
+        text = str(exc)
+        if text.startswith(_OOM_PREFIXES) or any(status in text for status in _ALLOC_FAILED):
+            return Fault.OOM
+    return Fault.OTHER
 
 
 def is_capacity(exc: BaseException) -> bool:
     """The device ran out: an allocation failure, or varena's `Exhausted`."""
-    exhausted = (
-        type(exc).__module__ == "tensorfs.varena.torch" and type(exc).__name__ == "Exhausted"
-    )
-    return exhausted or is_device_oom(exc)
-
-
-def is_library_refusal(exc: BaseException) -> bool:
-    """A cuBLAS or cuDNN status raised from a library call. Each takes device memory for itself
-    at a first launch (its handle, a workspace, a kernel's code) and reports its absence under
-    several names (INTERNAL_ERROR, NOT_SUPPORTED, EXECUTION_FAILED, NOT_INITIALIZED), so under
-    a memory budget one is run again once with room made; a second is the library's own."""
-    text = str(exc)
-    return isinstance(exc, RuntimeError) and ("CUBLAS_STATUS_" in text or "CUDNN_STATUS_" in text)
+    return fault(exc) in (Fault.OOM, Fault.EXHAUSTED)
 
 
 def unwind(exc: BaseException) -> None:
@@ -263,12 +285,17 @@ def classify(exc: BaseException | None) -> Outcome:
         return Outcome("failed", "runtime", exc.code, exc.message, exc.fields, _trace(exc))
     if isinstance(exc, AuthorError):
         return Outcome("failed", "author", exc.code, exc.message, exc.fields, _trace(exc))
-    if is_device_oom(exc):
+    found = fault(exc)
+    if found is Fault.OOM:
         first = str(exc).partition("\n")[0][:400] or "the device ran out of memory"
         return Outcome("failed", "runtime", DEVICE_OOM, first, (), _trace(exc))
-    if type(exc).__module__ == "tensorfs.varena.torch":  # varena's memory, named structurally
-        code = MEMORY_EXHAUSTED if type(exc).__name__ == "Exhausted" else "weight_unbound"
-        return Outcome("failed", "runtime", code, str(exc)[:400], (), _trace(exc))
+    if found is Fault.EXHAUSTED:
+        return Outcome("failed", "runtime", MEMORY_EXHAUSTED, str(exc)[:400], (), _trace(exc))
+    if found in (Fault.STICKY, Fault.DEVICE):
+        text = f"{type(exc).__name__}: {exc}"[:400]
+        return Outcome("failed", "runtime", DEVICE_FAULT, text, (), _trace(exc))
+    if type(exc).__module__.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):
+        return Outcome("failed", "runtime", "memory_error", str(exc)[:400], (), _trace(exc))
     return Outcome(
         "failed",
         "author",
