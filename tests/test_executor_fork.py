@@ -130,7 +130,7 @@ def test_memory_protocol_is_advertised_before_start_and_torch_import(zygote: Any
     process, channel, _start = zygote
     reply = _call(channel, {"cmd": "hello"})
     assert reply["ok"] and reply["pid"] == process.pid
-    assert reply["memory_protocol"] == 1
+    assert reply["memory_protocol"] == 2
     assert reply["torch_loaded"] is False
 
 
@@ -163,7 +163,7 @@ def test_gpu_start_refuses_a_newer_memory_protocol_before_reading_descriptors(
     zygote: Any,
 ) -> None:
     _process, channel, start = zygote
-    command = {**start, "devices": "0", "ledgers": 1, "memory_protocol": 2}
+    command = {**start, "devices": "0", "ledgers": 1, "memory_protocol": 3}
     channel.send(command)
     # No GPU or descriptor is supplied. Receiving this frame proves the real executor
     # refused before either the legacy first FD or the incompatible second FD could block.

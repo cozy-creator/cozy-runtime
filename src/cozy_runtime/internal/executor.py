@@ -144,6 +144,7 @@ from cozy_runtime.internal import (
     int8_linear,
     kernel_cache,
     kernel_compile,
+    liveness,
     model_config,
     package_interface,
     prebuilt,
@@ -587,6 +588,22 @@ def _trees(command: Invoke) -> dict[str, tuple[Path, str]]:
     return {ref: (Path(root), digest) for ref, (root, digest) in command.trees.items()}
 
 
+def _redial() -> Callable[[], bool]:
+    """A follower's wait before it dials its lease listener again: TensorD registers it from
+    rank 0's progress frame, which can land after its first dial. The wait doubles from a
+    millisecond to liveness's sample and always dials again; a follower never registered shows
+    no progress, so rank 0's watch over the Start ends the group (`group_unformed`) and with it
+    this process. No clock decides it."""
+    delay = [0.001]
+
+    def redial() -> bool:
+        time.sleep(delay[0])
+        delay[0] = min(delay[0] * 2, liveness.SAMPLE_SECONDS)
+        return True
+
+    return redial
+
+
 def _allocations(torch: Any) -> int:
     """GPU 0's progress in a group call: the allocations its ops made (`group.watched`)."""
     return int(torch.cuda.memory_stats().get("allocation.all.allocated", 0))
@@ -804,6 +821,9 @@ class Executor:
         #: Why varena runs standalone on a private table, outside TensorD's ledger ("" it does
         #: not): an older TensorD's grant this Runtime cannot use (skew degrades)
         self.standalone = ""
+        #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
+        #: rank 0 forwards it in its followers' Start
+        self.leases: int | None = None
         #: The machine's sealed TensorFS cache directory.
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -965,9 +985,9 @@ class Executor:
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
             "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
-            # Two ledger descriptors per GPU and the unified Varena broker contract.
-            # TensorD checks this before transferring Start's memory authority.
-            "memory_protocol": 1,
+            # 2: each GPU's weight pages leased from TensorD's manager beside its two ledger
+            # descriptors. TensorD checks this before transferring Start's memory authority.
+            "memory_protocol": 2,
             #: commands beyond the floor's (`memory` is the invoke reply's own object)
             "capabilities": [
                 "import_only",
@@ -1043,7 +1063,14 @@ class Executor:
             return
         device, ledgers = self._rank_device(torch), host.ledgers
         grant = Grant(*ledgers[:2]) if device.type == "cuda" and ledgers else None
-        host.memory, host.execution = Memory.open(device, grant), execution
+        # TensorD's lease namespace, when it leases this GPU's weight pages. A follower can dial
+        # before rank 0's progress frame has registered it: it dials again (`_redial`).
+        leases = host.leases if device.type == "cuda" else None
+        redial = _redial() if leases is not None and self.rank > 0 else None
+        memory = Memory.open(device, grant, leases=leases, redial=redial)
+        host.memory, host.execution = memory, execution
+        if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
+            host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         _split.install(execution)
@@ -1579,13 +1606,13 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        if (command.devices or command.ledgers) and command.memory_protocol > 1:
+        if (command.devices or command.ledgers) and command.memory_protocol > 2:
             # A newer TensorD's grant layout is unknown here: its descriptors stay unread.
             self.poisoned = "incompatible memory protocol"
             return {
                 "ok": False,
                 "code": "memory_protocol_incompatible",
-                "detail": "GPU Start requires memory_protocol=1 before ledger transfer; "
+                "detail": "GPU Start requires memory_protocol 1 or 2 before ledger transfer; "
                 f"TensorD supplied {command.memory_protocol}. Upgrade TensorD, Runtime "
                 "and TensorFS together.",
             }
@@ -1607,6 +1634,7 @@ class Executor:
                 os.close(fd)
         else:
             self.ledgers = ledgers
+        self.leases = command.leases if command.memory_protocol == 2 else None
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:
