@@ -1,0 +1,1 @@
+A kernel build tells its own CPU in its word while it moves, and a call waiting on it moves as that word moves, so a sandboxed executor waiting through one long entry (a Triton GEMM) is not judged wedged.
