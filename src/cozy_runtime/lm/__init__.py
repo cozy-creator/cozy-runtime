@@ -44,12 +44,12 @@ from contextlib import ExitStack, contextmanager
 from typing import Any
 
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author import _work as work
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, capture, say
-from cozy_runtime.internal import streams, work
+from cozy_runtime.graphs import BYPASS, capture, say, streams
 from cozy_runtime.lm import _kernels
 
 try:

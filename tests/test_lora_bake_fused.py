@@ -259,6 +259,6 @@ def test_a_fused_nvfp4_bake_keeps_the_eager_grid_and_the_delta() -> None:
         first = fused if first is None else first
     again = _copy(stored)
     lora_bake.fused(torch, again, down, up, 0)
-    assert torch.equal(again["weight"], first["weight"])
+    assert first is not None and torch.equal(again["weight"], first["weight"])
     assert abs(sum(kept) / 4 - sum(eager_kept) / 4) < 0.1
     assert 0.8 < sum(kept) / 4 < 1.2

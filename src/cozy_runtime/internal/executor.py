@@ -72,6 +72,7 @@ from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _split, describe
+from cozy_runtime.author import _work as work
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
@@ -131,6 +132,7 @@ from cozy_runtime.author._weights import Weights as RawWeights
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.author.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.derive.operations import app as builtin_operations_app
+from cozy_runtime.graphs import streams
 from cozy_runtime.internal import (
     accel,
     arch,
@@ -158,11 +160,9 @@ from cozy_runtime.internal import (
     sandbox,
     spawn,
     stage_memo,
-    streams,
     tolerant,
     tools,
     w4a8_linear,
-    work,
     zygote,
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
@@ -3346,7 +3346,7 @@ class Executor:
         segments: list[dict[str, Any]] = []
         later: list[attention.Applied] = []
         #: each kernel that became ready mid-run, and the step from which it served
-        swapped: list[tuple[str, dict[str, Any]]] = []
+        swapped: list[tuple[str, dict[str, str | int]]] = []
         steps: dict[str, int] = {}
         stage = [""]  # the last stage this attempt itself reported
         handler = threading.get_ident()
@@ -3359,7 +3359,7 @@ class Executor:
                 return
             if frame.position is not None:
                 steps[frame.stage] = frame.position
-            at = {"stage": frame.stage, "step": steps.get(frame.stage, 0)}
+            at: dict[str, str | int] = {"stage": frame.stage, "step": steps.get(frame.stage, 0)}
             swapped.extend((name, at) for name in kernel_ready.boundary())
             if pin or served_attention is None:
                 return  # an override holds its kernel for every step

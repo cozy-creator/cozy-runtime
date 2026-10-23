@@ -1507,7 +1507,7 @@ def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
     served = {name for kernels in hosts.values() for name in kernels}
     artifacts = {
         ready.name: ready.artifact
-        for ready in kernel_ready.served(_SLOTS)
+        for ready in cast("list[Ready]", kernel_ready.served(_SLOTS))
         if ready.name in served and ready.artifact
     }
     return Applied(hosts, (), pin, artifacts=artifacts or None)
@@ -1823,7 +1823,7 @@ def compiled(names: Iterable[str], device: DeviceFacts) -> bool:
 def image_kernels(device: DeviceFacts) -> str:
     """What this device serves now, for a refusal message (cr-125): every kernel already
     ready here, and each one still compiling with its progress. Starts no compile."""
-    ready = sorted(ready.name for ready in kernel_ready.served(_slot("", device)))
+    ready = sorted(r.name for r in cast("list[Ready]", kernel_ready.served(_slot("", device))))
     busy = [f"{n} {s.line()}" for n, s in sorted(_STATES.items()) if s.state == "compiling"]
     return ", ".join(ready + busy) or "none"
 

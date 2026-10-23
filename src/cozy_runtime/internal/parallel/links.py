@@ -36,7 +36,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
-from cozy_runtime.internal import filelock, kernel_cache, liveness, proctree, spawn, streams
+from cozy_runtime.graphs import streams
+from cozy_runtime.internal import filelock, kernel_cache, liveness, proctree, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
 

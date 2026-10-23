@@ -45,11 +45,13 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author import _work as work
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
-from cozy_runtime.internal import attention_ulysses, module_state, streams, work
+from cozy_runtime.graphs import streams
+from cozy_runtime.internal import attention_ulysses, module_state
 
 #: Set while a mechanism runs its own graphs over a component (`cozy_runtime.lm`): its calls
 #: pass straight through.
@@ -297,7 +299,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
                     placed[0].unpin(placed[1], f"graphs:{placed[1]}", pin)
                 # Both locals retain the token: let its event-ordered hold go before eager
                 # execution. Other callers' recordings still retain their own references.
-                pin = layout = None
+                del pin, layout
             return call(module, *args, **kwargs)
     recorder.replays += 1
     if placed is not None:
@@ -337,7 +339,8 @@ def _record(
         if not is_capacity(exc):
             raise
         why = f"{type(exc).__name__}: {exc}".splitlines()[0][:300]
-        return _failed(torch, recorder, key, placed, why, type(module).__name__)
+        _failed(torch, recorder, key, placed, why, type(module).__name__)
+        return None
     try:
         with request_path.known("cozy_runtime.graphs._record"):  # cr-210
             graph, why = capture(
@@ -381,7 +384,8 @@ def _record(
     recorder.record_s += time.perf_counter() - started
     if graph is None:
         outputs.clear()
-        return _failed(torch, recorder, key, placed, why, type(module).__name__)
+        _failed(torch, recorder, key, placed, why, type(module).__name__)
+        return None
     entry = _Recording(torch, graph, inputs, outputs[0], layout, served)
     if recorder.pool is pool:  # else the plane released the pool for room meanwhile
         recorder.pool_bytes += max(torch.cuda.memory_reserved() - reserved, 0)
