@@ -42,6 +42,10 @@ _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
 _STREAMING: contextvars.ContextVar[object | None] = contextvars.ContextVar("cozy_graphs_streaming")
 #: The idle period recording on this thread (`capture_idle`): each region boundary checks it.
 _IDLE: contextvars.ContextVar[_Idle | None] = contextvars.ContextVar("cozy_graphs_idle")
+#: an idle job's cleanup (its model's state put back): ops there never yield
+_SETTLING: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cozy_graphs_settling", default=False
+)
 _PLAIN = (type(None), bool, int, float, str)
 #: graph owners beside the regions (the LM engine's decode steps), each its (snapshot, release)
 #: of a component root, registered by its module when a package imports it: a Runtime serving no
@@ -423,8 +427,10 @@ class Yielded(Exception):
 class _Idle:
     """Work for the device's idle periods, in the order it queued (`capture_idle`): a job answers
     whether it is done; one that is not (its region measured once, its pages not resident, no
-    free room) waits for the next period. `check`, at each region boundary in a job, yields to a
-    command that arrived; the longest stretch between checks is the longest a command waited."""
+    free room) waits for the next period. `check`, before each torch op of a job (`_yielding`)
+    and at each region boundary, yields to a command that arrived: the job ends there, a capture
+    discarded, first again next period. The longest stretch between checks is the longest a
+    command waited (v17: 386 ms when it was the whole UNet's capture)."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -450,6 +456,7 @@ class _Idle:
         it interrupted goes first next period)."""
         self.stop, self.last, later = stop, time.perf_counter(), []
         self.periods += 1
+        torch = sys.modules.get("torch")  # a job's ops yield only where torch runs them
         token = _IDLE.set(self)
         try:
             while True:
@@ -459,7 +466,9 @@ class _Idle:
                     job = self.jobs.popleft()
                 try:
                     self.check()
-                    if not job():
+                    with _yielding(torch)() if torch is not None else nullcontext():
+                        done = job()
+                    if not done:
                         later.append(job)
                 except Yielded:
                     self.yields += 1
@@ -491,6 +500,23 @@ class _Idle:
 
 
 IDLE = _Idle()
+
+
+@functools.cache
+def _yielding(torch: Any) -> Any:
+    """The torch function mode an idle job runs under: before each op, a command that arrived
+    ends the job (`_Idle.check`), so a whole component's capture yields within one op. Its
+    cleanup (`_SETTLING`) never yields; a package that catches the raise meets it at its next op."""
+
+    class Yielding(torch.overrides.TorchFunctionMode):  # type: ignore[misc]
+        def __torch_function__(
+            self, func: Any, types: Any, args: Any = (), kwargs: Any = None
+        ) -> Any:
+            if not _SETTLING.get() and (idle := _IDLE.get(None)) is not None:
+                idle.check()
+            return func(*args, **(kwargs or {}))
+
+    return Yielding
 
 
 def capture_idle(stop: Callable[[], bool]) -> bool:
@@ -1117,7 +1143,7 @@ def _record(
                     return True
                 entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner)
                 root = _REGIONS[module][0]() is module
-                if why := _no_gain(torch, entry, root, recorder.eager.wall_ms()):
+                if why := _no_gain(torch, entry, root, recorder.eager):
                     recorder.judged[key] = why
                     entry.close()
                     return True
@@ -1145,8 +1171,12 @@ def _record(
         _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
         return True
     finally:
-        if state is not None:
-            state.restore()
+        settling = _SETTLING.set(True)
+        try:
+            if state is not None:
+                state.restore()
+        finally:
+            _SETTLING.reset(settling)
         recorder.capture_ms += (time.perf_counter() - began) * 1e3
         if stream is not None:
             # Warmup can queue reads before refusing an allocation. Join even the failure
@@ -1204,26 +1234,33 @@ class _State:
         return self.changed
 
 
-def _no_gain(torch: Any, entry: _Recording, root: bool, eager: float | None) -> str:
+def _no_gain(torch: Any, entry: _Recording, root: bool, eager: _Timing) -> str:
     """Why a verified graph is dropped: a replay as a request makes it (its inputs copied in, a
-    root's outputs copied out), timed twice at idle, saves no more than the two differ by
-    against its eager calls' device time a call (v14/v15: CLIP's tiny regions recorded, then
-    replayed no faster: the copies and the launch were their whole cost). "" when it gains,
-    or with no eager wall measured."""
+    root's outputs copied out), timed twice at idle, costs no less than an eager call by more
+    than the two differ by (v14/v15: CLIP's tiny regions recorded, then replayed no faster: the
+    copies and the launch were their whole cost). A call costs the longer of its host submission
+    and its device time between events: a launch-bound call queued behind other work shows its
+    kernels' time alone on the device, its cost on the host (v17's two-stream MLP). "" when it
+    gains, or with no eager call measured past the first."""
+    submit, device = eager.submit_ms(), eager.wall_ms()
+    if submit is None or device is None:
+        return ""
     leaves = [t.clone() if t is not None else None for t in entry.inputs]
-    walls = []
+    costs = []
     for _ in range(2):
         out = entry.output() if root else None
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         start.record()
+        began = time.perf_counter()
         entry(leaves, out)
+        host = (time.perf_counter() - began) * 1e3
         end.record()
         end.synchronize()
-        walls.append(float(start.elapsed_time(end)))
-    replay = sum(walls) / len(walls)
-    if eager is None or eager - replay > abs(walls[0] - walls[1]):
+        costs.append(max(host, float(start.elapsed_time(end))))
+    replay, called = sum(costs) / len(costs), max(submit, device)
+    if called - replay > abs(costs[0] - costs[1]):
         return ""
-    return f"no gain: replay {replay:.3f} ms a call against eager {eager:.3f} ms"
+    return f"no gain: replay {replay:.3f} ms a call against eager {called:.3f} ms"
 
 
 def _device_bound(submit: float, busy: float) -> str:
