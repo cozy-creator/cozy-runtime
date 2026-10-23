@@ -102,7 +102,14 @@ def test_full_packed_virtual_offsets_are_widened_before_stride_products() -> Non
     from cozy_runtime.internal import attention_sage3_fixed as candidate
 
     tree = ast.parse(Path(candidate.__file__).read_text())
-    functions = {node.name: node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+    means = ast.parse(
+        Path(candidate.__file__).with_name("attention_sage2_fixed_mean.py").read_text()
+    )
+    functions = {
+        node.name: node
+        for node in (*ast.walk(tree), *ast.walk(means))
+        if isinstance(node, ast.FunctionDef)
+    }
     for name in ("partial_mean", "center_and_correct"):
         assignments = {
             target.id: node.value

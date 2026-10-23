@@ -54,7 +54,6 @@ def test_hybrid_dense_steps_and_prefix_use_the_same_fixed_local(monkeypatch: Any
     monkeypatch.setattr(fixed, "DENSE", Local(dense, lambda *_: "fixed CPU policy stand-in"))
     monkeypatch.setattr(sol, "_card", lambda _device: (9, 0))
     monkeypatch.setattr(sol, "_DENSE", wrong)
-    monkeypatch.setattr(sol, "specialize", lambda *_args: None)
     monkeypatch.setattr(sol, "_ready", lambda *_args: (object(), ""))
     monkeypatch.setattr(sol, "_native", lambda _q, _k, v, *_args: v.clone() + 2)
     q = torch.zeros(1, 19, 2, 128, dtype=torch.bfloat16)
