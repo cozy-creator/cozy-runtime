@@ -2853,18 +2853,20 @@ class Executor:
                 "code": "model_binding_set_invalid",
                 "detail": "models must be an array of 1 through 16 binding rows with budgets",
             }
+        # The machine sends a function's slots in its declaration order; one order is ours.
+        rows = tuple(sorted(rows, key=lambda row: row.binding.model_binding_path))
         paths = [row.binding.model_binding_path for row in rows]
         parameters = [row.binding.model_parameter_name for row in rows]
         if (
             not all(paths)
-            or paths != sorted(set(paths))
+            or len(paths) != len(set(paths))
             or not all(parameters)
             or len(parameters) != len(set(parameters))
         ):
             return {
                 "ok": False,
                 "code": "model_binding_set_invalid",
-                "detail": "model paths must be sorted unique and parameters must be unique",
+                "detail": "model paths and parameters must be named and unique",
             }
 
         children: list[tuple[str, Executor, dict[str, Any]]] = []
