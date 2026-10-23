@@ -1,0 +1,49 @@
+name: build
+# The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, and the package imports on CPU.
+# Required on master, so it always reports: a docs-only PR passes without building.
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    # Hang bound, not a work budget.
+    timeout-minutes: 20
+    steps:
+      - id: scope
+        name: Docs-only changes skip the build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          files=$([ -z "$PR" ] || gh pr diff "$PR" -R "$GITHUB_REPOSITORY" --name-only) || files=
+          if [ -n "$files" ] && ! grep -qvE '\.(md|txt|png|jpe?g|svg)$|^docs/|^changelog\.d/|(^|/)LICENSE$' <<< "$files"; then
+            echo "docs only"; echo run=false >> "$GITHUB_OUTPUT"
+          else
+            echo run=true >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.scope.outputs.run == 'true'
+        uses: actions/checkout@v5
+      - if: steps.scope.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - if: steps.scope.outputs.run == 'true'
+        run: uv sync --locked
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run --locked ruff check --select E9,F63,F7,F82 --output-format github .
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run --locked python -m compileall -q src
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run --locked python -c "import cozy_runtime"
