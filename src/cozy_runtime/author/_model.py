@@ -820,6 +820,7 @@ class Model[PipelineT]:
     _cozy_schedulers: Mapping[str, Scheduler] = {}
     _cozy_caches: tuple[DerivedCache, ...] = ()
     _cozy_adapters: tuple[AdapterRef, ...] = ()
+    _cozy_device: Device = Device()
     _cozy_residency: Residency | None = None
     """Runtime-installed. Absent under `for_test`, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
@@ -894,6 +895,13 @@ class Model[PipelineT]:
     def unload(self, loader: Loader) -> None:
         """Release declared state. The runtime drains before calling this."""
         return None
+
+    @property
+    def device(self) -> Device:
+        """Where this model's calls take and return tensors: the device the runtime runs it on
+        (`cuda:0` on its GPU, `cpu` where there is none). A package never picks one; placement
+        is the runtime's, and reading it is not a door."""
+        return self._cozy_device
 
     @property
     def _cozy_active(self) -> tuple[str, tuple[str, ...]] | None:
@@ -1332,6 +1340,7 @@ class ModelRegistry:
     ) -> Generation:
         started = time.perf_counter()
         model = cls()
+        object.__setattr__(model, "_cozy_device", self._device)
         loader = self._loader(model, artifact, mode)
         made = time.perf_counter()
         object.__setattr__(model, "_cozy_loading", True)
