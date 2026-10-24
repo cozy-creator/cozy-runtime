@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from typing import cast
 
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author._activity import own_thread
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED
 from cozy_runtime.internal import kernel_compile
@@ -104,7 +103,6 @@ def wait[T](name: str, opener: Opener[T]) -> T:
 
 
 def _background(name: str, slot: _Slot, opener: Opener[object]) -> None:
-    own_thread()
     kernel_compile.told.set(False)  # no one waits for it
     try:
         value = opener(True)
