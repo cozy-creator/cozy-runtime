@@ -35,9 +35,9 @@ import msgspec
 
 from cozy_runtime.author._attention import _PRODUCERS, AttentionProducer
 from cozy_runtime.author._attention_scope import _EXPECTED
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author.kernels import quantize_once
 from cozy_runtime.internal import (
-    accel,
     arch,
     attention_kitchen_sol,
     attention_sage2_fixed,
@@ -689,11 +689,7 @@ def _expected(live_tokens: int, module: Any) -> None:
         return
     import torch
 
-    device = next((p.device for p in module.parameters() if p.device.type != "meta"), None)
-    if device is None and accel.present(torch, "cuda"):
-        device = torch.device("cuda", torch.cuda.current_device())
-    if device is not None:
-        attention_sol.expect(live_tokens, device)
+    attention_sol.expect(live_tokens, torch.device(str(placed_device())))
 
 
 _EXPECTED.append(_expected)

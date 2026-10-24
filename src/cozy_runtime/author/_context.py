@@ -44,6 +44,21 @@ class Device:
         return self.type if self.index is None else f"{self.type}:{self.index}"
 
 
+_PLACED: list[Device] = [Device()]
+
+
+def device() -> Device:
+    """This process's device, the one every model, call and placement here uses: its GPU (a
+    group rank's own), MPS, or the CPU where none is present. A package never picks one; reading
+    it is not a door. The CPU until an executor names it."""
+    return _PLACED[0]
+
+
+def place(placed: Device) -> None:
+    """The executor names its device once its accelerator is up (`device()`)."""
+    _PLACED[0] = placed
+
+
 @dataclass(frozen=True, slots=True)
 class AdapterRef:
     """One entry of the applied stack. Gates read `kind`, NEVER `ref` (§1.4 hard rule)."""

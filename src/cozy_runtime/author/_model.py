@@ -48,6 +48,7 @@ from cozy_runtime.author._context import (
     Device,
     RequestView,
     derive_seed,
+    device,
 )
 from cozy_runtime.author._errors import (
     CapabilityError,
@@ -896,6 +897,13 @@ class Model[PipelineT]:
         return None
 
     @property
+    def device(self) -> Device:
+        """Where this model's calls take and return tensors: the device the runtime runs it on
+        (`author.device()`: its GPU, or the CPU where there is none). A package never picks
+        one; placement is the runtime's, and reading it is not a door."""
+        return device()
+
+    @property
     def _cozy_active(self) -> tuple[str, tuple[str, ...]] | None:
         """This context's innermost open local scope of this instance: (method, components)."""
         for owner, method, components in reversed(_LOCAL_SCOPES.get()):
@@ -1232,12 +1240,10 @@ class ModelRegistry:
         *,
         release: str,
         backend: Backend | None = None,
-        device: Device | None = None,
         substrate: Callable[[], AbstractContextManager[object]] | None = None,
     ) -> None:
         self._release = release
         self._backend = backend
-        self._device = device or Device()
         self._substrate = substrate
         self._generations: dict[ConstructionIdentity, Generation] = {}
         self._by_path: dict[str, Generation] = {}
@@ -1428,7 +1434,7 @@ class ModelRegistry:
         return Generation(identity, model, record)
 
     def _loader(self, model: Model[Any], artifact: Artifact, mode: Mode) -> Loader:
-        return Loader(artifact, owner=model, backend=self._backend, mode=mode, device=self._device)
+        return Loader(artifact, owner=model, backend=self._backend, mode=mode)
 
 
 _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", tensor_schema={}, config=Config({}))
