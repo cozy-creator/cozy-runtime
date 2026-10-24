@@ -38,7 +38,6 @@ code changed are reported in `env_changed` rather than silently ignored.
 from __future__ import annotations
 
 import argparse
-import base64
 import contextlib
 import contextvars
 import ctypes
@@ -61,7 +60,7 @@ import traceback
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import msgspec
 import tensorfs
@@ -76,7 +75,7 @@ from cozy_runtime.author import _work as work
 from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._assets import GrantedInput, InputMetadata
 from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device
@@ -166,6 +165,7 @@ from cozy_runtime.internal.executor_commands import (
     Binding,
     CallInterface,
     Fork,
+    Forwarded,
     GroupHardware,
     Hello,
     Invoke,
@@ -173,16 +173,18 @@ from cozy_runtime.internal.executor_commands import (
     Kernels,
     KnownCommand,
     Load,
+    Malformed,
     Map,
-    ModelLoad,
     PrepareRequest,
     Probe,
     Release,
     Shutdown,
     Start,
-    Supplied,
     TensorFSOptions,
     Unload,
+    bindings,
+    granted,
+    parameter_names,
 )
 from cozy_runtime.internal.executor_replies import GpuMemory, RankMemory
 from cozy_runtime.internal.exits import Exit
@@ -362,15 +364,19 @@ def _held(
 
 
 def _supplied(bearers: weights_store.Bearers, frame: Frame) -> None:
-    """A bearer as the seam reads it, before any later frame; a malformed one is its command's
-    to refuse."""
-    try:
-        supplied = msgspec.convert(frame, Supplied)
-    except msgspec.ValidationError:
+    """A bearer as the seam reads it, before any later frame: a `bearer`'s, or what a Load or
+    Invoke carries (its `actor` and `tensorfs`); a malformed one is its command's to refuse."""
+    if not frame.get("tensorfs"):
         return
-    options = supplied.tensorfs
-    if options is not None and options.token:
-        bearers.note(supplied.actor, options.endpoint, options.token, options.expires_unix_ms)
+    supplied = {"cmd": "bearer", "actor": frame.get("actor") or "", "tensorfs": frame["tensorfs"]}
+    try:
+        bearer = executor_commands.decode(supplied)
+    except Malformed:
+        return
+    assert isinstance(bearer, executor_commands.Bearer)
+    options = bearer.tensorfs
+    if options.token:
+        bearers.note(bearer.actor, options.endpoint, options.token, options.expires_unix_ms)
 
 
 def _connection(
@@ -381,13 +387,9 @@ def _connection(
     (`configure` adds a root, so setting it again is harmless)."""
     if options is None:
         return None
-    if options.ca_der is not None:
-        try:
-            ca_der = base64.b64decode(options.ca_der, validate=True)
-        except ValueError as exc:
-            raise InvalidRequest("TensorFS CA is not base64 DER", code="tensorfs_config") from exc
-        tensorfs.configure(ca_der=ca_der)
-    if options.token is None:
+    if options.ca_der:
+        tensorfs.configure(ca_der=options.ca_der)
+    if not options.token:
         return weights_store.Connection(options.endpoint)
     bearers.offer(actor, options.endpoint, options.token, options.expires_unix_ms)
     bearer = weights_store.Bearer(bearers, actor, options.endpoint, options.token)
@@ -561,7 +563,7 @@ def adjustment_row(row: AdjustmentRow) -> dict[str, str]:
 
 def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
     """Verified input paths in the attempt's spool."""
-    return {input_id: row.granted(input_id) for input_id, row in command.inputs.items()}
+    return {input_id: granted(row, input_id) for input_id, row in command.inputs.items()}
 
 
 def _trees(command: Invoke) -> dict[str, tuple[Path, str]]:
@@ -660,6 +662,10 @@ class _CompositeResidency:
             }
             for part in ("notes", "graphs")
         }
+
+
+#: What a command rank 0 added nothing to carries.
+_NOTHING_FORWARDED = Forwarded()
 
 
 def _leases(command: Start) -> int | None:
@@ -919,8 +925,11 @@ class Executor:
 
     # ------------------------------------------------------------------ prepare
 
-    def handle(self, command: KnownCommand) -> dict[str, Any]:
-        """Answer one decoded worker command (`shutdown` ends the loop before this)."""
+    def handle(
+        self, command: KnownCommand, forwarded: Forwarded = _NOTHING_FORWARDED
+    ) -> dict[str, Any]:
+        """Answer one decoded worker command (`shutdown` ends the loop before this); `forwarded`
+        is what rank 0 added to it for this follower."""
         match command:
             case Hello():
                 return self.hello()
@@ -935,7 +944,7 @@ class Executor:
             case Start():
                 return self.start(command)
             case Load():
-                return self.load(command)
+                return self.load(command, forwarded)
             case Activate():
                 return self.activate(command)
             case Unload():
@@ -1563,10 +1572,7 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        # An older TensorD's GPU ledgers follow its Start (a memfd and an eventfd each): unused
-        # here, they close. Skew degrades: whatever leases nothing runs standalone.
-        for fd in self.channel.recv_fds(2 * command.ledgers):
-            os.close(fd)
+        # Skew degrades: whatever leases nothing runs standalone.
         self.leases = _leases(command)
         if command.devices and self.leases is None and not self.standalone:
             self.standalone = (
@@ -1603,7 +1609,7 @@ class Executor:
         _restore_seal()
         try:
             interface = package_interface.parse(
-                Path(command.package_interface).read_bytes(), command.package_interface
+                Path(command.package_interface).read_bytes(), str(command.package_interface)
             )
         except (OSError, ValueError, ConformanceError) as exc:
             self.poisoned = "start without a readable package interface"
@@ -1698,11 +1704,11 @@ class Executor:
                         importlib.import_module(name)
                     stage("runtime_imports")
             if self.discovered is None:
-                self._install_call_proxies(command.call_interfaces)
-                self._discover_provisioned(command.release())
+                self._install_call_proxies(tuple(command.call_interfaces))
+                self._discover_provisioned(executor_commands.release(command))
                 stage("package_import")
             # A fork's own Start names them again; its import-only parent installed them.
-            self.call_interfaces = command.call_interfaces or self.call_interfaces
+            self.call_interfaces = tuple(command.call_interfaces) or self.call_interfaces
             compiles = (
                 self._expect_kernels(isolated=command.import_only)
                 if constructs and self.rank == 0 and not imported
@@ -1835,7 +1841,7 @@ class Executor:
             os.close(log)
         _capture_seal()
         kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
-        channel = connect(command.socket)
+        channel = connect(str(command.socket))
         child = Executor(
             channel,
             Path(command.root),
@@ -1979,7 +1985,7 @@ class Executor:
     def _refusal(self, code: str, detail: str) -> dict[str, Any]:
         return {"ok": False, "code": code, "detail": detail}
 
-    def load(self, command: Load) -> dict[str, Any]:
+    def load(self, command: Load, forwarded: Forwarded = _NOTHING_FORWARDED) -> dict[str, Any]:
         """Construct and fill ONE construction under its key; a loaded key answers again.
 
         TensorD names the key and supplies endpoint options and memory budgets. Runtime
@@ -1989,7 +1995,7 @@ class Executor:
         followers or raised poisons the process.
         """
         if self.rank > 0:
-            return self._follower_load(command)
+            return self._follower_load(command, forwarded)
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if not self.started:
@@ -2021,11 +2027,11 @@ class Executor:
         """A reload names the construction under every parameter its bindings now spell
         (h3a-018): an added entrypoint over loaded bytes binds the same model object."""
         members = self.model_executors or [self]
-        for row, member in zip(command.rows(), members, strict=False):
+        for binding, member in zip(bindings(command), members, strict=False):
             model = next(iter(member.models.values()), None)
             if model is None:
                 continue
-            for name in row.binding.parameter_names():
+            for name in parameter_names(binding):
                 member.models.setdefault(name, model)
                 self.models.setdefault(name, model)
 
@@ -2053,18 +2059,18 @@ class Executor:
             for member in child.model_executors or [child]
         ]
 
-    def _follower_load(self, command: Load) -> dict[str, Any]:
+    def _follower_load(self, command: Load, forwarded: Forwarded) -> dict[str, Any]:
         """Rank r's half of rank 0's load: one construction, or one model of a many-model
         construction (`model_key`), filled under rank 0's agreed plan and ceiling."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        key, model_key = command.construction, command.model_key
-        if not key or (model_key is UNSET and key in self.constructions):
+        key, model_key = command.construction, forwarded.model_key
+        if not key or (model_key is None and key in self.constructions):
             self.poisoned = "GPU divergence"
             return self._refusal("gpu_divergence", f"{_gpu(0)} loaded an unnamed or loaded key")
-        if model_key is UNSET:
+        if model_key is None:
             child = self._construction_child(key)
-            reply = child._prepare_first(command)
+            reply = child._prepare_first(command, forwarded)
             if not reply.get("ok"):
                 self.poisoned = child.poisoned or f"load refused: {reply.get('code')}"
                 return reply
@@ -2079,7 +2085,7 @@ class Executor:
         member = container._construction_child(key)
         member._group_parent = container
         container.model_executors.append(member)
-        reply = member._prepare_first(command)
+        reply = member._prepare_first(command, forwarded)
         if not reply.get("ok"):
             self.poisoned = member.poisoned or f"load refused: {reply.get('code')}"
             return reply
@@ -2191,8 +2197,11 @@ class Executor:
             "free_bytes": free,
         }
 
-    def _prepare_first(self, command: Load) -> dict[str, Any]:
-        """Construct and fill one construction (or one model of a many-model one)."""
+    def _prepare_first(
+        self, command: Load, forwarded: Forwarded = _NOTHING_FORWARDED
+    ) -> dict[str, Any]:
+        """Construct and fill one construction, or one model of a many-model one
+        (`forwarded.model_key` names it to rank 0's followers)."""
         if self.poisoned:
             return {
                 "ok": False,
@@ -2230,8 +2239,8 @@ class Executor:
             # THE BROADCAST HARDWARE HALF: the degree and the devices are this rank's own
             # facts already, and a rank 0 that planned for other cards is divergence, not
             # something to fill under.
-            hardware = command.group
-            if hardware is UNSET or (hardware.degree, hardware.devices) != (
+            hardware = forwarded.group
+            if hardware is None or (hardware.degree, hardware.devices) != (
                 self.world,
                 _sealed_entries(),
             ):
@@ -2243,12 +2252,12 @@ class Executor:
                     f"{self.world}-GPU group; {_gpu(0)} broadcast "
                     + (
                         "no hardware plan"
-                        if hardware is UNSET
+                        if hardware is None
                         else f"{hardware.degree} GPUs over {list(hardware.devices)}"
                     ),
                     "rank": self.rank,
                 }
-        if degree > 1 and command.models is UNSET and not command.single().binding.model_class:
+        if degree > 1 and not command.models and not command.binding.model_class:
             self.poisoned = "sequence-parallel construction unsupported"
             return {
                 "ok": False,
@@ -2262,12 +2271,11 @@ class Executor:
                 "code": "group_unformed",
                 "detail": "a group load needs a started process whose GPUs have joined",
             }
-        if command.models is not UNSET:
-            return self._prepare_many(command, command.models)
-        single = command.single()
-        if self._group_parent is None and self._deferred(single.binding):
-            return self._prepare_many(command, (single,))
-        binding = single.binding
+        if command.models:
+            return self._prepare_many(command, bindings(command))
+        binding = command.binding
+        if self._group_parent is None and self._deferred(binding):
+            return self._prepare_many(command, (binding,))
         self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
@@ -2324,11 +2332,9 @@ class Executor:
             try:
                 self.group.broadcast(
                     executor_commands.encode(
-                        msgspec.structs.replace(
-                            command,
-                            construction=self.construction,
-                            group=GroupHardware(degree=self.world, devices=_sealed_entries()),
-                        )
+                        command.replace(construction=self.construction),
+                        group=GroupHardware(degree=self.world, devices=_sealed_entries()),
+                        model_key=forwarded.model_key,
                     )
                 )
             except GroupRefusal as exc:
@@ -2525,7 +2531,7 @@ class Executor:
             assets=config_checkpoint.assets(),
             # CUSTODY is a BINDING fact: canonical refuses a serve-time extra key, local
             # tiers it (§1.1).
-            custody=binding.custody,
+            custody=cast("Literal['canonical', 'local']", binding.custody),
             unnormalized=normalized(config_checkpoint),
         )
         adapter_graphs = [
@@ -2620,7 +2626,7 @@ class Executor:
         self.backend = backend
         self.registry = registry
         # ONE generation under EVERY parameter name the placement's bindings spell (h3a-018).
-        self.models = {name: model for name in binding.parameter_names()}
+        self.models = {name: model for name in parameter_names(binding)}
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY: from here on a declared scope is a
         # shared `use` of its components, and each block binds its weights while it runs.
         self.residency = Placement(host.memory, backend)
@@ -2784,7 +2790,7 @@ class Executor:
         """Whether this model is built on first use (`on_demand=`)."""
         return self.world == 1 and binding.model_binding_path in self.host.on_demand
 
-    def _prepare_many(self, command: Load, rows: tuple[ModelLoad, ...]) -> dict[str, Any]:
+    def _prepare_many(self, command: Load, rows: tuple[Binding, ...]) -> dict[str, Any]:
         """Prepare one complete bounded multi-model callable in this device process; an
         on-demand model is built when the function first reads it (`_build_on_demand`)."""
         if not 1 <= len(rows) <= 16:
@@ -2794,9 +2800,9 @@ class Executor:
                 "detail": "models must be an array of 1 through 16 binding rows with budgets",
             }
         # The machine sends a function's slots in its declaration order; one order is ours.
-        rows = tuple(sorted(rows, key=lambda row: row.binding.model_binding_path))
-        paths = [row.binding.model_binding_path for row in rows]
-        parameters = [row.binding.model_parameter_name for row in rows]
+        rows = tuple(sorted(rows, key=lambda row: row.model_binding_path))
+        paths = [row.model_binding_path for row in rows]
+        parameters = [row.model_parameter_name for row in rows]
         if (
             not all(paths)
             or len(paths) != len(set(paths))
@@ -2810,31 +2816,30 @@ class Executor:
             }
 
         children: list[tuple[str, Executor, dict[str, Any]]] = []
-        for row in rows:
-            binding = row.binding
+        for binding in rows:
             parameter = binding.model_parameter_name
             child = self._construction_child(self.construction)
             child._group_parent = self
             # The command with one model in place of its set: everything the machine said
             # about the load holds for each model.
-            load = msgspec.structs.replace(
-                command,
+            load = command.replace(
                 construction=self.construction,
                 binding=binding,
-                models=UNSET,
-                group=UNSET,
+                models=[],
+                sequence_parallel_degree=max(self.world, 1),
+            )
+            named = Forwarded(
                 model_key=f"{self.construction}#{binding.model_binding_path}"
                 if self.world > 1
-                else UNSET,
-                sequence_parallel_degree=max(self.world, 1),
+                else None
             )
             if self._deferred(binding):
                 # Built inside the attempt that reads it.
-                build = functools.partial(self._build_on_demand, child, load)
-                child.models = dict.fromkeys(binding.parameter_names(), _OnDemand(build))
+                build = functools.partial(self._build_on_demand, child, load, named)
+                child.models = dict.fromkeys(parameter_names(binding), _OnDemand(build))
                 children.append((parameter, child, {}))
                 continue
-            reply = child._prepare_first(load)
+            reply = child._prepare_first(load, named)
             if not reply.get("ok"):
                 self.poisoned = child.poisoned or (
                     f"model {parameter} refused: {reply.get('code', 'unknown')}"
@@ -2851,7 +2856,7 @@ class Executor:
             return self._group_refusal(GroupRefusal("the model set contains no sharded component"))
         built = [(parameter, child, reply) for parameter, child, reply in children if reply]
         if self.discovered is None:
-            self._discover_provisioned(rows[0].binding)
+            self._discover_provisioned(rows[0])
         self.model_executors = [child for _, child, _ in children]
         self.torch = built[-1][1].torch if built else self.torch
         self.models = {}
@@ -2980,12 +2985,12 @@ class Executor:
             "facts": self.facts,
         }
 
-    def _build_on_demand(self, member: Executor, load: Load) -> Any:
+    def _build_on_demand(self, member: Executor, load: Load, forwarded: Forwarded) -> Any:
         """An on-demand model's first read: the load its construction deferred, run in the
         attempt that reads it; a pass that never uses it builds none of it."""
-        parameter = load.single().binding.model_parameter_name
+        parameter = load.binding.model_parameter_name
         try:
-            reply = member._prepare_first(load)
+            reply = member._prepare_first(load, forwarded)
         except Exception:
             self.poisoned = self.poisoned or member.poisoned or f"model {parameter} raised"
             raise
@@ -3000,7 +3005,7 @@ class Executor:
             self.residency.rows[parameter] = member.residency
         return member.models[parameter]
 
-    def _discover_provisioned(self, release: Release) -> None:
+    def _discover_provisioned(self, release: Release | Binding) -> None:
         """Import the installed release and bind its PackageInterface. No elapsed-time limit:
         the worker or machine ends an import only on its measured lack of progress, and a slow
         first import on a busy host is still an import."""
@@ -3177,7 +3182,17 @@ class Executor:
             finally:
                 kernel_compile.held.reset(held)
         try:
-            prepared = prepare(registration, command.payload, input_metadata=command.input_metadata)
+            metadata = {
+                key: InputMetadata(
+                    input_id=row.input_id,
+                    media_type=row.media_type,
+                    digest=row.digest,
+                    length=row.length,
+                    order=row.order,
+                )
+                for key, row in command.input_metadata.items()
+            }
+            prepared = prepare(registration, command.payload, input_metadata=metadata)
         except Exception as exc:
             outcome = classify(exc)
             return {
@@ -3374,11 +3389,7 @@ class Executor:
                         # hostile one, and there is no netns or seccomp under it.
                         trees=_trees(command),
                         assets=_granted_inputs(command),
-                        max_input_bytes=(
-                            None
-                            if command.max_input_bytes is None
-                            else command.max_input_bytes or 64 << 20
-                        ),
+                        max_input_bytes=None,
                         max_output_bytes=command.max_output_bytes,
                         sources=sources,
                         weights_values=functools.partial(read_values_into, self.torch),
@@ -4243,10 +4254,7 @@ class Executor:
         own = effect_interfaces.bindings()
         for row in rows:
             module, export = row.module, row.export
-            if row.native_effect:
-                if module == effect_interfaces.MODULE and export in own:
-                    bindings[(module, export)] = own[export]
-            elif row.builtin:
+            if row.builtin:
                 if row.builtin != "operations":
                     raise CapabilityError("unknown Runtime builtin", code="child_interface")
                 builtin_operations.validate_binding(module, export)
@@ -4731,7 +4739,11 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
     if name not in executor_commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
     command = executor_commands.decode(frame)
-    return None if isinstance(command, Shutdown) else executor.handle(command)
+    assert not isinstance(command, executor_commands.Bearer)  # the seam's alone (`_supplied`)
+    if isinstance(command, Shutdown):
+        return None
+    forwarded = executor_commands.forwarded(frame) if executor.rank > 0 else _NOTHING_FORWARDED
+    return executor.handle(command, forwarded)
 
 
 #: The commands whose refusals carry the raising traceback to the worker.
@@ -5000,7 +5012,7 @@ def _reply(executor: Executor, frame: Frame) -> Frame | None:
         reply = answer(executor, frame)
         if reply is None:
             return None
-    except msgspec.ValidationError as exc:
+    except (msgspec.ValidationError, Malformed) as exc:
         reply = {"ok": False, "code": "command_malformed", "detail": str(exc)[:1024]}
     except Exception as exc:  # the executor reports its own faults; it never hides one
         outcome: Outcome = classify(exc)
