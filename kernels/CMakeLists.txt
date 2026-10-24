@@ -17,6 +17,12 @@ enable_language(CUDA)
 # The C and C++ runtimes linked static, as NVIDIA's cudart_static is (LIBCMT): a Windows module
 # needs no Visual C++ redistributable (MSVCP140), as a Linux one links libstdc++ static.
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+# MSVC stamps build times into objects and the module unless /Brepro: the same sources then build
+# the same bytes, as on Linux, so a rebuild can be compared with the cached build it replaces.
+if(MSVC)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/Brepro> $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Brepro>)
+    add_link_options(/Brepro)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CUDA_STANDARD 17)
