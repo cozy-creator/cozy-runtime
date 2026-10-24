@@ -218,6 +218,15 @@ class _Block:
             (part.nbytes + 255) // 256 * 256 for p in self.parts.values() for part in p.values()
         )
 
+    @property
+    def allocation_bytes(self) -> int:
+        if self.region is not None:
+            return int(self.region.allocated_bytes)
+        if self.model.memory.native is None:
+            return self.nbytes
+        granularity = self.model.memory.granularity
+        return (self.storage_bytes + granularity - 1) // granularity * granularity
+
     def tensors(self) -> Iterator[Tensor]:
         if self.data is not None:
             yield from (tensor for parts in self.data.values() for tensor in parts.values())
@@ -308,7 +317,7 @@ class Model:
                 return None
             groups = self.groups()
             missing = sum(
-                b.storage_bytes
+                b.allocation_bytes
                 for b in groups
                 if b.data is None and (b.region is None or not b.region.resident)
             )
@@ -623,6 +632,7 @@ class Memory:
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
         self.native: Any = None
+        self.granularity = 512
         self.window_bytes = 0
         if self.cuda:
             try:
@@ -631,6 +641,7 @@ class Memory:
                 if budget_bytes is not None:
                     varena.set_activation_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
+                self.granularity = int(self.native.granularity)
             except (ImportError, AttributeError, RuntimeError) as exc:
                 raise ResidencyError(f"native CUDA weight residency is unavailable: {exc}") from exc
 
@@ -703,6 +714,7 @@ class Memory:
             # Native pins, including escaped Torch storage aliases, are the authority.
             # Do not count an idle Python block as reclaimable merely because hooks closed.
             cold = int(self.native.stats()["reclaimable_bytes"])
+            # Pure-cut workspace estimates still use Torch's allocation granularity.
             return Room(int(free), cold, 0)
         with self.lock:
             cold = warm = 0
@@ -769,7 +781,7 @@ class Memory:
             else:
                 model.common = block
         if self.native is not None:
-            self.window_bytes = max([self.window_bytes, *(b.storage_bytes for b in model.groups())])
+            self.window_bytes = max([self.window_bytes, *(b.allocation_bytes for b in model.groups())])
             self.native.set_streaming_limit(self.window_bytes)
         _placeholders(model)
         _hooks(model)
@@ -958,7 +970,8 @@ class Memory:
         if block.region is None:
             block.region = self.native.reserve(block.storage_bytes)
             block.preferred = (
-                model.prefix is None and self.room().free >= block.storage_bytes + self.window_bytes
+                model.prefix is None
+                and self.room().free >= block.allocation_bytes + self.window_bytes
             )
             if not block.preferred:
                 model.prefix = (
@@ -973,9 +986,9 @@ class Memory:
             )
             block.preferred = False
         if not block.region.resident and (not reclaim or self.budget_bytes is not None):
-            if reclaim and block.storage_bytes > self.room().free:
-                self.reclaim(block.storage_bytes, current={model.name})
-            if block.storage_bytes > self.room().free:
+            if reclaim and block.allocation_bytes > self.room().free:
+                self.reclaim(block.allocation_bytes, current={model.name})
+            if block.allocation_bytes > self.room().free:
                 raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
         try:
             return block.region.prepare()
@@ -990,7 +1003,7 @@ class Memory:
                 min(model.prefix, block.index) if model.prefix is not None else block.index
             )
             block.region.set_preferred(False)
-            if not self.reclaim(block.storage_bytes, current={model.name}):
+            if not self.reclaim(block.allocation_bytes, current={model.name}):
                 raise
             return block.region.prepare()
 
