@@ -1324,7 +1324,7 @@ class Executor:
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
             ranked = self.host._rank_request
-            working = accel.allocator_peak(self.host.memory) if ranked is not None else 0
+            working = accel.allocator_peak(self.host.memory, ranked.id) if ranked is not None else 0
         except Exception as exc:
             ending = mirror.ending(exc)
             # where it was raised, innermost first: a GPU's own traceback stays on that GPU
@@ -4439,7 +4439,7 @@ class Executor:
                     yield rows
                 finally:
                     del host.requests[request_id]
-                    peak = accel.allocator_peak(host.memory)  # read while it is open
+                    peak = accel.allocator_peak(host.memory, request_id)  # read while open
                     host.cuts[request_id] = msgspec.to_builtins(host.execution.cut_rows(request))
         finally:
             if request is not None:

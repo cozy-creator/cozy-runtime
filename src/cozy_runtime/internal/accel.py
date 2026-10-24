@@ -565,11 +565,16 @@ def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
     return int(torch.cuda.memory_reserved(getattr(memory, "device", None)))
 
 
-def allocator_peak(memory: Any) -> int:
-    """Absolute process high-water; overlapping requests share this observation."""
+def allocator_peak(memory: Any, request: str | None = None) -> int:
+    """Absolute process high-water, including samples carried across pure-cut resets.
+
+    A request names the observation window, not exclusive ownership; overlapping calls share it.
+    """
     if memory is None or not memory.cuda:
         return 0
-    return int(memory.torch_stats()["peak"])
+    figures = memory.torch_stats()
+    carried = figures["requests"].get(request, (0, 0))[1] if request is not None else 0
+    return max(int(figures["peak"]), int(carried))
 
 
 #: This process's own cache releases that returned something, by the function that asked:
