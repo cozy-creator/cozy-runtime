@@ -80,6 +80,8 @@ GEMM: dict[str, dict[str, tuple[int, ...]]] = {
     "int8": {"mma.sync": (80, 86, 89, 120, 121), **(TMA_GEMM["int8"] if _TMA else {})},
     "fp8": dict(TMA_GEMM["fp8"]) if _TMA else {},
 }
+#: The cards `_gemm.svdq_*` has a cubin for: block-scaled FP4 mma.sync (RTX 50, DGX Spark).
+SVDQ: tuple[int, ...] = () if ABSENT else (120, 121)
 
 
 def rms_rope_split_half(

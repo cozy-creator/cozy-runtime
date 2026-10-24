@@ -79,7 +79,9 @@ gemm_unit(rotate rotate.cu "${EVERY}")
 gemm_unit(int8_mma_sync gemm_sm80.cu "80;86-real;89-real;120-real;121-real" COZY_MMA_SYNC)
 # W4A8's mma.sync GEMM, on every card with int8 MMA (Hopper too: design four-bit-lanes §5.2).
 gemm_unit(w4a8 w4a8.cu "80;86-real;89-real;90-real;100-real;120-real;121-real")
-set(units rotate int8_mma_sync w4a8)
+# svdq.nvfp4's linear: block-scaled FP4 mma.sync, RTX 50 and DGX Spark only (`svdq.cu`).
+gemm_unit(svdq svdq.cu "120a-real;121a-real")
+set(units rotate int8_mma_sync w4a8 svdq)
 # Every other GEMM is CUTLASS's TMA kernel: its 128-byte-aligned parameters are passed by value,
 # which MSVC refuses (C2719), so a Windows build carries none (cr-201).
 if(MSVC)

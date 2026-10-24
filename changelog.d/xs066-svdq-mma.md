@@ -1,0 +1,1 @@
+svdq.nvfp4 on RTX 50 runs on prebuilt kernels (`_gemm.svdq_quantize`, `_gemm.svdq_gemm`), adapted from Nunchaku's W4A4 GEMM. They use block-scaled FP4 mma.sync with the low-rank term in the GEMM's epilogue. A leaf bound on such a card holds its weight in their tiles. The kernels verify against the law on the card before they serve; Triton serves elsewhere on Blackwell.
