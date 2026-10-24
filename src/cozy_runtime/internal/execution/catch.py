@@ -1,8 +1,8 @@
 """Pure-site cuts sized from their operands against executor-local residency (`sizing`).
 
-A pure cut site picks its level at dispatch from its op's live shapes (`need`) against the
-request's room (`r.room()`), so its first try fits: no OOM probing, nothing remembered. A refusal
-above the finest re-reads the room and runs finer (`sizing.descend`); only the finest's refusal
+A pure cut site estimates its level from live shapes (`need`) and local room (`r.room()`).
+An unexpected capacity refusal reclaims inactive owners and retries that pure level once if
+memory was released; otherwise it descends (`sizing.descend`). Failure at the finest level
 ends the request, typed (device_out_of_memory). Model blocks and package code always run once.
 """
 
@@ -40,6 +40,8 @@ class Cut(msgspec.Struct, frozen=True, kw_only=True):
     need: int
     tier: str
     descent: int
+    #: Same-level pure retries after observed local reclamation.
+    retries: int = 0
 
 
 class Cuts(msgspec.Struct, kw_only=True):
@@ -132,11 +134,6 @@ def _refused(exc: BaseException) -> bool:
     if not short(exc):
         return False
     _clear(exc)
-    request = CURRENT.get()
-    if request is not None:
-        # This is a declared pure cut, after its failed temporaries are unwound. Reclaim
-        # inactive owned weights/caches before choosing a smaller execution plan.
-        request.reclaim()
     return True
 
 
@@ -151,6 +148,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     scope = Scope(site)
     _local.scopes.append(scope)
     available = request.room()
+    retries = 0
 
     def room() -> sizing.Room:
         nonlocal available
@@ -158,11 +156,24 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         return available
 
     def whole(level: int) -> T:
+        nonlocal retries
         scope.ordinals.clear()
         # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
         # site's predicted cold/warm bytes must be reclaimed before running that site.
         if not _capturing() and (wanted := need(level, available.granularity)) > available.free:
             request.reclaim(wanted)
+        try:
+            return run(level)
+        except Exception as exc:
+            if not short(exc):
+                raise
+            _clear(exc)
+            # A failed allocation can reveal pressure the shape estimate cannot predict.
+            # This also runs at the finest level, which sizing.descend cannot make smaller.
+            # Retry only this declared pure operation, and only after actual reclamation.
+            if request.reclaim() <= 0:
+                raise
+        retries += 1
         return run(level)
 
     try:
@@ -175,10 +186,12 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
                 with _ROWS_LOCK:
                     _ROWS.setdefault(id(request), Cuts()).oom_floor += 1
             raise
-        row = Cut(site=site, level=level, need=need(level, 1), tier=tier, descent=steps)
+        row = Cut(
+            site=site, level=level, need=need(level, 1), tier=tier, descent=steps, retries=retries
+        )
         with _ROWS_LOCK:
             rows = _ROWS.setdefault(id(request), Cuts())
-            if steps or all(r.site != site for r in rows.sites):
+            if steps or retries or all(r.site != site for r in rows.sites):
                 rows.sites.append(row)
         return result
     finally:
