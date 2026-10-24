@@ -27,7 +27,7 @@ import sys
 import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import Future
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field, is_dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -182,10 +182,8 @@ class _PreparedScope:
         except BaseException as error:
             complete = False
             if execution is not None and fault(error) not in (Fault.STICKY, Fault.DEVICE):
-                try:
+                with suppress(BaseException):
                     complete = execution.poll().done
-                except BaseException:
-                    pass
             if (
                 execution is not None
                 and not complete
@@ -215,8 +213,7 @@ class _PreparedScope:
                 if error is not None
                 and (
                     fault(error) in (Fault.STICKY, Fault.DEVICE)
-                    or isinstance(error, RuntimeFailure)
-                    and error.code == "device_fault"
+                    or (isinstance(error, RuntimeFailure) and error.code == "device_fault")
                 )
             ),
             None,
