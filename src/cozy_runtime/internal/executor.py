@@ -2547,6 +2547,7 @@ class Executor:
         registry = ModelRegistry(
             release=binding.release,
             backend=backend,
+            device=self._device(),
             substrate=lambda: serving_substrate(hardware_variant, seen),
         )
         try:
