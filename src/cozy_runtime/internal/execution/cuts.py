@@ -103,7 +103,7 @@ def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
             return conv(x, weight, bias)
         run = functools.partial(_bands, conv, x, weight, bias, by_images, units)
         need = levelled(units, _conv_need(module, x, units, by_images))
-        return catch.cut(site, levels(units), need, run)
+        return catch.cut(site, levels(units), need, run, (x, weight, bias))
 
     return cut
 
@@ -193,7 +193,7 @@ def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callab
         try:
             run = functools.partial(_tokens, forward, x, tokens)
             need = levelled(tokens, _ffn_shape(module, x).need(tokens))
-            return catch.cut(site, levels(tokens), need, run)
+            return catch.cut(site, levels(tokens), need, run, (x,))
         except _Whole:
             whole.append(True)
         return forward(x)
@@ -280,7 +280,7 @@ def _norm(site: str, module: nn.Module, forward: Callable[..., object]) -> Calla
         run = functools.partial(_rows, forward, flat, tokens)
         # torch's rms_norm holds an fp32 upcast of its rows where it is not fused
         need = levelled(tokens, sizing.norm(tokens, row, x.element_size(), 4))
-        out = catch.cut(site, levels(tokens), need, run)
+        out = catch.cut(site, levels(tokens), need, run, (x,))
         return cast(Tensor, out).view(x.shape)
 
     return cut
@@ -351,7 +351,7 @@ def _rms(
             run = functools.partial(_rms_bands, forward, x, axis)
             # Diffusers' channel RMS normalizes, then scales: two fp32-wide temporaries a value
             need = levelled(height, sizing.norm(height, x.numel() // height, x.element_size(), 8))
-            return catch.cut(site, levels(height), need, run)
+            return catch.cut(site, levels(height), need, run, (x,))
         except _Whole:
             return forward(x)
 
@@ -429,7 +429,7 @@ def attend(
     def piece(level: int) -> Tensor:
         return _attend(call, q, k, v, mask, group, *cut(level))
 
-    return catch.cut(site, by_heads + levels(blocks), need, piece)
+    return catch.cut(site, by_heads + levels(blocks), need, piece, (q, k, v, mask))
 
 
 def _attend(
@@ -488,7 +488,7 @@ def split[T](
         def need(level: int, granularity: int) -> int:
             return sizing.peak(granularity, out_bytes, (fit(window(level)),))
 
-        return catch.cut(f"split:{key}", deepest, need, at)
+        return catch.cut(f"split:{key}", deepest, need, at, (run,))
     # Unmeasured: the next window to measure (the finest, then the next larger), sized as so.
     target = next(
         (lv for lv in range(deepest, -1, -1) if all(window(lv) > w for w, _ in points)), 0
@@ -498,10 +498,10 @@ def split[T](
         return 0 if level >= target else sys.maxsize  # a coarser window is not yet measured
 
     if request is None or deepest == 0:
-        return catch.cut(f"split:{key}", deepest, measuring, at)
+        return catch.cut(f"split:{key}", deepest, measuring, at, (run,))
     request.reset_peak()
     start = request.reset_peak()  # what is live now: the restarted high-water
-    result = catch.cut(f"split:{key}", deepest, measuring, at)
+    result = catch.cut(f"split:{key}", deepest, measuring, at, (run,))
     grew = max(request.reset_peak() - start - out_bytes, 0)
     with _MEASURED_LOCK:
         known = _MEASURED.setdefault(key, [])

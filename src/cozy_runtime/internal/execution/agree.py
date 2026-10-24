@@ -23,7 +23,8 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from cozy_runtime.internal.execution.catch import Args, Kwargs, tensors
+from cozy_runtime.internal.execution.catch import Args, Kwargs
+from cozy_runtime.internal.execution.park import tensors
 
 #: every exchange of a model is one cut site: the same shapes cross in every block
 SITE = "ulysses"

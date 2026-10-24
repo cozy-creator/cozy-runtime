@@ -3481,7 +3481,15 @@ class Executor:
         # The last attempt out drains the device, with none running.
         last = self.host.in_flight.last(slot)
         varena = [*own_memory, *rank_memory]
+        # A GPU that parked is one of TensorD's memory-log decision lines (`note_decisions`).
+        parks = [
+            {"kind": "park", "gpu": m.gpu, "parked": m.parked, "restored": m.restored}
+            for m in varena
+            if m.parked
+        ]
         memory = {"varena": msgspec.to_builtins(varena)} if varena else None
+        if memory is not None and parks:
+            memory["decisions"] = parks
         handler_ms = (time.perf_counter() - lease_acquired) * 1000
         self._attempt_spool = self.host._attempt_spool = None
         self.host._attempt_request = ""
