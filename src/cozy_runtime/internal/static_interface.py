@@ -191,7 +191,8 @@ _VOCAB_MODULES = {
     "enum": "enum",
     "cozy_runtime.author": "author",
 }
-_TRUSTED_ROOTS = ("cozy_runtime.derive",)
+#: Runtime modules a package builds its surface from: followed for types, models and constants.
+_TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm")
 
 
 def _author_structs() -> tuple[str, ...]:
