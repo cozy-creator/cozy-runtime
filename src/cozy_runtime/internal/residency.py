@@ -29,6 +29,7 @@ from cozy_runtime.author._errors import Fault, fault
 
 __all__ = [
     "Binding",
+    "BindingLayout",
     "Declared",
     "Hold",
     "Level",
@@ -39,6 +40,7 @@ __all__ = [
     "ResidencyError",
     "Room",
     "StaleBinding",
+    "TensorLayout",
     "Weights",
     "blocks_of",
 ]
@@ -118,11 +120,56 @@ class Filling(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class TensorLayout:
+    """One final buffer's exact geometry; source names an eligible whole raw-role alias."""
+
+    dtype: str
+    shape: tuple[int, ...]
+    strides: tuple[int, ...] = ()
+    source: str | None = None
+
+    def elements(self) -> int:
+        strides = self.strides or _strides(self.shape)
+        if (
+            len(self.shape) != len(strides)
+            or any(n < 0 for n in self.shape)
+            or any(n < 0 for n in strides)
+        ):
+            raise ResidencyError("invalid final buffer geometry")
+        extent = 1
+        for stride, length in sorted(
+            (s, n) for n, s in zip(self.shape, strides, strict=True) if n > 1
+        ):
+            if stride < extent:
+                raise ResidencyError("final buffer axes overlap")
+            extent = stride * length
+        return (
+            0
+            if any(n == 0 for n in self.shape)
+            else 1 + sum((n - 1) * s for n, s in zip(self.shape, strides, strict=True))
+        )
+
+
+class BindingLayout(Protocol):
+    """An explicitly immutable binder. Its cold writer is not a native-prefetch callback."""
+
+    @property
+    def identity(self) -> str: ...
+
+    def layout(self, key: str, /) -> Mapping[str, TensorLayout] | None: ...
+
+    def write(
+        self, key: str, parts: Mapping[str, Tensor], destinations: Mapping[str, Tensor], /
+    ) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
 class Declared:
     weights: Weights
     blocks: Sequence[str] | None = None
     fill: Filling | None = None
     bind: Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]] | None = None
+    finals: BindingLayout | None = None
 
 
 class Placeholder(Tensor):  # type: ignore[misc]  # Torch is optional in the checking environment.
@@ -188,6 +235,7 @@ class _Part:
     shape: tuple[int, ...]
     nbytes: int
     role: str
+    strides: tuple[int, ...] = ()
 
 
 @dataclass(eq=False, slots=True)
@@ -208,6 +256,14 @@ class _Block:
     region: Any = None
     preferred: bool = False
     native_storage: int | None = None
+    aliases: dict[str, dict[str, str]] | None = None
+    finals: dict[str, dict[str, _Part]] = field(default_factory=dict)
+    final_region: Any = None
+    final_use: Any = None
+    final_data: dict[str, dict[str, Tensor]] | None = None
+    final_storage: int | None = None
+    final_fills: int = 0
+    final_hits: int = 0
 
     @property
     def nbytes(self) -> int:
@@ -222,12 +278,33 @@ class _Block:
 
     @property
     def allocation_bytes(self) -> int:
-        if self.region is not None:
-            return int(self.region.allocated_bytes)
         if self.model.memory.native is None:
             return self.nbytes
         granularity = self.model.memory.granularity
-        return (self.storage_bytes + granularity - 1) // granularity * granularity
+        return sum(
+            int(region.allocated_bytes)
+            if region is not None
+            else (size + granularity - 1) // granularity * granularity
+            for region, size in (
+                (self.region, self.storage_bytes),
+                (self.final_region, self.final_bytes),
+            )
+        )
+
+    @property
+    def final_bytes(self) -> int:
+        return sum(
+            (p.nbytes + 255) // 256 * 256 for row in self.finals.values() for p in row.values()
+        )
+
+    def cached(self) -> bool:
+        if self.final_bytes and (self.final_region is None or not self.final_region.resident):
+            return False
+        raw_needed = self.aliases is None or any(self.aliases.values()) or not self.finals
+        return not raw_needed or (self.region is not None and bool(self.region.resident))
+
+    def final_only(self) -> bool:
+        return bool(self.finals) and self.aliases is not None and not any(self.aliases.values())
 
     def tensors(self) -> Iterator[Tensor]:
         if self.data is not None:
@@ -241,7 +318,9 @@ class Model:
         self.memory, self.module, self.source = memory, module, declared.weights
         self.component = declared.weights.component
         self.name = f"{self.source.release}/{self.source.ck.id}/{self.component}"
-        self.fill, self.bind = declared.fill, declared.bind
+        self.fill, self.bind, self.finals = declared.fill, declared.bind, declared.finals
+        self.binding_identity = None if self.finals is None else self.finals.identity
+        self.layout_identity = ""
         self.identity = self.wanted_identity()
         self.generation = 0
         self.local = threading.local()
@@ -259,7 +338,13 @@ class Model:
         self.prefix: int | None = None
 
     def wanted_identity(self) -> str | None:
-        return "stored" if self.fill is None else self.fill.identity
+        fill = "stored" if self.fill is None else self.fill.identity
+        if fill is None:
+            return fill
+        layout = None if self.finals is None else self.finals.identity
+        return (
+            repr((fill, layout, self.layout_identity)) if layout or self.layout_identity else fill
+        )
 
     def _claim(self) -> None:
         # Runtime's component scopes normally serialize these uses. Refuse an undeclared
@@ -318,11 +403,7 @@ class Model:
                 # hold would pin idle blocks and defeat allocation-time native recovery.
                 return None
             groups = self.groups()
-            missing = sum(
-                b.allocation_bytes
-                for b in groups
-                if b.data is None and (b.region is None or not b.region.resident)
-            )
+            missing = sum(b.allocation_bytes for b in groups if b.data is None and not b.cached())
             if free_only and missing > self.memory.room().free:
                 if self.memory.cuda:
                     torch.cuda.empty_cache()
@@ -436,9 +517,7 @@ class Binding:
         )
 
     def resident(self) -> bool:
-        return self.valid() and all(
-            b.data is not None or (b.region is not None and b.region.resident) for b in self.groups
-        )
+        return self.valid() and all(b.data is not None or b.cached() for b in self.groups)
 
     @contextmanager
     def prepare(self, stream: Any = None) -> Iterator[Binding]:
@@ -785,6 +864,12 @@ class Memory:
             else:
                 model.common = block
         if self.native is not None:
+            for block in model.groups():
+                _layout(block)
+            model.layout_identity = hashlib.sha256(
+                repr([(b.path, b.aliases, b.finals) for b in model.groups()]).encode()
+            ).hexdigest()
+            model.identity = model.wanted_identity()
             self.window_bytes = max(
                 [self.window_bytes, *(b.allocation_bytes for b in model.groups())]
             )
@@ -795,6 +880,8 @@ class Memory:
         return model
 
     def _declare(self, model: Model) -> None:
+        if model.finals is not None and model.finals.identity != model.binding_identity:
+            raise StaleBinding("an immutable binding layout changed; reconstruct the model")
         identity = model.wanted_identity()
         if identity != model.identity or identity is None:
             if any(b.retained for b in model.groups()):
@@ -815,6 +902,16 @@ class Memory:
             # CUDA context before unmapping. record_stream is not that ownership fence.
             block.data = block.assigned = block.ready = None
             block.native_storage = None
+            self._drop_final(block)
+
+    def _drop_final(self, block: _Block, *, forget: bool = False) -> None:
+        if block.final_use is not None and block.final_use.needs_fill:
+            # A failed writer may have exported an alias. The next attempt needs a new
+            # reservation; that alias retains its old owner and unspecified partial bytes.
+            forget = True
+        block.final_use = block.final_data = block.final_storage = None
+        if forget:
+            block.final_region = None
 
     def _discard(self, block: _Block, *, forget: bool = False) -> int:
         with self.lock:
@@ -828,6 +925,7 @@ class Memory:
             present = block.data is not None
             block.data = block.assigned = block.ready = None
             block.native_storage = None
+            self._drop_final(block, forget=forget)
             if forget:
                 # Never overwrite an old fill beneath an escaped alias. Its pin keeps
                 # the old reservation alive independently of this model's new identity.
@@ -964,40 +1062,43 @@ class Memory:
             # Only the failed allocation is retried. No read, fill transform or forward ran.
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
-    def _prepare_native(self, block: _Block, reclaim: bool) -> Any:
+    def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         model = block.model
+        field = "final_region" if final else "region"
+        region = getattr(block, field)
+        size = block.final_bytes if final else block.storage_bytes
         request = _REQUEST.get()
-        if (
-            request is not None
-            and request.idle
-            and (block.region is None or not block.region.resident)
-        ):
+        if request is not None and request.idle and (region is None or not region.resident):
             raise StaleBinding("idle graph preparation cannot fill native weight backing")
-        if block.region is None:
-            block.region = self.native.reserve(block.storage_bytes)
-            block.preferred = (
-                model.prefix is None
-                and self.room().free >= block.allocation_bytes + self.window_bytes
-            )
+        if region is None:
+            first = block.region is None and block.final_region is None
+            region = self.native.reserve(size)
+            setattr(block, field, region)
+            if first:
+                block.preferred = (
+                    model.prefix is None
+                    and self.room().free >= block.allocation_bytes + self.window_bytes
+                )
             if not block.preferred:
                 model.prefix = (
                     min(model.prefix, block.index) if model.prefix is not None else block.index
                 )
-            block.region.set_preferred(block.preferred)
-        elif block.preferred and not block.region.preferred:
+            region.set_preferred(block.preferred and (final or not block.final_only()))
+        elif block.preferred and (final or not block.final_only()) and not region.preferred:
             # Native activation recovery reduces the prefix without calling Python. Keep
             # later unprepared blocks on the streaming side of that same watermark.
             model.prefix = (
                 min(model.prefix, block.index) if model.prefix is not None else block.index
             )
             block.preferred = False
-        if not block.region.resident and (not reclaim or self.budget_bytes is not None):
-            if reclaim and block.allocation_bytes > self.room().free:
-                self.reclaim(block.allocation_bytes, current={model.name})
-            if block.allocation_bytes > self.room().free:
+        needed = int(region.allocated_bytes)
+        if not region.resident and (not reclaim or self.budget_bytes is not None):
+            if reclaim and needed > self.room().free:
+                self.reclaim(needed, current={model.name})
+            if needed > self.room().free:
                 raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
         try:
-            return block.region.prepare()
+            return region.prepare()
         except torch.OutOfMemoryError:
             if not reclaim:
                 raise
@@ -1008,10 +1109,37 @@ class Memory:
             model.prefix = (
                 min(model.prefix, block.index) if model.prefix is not None else block.index
             )
-            block.region.set_preferred(False)
-            if not self.reclaim(block.allocation_bytes, current={model.name}):
+            region.set_preferred(False)
+            if not self.reclaim(needed, current={model.name}):
                 raise
-            return block.region.prepare()
+            return region.prepare()
+
+    def _final_views(self, block: _Block, reclaim: bool) -> None:
+        if not block.finals:
+            return
+        use = self._prepare_native(block, reclaim, final=True) if block.final_bytes else None
+        block.final_use = use
+        request = _REQUEST.get()
+        if use is not None and use.needs_fill and request is not None and request.idle:
+            raise StaleBinding("final weight backing changed before idle graph preparation")
+        raw = use.tensor if use is not None else self._empty(0, False)
+        if use is not None:
+            block.final_storage = int(raw.untyped_storage().data_ptr())
+            if use.needs_fill:
+                raw.zero_()  # includes all alignment gaps and padded strided extents
+            else:
+                block.final_hits += 1
+                if request is not None:
+                    request.final_hits += 1
+        offset = 0
+        data: dict[str, dict[str, Tensor]] = {}
+        for key, parts in block.finals.items():
+            row = data[key] = {}
+            for name, part in parts.items():
+                flat = raw[offset : offset + part.nbytes].view(getattr(torch, _DTYPES[part.dtype]))
+                row[name] = flat.as_strided(part.shape, part.strides)
+                offset += (part.nbytes + 255) // 256 * 256
+        block.final_data = data
 
     @torch.inference_mode(False)  # type: ignore[untyped-decorator]
     def _ensure(self, block: _Block, reclaim: bool) -> None:
@@ -1027,6 +1155,17 @@ class Memory:
         try:
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
+            if self.native is not None:
+                self._final_views(block, reclaim)
+                if block.final_only() and (
+                    block.final_use is None or not block.final_use.needs_fill
+                ):
+                    # Final bytes are sufficient for this binding. Their owning views are
+                    # pinned already, so neither an eviction race nor missing raw backing
+                    # can trigger a redundant source read or decode.
+                    block.data = {}
+                    block.generation += 1
+                    return
             if self.native is not None and block.storage_bytes:
                 use = self._prepare_native(block, reclaim)
                 request = _REQUEST.get()
@@ -1088,6 +1227,7 @@ class Memory:
             if use is not None and use.needs_fill:
                 block.region = None
                 block.preferred = False
+            self._drop_final(block)
             raise
         finally:
             request = _REQUEST.get()
@@ -1139,9 +1279,9 @@ class Memory:
         if self.cuda:
             stream = self.stream()
             for tensor in block.tensors():
-                if (
-                    block.native_storage is None
-                    or tensor.untyped_storage().data_ptr() != block.native_storage
+                if tensor.untyped_storage().data_ptr() not in (
+                    block.native_storage,
+                    block.final_storage,
                 ):
                     tensor.record_stream(stream)
 
@@ -1259,6 +1399,7 @@ class Request:
         self.peak = 0
         self.overlap = False
         self.moved = self.read_ns = 0
+        self.final_fills = self.final_hits = 0
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.sample()
@@ -1358,6 +1499,7 @@ class Request:
             "host": None,
         }
         if self.memory.cuda and torch.cuda.is_initialized():
+            groups = [b for model in self.memory.models.values() for b in model.groups()]
             out.update(
                 peak=self.peak,
                 allocated=allocated,
@@ -1366,6 +1508,23 @@ class Request:
                 weight_residency=(
                     self.memory.native.stats() if self.memory.native is not None else None
                 ),
+                final_bindings={
+                    "fills": self.final_fills,
+                    "hits": self.final_hits,
+                    "resident_scope": "process",
+                    "raw_resident_bytes": sum(
+                        int(b.region.allocated_bytes)
+                        for b in groups
+                        if b.region is not None and b.region.resident
+                    ),
+                    "final_resident_bytes": sum(
+                        int(b.final_region.allocated_bytes)
+                        for b in groups
+                        if b.final_region is not None and b.final_region.resident
+                    ),
+                    "fallback_blocks": sum(b.aliases is None for b in groups),
+                    "native_prefetch": False,
+                },
             )
         elif self.memory.device.type == "mps":
             out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
@@ -1389,6 +1548,74 @@ def _sites(module: nn.Module) -> dict[str, list[_Site]]:
                 if not any(s.table is table and s.name == attr for s in sites):
                     sites.append(_Site(table, attr, parameter))
     return {name: groups[key] for name, key in names.items()}
+
+
+def _strides(shape: Sequence[int]) -> tuple[int, ...]:
+    stride = 1
+    out = []
+    for length in reversed(shape):
+        out.append(stride)
+        stride *= max(length, 1)
+    return tuple(reversed(out))
+
+
+def _layout(block: _Block) -> None:
+    """Validate final geometry once, before placeholders or any GPU bytes exist."""
+    model = block.model
+    if model.finals is None and model.bind is not None:
+        return  # An arbitrary binder has not declared immutable final bytes.
+    aliases: dict[str, dict[str, str]] = {}
+    finals: dict[str, dict[str, _Part]] = {}
+    codes = {kind: code for code, kind in _DTYPES.items() if code != "F4"}
+    for key, parts in block.parts.items():
+        if model.finals is not None:
+            declared = model.finals.layout(key)
+            if declared is None:
+                return  # The provider explicitly declines final-buffer caching here.
+        else:
+            name = model.source.bound.get(key, key) if model.source.bound else key
+            sites = model.sites.get(name)
+            if set(parts) != {"value"} or not sites:
+                return
+            target = sites[0].table[sites[0].name]
+            code = codes.get(str(target.dtype).removeprefix("torch."))
+            if code is None:
+                return
+            declared = {
+                name: TensorLayout(code, tuple(target.shape), tuple(target.stride()), "value")
+            }
+        row_aliases = aliases[key] = {}
+        row_finals = finals[key] = {}
+        for name, layout in declared.items():
+            if name not in model.sites:
+                raise ResidencyError(f"{model.name}: final layout names no target {name}")
+            shape = layout.shape
+            strides = layout.strides or _strides(shape)
+            target = model.sites[name][0].table[model.sites[name][0].name]
+            if (
+                tuple(target.shape) != shape
+                or codes.get(str(target.dtype).removeprefix("torch.")) != layout.dtype
+            ):
+                raise ResidencyError(f"{name}: final layout disagrees with target shape or dtype")
+            if layout.dtype not in _DTYPES or layout.dtype == "F4":
+                raise ResidencyError(f"{name}: invalid final buffer geometry")
+            count = layout.elements()
+            dtype = getattr(torch, _DTYPES[layout.dtype])
+            width = int(torch.empty((), dtype=dtype, device="meta").element_size())
+            source = parts.get(layout.source) if layout.source is not None else None
+            if (
+                source is not None
+                and source.dtype == layout.dtype
+                and source.shape == shape
+                and strides == _strides(source.shape)
+                and source.nbytes == count * width
+            ):
+                assert layout.source is not None
+                row_aliases[name] = layout.source
+            else:
+                row_finals[name] = _Part(layout.dtype, shape, count * width, "", strides)
+    block.aliases = aliases
+    block.finals = {key: row for key, row in finals.items() if row}
 
 
 def _placeholders(model: Model) -> None:
@@ -1420,20 +1647,58 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
     model = block.model
     if block.data is None:
         raise ResidencyError("weight assignment before a complete fill")
+    rows: dict[str, Mapping[str, Tensor]]
+    if block.aliases is not None:
+        use = block.final_use
+        if use is not None and use.needs_fill:
+            assert block.final_data is not None
+            for key, destinations in block.final_data.items():
+                parts = block.data[key]
+                if model.finals is not None:
+                    model.finals.write(key, parts, destinations)
+                else:
+                    for destination in destinations.values():
+                        destination.copy_(parts["value"])
+            use.commit()
+            block.final_fills += 1
+            if (request := _REQUEST.get()) is not None:
+                request.final_fills += 1
+            if block.final_only():
+                # Compute consumes only the completed final bytes. Retire our raw views
+                # and make their backing the first victim; an escaped alias still pins it.
+                if block.region is not None:
+                    block.region.set_preferred(False)
+                block.data = {}
+                block.native_storage = None
+        # Only ordinary owning views remain. The native region can become evictable
+        # once those views (including every escaped storage alias) disappear.
+        block.final_use = None
+        rows = {
+            key: {
+                **{name: block.data[key][role] for name, role in aliases.items()},
+                **(block.final_data or {}).get(key, {}),
+            }
+            for key, aliases in block.aliases.items()
+        }
+    else:
+        rows = {}
+        for key, parts in block.data.items():
+            if model.bind is not None:
+                rows[key] = model.bind(key, parts)
+            elif set(parts) == {"value"}:
+                name = model.source.bound.get(key, key) if model.source.bound else key
+                rows[key] = {name: parts["value"]}
+            else:
+                raise ResidencyError(f"{model.name}: encoded {key} needs a declared binder")
     assigned: dict[tuple[int, str], tuple[_Site, Tensor]] = {}
-    for key, parts in block.data.items():
-        if model.bind is not None:
-            values = model.bind(key, parts)
-        elif set(parts) == {"value"}:
-            name = model.source.bound.get(key, key) if model.source.bound else key
-            values = {name: parts["value"]}
-        else:
-            raise ResidencyError(f"{model.name}: encoded {key} needs a declared binder")
+    for values in rows.values():
         for name, value in values.items():
             sites = model.sites.get(name, ())
             if not sites:
                 continue
             old = sites[0].table[sites[0].name]
+            if block.aliases is not None and old is not None and old.dtype != value.dtype:
+                raise ResidencyError(f"{name}: destination dtype changed after binding layout")
             tensor = value if old is None or old.dtype == value.dtype else value.to(old.dtype)
             if any(site.parameter for site in sites):
                 tensor = nn.Parameter(tensor, requires_grad=False)

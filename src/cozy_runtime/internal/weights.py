@@ -20,11 +20,11 @@ from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from cozy_runtime import graphs
-from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
+from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members, canonical_dtype
 from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.derive import placing
@@ -58,6 +58,8 @@ from cozy_runtime.internal.residency import (
     Memory,
     Model,
     Region,
+    ResidencyError,
+    TensorLayout,
     Weights,
     blocks_of,
 )
@@ -448,6 +450,7 @@ class Backend:
             ),
             fill=bakes if bakes.bakes else None,
             bind=routes,
+            finals=routes,
         )
         # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).
@@ -540,6 +543,80 @@ class _Routes:
             for stored, row in rows.items()
             if row.key in backend.leaves
         }
+        self._layouts = {key: self._layout(key) for key in self.rows}
+        self._identity = repr(
+            tuple(
+                (
+                    key,
+                    implementation_digest(self.providers[key]),
+                    self.providers[key].params,
+                    None if layout is None else tuple(layout.items()),
+                )
+                for key, layout in sorted(self._layouts.items())
+            )
+        )
+
+    @property
+    def identity(self) -> str:
+        return self._identity
+
+    def layout(self, key: str) -> Mapping[str, TensorLayout] | None:
+        return self._layouts[key]
+
+    def _layout(self, key: str) -> Mapping[str, TensorLayout] | None:
+        row = self.rows[key]
+        name = row.key.partition(".")[2]
+        route = self.routes[key]
+        if route in ("verbatim", "decoded_float"):
+            return MappingProxyType(
+                {
+                    name: TensorLayout(
+                        row.dtype, row.shape, source="value" if route == "verbatim" else None
+                    )
+                }
+            )
+        leaf, _, derived = self.leaves[key]
+        targets = {}
+        for part in row.encoded.parts:
+            role = part.role
+            if role not in leaf._cozy_roles:
+                continue
+            buffer = leaf.BUFFERS.get(role, role)
+            value = leaf._buffers[buffer]
+            if value is None:
+                continue
+            targets[f"{name.removesuffix('.weight')}.{buffer}"] = TensorLayout(
+                canonical_dtype(value.dtype),
+                tuple(value.shape),
+                tuple(value.stride()),
+                role if role not in derived else None,
+            )
+        try:
+            for target in targets.values():
+                target.elements()
+        except ResidencyError:
+            return None  # e.g. a broadcast/overlapping view needs an explicit native recipe.
+        return MappingProxyType(targets)
+
+    def write(
+        self, key: str, parts: Mapping[str, Tensor], destinations: Mapping[str, Tensor]
+    ) -> None:
+        """Cold final-byte fill. Warm residency never invokes provider code here.
+
+        This Python writer is not an asynchronous/native-prefetch descriptor. A native
+        handoff must name an implemented TensorFS read/decode operation explicitly.
+        """
+        route = self.routes[key]
+        if route == "decoded_float":
+            (destination,) = destinations.values()
+            self.providers[key].decode(self.torch, parts, destination)
+        elif route == "verbatim":
+            for destination in destinations.values():
+                destination.copy_(parts["value"])
+        else:
+            produced = self(key, parts)
+            for name, destination in destinations.items():
+                destination.copy_(produced[name])
 
     def __call__(self, key: str, parts: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
         torch, row = self.torch, self.rows[key]
@@ -712,8 +789,7 @@ class _Bakes:
         # A group uses the reference implementation on every rank until a common fused
         # readiness contract exists. This choice is fixed before any scope binds its weights.
         group = (
-            self.torch.distributed.is_initialized()
-            and self.torch.distributed.get_world_size() > 1
+            self.torch.distributed.is_initialized() and self.torch.distributed.get_world_size() > 1
         )
         how: lora_bake.How | None = "eager" if gpu is None or group else lora_bake.serving(gpu)
         self._choice.set((strategy if how is not None else "per_step", how))
