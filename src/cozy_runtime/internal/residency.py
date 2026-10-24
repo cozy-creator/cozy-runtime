@@ -652,12 +652,14 @@ class Memory:
         self.apply_budget()
         if self.cuda:
             free, _ = torch.cuda.mem_get_info(self.device)
-            allocated, _, _ = self._figures()
+            _, reserved, _ = self._figures()
             # reserved - allocated includes graph-private storage that ordinary eager
             # allocation cannot necessarily reuse. Driver free is a conservative bound.
             free = max(int(free) - _RESERVE, 0)
             if self.budget_bytes is not None:
-                free = min(free, max(self.budget_bytes - allocated, 0))
+                # Torch's fraction limits driver reservations, including graph pools.
+                # Unused private-pool bytes are not headroom for an eager allocation.
+                free = min(free, max(self.budget_bytes - reserved, 0))
         else:
             from cozy_runtime.internal.accel import host_memory
 
