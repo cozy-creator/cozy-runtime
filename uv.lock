@@ -394,7 +394,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.31.0"
+version = "0.32.0"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -1684,9 +1684,15 @@ wheels = [
 [[package]]
 name = "tensorfs"
 version = "0.15.0"
-source = { registry = "https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/varena-dev-07d211695" }
+source = { registry = "https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/tensorfs-v0.15.0" }
+sdist = { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.15.0/tensorfs-0.15.0.tar.gz" }
 wheels = [
-    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/varena-dev-07d211695/tensorfs-0.15.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.15.0/tensorfs-0.15.0-cp311-abi3-macosx_10_12_x86_64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.15.0/tensorfs-0.15.0-cp311-abi3-macosx_11_0_arm64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.15.0/tensorfs-0.15.0-cp311-abi3-win_amd64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.15.0/tensorfs-0.15.0-cp311-abi3-win_arm64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.15.0/tensorfs-0.15.0-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.15.0/tensorfs-0.15.0-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
 ]
 
 [[package]]
