@@ -30,7 +30,7 @@ def main() -> None:
     assert len(versions) == 1, "the wheel set must contain one version"
     (version,) = versions
     # Each Linux arch's release job builds its own native wheel beside the pure one; x86_64's also
-    # builds the Windows one (publish.yaml holds the exact release set).
+    # builds the Windows one (runtime-publish.yaml holds the exact release set).
     arch = platform.machine()
     linux = f"cp312-abi3-manylinux_2_28_{arch}"
     assert platform.system() == "Linux" and arch in ("x86_64", "aarch64"), (
