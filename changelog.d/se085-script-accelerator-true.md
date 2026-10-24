@@ -1,0 +1,1 @@
+A script may declare `accelerator = true` in its `[tool.cozy]`: the default, the machine's GPU when it has one. Runtime 0.32 refused it at install ("script accelerator is false or absent"), so a script written for the GPU could not run (release-gate `ceiling.py`, run 16429).

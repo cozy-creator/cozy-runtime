@@ -146,7 +146,7 @@ def declarations(
     raw: bytes,
 ) -> tuple[dict[str, str], tuple[WeightsOutput, ...], Literal[False] | None]:
     """A script's `[tool.cozy]`: its model default releases, its weights outputs and
-    `accelerator = false` (absent: the machine's GPU when it has one)."""
+    `accelerator`: false runs it on CPU only; true or absent, the machine's GPU when it has one."""
     block: list[str] = []
     opened = found = False
     for line in raw.decode("utf-8").splitlines():
@@ -169,8 +169,9 @@ def declarations(
     if not isinstance(cozy, dict) or set(cozy) - {"models", "weights", "accelerator"}:
         raise ValueError("script tool.cozy accepts models, weights and accelerator only")
     accelerator = cozy.get("accelerator")
-    if accelerator is not None and accelerator is not False:
-        raise ValueError("script accelerator is false or absent")
+    if accelerator is not None and type(accelerator) is not bool:
+        raise ValueError("script accelerator is true or false")
+    accelerator = False if accelerator is False else None
     models = model_defaults(cozy.get("models", {}))
     weights = cozy.get("weights", {})
     if (
