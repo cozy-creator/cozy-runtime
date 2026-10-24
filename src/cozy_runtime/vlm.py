@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Annotated, Any
 
@@ -50,6 +50,7 @@ from cozy_runtime.author import (
     VideoAsset,
     uses_components,
 )
+from cozy_runtime.author._model import WARNINGS
 
 COMPONENT = "model"
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
@@ -170,6 +171,9 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
             temperature=payload.temperature,
             top_p=payload.top_p,
             seed=payload.seed,
+            progress=lambda steps: tel.progress(
+                min(steps / payload.max_tokens, 1.0), stage="answering"
+            ),
         )
     return AskResult(texts)
 
@@ -311,11 +315,13 @@ class VisionLM(Model[Pipeline], encoded_leaves="accept", min_bits=4, phase="deco
         temperature: float,
         top_p: float,
         seed: int,
+        progress: Callable[[int], None] | None = None,
     ) -> list[str]:
         """One answer per question, all at once: one prefill over the rows, left-padded, and one
         decode of them together (the decoding arguments are `lm.generate`'s). Each video's
         blocks are stamped with their `<t seconds>` as the processor writes them. An answer ends
-        before its first `stop`; with `thinking`, only what follows the thought is the answer."""
+        before its first `stop`; with `thinking`, only what follows the thought is the answer,
+        and a thought `max_new_tokens` cut short is returned as it stands, with a run warning."""
         texts = [self._chat(question, system, thinking) for question in questions]
         images = [image for question in questions for image in question.images]
         videos = [video for question in questions for video in question.videos]
@@ -340,14 +346,28 @@ class VisionLM(Model[Pipeline], encoded_leaves="accept", min_bits=4, phase="deco
             "temperature": temperature,
             "top_p": top_p,
             "seed": seed,
+            "progress": progress,
         }
         # A thought may say a stop string: then stops cut only the answer, after decoding.
         replies = self._generate(
             self._inputs(text=texts, **kwargs), [] if thinking else stop, decoding
         )
-        if thinking:
-            replies = [reply.partition(THOUGHT_END)[2] for reply in replies]
-        return [_cut(reply, stop).strip() for reply in replies]
+        if not thinking:
+            return [_cut(reply, stop).strip() for reply in replies]
+        answers = []
+        for row, reply in enumerate(replies):
+            thought, ended, answer = reply.partition(THOUGHT_END)
+            if ended:
+                answers.append(_cut(answer, stop).strip())
+                continue
+            WARNINGS.append(
+                (
+                    "a thought was cut short at max_tokens, before its answer; it is returned",
+                    {"row": row, "max_tokens": max_new_tokens},
+                )
+            )
+            answers.append(thought.strip())
+        return answers
 
     def _chat(self, question: Question, system: str, thinking: bool) -> str:
         content = [

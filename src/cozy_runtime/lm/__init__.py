@@ -145,6 +145,7 @@ def generate(
     top_p: float = 1.0,
     seed: int = 0,
     draft: Any = None,
+    progress: Callable[[int], None] | None = None,
 ) -> Any:
     """Tokens after the prompt, `[batch, n]` (`model.generate(...)`'s tail): `inputs` as the
     processor returned them, generation ends at a `stop` token or after `max_new_tokens`, and a
@@ -157,11 +158,15 @@ def generate(
     model's head read before it, the state the head reads for the token after; `rotary` is the
     model's own rotary embedding. It speeds up a
     batch of one, each token computed as decode computes it. Without one, the head `drafting`
-    names is used."""
+    names is used.
+    `progress(steps)` is told the decode steps taken so far, at most every `PROGRESS_S`, so a long
+    decode is seen moving (a machine ends a call that shows no progress); one that raises is
+    dropped, with a run warning."""
     draft = draft if draft is not None else _DRAFT.get()
     if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
         raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
     sampling = _Sampling(float(temperature), float(top_p), int(seed))
+    tell = _Tell(progress)
     stops = [int(token) for token in stop]
     filler = stops[0] if pad is None else int(pad)
     why = ABSENT or _unsupported(model)
@@ -170,13 +175,13 @@ def generate(
             type(model).__name__, f"[lm] {type(model).__name__} decodes through Transformers: {why}"
         )
         return _transformers(
-            model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling
+            model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell
         )
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
         if engine is None:
             engine = _ENGINES[model] = _Engine(model)
-    request = _Request(inputs, max_new_tokens, stops, filler, presence_penalty, sampling)
+    request = _Request(inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell)
     token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
     try:
         with torch.inference_mode():
@@ -614,6 +619,7 @@ def _transformers(
     pad: int,
     penalty: float,
     sampling: _Sampling,
+    tell: _Tell,
 ) -> Any:
     prompt = int(inputs["input_ids"].shape[1])
     processors: list[Any] = [_Presence(prompt, penalty)] if penalty else []
@@ -628,20 +634,50 @@ def _transformers(
             eos_token_id=stops,
             pad_token_id=pad,
             logits_processor=LogitsProcessorList(processors),
-            stopping_criteria=StoppingCriteriaList([_Cancel(context)] if context else []),
+            stopping_criteria=StoppingCriteriaList([_Cancel(context, tell)]),
         )
     return out[:, prompt:]
 
 
 class _Cancel(StoppingCriteria):  # type: ignore[misc]
-    """Transformers' loop raises the attempt's cancellation between tokens."""
+    """Transformers' loop raises the attempt's cancellation between tokens and tells its
+    progress."""
 
-    def __init__(self, context: Context) -> None:
-        self.context = context
+    def __init__(self, context: Context | None, tell: _Tell) -> None:
+        self.context, self.tell, self.steps = context, tell, 0
 
     def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
-        self.context.raise_if_cancelled()
+        if self.context is not None:
+            self.context.raise_if_cancelled()
+        self.steps += 1
+        self.tell(self.steps)
         return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+
+
+#: The least time between two progress reports of one call.
+PROGRESS_S = 0.25
+
+
+class _Tell:
+    """A call's `progress`, told the steps taken so far at most every `PROGRESS_S`."""
+
+    def __init__(self, progress: Callable[[int], None] | None) -> None:
+        self.progress, self.told = progress, 0.0
+
+    def __call__(self, steps: int) -> None:
+        if self.progress is None:
+            return
+        now = time.perf_counter()
+        if now - self.told < PROGRESS_S:
+            return
+        self.told = now
+        try:
+            self.progress(steps)
+        except Exception as exc:  # the decode (perhaps other calls' too) outlives its report
+            self.progress = None
+            WARNINGS.append(
+                ("decode progress stopped: its report failed", {"error": str(exc)[:200]})
+            )
 
 
 def window(length: int, capacity: int) -> int:
@@ -1013,6 +1049,7 @@ class _Request:
         pad: int,
         penalty: float,
         sampling: _Sampling,
+        tell: _Tell,
     ) -> None:
         self.inputs, self.max_new, self.stops, self.pad, self.penalty, self.sampling = (
             inputs,
@@ -1022,6 +1059,7 @@ class _Request:
             penalty,
             sampling,
         )
+        self.tell = tell
         rows = int(inputs["input_ids"].shape[0])
         self.prompt = int(inputs["input_ids"].shape[1])
         self.tokens: list[Any] = [None] * rows
@@ -1186,6 +1224,7 @@ class _Engine:
                 request.pad,
                 request.penalty,
                 request.sampling,
+                request.tell,
             )
         self._report(request)
         return request.result()
@@ -1369,6 +1408,7 @@ class _Engine:
         for request in {id(row.request): row.request for row in rows}.values():
             request.steps += 1
             request.live += len(rows)
+            request.tell(request.steps)
 
     def _settle(self, incoming: list[_Request]) -> None:
         """Between steps, with the device caught up: done and cancelled rows leave, the rows
