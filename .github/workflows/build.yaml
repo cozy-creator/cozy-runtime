@@ -1,22 +1,23 @@
 name: build
 # The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, and the package imports on CPU.
-# Required on master, so it always reports: a docs-only PR passes without building.
+# Required for merges into master and rc/*: it runs on the merge queue's group (merge_group), on the final
+# PR + branch state; on a pull request it is skipped, which lets the PR be queued. A docs-only group passes
+# without building.
 on:
   pull_request:
-  push:
-    branches: [master]
+  merge_group:
   workflow_dispatch:
 
 concurrency:
-  group: build-${{ github.event.pull_request.number || github.ref }}
+  group: build-${{ github.event.merge_group.head_ref || github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
   build:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     # Hang bound, not a work budget.
     timeout-minutes: 20
@@ -25,9 +26,10 @@ jobs:
         name: Docs-only changes skip the build
         env:
           GH_TOKEN: ${{ github.token }}
-          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.merge_group.head_sha }}
         run: |
-          files=$([ -z "$PR" ] || gh pr diff "$PR" -R "$GITHUB_REPOSITORY" --name-only) || files=
+          files=$([ -z "$BASE" ] || gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" --paginate --jq '.files[].filename') || files=
           if [ -n "$files" ] && ! grep -qvE '\.(md|txt|png|jpe?g|svg)$|^docs/|^changelog\.d/|(^|/)LICENSE$' <<< "$files"; then
             echo "docs only"; echo run=false >> "$GITHUB_OUTPUT"
           else
