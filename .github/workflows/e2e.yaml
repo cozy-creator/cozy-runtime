@@ -1,7 +1,8 @@
 name: e2e
 # CI v2 (tracker/design/ci-v2.md): cozy-creator's e2e suites, selected by what the change touches. Required for
 # merges into master and rc/*: it runs on the merge queue's group (merge_group), on the final PR + branch state;
-# on a pull request the called workflow skips its suites, which lets the PR be queued.
+# on a pull request the called workflow skips its suites, which lets the PR be queued. The required check is
+# this job's `e2e / e2e`.
 on:
   pull_request:
   merge_group:
