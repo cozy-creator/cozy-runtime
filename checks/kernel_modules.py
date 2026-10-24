@@ -46,7 +46,7 @@ code = _gemm.gemv(0, 0, False, 0, 0, 0, 0, False, 1, 8, 256, 0)
 assert code != 0, "a gemv ran with no GPU"
 assert _gemm.gemm(0, 3, False, 0, 0, 0, 0, 0, 0, False, 1, 8, 256, -1, None, 0) == 1
 assert _gemm.TMA == ("tma" not in sys.argv[2:]), f"_gemm.TMA is {_gemm.TMA}"
-assert _gemm.svdq_gemm(0, *(0,) * 10, False, 1, 100, 64, 32, 0) == 1  # N % 128: refused
+assert _gemm.svdq_gemm(0, *(0,) * 11, False, 1, 100, 64, 32, 0) == 1  # N % 128: refused
 assert callable(_norm.rms_rope_split_half)
 if "_fa3" not in sys.argv[2:]:
     _fa3 = load("_fa3")
