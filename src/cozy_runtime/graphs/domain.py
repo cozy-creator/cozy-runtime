@@ -145,7 +145,7 @@ class Domain:
     def prime_blas(self) -> None:
         """The library stream's cuBLAS and cuDNN handles and workspaces, which torch keeps per
         stream for the process's life: made once, outside any request, so they live in the
-        process arena and never in a request's or a capture's."""
+        process and never depend on a request's temporary allocations."""
         if why := self.refusal():
             raise Unavailable(why)
         if not self.primed:

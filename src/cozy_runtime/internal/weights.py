@@ -576,8 +576,8 @@ class _Routes:
     into a float tensor, or a native leaf's role buffers (derived roles made from the stored
     ones). A decoded tensor is decoded once a generation (`delivery.cost_class`), not once a
     bind: it is kept under the fill identity it was decoded from, in the component's derived
-    region, pinned while the component is in use (`Placement.using`). Between uses varena may
-    drop the region, and its next pin finds it fresh: the next bind decodes again. Leaf buffers
+    cache, pinned while the component is in use (`Placement.using`). Between uses the residency
+    owner may discard it, and the next bind decodes again. Leaf buffers
     live for that bind."""
 
     def __init__(
@@ -931,9 +931,7 @@ def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:
 
 
 class Placement:
-    """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
-    pins and KV caches as the memory's caches, a request's LoRA serving, notes, and each
-    scope's varena pass and step hold (`using`)."""
+    """A placed component's Runtime-owned residency, graph/cache lifetime, and LoRA choice."""
 
     def __init__(self, memory: Memory, backend: Backend) -> None:
         self.memory = memory
@@ -981,7 +979,7 @@ class Placement:
 
     @contextmanager
     def using(self, method: str, components: tuple[str, ...]) -> Iterator[None]:
-        """A local scope (`_ComponentScope`): one varena pass per component for the call, its
+        """A local scope (`_ComponentScope`): one residency pass per component for the call, its
         forwards nested in it, and its blocks held bound from free bytes while its plan step
         lasts. A hold never outlives the step: a later step's activations cannot evict pinned
         pages (S3). A component with no free room binds per block."""

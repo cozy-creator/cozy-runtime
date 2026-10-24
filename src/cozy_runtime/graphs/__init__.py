@@ -54,7 +54,7 @@ DECODERS: list[
     tuple[Callable[[Any], tuple[dict[str, int], list[Any], Any]], Callable[[Any], None]]
 ] = []
 _SAID: set[str] = set()
-#: the request an idle capture runs in (`graph_idle`): its warm-up's arena sizes the capture
+#: the isolated request used for idle warm-up and capture observations
 IDLE_REQUEST = "graphs-idle"
 
 
@@ -955,7 +955,7 @@ def _capture_pending(pending: _Pending) -> bool:
         idle = placed[0].graph_idle() if placed is not None else nullcontext()
         try:
             owner.initialize()
-            owner.prime_blas()  # before the idle request: torch keeps them, in the process arena
+            owner.prime_blas()  # before the idle request: Torch owns the shared workspaces
             with idle:
                 done = _record(torch, module, pending, recorder, placed, submit)
         except Exception as exc:  # the signature runs as written; the period goes on
@@ -1005,7 +1005,7 @@ def _record(
             stream = owner.stream
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
-                # The warm-up runs in the idle request's arena: its high-water is the capture's.
+                # Warm-up runs with ordinary Torch allocations, before graph-private storage.
                 seeded = torch.Generator(device=current.device).manual_seed(_SEED)
                 inputs = [
                     _input(torch, v, seeded) if isinstance(v, _Leaf) else None
@@ -1036,7 +1036,7 @@ def _record(
                     )
                 pool = recorder.pool
                 # Its static inputs are the pool's, made in the capture (an allocation launches
-                # nothing), so they live as long as the graph and never in a request's arena.
+                # nothing), so their storage stays owned with the graph.
                 statics: list[Any] = []
                 outputs: list[Any] = []
 
@@ -1122,7 +1122,7 @@ def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
 
 def _hooked(module: Any) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
-    at every call, which a replay would skip (varena's binds and Runtime's own are served)."""
+    at every call, which a replay would skip (Runtime's binding and scope hooks are served)."""
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
