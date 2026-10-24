@@ -23,8 +23,6 @@ from typing import Any
 from cozy_runtime.internal import config, proctree
 from cozy_runtime.internal.exits import Exit
 
-CAPABILITY = "fork/1"
-
 #: Names their libraries read once at load, during the parent's imports: a child keeps them.
 LOADED = ("OMP_NUM_THREADS",)
 

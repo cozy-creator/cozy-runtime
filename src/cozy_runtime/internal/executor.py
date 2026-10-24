@@ -53,7 +53,6 @@ import importlib.util
 import json
 import math
 import os
-import platform
 import socket
 import sys
 import threading
@@ -162,7 +161,6 @@ from cozy_runtime.internal.config import inherited_environment, restore_seal, se
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.encoding.leaves import FORMATS, serving
 from cozy_runtime.internal.executor_commands import (
-    LOAD_ATTENTION_PIN,
     Activate,
     Attention,
     Binding,
@@ -216,7 +214,6 @@ from cozy_runtime.internal.parallel.plan import (
 )
 from cozy_runtime.internal.resolution import RefusedLeaves
 from cozy_runtime.internal.seam import (
-    EXECUTOR_PROTOCOL_REVISION,
     RESULT_DOCUMENT,
     Channel,
     Frame,
@@ -485,22 +482,6 @@ def _distribution_version(name: str) -> str:
         return ""
 
 
-def _proc_status(field: str) -> str:
-    """A `/proc/self/status` field; "" where the system has no `/proc` (macOS)."""
-    with contextlib.suppress(FileNotFoundError), open("/proc/self/status") as handle:
-        for line in handle:
-            if line.startswith(field + ":"):
-                return line.split(":", 1)[1].strip()
-    return ""
-
-
-def _oom_score_adj() -> str:
-    try:
-        return Path("/proc/self/oom_score_adj").read_text().strip()
-    except FileNotFoundError:  # no /proc: macOS has no OOM killer score
-        return ""
-
-
 if sys.platform == "win32":
 
     class _MemoryCounters(ctypes.Structure):
@@ -537,10 +518,9 @@ if sys.platform == "win32":
             raise ctypes.WinError(ctypes.get_last_error())
         return int(counters.PeakWorkingSetSize)
 
-    def _identity() -> tuple[int, int, int]:
-        """Process group, uid, euid. A Windows executor is its own group (its Job Object)
-        and has no POSIX ids."""
-        return os.getpid(), 0, 0
+    def _group() -> int:
+        """A Windows executor is its own group (its Job Object)."""
+        return os.getpid()
 
 else:
 
@@ -550,9 +530,8 @@ else:
             1 if sys.platform == "darwin" else 1024
         )
 
-    def _identity() -> tuple[int, int, int]:
-        """Process group, uid, euid."""
-        return os.getpgrp(), os.getuid(), os.geteuid()
+    def _group() -> int:
+        return os.getpgrp()
 
 
 def _deadline(seconds: float | None) -> float:
@@ -978,35 +957,19 @@ class Executor:
                 raise AssertionError("shutdown ends the command loop")
 
     def hello(self) -> dict[str, Any]:
-        group, uid, euid = _identity()
+        """What TensorD (`Hello`) and rank 0 (`group._Hello`) read: who this process is, its
+        versions, its memory protocol and its seal."""
         return {
             "ok": True,
             "pid": os.getpid(),
             "ppid": os.getppid(),
-            "python_version": platform.python_version(),
-            "python_abi": (sys.implementation.cache_tag or "").replace("cpython-", "cp"),
-            "python_executable": sys.executable,
+            "pgid": _group(),
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
-            "executor_protocol_revision": EXECUTOR_PROTOCOL_REVISION,
             # 2: each GPU's weight pages leased from TensorD's manager beside its two ledger
             # descriptors. TensorD checks this before transferring Start's memory authority.
             "memory_protocol": 2,
-            #: commands beyond the floor's (`memory` is the invoke reply's own object)
-            "capabilities": [
-                "import_only",
-                zygote.CAPABILITY,
-                LOAD_ATTENTION_PIN,
-            ],
-            "memo": [stage_memo.CAPABILITY],
-            "pgid": group,
-            "no_new_privs": _proc_status("NoNewPrivs"),
-            "oom_score_adj": _oom_score_adj(),
-            "uid": uid,
-            "euid": euid,
             "sealed": dict(_SEALED),
-            "torch_loaded": "torch" in sys.modules,
-            "rss_bytes": _rss(),
             "rank": self.rank,
             "world": self.world,
         }

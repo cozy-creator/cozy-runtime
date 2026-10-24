@@ -50,11 +50,6 @@ if sys.platform == "win32":
 else:
     import fcntl
 
-#: Worker/executor command-and-reply compatibility, independent of SDK package
-#: version or source build. Compatible additive fields keep this revision; only
-#: an incompatible change to required commands/semantics raises it.
-EXECUTOR_PROTOCOL_REVISION = 1
-
 #: Not a size rule: the most one length prefix may make a reader allocate (the documents'
 #: guard, shared with TensorD's `protocol::MAX_FRAME`). It refuses only a corrupt or hostile
 #: prefix.
