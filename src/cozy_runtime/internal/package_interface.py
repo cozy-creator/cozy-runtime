@@ -40,7 +40,6 @@ if TYPE_CHECKING:
 
 SCHEMA = "cozy.package.interface/1"
 DIGEST_KEY = "package_interface_digest"
-FILENAME = "metadata/package-interface.json"
 
 #: The top-level fields every interface carries. Readers ignore additional fields.
 TOP_LEVEL_KEYS = frozenset({"format", "application", "entrypoints"})

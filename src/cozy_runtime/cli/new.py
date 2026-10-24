@@ -61,12 +61,6 @@ warn_unreachable = true
 """
 
 
-def _package_toml(pkg: str) -> str:
-    return f"""[application]
-object = "{pkg}:app"
-"""
-
-
 _MODULE = '''"""__PKG__ — a cozy-runtime package.
 
 The SIGNATURE is the contract:
@@ -180,7 +174,6 @@ def run(name: str, target_dir: str) -> Result:
 
     files = {
         "pyproject.toml": _pyproject(name, pkg),
-        "package.toml": _package_toml(pkg),
         "README.md": _readme(name, pkg),
         ".gitignore": ".venv/\n__pycache__/\ndist/\n",
         f"src/{pkg}/__init__.py": _module(pkg),

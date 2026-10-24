@@ -1254,29 +1254,34 @@ def _single_target(stmt: ast.stmt) -> str | None:
 
 
 def read_application(project: Path) -> str:
-    """`[application] object` from package.toml, or the zero/ambiguous refusal."""
-    path = project / "package.toml"
-    if not path.is_file():
-        raise StaticRefusal(
-            f"{path} does not exist: a package repository has package.toml naming its "
-            'one app export ([application] object = "my_package:app")',
-            code="no_package_toml",
-        )
+    """pyproject's one `cozy.application` entry point (the one the wheel carries), or the
+    zero/ambiguous refusal."""
+    path = project / "pyproject.toml"
     try:
         data = tomllib.loads(path.read_text())
-    except tomllib.TOMLDecodeError as exc:
-        raise StaticRefusal(f"{path} is not valid TOML: {exc}", code="package_toml") from exc
-    application = data.get("application", {})
-    obj = application.get("object") if isinstance(application, dict) else None
-    if not isinstance(obj, str) or not obj:
+    except FileNotFoundError as exc:
         raise StaticRefusal(
-            f"{path} names no [application] object — discovery reads exactly ONE configured "
-            "export and nothing else, so zero named apps is ambiguous by construction",
-            code="zero_application",
+            f"{path} does not exist: a package's pyproject.toml names its one App export "
+            '([project.entry-points."cozy.application"] default = "my_package:app")',
+            code="no_pyproject",
+        ) from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise StaticRefusal(f"{path} is not valid TOML: {exc}", code="pyproject") from exc
+    table = data.get("project")
+    points = table.get("entry-points") if isinstance(table, dict) else None
+    group = points.get("cozy.application") if isinstance(points, dict) else None
+    objects = list(group.values()) if isinstance(group, dict) else []
+    if len(objects) != 1 or not isinstance(objects[0], str) or not objects[0]:
+        raise StaticRefusal(
+            f'{path} names {len(objects)} [project.entry-points."cozy.application"] entries; '
+            "discovery reads exactly one",
+            code="application_entrypoint_count",
         )
+    obj = objects[0]
     if obj.count(":") != 1 or not all(part.strip() for part in obj.split(":")):
         raise StaticRefusal(
-            f'[application] object = "{obj}" is not <module>:<attribute>', code="application_path"
+            f'cozy.application entry point "{obj}" is not <module>:<attribute>',
+            code="application_path",
         )
     return obj
 
