@@ -882,6 +882,9 @@ class Executor:
         #: HOST ONLY: what its attempts may call (`Start.call_interfaces`), and their bindings
         self.call_interfaces: tuple[CallInterface, ...] = ()
         self._bound_calls: tuple[tuple[CallInterface, ...], CallBindings] | None = None
+        #: The call bindings just made, for the request that made them: dependency exports bound
+        #: from their documents, and those bound from their own code.
+        self.bindings_note: tuple[int, list[str]] | None = None
         self.ready = False
         self.poisoned = ""
         #: its followers were sent the load: from here a refusal leaves them mid-protocol
@@ -3423,6 +3426,15 @@ class Executor:
                 )
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
+            note, self.host.bindings_note = self.host.bindings_note, None
+            if note is not None:
+                record.emit(
+                    "confession",
+                    "calls.bound",
+                    note[0],
+                    from_code=len(note[1]),
+                    code=", ".join(note[1])[:600],
+                )
             for work, (ms, times) in blocking.items():
                 took = {"ms": round(ms, 1), "times": times}
                 record.emit("confession", "request_path.blocking", work, **took)
@@ -4317,13 +4329,7 @@ class Executor:
         for export in own:
             key = (effect_interfaces.MODULE, export)
             bindings.setdefault(key, effect_interfaces.unserved(export))
-        if generated or analyzed:
-            # Which dependency exports bound from their documents and which from their own code.
-            print(
-                f"[calls] {generated} bound from their documents, {len(analyzed)} from their code"
-                + (f": {', '.join(analyzed)}" if analyzed else "")[:600],
-                file=sys.stderr,
-            )
+        self.bindings_note = (generated, analyzed) if generated or analyzed else None
         return bindings
 
     def _store(self) -> Path:
