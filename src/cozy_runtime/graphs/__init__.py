@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 import weakref
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -456,10 +456,17 @@ class _Idle:
         self.last = 0.0
         self.periods = self.yields = self.failures = 0
         self.longest_ms = 0.0
+        #: why a job waited for a later period, by reason (the receipt's `idle.waits`)
+        self.waits: Counter[str] = Counter()
 
     def add(self, job: Callable[[], bool]) -> None:
         with self.lock:
             self.jobs.append(job)
+
+    def wait(self, why: str) -> bool:
+        """A job not done this period, and why: False, so it waits for the next."""
+        self.waits[why] += 1
+        return False
 
     def check(self) -> None:
         now = time.perf_counter()
@@ -513,6 +520,7 @@ class _Idle:
             "yields": self.yields,
             "failures": self.failures,
             "longest_block_ms": round(self.longest_ms, 3),
+            "waits": dict(self.waits),
         }
 
 
@@ -1002,7 +1010,7 @@ def _capture_pending(pending: _Pending) -> bool:
         return True  # released, or its graphs dropped since it queued: its next call queues
     submit = recorder.eager.submit_ms()
     if submit is None:
-        return False
+        return IDLE.wait("measured once")
     placed, owner = _placed(module), recorder.domain
     assert owner is not None
     device = next(leaf.device for leaf in pending.leaves if isinstance(leaf, _Leaf))
@@ -1010,12 +1018,13 @@ def _capture_pending(pending: _Pending) -> bool:
         if recorder.landed != LANDED[0] or (
             recorder.binding is not None and not recorder.binding.valid()
         ):
+            IDLE.waits["kernel landed or binding stale"] += 1
             return recorder.forget(torch)  # its queue went with its graphs
         if placed is not None:
             if recorder.binding is None:
                 recorder.binding = placed[0].retain(placed[1], (_REGIONS[module][1],))
             if not placed[0].graph_resident(recorder.binding):
-                return False
+                return IDLE.wait("pages not resident")
         idle = placed[0].graph_idle() if placed is not None else nullcontext()
         try:
             owner.initialize()
@@ -1026,7 +1035,7 @@ def _capture_pending(pending: _Pending) -> bool:
             if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
                 raise
             if is_capacity(exc):
-                return False
+                return IDLE.wait("no free room")
             _failed(module, recorder, pending.key, f"{type(exc).__name__}: {exc}"[:300])
             done = True
         if done:
@@ -1152,8 +1161,10 @@ def _record(
             _LENT[tensor.data_ptr()] = (weakref.ref(entry), index)
         return True
     except Exception as exc:
-        if is_capacity(exc) or _unprepared(exc) or isinstance(exc, Building):
-            return False
+        if isinstance(exc, Building):
+            return IDLE.wait("kernel building")
+        if is_capacity(exc) or _unprepared(exc):
+            return IDLE.wait("no free room")
         if not isinstance(exc, domain.Unavailable):
             raise
         _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
