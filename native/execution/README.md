@@ -27,6 +27,15 @@ device/context and copy-address constraints. Host callbacks, allocation/free, ev
 semaphore and existing conditional nodes are refused. Device graph launch is not mixed into the
 conditional body. Unsupported hardware or graph operations return a typed CUDA failure.
 
+Actual CUDA stream capture holds the process-wide capture exclusion. Prepared replay does not:
+it retains every external Tensor and original Storage plus supplied Binding owners, so each
+dependency's physical pin remains held through GPU completion and owned output readout. The
+graph contains no allocation, I/O, host callback or event-dependent work that could wait on a
+reclaiming host thread. Unrelated reclamation still performs the native core's conservative
+context join; this change makes no claim of overlapping eviction. A future-fill overlap gate
+must map/admit its distinct destination and prepare staging, streams and decoder kernels before
+launch, then publish through its own producer event. Actual capture remains excluded throughout.
+
 Cancellation is a GPU atomic write from a separate control stream. The boundary kernel observes
 it after a complete body. Progress uses a control-stream kernel reading device atomics into an
 owned snapshot, followed by ordered D2H and an event; CPU never races a device write to the same

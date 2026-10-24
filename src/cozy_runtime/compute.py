@@ -218,7 +218,6 @@ class PreparedRepeat:
 
     def submit(self, context: Context | None = None) -> Execution:
         import torch
-        from tensorfs import varena
 
         if context is not None:
             context.raise_if_cancelled()
@@ -231,14 +230,11 @@ class PreparedRepeat:
             with torch.cuda.device(self.device):
                 outputs = tuple(torch.empty_like(t) for t in self.state)
                 readout = torch.cuda.Event()
-            guard = varena.capture(self.device)
-            guard.__enter__()
             try:
                 epoch = self._native.launch(torch.cuda.current_stream(self.device).cuda_stream)
             except Exception as error:
-                guard.__exit__(type(error), error, error.__traceback__)
                 _native_error(error)
-            self._active = Execution(self, context, guard, epoch, outputs, readout)
+            self._active = Execution(self, context, epoch, outputs, readout)
             return self._active
 
 
@@ -249,13 +245,11 @@ class Execution:
         self,
         plan: PreparedRepeat,
         context: Context | None,
-        guard: Any,
         epoch: int,
         outputs: tuple[Any, ...],
         readout: Any,
     ) -> None:
         self.plan, self.context = plan, context
-        self._guard = guard
         self._finished: Progress | None = None
         self._epoch, self._outputs, self._readout = epoch, outputs, readout
         self._observation = threading.RLock()
@@ -270,13 +264,7 @@ class Execution:
                 self._readout.record(torch.cuda.current_stream(self.plan.device))
                 self._readout.synchronize()
             self._finished = Progress(completed, canceled, True)
-            self._release_guard()
         return self._finished
-
-    def _release_guard(self) -> None:
-        if self._guard is not None:
-            self._guard.__exit__(None, None, None)
-            self._guard = None
 
     def poll(self) -> Progress:
         with self._observation:
@@ -318,6 +306,5 @@ class Execution:
         try:
             self.plan._native.close(self._epoch)
             self.plan._closed = True
-            self._release_guard()
         except Exception as error:
             _native_error(error)
