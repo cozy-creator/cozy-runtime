@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 #: a piece's bytes for its unit count (tokens, rows, images, heads or query rows), each term
 #: in whole allocation granules of the given size
@@ -18,17 +19,25 @@ type Per = Callable[[int, int], int]
 type Need = Callable[[int, int], int]
 
 
-@dataclass(frozen=True, slots=True)
-class Room:
+class Room(Protocol):
     """Local free bytes and eligible cached weights outside/inside the current scope's plan.
     Active weights and graph-retained tensors are excluded. The pure-cut caller reclaims any
     selected cached bytes before executing; the allocator itself owns no eviction policy."""
 
-    free: int
-    cold: int
-    warm: int
-    granularity: int
-    floor: int
+    @property
+    def free(self) -> int: ...
+
+    @property
+    def cold(self) -> int: ...
+
+    @property
+    def warm(self) -> int: ...
+
+    @property
+    def granularity(self) -> int: ...
+
+    @property
+    def floor(self) -> int: ...
 
 
 def pieces(units: int, level: int) -> int:
