@@ -1,0 +1,1 @@
+The executor trampoline no longer takes `--uid/--gid`: executors run as their machine's user (a pod has one tenant; a local machine runs its owner's code). The unused Python executor spawn (`spawn_executor`) is gone.

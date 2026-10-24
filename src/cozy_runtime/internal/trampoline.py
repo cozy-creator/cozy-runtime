@@ -23,11 +23,7 @@ Order matters and is the point:
 5. **oom_score_adj** — the EXECUTOR raises its OWN score. The worker stays a bare
    interpreter at the default score so the kernel's OOM victim ordering picks the disposable
    process, and nothing in the worker needs privilege to arrange it.
-6. **uid/gid** — dropped only when this process is privileged enough to drop them; on an
-   unprivileged box there is nothing to drop and the step is a recorded no-op, never a
-   pretended success. Linux clears pdeathsig on credential changes: arm it again after
-   all transitions and re-check the expected parent before entering the executor.
-7. **signals** — default dispositions and an empty mask, so an inherited mask cannot make a
+6. **signals** — default dispositions and an empty mask, so an inherited mask cannot make a
    child unkillable by the cancellation path.
 
 Exit codes are the runtime's shared matrix so a trampoline refusal is distinguishable from
@@ -71,7 +67,6 @@ def main(argv: list[str]) -> None:
     """Seal one child and enter its selected containment scope before executor import."""
     expect_parent = 0
     oom_adj = 0
-    uid = gid = -1
     cgroup_path = ""
     cgroup_inode = 0
     scope_backend = ""
@@ -87,10 +82,6 @@ def main(argv: list[str]) -> None:
             expect_parent = int(value)
         elif flag == "--oom-adj":
             oom_adj = int(value)
-        elif flag == "--uid":
-            uid = int(value)
-        elif flag == "--gid":
-            gid = int(value)
         elif flag == "--cgroup":
             cgroup_path = value
         elif flag == "--cgroup-inode":
@@ -132,20 +123,6 @@ def main(argv: list[str]) -> None:
     except OSError as exc:
         _fail(f"oom_score_adj={oom_adj}: {exc}", Exit.internal)
 
-    if gid >= 0 and os.geteuid() == 0:
-        os.setgroups([])
-        os.setgid(gid)
-    if uid >= 0:
-        if os.geteuid() == 0:
-            os.setuid(uid)
-        elif uid != os.geteuid():
-            _fail(
-                f"--uid {uid} requested at euid {os.geteuid()}: an unprivileged trampoline "
-                "cannot become another user, and pretending it did is worse than refusing",
-                Exit.structural,
-            )
-
-    _arm_parent_death(expect_parent)
 
     # Keep executor-directed signals out of the worker's group. Under process-tree
     # containment, stop before package import so the parent can fsync this exact birth and
