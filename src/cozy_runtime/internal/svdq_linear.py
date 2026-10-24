@@ -7,11 +7,13 @@
   `input_scale` (calibrated), else the call's `|x| · p` max / 2688. Each 16-block's scale is
   `amax / (6 g_x)` rounded to E4M3 within [2⁻⁹, 448], each element the nearest E2M1, ties even.
 
-Two Triton kernels, built when the executor starts (`KERNELS`):
+On RTX 50 the wheel's prebuilt kernels serve (`_kernels._gemm.svdq_*`, `kernels/csrc/gemm/svdq.cu`):
+block-scaled FP4 mma.sync, the weight held in their tiles from the bind (`tiles`). Elsewhere on
+Blackwell, two Triton kernels built when the executor starts (`KERNELS`):
 - `_quantize` reads `x` once: it writes the nvfp4 operand and the down-projection `x · downᵀ`;
 - `_gemm` multiplies on the FP4 tensor cores (`tl.dot_scaled`); its epilogue adds the
   up-projection, both second levels, `c` and the bias.
-Until the build lands, and off Blackwell, `eager` serves the same law with torch ops.
+Until a build serves, and off Blackwell, `eager` serves the same law with torch ops.
 
 `torch` is the torch module: this module imports no torch.
 """
@@ -20,12 +22,15 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
+from functools import partial
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from cozy_runtime import _kernels
 from cozy_runtime.author._model import Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, TritonEntry, TritonKernels
-from cozy_runtime.internal import int8_linear
+from cozy_runtime.internal import int8_linear, prebuilt
+from cozy_runtime.internal import verify as verdicts
 from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, Tensor
 
 if TYPE_CHECKING:
@@ -44,7 +49,11 @@ TILE_M, TILE_N, TILE_K, GROUP_M, GEMM_WARPS, GEMM_STAGES = 128, 128, 256, 8, 8, 
 #: The column multiple the kernels need (one K step).
 K_ALIGN = TILE_K
 #: What a run's `gemm.selected` names.
-TRITON, EAGER = "cozy-svdq-nvfp4", "torch-eager"
+TRITON, EAGER, NATIVE = "cozy-svdq-nvfp4", "torch-eager", "cozy-svdq-nvfp4-mma"
+#: The rows the prebuilt kernels' operand is padded to, and the columns their weight tiles span.
+NATIVE_ROWS, NATIVE_COLS = 256, 128
+#: Whether the prebuilt kernels serve each GPU (`native`).
+_NATIVE: dict[int, bool] = {}
 
 try:
     import triton
@@ -302,7 +311,7 @@ def _launcher(torch: ModuleType, device: Device) -> Launch | None:
         try:
             launch = READY[0](KERNELS, device=device) if READY else None
             if launch is not None:
-                verify(torch, device, launch)
+                verify(torch, device, *_triton(torch, launch))
         except KernelsUnavailable as exc:  # absent, failed or corrupt for good: the run says so
             int8_linear.failed(TRITON, index, exc)
             _FP4[index] = False
@@ -315,13 +324,171 @@ def _launcher(torch: ModuleType, device: Device) -> Launch | None:
     return launch
 
 
-def verify(torch: ModuleType, device: Device, launch: Launch) -> None:
-    """Both kernels against the law on ragged rows and columns, each dtype and built rank, with
+def native(torch: ModuleType, device: Device) -> bool:
+    """Whether the wheel's prebuilt svdq kernels (`_kernels._gemm.svdq_*`) serve this card:
+    carried for it and agreeing with the law here (`verify`), asked once per card and Runtime
+    build. A leaf bound on such a card holds its weight in their tiles (`tiles`)."""
+    index = device.index or 0
+    if index not in _NATIVE:
+        major, minor = torch.cuda.get_device_capability(index)
+        sm = 10 * int(major) + int(minor)
+        ok = False
+        if sm in _kernels.SVDQ:
+            verdict = verdicts.verified(
+                NATIVE, prebuilt.artifact(), sm, partial(_probe, torch, device)
+            )
+            if not verdict.ok:
+                int8_linear.failed(NATIVE, index, RuntimeError(verdict.detail))
+            ok = verdict.ok
+        _NATIVE[index] = ok
+    return _NATIVE[index]
+
+
+def tiles(torch: ModuleType, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+    """The weight's codes `[N, K/2]` (u8, element 2k low) and E4M3 scales `[N, K/16]` as the
+    prebuilt GEMM reads them (Nunchaku's fragment layouts), same shapes and bytes, reordered:
+    per 128 rows and 64 columns, eight 16-row MMA tiles of 32 lanes' 16 bytes, then 32 lanes'
+    four scale words. N % 128 == 0 and K % 64 == 0."""
+    n, k = int(weight.shape[0]), 2 * int(weight.shape[1])
+    words = weight.contiguous().view(torch.int32).view(n // 128, 8, 2, 8, k // 64, 2, 4)
+    words = words.permute(0, 4, 1, 3, 6, 2, 5).contiguous()  # (n/128, k/64, n16, g, t, n8, k32)
+    scales = scale.contiguous().view(torch.uint8).view(torch.int32)
+    scales = scales.view(n // 128, 4, 4, 8, k // 64).permute(0, 4, 3, 2, 1).contiguous()
+    return words.view(torch.uint8).view(n, k // 2), scales.view(torch.uint8).view(n, k // 16)
+
+
+def untiled(torch: ModuleType, roles: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    """`roles` with the weight and its scales back in their stored layout (`tiles` undone)."""
+    if "weight_tiles" not in roles:
+        return dict(roles)
+    out = {r: t for r, t in roles.items() if r not in ("weight_tiles", "scale_tiles")}
+    n, k = int(roles["weight_tiles"].shape[0]), 2 * int(roles["weight_tiles"].shape[1])
+    words = roles["weight_tiles"].view(torch.int32).view(n // 128, k // 64, 8, 8, 4, 2, 2)
+    words = words.permute(0, 2, 5, 3, 1, 6, 4).contiguous()
+    scales = roles["scale_tiles"].view(torch.int32).view(n // 128, k // 64, 8, 4, 4)
+    scales = scales.permute(0, 4, 3, 2, 1).contiguous()
+    out["weight"] = words.view(torch.uint8).view(n, k // 2)
+    out["scale"] = scales.view(torch.uint8).view(n, k // 16).view(torch.float8_e4m3fn)
+    return out
+
+
+def operand(torch: ModuleType, act: Tensor, ascales: Tensor) -> tuple[Tensor, Tensor]:
+    """The prebuilt quantize's operand `[R, K/2]` and scales `[R, K/16]` (R a multiple of
+    `NATIVE_ROWS`) in the law's layout: codes with element 2k low, E4M3 bytes."""
+    rows, k = int(act.shape[0]), 2 * int(act.shape[1])
+    words = act.view(torch.int32).view(rows // 256, k // 64, 8, 2, 8, 4, 2, 2)
+    words = words.permute(0, 2, 3, 7, 4, 1, 6, 5).contiguous()  # rows then k-chunks, natural
+    scales = ascales.view(torch.int32).view(rows // 256, k // 64, 8, 8, 2, 2)
+    scales = scales.permute(0, 2, 4, 5, 3, 1).contiguous()
+    return words.view(torch.uint8).view(rows, k // 2), scales.view(torch.uint8).view(rows, k // 16)
+
+
+def _native_quantized(
+    torch: ModuleType, x: Tensor, roles: Mapping[str, Tensor]
+) -> tuple[Tensor, Tensor, Tensor, Tensor, int]:
+    """`svdq_quantize`: `x`'s operand in the GEMM's tiles, its scales and its down-projection
+    (rows padded to `NATIVE_ROWS`), its `g_x`, and its row count."""
+    cols, r = int(roles["pre_quant_scale"].numel()), int(roles["lowrank_down"].shape[0])
+    flat = x.reshape(-1, cols).contiguous()
+    rows = int(flat.shape[0])
+    padded_rows = -(-rows // NATIVE_ROWS) * NATIVE_ROWS
+    g = activation_scale(torch, flat, roles).contiguous()
+    act = torch.empty(padded_rows, cols // 2, dtype=torch.uint8, device=x.device)
+    ascales = torch.empty(padded_rows, cols // NVFP4_BLOCK, dtype=torch.uint8, device=x.device)
+    low = torch.empty(padded_rows, r, dtype=torch.bfloat16, device=x.device)
+    index = x.device.index or 0
+    code = _kernels._gemm.svdq_quantize(
+        index, flat.data_ptr(), flat.dtype == torch.float16, roles["pre_quant_scale"].data_ptr(),
+        g.data_ptr(), roles["lowrank_down"].data_ptr(), act.data_ptr(), ascales.data_ptr(),
+        low.data_ptr(), rows, cols, r, int(torch.cuda.current_stream(index).cuda_stream),
+    )  # fmt: skip
+    _check(torch, code, "quantize")
+    return act, ascales, low, g, rows
+
+
+def _native_multiplied(
+    torch: ModuleType,
+    quantized: tuple[Tensor, Tensor, Tensor, Tensor, int],
+    roles: Mapping[str, Tensor],
+    bias: Tensor | None,
+    half: object,
+) -> Tensor:
+    """`svdq_gemm`: `[M, N]` in `half`, from `_native_quantized`'s operands and a tiled weight."""
+    act, ascales, low, g, rows = quantized
+    n, r = int(roles["lowrank_up"].shape[0]), int(roles["lowrank_up"].shape[1])
+    c = roles.get("channel_scale")
+    bias = None if bias is None else bias.to(half).contiguous()
+    out = torch.empty(rows, n, dtype=half, device=act.device)
+    index = act.device.index or 0
+    code = _kernels._gemm.svdq_gemm(
+        index, act.data_ptr(), ascales.data_ptr(), roles["weight_tiles"].data_ptr(),
+        roles["scale_tiles"].data_ptr(), g.data_ptr(), roles["scale_2"].data_ptr(),
+        0 if c is None else c.data_ptr(), low.data_ptr(), roles["lowrank_up"].data_ptr(),
+        0 if bias is None else bias.data_ptr(), out.data_ptr(), half == torch.float16, rows, n,
+        2 * int(act.shape[1]), r, int(torch.cuda.current_stream(index).cuda_stream),
+    )  # fmt: skip
+    _check(torch, code, "GEMM")
+    return out
+
+
+def _check(torch: ModuleType, code: int, what: str) -> None:
+    if code == 0:
+        return
+    detail = f"svdq {what}: {_kernels._gemm.error_name(code)}"
+    if code == _kernels._gemm.OUT_OF_MEMORY:
+        raise torch.cuda.OutOfMemoryError(detail)
+    raise RuntimeError(detail)
+
+
+def _probe(torch: ModuleType, device: Device) -> verdicts.Verdict:
+    """`verify` on the prebuilt kernels: the verdict `native` keeps."""
+
+    def quantized(x: Tensor, roles: Mapping[str, Tensor]) -> tuple[object, Tensor, Tensor, Tensor]:
+        made = _native_quantized(torch, x, roles)
+        q, sx = operand(torch, made[0], made[1])
+        rows = made[4]
+        return made, q[:rows], sx[:rows].view(torch.float8_e4m3fn), made[2][:rows]
+
+    def multiplied(made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object):
+        weight, scale = tiles(torch, roles["weight"], roles["scale"])
+        tiled = {**roles, "weight_tiles": weight, "scale_tiles": scale}
+        return _native_multiplied(torch, made, tiled, bias, half)  # type: ignore[arg-type]
+
+    try:
+        verify(torch, device, quantized, multiplied)
+    except Exception as exc:  # a miss or a launch error: the verdict says which
+        return verdicts.Verdict(False, f"{type(exc).__name__}: {exc}"[:300])
+    return verdicts.Verdict(True, "the law, bit for bit and within rounding")
+
+
+def _triton(torch: ModuleType, launch: Launch) -> tuple[Callable[..., Any], Callable[..., Any]]:
+    """The Triton build's two kernels as `verify` calls them."""
+
+    def quantized(x: Tensor, roles: Mapping[str, Tensor]) -> tuple[object, Tensor, Tensor, Tensor]:
+        q, sx, low, g = _quantized(torch, launch, x, roles)
+        return (q, sx, low, g), q, sx, low
+
+    def multiplied(made: Any, roles: Mapping[str, Tensor], bias: Tensor | None, half: object):
+        return _multiplied(torch, launch, *made, roles, bias, half)
+
+    return quantized, multiplied
+
+
+def verify(
+    torch: ModuleType,
+    device: Device,
+    quantized: Callable[[Tensor, Mapping[str, Tensor]], tuple[object, Tensor, Tensor, Tensor]],
+    multiplied: Callable[[object, Mapping[str, Tensor], Tensor | None, object], Tensor],
+    shape: tuple[int, int, int] = (200, 256, 256),
+) -> None:
+    """Both kernels of one build against the law on ragged rows, each dtype and built rank, with
     and without `c` and the bias: the operand and its scales bit for bit; the down-projection and
     the output against the law's exact (f64) products, within their bf16 or fp16 rounding. Raises
-    on a miss."""
+    on a miss. `quantized(x, roles)` returns what `multiplied(it, roles, bias, half)` takes, then
+    the codes `[M, K/2]`, E4M3 scales `[M, K/16]` and down-projection in the law's layout.
+    `shape` is (M, N, K)."""
     generator = torch.Generator(device=device).manual_seed(0)
-    rows, n, k = 200, 144, 256
+    rows, n, k = shape
 
     def draw(*shape: int) -> Tensor:
         return torch.randn(*shape, generator=generator, device=device)
@@ -347,7 +514,8 @@ def verify(torch: ModuleType, device: Device, launch: Launch) -> None:
                 roles = {**roles, "channel_scale": draw(n).abs() + 0.5}
             else:
                 roles = {role: t for role, t in roles.items() if role != "channel_scale"}
-            q, sx, low, g = _quantized(torch, launch, x, roles)
+            made, q, sx, low = quantized(x, roles)
+            g = activation_scale(torch, x, roles)
             codes, scales = quantize(torch, _smoothed(torch, x, roles), g)
             if not (
                 torch.equal(q, codes[:, 0::2] | (codes[:, 1::2] << 4))
@@ -366,13 +534,15 @@ def verify(torch: ModuleType, device: Device, launch: Launch) -> None:
             want = want + low.double() @ roles["lowrank_up"].double().t()
             if bias is not None:
                 want = want + bias.double()
-            got = _multiplied(torch, launch, q, sx, low, g, roles, bias, half)
+            got = multiplied(made, roles, bias, half)
             if not far(got, want) < 5e-3:
                 raise RuntimeError(f"the svdq GEMM is {far(got, want):.3g} from the law ({half})")
 
 
 def serving(index: int) -> str:
     """The kernel this card's svdq leaves serve now: a run's `gemm.selected`."""
+    if _NATIVE.get(index):
+        return NATIVE
     return TRITON if _LAUNCH.get(index, (0.0, None))[1] is not None else EAGER
 
 
@@ -466,7 +636,17 @@ def linear(
     """`x @ Wᵀ + bias` for one leaf's roles (`SvdqNvfp4NativeLeaf`): `weight` u8 `[N, K/2]`,
     `scale` E4M3 `[N, K/16]`, `scale_2` f32, `pre_quant_scale` f32 `[K]`, `lowrank_down` bf16
     `[R, K]` and `lowrank_up` bf16 `[N, R]` (R one of `RANKS`), optional `channel_scale` `[N]` and
-    `input_scale`. The kernels serve a half `x` written in its own dtype; the law the rest."""
+    `input_scale`. The kernels serve a half `x` written in its own dtype; the law the rest. A
+    weight in the prebuilt GEMM's tiles (`weight_tiles`, `scale_tiles`) is theirs to serve."""
+    if "weight_tiles" in roles:
+        if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and out_dtype == x.dtype:
+            try:
+                made = _native_quantized(torch, x, roles)
+                out = _native_multiplied(torch, made, roles, bias, x.dtype)
+                return out.view(*x.shape[:-1], -1)
+            except Exception as exc:  # the law serves this call, and the run says so
+                int8_linear.failed(NATIVE, x.device.index or 0, exc)
+        return eager(torch, x, untiled(torch, roles), bias, out_dtype)
     launch = None
     if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and out_dtype == x.dtype:
         launch = _launcher(torch, x.device)

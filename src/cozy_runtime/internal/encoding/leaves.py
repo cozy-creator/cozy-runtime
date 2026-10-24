@@ -971,6 +971,14 @@ class SvdqNvfp4NativeLeaf:
             "lowrank_down": down,
             "lowrank_up": up,
         }
+        if (
+            weight.is_cuda
+            and out_features % svdq_linear.NATIVE_COLS == 0
+            and svdq_linear.native(torch, weight.device)
+        ):
+            tiled, tiled_scale = svdq_linear.tiles(torch, weight, scale)
+            del roles["weight"], roles["scale"]
+            roles["weight_tiles"], roles["scale_tiles"] = tiled, tiled_scale
         for role in ("channel_scale", "input_scale"):
             if role in parts:
                 roles[role] = parts[role].to(torch.float32)

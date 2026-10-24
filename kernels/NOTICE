@@ -106,3 +106,14 @@ commit d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5.
 
 For full license texts of these dependencies, please refer to their respective
 project repositories or installation directories.
+
+--------------------------------------------------------------------------------
+Nunchaku
+--------------------------------------------------------------------------------
+Copyright (c) the Nunchaku authors (MIT HAN Lab and contributors)
+License: Apache-2.0
+Website: https://github.com/nunchux-ai/nunchaku
+
+csrc/gemm/svdq.cu adapts Nunchaku's W4A4 GEMM (src/kernels/zgemm/gemm_w4a4.cuh and
+gemm_base.cuh at 302e0e9): its tile shape, register pipeline, fragment layouts and
+block-scaled MMA call. The changes are stated in that file's header.
