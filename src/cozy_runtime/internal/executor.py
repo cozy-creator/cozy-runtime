@@ -4487,7 +4487,13 @@ class Executor:
             if self.memory is not None:
                 for member in child.model_executors or [child]:
                     if member.backend is not None:
+                        if command.level == "ram" and member.residency is not None:
+                            member.residency.release()
                         for model in member.backend.models.values():
+                            if command.level == "ram":
+                                for _, release in graphs.DECODERS:
+                                    release(model.module)
+                                graphs.retire(self.torch, model.module)
                             self.memory.load(model.module, command.level)
             for reply in group.collect("map") if group is not None else ():
                 if not reply.get("ok"):
