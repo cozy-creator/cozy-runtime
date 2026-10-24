@@ -19,7 +19,6 @@ from cozy_runtime.author._assets import (
     bind,
     file_state,
 )
-from cozy_runtime.author._capture import ExecutionObservation
 from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._media import admits, normalize
 
@@ -76,11 +75,10 @@ def decode(
     *,
     request_id: str,
     guard: Callable[[], None],
-    observation: ExecutionObservation | None,
     grant_token: object | None = None,
     python_type: type[msgspec.Struct] | None = None,
     media: MediaReads | None = None,
-) -> tuple[Any, ExecutionObservation | None]:
+) -> Any:
     """Every native result leaf is replaced from the separately verified host grant."""
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")
@@ -90,33 +88,25 @@ def decode(
         output_id = grant.output_id
         if output_id in handles:
             raise ValueError("native result grant has a repeated or missing output ID")
-        capture = output_id == "runtime.capture"
-        node = result_at(value, output_id) if not capture else None
-        if capture:
-            if observation is None or observation.capture is None:
-                raise ValueError("capture grant has no matching execution observation")
+        node = result_at(value, output_id)
+        if not isinstance(node, dict):
+            raise ValueError("native result field is not an asset record")
+        declared = msgspec.convert(node, ByteResult, strict=True)
+        kind = declared.kind
+        if kind not in _ASSETS and kind != "tree":
+            raise ValueError("native result field has an invalid asset shape")
+        digest, size = declared.digest, declared.size_bytes
+        if kind == "tree":
             expected_size = msgspec.convert(raw_grant, _TreeGrant, strict=True).content_bytes
-            kind, size, media_type = "tree", expected_size, ""
-            digest = grant.digest
+            media_type = ""
         else:
-            if not isinstance(node, dict):
-                raise ValueError("native result field is not an asset record")
-            declared = msgspec.convert(node, ByteResult, strict=True)
-            kind = declared.kind
-            if kind not in _ASSETS and kind != "tree":
-                raise ValueError("native result field has an invalid asset shape")
-            digest, size = declared.digest, declared.size_bytes
-            if kind == "tree":
-                expected_size = msgspec.convert(raw_grant, _TreeGrant, strict=True).content_bytes
-                media_type = ""
-            else:
-                file_grant = msgspec.convert(raw_grant, _FileGrant, strict=True)
-                expected_size = file_grant.length
-                media_type = msgspec.convert(node, FileResult, strict=True).media_type
-                if media_type != file_grant.media_type or not admits(kind, normalize(media_type)):
-                    raise ValueError("native result differs from its verified host grant")
-            if declared.asset_ref != digest:
-                raise ValueError("native result reference differs from its byte identity")
+            file_grant = msgspec.convert(raw_grant, _FileGrant, strict=True)
+            expected_size = file_grant.length
+            media_type = msgspec.convert(node, FileResult, strict=True).media_type
+            if media_type != file_grant.media_type or not admits(kind, normalize(media_type)):
+                raise ValueError("native result differs from its verified host grant")
+        if declared.asset_ref != digest:
+            raise ValueError("native result reference differs from its byte identity")
         if (
             kind != grant.kind
             or _DIGEST.fullmatch(digest) is None
@@ -145,18 +135,6 @@ def decode(
             handle = asset
         handle._grant_token = grant_token
         handles[output_id] = handle
-        if capture:
-            assert observation is not None and observation.capture is not None
-            observation = msgspec.structs.replace(
-                observation, capture=msgspec.structs.replace(observation.capture, tree=handle)
-            )
-
-    if (
-        observation is not None
-        and observation.capture is not None
-        and "runtime.capture" not in handles
-    ):
-        raise ValueError("capture observation has no verified native result grant")
 
     def replace(node: object, path: str) -> object:
         if path in handles:
@@ -223,4 +201,4 @@ def decode(
             source_state=file_state(asset._local),
             media=media,
         )
-    return result, observation
+    return result

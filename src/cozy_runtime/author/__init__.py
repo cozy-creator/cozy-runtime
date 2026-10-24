@@ -41,12 +41,6 @@ from cozy_runtime.author._attention_scope import (
     expect_attention,
 )
 from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable, prefetch
-from cozy_runtime.author._capture import (
-    ActivationCapture,
-    ActivationCaptureResult,
-    ExecutionEnvironment,
-    ExecutionObservation,
-)
 from cozy_runtime.author._concurrent import concurrently
 from cozy_runtime.author._context import (
     AdapterRef,
@@ -197,8 +191,6 @@ __all__ = [
     "MAX_WEIGHTS_NEW_BYTES",
     "MEGAPIXEL",
     "NEUTRAL_ERROR_SET",
-    "ActivationCapture",
-    "ActivationCaptureResult",
     "AdapterCompatibility",
     "AdapterRef",
     "AdjustmentRow",
@@ -253,8 +245,6 @@ __all__ = [
     "Egress",
     "EgressResponse",
     "EncodingRule",
-    "ExecutionEnvironment",
-    "ExecutionObservation",
     "FileAsset",
     "Fit",
     "Image",
