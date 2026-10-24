@@ -797,6 +797,9 @@ class Memory:
     def _declare(self, model: Model) -> None:
         identity = model.wanted_identity()
         if identity != model.identity or identity is None:
+            from cozy_runtime import graphs
+
+            graphs.retire_stale(torch, model.module)
             if any(b.retained for b in model.groups()):
                 raise StaleBinding("retire old graph bindings before changing a weight fill")
             for hold in list(model.holds):

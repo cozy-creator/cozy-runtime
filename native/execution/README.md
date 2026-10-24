@@ -24,6 +24,15 @@ Node-kind inspection does not discover pointers hidden in custom/native kernel p
 ATen dependency tracking and graph-pool ownership cover the supported Torch path; custom launches
 without complete explicit buffer/module owners are outside the admitted contract.
 
+Each supplied Runtime Binding describes dependencies; capture acquires a separate retained Binding
+for the prepared definition. The caller may close its original Binding after capture. Definitions
+are attached to the existing component graph owner, so idle offload and changed-fill retirement
+close their native graph before releasing their own bindings. Active executions hold model-use
+claims through completion and owned readout; an offload cannot cancel them to obtain memory.
+Definitions for unrelated component roots remain untouched. Re-capture after retirement acquires
+new bindings and addresses. Preparation bypasses existing replay wrappers and captures original
+tensor operations, never a nested Torch executable launch.
+
 Within a normal invocation, `Context.plan` registers one pending prepared-work owner before
 calling the provider. The request admits one complete prepared submission, rejects late or
 additional submissions, joins before success serialization, and cancels/joins unfinished work on

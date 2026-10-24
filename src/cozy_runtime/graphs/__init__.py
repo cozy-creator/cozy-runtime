@@ -335,6 +335,8 @@ class _Recorder:
         #: ms a call
         self.bound: dict[tuple[object, ...], tuple[float, float, float | None]] = {}
         self.binding: Any = None
+        #: Native prepared definitions owned by this same component retirement boundary.
+        self.prepared: weakref.WeakSet[Any] = weakref.WeakSet()
         #: its graphs' capture pool (`domain.Pool`), made at its first capture
         self.pool: domain.Pool | None = None
         self.replays = 0
@@ -554,6 +556,8 @@ def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
             continue
         if root not in _RECORDERS:
             _RECORDERS[root] = _Recorder(tuple(declared.get(name, ())))
+        elif not _RECORDERS[root].recordings and _RECORDERS[root].pool is None:
+            _RECORDERS[root].keys = tuple(declared.get(name, ()))
         if not getattr(type(root), "_cozy_graphed", False):
             root.__class__ = _graphed(torch, type(root))
         installed.append(name)
@@ -586,7 +590,14 @@ def retire(torch: Any, root: Any) -> None:
     """Drain `root`'s graphs and drop them, keeping its region: its calls run as written until
     an idle period records them again (an idle offload, a changed fill)."""
     recorder = _RECORDERS.get(root)
-    if recorder is None or (not recorder.recordings and recorder.pool is None):
+    if recorder is None:
+        return
+    with recorder.lock:
+        prepared = tuple(recorder.prepared)
+    # Native close can join CUDA and invoke Python owner destructors; never hold this lock.
+    for definition in prepared:
+        definition._retire_if_idle()
+    if not recorder.recordings and recorder.pool is None:
         return
     scope = recorder.domain.using() if recorder.domain is not None else nullcontext()
     with scope, recorder.lock:
@@ -598,8 +609,30 @@ def retire_stale(torch: Any, root: Any) -> None:
     """Before a scope binds `root`'s weights: graphs recorded against another fill (a LoRA mode
     or bake recipe this attempt changed) go first, so nothing replays over a refill."""
     recorder = _RECORDERS.get(root)
+    if recorder is not None:
+        with recorder.lock:
+            prepared = tuple(recorder.prepared)
+        for definition in prepared:
+            if not definition._valid_definition():
+                definition._retire_if_idle()
     if recorder is not None and recorder.binding is not None and not recorder.binding.valid():
         retire(torch, root)
+
+
+def own_prepared(root: Any, definition: Any) -> None:
+    """Attach a native definition to the existing component owner, without graph interception."""
+    recorder = _RECORDERS.get(root)
+    if recorder is None:
+        recorder = _RECORDERS[root] = _Recorder(())
+    with recorder.lock:
+        recorder.prepared.add(definition)
+
+
+def forget_prepared(root: Any, definition: Any) -> None:
+    recorder = _RECORDERS.get(root)
+    if recorder is not None:
+        with recorder.lock:
+            recorder.prepared.discard(definition)
 
 
 def release(torch: Any, root: Any) -> None:
