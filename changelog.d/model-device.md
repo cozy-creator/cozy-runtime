@@ -1,1 +1,0 @@
-`Model.device` is where a model's calls take and return tensors, the device the runtime runs it on (`cuda:0` on its GPU, `cpu` where there is none), so a package never picks one. The executor's model registry now carries that device (it gave every model and `Loader.device` the CPU).

@@ -24,6 +24,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import accel
 
 
@@ -92,7 +93,7 @@ class Pool:
 class Domain:
     def __init__(self, torch: Any, memory: Any) -> None:
         self.torch, self.memory = torch, memory
-        self.device = torch.cuda.current_device()
+        self.device = placed_device().index or 0
         self.lock = threading.RLock()
         self.stream: Any = None
         self.control: Any = None

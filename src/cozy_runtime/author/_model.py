@@ -48,6 +48,7 @@ from cozy_runtime.author._context import (
     Device,
     RequestView,
     derive_seed,
+    device,
 )
 from cozy_runtime.author._errors import (
     CapabilityError,
@@ -820,7 +821,6 @@ class Model[PipelineT]:
     _cozy_schedulers: Mapping[str, Scheduler] = {}
     _cozy_caches: tuple[DerivedCache, ...] = ()
     _cozy_adapters: tuple[AdapterRef, ...] = ()
-    _cozy_device: Device = Device()
     _cozy_residency: Residency | None = None
     """Runtime-installed. Absent under `for_test`, which is the whole
     reason a scope works without one: a test double has no bytes to stage."""
@@ -899,9 +899,9 @@ class Model[PipelineT]:
     @property
     def device(self) -> Device:
         """Where this model's calls take and return tensors: the device the runtime runs it on
-        (`cuda:0` on its GPU, `cpu` where there is none). A package never picks one; placement
-        is the runtime's, and reading it is not a door."""
-        return self._cozy_device
+        (`author.device()`: its GPU, or the CPU where there is none). A package never picks
+        one; placement is the runtime's, and reading it is not a door."""
+        return device()
 
     @property
     def _cozy_active(self) -> tuple[str, tuple[str, ...]] | None:
@@ -1240,12 +1240,10 @@ class ModelRegistry:
         *,
         release: str,
         backend: Backend | None = None,
-        device: Device | None = None,
         substrate: Callable[[], AbstractContextManager[object]] | None = None,
     ) -> None:
         self._release = release
         self._backend = backend
-        self._device = device or Device()
         self._substrate = substrate
         self._generations: dict[ConstructionIdentity, Generation] = {}
         self._by_path: dict[str, Generation] = {}
@@ -1340,7 +1338,6 @@ class ModelRegistry:
     ) -> Generation:
         started = time.perf_counter()
         model = cls()
-        object.__setattr__(model, "_cozy_device", self._device)
         loader = self._loader(model, artifact, mode)
         made = time.perf_counter()
         object.__setattr__(model, "_cozy_loading", True)
@@ -1437,7 +1434,7 @@ class ModelRegistry:
         return Generation(identity, model, record)
 
     def _loader(self, model: Model[Any], artifact: Artifact, mode: Mode) -> Loader:
-        return Loader(artifact, owner=model, backend=self._backend, mode=mode, device=self._device)
+        return Loader(artifact, owner=model, backend=self._backend, mode=mode)
 
 
 _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", tensor_schema={}, config=Config({}))

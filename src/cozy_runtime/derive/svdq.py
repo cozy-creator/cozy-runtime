@@ -26,6 +26,7 @@ from typing import Any, NamedTuple
 import numpy as np
 
 from cozy_runtime import graphs
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import svdq_linear
 from cozy_runtime.internal.encoding.formats import nvfp4_values
 
@@ -95,7 +96,7 @@ class Calibration:
             handle.remove()
         self._handles.clear()
         graphs.BYPASS.reset(self._bypass)
-        if self.torch.cuda.is_available():
+        if placed_device().type == "cuda":
             self.torch.cuda.synchronize()  # the reservoir's row copies have landed
         missing = sorted(set(self.modules) - set(self._seen))
         if kind is None and missing:
