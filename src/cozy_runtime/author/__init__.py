@@ -94,7 +94,9 @@ from cozy_runtime.author._image import (
     ReferenceImages,
     Region,
     Seed,
+    Sizes,
     Target,
+    corners,
     held,
 )
 from cozy_runtime.author._invoke import (
@@ -298,6 +300,7 @@ __all__ = [
     "SelectionPlan",
     "Settings",
     "Shape",
+    "Sizes",
     "Surface",
     "Target",
     "Telemetry",
@@ -319,6 +322,7 @@ __all__ = [
     "canonical_json",
     "classify",
     "concurrently",
+    "corners",
     "data_values",
     "decode_request",
     "describe",
