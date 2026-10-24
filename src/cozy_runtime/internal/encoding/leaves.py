@@ -803,6 +803,8 @@ def _svdq_leaf_class(torch: ModuleType) -> type:
         #: factors and branch bound at these addresses.
         _merged: tuple[tuple[object, ...], dict[str, Tensor] | None, tuple[Tensor, Tensor]] | None
         _merged = None
+        #: Whether the weight is in the prebuilt GEMM's tiles (`svdq_linear.tiled`).
+        tiled = False
 
         def adopt(
             self, lora: Callable[[], list[tuple[object, Tensor, Tensor, float]]] | None
@@ -837,7 +839,7 @@ def _svdq_leaf_class(torch: ModuleType) -> type:
                     if merged is not None:
                         roles.update(merged)
                         apart = None
-                y = svdq_linear.linear(torch, x, roles, bias, out_dtype)
+                y = svdq_linear.linear(torch, x, roles, bias, out_dtype, self.tiled)
             if apart is not None:  # more ranks than the kernels take: the LoRAs' own term
                 down, up = apart
                 y = y + ((x.to(down.dtype) @ down.t()) @ up.t()).to(y.dtype)
@@ -970,10 +972,15 @@ class SvdqNvfp4NativeLeaf:
             "lowrank_down": down,
             "lowrank_up": up,
         }
+        placed = placed_device()
+        tiled = placed.type == "cuda" and svdq_linear.tiled(torch, placed.index or 0, out_features)
+        if tiled:  # the prebuilt kernels' tiles (RTX 50); asking starts their probe beside the fill
+            svdq_linear.native(torch, placed.index or 0)
+            roles["weight"], roles["scale"] = svdq_linear.tiles(torch, weight, scale)
         for role in ("channel_scale", "input_scale"):
             if role in parts:
                 roles[role] = parts[role].to(torch.float32)
-        return _svdq_leaf_class(torch)(
+        leaf = _svdq_leaf_class(torch)(
             None,
             roles,
             getattr(replaced, "bias", None),
@@ -983,6 +990,8 @@ class SvdqNvfp4NativeLeaf:
             in_features,
             out_features,
         )
+        leaf.tiled = tiled
+        return leaf
 
 
 def quantize_activation_mx(torch: ModuleType, x: Tensor) -> tuple[Tensor, Tensor]:
