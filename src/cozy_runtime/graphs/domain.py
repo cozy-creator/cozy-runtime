@@ -20,7 +20,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,7 +44,7 @@ class Pool:
     """A stock Torch graph-pool token. Graphs and their static tensors own its allocations.
 
     Runtime retires every graph and waits for its readers before dropping those tensors.
-    There is no separate physical-residency manager or allocator-routing callback.
+    The native weight manager does not own this activation/scratch pool.
     """
 
     handle: tuple[int, int]
@@ -98,6 +98,12 @@ class Domain:
             return "library workspace configuration changed while graphs retain its pointers"
         return unsupported(self.torch)
 
+    def recovery_blocked(self) -> AbstractContextManager[Any]:
+        """Block native reclaim on every thread while this device captures or replays."""
+        from tensorfs import varena
+
+        return varena.capture(self.device)
+
     def initialize(self) -> None:
         """Preparation, including the never-replayed owner, uses the admitted budget."""
         if why := self.refusal():
@@ -114,7 +120,7 @@ class Domain:
             self.owner = self.torch.cuda.CUDAGraph()
             # No library work or allocation inside this owner graph. Recording an event makes
             # its capture stream explicit; reset later clears only this stream.
-            with self.torch.cuda.stream(self.stream):
+            with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
                 self.owner.capture_begin(capture_error_mode="thread_local")
                 self.join.record(self.stream)
                 self.owner.capture_end()
@@ -194,7 +200,7 @@ def device(torch: Any, memory: Any) -> Domain:
         found = _DEVICES.get(memory)
         if found is None:
             found = _DEVICES[memory] = Domain(torch, memory)
-            finalizer = weakref.finalize(memory, found.finish)
+            finalizer: Any = weakref.finalize(memory, found.finish)
             finalizer.atexit = False
         return found
 
@@ -205,7 +211,7 @@ def acquire(torch: Any, root: Any, memory: Any = None) -> Domain:
         if found is None:
             found = Domain(torch, memory)
             _OWNERS[root] = found
-            finalizer = weakref.finalize(root, found.finish)
+            finalizer: Any = weakref.finalize(root, found.finish)
             finalizer.atexit = False
         return found
 

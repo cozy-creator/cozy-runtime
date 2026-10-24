@@ -458,11 +458,10 @@ def drain(torch: Any, kind: str) -> None:
         torch.cuda.current_stream().synchronize()
 
 
-#: torch's caching allocator, set in code before the first allocation: a segment grows by
-#: mapping only the pages a request adds and gives freed pages back the same way, so torch
-#: fragments less beside the plane's maps. The machine erases every `PYTORCH_` variable from
-#: an executor's environment: nothing outside the Runtime changes this.
-ALLOCATOR = "expandable_segments:True"
+#: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
+#: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
+#: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
+ALLOCATOR = "backend:native,expandable_segments:False"
 
 
 def initialize(torch: Any, kind: str) -> None:
@@ -476,7 +475,15 @@ def initialize(torch: Any, kind: str) -> None:
     if kind == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("this Mac's torch has no usable MPS device")
     if kind == "cuda":
+        from cozy_runtime.internal.residency import ResidencyError
+
         torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
+        try:
+            from tensorfs import varena
+
+            varena.install_allocator()
+        except (ImportError, RuntimeError) as exc:
+            raise ResidencyError(f"native CUDA allocation recovery is unavailable: {exc}") from exc
         torch.cuda.init()
 
 
@@ -518,7 +525,7 @@ def oom_error(torch: Any, kind: str) -> type[BaseException]:
 
 def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) -> dict[str, int]:
     """The allocator's live numbers plus the driver's own view — the only number that sees
-    other processes. CUDA allocations and cache reservations come from stock Torch. On unified
+    other processes. CUDA figures include native weight backing beside stock Torch. On unified
     memory the device is this process's
     budget (`unified_budget`) and the driver's figure counts this process's Metal buffers only.
     A CPU's device memory is the host's RAM, and no allocator of ours holds any of it."""
@@ -539,12 +546,18 @@ def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) ->
             "driver_total_bytes": total,
         }
     free, total = torch.cuda.mem_get_info(device)
+    weights = _weight_bytes(memory)
     return {
-        "allocated_bytes": int(torch.cuda.memory_allocated(device)),
-        "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+        "allocated_bytes": int(torch.cuda.memory_allocated(device)) + weights,
+        "reserved_bytes": int(torch.cuda.memory_reserved(device)) + weights,
         "driver_free_bytes": int(free),
         "driver_total_bytes": int(total),
     }
+
+
+def _weight_bytes(memory: Any) -> int:
+    native = getattr(memory, "native", None)
+    return int(native.stats()["resident_bytes"]) if native is not None else 0
 
 
 def allocated(torch: Any, kind: str, memory: Any = None) -> int:
@@ -553,7 +566,7 @@ def allocated(torch: Any, kind: str, memory: Any = None) -> int:
         return int(torch.mps.current_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(torch.cuda.memory_allocated(getattr(memory, "device", None)))
+    return int(torch.cuda.memory_allocated(getattr(memory, "device", None))) + _weight_bytes(memory)
 
 
 def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
@@ -562,7 +575,7 @@ def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
         return int(torch.mps.driver_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(torch.cuda.memory_reserved(getattr(memory, "device", None)))
+    return int(torch.cuda.memory_reserved(getattr(memory, "device", None))) + _weight_bytes(memory)
 
 
 def allocator_peak(memory: Any, request: str | None = None) -> int:

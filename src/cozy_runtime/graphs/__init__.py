@@ -80,7 +80,11 @@ def capture(
     stream.wait_stream(current)
     stream.wait_stream(work)
     failure: BaseException | None = None
-    with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
+    with (
+        owner.recovery_blocked(),
+        torch.utils._python_dispatch._disable_current_modes(),
+        torch.cuda.stream(stream),
+    ):
         try:
             graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
         except Exception as exc:
@@ -176,7 +180,8 @@ class _Recording:
                 if static is not None and not _same(static, value):
                     static.copy_(value)
                     copied += static.nbytes
-            self.graph.replay()
+            with self.owner.recovery_blocked():
+                self.graph.replay()
             work.done += 1
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
@@ -726,9 +731,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
     if (
         (context := CURRENT.get()) is not None
         and not (torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
-        and not (
-            torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-        )
+        and not (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
     ):
         context.raise_if_cancelled()
     if (idle := _IDLE.get(None)) is not None:
@@ -1073,7 +1076,8 @@ def _record(
                 for target, value in zip(statics, inputs, strict=True):
                     if target is not None:
                         target.copy_(value)
-                graph.replay()  # served only when it reproduces the eager run bit for bit
+                with owner.recovery_blocked():
+                    graph.replay()  # served only when it reproduces the eager run bit for bit
                 pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
                 if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
                     why = "its replay differs from the eager run on the same inputs"
@@ -1225,7 +1229,8 @@ _SEED = 0
 def _arguments(torch: Any, pending: Any, tensors: list[Any]) -> tuple[Any, Any]:
     """The call's arguments with `tensors` at its leaves' places (None keeps the leaf)."""
     leaves = [t if t is not None else v for t, v in zip(tensors, pending.leaves, strict=True)]
-    return torch.utils._pytree.tree_unflatten(leaves, pending.spec)
+    args, kwargs = torch.utils._pytree.tree_unflatten(leaves, pending.spec)
+    return args, kwargs
 
 
 def _static(torch: Any, leaf: _Leaf) -> Any:

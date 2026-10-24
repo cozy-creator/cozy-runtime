@@ -1,8 +1,8 @@
-"""Executor-local weight residency over ordinary Torch allocations.
+"""Executor-local weight residency with ordinary Torch views.
 
-TensorFS fills Torch-owned destinations. Runtime declares immutable weight groups and their
-fill transforms; hooks bind those groups while used. Inactive groups may be discarded at a
-preparation boundary. No allocator hook, VMM mapping, shared page or package replay lives here.
+CUDA weights use TensorFS's process-local Rust reservations. A view owns its physical pin
+through the Torch storage lifetime, including escaped aliases. Runtime drops idle views while
+the native manager keeps eligible backing cached. CPU and MPS use Torch-owned storage.
 """
 
 from __future__ import annotations
@@ -203,10 +203,20 @@ class _Block:
     generation: int = 0
     last: int = 0
     ready: Any = None
+    region: Any = None
+    preferred: bool = False
+    native_storage: int | None = None
 
     @property
     def nbytes(self) -> int:
         return sum(part.nbytes for parts in self.parts.values() for part in parts.values())
+
+    @property
+    def storage_bytes(self) -> int:
+        # Every part is independently aligned, just as its former Torch allocation was.
+        return sum(
+            (part.nbytes + 255) // 256 * 256 for p in self.parts.values() for part in p.values()
+        )
 
     def tensors(self) -> Iterator[Tensor]:
         if self.data is not None:
@@ -234,6 +244,8 @@ class Model:
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
         self.closed = False
+        # Once a block streams, later blocks cannot grow the resident prefix again.
+        self.prefix: int | None = None
 
     def wanted_identity(self) -> str | None:
         return "stored" if self.fill is None else self.fill.identity
@@ -290,8 +302,16 @@ class Model:
         self._claim()
         try:
             self.memory._declare(self)
+            if free_only and self.memory.native is not None:
+                # Native backing is already a cache. A speculative whole-model Torch
+                # hold would pin idle blocks and defeat allocation-time native recovery.
+                return None
             groups = self.groups()
-            missing = sum(b.nbytes for b in groups if b.data is None)
+            missing = sum(
+                b.storage_bytes
+                for b in groups
+                if b.data is None and (b.region is None or not b.region.resident)
+            )
             if free_only and missing > self.memory.room().free:
                 if self.memory.cuda:
                     torch.cuda.empty_cache()
@@ -330,7 +350,7 @@ class Model:
                 handle.remove()
             self.handles.clear()
             for block in self.groups():
-                self.memory._discard(block)
+                self.memory._discard(block, forget=True)
             self.memory.models.pop(self.module, None)
 
 
@@ -405,7 +425,9 @@ class Binding:
         )
 
     def resident(self) -> bool:
-        return self.valid() and all(b.data is not None for b in self.groups)
+        return self.valid() and all(
+            b.data is not None or (b.region is not None and b.region.resident) for b in self.groups
+        )
 
     @contextmanager
     def prepare(self, stream: Any = None) -> Iterator[Binding]:
@@ -527,6 +549,7 @@ class Binding:
             with self.model.memory.lock:
                 for block, _ in self.held:
                     block.retained -= 1
+                    self.model.memory._idle(block)
                 self.held.clear()
 
 
@@ -587,7 +610,7 @@ class Region:
 
 
 class Memory:
-    """The residency of one executor device; Torch remains its allocator."""
+    """One executor's weight residency, beside Torch's activation allocator."""
 
     def __init__(self, device: Any, budget_bytes: int | None = None) -> None:
         self.device = torch.device(device)
@@ -599,6 +622,17 @@ class Memory:
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
+        self.native: Any = None
+        self.window_bytes = 0
+        if self.cuda:
+            try:
+                from tensorfs import varena
+
+                if budget_bytes is not None:
+                    varena.set_activation_limit(self.device.index or 0, budget_bytes)
+                self.native = varena.Arena(self.device.index or 0)
+            except (ImportError, RuntimeError) as exc:
+                raise ResidencyError(f"native CUDA weight residency is unavailable: {exc}") from exc
 
     @classmethod
     def open(cls, gpu: Any = 0, *, budget_bytes: int | None = None) -> Memory:
@@ -638,10 +672,11 @@ class Memory:
 
     def _figures(self) -> tuple[int, int, int]:
         if self.cuda and torch.cuda.is_initialized():
+            resident = int(self.native.stats()["resident_bytes"]) if self.native is not None else 0
             return (
-                int(torch.cuda.memory_allocated(self.device)),
-                int(torch.cuda.memory_reserved(self.device)),
-                int(torch.cuda.max_memory_allocated(self.device)),
+                int(torch.cuda.memory_allocated(self.device)) + resident,
+                int(torch.cuda.memory_reserved(self.device)) + resident,
+                int(torch.cuda.max_memory_allocated(self.device)) + resident,
             )
         if self.device.type == "mps":
             used = int(torch.mps.current_allocated_memory())
@@ -657,13 +692,18 @@ class Memory:
             # allocation cannot necessarily reuse. Driver free is a conservative bound.
             free = max(int(free) - _RESERVE, 0)
             if self.budget_bytes is not None:
-                # Torch's fraction limits driver reservations, including graph pools.
+                # Account native backing beside Torch reservations, including graph pools.
                 # Unused private-pool bytes are not headroom for an eager allocation.
                 free = min(free, max(self.budget_bytes - reserved, 0))
         else:
             from cozy_runtime.internal.accel import host_memory
 
             free = host_memory().free_bytes
+        if self.native is not None:
+            # Native pins, including escaped Torch storage aliases, are the authority.
+            # Do not count an idle Python block as reclaimable merely because hooks closed.
+            cold = int(self.native.stats()["reclaimable_bytes"])
+            return Room(int(free), cold, 0)
         with self.lock:
             cold = warm = 0
             for model in self.models.values():
@@ -698,7 +738,7 @@ class Memory:
                 if model.users or any(b.count or b.retained for b in model.groups()):
                     raise ResidencyError("retire graphs and model uses before idle offload")
                 for block in model.groups():
-                    self._discard(block)
+                    self._discard(block, forget=True)
         return model
 
     def _register(self, module: nn.Module, declared: Declared) -> Model:
@@ -728,6 +768,9 @@ class Memory:
                 model.blocks[path] = block
             else:
                 model.common = block
+        if self.native is not None:
+            self.window_bytes = max([self.window_bytes, *(b.storage_bytes for b in model.groups())])
+            self.native.set_streaming_limit(self.window_bytes)
         _placeholders(model)
         _hooks(model)
         self.models[module] = model
@@ -743,23 +786,38 @@ class Memory:
             if any(b.count for b in model.groups()):
                 raise ResidencyError("a weight fill cannot change during an active use")
             for block in model.groups():
-                self._discard(block)
+                self._discard(block, forget=True)
             model.identity = identity
             model.generation += 1
 
-    def _discard(self, block: _Block) -> int:
+    def _idle(self, block: _Block) -> None:
+        if self.native is not None and not (block.count or block.retained or block.loading):
+            # The DLPack storage owner holds the physical pin. A surviving external alias
+            # retains it after these references disappear; native eviction also joins the
+            # CUDA context before unmapping. record_stream is not that ownership fence.
+            block.data = block.assigned = block.ready = None
+            block.native_storage = None
+
+    def _discard(self, block: _Block, *, forget: bool = False) -> int:
         with self.lock:
             if (
                 block.count
                 or block.retained
                 or block.loading
-                or block.data is None
                 or (block.model.users and block.model.thread != threading.get_ident())
             ):
                 return 0
+            present = block.data is not None
             block.data = block.assigned = block.ready = None
-            block.generation += 1
-            return block.nbytes
+            block.native_storage = None
+            if forget:
+                # Never overwrite an old fill beneath an escaped alias. Its pin keeps
+                # the old reservation alive independently of this model's new identity.
+                block.region = None
+                block.preferred = False
+            if present or forget:
+                block.generation += 1
+            return block.nbytes if present else 0
 
     def _retire(self, model: Model) -> bool:
         with self.lock:
@@ -792,7 +850,10 @@ class Memory:
             if flush or dropped >= max(need - available, 1):
                 # Dropped owner bytes only trigger a batch flush. Aliases, allocator
                 # fragmentation and graph pools can keep them resident; measure again.
-                if self.cuda:
+                if self.native is not None:
+                    self.native.reclaim(max(need - available, 0))
+                    available = self.room(current).free
+                if self.cuda and available < need:
                     torch.cuda.empty_cache()
                 dropped = 0
                 available = self.room(current).free
@@ -808,6 +869,11 @@ class Memory:
             ]
         for hold in holds:
             hold.shed()
+        if self.native is not None:
+            self.native.reclaim(
+                max(need - available, 0) if need else int(self.native.stats()["resident_bytes"])
+            )
+            available = self.room(current).free if need else 0
         with self.lock:
             blocks = sorted(
                 (b for m in self.models.values() for b in m.groups()),
@@ -839,6 +905,8 @@ class Memory:
                 if region.discard():
                     enough(flush=True)
         if self.cuda and not need:
+            if self.native is not None:
+                self.native.reclaim(int(self.native.stats()["resident_bytes"]))
             torch.cuda.empty_cache()
         allocated, reserved, _ = self._figures()
         free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
@@ -878,6 +946,54 @@ class Memory:
             # Only the failed allocation is retried. No read, fill transform or forward ran.
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
+    def _prepare_native(self, block: _Block, reclaim: bool) -> Any:
+        model = block.model
+        request = _REQUEST.get()
+        if (
+            request is not None
+            and request.idle
+            and (block.region is None or not block.region.resident)
+        ):
+            raise StaleBinding("idle graph preparation cannot fill native weight backing")
+        if block.region is None:
+            block.region = self.native.reserve(block.storage_bytes)
+            block.preferred = (
+                model.prefix is None and self.room().free >= block.storage_bytes + self.window_bytes
+            )
+            if not block.preferred:
+                model.prefix = (
+                    min(model.prefix, block.index) if model.prefix is not None else block.index
+                )
+            block.region.set_preferred(block.preferred)
+        elif block.preferred and not block.region.preferred:
+            # Native activation recovery reduces the prefix without calling Python. Keep
+            # later unprepared blocks on the streaming side of that same watermark.
+            model.prefix = (
+                min(model.prefix, block.index) if model.prefix is not None else block.index
+            )
+            block.preferred = False
+        if not block.region.resident and (not reclaim or self.budget_bytes is not None):
+            if reclaim and block.storage_bytes > self.room().free:
+                self.reclaim(block.storage_bytes, current={model.name})
+            if block.storage_bytes > self.room().free:
+                raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
+        try:
+            return block.region.prepare()
+        except torch.OutOfMemoryError:
+            if not reclaim:
+                raise
+            # No read or transform has run. A larger block or a different model may need
+            # a smaller resident prefix. Retire eligible owners only after this miss;
+            # retry the allocation only if reclamation actually returned memory.
+            block.preferred = False
+            model.prefix = (
+                min(model.prefix, block.index) if model.prefix is not None else block.index
+            )
+            block.region.set_preferred(False)
+            if not self.reclaim(block.storage_bytes, current={model.name}):
+                raise
+            return block.region.prepare()
+
     @torch.inference_mode(False)  # type: ignore[untyped-decorator]
     def _ensure(self, block: _Block, reclaim: bool) -> None:
         if block.data is not None:
@@ -888,25 +1004,40 @@ class Memory:
             block.loading = True
         data: dict[str, dict[str, Tensor]] = {}
         read_bytes = read_ns = 0
+        use = None
         try:
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
+            if self.native is not None and block.storage_bytes:
+                use = self._prepare_native(block, reclaim)
+                request = _REQUEST.get()
+                if use.needs_fill and request is not None and request.idle:
+                    raise StaleBinding(
+                        "native weight backing changed before idle graph preparation"
+                    )
+                block.native_storage = int(use.tensor.untyped_storage().data_ptr())
+            offset = 0
             for key, parts in block.parts.items():
                 views = data[key] = {}
                 for role, part in parts.items():
-                    raw = self._empty(part.nbytes, reclaim)
-                    began = time.perf_counter_ns()
-                    try:
-                        tensors.read_into(key, raw, role=part.role or None)
-                    except tensorfs.Error:
-                        # TensorFS retains borrowed destinations on failed completion. Surface
-                        # a sticky device failure as Torch's typed error before this executor
-                        # can be reused; ordinary I/O errors keep their original classification.
-                        if self.cuda:
-                            torch.cuda.synchronize(self.device)
-                        raise
-                    read_ns += time.perf_counter_ns() - began
-                    read_bytes += part.nbytes
+                    raw = (
+                        use.tensor[offset : offset + part.nbytes]
+                        if use is not None
+                        else self._empty(part.nbytes, reclaim)
+                    )
+                    offset += (part.nbytes + 255) // 256 * 256
+                    if use is None or use.needs_fill:
+                        began = time.perf_counter_ns()
+                        try:
+                            tensors.read_into(key, raw, role=part.role or None)
+                        except tensorfs.Error:
+                            # A failed destination completion must retain its native owner.
+                            # Preserve the existing sticky CUDA failure classification.
+                            if self.cuda:
+                                torch.cuda.synchronize(self.device)
+                            raise
+                        read_ns += time.perf_counter_ns() - began
+                        read_bytes += part.nbytes
                     dtype = getattr(torch, _DTYPES[part.dtype])
                     shape = part.shape
                     if part.dtype == "F4":
@@ -917,8 +1048,10 @@ class Memory:
                     if view.numel() != math.prod(shape):
                         raise ResidencyError(f"stored geometry does not match {key}#{role}")
                     views[role] = view.view(shape)
-            if block.model.fill is not None:
+            if block.model.fill is not None and (use is None or use.needs_fill):
                 block.model.fill(block.path, data)
+            if use is not None:
+                use.commit()
             ready = None
             if self.cuda:
                 ready = torch.cuda.Event()
@@ -926,6 +1059,13 @@ class Memory:
             with self.lock:
                 block.data, block.ready = data, ready
                 block.generation += 1
+        except BaseException:
+            # A failed fill may have exported storage to a transform. Retire this region
+            # identity; those exports keep their own pins, never a future fill's bytes.
+            if use is not None and use.needs_fill:
+                block.region = None
+                block.preferred = False
+            raise
         finally:
             request = _REQUEST.get()
             if request is not None and read_bytes:
@@ -948,7 +1088,7 @@ class Memory:
                 request = _REQUEST.get()
                 self._ensure(block, reclaim and not (request is not None and request.idle))
             # A cached Hold can keep count > 0 across sequential threads or streams.
-            # record_stream protects lifetime, but every consumer also needs readiness.
+            # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
             # its external readiness event now would violate CUDA capture isolation.
             if block.ready is not None and not capturing:
@@ -976,7 +1116,11 @@ class Memory:
         if self.cuda:
             stream = self.stream()
             for tensor in block.tensors():
-                tensor.record_stream(stream)
+                if (
+                    block.native_storage is None
+                    or tensor.untyped_storage().data_ptr() != block.native_storage
+                ):
+                    tensor.record_stream(stream)
 
     def _exit(self, block: _Block) -> None:
         try:
@@ -989,6 +1133,7 @@ class Memory:
                         site.table[site.name] = previous
                     block.saved.clear()
                     block.last = time.monotonic_ns()
+                    self._idle(block)
 
     def _read(self, block: _Block, site: _Site) -> Tensor:
         model = block.model
@@ -1077,6 +1222,7 @@ class Memory:
             "peak": peak,
             "requests": {r.id: (allocated, max(r.peak, peak)) for r in self.requests},
             "allocator_scope": "process",
+            "weights": self.native.stats() if self.native is not None else None,
         }
 
 
@@ -1193,7 +1339,10 @@ class Request:
                 peak=self.peak,
                 allocated=allocated,
                 reserved=reserved,
-                peak_window="process allocator high-water, carried across section resets",
+                peak_window="Torch high-water plus sampled native backing, carried across resets",
+                weight_residency=(
+                    self.memory.native.stats() if self.memory.native is not None else None
+                ),
             )
         elif self.memory.device.type == "mps":
             out.update(allocated=allocated, reserved=reserved, measurement="observed_current")

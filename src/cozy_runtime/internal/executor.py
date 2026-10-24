@@ -961,8 +961,8 @@ class Executor:
             "pgid": _group(),
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
-            "memory_protocol": 0,  # stock Torch owns this executor's allocations
-            "memory_backend": "torch",
+            "memory_protocol": 0,  # all weight and activation storage is process-local
+            "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -1003,12 +1003,12 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
-        accel.initialize(torch, self.device_kind)
-        if self.world > 1 and self.device_kind == "cuda":
-            torch.cuda.set_device(self.rank)
         from cozy_runtime.internal.residency import ResidencyError
 
         try:
+            accel.initialize(torch, self.device_kind)
+            if self.world > 1 and self.device_kind == "cuda":
+                torch.cuda.set_device(self.rank)
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
@@ -1017,7 +1017,7 @@ class Executor:
         return None
 
     def _open_memory(self, torch: Any) -> None:
-        """This executor's stock-Torch residency and its pure-site execution helpers."""
+        """This executor's local residency and its pure-site execution helpers."""
         from cozy_runtime.internal import execution
         from cozy_runtime.internal.residency import Memory
 
@@ -1857,7 +1857,7 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
-            "memory_backend": "torch",
+            "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
         }
 
     def _model_classes(self) -> list[type[Model[Any]]]:
@@ -4497,7 +4497,8 @@ class Executor:
         child = self.constructions.get(self.active)
         if child is None or child.residency is None:
             return {}
-        return child.residency.document()
+        document: dict[str, Any] = child.residency.document()
+        return document
 
     def process_incarnations(self) -> list[dict[str, Any]]:
         """The actual rank births, including a follower that vanished before this probe."""
