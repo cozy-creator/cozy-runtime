@@ -59,7 +59,6 @@ if TYPE_CHECKING:
 
 _LOG = logging.getLogger(__name__)
 SCHEMA = "cozy.stage-memo/1"
-CAPABILITY = "stage/1"
 #: A written entry must cost this many times its measured read to produce.
 VALUE_RATIO = 2.0
 #: The newest measurement's weight in each moving average.

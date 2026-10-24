@@ -1,0 +1,1 @@
+An executor's `hello` carries only what TensorD and rank 0 read: pid, ppid, pgid, versions, memory protocol, seal, rank and world. Its capabilities, memo, protocol revision, Python facts, uid/euid, no_new_privs, oom_score_adj, torch_loaded and rss_bytes are gone; nothing read them.

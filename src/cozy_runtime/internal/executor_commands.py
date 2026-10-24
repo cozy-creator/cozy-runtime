@@ -253,11 +253,6 @@ class GroupHardware(msgspec.Struct, frozen=True, kw_only=True):
     devices: tuple[str, ...]
 
 
-#: An executor capability: `Load.attention_pin` is the request's pin, whose kernel build it
-#: imports first; the construction itself still selects automatically.
-LOAD_ATTENTION_PIN = "attention.load_pin/1"
-
-
 class Load(Command, frozen=True, kw_only=True, tag="load"):
     """Ask Runtime to construct models and register their weights with its memory, read through
     TensorFS. The command names one model (`binding`) or several (`models`)."""
@@ -268,7 +263,8 @@ class Load(Command, frozen=True, kw_only=True, tag="load"):
     actor: str = ""
     devices: str = ""
     sequence_parallel_degree: int = 1
-    #: the pin of the request this executor loads for (`LOAD_ATTENTION_PIN`)
+    #: the pin of the request this executor loads for: its kernel build is imported first; the
+    #: construction itself still selects automatically
     attention_pin: str = ""
     #: The one-model form; a many-model load names `models`.
     binding: Binding | UnsetType = UNSET
