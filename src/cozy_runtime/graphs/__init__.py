@@ -71,10 +71,8 @@ def capture(
     """Record a caller-owned capture-safe computation in its already prepared pool.
 
     The caller owns purity, residency, static-data lifetime and all consuming streams. No
-    allocation recovery or chunk selection is allowed inside capture: varena serves it from the
-    bytes `Pool.prepare` mapped, or refuses. torch ends no capture that failed to begin or end
-    after its pool's begin hook ran: varena is told (`capture_failed`), or its routing of this
-    thread into the pool never clears and its later allocations wait forever.
+    weight staging or eviction is allowed inside capture. Torch owns the capture pool and its
+    allocation bookkeeping; a failed capture is reset before its caller may try eager execution.
     """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
@@ -84,13 +82,7 @@ def capture(
     failure: BaseException | None = None
     with torch.utils._python_dispatch._disable_current_modes(), torch.cuda.stream(stream):
         try:
-            began = False
-            try:
-                graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
-                began = True
-            finally:
-                if not began:
-                    pool.failed()
+            graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
         except Exception as exc:
             failure = exc
         else:
@@ -108,10 +100,11 @@ def capture(
             try:
                 graph.capture_end()
             except Exception as exc:
-                pool.failed()
                 failure = failure or exc
     current.wait_stream(stream)
     current.wait_stream(work)
+    if failure is not None:
+        graph.reset()
     if isinstance(failure, Building | Yielded):
         raise failure
     if failure is not None:
@@ -386,9 +379,7 @@ class _Recorder:
         if self.binding is not None:
             self.binding.close()
             self.binding = None
-        if self.pool is not None:
-            self.pool.close()
-            self.pool = None
+        self.pool = None
         self.queued.clear()
         self.failed.clear()
         self.waiting.clear()
@@ -685,7 +676,7 @@ def describe(root: Any) -> dict[str, Any]:
     answer.update(
         idle=IDLE.document(),
         graph_pools=len(pools),
-        graph_pool_bytes=sum(pool.nbytes() for pool in pools.values()),
+        graph_pool_bytes=None,  # stock Torch does not expose a public per-pool byte counter
         domains=len(domains),
     )
     return answer
@@ -911,22 +902,10 @@ def _replay(
         recorder.waiting[key] = attempt
         _refused(recorder, placed, f"its weights cannot all be resident at once ({exc})")
         return _EAGER
-    pool = recorder.pool
-    assert pool is not None
-
-    def replay() -> Any:
-        # Preparation may allocate/map/revoke. Hold the drop word only for actual execution
-        # and copies, so the mechanism thread can keep serving preparation while a drop waits.
-        with pool.replaying(torch.cuda.current_stream()) as ok:
-            return entry(leaves, out) if ok else _EAGER
-
     try:
-        result = recorder.replayed.run(torch, replay)
+        result = recorder.replayed.run(torch, lambda: entry(leaves, out))
     finally:
         lease.__exit__(None, None, None)
-    if result is _EAGER:  # varena dropped the region: its graphs go, recorded again at idle
-        recorder.drop()
-        return _EAGER
     recorder.gap = ""
     recorder.replays += 1
     recorder.copy_bytes += entry.copied
@@ -1040,7 +1019,6 @@ def _record(
                         else domain.Pool(torch.cuda.graph_pool_handle())
                     )
                 pool = recorder.pool
-                pool.prepare(IDLE_REQUEST)
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so they live as long as the graph and never in a request's arena.
                 statics: list[Any] = []
@@ -1058,7 +1036,6 @@ def _record(
                 if graph is None:
                     _failed(module, recorder, key, why)
                     return True
-                pool.captured(time.perf_counter_ns() - took)
                 if changed := state.restore():
                     recorder.judged[key] = f"recording it changed the model's state: {changed}"
                     graph.reset()
@@ -1101,8 +1078,7 @@ def _record(
         if key not in recorder.recordings:
             if graph is not None:
                 graph.reset()
-            if recorder.pool is not None and not recorder.recordings:
-                recorder.pool.close()
+            if not recorder.recordings:
                 recorder.pool = None
 
 

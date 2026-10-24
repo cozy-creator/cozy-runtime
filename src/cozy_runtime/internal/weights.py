@@ -1,5 +1,5 @@
-"""Model weights (varena-slim §3): Runtime builds each model on meta, and one
-`tensorfs.varena.torch.Memory` per executor decides where every weight byte lives.
+"""Model weights: Runtime builds each model on meta, and its local residency module
+fills ordinary Torch tensors from TensorFS at declared component/block boundaries.
 
 `Backend` is the loader's backend. `fit` judges, `materialize` keeps weights on meta and derived
 buffers real, `fill` checks each destination against its stored row, and `commit` installs
@@ -23,18 +23,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
-
-from tensorfs.varena.torch import (
-    Binding,
-    Declared,
-    Hold,
-    Level,
-    Memory,
-    Model,
-    Region,
-    Weights,
-    blocks_of,
-)
 
 from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
@@ -65,6 +53,17 @@ from cozy_runtime.internal.fill import (
 )
 from cozy_runtime.internal.fill import fit as fill_fit
 from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (Ulysses' torch side, served)
+from cozy_runtime.internal.residency import (
+    Binding,
+    Declared,
+    Hold,
+    Level,
+    Memory,
+    Model,
+    Region,
+    Weights,
+    blocks_of,
+)
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
 
 if TYPE_CHECKING:
@@ -488,8 +487,15 @@ class Backend:
         checkpoint = self.checkpoints[name]
         routes = self.routes[name] = _Routes(self, name, rows, root)
         leg = self._leg(f"{name}.routes", leg)
-        vars(root)["_varena"] = Declared(
-            Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
+        bound = {stored: row.key.partition(".")[2] for stored, row in rows.items()}
+        vars(root)["_cozy_weights"] = Declared(
+            Weights(
+                checkpoint.ck,
+                name,
+                release=self.release,
+                keys=tuple(rows),
+                bound={stored: path for stored, path in bound.items() if path != stored},
+            ),
             fill=bakes if bakes.bakes else None,
             bind=routes,
         )
@@ -639,7 +645,9 @@ class _Routes:
     def _region(self) -> Region:
         if self.region is None:
             memory = self.backend.memory
-            self.region = memory.region(f"decoded:{self.component}", "derived", self.root, False)
+            self.region = memory.region(
+                f"decoded:{self.component}", "derived", self.root, release=self.forget
+            )
         return self.region
 
     def forget(self) -> None:
@@ -947,6 +955,15 @@ class Placement:
         self.unheld: set[str] = set()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
+            # A cached graph owns its exact weight tensors. Residency may ask this owner
+            # to retire it only when the model is idle and a later scope actually needs room.
+            model.retire_graphs = functools.partial(self._retire_graphs, name)
+
+    def _retire_graphs(self, component: str) -> None:
+        root = self.models[component].module
+        for _, release in graphs.DECODERS:
+            release(root)
+        graphs.retire(self.torch, root)
 
     def open_attempt(self) -> None:
         self.attempts += 1
@@ -1039,20 +1056,25 @@ class Placement:
         return self.models[component].retain(paths)
 
     def graph_accounted(self) -> bool:
-        return self.memory.cuda and self.memory.native.context_measurable()
+        return self.memory.cuda
 
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def region(self, owner: str, kind: str, sets: Module | Sequence[Module]) -> Region:
-        """A long-lived intermediate's region serving `sets` (`Memory.region`): varena spills
-        or drops it between pins, and its next pin says fresh."""
-        return self.memory.region(owner, kind, sets=sets)
+    def region(
+        self,
+        owner: str,
+        kind: str,
+        sets: Module | Sequence[Module],
+        *,
+        release: Callable[[], None] | None = None,
+    ) -> Region:
+        """An explicitly owned cache. Its owner releases entries at safe scope boundaries."""
+        return self.memory.region(owner, kind, sets=sets, release=release)
 
     def graph_pool(self, component: str) -> graphs.domain.Pool:
-        """A capture pool and replay/drop word. Binding owns each capture/replay's weights."""
-        region = self.memory.graph_region()
-        return graphs.domain.Pool(region.pool, region, self.memory)
+        """Stock Torch owns the graph pool; the recording retains its binding and tensors."""
+        return graphs.domain.Pool(self.torch.cuda.graph_pool_handle())
 
     def graph_pass(self, component: str, entry: str) -> Any:
         return self.models[component].passing(entry)

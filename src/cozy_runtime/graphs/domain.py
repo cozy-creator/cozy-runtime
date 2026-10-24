@@ -6,8 +6,8 @@ small owner graph on the library stream is reset only at final domain teardown; 
 replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
 
 A placed model's components run one after another on a device, so all their graphs share the
-device's one domain and its one capture pool (`Memory.graph_pool`), each component's graphs a
-graph region of it (`Pool`). `using` serializes every region call on the device (a host lock and
+device's one domain and its capture-pool token (`Pool`). `using` serializes graph use on the
+device (a host lock and
 a completion event across streams), and each replay copies its inputs in and its outputs out
 inside that interval, so no two graphs' scratch is ever live at once: the pool holds one
 region's working set plus every graph's static buffers.
@@ -41,52 +41,13 @@ def unsupported(torch: Any) -> str:
 
 @dataclass(eq=False, slots=True)
 class Pool:
-    """A component's graphs' capture pool: its graph region of the device's one pool, which
-    varena serves and may drop (`region`), or, with no varena memory, a torch pool of its own.
-    A capture is served from bytes `prepare` mapped ahead, never by making room inside it."""
+    """A stock Torch graph-pool token. Graphs and their static tensors own its allocations.
+
+    Runtime retires every graph and waits for its readers before dropping those tensors.
+    There is no separate physical-residency manager or allocator-routing callback.
+    """
 
     handle: tuple[int, int]
-    region: Any = None
-    memory: Any = None
-
-    def prepare(self, request: str) -> None:
-        """Before a capture into the pool begins: the working set its warm-up reached in open
-        request `request`'s arena, mapped into the pool now."""
-        if self.region is not None:
-            self.region.prepare(accel.arena_peak(self.memory, request))
-
-    @contextmanager
-    def replaying(self, stream: Any) -> Iterator[bool]:
-        """Around a replay and its outputs' readers on `stream`: False while varena drops the
-        region (its graphs go, run eager); a True one is released after, by an event on
-        `stream`, even when the replay raises."""
-        if self.region is None:
-            yield True
-            return
-        with self.region.replaying(stream) as ok:
-            yield ok
-
-    def captured(self, ns: int) -> None:
-        """What capturing a graph into it took: varena's drop-versus-keep choice."""
-        if self.region is not None:
-            self.region.captured(ns)
-
-    def failed(self) -> None:
-        """A capture into the pool that torch never ended (its begin or end raised): varena
-        stops routing the capturing thread into it."""
-        if self.memory is not None:
-            self.memory.capture_failed(self.handle)
-
-    def nbytes(self) -> int:
-        """Bytes varena maps in the pool (the device's, every graph region of it)."""
-        if self.memory is None:
-            return 0
-        return int(self.memory.torch_stats()["pools"].get(self.handle, (0, 0))[0])
-
-    def close(self) -> None:
-        """Its graphs are reset: the region's pins and its use of the pool go."""
-        if self.region is not None:
-            self.region.close()
 
 
 class Domain:

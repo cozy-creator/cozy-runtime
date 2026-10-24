@@ -509,7 +509,7 @@ def _capture_contract(model: Any) -> str:
     for sub in model.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             if any(
-                not getattr(h, "__module__", "").startswith("tensorfs.varena.")
+                not getattr(h, "__module__", "").startswith("cozy_runtime.internal.residency")
                 for h in hooks.values()
             ):
                 return "custom Python hooks"
@@ -1224,10 +1224,10 @@ class _Engine:
         try:
             with _PLANE, ExitStack() as stack:
                 # The KV region is pinned while this drive lasts, so no live row is lost; between
-                # drives varena may take it, and then the buffers are made again.
+                # drives the owner may release it, and then the buffers are made again.
                 if self.region is None and (placed := PLACED.get(self.model)) is not None:
                     self.region = placed[0].region(
-                        f"lm:{type(self.model).__name__}", "kv", self.model
+                        f"lm:{type(self.model).__name__}", "kv", self.model, release=self._drop
                     )
                 if self.region is not None and stack.enter_context(self.region.pin()):
                     self._drop()
@@ -1840,32 +1840,21 @@ class _Engine:
                             else Pool(torch.cuda.graph_pool_handle())
                         )
                     pool = self.pool
-                    context = CURRENT.get()
-                    # The driver's request high-water bounds the step's working set (an idle
-                    # capture measures it exactly: cr-210 moves this off the request).
-                    pool.prepare(context.request_id if context is not None else "")
                     graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
                 if graph is None and not self.graphs and self.pool is not None:
-                    self.pool.close()
                     self.pool = None
             self.captured[0] += 1
             self.captured[1] += time.perf_counter() - capturing
             if graph is not None:
                 self.graphs[key] = graph
                 self.recorded += 1
-                pool.captured(int((time.perf_counter() - capturing) * 1e9))
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
-            with self.pool.replaying(torch.cuda.current_stream()) as ok:
-                if ok:
-                    graph.replay()
-            if not ok:
-                self._forget()  # varena drops the region: its graphs go, recorded again later
-                graph = None
+            graph.replay()
         if graph is not None:
             self.replayed += 1
         else:
@@ -1882,10 +1871,10 @@ class _Engine:
                 event.synchronize()
             self.completions.clear()
             self.retired_graphs += len(self.graphs)
+            for graph in self.graphs.values():
+                graph.reset()
             self.graphs, self.warmed, self.unrecorded = {}, set(), {}
-            if self.pool is not None:
-                self.pool.close()
-                self.pool = None
+            self.pool = None
 
     def _unrecorded(self, key: tuple[int, int, bool, bool], why: str) -> None:
         """That step runs eagerly from now on, with a warning on the calls it serves."""

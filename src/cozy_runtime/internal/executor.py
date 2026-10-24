@@ -2,9 +2,9 @@
 
 Runtime imports the package's Torch stack and constructs its models in this process.
 TensorD makes model data available, prepares shared CPU buffers through TensorFS and
-coordinates machine budgets. Runtime uses its local TensorFS plane/device APIs to allocate,
-copy, map and unmap GPU weight memory, and can attach allocations TensorD keeps through
-exported handles. TensorFS therefore runs in both processes; it is not a separate daemon.
+coordinates machine budgets. Runtime allocates ordinary Torch tensors and lends their storage
+through TensorFS's read interface. Each executor owns its allocations; TensorFS runs in both
+processes as a library.
 
 The executor lives for its (environment, lane) and holds its loaded constructions.
 TensorD supervises its disposable lifetime and owns durable execution records; source and
@@ -66,7 +66,6 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import tensorfs
 from msgspec import UNSET, UnsetType
-from tensorfs.varena import VarenaError
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -230,8 +229,8 @@ else:
 if TYPE_CHECKING:
     from types import ModuleType
 
-    from tensorfs.varena.torch import Memory
-    from tensorfs.varena.torch import Request as MemoryRequest
+    from cozy_runtime.internal.residency import Memory
+    from cozy_runtime.internal.residency import Request as MemoryRequest
 
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -662,12 +661,6 @@ class _CompositeResidency:
         }
 
 
-def _leases(command: Start) -> int | None:
-    """TensorD's lease namespace when it leases this executor's pages (memory protocol 2), else
-    None: off Linux, with no manager, or an older TensorD, varena runs each GPU standalone."""
-    return command.leases if command.memory_protocol == 2 else None
-
-
 def _construction_record(facts: Mapping[str, Any]) -> dict[str, Any]:
     """A prepare's run-record entry: when it ended, how long it took and its legs."""
     return {
@@ -796,21 +789,17 @@ class Executor:
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
         #: HOST ONLY: every loaded construction and the active one. One memory decides where
-        #: all their weights live (`tensorfs.varena.torch`), and the execution layer runs
+        #: all their weights live (`internal.residency`), and the execution layer runs
         #: torch under it (`internal.execution`, imported with the device).
         self.constructions: dict[str, Executor] = {}
         self.memory: Memory | None = None
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: Why a GPU runs standalone ("" it does not): TensorD leases nothing here (its memory
-        #: protocol), or it asked and no manager answers (`Memory.standalone`)
-        self.standalone = ""
         #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
         self.cuts: dict[str, object] = {}
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
-        self.leases: int | None = None
         #: The machine's sealed TensorFS cache directory.
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -972,9 +961,8 @@ class Executor:
             "pgid": _group(),
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
-            # 2: each GPU's weight pages leased from TensorD's manager (`Start.leases`); a
-            # Start of any other runs standalone.
-            "memory_protocol": 2,
+            "memory_protocol": 0,  # stock Torch owns this executor's allocations
+            "memory_backend": "torch",
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -1015,34 +1003,29 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
-        try:
-            self._open_memory(torch)  # before torch's context, so varena measures its own
-        except VarenaError as exc:  # its torch allocator will not load, or TensorD refused it
-            return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
         accel.initialize(torch, self.device_kind)
         if self.world > 1 and self.device_kind == "cuda":
             torch.cuda.set_device(self.rank)
+        from cozy_runtime.internal.residency import ResidencyError
+
+        try:
+            self._open_memory(torch)
+        except ResidencyError as exc:
+            return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
         return None
 
     def _open_memory(self, torch: Any) -> None:
-        """This process's memory (`tensorfs.varena.torch`), on its grant from TensorD, and the
-        execution layer that runs torch under it."""
-        from tensorfs.varena.torch import Memory
-
+        """This executor's stock-Torch residency and its pure-site execution helpers."""
         from cozy_runtime.internal import execution
+        from cozy_runtime.internal.residency import Memory
 
         host = self.host
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        # TensorD's lease namespace, when it leases this GPU's weight pages. A follower that
-        # dials before rank 0's progress frame registers it is held until TensorD has.
-        leases = host.leases if device.type == "cuda" else None
-        host.memory, host.execution = Memory.open(device, leases=leases), execution
-        if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
-            host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
+        host.memory, host.execution = Memory.open(device), execution
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         _split.install(execution)
@@ -1341,7 +1324,7 @@ class Executor:
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
             ranked = self.host._rank_request
-            working = accel.arena_peak(self.host.memory, ranked.id) if ranked is not None else 0
+            working = accel.allocator_peak(self.host.memory) if ranked is not None else 0
         except Exception as exc:
             ending = mirror.ending(exc)
             # where it was raised, innermost first: a GPU's own traceback stays on that GPU
@@ -1571,16 +1554,6 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        # An older TensorD's GPU ledgers follow its Start (a memfd and an eventfd each): unused
-        # here, they close. Skew degrades: whatever leases nothing runs standalone.
-        for fd in self.channel.recv_fds(2 * command.ledgers):
-            os.close(fd)
-        self.leases = _leases(command)
-        if command.devices and self.leases is None and not self.standalone:
-            self.standalone = (
-                f"TensorD's memory protocol {command.memory_protocol} leases nothing here: "
-                "each GPU runs standalone"
-            )
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:
@@ -1884,7 +1857,7 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
-            **({"memory_standalone": self.standalone} if self.standalone else {}),
+            "memory_backend": "torch",
         }
 
     def _model_classes(self) -> list[type[Model[Any]]]:
@@ -3511,10 +3484,11 @@ class Executor:
             self.residency.release()  # the last step's holds
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
-        # On CUDA the request's own arena high-water (varena's); MPS keeps no mark: its figures now.
+        # Stock Torch's peak is absolute and process-wide. Overlapping attempts share it;
+        # never add the request-start allocation again or present it as exclusive ownership.
         arena = own_memory[0].torch_peak if own_memory else 0
         live = accel.allocated(torch, self.device_kind, own) if torch is not None else 0
-        peak_vram = allocated_at_start + arena if self.device_kind == "cuda" else live
+        peak_vram = max(arena, live) if self.device_kind == "cuda" else live
         peak_reserved = accel.reserved(torch, self.device_kind, own) if torch is not None else 0
         residency_document = self.residency.document() if self.residency else {}
         working_peak = max(peak_vram - allocated_at_start, 0)
@@ -4448,9 +4422,8 @@ class Executor:
 
     @contextlib.contextmanager
     def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:
-        """The attempt as varena's request (varena-slim §3), its ops under the execution
-        layer's catch and its plan `ctx.plan`'s: everything it allocated is freed at its end,
-        failed or not, and its record (this GPU's) lands in the list."""
+        """The request's residency scopes and pure cuts. Tensor ownership determines lifetime;
+        its recorded allocator figures are process-wide, not exact per-request allocations."""
         host, rows = self.host, list[GpuMemory]()
         if host.memory is None or host.execution is None:
             yield rows
@@ -4466,7 +4439,7 @@ class Executor:
                     yield rows
                 finally:
                     del host.requests[request_id]
-                    peak = accel.arena_peak(host.memory, request_id)  # read while it is open
+                    peak = accel.allocator_peak(host.memory)  # read while it is open
                     host.cuts[request_id] = msgspec.to_builtins(host.execution.cut_rows(request))
         finally:
             if request is not None:
@@ -4503,13 +4476,8 @@ class Executor:
                                     release(model.module)
                                 graphs.retire(self.torch, model.module)
                             self.memory.load(model.module, command.level)
-                if (
-                    command.level == "ram"
-                    and (trim := getattr(self.memory, "trim", None)) is not None
-                ):
-                    # Graph/static tensors and weights have retired; return quiet torch spans,
-                    # including the allocation float, through the adapter's existing operation.
-                    trim()
+                if command.level == "ram":
+                    self.memory.trim()
             for reply in group.collect("map") if group is not None else ():
                 if not reply.get("ok"):
                     raise GroupRefusal(

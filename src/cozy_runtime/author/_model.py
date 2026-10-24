@@ -317,8 +317,10 @@ class Residency(Protocol):
         """Shared capture stream and library workspace, serialized across component graphs."""
         ...
 
-    def region(self, owner: str, kind: str, sets: Any) -> Any:
-        """A long-lived intermediate's region (KV, latents, derived weights) serving `sets`."""
+    def region(
+        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None
+    ) -> Any:
+        """An explicitly owned cache, released only while it has no active user."""
         ...
 
     def graph_pool(self, component: str) -> Any:

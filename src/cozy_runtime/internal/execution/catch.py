@@ -19,11 +19,11 @@ from dataclasses import dataclass, field
 
 import msgspec
 import torch
-from tensorfs.varena.torch import Request
 from torch import Tensor, nn
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.execution import sizing
+from cozy_runtime.internal.residency import Request
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
@@ -133,6 +133,11 @@ def _refused(exc: BaseException) -> bool:
     if not short(exc):
         return False
     _clear(exc)
+    request = CURRENT.get()
+    if request is not None:
+        # This is a declared pure cut, after its failed temporaries are unwound. Reclaim
+        # inactive owned weights/caches before choosing a smaller execution plan.
+        request.reclaim()
     return True
 
 
