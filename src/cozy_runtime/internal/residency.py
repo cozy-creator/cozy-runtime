@@ -631,7 +631,7 @@ class Memory:
                 if budget_bytes is not None:
                     varena.set_activation_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
-            except (ImportError, RuntimeError) as exc:
+            except (ImportError, AttributeError, RuntimeError) as exc:
                 raise ResidencyError(f"native CUDA weight residency is unavailable: {exc}") from exc
 
     @classmethod

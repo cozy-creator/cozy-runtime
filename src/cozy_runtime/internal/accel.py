@@ -482,7 +482,7 @@ def initialize(torch: Any, kind: str) -> None:
             from tensorfs import varena
 
             varena.install_allocator()
-        except (ImportError, RuntimeError) as exc:
+        except (ImportError, AttributeError, RuntimeError) as exc:
             raise ResidencyError(f"native CUDA allocation recovery is unavailable: {exc}") from exc
         torch.cuda.init()
 
