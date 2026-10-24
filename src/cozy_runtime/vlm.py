@@ -88,7 +88,7 @@ class AskRequest(msgspec.Struct):
     prompts: Annotated[list[AskPrompt], msgspec.Meta(max_length=16)] = []
     system: Text = ""
     #: Think before answering (the chat template's switch); only the answer after the thought is
-    #: returned, and a thought `max_tokens` cuts off leaves none.
+    #: returned. A thought `max_tokens` cuts off is returned as it stands, with a warning.
     thinking: bool = False
     max_tokens: Annotated[int, msgspec.Meta(ge=1, le=16384)] = 1024
     #: 0 answers greedily; above it, each token is drawn from the `top_p` nucleus at this
