@@ -40,10 +40,7 @@ from PIL import Image
 from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._executor_requests import (
-    Answer,
-    MemoEntry,
-    MemoStored,
-    Request,
+    Exchange,
     StageMemoLookup,
     StageMemoStore,
 )
@@ -79,8 +76,6 @@ _DTYPES = {
     "uint8": "U8",
     "bool": "BOOL",
 }
-
-type Exchange = Callable[[Request, type[Answer]], Answer]
 
 
 class Tensor(Protocol):
@@ -522,8 +517,8 @@ class Engine:
         exchange = self.exchange
         if exchange is None:
             return None
-        answer = exchange(StageMemoLookup(key=key, stage=stage, numerics=numerics), MemoEntry)
-        if not isinstance(answer, MemoEntry) or not answer.ok:
+        answer = exchange(StageMemoLookup(key=key, stage=stage, numerics=numerics))
+        if not answer.ok:
             return None
         if answer.disputed:
             self.disputed.add((stage, numerics))
@@ -560,15 +555,14 @@ class Engine:
                 cost_ms=round(entry.cost_s * 1000, 3) if entry is not None else 0.0,
                 reason=reason,
             ),
-            MemoStored,
         )
-        stored = isinstance(answer, MemoStored) and answer.ok and answer.stored
-        if isinstance(answer, MemoStored) and answer.disputed:
+        stored = answer.ok and answer.stored
+        if answer.disputed:
             self.disputed.add((stage, numerics))
         if not local:
             return reason
         Path(local).unlink(missing_ok=True)  # the Worker keeps its own copy
-        return "" if stored else getattr(answer, "reason", "") or "worker_declined"
+        return "" if stored else answer.reason or "worker_declined"
 
     def worth_storing(self, stats: MethodStats, entry: Entry) -> str:
         """Why not to write this entry to disk, or "" to write it."""

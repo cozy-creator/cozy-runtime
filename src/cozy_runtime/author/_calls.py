@@ -28,7 +28,6 @@ from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._executor_requests import (
     MAX_CALL_INDEX,
     Answer,
-    CallState,
     ChildCall,
     ChildCancel,
     ChildForget,
@@ -39,7 +38,7 @@ from cozy_runtime.author._executor_requests import (
 )
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
-from cozy_runtime.author._model import WARNINGS, Model
+from cozy_runtime.author._model import WARNINGS, Model, WarningRow
 from cozy_runtime.author._model_defaults import model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 from cozy_runtime.author._weights import Weights
@@ -224,9 +223,7 @@ def prefetch(
     payload = canonical_json.encode(msgspec.to_builtins(selected))
     if len(payload) > MAX_CALL_BYTES:
         raise CapabilityError("model prefetch exceeds inline bound", code="child_payload_bound")
-    answer = broker.exchange(
-        ModelPrefetch(module=module, export=name, payload=payload.decode()), Answer
-    )
+    answer = broker.exchange(ModelPrefetch(module=module, export=name, payload=payload.decode()))
     # The machine can decline an optional optimization; the call prepares on demand.
     if answer.code != "model_prefetch_unsupported":
         broker._check(answer, 0)
@@ -330,7 +327,7 @@ class _Broker:
         """`ctx.release_gpus()` of this attempt: its root's GPU lease ends at the worker."""
         if self.closed:
             raise CapabilityError("GPU release escaped its attempt", code="escaped_handle")
-        self._check(self.exchange(GpuRelease(), Answer), 0)
+        self._check(self.exchange(GpuRelease()), 0)
 
     def reserve(
         self,
@@ -381,7 +378,7 @@ class _Broker:
             )
             if ignored:
                 # A field the installed callee does not declare is a warning, never a refusal.
-                row = (
+                row: WarningRow = (
                     "a package call named fields its callee does not declare; they were dropped",
                     {"callee": f"{module}:{export}", "fields": ", ".join(ignored)},
                 )
@@ -420,12 +417,12 @@ class _Broker:
                     raise ChildCallError("escaped_handle", "parent attempt closed", call.index)
                 for ready in tuple(self.calls.values()):
                     if ready.task is not None and ready.index not in self.activated:
-                        answer = self.exchange(self._intent(ready), CallState)
+                        answer = self.exchange(self._intent(ready))
                         self._observe(ready, answer)
                         self._check(answer, ready.index, call.ctx)
                         self.activated.add(ready.index)
                 seen = self.nudged
-                answer = self.exchange(ChildPoll(call_index=call.index), CallState)
+                answer = self.exchange(ChildPoll(call_index=call.index))
                 self._observe(call, answer)
                 self._check(answer, call.index, call.ctx)
                 if answer.state == "succeeded":
@@ -466,12 +463,12 @@ class _Broker:
                     await self._changed(seen, call.ctx.deadline)
         except asyncio.CancelledError:
             if call.index in self.activated and not self.closed:
-                self.exchange(ChildCancel(call_index=call.index), CallState)
+                self.exchange(ChildCancel(call_index=call.index))
             raise
         finally:
             try:
                 if call.index in self.activated and not self.closed:
-                    self.exchange(ChildForget(call_index=call.index), Answer)
+                    self.exchange(ChildForget(call_index=call.index))
             finally:
                 self.activated.discard(call.index)
                 self.calls.pop(call.index, None)
@@ -519,7 +516,7 @@ class _Broker:
             self.nudges = None
 
     @staticmethod
-    def _observe(call: PendingCall[Any], answer: CallState) -> None:
+    def _observe(call: PendingCall[Any], answer: Answer) -> None:
         child_id = answer.child_request_id
         if child_id:
             if len(child_id) > 256 or call.request_id not in ("", child_id):

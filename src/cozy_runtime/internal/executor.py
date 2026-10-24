@@ -100,9 +100,8 @@ from cozy_runtime.author._executor_requests import (
     CheckpointItem,
     ChildEvents,
     Exchange,
-    Handoff,
-    Published,
     Request,
+    decode_answer,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
 from cozy_runtime.author._invoke import (
@@ -151,7 +150,6 @@ from cozy_runtime.internal import (
     sandbox,
     spawn,
     stage_memo,
-    tolerant,
     tools,
     w4a8_linear,
     zygote,
@@ -412,7 +410,7 @@ def _show_checkpoint(
 ) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
     item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision, tag=tag, variant=variant)
-    answer = exchange(item, Answer)
+    answer = exchange(item)
     if not answer.ok:
         raise RuntimeFailure(
             answer.detail or "the machine refused the checkpoint item",
@@ -3408,7 +3406,7 @@ class Executor:
                         tensorfs_adopt=(
                             weight_outputs.adopt if weight_outputs is not None else None
                         ),
-                        publish=lambda request: exchange(request, Published),
+                        publish=exchange,
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                     ),
                 )
@@ -4236,7 +4234,7 @@ class Executor:
             request_id,
             self._bound_calls[1],
             exchange,
-            lambda: self._child_events(exchange),
+            lambda: self._child_events(request_id),
             functools.partial(self._yielding, request_id),
         )
 
@@ -4320,25 +4318,25 @@ class Executor:
         with store_refusals(f"opening {ref[:23]}"):
             return Checkpoint(weights_store.open_checkpoint(self._store(), ref, connection))
 
-    def _child_events(self, exchange: Exchange) -> int | None:
+    def _child_events(self, request_id: str) -> int | None:
         """The worker's nudge socket for this attempt's calls; None when it refuses, and on
         Windows, whose event loop cannot watch a pipe: its calls are polled."""
         if sys.platform == "win32":
             return None
-        answer = exchange(ChildEvents(), Handoff)
-        return answer.descriptor if answer.ok else None
+        answer, descriptor = self._durable(ChildEvents(), request_id, handoff=True)
+        return descriptor if answer.ok else None
 
     def _exchange(self, request_id: str) -> Exchange:
         """One call's durable exchange, naming it from whatever thread its code runs on."""
 
-        def exchange[A: Answer](request: Request, into: type[A], /) -> A:
-            return self._durable(request, into, request_id)
+        def exchange(request: Request, /) -> Answer:
+            return self._durable(request, request_id)[0]
 
         return exchange
 
-    def _durable[A: Answer](
-        self, request: Request, into: type[A], request_id: str | None = None
-    ) -> A:
+    def _durable(
+        self, request: Request, request_id: str | None = None, *, handoff: bool = False
+    ) -> tuple[Answer, int | None]:
         """One DURABLE mid-attempt exchange. Blocks until the worker answers.
 
         This is the seam's other half of `child.Executor.call(on_request=…)`. It is a
@@ -4348,14 +4346,14 @@ class Executor:
         """
         body = encode_request(request)
         channel, exchange = self.channel, body["kind"]
+        descriptor: list[int] = []
 
         def receive(frame: Frame) -> None:
-            handoff = issubclass(into, Handoff)
             if frame.get("descriptor") is True:
                 if not handoff:
                     channel.close()
                     raise SeamError("seam_descriptor", "unexpected capability in control reply")
-                frame["descriptor"] = channel.recv_descriptor()
+                descriptor.append(channel.recv_descriptor())
             elif handoff and frame.get("ok") is True:
                 raise SeamError("seam_descriptor", "successful reply omitted its capability")
             if frame.pop("descriptors", 0) or frame.get("lease") is True:
@@ -4368,9 +4366,10 @@ class Executor:
             receive=receive,
         )
         try:
-            return tolerant.read(frame, into, ("progress", "observation"))[0]
-        except msgspec.ValidationError as exc:
+            answer = decode_answer(msgspec.json.encode(frame))
+        except Malformed as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
+        return answer, descriptor[0] if descriptor else None
 
     def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
         def activity(sequence: int, active: bool, known: bool, finished: bool) -> None:

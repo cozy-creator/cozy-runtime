@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
 import msgspec
+from tensorfs.executor import ByteGrant
 
 from cozy_runtime.author._assets import (
     Asset,
@@ -39,24 +40,6 @@ class FileResult(ByteResult, frozen=True):
     media_type: str
 
 
-class _Grant(msgspec.Struct, frozen=True):
-    """Fields consumed when reading a grant from another Runtime's worker."""
-
-    output_id: str
-    kind: str
-    digest: str
-    local: str
-
-
-class _FileGrant(_Grant, frozen=True):
-    length: int
-    media_type: str
-
-
-class _TreeGrant(_Grant, frozen=True):
-    content_bytes: int
-
-
 def result_at(value: object, path: str) -> object:
     for part in path.split(".") if path else ():
         if isinstance(value, list) and part.isdigit() and str(int(part)) == part:
@@ -71,7 +54,7 @@ def result_at(value: object, path: str) -> object:
 def decode(
     value: object,
     result_type: object,
-    grants: Sequence[Mapping[str, object]],
+    grants: Sequence[ByteGrant],
     *,
     request_id: str,
     guard: Callable[[], None],
@@ -83,8 +66,7 @@ def decode(
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")
     handles: dict[str, Asset | Tree] = {}
-    for raw_grant in grants:
-        grant = msgspec.convert(raw_grant, _Grant, strict=True)
+    for grant in grants:
         output_id = grant.output_id
         if output_id in handles:
             raise ValueError("native result grant has a repeated or missing output ID")
@@ -97,13 +79,12 @@ def decode(
             raise ValueError("native result field has an invalid asset shape")
         digest, size = declared.digest, declared.size_bytes
         if kind == "tree":
-            expected_size = msgspec.convert(raw_grant, _TreeGrant, strict=True).content_bytes
+            expected_size = grant.content_bytes
             media_type = ""
         else:
-            file_grant = msgspec.convert(raw_grant, _FileGrant, strict=True)
-            expected_size = file_grant.length
+            expected_size = grant.length
             media_type = msgspec.convert(node, FileResult, strict=True).media_type
-            if media_type != file_grant.media_type or not admits(kind, normalize(media_type)):
+            if media_type != grant.media_type or not admits(kind, normalize(media_type)):
                 raise ValueError("native result differs from its verified host grant")
         if declared.asset_ref != digest:
             raise ValueError("native result reference differs from its byte identity")

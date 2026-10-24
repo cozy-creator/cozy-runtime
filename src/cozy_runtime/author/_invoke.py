@@ -67,7 +67,7 @@ from cozy_runtime.author._errors import (
     classify,
     unwind,
 )
-from cozy_runtime.author._executor_requests import Publish, Published
+from cozy_runtime.author._executor_requests import Answer, Publish
 from cozy_runtime.author._markers import AssetBound, ImagePreparation, Preparation
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
@@ -141,7 +141,7 @@ class Invocation:
     activity: Callable[[int, bool, bool, bool], None] | None = None
     plan: Callable[[Sequence[str | Collection[str]]], None] | None = None
     calls: _Broker | None = None
-    publish: Callable[[Publish], Published] | None = None
+    publish: Callable[[Publish], Answer] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
 
 

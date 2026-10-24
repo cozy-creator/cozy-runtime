@@ -48,7 +48,7 @@ from cozy_runtime.author._decode import (
     MediaReads,
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
-from cozy_runtime.author._executor_requests import Publish, Published, PublishPart
+from cozy_runtime.author._executor_requests import Answer, Publish, PublishPart
 from cozy_runtime.author._observations import DEVICE, Attribution, EventRing, Observation, Scalar
 
 T = TypeVar("T")
@@ -187,7 +187,7 @@ class Attempt:
     _stall_watch: _stalls.Watch | None = None
     #: Sends one publish to the worker, which journals it on the run's output log. None in a
     #: harness with no worker: `published` then records what would have been shown.
-    publish: Callable[[Publish], Published] | None = None
+    publish: Callable[[Publish], Answer] | None = None
     published: list[Publish] = field(default_factory=list)
     #: The result fields `Outputs.publish` may name (`Surface.outputs`); None: not known here.
     outputs: frozenset[str] | None = None
