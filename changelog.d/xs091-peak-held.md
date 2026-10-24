@@ -1,0 +1,1 @@
+`measurements.memory.peak_reserved_bytes` is again the device bytes a request held at its fullest pass: varena's held peak, its pages and torch's (`stats.varena[].stats.peak`). Since varena became torch's allocator it had been torch's arena's mapped bytes alone, which leave out the weights.
