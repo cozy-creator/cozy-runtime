@@ -23,6 +23,7 @@ unsafe extern "C" {
     fn cozy_repeat_cancel(run: *mut c_void) -> i32;
     fn cozy_repeat_wait(run: *mut c_void, completed: *mut u32, canceled: *mut u32) -> i32;
     fn cozy_repeat_nodes(run: *mut c_void) -> u32;
+    fn cozy_repeat_validated_nodes(run: *mut c_void) -> u32;
     fn cozy_repeat_destroy(run: *mut c_void) -> i32;
 }
 
@@ -68,6 +69,7 @@ struct ResidentRepeat {
     owners: Mutex<Vec<Py<PyAny>>>,
     pid: u32,
     nodes: u32,
+    validated_nodes: u32,
     device: i32,
     steps: u32,
 }
@@ -183,6 +185,8 @@ impl ResidentRepeat {
         }
         // SAFETY: the successfully constructed handle remains exclusively owned here.
         let nodes = unsafe { cozy_repeat_nodes(pointer as *mut c_void) };
+        // SAFETY: successful preparation inspected this same live native body recursively.
+        let validated_nodes = unsafe { cozy_repeat_validated_nodes(pointer as *mut c_void) };
         Ok(Self {
             state: Mutex::new(State {
                 pointer,
@@ -194,6 +198,7 @@ impl ResidentRepeat {
             owners: Mutex::new(owners),
             pid: std::process::id(),
             nodes,
+            validated_nodes,
             device,
             steps,
         })
@@ -217,6 +222,7 @@ impl ResidentRepeat {
         let result = PyDict::new(py);
         result.set_item("execution_mode", "cuda_conditional_while")?;
         result.set_item("body_nodes", self.nodes)?;
+        result.set_item("validated_nodes", self.validated_nodes)?;
         result.set_item("device", self.device)?;
         result.set_item("steps_per_launch", self.steps)?;
         result.set_item("host_graph_launches", launches)?;

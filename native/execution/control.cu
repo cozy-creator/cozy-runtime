@@ -26,6 +26,7 @@ struct Repeat {
     int device = 0;
     unsigned steps = 0;
     unsigned nodes = 0;
+    unsigned validated_nodes = 0;
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
     cudaStream_t work = nullptr;
@@ -184,6 +185,8 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     kernel.gridDim = dim3(1); kernel.blockDim = dim3(1); kernel.kernelParams = args;
     cudaGraphNode_t boundary;
     CHECK(cudaGraphAddKernelNode(&boundary, body, &compute, 1, &kernel));
+    // Inspect the actual assembled body, including the cloned source child definition.
+    CHECK(inspect(body, run->validated_nodes, device));
     CHECK(cudaGraphInstantiate(&run->executable, run->graph, 0));
     CHECK(cudaGraphUpload(run->executable, run->work));
     CHECK(cudaStreamSynchronize(run->work));
@@ -280,6 +283,7 @@ static int wait(Repeat *run, unsigned *completed, unsigned *canceled) {
 }
 
 extern "C" unsigned cozy_repeat_nodes(Repeat *run) { return run->nodes; }
+extern "C" unsigned cozy_repeat_validated_nodes(Repeat *run) { return run->validated_nodes; }
 
 static int destroy(Repeat *run) {
     if (!run) return cudaSuccess;
