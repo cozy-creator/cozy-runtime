@@ -20,6 +20,7 @@ conservative route.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -37,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.graphs import streams
-from cozy_runtime.internal import filelock, kernel_cache, liveness, proctree, spawn
+from cozy_runtime.internal import filelock, kernel_cache, spawn
 from cozy_runtime.internal.config import inherited_environment
 from cozy_runtime.internal.parallel import copy_engine, group
 
@@ -325,21 +326,11 @@ def measured(directory: Path | None, devices: Sequence[str]) -> Links:
         return Links(reason=f"the links could not be measured: {exc}")
 
 
-def _burn(pid: int) -> int | None:
-    """The probe's progress: CPU and bytes of its process and every descendant."""
-    try:
-        burns = [liveness.burn(member) for member in (pid, *proctree.descendants(pid))]
-    except proctree.ProcessTreeUnsupported:
-        return None
-    readable = [burn for burn in burns if burn is not None]
-    return sum(readable) if readable else None
-
-
 def _probe(devices: Sequence[str]) -> Links:
-    """Run the probe child, reading its lines as they come. Until its pairs are in, it is
-    judged by its progress (`liveness`); the process group (inside NCCL, which spins) gets
-    four times what the child took to start and measure its first pair, and is ended as a
-    whole if it says nothing."""
+    """Run the probe child, reading its lines until its exit or its group's row: that result is
+    kept, and whatever of the probe is still tearing down is ended. Its pairs end by the child's
+    own exit and its direct-copy guard (`_measure`); its process group gets four times what
+    the child took to start and measure its first pair, and is ended as a whole past that."""
     count = len(devices)
     # The group lane's NCCL law (`group.NVLS_ENV`), which a machine's own boot does not carry.
     environment = {
@@ -362,22 +353,12 @@ def _probe(devices: Sequence[str]) -> Links:
     pairs: list[Pair] = []
     processes: dict[str, Any] = {}
     window: float | None = None
-    pace, sampled, stalled = liveness.Pace(), float("-inf"), ""
     watch = selectors.DefaultSelector()
     watch.register(child.stdout, selectors.EVENT_READ)
-    while child.poll() is None or watch.select(0):
-        now = time.monotonic()
-        if window is None and now - sampled >= liveness.SAMPLE_SECONDS:
-            sampled, burn = now, _burn(child.pid)
-            pace.observe(None if burn is None else (len(pairs), burn), now)
-            if pace.wedged(liveness.noise_floor(), now):
-                stalled = f"the link probe stopped: {pace.verdict(liveness.noise_floor(), now)}"
-                os.killpg(child.pid, signal.SIGKILL)
-                break
-        if not watch.select(liveness.SAMPLE_SECONDS if window is None else max(window - now, 0)):
-            if window is None:
-                continue
-            os.killpg(child.pid, signal.SIGKILL)
+    while True:
+        # The last resort: NCCL gives no progress signal, and a broken peer path spins in it
+        # forever, so the group's phase alone has a deadline, scaled to this child's own start.
+        if not watch.select(None if window is None else max(window - time.monotonic(), 0)):
             processes = _unformed(
                 Links(tuple(pairs)).level,
                 "a group of probe processes stopped making progress in NCCL",
@@ -389,12 +370,15 @@ def _probe(devices: Sequence[str]) -> Links:
         row = json.loads(line) if line.startswith("{") else {}
         if "group" in row:
             processes = row["group"]
-        elif row:
+            break
+        if row:
             pairs.append(Pair(**row))
             if len(pairs) == 1:
                 started = time.monotonic() - began
             if len(pairs) == count * (count - 1):
                 window = time.monotonic() + 4 * started
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(child.pid, signal.SIGKILL)
     child.wait()
     with errors:
         errors.seek(0)
@@ -404,7 +388,7 @@ def _probe(devices: Sequence[str]) -> Links:
         reason = (
             f"GPU {broken.src} to GPU {broken.dst}: {broken.detail}"
             if broken
-            else stalled or f"the link probe ended early: {tail[0][:200]}"
+            else f"the link probe ended early: {tail[0][:200]}"
         )
         return Links(tuple(pairs) if broken else (), {}, reason)
     if not processes and (links := Links(tuple(pairs))).all_peers:
