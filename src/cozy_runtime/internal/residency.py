@@ -779,6 +779,23 @@ class Memory:
             return 0
         before_allocated, before_reserved, _ = self._figures()
         before_free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
+        available = self.room(current).free if need else 0
+        dropped = 0
+
+        def enough(released: int = 0, *, flush: bool = False) -> bool:
+            nonlocal available, dropped
+            if not need:
+                return False
+            dropped += released
+            if flush or dropped >= max(need - available, 1):
+                # Dropped owner bytes only trigger a batch flush. Aliases, allocator
+                # fragmentation and graph pools can keep them resident; measure again.
+                if self.cuda:
+                    torch.cuda.empty_cache()
+                dropped = 0
+                available = self.room(current).free
+            return available >= need
+
         with self.lock:
             holds = [
                 hold
@@ -795,23 +812,31 @@ class Memory:
                 key=lambda b: (b.model.name in current, b.last),
             )
         for block in blocks:
-            if need and self.room(current).free >= need:
+            if enough():
                 break
-            self._discard(block)
-        if not need or self.room(current).free < need:
+            enough(self._discard(block))
+        # Return public allocator cache before escalating to graph retirement.
+        if not enough(flush=True):
             for model in sorted(list(self.models.values()), key=lambda m: m.name in current):
-                if need and self.room(current).free >= need:
+                if enough():
                     break
                 if self._retire(model):
+                    if enough(flush=True):
+                        break
                     for block in model.groups():
-                        self._discard(block)
+                        if enough():
+                            break
+                        enough(self._discard(block))
+                    enough(flush=True)
         # A callback may discard graph owners or decoded caches. It runs outside metadata
         # locks, and a pinned/locked region is skipped rather than waited on.
-        for region in sorted(list(self.regions), key=lambda r: r.last):
-            if need and self.room(current).free >= need:
-                break
-            region.discard()
-        if self.cuda:
+        if not enough(flush=True):
+            for region in sorted(list(self.regions), key=lambda r: r.last):
+                if enough():
+                    break
+                if region.discard():
+                    enough(flush=True)
+        if self.cuda and not need:
             torch.cuda.empty_cache()
         allocated, reserved, _ = self._figures()
         free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
