@@ -225,17 +225,6 @@ class _Recording:
         self.graph.reset()
         self.graph = self.pool = None
 
-    def finish(self) -> None:
-        """Every replay and declared output reader is done before fill-dependent retirement."""
-        if not self.fenced and self.stream is not None:
-            self.stream.synchronize()
-        if self.done is not None:
-            self.done.synchronize()
-        for reader in self.readers:
-            reader.synchronize()
-        self.readers.clear()
-        self.fenced = True
-
     def idle(self) -> bool:
         if not self.fenced or (self.done is not None and not self.done.query()):
             return False
@@ -357,7 +346,7 @@ _COUNTERS = (
 
 class _Recorder:
     def __init__(self) -> None:
-        self.lock = threading.RLock()
+        self.lock = threading.Lock()
         self.recordings: dict[tuple[object, ...], _Recording] = {}
         #: each signature waiting for an idle period to record (`capture_idle`)
         self.queued: dict[tuple[object, ...], _Pending] = {}
@@ -415,18 +404,6 @@ class _Recorder:
             return False
         self.drop()
         return True
-
-    def retire(self) -> None:
-        """A weight fill is changing: drain readers and discard graphs before its old pins go.
-
-        Binding validation can discover the change while already holding these locks.
-        The domain orders this retirement against every other use of the shared scratch.
-        """
-        scope = self.domain.using() if self.domain is not None else nullcontext()
-        with scope, self.lock:
-            for entry in self.recordings.values():
-                entry.finish()
-            self.drop()
 
     def drop(self) -> None:
         self.retired += len(self.recordings)
@@ -941,8 +918,11 @@ def _region_call(
         if recorder.waiting.get(key) == attempt:
             return eager()
         if placed is not None:
-            if recorder.binding is not None and not recorder.binding.valid():
-                recorder.forget(torch)
+            if (
+                recorder.binding is not None
+                and not recorder.binding.valid()
+                and not recorder.forget(torch)
+            ):
                 return eager()
             if recorder.binding is None:
                 recorder.binding = placed[0].retain(placed[1], (_REGIONS[module][1],))
@@ -1079,7 +1059,7 @@ def _record(
             recorder.judged[key] = why
             return True
         if placed is not None and not placed[0].graph_accounted():
-            _failed(module, recorder, key, "graph memory accounting or exact dependencies missing")
+            _failed(module, recorder, key, "driver/context memory is unmeasured")
             return True
         scope = (
             placed[0].graph_pass(placed[1], _REGIONS[module][1])
@@ -1093,7 +1073,7 @@ def _record(
             stream.wait_stream(current)
             if recorder.pool is None:
                 recorder.pool = (
-                    placed[0].graph_pool(placed[1], recorder.binding, recorder.retire)
+                    placed[0].graph_pool(placed[1])
                     if placed is not None
                     else domain.Pool(torch.cuda.graph_pool_handle())
                 )
