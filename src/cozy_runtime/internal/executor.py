@@ -4259,6 +4259,7 @@ class Executor:
             )
         bindings: dict[tuple[str, str], _CallType] = {}
         own = effect_interfaces.bindings()
+        generated, analyzed = 0, []
         for row in rows:
             module, export = row.module, row.export
             if row.native_effect:
@@ -4300,6 +4301,7 @@ class Executor:
                         model_components=declared.components,
                     )
                     binding = _serving(module, export, registration.surface)
+                    analyzed.append(f"{module}:{export}")
                 else:
                     generated_binding = getattr(imported, "__cozy_bindings__", {}).get(export)
                     if not isinstance(generated_binding, _CallType):
@@ -4307,6 +4309,7 @@ class Executor:
                             "installed export is not invocable", code="child_interface"
                         )
                     binding = generated_binding
+                    generated += 1
                 prior = bindings.get((module, export))
                 if prior is not None and prior != binding:
                     raise CapabilityError("ambiguous managed export", code="child_interface")
@@ -4314,6 +4317,13 @@ class Executor:
         for export in own:
             key = (effect_interfaces.MODULE, export)
             bindings.setdefault(key, effect_interfaces.unserved(export))
+        if generated or analyzed:
+            # Which dependency exports bound from their documents and which from their own code.
+            print(
+                f"[calls] {generated} bound from their documents, {len(analyzed)} from their code"
+                + (f": {', '.join(analyzed)}" if analyzed else "")[:600],
+                file=sys.stderr,
+            )
         return bindings
 
     def _store(self) -> Path:
