@@ -1,0 +1,216 @@
+// Original CUDA graph control, built ahead of time. No Python or host nodes in a loop body.
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <new>
+#include <vector>
+
+struct Control { unsigned completed; unsigned cancel; };
+struct Snapshot { unsigned completed; unsigned cancel; };
+struct Repeat {
+    int device = 0;
+    unsigned steps = 0;
+    unsigned nodes = 0;
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    cudaStream_t work = nullptr;
+    cudaStream_t control_stream = nullptr;
+    cudaEvent_t done = nullptr;
+    cudaEvent_t sampled = nullptr;
+    Control *control = nullptr;
+    Snapshot *device_snapshot = nullptr;
+    Snapshot *host_snapshot = nullptr;
+    int64_t *index = nullptr;
+    Snapshot observed{};
+    bool launched = false;
+    bool pending_sample = false;
+};
+
+__global__ void advance(Control *state, int64_t *index, unsigned steps,
+                        cudaGraphConditionalHandle condition) {
+    const unsigned completed = atomicAdd(&state->completed, 1u) + 1u;
+    *index = static_cast<int64_t>(completed);
+    const unsigned canceled = atomicAdd(&state->cancel, 0u);
+    cudaGraphSetConditional(condition, completed < steps && !canceled);
+}
+
+__global__ void cancel_repeat(Control *state) { atomicExch(&state->cancel, 1u); }
+
+__global__ void snapshot(Control *state, Snapshot *out) {
+    out->completed = atomicAdd(&state->completed, 0u);
+    out->cancel = atomicAdd(&state->cancel, 0u);
+}
+
+// Reject every operation whose ownership/side effects cannot be represented by a resident body.
+// cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle.
+static cudaError_t inspect(cudaGraph_t graph, unsigned &total, unsigned depth = 0) {
+    if (depth > 32) return cudaErrorNotSupported;
+    size_t count = 0;
+    auto error = cudaGraphGetNodes(graph, nullptr, &count);
+    if (error != cudaSuccess) return error;
+    if (count > 1000000 || total > 1000000 - count) return cudaErrorNotSupported;
+    std::vector<cudaGraphNode_t> nodes(count);
+    error = cudaGraphGetNodes(graph, nodes.data(), &count);
+    if (error != cudaSuccess) return error;
+    total += static_cast<unsigned>(count);
+    for (auto node : nodes) {
+        cudaGraphNodeType type;
+        error = cudaGraphNodeGetType(node, &type);
+        if (error != cudaSuccess) return error;
+        if (type == cudaGraphNodeTypeGraph) {
+            cudaGraph_t child;
+            error = cudaGraphChildGraphNodeGetGraph(node, &child);
+            if (error == cudaSuccess) error = inspect(child, total, depth + 1);
+            if (error != cudaSuccess) return error;
+        } else if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeEmpty
+                   && type != cudaGraphNodeTypeMemcpy && type != cudaGraphNodeTypeMemset) {
+            return cudaErrorNotSupported;
+        }
+    }
+    return cudaSuccess;
+}
+
+static cudaError_t cleanup(Repeat *run) {
+    // Stop at an uncertain completion. The caller retains this object and all source owners.
+    cudaError_t error;
+    if (run->work && (error = cudaStreamSynchronize(run->work)) != cudaSuccess) return error;
+    if (run->control_stream && (error = cudaStreamSynchronize(run->control_stream)) != cudaSuccess) return error;
+    if (run->executable && (error = cudaGraphExecDestroy(run->executable)) != cudaSuccess) return error;
+    run->executable = nullptr;
+    if (run->graph && (error = cudaGraphDestroy(run->graph)) != cudaSuccess) return error;
+    run->graph = nullptr;
+    if (run->control && (error = cudaFree(run->control)) != cudaSuccess) return error;
+    run->control = nullptr;
+    if (run->device_snapshot && (error = cudaFree(run->device_snapshot)) != cudaSuccess) return error;
+    run->device_snapshot = nullptr;
+    if (run->host_snapshot && (error = cudaFreeHost(run->host_snapshot)) != cudaSuccess) return error;
+    run->host_snapshot = nullptr;
+    if (run->done && (error = cudaEventDestroy(run->done)) != cudaSuccess) return error;
+    run->done = nullptr;
+    if (run->sampled && (error = cudaEventDestroy(run->sampled)) != cudaSuccess) return error;
+    run->sampled = nullptr;
+    if (run->work && (error = cudaStreamDestroy(run->work)) != cudaSuccess) return error;
+    run->work = nullptr;
+    if (run->control_stream && (error = cudaStreamDestroy(run->control_stream)) != cudaSuccess) return error;
+    run->control_stream = nullptr;
+    return cudaSuccess;
+}
+
+extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
+                                  unsigned steps, Repeat **out) {
+    *out = nullptr;
+    if (!source || !index || !steps) return cudaErrorInvalidValue;
+    auto error = cudaSetDevice(device);
+    if (error != cudaSuccess) return error;
+    auto run = new (std::nothrow) Repeat;
+    if (!run) return cudaErrorMemoryAllocation;
+    run->device = device; run->steps = steps; run->index = reinterpret_cast<int64_t *>(index);
+    // Return ownership even on failure so Rust can retain the source after uncertain cleanup.
+    *out = run;
+    auto checked = [&](cudaError_t result) { return result; };
+#define CHECK(call) do { error = checked(call); if (error != cudaSuccess) return error; } while (0)
+    CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes));
+    if (!run->nodes) return cudaErrorInvalidValue;
+    CHECK(cudaStreamCreateWithFlags(&run->work, cudaStreamNonBlocking));
+    CHECK(cudaStreamCreateWithFlags(&run->control_stream, cudaStreamNonBlocking));
+    CHECK(cudaEventCreateWithFlags(&run->done, cudaEventDisableTiming));
+    CHECK(cudaEventCreateWithFlags(&run->sampled, cudaEventDisableTiming));
+    CHECK(cudaMalloc(&run->control, sizeof(Control)));
+    CHECK(cudaMalloc(&run->device_snapshot, sizeof(Snapshot)));
+    CHECK(cudaMallocHost(&run->host_snapshot, sizeof(Snapshot)));
+    CHECK(cudaMemset(run->control, 0, sizeof(Control)));
+    CHECK(cudaMemset(run->index, 0, sizeof(int64_t)));
+    CHECK(cudaGraphCreate(&run->graph, 0));
+    cudaGraphConditionalHandle condition;
+    CHECK(cudaGraphConditionalHandleCreate(&condition, run->graph, 1, cudaGraphCondAssignDefault));
+    cudaGraphNodeParams conditional{};
+    conditional.type = cudaGraphNodeTypeConditional;
+    conditional.conditional.handle = condition;
+    conditional.conditional.type = cudaGraphCondTypeWhile;
+    conditional.conditional.size = 1;
+    cudaGraphNode_t loop;
+    CHECK(cudaGraphAddNode(&loop, run->graph, nullptr, nullptr, 0, &conditional));
+    auto body = conditional.conditional.phGraph_out[0];
+    cudaGraphNode_t compute;
+    CHECK(cudaGraphAddChildGraphNode(&compute, body, nullptr, 0, reinterpret_cast<cudaGraph_t>(source)));
+    void *args[] = {&run->control, &run->index, &run->steps, &condition};
+    cudaKernelNodeParams kernel{};
+    kernel.func = reinterpret_cast<void *>(advance);
+    kernel.gridDim = dim3(1); kernel.blockDim = dim3(1); kernel.kernelParams = args;
+    cudaGraphNode_t boundary;
+    CHECK(cudaGraphAddKernelNode(&boundary, body, &compute, 1, &kernel));
+    CHECK(cudaGraphInstantiate(&run->executable, run->graph, 0));
+    CHECK(cudaGraphUpload(run->executable, run->work));
+    CHECK(cudaStreamSynchronize(run->work));
+    return cudaSuccess;
+#undef CHECK
+}
+
+extern "C" int cozy_repeat_launch(Repeat *run, uintptr_t producer) {
+    auto error = cudaSetDevice(run->device);
+    if (error != cudaSuccess) return error;
+    if (run->launched) return cudaErrorInvalidValue;
+    // The source inputs are ready before this graph; no cross-stream implicit default ordering.
+    error = cudaEventRecord(run->done, reinterpret_cast<cudaStream_t>(producer));
+    if (error != cudaSuccess) return error;
+    error = cudaStreamWaitEvent(run->work, run->done, 0);
+    if (error != cudaSuccess) return error;
+    run->launched = true;
+    error = cudaGraphLaunch(run->executable, run->work);
+    if (error != cudaSuccess) return error;
+    return cudaEventRecord(run->done, run->work);
+}
+
+extern "C" int cozy_repeat_poll(Repeat *run, unsigned *completed, unsigned *canceled, int *done) {
+    auto error = cudaSetDevice(run->device);
+    if (error != cudaSuccess) return error;
+    if (!run->launched) return cudaErrorInvalidValue;
+    auto finished = cudaEventQuery(run->done);
+    if (finished != cudaSuccess && finished != cudaErrorNotReady) return finished;
+    *done = finished == cudaSuccess;
+    if (run->pending_sample) {
+        error = cudaEventQuery(run->sampled);
+        if (error == cudaSuccess) { run->observed = *run->host_snapshot; run->pending_sample = false; }
+        else if (error != cudaErrorNotReady) return error;
+    }
+    if (!run->pending_sample) {
+        snapshot<<<1, 1, 0, run->control_stream>>>(run->control, run->device_snapshot);
+        error = cudaGetLastError(); if (error != cudaSuccess) return error;
+        error = cudaMemcpyAsync(run->host_snapshot, run->device_snapshot, sizeof(Snapshot), cudaMemcpyDeviceToHost, run->control_stream);
+        if (error != cudaSuccess) return error;
+        error = cudaEventRecord(run->sampled, run->control_stream); if (error != cudaSuccess) return error;
+        run->pending_sample = true;
+    }
+    *completed = run->observed.completed; *canceled = run->observed.cancel;
+    return cudaSuccess;
+}
+
+extern "C" int cozy_repeat_cancel(Repeat *run) {
+    auto error = cudaSetDevice(run->device);
+    if (error != cudaSuccess) return error;
+    cancel_repeat<<<1, 1, 0, run->control_stream>>>(run->control);
+    return cudaGetLastError();
+}
+
+extern "C" int cozy_repeat_wait(Repeat *run, unsigned *completed, unsigned *canceled) {
+    auto error = cudaSetDevice(run->device);
+    if (error != cudaSuccess) return error;
+    if (!run->launched) return cudaErrorInvalidValue;
+    error = cudaEventSynchronize(run->done); if (error != cudaSuccess) return error;
+    error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
+    Control state;
+    error = cudaMemcpy(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost);
+    if (error != cudaSuccess) return error;
+    *completed = state.completed; *canceled = state.cancel;
+    return cudaSuccess;
+}
+
+extern "C" unsigned cozy_repeat_nodes(Repeat *run) { return run->nodes; }
+
+extern "C" int cozy_repeat_destroy(Repeat *run) {
+    if (!run) return cudaSuccess;
+    auto error = cudaSetDevice(run->device);
+    if (error != cudaSuccess) return error;
+    error = cleanup(run);
+    if (error == cudaSuccess) delete run;
+    return error;
+}

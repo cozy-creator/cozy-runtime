@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, final
+from typing import TYPE_CHECKING, Any, Literal, final, overload
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
     from cozy_runtime.author._recipes import DeclaredRecipe
+    from cozy_runtime.author._prepared import Execution, PreparedRepeat
     from cozy_runtime.author._weights import Weights
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
@@ -189,12 +190,25 @@ class Context:
         """THE cancellation question. A passed deadline IS cancellation, not a second flag."""
         return self._cancel() or time.monotonic() >= self.deadline
 
-    def plan(self, *steps: str | Collection[str]) -> None:
+    @overload
+    def plan(self, prepared: PreparedRepeat, /) -> Execution: ...
+
+    @overload
+    def plan(self, *steps: str | Collection[str]) -> None: ...
+
+    def plan(self, *steps: str | Collection[str] | PreparedRepeat) -> Execution | None:
         """The models this call runs, in order, so GPU memory evicts and restores by them: each
         step a component name, or a set of names used together (`{"unet", "controlnet"}`).
         Declare it before the first model runs; calling again replaces it. No sizes or times."""
+        from cozy_runtime.author._prepared import PreparedRepeat
+
+        if len(steps) == 1 and isinstance(steps[0], PreparedRepeat):
+            return steps[0].submit(self)
+        if any(isinstance(step, PreparedRepeat) for step in steps):
+            raise TypeError("prepared work must be the only ctx.plan argument")
         if self._plan is not None:
-            self._plan(steps)
+            self._plan(steps)  # type: ignore[arg-type]
+        return None
 
     def raise_if_cancelled(self) -> None:
         """THE cancellation spelling."""

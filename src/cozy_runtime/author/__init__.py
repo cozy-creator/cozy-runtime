@@ -42,6 +42,7 @@ from cozy_runtime.author._attention_scope import (
 )
 from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable, prefetch
 from cozy_runtime.author._concurrent import concurrently
+from cozy_runtime.author._prepared import Execution, PreparedRepeat, Progress
 from cozy_runtime.author._context import (
     AdapterRef,
     Context,
@@ -330,6 +331,9 @@ __all__ = [
     "placeable",
     "prefetch",
     "prepare",
+    "PreparedRepeat",
+    "Execution",
+    "Progress",
     "publish_release",
     "register_adapter",
     "register_attention",
