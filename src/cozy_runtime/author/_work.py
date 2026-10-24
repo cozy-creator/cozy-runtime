@@ -1,7 +1,7 @@
 """The executor's work toward its calls' results, told to the machine (cl-648): its CPU no longer
 says a call moves, so the points the Runtime already passes count. A construction leg ends, a
-graph replays, an LM step decodes, a kernel build its call waits on moves (`done`); varena binds a
-block (`tensorfs.varena.torch.progress`). Once a second, while that count moved, each call in
+graph replays, an LM step decodes, a kernel build its call waits on moves (`done`), or residency
+binds a block (`internal.residency.progress`). Once a second, while that count moved, each call in
 flight is told it. Calls side by side in one executor share it, as they share its GPU."""
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
-#: Work units done in this process outside varena.
+#: Work units done in this process outside residency.
 done = 0
 
 SAMPLE_SECONDS = 1.0
@@ -23,9 +23,9 @@ _telling = threading.Lock()
 
 
 def count() -> int:
-    """This process's work so far: the Runtime's units and the blocks varena bound."""
-    varena = sys.modules.get("tensorfs.varena.torch")
-    return done + int(getattr(varena, "progress", 0))
+    """This process's work so far: the Runtime's units and the blocks residency bound."""
+    residency = sys.modules.get("cozy_runtime.internal.residency")
+    return done + int(getattr(residency, "progress", 0))
 
 
 def begin(call: str) -> None:
