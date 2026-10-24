@@ -39,8 +39,7 @@ def prepare(destination: Path, wheels: dict[str, Path]) -> None:
         raise ValueError("all three non-PyPI source wheels are required")
     source = Path(__file__).resolve().parent
     destination.mkdir(parents=True, exist_ok=False)
-    for name in ("package.toml", "pyproject.toml"):
-        shutil.copyfile(source / name, destination / name)
+    shutil.copyfile(source / "pyproject.toml", destination / "pyproject.toml")
     shutil.copytree(
         source / "h3_request_profile",
         destination / "h3_request_profile",

@@ -189,7 +189,7 @@ against the line taken before its envelope was granted, and the record is record
 
 `internal/static_interface.py` derives the interface from SOURCE (cr-114, decision #713 —
 package code is untrusted). `cozy-runtime describe` runs it by default: `ast` over the module
-package.toml's `[application] object` names, following module-scope imports inside the tree
+pyproject's `cozy.application` entry point names, following module-scope imports inside the tree
 (and cozy-runtime's own `cozy_runtime.derive.*` source), a constant folder over literals,
 names, integer arithmetic, `tuple(…)`/`list(…)` and one comprehension over a folded
 sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
@@ -235,7 +235,7 @@ staging): it supervises and does not execute, so it reads the source and takes i
 slots off the interface document.
 
 `internal/discovery.py` is the import path and the static reader's ORACLE: it imports exactly
-the ONE `App` export package.toml names, freezes it, and stops. `cozy-runtime --conformance
+the ONE `App` export that entry point names, freezes it, and stops. `cozy-runtime --conformance
 describe` runs both and refuses unless they are byte-identical — and refuses outright unless
 the running interpreter is the package's own locked environment (its distribution, at
 pyproject's version, resolves there), because importing package code is running it. That is

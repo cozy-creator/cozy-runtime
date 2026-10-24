@@ -3,7 +3,7 @@
 That is the COMPLETE discovery algorithm (§1.0). Importing a module never registers
 anything — registration is a method call on the app object — so there is nothing to
 harvest, no package to walk, no dependency to stub and no source to parse. Everything a
-package interface says comes from the object package.toml named.
+package interface says comes from the object pyproject's `cozy.application` entry point names.
 
 Execution containment is a TIER-INDEPENDENT property of the caller, not of this module:
 the trusted build runs `describe` in a disposable container of the already-built release
@@ -114,7 +114,7 @@ def discover_installed(
 ) -> Discovered:
     """Freeze one package interface-named export from the installed package environment.
 
-    A materialized rental has an immutable venv, not a copied source tree or package.toml.
+    A materialized rental has an immutable venv, not a copied source tree.
     The exact PackageInterface supplies the application identity; importing anything else
     or adding a host path would recreate the source/PYTHONPATH authority the fixed worker rejects.
     """
