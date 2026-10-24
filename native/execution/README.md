@@ -20,6 +20,9 @@ target representation and transform/LoRA identity; this primitive introduces no 
 Supplied Runtime Bindings are checked for validity and identity once per submission, along with
 every external tensor's geometry and storage pointers. Non-ATen launchers must supply their native
 module and storage owners explicitly.
+Node-kind inspection does not discover pointers hidden in custom/native kernel parameters.
+ATen dependency tracking and graph-pool ownership cover the supported Torch path; custom launches
+without complete explicit buffer/module owners are outside the admitted contract.
 
 Within a normal invocation, `Context.plan` registers one pending prepared-work owner before
 calling the provider. The request admits one complete prepared submission, rejects late or

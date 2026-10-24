@@ -27,7 +27,7 @@ import sys
 import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import Future
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass, field, is_dataclass, replace
 from fractions import Fraction
 from pathlib import Path
@@ -180,7 +180,15 @@ class _PreparedScope:
                 if cancel_error is not None:
                     raise cancel_error
         except BaseException as error:
+            complete = False
             if execution is not None and fault(error) not in (Fault.STICKY, Fault.DEVICE):
+                with suppress(BaseException):
+                    complete = execution.poll().done
+            if (
+                execution is not None
+                and not complete
+                and fault(error) not in (Fault.STICKY, Fault.DEVICE)
+            ):
                 self.failure = RuntimeFailure(
                     "prepared-work completion is unproven; retire executor", code="device_fault"
                 )
@@ -202,7 +210,11 @@ class _PreparedScope:
             (
                 error
                 for error in errors
-                if error is not None and fault(error) in (Fault.STICKY, Fault.DEVICE)
+                if error is not None
+                and (
+                    fault(error) in (Fault.STICKY, Fault.DEVICE)
+                    or (isinstance(error, RuntimeFailure) and error.code == "device_fault")
+                )
             ),
             None,
         )
