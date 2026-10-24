@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, ClassVar, Protocol
 
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author.kernels import (
     INT8_CONVROT,
     ROWWISE_FP8,
@@ -474,10 +475,8 @@ class Int8ConvRotNativeLeaf:
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
     ) -> Tensor:
-        if (
-            torch.cuda.is_available()
-            and int8_linear.native(torch, torch.cuda.current_device()) is None
-        ):
+        placed = placed_device()
+        if placed.type == "cuda" and int8_linear.native(torch, placed.index or 0) is None:
             # The op is built at boot; until it lands the reviewed comfy-kitchen binary serves
             # (its build starts here, beside the weight fill), else the eager int8 GEMM.
             int8_linear.kitchen(torch, torch.cuda.current_device())
@@ -617,9 +616,9 @@ class W4a8NativeLeaf:
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
     ) -> Tensor:
-        if torch.cuda.is_available():
+        if (placed := placed_device()).type == "cuda":
             # The 8-bit op is built at boot; asking starts its load beside the weight fill.
-            int8_linear.native(torch, torch.cuda.current_device())
+            int8_linear.native(torch, placed.index or 0)
         codes = parts["weight"]
         roles = {
             "weight": codes,
@@ -759,9 +758,9 @@ class Nvfp4NativeLeaf:
     def leaf(
         self, torch: ModuleType, parts: Mapping[str, Tensor], replaced: Tensor, out_dtype: Tensor
     ) -> Tensor:
-        if torch.cuda.is_available():
+        if (placed := placed_device()).type == "cuda":
             # Starts the kernel's build beside the weight fill; the first calls run eager.
-            int8_linear.kitchen(torch, torch.cuda.current_device())
+            int8_linear.kitchen(torch, placed.index or 0)
         params = dict(self.params)
         weight = parts["weight"].view(torch.uint8)
         if params.get("nibble_order") == "high_first":
