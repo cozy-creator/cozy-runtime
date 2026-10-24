@@ -135,11 +135,9 @@ handed over as verified paths; the executor is never given an address.
 
 **Progress is observed, never promoted into a timer-driven failure.** Advancing monotone
 positions and measured process work are reported; an unchanged sample stays `silent`. Process
-exit, typed outcomes, explicit cancellation and enclosing caller deadlines decide lifecycle —
-and so does a PROVEN wedge, which `internal/liveness.py` defines once for a stream, a child
-process and a local boot: still for longer than the subject's own longest observed pause, and
-never for less than a floor derived from the sampling cadence. No number of seconds kills
-anything on its own. Observation cannot reach residency or placement.
+exit, a dead peer, typed outcomes, explicit cancellation and enclosing caller deadlines decide
+lifecycle; work that is alive but still is shown, not killed (`tracker/design/stalls.md`). No
+number of seconds kills anything on its own. Observation cannot reach residency or placement.
 
 **Component residency is the runtime's, and the package has no vocabulary for it.** An
 package declares the possible heavyweight set of each public model operation with

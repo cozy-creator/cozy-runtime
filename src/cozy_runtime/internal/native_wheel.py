@@ -32,7 +32,7 @@ from typing import TypedDict
 
 from packaging.version import InvalidVersion, Version
 
-from cozy_runtime.internal import base_observation, canonical, liveness
+from cozy_runtime.internal import base_observation, canonical
 
 MAX_ELF_SECTIONS = 16_384
 MAX_NATIVE_MEMBERS = 4_096
@@ -541,16 +541,12 @@ def observe_seat(python: Path, environment: Mapping[str, str]) -> dict[str, obje
 
     try:
         returncode, stdout, stderr = _run_working(
-            [str(python), "-I", "-m", "cozy_runtime.internal.native_seat_probe"],
-            environment,
-            "native_seat_probe",
+            [str(python), "-I", "-m", "cozy_runtime.internal.native_seat_probe"], environment
         )
     except OSError as exc:
         raise NativeWheelRefusal(
             "package_environment_native_seat_probe_failed", type(exc).__name__
         ) from exc
-    except _Wedged as exc:
-        raise NativeWheelRefusal("package_environment_native_seat_probe_wedged", str(exc)) from exc
     if returncode != 0 or len(stdout) > MAX_TOOL_OUTPUT or len(stderr) > MAX_TOOL_OUTPUT:
         detail = stderr.decode("utf-8", "replace").strip()[:1000]
         raise NativeWheelRefusal(
@@ -682,24 +678,8 @@ def verify_seat(
     return dict(observation)
 
 
-class _Wedged(Exception):
-    """A child that provably stopped working, with the measurement that says so."""
-
-
-def _run_working(
-    command: list[str], environment: Mapping[str, str], what: str
-) -> tuple[int, bytes, bytes]:
-    """Run one disposable child to EXIT, ending it early only on a proven wedge.
-
-    No wall clock runs here. The child is sampled on `liveness.SAMPLE_SECONDS` — a poll
-    cadence, not a bound — and killed with its group only when its own work meter
-    (`proctree.progress_burn`: CPU plus bytes moved) has been flat for longer than
-    `liveness.Pace` allows against the pauses this same child has shown. A cold import that
-    is paging a gigabyte of shared objects is moving bytes and is left alone; a child stuck
-    on a lock it will never get is not, and is ended with the measurement in hand. An
-    unreadable meter decides nothing: the child then ends only by exiting.
-    """
-    pace = liveness.Pace()
+def _run_working(command: list[str], environment: Mapping[str, str]) -> tuple[int, bytes, bytes]:
+    """Run one disposable child to its exit; whatever of its group outlives it is ended."""
     with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
         process = subprocess.Popen(
             command,
@@ -710,14 +690,7 @@ def _run_working(
             start_new_session=True,
         )
         try:
-            while True:
-                try:
-                    returncode = process.wait(timeout=liveness.SAMPLE_SECONDS)
-                    break
-                except subprocess.TimeoutExpired:
-                    pace.observe(liveness.burn(process.pid))
-                    if pace.wedged(liveness.noise_floor()):
-                        raise _Wedged(f"{what}: {pace.verdict(liveness.noise_floor())}") from None
+            returncode = process.wait()
         finally:
             _kill_process_group(process)
             process.wait()
@@ -772,9 +745,7 @@ def qualify_operator(
         request,
     ]
     try:
-        returncode, result_stdout, result_stderr = _run_working(command, environment, fixture)
-    except _Wedged as exc:
-        raise NativeWheelRefusal("package_environment_native_operator_wedged", str(exc)) from exc
+        returncode, result_stdout, result_stderr = _run_working(command, environment)
     except OSError as exc:
         raise NativeWheelRefusal(
             "package_environment_native_operator_failed", type(exc).__name__

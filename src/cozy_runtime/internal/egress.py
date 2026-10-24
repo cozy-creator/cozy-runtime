@@ -21,18 +21,19 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import socket
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
-from cozy_runtime.internal import liveness
-
 #: How much of a body one read() pulls.
 CHUNK = 1 << 20
 
-#: The silence bound on ONE socket operation, never on a transfer: the runtime's one noise
-#: floor (`liveness.noise_floor`), the patience a tensorfs pull stream is given too.
-SILENCE_SECONDS = liveness.noise_floor()
+#: The silence bound on ONE socket operation, never on a transfer: the patience a tensorfs pull
+#: stream is given too. A plain HTTPS GET gives no other progress signal than its bytes.
+SILENCE_SECONDS = 30.0
+#: A fetch asks again, from the bytes it holds, until this many attempts in a row moved nothing.
+STILL_ATTEMPTS = 3
 
 
 #: The address classes nothing in this runtime connects to. ONE list, checked by
@@ -149,7 +150,9 @@ def _validate(url: str, policy: EgressPolicy) -> tuple[str, list[str]]:
 def fetch_public_wheel(
     path: Path, url: str, expected_digest: str, ceiling: int
 ) -> tuple[Path, int]:
-    """One public wheel, pinned by URL and sha256, fetched anonymously through this door."""
+    """One public wheel, pinned by URL and sha256, fetched anonymously through this door. A
+    transfer that goes silent is asked again from the bytes it holds (`Range`), and fails once
+    `STILL_ATTEMPTS` attempts in a row moved nothing."""
     import os
     import uuid
     from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -175,34 +178,49 @@ def fetch_public_wheel(
 
     check(url)
     temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".partial")
+    opener = build_opener(PublicRedirect())
     try:
-        with build_opener(PublicRedirect()).open(url, timeout=SILENCE_SECONDS) as response:
-            header = response.headers.get("Content-Length")
-            bound = int(header) if header is not None else ceiling
-            if not 0 < bound <= ceiling:
-                raise EnvironmentRefusal("package_environment_wheel_invalid", "wheel size bound")
-            path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            digest = hashlib.sha256()
-            length = 0
-            with temporary.open("xb") as target:
-                while block := response.read(CHUNK):
-                    length += len(block)
-                    if length > bound:
-                        raise EnvironmentRefusal(
-                            "package_environment_wheel_invalid", "wheel size bound"
-                        )
-                    digest.update(block)
-                    target.write(block)
-                target.flush()
-                os.fsync(target.fileno())
-            if (
-                header is not None and length != bound
-            ) or "sha256:" + digest.hexdigest() != expected_digest:
-                raise EnvironmentRefusal(
-                    "package_environment_wheel_invalid", "wheel hash or length changed"
-                )
-            temporary.chmod(0o444)
-            os.replace(temporary, path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        digest, length, bound, still = hashlib.sha256(), 0, -1, 0
+        with temporary.open("xb") as target:
+            while True:
+                held = length
+                request = Request(url, headers={"Range": f"bytes={length}-"} if length else {})
+                try:
+                    with opener.open(request, timeout=SILENCE_SECONDS) as response:
+                        if length and response.status != 206:  # the range was not honoured
+                            target.seek(0)
+                            target.truncate()
+                            digest, length, held = hashlib.sha256(), 0, 0
+                        if not length:
+                            header = response.headers.get("Content-Length")
+                            bound = int(header) if header is not None else -1
+                            if not 0 < (ceiling if bound < 0 else bound) <= ceiling:
+                                raise EnvironmentRefusal(
+                                    "package_environment_wheel_invalid", "wheel size bound"
+                                )
+                        while block := response.read(CHUNK):
+                            length += len(block)
+                            if length > (ceiling if bound < 0 else bound):
+                                raise EnvironmentRefusal(
+                                    "package_environment_wheel_invalid", "wheel size bound"
+                                )
+                            digest.update(block)
+                            target.write(block)
+                    break
+                except OSError:
+                    still = 0 if length > held else still + 1
+                    if still >= STILL_ATTEMPTS:
+                        raise
+                    time.sleep(2**still - 1)  # backs off only while nothing moves
+            target.flush()
+            os.fsync(target.fileno())
+        if (bound >= 0 and length != bound) or "sha256:" + digest.hexdigest() != expected_digest:
+            raise EnvironmentRefusal(
+                "package_environment_wheel_invalid", "wheel hash or length changed"
+            )
+        temporary.chmod(0o444)
+        os.replace(temporary, path)
         return path, length
     except (OSError, ValueError, EgressRefusal) as exc:
         raise EnvironmentRefusal(

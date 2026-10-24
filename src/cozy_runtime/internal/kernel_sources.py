@@ -792,7 +792,6 @@ def build_setup(
             cwd=tree / recipe.subdir,
             env=environment,
             report=report,
-            alongside=functools.partial(kernel_compile.compilers, Path(spec["ledger"])),
         )
         [info] = work.glob("*.egg-info/PKG-INFO")
         found = email.parser.Parser().parsestr(info.read_text())
