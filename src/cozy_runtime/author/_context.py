@@ -68,9 +68,8 @@ class RequestView:
     `view.generator` and fresh schedulers explicitly. It cannot be subclassed: a wider view
     would be that deleted proxy under another name.
 
-    `generator` is a `random.Random` while the runtime is weightless; it becomes a
-    `torch.Generator` with the first real fills (cr-005). Author code passes it through and
-    never inspects it, so the swap is source-compatible.
+    `generator` is a `random.Random` seeded from the request. Noise for a model is drawn with
+    `cozy_runtime.rng`, on the CPU, so a seed makes the same output on any device.
     """
 
     generator: random.Random

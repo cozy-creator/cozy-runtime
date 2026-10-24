@@ -1,0 +1,1 @@
+One image-request helper for every image package (xs-101): `Sizes` and `ImageRequest.size()` hold a request's size to a model's range with one rule (the pixel count, then the ratio, a 1/16 cap after rounding, one `clamp` row rule); `corners()` checks a `Box`; `cozy_runtime.rng` draws a seed's noise on the CPU, so CPU degraded mode makes the GPU's image.
