@@ -1,0 +1,1 @@
+A package call naming a field its installed callee does not declare drops that field with a warning in the run (`a package call named fields its callee does not declare`), as a request does; it no longer fails `child_arguments`. A declared field of the wrong type still refuses.
