@@ -25,7 +25,7 @@ import threading
 import time
 import weakref
 from collections import deque
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
@@ -578,47 +578,13 @@ def uses_components(
     components' weights, its arguments and the numerics it runs under. The Runtime checks
     for a stored result before the scope opens, so a hit stages nothing.
     """
-    if not names:
-        raise ConformanceError(
-            "@uses_components() is empty: a method that touches no components is pure "
-            "orchestration and belongs in module code, never on a Model (§1.1)",
-            code="empty_component_set",
-        )
-    seen: list[str] = []
-    for name in names:
-        if not isinstance(name, str) or not name or not name.replace("_", "").isalnum():
-            raise ConformanceError(
-                f"@uses_components({name!r}): component names are plain identifiers",
-                code="component_name",
-            )
-        if name in seen:
-            raise ConformanceError(
-                f"@uses_components: {name!r} is declared twice", code="duplicate_component"
-            )
-        seen.append(name)
-    components = tuple(names)
+    components = component_set(
+        names, memoize=memoize, memo=memo_version is not None or bool(memo_dependencies)
+    )
 
     def decorate(fn: Callable[Concatenate[M, P], R]) -> Callable[Concatenate[M, P], R]:
-        if fn.__name__ in _RUNTIME_MEMBERS:
-            raise ConformanceError(
-                f"@uses_components on {fn.__name__}: lifecycle and runtime-owned members do "
-                "not open component scopes — decorate the public method that forms the "
-                "runtime boundary (§1.1)",
-                code="component_placement",
-            )
-        if fn.__name__.startswith("_"):
-            raise ConformanceError(
-                f"@uses_components on {fn.__name__}: private helpers inherit their caller's "
-                "active scope and cannot be called as handler operations (§1.1)",
-                code="component_placement",
-            )
-        _check_signature(fn)
+        component_method(fn.__qualname__, inspect.signature(fn).parameters)
         wrapper = _async_wrapper(fn, components) if _is_async(fn) else _sync_wrapper(fn, components)
-        if not memoize and (memo_version is not None or memo_dependencies):
-            raise ConformanceError(
-                "a stage's memo_version and memo_dependencies need memoize=True",
-                code="invocable_memoize",
-            )
         if memoize:
             declare(fn, version=memo_version, dependencies=memo_dependencies)
             wrapper = memoized(fn, wrapper, components, is_async=_is_async(fn))
@@ -731,14 +697,58 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     return cast("Callable[Concatenate[M, P], R]", wrapper)
 
 
-def _check_signature(fn: Callable[..., object]) -> None:
-    for name in inspect.signature(fn).parameters:
-        if (why := EXCLUDED_KEYWORDS.get(name)) is not None:
+def component_set(names: Sequence[object], *, memoize: bool, memo: bool) -> tuple[str, ...]:
+    """One `@uses_components` declaration's names; `memo`: it names a memo version or helpers."""
+    if not names:
+        raise ConformanceError(
+            "@uses_components() is empty: a method that touches no components is pure "
+            "orchestration and belongs in module code, never on a Model (§1.1)",
+            code="empty_component_set",
+        )
+    seen: list[str] = []
+    for name in names:
+        if not isinstance(name, str) or not name or not name.replace("_", "").isalnum():
             raise ConformanceError(
-                f"{fn.__qualname__}({name}=): {why} — the method wrapper exposes no device, "
+                f"@uses_components({name!r}): component names are plain identifiers",
+                code="component_name",
+            )
+        if name in seen:
+            raise ConformanceError(
+                f"@uses_components: {name!r} is declared twice", code="duplicate_component"
+            )
+        seen.append(name)
+    if memo and not memoize:
+        raise ConformanceError(
+            "a stage's memo_version and memo_dependencies need memoize=True",
+            code="invocable_memoize",
+        )
+    return tuple(seen)
+
+
+def component_method(qualname: str, parameters: Iterable[str]) -> None:
+    """Where `@uses_components` may stand: a public, author-owned method that takes no
+    residency keyword. Both readers apply it: import at decoration, source per method."""
+    name = qualname.rpartition(".")[2]
+    if name in _RUNTIME_MEMBERS:
+        raise ConformanceError(
+            f"@uses_components on {name}: lifecycle and runtime-owned members do "
+            "not open component scopes — decorate the public method that forms the "
+            "runtime boundary (§1.1)",
+            code="component_placement",
+        )
+    if name.startswith("_"):
+        raise ConformanceError(
+            f"@uses_components on {name}: private helpers inherit their caller's "
+            "active scope and cannot be called as handler operations (§1.1)",
+            code="component_placement",
+        )
+    for parameter in parameters:
+        if (why := EXCLUDED_KEYWORDS.get(parameter)) is not None:
+            raise ConformanceError(
+                f"{qualname}({parameter}=): {why} — the method wrapper exposes no device, "
                 "movement, allocation, offload, pinning, eviction or residency backend (§1.1)",
                 code="excluded_keyword",
-                fields=[name],
+                fields=[parameter],
             )
 
 

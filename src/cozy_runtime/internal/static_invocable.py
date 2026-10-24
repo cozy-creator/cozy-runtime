@@ -3,33 +3,29 @@
 from __future__ import annotations
 
 import ast
-from typing import TYPE_CHECKING, Any, cast, get_origin
+from typing import TYPE_CHECKING, Any, get_origin
 
 import msgspec
 
-import cozy_runtime.internal.invocable_interface as invocable_interface
-import cozy_runtime.internal.package_interface as package_interface
 from cozy_runtime import author
 from cozy_runtime.author._assets import Assets
-from cozy_runtime.author._describe import assert_declaration_shape
-from cozy_runtime.author._model_defaults import check_model_arguments
-from cozy_runtime.author._services import SERVICES, UNGRANTABLE
+from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import (
+    Declaration,
+    Slot,
     _classify,
     _wire_default,
     _wire_type,
     assets_binding,
     check_parameter_markers,
-    media_kinds,
 )
 from cozy_runtime.author._walker import is_struct, strip
-from cozy_runtime.internal.canonical import Json
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.static_interface import Reader, Registration
 
 
-def build(reader: Reader, registration: Registration) -> dict[str, Json]:
+def build(reader: Reader, registration: Registration) -> Declaration:
     module, fn = registration.module, registration.fn
     positional = [*fn.args.posonlyargs, *fn.args.args]
     if (
@@ -56,9 +52,9 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     fields: list[Any] = []
     parameters: list[str] = []
     explicit_defaults: dict[str, object] = {}
-    models: list[dict[str, Json]] = []
+    slots: list[Slot] = []
     contexts: list[str] = []
-    capabilities: list[str] = []
+    services: list[str] = []
     assets = None
     for index, arg in enumerate([*positional, *fn.args.kwonlyargs]):
         if arg.annotation is None:
@@ -67,19 +63,9 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
         override = registration.model_classes.get(arg.arg)
         found = (override, False) if override else reader.model_annotation(module, annotation)
         if found is not None:
-            model, weights = found
             if arg.arg in defaults:
                 reader.refuse(module, arg, "a model injection cannot have a default")
-            models.append(
-                package_interface.model_slot(
-                    f"{registration.name}.models.{arg.arg}",
-                    model,
-                    default=registration.model_defaults.get(arg.arg),
-                    uses=registration.model_components.get(arg.arg, ()),
-                    weights=weights,
-                    on_demand=arg.arg in registration.model_on_demand,
-                )
-            )
+            slots.append(Slot(arg.arg, *found))
             fields.append((arg.arg, author.ModelArtifact | None, None))
             parameters.append(arg.arg)
             continue
@@ -100,7 +86,7 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
                     reader.refuse(module, arg, "Context must be the first invocable parameter")
                 contexts.append(arg.arg)
             if parameter.capability:
-                capabilities.append(parameter.capability)
+                services.append(parameter.capability)
             continue
         if arg not in fn.args.kwonlyargs:
             reader.refuse(module, arg, "invocable operation arguments must be keyword-only")
@@ -125,12 +111,8 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
             explicit_defaults[arg.arg] = default
         else:
             fields.append((arg.arg, translated))
-    if len(contexts) != 1 or contexts[0] != positional[0].arg:
+    if not contexts:
         reader.refuse(module, fn, "an invocable must have exactly one Context, first")
-    if len(capabilities) != len(set(capabilities)):
-        reader.refuse(module, fn, "an injected service is requested twice")
-    if set(capabilities) & set(UNGRANTABLE):
-        reader.refuse(module, fn, "invocable requests a capability nothing can grant")
     payload = msgspec.defstruct(
         f"{fn.name}Request",
         fields,
@@ -146,45 +128,13 @@ def build(reader: Reader, registration: Registration) -> dict[str, Json]:
     result, _ = strip(result)
     if not is_struct(result):
         reader.refuse(module, fn.returns, "an invocable result must be a msgspec.Struct")
-    assert_declaration_shape(payload)
-    assert_declaration_shape(result, result=True)
-    doc = package_interface.callable_doc(
-        name=registration.name,
+    return registration.declaration(
         payload_type=payload,
         result_type=result,
-        models=models,
+        contexts=tuple(contexts),
+        services=tuple(services),
+        slots=tuple(slots),
         assets=assets,
-        publishes=registration.publishes,
-        weights_outputs=registration.weights,
-        accelerator=registration.accelerator,
-    )
-    if registration.weights and "weights" not in capabilities:
-        capabilities.append("weights")
-    if media_kinds(payload, assets):
-        capabilities.append("media_decode")
-    slots = [str(slot["path"]).rsplit(".", 1)[-1] for slot in models]
-    check_model_arguments(registration.model_defaults, slots)
-    check_model_arguments(registration.model_components, slots, what="components")
-    constructed = [str(s["path"]).rsplit(".", 1)[-1] for s in models if not s.get("weights")]
-    check_model_arguments(
-        dict.fromkeys(registration.model_on_demand), constructed, what="on_demand"
-    )
-    metadata = invocable_interface.from_types(
-        payload,
-        result,
-        module=module.name,
-        export=fn.name,
-        context=contexts[0],
-        parameters=parameters,
+        parameters=tuple(parameters),
         parameter_defaults=explicit_defaults,
-        memoize=registration.memoize,
-        capabilities=capabilities,
     )
-    doc["invocable"] = cast(Json, metadata)
-    invocable_interface.project_serving_models(doc)
-    invocable_interface.validate(
-        msgspec.convert(doc["invocable"], invocable_interface.Invocable, strict=True),
-        doc["request"],
-        doc["result"],
-    )
-    return doc
