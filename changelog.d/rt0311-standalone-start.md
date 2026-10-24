@@ -1,0 +1,1 @@
+A GPU Start that leases nothing runs its memory standalone instead of refusing and poisoning the executor: memory protocol 0 (every Windows TensorD, and Linux with no lease manager) and an older TensorD's Start, whose ledger descriptors are read and closed (run 15577: TensorD 0.11.12 beside a 0.31.0 Runtime).

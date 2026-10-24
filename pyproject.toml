@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.14,<0.15",
+    "tensorfs>=0.15,<0.16",
     "cryptography>=45",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -60,6 +60,8 @@ packages = ["src/cozy_runtime"]
 
 [tool.uv]
 package = true
+# TensorFS 0.15.0 before the gate promotes it to PyPI: its GitHub prerelease (CI v2 pre-release).
+find-links = ["https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/varena-dev-07d211695"]
 
 [tool.mypy]
 python_version = "3.12"
@@ -117,7 +119,7 @@ media = [
 ]
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
-model-execution = ["tensorfs>=0.14,<0.15"]
+model-execution = ["tensorfs>=0.15,<0.16"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
