@@ -561,7 +561,7 @@ class DerivedCache:
     bound the least recently used entries leave to admit a new one; an entry larger than
     the whole bound refuses. On a placed model its entries live in a latent region of their
     own, pinned while a component scope of its model is open (`enter`/`leave`): between scopes
-    varena may take it, and the next scope finds the cache empty.
+    the residency module may release its entries and the next scope finds the cache empty.
     """
 
     __slots__ = (
@@ -642,7 +642,7 @@ class DerivedCache:
         """Its region, made with its first entry on a placed model (None unplaced)."""
         residency = self._owner._cozy_residency
         if self._region is None and residency is not None:
-            self._region = residency.region(f"cache:{self.name}", "latent", ())
+            self._region = residency.region(f"cache:{self.name}", "latent", (), release=self.drop)
         return self._region
 
     def enter(self) -> None:
@@ -691,7 +691,9 @@ class _Region(Protocol):
 
 
 class _Residency(Protocol):
-    def region(self, owner: str, kind: str, sets: object) -> _Region: ...
+    def region(
+        self, owner: str, kind: str, sets: object, *, release: Callable[[], None] | None = None
+    ) -> _Region: ...
 
 
 class _ScopeHost(Protocol):

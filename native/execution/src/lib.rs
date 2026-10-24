@@ -1,0 +1,359 @@
+//! One resident graph definition, one GPU-driven loop, and its complete owner lifetime.
+use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
+use std::{ffi::c_void, sync::Mutex};
+
+pyo3::create_exception!(_execution, NativeExecutionError, PyRuntimeError);
+
+unsafe extern "C" {
+    fn cozy_repeat_create(
+        source: usize,
+        index: usize,
+        device: i32,
+        steps: u32,
+        out: *mut *mut c_void,
+    ) -> i32;
+    fn cozy_repeat_launch(run: *mut c_void, producer: usize) -> i32;
+    fn cozy_repeat_ready(run: *mut c_void, done: *mut i32) -> i32;
+    fn cozy_repeat_poll(
+        run: *mut c_void,
+        completed: *mut u32,
+        canceled: *mut u32,
+        done: *mut i32,
+    ) -> i32;
+    fn cozy_repeat_cancel(run: *mut c_void) -> i32;
+    fn cozy_repeat_wait(run: *mut c_void, completed: *mut u32, canceled: *mut u32) -> i32;
+    fn cozy_repeat_nodes(run: *mut c_void) -> u32;
+    fn cozy_repeat_destroy(run: *mut c_void) -> i32;
+}
+
+fn cuda_error(py: Python<'_>, operation: &str, code: i32) -> PyErr {
+    if matches!(code, -102..=-100) {
+        let error = NativeExecutionError::new_err(if code == -102 {
+            "prepared submission during CUDA capture is not supported"
+        } else if code == -101 {
+            "prepared graph body is empty"
+        } else {
+            "prepared graph contains unsupported node types or exceeds bounded inspection limits"
+        });
+        let _ = error.value(py).setattr("eligibility_refusal", true);
+        return error;
+    }
+    if code < 0 {
+        return PyRuntimeError::new_err(match code {
+            -1 => "stale execution token",
+            -2 => "prepared repeat is closed",
+            _ => "prepared repeat is not running",
+        });
+    }
+    let error = NativeExecutionError::new_err(format!("{operation}: CUDA error {code}"));
+    let _ = error.value(py).setattr("error_code", code);
+    error
+}
+
+struct State {
+    pointer: usize,
+    launched: bool,
+    failed: bool,
+    epoch: u64,
+    destroy_failed: bool,
+}
+
+#[pyclass(
+    name = "ResidentRepeat",
+    module = "cozy_runtime._kernels._execution",
+    frozen
+)]
+struct ResidentRepeat {
+    state: Mutex<State>,
+    owners: Mutex<Vec<Py<PyAny>>>,
+    pid: u32,
+    nodes: u32,
+    device: i32,
+    steps: u32,
+}
+
+impl ResidentRepeat {
+    fn check_process(&self) -> PyResult<()> {
+        if self.pid != std::process::id() {
+            return Err(PyRuntimeError::new_err(
+                "prepared GPU work cannot be used after fork",
+            ));
+        }
+        Ok(())
+    }
+
+    // The entire mutex lifetime is inside detach: no lock is held while reacquiring the GIL.
+    fn native<T: Send>(
+        &self,
+        py: Python<'_>,
+        operation: &str,
+        epoch: Option<u64>,
+        call: impl FnOnce(&mut State) -> Result<T, i32> + Send,
+    ) -> PyResult<T> {
+        self.check_process()?;
+        py.detach(|| {
+            let mut state = self.state.lock().map_err(|_| 999)?;
+            if epoch.is_some_and(|expected| expected != state.epoch) {
+                return Err(-1);
+            }
+            if state.pointer == 0 {
+                return Err(-2);
+            }
+            if state.failed {
+                return Err(999);
+            }
+            let result = call(&mut state);
+            if result.as_ref().is_err_and(|code| *code >= 0) {
+                state.failed = true;
+            }
+            result
+        })
+        .map_err(|code| cuda_error(py, operation, code))
+    }
+}
+
+impl ResidentRepeat {
+    fn dispose(&self, py: Python<'_>, epoch: Option<u64>) -> PyResult<()> {
+        self.check_process()?;
+        py.detach(|| {
+            let mut state = self.state.lock().map_err(|_| 999)?;
+            if epoch.is_some_and(|expected| expected != state.epoch) {
+                return Err(-1);
+            }
+            if state.destroy_failed {
+                return Err(999);
+            }
+            if state.pointer == 0 {
+                return Ok(());
+            }
+            // SAFETY: destruction joins both streams before releasing graph/control storage.
+            let code = unsafe { cozy_repeat_destroy(state.pointer as *mut c_void) };
+            if code != 0 {
+                state.failed = true;
+                state.destroy_failed = true;
+                return Err(code);
+            }
+            state.pointer = 0;
+            Ok(())
+        })
+        .map_err(|code| cuda_error(py, "close resident repeat", code))?;
+        let owners = {
+            let mut held = self
+                .owners
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?;
+            std::mem::take(&mut *held)
+        };
+        // Python destructors may reenter close. No native mutex may span their execution.
+        drop(owners);
+        Ok(())
+    }
+}
+
+#[pymethods]
+impl ResidentRepeat {
+    #[new]
+    fn new(
+        py: Python<'_>,
+        source_graph: usize,
+        index: usize,
+        device: i32,
+        steps: u32,
+        owners: Vec<Py<PyAny>>,
+    ) -> PyResult<Self> {
+        if source_graph == 0 || index == 0 || steps == 0 {
+            return Err(PyRuntimeError::new_err(
+                "nonempty owned graph, GPU index and positive repeat count required",
+            ));
+        }
+        let (pointer, code) = py.detach(|| {
+            let mut pointer = std::ptr::null_mut();
+            // SAFETY: private bridge passes a live Torch-owned graph definition and int64 device tensor.
+            let code =
+                unsafe { cozy_repeat_create(source_graph, index, device, steps, &mut pointer) };
+            (pointer as usize, code)
+        });
+        if code != 0 {
+            // SAFETY: the helper returns its partial owner even on failure.
+            if pointer != 0 && unsafe { cozy_repeat_destroy(pointer as *mut c_void) } != 0 {
+                // Unknown device completion: retain every Python/Torch storage owner until process exit.
+                std::mem::forget(owners);
+            }
+            return Err(cuda_error(py, "prepare resident repeat", code));
+        }
+        // SAFETY: the successfully constructed handle remains exclusively owned here.
+        let nodes = unsafe { cozy_repeat_nodes(pointer as *mut c_void) };
+        Ok(Self {
+            state: Mutex::new(State {
+                pointer,
+                launched: false,
+                failed: false,
+                epoch: 0,
+                destroy_failed: false,
+            }),
+            owners: Mutex::new(owners),
+            pid: std::process::id(),
+            nodes,
+            device,
+            steps,
+        })
+    }
+
+    #[getter]
+    fn body_nodes(&self) -> u32 {
+        self.nodes
+    }
+
+    fn facts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.check_process()?;
+        let (launches, closed) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("native owner poisoned"))?;
+            (state.epoch, state.pointer == 0)
+        };
+        // These facts originate in the actual constructed native handle, never a protocol match.
+        let result = PyDict::new(py);
+        result.set_item("execution_mode", "cuda_conditional_while")?;
+        result.set_item("body_nodes", self.nodes)?;
+        result.set_item("device", self.device)?;
+        result.set_item("steps_per_launch", self.steps)?;
+        result.set_item("host_graph_launches", launches)?;
+        result.set_item("control_kernels_preloaded", true)?;
+        result.set_item("closed", closed)?;
+        Ok(result)
+    }
+
+    fn launch(&self, py: Python<'_>, producer_stream: usize) -> PyResult<u64> {
+        self.native(py, "launch resident repeat", None, |state| {
+            // SAFETY: exclusive handle, source owners retained; producer stream belongs to this device.
+            match unsafe { cozy_repeat_launch(state.pointer as *mut c_void, producer_stream) } {
+                0 => {
+                    state.launched = true;
+                    state.epoch += 1;
+                    Ok(state.epoch)
+                }
+                code => Err(code),
+            }
+        })
+    }
+
+    fn poll(&self, py: Python<'_>, epoch: u64) -> PyResult<(u32, bool, bool)> {
+        self.native(py, "observe resident repeat", Some(epoch), |state| {
+            if !state.launched {
+                return Err(-3);
+            }
+            let (mut completed, mut canceled, mut done) = (0, 0, 0);
+            // SAFETY: valid owner and stack outputs; snapshot reads GPU atomics on its own stream.
+            match unsafe {
+                cozy_repeat_poll(
+                    state.pointer as *mut c_void,
+                    &mut completed,
+                    &mut canceled,
+                    &mut done,
+                )
+            } {
+                0 => Ok((completed, canceled != 0, done != 0)),
+                code => Err(code),
+            }
+        })
+    }
+
+    fn cancel(&self, py: Python<'_>, epoch: u64) -> PyResult<()> {
+        self.native(py, "cancel resident repeat", Some(epoch), |state| {
+            if !state.launched {
+                return Err(-3);
+            }
+            // SAFETY: cancellation is an atomic GPU write on a separate control stream.
+            match unsafe { cozy_repeat_cancel(state.pointer as *mut c_void) } {
+                0 => Ok(()),
+                code => Err(code),
+            }
+        })
+    }
+
+    fn wait(&self, py: Python<'_>, epoch: u64) -> PyResult<(u32, bool)> {
+        loop {
+            let ready = self.native(py, "observe resident completion", Some(epoch), |state| {
+                if !state.launched {
+                    return Err(-3);
+                }
+                let mut done = 0;
+                // SAFETY: event query only; no launch and no mutex held while parked below.
+                match unsafe { cozy_repeat_ready(state.pointer as *mut c_void, &mut done) } {
+                    0 => Ok(done != 0),
+                    code => Err(code),
+                }
+            })?;
+            if ready {
+                break;
+            }
+            py.detach(|| std::thread::sleep(std::time::Duration::from_millis(1)));
+        }
+        self.native(py, "wait for resident repeat", Some(epoch), |state| {
+            if !state.launched {
+                return Err(-3);
+            }
+            let (mut completed, mut canceled) = (0, 0);
+            // SAFETY: waits for GPU completion; never submits another iteration.
+            match unsafe {
+                cozy_repeat_wait(state.pointer as *mut c_void, &mut completed, &mut canceled)
+            } {
+                0 => Ok((completed, canceled != 0)),
+                code => Err(code),
+            }
+        })
+    }
+
+    fn close(&self, py: Python<'_>, epoch: u64) -> PyResult<()> {
+        self.dispose(py, Some(epoch))
+    }
+
+    fn close_owner(&self, py: Python<'_>) -> PyResult<()> {
+        self.dispose(py, None)
+    }
+}
+
+impl Drop for ResidentRepeat {
+    fn drop(&mut self) {
+        if self.pid != std::process::id() {
+            // Never acquire inherited CUDA/mutex state, or destroy inherited Torch owners after fork.
+            std::mem::forget(std::mem::take(
+                self.owners
+                    .get_mut()
+                    .unwrap_or_else(|error| error.into_inner()),
+            ));
+            return;
+        }
+        let Ok(state) = self.state.get_mut() else {
+            std::mem::forget(std::mem::take(
+                self.owners
+                    .get_mut()
+                    .unwrap_or_else(|error| error.into_inner()),
+            ));
+            return;
+        };
+        // SAFETY: the last Python owner implies no method can concurrently touch the handle.
+        if state.destroy_failed
+            || (state.pointer != 0
+                && unsafe { cozy_repeat_destroy(state.pointer as *mut c_void) } != 0)
+        {
+            std::mem::forget(std::mem::take(
+                self.owners
+                    .get_mut()
+                    .unwrap_or_else(|error| error.into_inner()),
+            ));
+        }
+    }
+}
+
+#[pymodule]
+fn _execution(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add(
+        "NativeExecutionError",
+        module.py().get_type::<NativeExecutionError>(),
+    )?;
+    module.add_class::<ResidentRepeat>()?;
+    Ok(())
+}
