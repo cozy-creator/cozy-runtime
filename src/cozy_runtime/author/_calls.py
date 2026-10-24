@@ -312,7 +312,7 @@ class _Broker:
         self.context: Context | None = None
         self.grant_token = object()
         self.telemetry: Telemetry | None = None
-        #: The attempt's media reader: received media and Tree members read through it.
+        #: The attempt's media reader: received media read through it.
         self.media: MediaReads | None = None
 
     def bind(

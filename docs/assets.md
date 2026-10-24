@@ -123,22 +123,7 @@ Pass `assets` to another managed function. `assets.select("product", "woman")` o
 `assets[:2]` reorders references without reading and keeps custody, labels and fidelity.
 Child input IDs are rebound; nonempty labels stay unique.
 
-## Tree members and child results
-
-```python
-image = prefix.member(
-    "shots/000000/continuation.png",
-    ImageAsset,
-    bound=AssetBound(max_bytes=8 << 20, max_decoded_bytes=64 << 20),
-)
-pixels = image.read()
-await next_shot(opening_frame=image)
-```
-
-`member` also accepts `VideoAsset`, `AudioAsset` and `FileAsset`. Runtime verifies the
-native Tree membership, byte identity, media type and bound, and uses the materialized
-member without copying it. The handle is valid only during this attempt; use `Outputs`
-to export it.
+## Child results
 
 A function returning media declares the consumer's decode bound on its result:
 

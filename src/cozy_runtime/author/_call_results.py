@@ -120,7 +120,6 @@ def decode(
             tree = Tree(digest, digest=digest, root=Path(grant.local), attempt=request_id)
             tree.size_bytes = size
             tree._read_guard = guard
-            tree._member_token = grant_token
             handle: Asset | Tree = tree
         else:
             asset: Asset = _ASSETS[kind](
