@@ -991,7 +991,7 @@ class Placement:
             graphs.retire_stale(self.torch, self.models[name].module)
         stream = self.torch.cuda.current_stream() if self.memory.cuda else None
         for name in sorted(entering - self.holds.keys() - self.unheld):
-            shed = functools.partial(self.holds.pop, name, None)
+            shed = functools.partial(self._shed, name)
             hold = self.models[name].hold(shed, free_only=True)
             if hold is None:
                 self.unheld.add(name)
@@ -1002,7 +1002,7 @@ class Placement:
                 # its decoded tensors stay while it runs; dropped while unused, binds decode again
                 routes = self.routes.get(name)
                 region = routes.region if routes is not None else None
-                if region is not None and passes.enter_context(region.pin()):
+                if routes is not None and region is not None and passes.enter_context(region.pin()):
                     routes.forget()
                 passes.enter_context(self.models[name].passing(method))
             yield
@@ -1012,6 +1012,9 @@ class Placement:
         for name in [name for name in self.holds if name not in keep]:
             self.holds.pop(name)[0].release()
             self.unheld.clear()  # room came back
+
+    def _shed(self, component: str) -> None:
+        self.holds.pop(component, None)
 
     def graph_held(self, component: str) -> Any:
         """The stream `component`'s held blocks bound on, or None when they are not held."""
@@ -1056,7 +1059,7 @@ class Placement:
         return self.models[component].retain(paths)
 
     def graph_accounted(self) -> bool:
-        return self.memory.cuda
+        return bool(self.memory.cuda)
 
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
