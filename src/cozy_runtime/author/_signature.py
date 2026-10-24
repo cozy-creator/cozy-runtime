@@ -357,6 +357,13 @@ def _hints(fn: Callable[..., object]) -> Mapping[str, object]:
         ) from exc
 
 
+def model_class(annotation: object) -> type[Model[Any]] | None:
+    """The Model class a model parameter names: `M`, or `M[P]` by its origin
+    (`quantize_calibrated`'s `Model[Any]`), as `weights_class` reads `Weights[M]`."""
+    cls = get_origin(annotation) or annotation
+    return cls if isinstance(cls, type) and issubclass(cls, Model) else None
+
+
 def _classify(name: str, annotation: object, where: str) -> Param:
     base, markers = strip(annotation)
     if any(isinstance(m, _PreflightMarker) for m in markers):
@@ -376,6 +383,17 @@ def _classify(name: str, annotation: object, where: str) -> Param:
                 fields=[name],
             )
         return Param(name, "weights", layout)
+    if (model := model_class(base)) is not None:
+        if markers:
+            raise ConformanceError(
+                f"{where}: model parameter {name} carries {markers[0]!r} — the Annotated "
+                "override-marker plane is EMPTY at launch: a bare typed parameter is "
+                "unconditionally the whole declaration (§1.1). Future markers enter "
+                "through cr-018's door",
+                code="empty_marker_plane",
+                fields=[name],
+            )
+        return Param(name, "model", model)
     origin = get_origin(base)
     if base is Assets or origin is Assets:
         assets_binding(name, annotation)
@@ -396,17 +414,6 @@ def _classify(name: str, annotation: object, where: str) -> Param:
                 continue
             if issubclass(base, plain):
                 return Param(name, "service", base, cap)
-        if issubclass(base, Model):
-            if markers:
-                raise ConformanceError(
-                    f"{where}: model parameter {name} carries {markers[0]!r} — the Annotated "
-                    "override-marker plane is EMPTY at launch: a bare typed parameter is "
-                    "unconditionally the whole declaration (§1.1). Future markers enter "
-                    "through cr-018's door",
-                    code="empty_marker_plane",
-                    fields=[name],
-                )
-            return Param(name, "model", base)
         if is_struct(base):
             return Param(name, "payload", base)
     raise ConformanceError(
@@ -484,12 +491,10 @@ def analyze(
             base, _ = strip(annotation)
             injected = (
                 base is Context
+                or model_class(base) is not None
                 or (
                     isinstance(base, type)
-                    and (
-                        issubclass(base, Model)
-                        or any(issubclass(base, service) for service in SERVICES.values())
-                    )
+                    and any(issubclass(base, service) for service in SERVICES.values())
                 )
                 or get_origin(base) in (Settings, Secrets)
                 or weights_class(base) is not None
@@ -499,7 +504,14 @@ def analyze(
                     raise ConformanceError(
                         "invocable arguments must be keyword-only", code="invocable_signature"
                     )
-                _wire_type(annotation)
+                try:
+                    _wire_type(annotation)
+                except ConformanceError as exc:
+                    raise ConformanceError(
+                        f"{where}: parameter {parameter.name}: {exc.message}",
+                        code=exc.code,
+                        fields=[parameter.name],
+                    ) from None
                 params.append(Param(parameter.name, "wire", annotation))
                 if parameter.default is parameter.empty:
                     wire_fields.append((parameter.name, annotation))
@@ -517,9 +529,7 @@ def analyze(
                 raise ConformanceError(
                     "injected invocable parameters cannot have defaults", code="injected_default"
                 )
-            if weights_class(base) is not None or (
-                isinstance(base, type) and issubclass(base, Model)
-            ):
+            if weights_class(base) is not None or model_class(base) is not None:
                 # Ordinary top-level invocation may use the owner's frozen model
                 # binding. A managed caller may supply an exact produced artifact
                 # override, which the owner also binds through that same model lane.
@@ -700,7 +710,7 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
                 _wire_type(field.type, seen | {base})
             return
     raise ConformanceError(
-        "invocable type is recursive or has no portable wire representation",
+        f"invocable type {annotation!r} is recursive or has no portable wire representation",
         code="invocable_wire_type",
     )
 
@@ -729,11 +739,7 @@ def analyze_preflight(
         )
     for pname in positional:
         base, _ = strip(hints.get(pname, object))
-        if (
-            base is Context
-            or weights_class(base) is not None
-            or (isinstance(base, type) and issubclass(base, Model))
-        ):
+        if base is Context or weights_class(base) is not None or model_class(base) is not None:
             raise ConformanceError(
                 f"preflight {where}: parameter {pname} reaches {base!r} — a preflight has "
                 "no Context, Model, device, network, output or secret access",
