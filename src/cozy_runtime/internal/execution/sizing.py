@@ -1,5 +1,4 @@
-"""A pure cut site's level from its op's live shapes, against the room the agent reports
-(design/varena-leases.md §8 "No learning loop"; status/s4-leases-runtime-plan.md §5).
+"""A pure cut site's level from its op's live shapes and executor-local available memory.
 
 Arithmetic on the operands, never an OOM probe, so a first try fits: `need(level)` is the bytes
 live at a piece's peak, the whole output included, each term rounded up to the allocation
@@ -21,11 +20,9 @@ type Need = Callable[[int, int], int]
 
 @dataclass(frozen=True, slots=True)
 class Room:
-    """What this process may hold now, as varena's `Room` (`r.room(step)`) reports it: its float
-    and the manager's free (net of the driver headroom), revocable bytes outside the step's plan
-    sets (`cold`), its own inside them (`warm`), the allocation granularity every need rounds up
-    to, and the streaming floor the warm tier leaves (SLOTS of the largest block it would evict,
-    so those blocks bind again within the step)."""
+    """Local free bytes and eligible cached weights outside/inside the current scope's plan.
+    Active weights and graph-retained tensors are excluded. The pure-cut caller reclaims any
+    selected cached bytes before executing; the allocator itself owns no eviction policy."""
 
     free: int
     cold: int

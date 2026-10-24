@@ -1090,6 +1090,11 @@ def _record(
                 graph.reset()
             if not recorder.recordings:
                 recorder.pool = None
+                if recorder.binding is not None:
+                    # A stock binding owns weight storage once prepared. A rejected warm-up
+                    # must not retain a whole root when no executable uses those addresses.
+                    recorder.binding.close()
+                    recorder.binding = None
 
 
 @contextmanager

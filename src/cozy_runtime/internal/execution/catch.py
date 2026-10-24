@@ -1,5 +1,4 @@
-"""Pure-site cuts sized from their operands against the room varena reports (design
-varena-leases §8 "No learning loop"; `sizing`).
+"""Pure-site cuts sized from their operands against executor-local residency (`sizing`).
 
 A pure cut site picks its level at dispatch from its op's live shapes (`need`) against the
 request's room (`r.room()`), so its first try fits: no OOM probing, nothing remembered. A refusal
@@ -28,7 +27,7 @@ from cozy_runtime.internal.residency import Request
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
 
-#: the varena request being served (`serving`): its pure cut sites size from its room
+#: the request being served (`serving`): its pure cut sites size from its local room
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
 
 
@@ -151,16 +150,26 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         return run(0)
     scope = Scope(site)
     _local.scopes.append(scope)
+    available = request.room()
+
+    def room() -> sizing.Room:
+        nonlocal available
+        available = request.room()
+        return available
 
     def whole(level: int) -> T:
         scope.ordinals.clear()
+        # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
+        # site's predicted cold/warm bytes must be reclaimed before running that site.
+        if not _capturing() and (wanted := need(level, available.granularity)) > available.free:
+            request.reclaim(wanted)
         return run(level)
 
     try:
         if _capturing():
-            return whole(sizing.choose(finest, need, request.room())[0])
+            return whole(sizing.choose(finest, need, available)[0])
         try:
-            result, level, steps, tier = sizing.descend(finest, need, request.room, whole, _refused)
+            result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
         except Exception as exc:
             if short(exc):
                 with _ROWS_LOCK:
