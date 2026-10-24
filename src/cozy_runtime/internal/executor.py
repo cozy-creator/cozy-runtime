@@ -662,6 +662,11 @@ class _CompositeResidency:
         }
 
 
+#: Whether this varena takes a charge page at open (`Memory.open(charge=)`, varena-local A2),
+#: read off the compiled `Memory` without importing torch: an older one runs uncharged.
+_CHARGES = "charge" in (getattr(tensorfs.varena.Memory.cuda, "__text_signature__", "") or "")
+
+
 def _leases(command: Start) -> int | None:
     """TensorD's lease namespace when it leases this executor's pages (memory protocol 2), else
     None: off Linux, with no manager, or an older TensorD, varena runs each GPU standalone."""
@@ -811,6 +816,9 @@ class Executor:
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
         self.leases: int | None = None
+        #: HOST ONLY: the machine's charge page (`Start.charge`), an fd this process keeps open:
+        #: varena charges every byte it creates on a GPU to that GPU's section of it
+        self.charge: int | None = None
         #: The machine's sealed TensorFS cache directory.
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -975,6 +983,9 @@ class Executor:
             # 2: each GPU's weight pages leased from TensorD's manager (`Start.leases`); a
             # Start of any other runs standalone.
             "memory_protocol": 2,
+            # its varena takes the machine's charge page (`Start.charge`), which TensorD sends
+            # under a GPU memory limit
+            "charge": _CHARGES,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -1040,7 +1051,8 @@ class Executor:
         # TensorD's lease namespace, when it leases this GPU's weight pages. A follower that
         # dials before rank 0's progress frame registers it is held until TensorD has.
         leases = host.leases if device.type == "cuda" else None
-        host.memory, host.execution = Memory.open(device, leases=leases), execution
+        charged = {"charge": host.charge} if host.charge is not None and _CHARGES else {}
+        host.memory, host.execution = Memory.open(device, leases=leases, **charged), execution
         if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
             host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
         if device.type == "cuda":  # steps report the device's time beside the host's
@@ -1567,6 +1579,14 @@ class Executor:
         # here, they close. Skew degrades: whatever leases nothing runs standalone.
         for fd in self.channel.recv_fds(2 * command.ledgers):
             os.close(fd)
+        if command.charge:  # its one descriptor follows the frame
+            (page,) = self.channel.recv_fds(1)
+            if self.charge is None:
+                self.charge = page
+            else:  # a Start again: the page it already holds
+                os.close(page)
+        elif command.charge_fd is not None and self.charge is None:  # a follower: GPU 0's
+            self.charge = command.charge_fd
         self.leases = _leases(command)
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
@@ -1659,7 +1679,10 @@ class Executor:
                 # from this frame, before the follower's Start opens its memory, pairing them
                 # with GPUs by position (rank 1 first).
                 self.channel.send({"event": "progress", "follower_pids": list(self.group.pids())})
-                self.group.start(executor_commands.encode(command))
+                # A follower inherits the charge page (fork, or posix_spawn of an inheritable
+                # fd) at this number; no descriptor follows its Start.
+                charge = {"charge": False, "charge_fd": self.charge}
+                self.group.start({**executor_commands.encode(command), **charge})
                 stage("followers_spawned")
             if device:
                 import torch
@@ -1793,6 +1816,8 @@ class Executor:
         Otherwise it is spawned."""
         assert self.group is not None
         if not self.imported or zygote.unsafe(sys.modules.get("torch")):
+            if self.charge is not None:  # the spawned follower keeps GPU 0's charge page
+                os.set_inheritable(self.charge, True)
             return self.group._spawn_follower(module_argv, rank_fd)
         rank, world = (int(module_argv[module_argv.index(f) + 1]) for f in ("--rank", "--world"))
         siblings = [follower.channel for follower in self.group.followers]

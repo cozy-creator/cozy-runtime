@@ -186,6 +186,11 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: TensorD's namespace (its uid) each GPU's lease listener is named in: given only when it
     #: leases this executor's weight pages (memory protocol 2).
     leases: int | None = None
+    #: The machine's charge page follows the frame, one descriptor (under a GPU memory limit, to
+    #: an executor whose hello said `charge`).
+    charge: bool = False
+    #: A follower's: GPU 0's charge page, inherited at this descriptor number.
+    charge_fd: int | None = None
     #: The callables its attempts may call: their proxies are installed before the package is
     #: imported, and every attempt gets the call broker over them.
     call_interfaces: tuple[CallInterface, ...] = ()
