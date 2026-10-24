@@ -171,3 +171,30 @@ add_library(rms_rope OBJECT csrc/norm/rms_rope.cu)
 set_target_properties(rms_rope PROPERTIES CUDA_ARCHITECTURES "${EVERY}")
 target_compile_options(rms_rope PRIVATE --expt-extended-lambda --use_fast_math)
 kernel_module(_norm norm.cpp rms_rope)
+
+# Native Torch owns inactive weight storage and reclaims it through its supported
+# allocator callback. This one library has a pinned Torch C++ ABI, no Python ABI
+# or CUDA kernels; load it with torch.ops.load_library after importing Torch.
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c
+            "import torch; assert torch.__version__.split('+')[0] == '2.14.1' and torch.version.cuda == '13.0'; print(torch.utils.cmake_prefix_path)"
+    OUTPUT_VARIABLE TORCH_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY
+)
+list(APPEND CMAKE_PREFIX_PATH "${TORCH_PREFIX}")
+find_package(Torch 2.14.1 EXACT REQUIRED)
+find_library(C10_CUDA_LIBRARY c10_cuda PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED NO_DEFAULT_PATH)
+add_library(_residency SHARED csrc/residency.cpp)
+set_target_properties(_residency PROPERTIES PREFIX "" CXX_STANDARD 20
+                      MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+target_include_directories(_residency PRIVATE ${TORCH_INCLUDE_DIRS} ${CUDAToolkit_INCLUDE_DIRS})
+separate_arguments(TORCH_FLAGS NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+target_compile_options(_residency PRIVATE ${TORCH_FLAGS} ${isolated})
+target_link_libraries(_residency PRIVATE ${TORCH_LIBRARIES} "${C10_CUDA_LIBRARY}" CUDA::cudart)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(_residency PRIVATE -Wl,--build-id=none
+                        -Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/modules.map)
+    set_target_properties(_residency PROPERTIES
+                          INSTALL_RPATH "$ORIGIN/../../torch/lib;$ORIGIN/../../nvidia/cu13/lib")
+endif()
+install(TARGETS _residency LIBRARY DESTINATION cozy_runtime/_kernels
+                          RUNTIME DESTINATION cozy_runtime/_kernels)
