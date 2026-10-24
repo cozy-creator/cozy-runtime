@@ -93,7 +93,7 @@ class ModelSlot(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
         return self.path.rpartition(".")[2]
 
 
-class ImageFit(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+class ImageFit(msgspec.Struct, frozen=True, kw_only=True):
     profile: Literal["image-fit/1"]
     max_edge: Annotated[int, msgspec.Meta(gt=0)] | None = None
     max_pixels: Annotated[int, msgspec.Meta(gt=0)] | None = None
@@ -102,7 +102,7 @@ class ImageFit(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=
 _Seconds = Annotated[int, msgspec.Meta(gt=0)] | Annotated[float, msgspec.Meta(gt=0)]
 
 
-class Trim(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+class Trim(msgspec.Struct, frozen=True, kw_only=True):
     profile: Literal["video-trim/1", "audio-trim/1"]
     excess: Literal["refuse", "truncate"]
     min_seconds: _Seconds | None = None
@@ -112,7 +112,7 @@ class Trim(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
 _Cap = Annotated[int, msgspec.Meta(gt=0)]
 
 
-class VideoFit(msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True):
+class VideoFit(msgspec.Struct, frozen=True, kw_only=True):
     """`video-trim/1` and the most of a video the package reads: client hints, never a refusal."""
 
     profile: Literal["video-fit/1"]
@@ -718,7 +718,7 @@ def preparation_members(
 ) -> tuple[type[ImagePreparation | VideoPreparation | AudioPreparation], dict[str, Json]] | None:
     """A known profile's marker and its grammar members, or None for a newer writer's profile.
 
-    A known profile admits exactly its grammar: an extra member refuses.
+    A member a known profile's grammar does not name is a newer writer's, and is dropped.
     """
     if not isinstance(value, dict) or not isinstance(value.get("profile"), str):
         raise ConformanceError("must be an object naming its profile", code="preparation")

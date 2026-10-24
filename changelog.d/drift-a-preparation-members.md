@@ -1,0 +1,1 @@
+A package interface whose preparation profile (`image-fit/1`, `video-fit/1`, `video-trim/1`, `audio-trim/1`) carries a member this Runtime does not know drops that member; the interface no longer fails `malformed_package_interface`, which refused every call of the package.
