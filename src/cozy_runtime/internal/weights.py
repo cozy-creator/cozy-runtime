@@ -968,6 +968,7 @@ class Placement:
         self.notes.clear()
         self.steps = []
         self.release()
+        self.unheld.clear()  # A previous request's failed whole-model hold is not a future limit.
         self._lora_mode.set("bake")
         for bakes in self.bakes.values():
             bakes.choose("bake")  # Followers open here; the invoke may then select per_step.
