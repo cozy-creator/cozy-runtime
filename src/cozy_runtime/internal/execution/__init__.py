@@ -11,7 +11,7 @@ from pathlib import Path
 
 import tensorfs
 import torch
-from tensorfs.varena import Fills, Stats
+from tensorfs import varena
 from tensorfs.varena.torch import Request, blocks_of
 from torch import nn
 
@@ -71,58 +71,9 @@ def record(
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
-        stats=_stats(request.stats()),
+        stats=varena.document(request.stats()),
         torch_peak=torch_peak,
     )
-
-
-def _stats(stats: Stats) -> dict[str, object]:
-    """varena's record of the request (`tensorfs.varena.Stats`, its one definition), copied into
-    the reply attribute by attribute: what make_room took by class (F, O, S, N, D, W, P), the
-    most it held at a pass end, its passes' compute bytes and the request-end audit."""
-    moved = stats.moved
-    return {
-        "request": stats.request,
-        "moved": {
-            "kept": _fills(moved.kept),
-            "leased": _fills(moved.leased),
-            "store": _fills(moved.store),
-            "speculative": moved.speculative,
-        },
-        "trace": [
-            {
-                "step": ref.step,
-                "set": ref.set,
-                "block": ref.block,
-                "bytes": ref.bytes,
-                "origin": str(ref.origin),
-                "speculative": ref.speculative,
-            }
-            for ref in stats.trace
-        ],
-        "steps": [{"capacity": s.capacity, "evicted": list(s.evicted)} for s in stats.steps],
-        "stall_ns": stats.stall_ns,
-        "evicted": list(stats.evicted),
-        "peak": stats.peak,
-        "compute": stats.compute,
-        "host": stats.host,
-        "leftover": stats.leftover,
-        "make_room": [
-            {
-                "step": m.step,
-                "trigger": m.trigger,
-                "need": m.need,
-                "freed": m.freed,
-                "waited": m.waited,
-            }
-            for m in stats.make_room
-        ],
-        "outlived": [{"ptr": o.ptr, "bytes": o.bytes, "stream": o.stream} for o in stats.outlived],
-    }
-
-
-def _fills(fills: Fills) -> dict[str, int]:
-    return {"bytes": fills.bytes, "ns": fills.ns}
 
 
 #: each (device, store)'s measured ceilings, once per executor

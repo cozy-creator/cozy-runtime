@@ -1,0 +1,1 @@
+A request's varena record in the invoke reply is written by serde from TensorFS's record (`tensorfs.varena.document`), not copied field by field: it now carries every member, `moved.derived` included. Requires tensorfs 0.15.1.
