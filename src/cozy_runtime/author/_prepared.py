@@ -178,8 +178,14 @@ class PreparedRepeat:
                     index.data_ptr(),
                     device,
                     steps,
-                    [graph, stream, index, *held.values(),
-                     *(tensor.untyped_storage() for tensor in held.values()), *owners],
+                    [
+                        graph,
+                        stream,
+                        index,
+                        *held.values(),
+                        *(tensor.untyped_storage() for tensor in held.values()),
+                        *owners,
+                    ],
                 )
             except _execution.NativeExecutionError as error:
                 _native_error(error)
