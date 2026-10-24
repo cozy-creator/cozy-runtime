@@ -975,7 +975,11 @@ class Placement:
         return self.models[component].retain(paths)
 
     def graph_accounted(self) -> bool:
-        return self.memory.cuda and self.memory.native.context_measurable()
+        return (
+            self.memory.cuda
+            and hasattr(self.memory, "graph_region_blocks")
+            and self.memory.native.context_measurable()
+        )
 
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
@@ -985,11 +989,18 @@ class Placement:
         or drops it between pins, and its next pin says fresh."""
         return self.memory.region(owner, kind, sets=sets)
 
-    def graph_pool(self, component: str) -> graphs.domain.Pool:
-        """`component`'s graph region of the device's one capture pool: it holds the
-        component's weights bound while its graphs live, and varena drops it between replays."""
+    def graph_pool(
+        self, component: str, binding: Any = None, retire: Callable[[], None] | None = None
+    ) -> graphs.domain.Pool:
+        """Its graphs' exact dependencies in the device's shared pool, pinned until retirement."""
         model = self.models[component]
-        region = self.memory.graph_region(sets=model, retained=model)
+        owned = binding is None
+        binding = model.retain() if owned else binding
+        try:
+            region = self.memory.graph_region_blocks(binding, retire=retire)
+        finally:
+            if owned:
+                binding.close()
         return graphs.domain.Pool(region.pool, region, self.memory)
 
     def graph_segments(self, component: str) -> tuple[str, ...]:

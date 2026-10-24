@@ -1810,7 +1810,7 @@ class _Engine:
             and not placed[0].graph_accounted()
         )
         reason = (
-            ("driver/context memory is unmeasured" if unaccounted else "")
+            ("graph memory accounting or exact dependencies unavailable" if unaccounted else "")
             or (self.domain.refusal() if cuda and self.domain is not None else "")
             or _capture_contract(self.model)
             or ("draft head has no isolated capture contract" if drafted else "")
@@ -1826,7 +1826,9 @@ class _Engine:
             if key not in self.warmed:
                 if self.pool is None:
                     self.pool = (
-                        placed[0].graph_pool(placed[1])
+                        placed[0].graph_pool(
+                            placed[1], self.addresses.get(id(self.model)), self._retire_graphs
+                        )
                         if placed is not None
                         else Pool(torch.cuda.graph_pool_handle())
                     )
@@ -1867,6 +1869,11 @@ class _Engine:
         else:
             self._advance(size)
             self.eager += 1
+
+    def _retire_graphs(self) -> None:
+        """A fill changes after the domain's graph/output work has drained."""
+        with self.domain.using():
+            self._forget()
 
     def _forget(self) -> None:
         """Release recordings only at the driver's already-drained step boundary."""

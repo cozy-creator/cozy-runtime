@@ -6,7 +6,8 @@ declaration and its derived canonical path (`generate.models.model`) is the bind
 There is no slot object, no `artifacts=` dict, and the `Annotated` override-marker plane is
 EMPTY at launch. The CLASS carries closed keywords (`encoded_leaves`, `min_bits`, `phase`,
 `attention_bits`); there are no stamps, no `task=`/`objective=`/`structure=`, and no model or
-release name anywhere in code (model-code-fit §1, D1). A semantic twin is a component name or a config fact.
+release name anywhere in code (model-code-fit §1, D1). A semantic twin is a component name or a
+config fact.
 
 Construction identity is (package release, model class, exact artifact snapshot + immutable
 config, construction/provider variant). Equal identities coalesce ONE single-flight model
@@ -306,7 +307,7 @@ class Residency(Protocol):
         ...
 
     def graph_accounted(self) -> bool:
-        """Whether per-process driver/context bytes can be included in graph admission."""
+        """Whether graph admission accounts for driver/context bytes and exact dependencies."""
         ...
 
     def graph_domain(self, component: str) -> Any:
@@ -317,8 +318,10 @@ class Residency(Protocol):
         """A long-lived intermediate's region (KV, latents, derived weights) serving `sets`."""
         ...
 
-    def graph_pool(self, component: str) -> Any:
-        """`component`'s graph region of the device's one capture pool."""
+    def graph_pool(
+        self, component: str, binding: Any = None, retire: Callable[[], None] | None = None
+    ) -> Any:
+        """The binding's graph region; retire drains its executable before a fill changes."""
         ...
 
     def graph_segments(self, component: str) -> tuple[str, ...]:
