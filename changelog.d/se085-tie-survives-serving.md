@@ -1,0 +1,1 @@
+A model with `tie_word_embeddings` stays tied under the serving substrate: registering a placeholder again (Transformers' `tie_weights`) keeps its one object, so the checkpoint's single stored tensor binds both names instead of failing `config_tensor_missing` on `lm_head.weight`.

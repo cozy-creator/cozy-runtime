@@ -472,7 +472,9 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     def register(module: Any, name: str, param: Any) -> None:
         original(module, name, param)
         held = module._parameters.get(name)
-        if held is None:
+        # A placeholder registered again is a tie (`lm_head.weight = embed_tokens.weight`): it
+        # keeps its one object, so the census sees one destination (cr-218).
+        if held is None or is_virtual(held):
             return
         # A device move, performed BY THE RUNTIME, so the guard steps aside exactly here —
         # the fence is on WHO moves bytes, not on what (see `placing`).
