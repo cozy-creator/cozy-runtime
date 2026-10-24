@@ -502,3 +502,7 @@ parameter. Ordinary client scripts can keep their lightweight `ScriptContext` fo
 managed calls. `Weights.read_values_into` provides logical float32 reconstruction over the same
 TensorFS source handle; its geometry, encoded identities, byte reads and lease lifetime are all
 TensorFS-owned.
+
+## Merging
+
+PRs into `master` merge through the merge queue: `gh pr merge <n>` (the queue squashes; never `--admin`). CI runs there, on the final PR + branch state; nothing runs on a push.
