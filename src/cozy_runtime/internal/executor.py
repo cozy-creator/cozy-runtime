@@ -4039,7 +4039,7 @@ class Executor:
         assert self.group is not None
         try:
             replies = [
-                msgspec.convert(reply, RankMemory, strict=True)
+                msgspec.convert(reply, RankMemory)
                 for reply in self.group.call(executor_commands.encode(command))
             ]
         except msgspec.ValidationError as exc:
