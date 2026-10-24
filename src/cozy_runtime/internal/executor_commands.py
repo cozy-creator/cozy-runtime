@@ -173,6 +173,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     devices: str = ""
     #: 2: TensorD leases each GPU's pages (`leases`); any other, or absent: standalone.
     memory_protocol: int = 0
+    #: Optional local allowance per executor/GPU; it does not enforce a machine-wide total.
+    #: Zero is a configured limit, not absence.
+    gpu_memory_limit: int | None = None
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
