@@ -20,6 +20,7 @@ import msgspec
 import torch
 from torch import Tensor, nn
 
+from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.execution import sizing
 from cozy_runtime.internal.residency import Request
@@ -106,8 +107,23 @@ def site(kind: str) -> str | None:
 
 def piece() -> None:
     """A cut's next piece starts: the ops inside it are numbered from the start again."""
+    checkpoint()
     if _local.scopes:
         _local.scopes[-1].ordinals.clear()
+
+
+def checkpoint() -> None:
+    """Stop at an owned eager boundary; group cancellation stays with mirrored calls.
+
+    One rank must not leave a collective while another enters it. A CUDA capture also keeps
+    its prepared interval intact; its caller checks cancellation before the next launch.
+    """
+    context = ATTEMPT.get()
+    if context is None or _capturing():
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        return
+    context.raise_if_cancelled()
 
 
 def short(exc: BaseException) -> bool:
@@ -142,6 +158,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     attention pieces, a package's split, a norm's or a conv's bands), at the coarsest level
     whose `need` fits the request's room; a refusal descends. Outside a request it runs whole;
     inside a capture at the level the room gives now (its pool was prepared for it)."""
+    checkpoint()
     request = CURRENT.get()
     if request is None:
         return run(0)
@@ -157,6 +174,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
 
     def whole(level: int) -> T:
         nonlocal retries
+        checkpoint()
         scope.ordinals.clear()
         # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
         # site's predicted cold/warm bytes must be reclaimed before running that site.
@@ -174,6 +192,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
             if request.reclaim() <= 0:
                 raise
         retries += 1
+        checkpoint()
         return run(level)
 
     try:
@@ -211,6 +230,7 @@ def wrap(
         outer = _local.named, _local.ordinals
         _local.named, _local.ordinals = name, {}
         try:
+            checkpoint()
             with nullcontext() if around is None else around(module, args, kwargs):
                 return forward(*args, **kwargs)
         finally:

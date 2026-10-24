@@ -4466,6 +4466,10 @@ class Executor:
             if group is not None:
                 group.broadcast(executor_commands.encode(command))
             if self.memory is not None:
+                if command.level == "ram":
+                    # Map is ordered after every preceding invocation. Join its remaining
+                    # consumer streams before retiring owners and returning allocator storage.
+                    accel.synchronize(self.torch, self.device_kind)
                 for member in child.model_executors or [child]:
                     if member.backend is not None:
                         if command.level == "ram" and member.residency is not None:

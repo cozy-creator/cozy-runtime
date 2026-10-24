@@ -721,6 +721,16 @@ def _unprepared(exc: BaseException) -> bool:
 
 
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
+    from cozy_runtime.author._context import CURRENT
+
+    if (
+        (context := CURRENT.get()) is not None
+        and not (torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
+        and not (
+            torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        )
+    ):
+        context.raise_if_cancelled()
     if (idle := _IDLE.get(None)) is not None:
         idle.check()
     recorder = _RECORDERS.get(module)
