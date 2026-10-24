@@ -25,6 +25,8 @@ from tensorfs.raw import parts as stored_parts
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
+from cozy_runtime.author._errors import Fault, fault
+
 __all__ = [
     "Binding",
     "Declared",
@@ -643,6 +645,8 @@ class Memory:
                 self.native = varena.Arena(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
             except (ImportError, AttributeError, RuntimeError) as exc:
+                if fault(exc) is not Fault.OTHER:
+                    raise
                 raise ResidencyError(f"native CUDA weight residency is unavailable: {exc}") from exc
 
     @classmethod
