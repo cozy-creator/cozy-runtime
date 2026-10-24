@@ -21,11 +21,22 @@ Supplied Runtime Bindings are checked for validity and identity once per submiss
 every external tensor's geometry and storage pointers. Non-ATen launchers must supply their native
 module and storage owners explicitly.
 
+Within a normal invocation, `Context.plan` registers one pending prepared-work owner before
+calling the provider. The request admits one complete prepared submission, rejects late or
+additional submissions, joins before success serialization, and cancels/joins unfinished work on
+unwind. Admission locks never span provider callbacks or blocking device work. Reusable graph
+definitions are not automatically closed by request completion. Low-level `submit()` outside an
+invocation remains caller-owned. Native launch orders the caller's stream after its completion
+event; other streams and host readers must await results or establish their own dependency.
+Submission during CUDA capture is refused before allocation/launch.
+
 The complete source graph is walked recursively. Only kernel, empty, memcpy, memset and ordinary
-child graph nodes are accepted. CUDA instantiation enforces the conditional body's additional
-device/context and copy-address constraints. Host callbacks, allocation/free, event, external
+child graph nodes are accepted. Copy and memset nodes must address device memory on the selected
+device; host-ended copies are rejected because graph pools do not own CPU temporaries. CUDA
+instantiation enforces the conditional body's additional context constraints. Host callbacks, allocation/free, event, external
 semaphore and existing conditional nodes are refused. Device graph launch is not mixed into the
-conditional body. Unsupported hardware or graph operations return a typed CUDA failure.
+conditional body. Known graph-layout ineligibility is a capability refusal; actual CUDA failures
+retain their driver error code.
 
 Actual CUDA stream capture holds the process-wide capture exclusion. Prepared replay does not:
 it retains every external Tensor and original Storage plus supplied Binding owners, so each

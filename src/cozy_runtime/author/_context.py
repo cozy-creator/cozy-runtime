@@ -138,6 +138,7 @@ class Context:
         default=None, repr=False
     )
     _recipes: tuple[DeclaredRecipe, ...] = field(default=(), repr=False)
+    _submit_prepared: Callable[[PreparedWork], Execution] | None = field(default=None, repr=False)
 
     def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
@@ -207,6 +208,8 @@ class Context:
         from cozy_runtime.author._prepared import PreparedWork
 
         if len(steps) == 1 and isinstance(steps[0], PreparedWork):
+            if self._submit_prepared is not None:
+                return self._submit_prepared(steps[0])
             return steps[0].submit(self)
         if any(isinstance(step, PreparedWork) for step in steps):
             raise TypeError("prepared work must be the only ctx.plan argument")

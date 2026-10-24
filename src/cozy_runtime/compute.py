@@ -12,6 +12,7 @@ import weakref
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, NoReturn
 
+from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 from cozy_runtime.author._prepared import Progress
 
 if TYPE_CHECKING:
@@ -20,8 +21,6 @@ if TYPE_CHECKING:
 
 def _native_error(error: Exception) -> NoReturn:
     import torch
-
-    from cozy_runtime.author._errors import CapabilityError
 
     if getattr(error, "eligibility_refusal", False):
         raise CapabilityError(str(error), code="prepared_graph_ineligible") from error
@@ -203,14 +202,11 @@ class PreparedRepeat:
         with self._submission:
             if self._closed:
                 return
-            if self._active is not None:
-                self._active.close()
-            else:
-                try:
-                    self._native.close(0)
-                except Exception as error:
-                    _native_error(error)
-                self._closed = True
+            try:
+                self._native.close_owner()
+            except Exception as error:
+                _native_error(error)
+            self._closed = True
 
     def facts(self) -> dict[str, object]:
         """Facts from the actual native graph owner; a PreparedWork protocol is not evidence."""
@@ -219,6 +215,11 @@ class PreparedRepeat:
     def submit(self, context: Context | None = None) -> Execution:
         import torch
 
+        if torch.cuda.is_current_stream_capturing():
+            raise CapabilityError(
+                "prepared submission during CUDA capture is not supported",
+                code="prepared_capture_active",
+            )
         if context is not None:
             context.raise_if_cancelled()
             if context.device.type != "cuda" or context.device.index not in (None, self.device):
@@ -228,14 +229,36 @@ class PreparedRepeat:
             if self._active is not None and not self._active.poll().done:
                 raise RuntimeError("a prepared repeat is already running")
             with torch.cuda.device(self.device):
+                if torch.cuda.is_current_stream_capturing():
+                    raise CapabilityError(
+                        "prepared submission during CUDA capture is not supported",
+                        code="prepared_capture_active",
+                    )
                 outputs = tuple(torch.empty_like(t) for t in self.state)
                 readout = torch.cuda.Event()
+            if context is not None:
+                context.raise_if_cancelled()
             try:
                 epoch = self._native.launch(torch.cuda.current_stream(self.device).cuda_stream)
-            except Exception as error:
-                _native_error(error)
-            self._active = Execution(self, context, epoch, outputs, readout)
-            return self._active
+                self._active = Execution(self, context, epoch, outputs, readout)
+                return self._active
+            except BaseException as error:
+                if isinstance(error, Exception) and getattr(error, "eligibility_refusal", False):
+                    _native_error(error)  # native preflight rejected before any launch/mutation
+                # A signal or error after launch must not lose an in-flight native owner.
+                try:
+                    self._native.close_owner()
+                    self._closed = True
+                except Exception as cleanup:
+                    if getattr(cleanup, "error_code", None) not in (None, 2):
+                        _native_error(cleanup)
+                    raise RuntimeFailure(
+                        "prepared submission completion is unproven; retire executor",
+                        code="device_fault",
+                    ) from cleanup
+                if isinstance(error, Exception):
+                    _native_error(error)
+                raise
 
 
 class Execution:

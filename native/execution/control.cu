@@ -59,7 +59,7 @@ __global__ void snapshot(Control *state, Snapshot *out) {
 
 // Reject every operation whose ownership/side effects cannot be represented by a resident body.
 // cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle.
-static cudaError_t inspect(cudaGraph_t graph, unsigned &total, unsigned depth = 0) {
+static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device, unsigned depth = 0) {
     if (depth > 32) return static_cast<cudaError_t>(-100);
     size_t count = 0;
     auto error = cudaGraphGetNodes(graph, nullptr, &count);
@@ -76,8 +76,31 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, unsigned depth = 
         if (type == cudaGraphNodeTypeGraph) {
             cudaGraph_t child;
             error = cudaGraphChildGraphNodeGetGraph(node, &child);
-            if (error == cudaSuccess) error = inspect(child, total, depth + 1);
+            if (error == cudaSuccess) error = inspect(child, total, device, depth + 1);
             if (error != cudaSuccess) return error;
+        } else if (type == cudaGraphNodeTypeMemcpy) {
+            cudaMemcpy3DParms parameters{};
+            error = cudaGraphMemcpyNodeGetParams(node, &parameters);
+            if (error != cudaSuccess) return error;
+            if (parameters.srcArray || parameters.dstArray || !parameters.srcPtr.ptr || !parameters.dstPtr.ptr
+                || (parameters.kind != cudaMemcpyDeviceToDevice && parameters.kind != cudaMemcpyDefault))
+                return static_cast<cudaError_t>(-100);
+            for (const void *pointer : {parameters.srcPtr.ptr, parameters.dstPtr.ptr}) {
+                cudaPointerAttributes attributes{};
+                error = cudaPointerGetAttributes(&attributes, pointer);
+                if (error != cudaSuccess) return error;
+                if (attributes.type != cudaMemoryTypeDevice || attributes.device != device)
+                    return static_cast<cudaError_t>(-100);
+            }
+        } else if (type == cudaGraphNodeTypeMemset) {
+            cudaMemsetParams parameters{};
+            error = cudaGraphMemsetNodeGetParams(node, &parameters);
+            if (error != cudaSuccess) return error;
+            cudaPointerAttributes attributes{};
+            error = cudaPointerGetAttributes(&attributes, parameters.dst);
+            if (error != cudaSuccess) return error;
+            if (attributes.type != cudaMemoryTypeDevice || attributes.device != device)
+                return static_cast<cudaError_t>(-100);
         } else if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeEmpty
                    && type != cudaGraphNodeTypeMemcpy && type != cudaGraphNodeTypeMemset) {
             return static_cast<cudaError_t>(-100);
@@ -125,7 +148,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     *out = run;
     auto checked = [&](cudaError_t result) { return result; };
 #define CHECK(call) do { error = checked(call); if (error != cudaSuccess) return error; } while (0)
-    CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes));
+    CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device));
     if (!run->nodes) return -101;
     CHECK(cudaStreamCreateWithFlags(&run->work, cudaStreamNonBlocking));
     int lowest_priority, highest_priority;
@@ -176,6 +199,10 @@ extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
 
 static int launch(Repeat *run, uintptr_t producer) {
     cudaError_t error;
+    cudaStreamCaptureStatus capturing;
+    error = cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(producer), &capturing);
+    if (error != cudaSuccess) return error;
+    if (capturing != cudaStreamCaptureStatusNone) return -102;
     if (run->launched) {
         error = cudaEventQuery(run->done); if (error != cudaSuccess) return error;
         error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
@@ -197,7 +224,10 @@ static int launch(Repeat *run, uintptr_t producer) {
     run->launched = true;
     error = cudaGraphLaunch(run->executable, run->work);
     if (error != cudaSuccess) return error;
-    return cudaEventRecord(run->done, run->work);
+    error = cudaEventRecord(run->done, run->work);
+    if (error != cudaSuccess) return error;
+    // Subsequent ordinary operations on the caller's stream observe the completed native work.
+    return cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(producer), run->done, 0);
 }
 
 static int ready(Repeat *run, int *done) {

@@ -27,8 +27,10 @@ unsafe extern "C" {
 }
 
 fn cuda_error(py: Python<'_>, operation: &str, code: i32) -> PyErr {
-    if matches!(code, -100 | -101) {
-        let error = NativeExecutionError::new_err(if code == -101 {
+    if matches!(code, -102..=-100) {
+        let error = NativeExecutionError::new_err(if code == -102 {
+            "prepared submission during CUDA capture is not supported"
+        } else if code == -101 {
             "prepared graph body is empty"
         } else {
             "prepared graph contains unsupported node types or exceeds bounded inspection limits"
@@ -110,6 +112,44 @@ impl ResidentRepeat {
     }
 }
 
+impl ResidentRepeat {
+    fn dispose(&self, py: Python<'_>, epoch: Option<u64>) -> PyResult<()> {
+        self.check_process()?;
+        py.detach(|| {
+            let mut state = self.state.lock().map_err(|_| 999)?;
+            if epoch.is_some_and(|expected| expected != state.epoch) {
+                return Err(-1);
+            }
+            if state.destroy_failed {
+                return Err(999);
+            }
+            if state.pointer == 0 {
+                return Ok(());
+            }
+            // SAFETY: destruction joins both streams before releasing graph/control storage.
+            let code = unsafe { cozy_repeat_destroy(state.pointer as *mut c_void) };
+            if code != 0 {
+                state.failed = true;
+                state.destroy_failed = true;
+                return Err(code);
+            }
+            state.pointer = 0;
+            Ok(())
+        })
+        .map_err(|code| cuda_error(py, "close resident repeat", code))?;
+        let owners = {
+            let mut held = self
+                .owners
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?;
+            std::mem::take(&mut *held)
+        };
+        // Python destructors may reenter close. No native mutex may span their execution.
+        drop(owners);
+        Ok(())
+    }
+}
+
 #[pymethods]
 impl ResidentRepeat {
     #[new]
@@ -187,10 +227,10 @@ impl ResidentRepeat {
 
     fn launch(&self, py: Python<'_>, producer_stream: usize) -> PyResult<u64> {
         self.native(py, "launch resident repeat", None, |state| {
-            state.launched = true;
             // SAFETY: exclusive handle, source owners retained; producer stream belongs to this device.
             match unsafe { cozy_repeat_launch(state.pointer as *mut c_void, producer_stream) } {
                 0 => {
+                    state.launched = true;
                     state.epoch += 1;
                     Ok(state.epoch)
                 }
@@ -267,39 +307,11 @@ impl ResidentRepeat {
     }
 
     fn close(&self, py: Python<'_>, epoch: u64) -> PyResult<()> {
-        self.check_process()?;
-        py.detach(|| {
-            let mut state = self.state.lock().map_err(|_| 999)?;
-            if epoch != state.epoch {
-                return Err(-1);
-            }
-            if state.destroy_failed {
-                return Err(999);
-            }
-            if state.pointer == 0 {
-                return Ok(());
-            }
-            // SAFETY: destruction joins both streams before releasing graph/control storage.
-            let code = unsafe { cozy_repeat_destroy(state.pointer as *mut c_void) };
-            if code != 0 {
-                state.failed = true;
-                state.destroy_failed = true;
-                return Err(code);
-            }
-            state.pointer = 0;
-            Ok(())
-        })
-        .map_err(|code| cuda_error(py, "close resident repeat", code))?;
-        let owners = {
-            let mut held = self
-                .owners
-                .lock()
-                .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?;
-            std::mem::take(&mut *held)
-        };
-        // Python destructors may reenter close. No native mutex may span their execution.
-        drop(owners);
-        Ok(())
+        self.dispose(py, Some(epoch))
+    }
+
+    fn close_owner(&self, py: Python<'_>) -> PyResult<()> {
+        self.dispose(py, None)
     }
 }
 
