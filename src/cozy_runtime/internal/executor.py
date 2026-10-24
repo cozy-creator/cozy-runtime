@@ -2412,8 +2412,9 @@ class Executor:
         present = [name for name in names if checkpoints[name].has(name)]
         rows = [r for name in present for r in checkpoints[name].rows(name)]
         stage("checkpoint_headers")
-        if accel.memory_class(self.device_kind) == "unified":
+        if self.device_kind == "mps":
             # One pool, every weight resident (cr-021): past the GPU's working set never fits.
+            # A CPU's weights are host memory, which pages: it is never refused here.
             need, room = sum(r.stored_nbytes for r in rows), accel.unified_ceiling(torch)
             if need > room:
                 return self._refusal(
