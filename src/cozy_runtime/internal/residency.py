@@ -796,7 +796,15 @@ class Memory:
                 for role, part in parts.items():
                     raw = self._empty(part.nbytes, reclaim)
                     began = time.perf_counter_ns()
-                    tensors.read_into(key, raw, role=part.role or None)
+                    try:
+                        tensors.read_into(key, raw, role=part.role or None)
+                    except tensorfs.Error:
+                        # TensorFS retains borrowed destinations on failed completion. Surface
+                        # a sticky device failure as Torch's typed error before this executor
+                        # can be reused; ordinary I/O errors keep their original classification.
+                        if self.cuda:
+                            torch.cuda.synchronize(self.device)
+                        raise
                     read_ns += time.perf_counter_ns() - began
                     read_bytes += part.nbytes
                     dtype = getattr(torch, _DTYPES[part.dtype])
@@ -1158,9 +1166,14 @@ def _hooks(model: Model) -> None:
         model.handles.extend(_paired(sub, opened, lambda: memory._close(model)))
     for block in model.blocks.values():
         sub = model.module.get_submodule(block.path)
-        model.handles.extend(
-            _paired(sub, lambda *_, b=block: memory._enter(b), lambda b=block: memory._exit(b))
-        )
+
+        def entered(*_: object, b: _Block = block) -> None:
+            memory._enter(b)
+
+        def exited(b: _Block = block) -> None:
+            memory._exit(b)
+
+        model.handles.extend(_paired(sub, entered, exited))
 
 
 def _paired(module: nn.Module, enter: Callable[..., None], leave: Callable[[], None]) -> list[Any]:
