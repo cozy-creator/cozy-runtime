@@ -635,6 +635,29 @@ def release(torch: Any, root: Any) -> None:
     domain.release(root)
 
 
+def retire(torch: Any, root: Any) -> int:
+    """`root`'s graphs go before its weights leave the device (an offload, `Map(Ram)`): each
+    recording's replays and lent outputs finished, then its recordings, binding and capture pool.
+    Its calls run as written and record again on later use. A recording whose output a caller
+    still holds stays. Returns how many went."""
+    retired = 0
+    for module, (owner, _) in list(_REGIONS.items()):
+        recorder = _RECORDERS.get(module) if owner() is root else None
+        if recorder is None:
+            continue
+        with recorder.lock:
+            for entry in recorder.recordings.values():
+                if not entry.fenced:
+                    entry.stream.synchronize()
+                    entry.fenced = True
+                elif entry.done is not None:
+                    entry.done.synchronize()
+            held = len(recorder.recordings)
+            if recorder.forget(torch):
+                retired += held
+    return retired
+
+
 def mark(root: Any) -> None:
     """A new attempt of `root`'s component opens: its receipts count from here."""
     for module, (owner, _) in list(_REGIONS.items()):
