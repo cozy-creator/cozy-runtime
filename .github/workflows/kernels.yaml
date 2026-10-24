@@ -1,7 +1,7 @@
 name: kernels
 # Cozy's prebuilt kernels (`kernels/`): the modules each native cozy-runtime wheel carries under
 # `cozy_runtime/_kernels`, one set per OS and CPU, each held to its declared targets, imports and a
-# call without a GPU (checks/kernel_modules.py). publish.yaml and dev-build.yaml call this and
+# call without a GPU (checks/kernel_modules.py). runtime-publish.yaml and dev-build.yaml call this and
 # repackage the artifact `kernels-<target>` into their wheels (`task wheel`). By hand:
 #   gh workflow run kernels.yaml -R cozy-creator/cozy-runtime -f ref=<tag|sha>
 #
