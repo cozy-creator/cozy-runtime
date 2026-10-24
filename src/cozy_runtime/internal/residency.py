@@ -121,7 +121,7 @@ class Declared:
     bind: Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]] | None = None
 
 
-class Placeholder(Tensor):
+class Placeholder(Tensor):  # type: ignore[misc]  # Torch is optional in the checking environment.
     """Metadata between binds; a real read obtains ordinary owning Torch storage."""
 
     @staticmethod
@@ -524,7 +524,7 @@ class Memory:
 
     def __init__(self, device: Any, budget_bytes: int | None = None) -> None:
         self.device = torch.device(device)
-        self.cuda = self.device.type == "cuda"
+        self.cuda: bool = self.device.type == "cuda"
         self.budget_bytes = budget_bytes
         self._budget_applied = False
         self.lock = threading.RLock()
@@ -776,7 +776,7 @@ class Memory:
             # Only the failed allocation is retried. No read, fill transform or forward ran.
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
-    @torch.inference_mode(False)
+    @torch.inference_mode(False)  # type: ignore[untyped-decorator]
     def _ensure(self, block: _Block, reclaim: bool) -> None:
         if block.data is not None:
             if block.ready is not None:
@@ -1105,7 +1105,11 @@ def _placeholders(model: Model) -> None:
         held = Placeholder(meta.shape, meta.dtype, model.memory.device)
         if sites[0].parameter:
             held = nn.Parameter(held, requires_grad=False)
-        held._varena_read = lambda b=block, s=sites[0]: model.memory._read(b, s)
+
+        def read(b: _Block = block, site: _Site = sites[0]) -> Tensor:
+            return model.memory._read(b, site)
+
+        held._varena_read = read
         for site in sites:
             site.table[site.name] = held
 
