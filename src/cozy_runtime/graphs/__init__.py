@@ -109,7 +109,7 @@ def capture(
         except Exception as cleanup:
             if fault(failure) in (Fault.STICKY, Fault.DEVICE):
                 failure.add_note(f"discarding its failed capture also failed: {cleanup}")
-                raise failure
+                raise failure from None
             error = torch.AcceleratorError(
                 f"failed capture could not be discarded safely: {cleanup}"
             )
@@ -898,7 +898,11 @@ def _replay(
     except Exception as exc:
         if not _unprepared(exc):
             raise
-        recorder.waiting[key] = attempt
+        # No replay launched. The cached private pool can itself be why ordinary outputs
+        # do not fit, so drain and retire it before the eager path allocates those outputs.
+        recorder.finish()
+        recorder.drop()
+        torch.cuda.empty_cache()
         return _EAGER
     try:
         began = time.perf_counter()
@@ -909,7 +913,9 @@ def _replay(
         if not _unprepared(exc):
             raise
         del out
-        recorder.waiting[key] = attempt
+        recorder.finish()
+        recorder.drop()
+        torch.cuda.empty_cache()
         _refused(recorder, placed, f"its weights cannot all be resident at once ({exc})")
         return _EAGER
     try:
@@ -1261,17 +1267,13 @@ def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float:
 
 
 def _lease(torch: Any, placed: Any, binding: Any) -> Any:
-    """A replay's residency: its region's blocks prepared around it, unless its component's
-    blocks are held for the plan's step (`Placement.using`; v7: a CLIP replay bound and unbound
-    its whole block, ~6 ms a call)."""
+    """A replay uses already-retained ordinary storage; it never reassigns module slots."""
     if placed is None or binding is None:
         return nullcontext()
     stream, held = torch.cuda.current_stream(), placed[0].graph_held(placed[1])
-    if held is None:
-        return binding.prepare(stream)
-    if held != stream:
+    if held is not None and held != stream:
         stream.wait_stream(held)
-    return nullcontext()
+    return binding.replay_use(stream)
 
 
 def _refused(recorder: _Recorder, placed: Any, why: str) -> None:
