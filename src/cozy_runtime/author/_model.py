@@ -321,10 +321,6 @@ class Residency(Protocol):
         """`component`'s graph region of the device's one capture pool."""
         ...
 
-    def graph_segments(self, component: str) -> tuple[str, ...]:
-        """Declared model-block paths that bound graph regions independently of residency."""
-        ...
-
     def graph_pass(self, component: str, entry: str) -> Any:
         """Open the ordinary model pass before capture; nested regions share it."""
         ...

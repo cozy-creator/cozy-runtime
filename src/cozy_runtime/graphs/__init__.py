@@ -4,9 +4,9 @@ Kernel choice is shipped. Runtime prepares memory, captures process-local addres
 replays; it neither times competing paths nor compiles kernels. A component's region is its
 root call: one graph per signature, keyed by its inputs' layout, the values of the attributes
 its package declares steer its forward (`Model.__graph_keys__`), and the kernels serving
-(`LANDED`). A placed component that streams (no step hold) runs its root as written and graphs
-each declared block instead. Nothing records on a request's path: a signature's calls run as
-written until the device is idle, when it records on seeded inputs of its layout if its eager
+(`LANDED`). A component that cannot keep its complete dependencies resident runs as written.
+Nothing records on a request's path: a signature's calls run as written until the device is
+idle, when it records on seeded inputs of its layout if its eager
 calls were launch-bound, its replay matches eager bit for bit and saves time, and recording
 changed no state of the model (`capture_idle`); the next request replays. Every graph has its
 own static buffers in the device's one capture pool (`domain`). A cached binding owns virtual
@@ -39,8 +39,6 @@ from cozy_runtime.internal import attention_ulysses
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
 _WARMING = contextvars.ContextVar("cozy_graphs_warming", default=False)
-#: The root of a streamed component running as written: its blocks are its regions meanwhile.
-_STREAMING: contextvars.ContextVar[object | None] = contextvars.ContextVar("cozy_graphs_streaming")
 #: The idle period recording on this thread (`capture_idle`): each region boundary checks it.
 _IDLE: contextvars.ContextVar[_Idle | None] = contextvars.ContextVar("cozy_graphs_idle")
 #: an idle job's cleanup (its model's state put back): ops there never yield
@@ -570,8 +568,7 @@ class _Pending:
 
 def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
     """Each component root is a region, keyed by the attributes the model declares steer it
-    (`__graph_keys__`: component -> attribute paths); a placed component's declared blocks are
-    regions while it streams."""
+    (`__graph_keys__`: component -> attribute paths). Streamed blocks remain eager."""
     skipped = set(getattr(type(model), "__uncaptured__", ()))
     declared: Mapping[str, tuple[str, ...]] = getattr(type(model), "__graph_keys__", {})
     installed = []
@@ -579,13 +576,10 @@ def install(torch: Any, model: object, roots: Mapping[str, Any]) -> list[str]:
         if name in skipped or not isinstance(root, torch.nn.Module):
             continue
         _KEYS[root] = tuple(declared.get(name, ()))
-        placed = PLACED.get(root)
-        blocks = placed[0].graph_segments(placed[1]) if placed is not None else ()
-        for path, module in (("", root), *((p, root.get_submodule(p)) for p in blocks)):
-            _REGIONS[module] = (weakref.ref(root), path)
-            if not getattr(type(module), "_cozy_graphed", False):
-                module.__class__ = _graphed(torch, type(module))
-            installed.append(f"{name}.{path}" if path else name)
+        _REGIONS[root] = (weakref.ref(root), "")
+        if not getattr(type(root), "_cozy_graphed", False):
+            root.__class__ = _graphed(torch, type(root))
+        installed.append(name)
     return installed
 
 
@@ -794,21 +788,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
     ):
         return call(module, *args, **kwargs)
     placed = _placed(module)
-    owner, path = region
-    if path and _STREAMING.get(None) is not owner():
-        return call(module, *args, **kwargs)  # its root's graph or eager run holds it
-    if (
-        not path
-        and placed is not None
-        and placed[0].graph_held(placed[1]) is None
-        and placed[0].graph_segments(placed[1])
-    ):  # it streams: it runs as written, its blocks replay
-        token = _STREAMING.set(module)
-        try:
-            return call(module, *args, **kwargs)
-        finally:
-            _STREAMING.reset(token)
-    scope = placed[0].graph_pass(placed[1], path) if placed is not None else nullcontext()
+    scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
     began = time.perf_counter()
     try:
         with scope:
@@ -918,11 +898,8 @@ def _region_call(
         if recorder.waiting.get(key) == attempt:
             return eager()
         if placed is not None:
-            if (
-                recorder.binding is not None
-                and not recorder.binding.valid()
-                and not recorder.forget(torch)
-            ):
+            if recorder.binding is not None and not recorder.binding.valid():
+                recorder.forget(torch)
                 return eager()
             if recorder.binding is None:
                 recorder.binding = placed[0].retain(placed[1], (_REGIONS[module][1],))
@@ -1350,13 +1327,12 @@ def _lease(torch: Any, placed: Any, binding: Any) -> Any:
 
 
 def _refused(module: Any, placed: Any, why: str) -> None:
-    """A region whose preparation the memory refused runs as written this request, its finer
-    regions replaying under it; the run says so once."""
+    """A root whose preparation the memory refused runs as written; the run says so once."""
     why = why.splitlines()[0][:300]
     _GAPS[module] = why
     if placed is not None:
         placed[0].note(f"{placed[1]}.graphs", f"eager {why}")
-    say(f"refused:{why}", f"[graphs] a region runs as written, its finer regions replay: {why}")
+    say(f"refused:{why}", f"[graphs] a component runs as written: {why}")
 
 
 def _failed(module: Any, recorder: _Recorder, key: tuple[object, ...], why: str) -> None:
