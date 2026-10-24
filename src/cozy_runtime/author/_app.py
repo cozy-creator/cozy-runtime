@@ -24,7 +24,7 @@ from typing import Any, ParamSpec, TypeVar, overload
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
-from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
+from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy, one_memo
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
@@ -225,7 +225,7 @@ class App:
                     "declare components once, on invocable or App registration",
                     code="model_components",
                 )
-            memo = export.memoize if export is not None else policy
+            memo = one_memo(export.memoize, policy) if export is not None else policy
             declare_memo(
                 export.implementation if export is not None else target,
                 version=memo_version,

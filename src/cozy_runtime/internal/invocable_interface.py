@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import enum
-import inspect
 import keyword
 import re
 import types
@@ -13,83 +12,10 @@ from typing import Any, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError, Memoize, Surface
+from cozy_runtime.author import ConformanceError, Memoize
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal import canonical, schema
-
-
-def metadata(surface: Surface) -> dict[str, Any]:
-    result = _metadata(surface)
-    # A writer's identity keys TensorFS derivation replay, as a memoized result's keys the memo.
-    if surface.memoize or surface.weights_outputs:
-        from cozy_runtime.internal.memo_implementation import describe
-
-        result.update(describe(surface.fn))
-    return result
-
-
-def _metadata(surface: Surface) -> dict[str, Any]:
-    if not surface.invocable:
-        return serving_metadata(
-            surface.payload_type,
-            surface.result_type,
-            module=surface.fn.__module__,
-            export=surface.fn.__name__,
-            context=next((p.name for p in surface.params if p.role == "context"), ""),
-            capabilities=sorted(surface.capabilities),
-            memoize=surface.memoize,
-        )
-    parameters = [
-        parameter.name
-        for parameter in surface.params
-        if parameter.role in ("wire", "model", "weights", "assets")
-    ]
-    signature = inspect.signature(surface.fn)
-    defaults = {
-        name: signature.parameters[name].default
-        for name in parameters
-        if signature.parameters[name].default is not inspect.Parameter.empty
-    }
-    return from_types(
-        surface.payload_type,
-        surface.result_type,
-        module=surface.fn.__module__,
-        export=surface.fn.__name__,
-        context=next(p.name for p in surface.params if p.role == "context"),
-        parameters=parameters,
-        parameter_defaults=defaults,
-        memoize=surface.memoize,
-        capabilities=sorted(surface.capabilities),
-    )
-
-
-def serving_metadata(
-    payload_type: object,
-    result_type: object,
-    *,
-    module: str,
-    export: str,
-    context: str,
-    capabilities: Sequence[str],
-    memoize: Memoize | None = None,
-) -> dict[str, Any]:
-    """Caller names over the existing serving wire schema; never change its handler."""
-    return from_types(
-        payload_type,
-        result_type,
-        module=module,
-        export=export,
-        context=context,
-        parameters=[
-            field.encode_name
-            for field in msgspec.structs.fields(typing.cast(type[msgspec.Struct], payload_type))
-        ],
-        parameter_defaults={},
-        memoize=memoize,
-        capabilities=capabilities,
-        serving=True,
-    )
 
 
 def from_types(
@@ -99,13 +25,17 @@ def from_types(
     module: str,
     export: str,
     context: str,
-    parameters: Sequence[str],
+    parameters: Sequence[str] | None,
     parameter_defaults: Mapping[str, object],
     memoize: Memoize | None,
     capabilities: Sequence[str],
-    serving: bool = False,
 ) -> dict[str, Any]:
-    """Portable names/defaults from resolved types, shared by both interface readers."""
+    """Portable names/defaults from resolved types, shared by both interface readers.
+    `parameters` None: a handler, whose caller names are its request struct's fields."""
+    serving = parameters is None
+    if parameters is None:
+        payload = typing.cast(type[msgspec.Struct], payload_type)
+        parameters = [field.encode_name for field in msgspec.structs.fields(payload)]
     defaults: dict[str, Any] = {}
     names: dict[str, str] = {}
     enums: dict[str, list[str]] = {}
