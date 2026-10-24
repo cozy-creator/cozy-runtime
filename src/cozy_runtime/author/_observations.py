@@ -309,6 +309,13 @@ class DeviceClock(Protocol):
 
     def mark(self) -> object: ...
     def between(self, start: object, end: object) -> float: ...
+    def busy(self) -> bool:
+        """Work is queued on the current stream and not done yet."""
+        ...
+
+    def passed(self, mark: object) -> bool:
+        """The device is past `mark`: the work queued before it is done."""
+        ...
 
 
 #: The device clock the executor installs where a GPU runs the attempt (empty: host only).

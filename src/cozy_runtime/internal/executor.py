@@ -4920,7 +4920,7 @@ def serve(executor: Executor, channel: Channel) -> int:
             # After the device Start, as every thread of ours: a live thread in an import-only
             # executor refuses its forks (each fresh executor then imports everything again).
             if executor.rank == 0:
-                work.follow(functools.partial(_tell, channel))
+                work.follow(functools.partial(_tell, channel), DEVICE[0] if DEVICE else None)
             threading.Thread(
                 target=_idle, args=(executor, order), name="graphs-idle", daemon=True
             ).start()

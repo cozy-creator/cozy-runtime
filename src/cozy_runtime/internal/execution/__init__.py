@@ -61,6 +61,13 @@ class Steps:
         end.synchronize()  # read at the attempt's end: its streams are idle already
         return float(start.elapsed_time(end))
 
+    def busy(self) -> bool:
+        return not torch.cuda.current_stream().query()
+
+    def passed(self, mark: object) -> bool:
+        assert isinstance(mark, torch.cuda.Event)
+        return bool(mark.query())
+
 
 def record(
     request: Request, gpu: int, device: int | None, store: Path, torch_peak: int
