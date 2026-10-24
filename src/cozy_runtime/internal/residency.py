@@ -376,7 +376,11 @@ class Hold:
 
 
 class Binding:
-    """A cached graph's owning storage. Close only after the graph and its readers retire."""
+    """A cached graph's owning storage, closed after its readers retire.
+
+    An undeclared fill may prepare once for an ephemeral direct read. It never reports a
+    valid/resident graph binding and cannot be replayed or prepared a second time.
+    """
 
     def __init__(self, model: Model, groups: list[_Block]) -> None:
         self.model, self.groups = model, groups
@@ -387,6 +391,7 @@ class Binding:
         ).hexdigest()
         self.closed = False
         self.completion_lost = False
+        self.used = False
         self.held: list[tuple[_Block, int]] = []
         self.lock = threading.RLock()
         self.last: Any = None
@@ -417,11 +422,20 @@ class Binding:
         with self.lock:
             self.model._claim()
             try:
-                if not self.valid():
+                ephemeral = (
+                    self.fill is None
+                    and not self.used
+                    and not self.closed
+                    and not self.completion_lost
+                    and self.model.wanted_identity() is None
+                    and self.generation == self.model.generation
+                )
+                if not self.valid() and not ephemeral:
                     raise StaleBinding("graph weight storage or fill changed")
                 request = _REQUEST.get()
                 if request is not None and request.idle and not self.resident():
                     raise StaleBinding("idle graph preparation cannot page weights in")
+                self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None:
                         stream.wait_event(self.last)
