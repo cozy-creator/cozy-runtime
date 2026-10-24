@@ -292,7 +292,8 @@ class VisionLM(Model[Pipeline], encoded_leaves="accept", min_bits=4, phase="deco
             )
 
     def execution_plan(self, plan: Any) -> str:
-        return lm.install(plan, self.pipe.components[COMPONENT])
+        model = self.pipe.components[COMPONENT]
+        return "+".join(filter(None, (lm.install(plan, model), moe.install(plan, model))))
 
     def unload(self, loader: Loader) -> None:
         del self.pipe
