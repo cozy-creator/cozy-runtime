@@ -2421,8 +2421,8 @@ class Executor:
                 return {
                     "ok": False,
                     "code": "modeled_accelerator_unavailable",
-                    "detail": "modeled execution requires a measured CUDA device; no "
-                    "caller-authored hardware variant is accepted",
+                    "detail": "a model needs a GPU, and this machine has none it can use (an "
+                    "NVIDIA GPU, or an Apple Silicon Mac's own): run it --on new",
                 }
             hardware_variant = f"sm{device_facts.sm}"
         reference = Variant(
@@ -2447,14 +2447,16 @@ class Executor:
         present = [name for name in names if checkpoints[name].has(name)]
         rows = [r for name in present for r in checkpoints[name].rows(name)]
         stage("checkpoint_headers")
-        if not accel.bf16_supported(self.device_kind) and any(
-            dtype_name(r.dtype) == "bfloat16" for r in rows
-        ):
-            return self._refusal(
-                "dtype_unsupported",
-                f"this lane stores bfloat16, which {device_facts.name} computes from macOS 14 "
-                f"on ({device_facts.driver} here): serve an f16 lane",
-            )
+        if accel.memory_class(self.device_kind) == "unified":
+            # One pool, every weight resident (cr-021): past the GPU's working set never fits.
+            need, room = sum(r.stored_nbytes for r in rows), accel.unified_ceiling(torch)
+            if need > room:
+                return self._refusal(
+                    MEMORY_EXHAUSTED,
+                    f"{binding.model or reference.snapshot} keeps {need / 2**30:.1f} GiB of "
+                    f"weights on the GPU, and {device_facts.name} holds {room / 2**30:.1f} GiB: "
+                    "run it on a Mac with more memory, or --on new",
+                )
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's plan names the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding.release)
