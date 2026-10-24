@@ -104,7 +104,17 @@ def capture(
     current.wait_stream(stream)
     current.wait_stream(work)
     if failure is not None:
-        graph.reset()
+        try:
+            graph.reset()
+        except Exception as cleanup:
+            if fault(failure) in (Fault.STICKY, Fault.DEVICE):
+                failure.add_note(f"discarding its failed capture also failed: {cleanup}")
+                raise failure
+            error = torch.AcceleratorError(
+                f"failed capture could not be discarded safely: {cleanup}"
+            )
+            error.error_code = 999
+            raise error from failure
     if isinstance(failure, Building | Yielded):
         raise failure
     if failure is not None:
