@@ -1119,7 +1119,7 @@ class Request:
         self.read_ns += ns
         self.trace.append(
             {
-                "step": len(self.trace),
+                "sequence": len(self.trace),
                 "set": block.model.name,
                 "block": block.index,
                 "bytes": nbytes,
@@ -1134,23 +1134,28 @@ class Request:
             return self.ended
         self.sample()
         allocated, reserved, _ = self.memory._figures()
-        return {
+        out: dict[str, Any] = {
             "request": self.id,
             "allocator_scope": "process",
             "overlapping": self.overlap,
-            "peak_window": "process allocator high-water, carried across section resets",
             "sets": {
                 m.name: sum(b.nbytes for b in m.groups()) for m in self.memory.models.values()
             },
             "moved": {"store": {"bytes": self.moved, "ns": self.read_ns}},
             "trace": list(self.trace),
-            "peak": self.peak,
-            "allocated": allocated,
-            "reserved": reserved,
+            "trace_scope": "fills",
             "host": None,
-            "steps": [],
-            "make_room": [],
         }
+        if self.memory.cuda and torch.cuda.is_initialized():
+            out.update(
+                peak=self.peak,
+                allocated=allocated,
+                reserved=reserved,
+                peak_window="process allocator high-water, carried across section resets",
+            )
+        elif self.memory.device.type == "mps":
+            out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
+        return out
 
 
 def _block_of(name: str, paths: Sequence[str]) -> str:
