@@ -327,7 +327,7 @@ class Invoke(_Attempt, frozen=True, kw_only=True, tag="invoke"):
     entrypoint: str
     tensorfs: TensorFSOptions | None = None
     spool: str
-    deadline_s: float | None
+    deadline_s: float | None = None
     inputs: dict[str, InputFile] = {}
     #: Retained input trees by reference: (root, digest).
     trees: dict[str, tuple[str, str]] = {}
