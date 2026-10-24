@@ -191,7 +191,7 @@ def release(model: Any) -> None:
         engine = _ENGINES.pop(model, None)
         if engine is None:
             return
-        if engine.driver is not None or engine.pending:
+        if engine.driver is not None or engine.pending or engine._occupied():
             _ENGINES[model] = engine
             raise RuntimeError("cannot unload a language model while decode is active")
         engine._drop()
@@ -1142,8 +1142,9 @@ class _Engine:
         self.stale = False
         #: seconds the last admission took: decoding gets as long before the next one
         self.debt = 0.0
-        #: its buffers' KV owner, reclaimable between drives and pinned throughout each drive
+        #: KV storage stays pinned across driver handoffs while any live row remains.
         self.region: Any = None
+        self.region_use: ExitStack | None = None
         self.retire = False
         self.cache_device: Any = None
         self.open: bool | float
@@ -1221,7 +1222,9 @@ class _Engine:
     # ------------------------------------------------------------------ the loop
 
     def _drive(self, mine: _Request) -> None:
-        with _PLANE, ExitStack() as lifetime:
+        with _PLANE, self.region_use or ExitStack() as lifetime:
+            held_region = self.region_use is not None
+            self.region_use = None
             try:
                 # The KV pin lasts through reholds and failure unwinding. Only weight
                 # bindings below may be replaced while this driver owns live rows.
@@ -1229,7 +1232,11 @@ class _Engine:
                     self.region = placed[0].region(
                         f"lm:{type(self.model).__name__}", "kv", self.model, release=self._drop
                     )
-                if self.region is not None and lifetime.enter_context(self.region.pin()):
+                if (
+                    not held_region
+                    and self.region is not None
+                    and lifetime.enter_context(self.region.pin())
+                ):
                     self._drop()
                 with ExitStack() as stack:
                     held = self._hold(stack)
@@ -1274,6 +1281,10 @@ class _Engine:
                 raise
             finally:
                 with self.cond:
+                    if self.region is not None and (self._occupied() or self.pending):
+                        # A waiting caller takes the driver next. These rows are still live;
+                        # only an idle decode cache is eligible for owner-driven discard.
+                        self.region_use = lifetime.pop_all()
                     self.driver = None
                     self.cond.notify_all()
 
