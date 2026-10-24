@@ -3,8 +3,10 @@ varena-leases §8 "No learning loop"; `sizing`).
 
 A pure cut site picks its level at dispatch from its op's live shapes (`need`) against the
 request's room (`r.room()`), so its first try fits: no OOM probing, nothing remembered. A refusal
-above the finest re-reads the room and runs finer (`sizing.descend`); only the finest's refusal
-ends the request, typed (device_out_of_memory). Model blocks and package code always run once.
+above the finest re-reads the room and runs finer (`sizing.descend`); the finest's refusal parks
+the request's idle tensors in mapped host memory and runs again (`park`, the last rung), and only
+a refusal with nothing left to park ends the request, typed (device_out_of_memory). Model blocks
+and package code always run once.
 """
 
 from __future__ import annotations
@@ -16,14 +18,15 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+from types import CodeType
 
 import msgspec
 import torch
 from tensorfs.varena.torch import Request
-from torch import Tensor, nn
+from torch import nn
 
 from cozy_runtime.author._errors import Fault, fault
-from cozy_runtime.internal.execution import sizing
+from cozy_runtime.internal.execution import park, sizing
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
@@ -34,18 +37,19 @@ CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", defau
 
 class Cut(msgspec.Struct, frozen=True, kw_only=True):
     """A site's dispatch: the level its operands' need fit, that need (bytes, ungranulated),
-    the room's tier it fit in, and the levels it descended after refusals."""
+    the room's tier it fit in, the levels it descended after refusals, and the bytes it parked."""
 
     site: str
     level: int
     need: int
     tier: str
     descent: int
+    parked: int = 0
 
 
 class Cuts(msgspec.Struct, kw_only=True):
     """A request's cut sites (`measurements.execution.cuts`): each site's first dispatch and
-    every one that descended, and the refusals at the floor."""
+    every one that descended or parked, and the refusals at the floor."""
 
     sites: list[Cut] = msgspec.field(default_factory=list)
     oom_floor: int = 0
@@ -136,11 +140,15 @@ def _refused(exc: BaseException) -> bool:
     return True
 
 
-def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -> T:
+def cut[T](
+    site: str, finest: int, need: sizing.Need, run: Callable[[int], T], reads: Args = ()
+) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
     attention pieces, a package's split, a norm's or a conv's bands), at the coarsest level
-    whose `need` fits the request's room; a refusal descends. Outside a request it runs whole;
-    inside a capture at the level the room gives now (its pool was prepared for it)."""
+    whose `need` fits the request's room; a refusal descends, and the finest's parks idle tensors
+    that are not among its `reads` and runs again. Its parked reads come back first when the room
+    holds them. Outside a request it runs whole; inside a capture at the level the room gives now
+    (its pool was prepared for it)."""
     request = CURRENT.get()
     if request is None:
         return run(0)
@@ -154,17 +162,31 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     try:
         if _capturing():
             return whole(sizing.choose(finest, need, request.room())[0])
-        try:
-            result, level, steps, tier = sizing.descend(finest, need, request.room, whole, _refused)
-        except Exception as exc:
-            if short(exc):
-                with _ROWS_LOCK:
-                    _ROWS.setdefault(id(request), Cuts()).oom_floor += 1
-            raise
-        row = Cut(site=site, level=level, need=need(level, 1), tier=tier, descent=steps)
+        if park.held():
+            park.restore(request, reads, need(finest, request.room().granularity))
+        parked = 0
+        while True:
+            try:
+                result, level, steps, tier = sizing.descend(
+                    finest, need, request.room, whole, _refused
+                )
+                break
+            except Exception as exc:
+                if not short(exc):
+                    raise
+                _clear(exc)
+                moved = park.park(request, reads, need(finest, request.room().granularity), _BLOCK)
+                if not moved:
+                    with _ROWS_LOCK:
+                        _ROWS.setdefault(id(request), Cuts()).oom_floor += 1
+                    raise
+                parked += moved
+        row = Cut(
+            site=site, level=level, need=need(level, 1), tier=tier, descent=steps, parked=parked
+        )
         with _ROWS_LOCK:
             rows = _ROWS.setdefault(id(request), Cuts())
-            if steps or all(r.site != site for r in rows.sites):
+            if steps or parked or all(r.site != site for r in rows.sites):
                 rows.sites.append(row)
         return result
     finally:
@@ -193,6 +215,12 @@ def wrap(
     vars(module)["_cozy_execution_forward"] = named
 
 
+#: every block wrapper's code (`wrap`'s `named`): Park reads the frames of the model call it is in
+_BLOCK = next(
+    c for c in wrap.__code__.co_consts if isinstance(c, CodeType) and c.co_name == "named"
+)
+
+
 def transparent[F: Callable[..., object]](forward: F) -> F:
     """`forward` stands in for its module's own (the class's at each call) with its results:
     marked as TensorFS's wrappers were, which a package's shape check allows (H3's `_plain`)."""
@@ -203,13 +231,3 @@ def transparent[F: Callable[..., object]](forward: F) -> F:
 def current(module: nn.Module) -> Callable[..., object]:
     """`module`'s class forward as it is at each call."""
     return lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)
-
-
-def tensors(value: object, depth: int = 3) -> list[Tensor]:
-    """The tensors in `value`, `depth` levels of sequences and mappings deep."""
-    if isinstance(value, Tensor):
-        return [value]
-    if depth and isinstance(value, list | tuple | Mapping):
-        items = value.values() if isinstance(value, Mapping) else value
-        return [t for item in items for t in tensors(item, depth - 1)]
-    return []

@@ -1,5 +1,5 @@
 """Torch execution under varena's memory (varena-slim §2): exact pure-site cuts sized from
-their operands against the request's room, and the Ulysses agreement.
+their operands against the request's room, Park as their last rung, and the Ulysses agreement.
 
 The executor opens a request (`with mem.request(id, plan=[]) as r, serving(r):`) and installs
 the catch on every model it loads (`install`); nothing else here is the executor's to call.
@@ -15,7 +15,7 @@ from tensorfs.varena import Fills, Stats
 from tensorfs.varena.torch import Request, blocks_of
 from torch import nn
 
-from cozy_runtime.internal.execution import agree, catch, cuts
+from cozy_runtime.internal.execution import agree, catch, cuts, park
 from cozy_runtime.internal.execution.agree import agreed, sizes
 from cozy_runtime.internal.execution.catch import cut_rows, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, split
@@ -65,14 +65,18 @@ class Steps:
 def record(
     request: Request, gpu: int, device: int | None, store: Path, torch_peak: int
 ) -> GpuMemory:
-    """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`: TensorFS's fill
-    ceilings for CUDA `device` (None: no GPU) and `store`, varena's record of the request and its
-    arena's torch high-water."""
+    """Physical GPU `gpu`'s row of the reply's `measurements.memory.varena`, once the request
+    ended: TensorFS's fill ceilings for CUDA `device` (None: no GPU) and `store`, varena's record
+    of the request, its arena's torch high-water, and what Park moved."""
+    stats = request.stats()
+    parked, restored = park.ended(request, stats)
     return GpuMemory(
         gpu=gpu,
         ceiling=_ceiling(device, store),
-        stats=_stats(request.stats()),
+        stats=_stats(stats),
         torch_peak=torch_peak,
+        parked=parked,
+        restored=restored,
     )
 
 
