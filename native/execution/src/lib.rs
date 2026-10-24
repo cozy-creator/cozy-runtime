@@ -1,5 +1,5 @@
 //! One resident graph definition, one GPU-driven loop, and its complete owner lifetime.
-use pyo3::{exceptions::PyRuntimeError, prelude::*};
+use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
 use std::{ffi::c_void, sync::Mutex};
 
 pyo3::create_exception!(_execution, NativeExecutionError, PyRuntimeError);
@@ -66,6 +66,8 @@ struct ResidentRepeat {
     owners: Mutex<Vec<Py<PyAny>>>,
     pid: u32,
     nodes: u32,
+    device: i32,
+    steps: u32,
 }
 
 impl ResidentRepeat {
@@ -152,12 +154,35 @@ impl ResidentRepeat {
             owners: Mutex::new(owners),
             pid: std::process::id(),
             nodes,
+            device,
+            steps,
         })
     }
 
     #[getter]
     fn body_nodes(&self) -> u32 {
         self.nodes
+    }
+
+    fn facts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        self.check_process()?;
+        let (launches, closed) = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| PyRuntimeError::new_err("native owner poisoned"))?;
+            (state.epoch, state.pointer == 0)
+        };
+        // These facts originate in the actual constructed native handle, never a protocol match.
+        let result = PyDict::new(py);
+        result.set_item("execution_mode", "cuda_conditional_while")?;
+        result.set_item("body_nodes", self.nodes)?;
+        result.set_item("device", self.device)?;
+        result.set_item("steps_per_launch", self.steps)?;
+        result.set_item("host_graph_launches", launches)?;
+        result.set_item("control_kernels_preloaded", true)?;
+        result.set_item("closed", closed)?;
+        Ok(result)
     }
 
     fn launch(&self, py: Python<'_>, producer_stream: usize) -> PyResult<u64> {
@@ -266,7 +291,9 @@ impl ResidentRepeat {
         })
         .map_err(|code| cuda_error(py, "close resident repeat", code))?;
         let owners = {
-            let mut held = self.owners.lock()
+            let mut held = self
+                .owners
+                .lock()
                 .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?;
             std::mem::take(&mut *held)
         };

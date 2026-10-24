@@ -6,6 +6,7 @@ capture pool. CUDA clones the source definition into a conditional WHILE body. A
 advances the iteration index and decides whether the GPU repeats. Python is absent from loop
 continuation; the host submits one graph for any number of steps.
 
+The public entry point is `from cozy_runtime.compute import PreparedRepeat`.
 The first supported operation is `PreparedRepeat.capture(step, state=..., steps=..., owners=...)`.
 `ctx.plan(prepared)` submits it and returns an `Execution`; existing string/component plans remain
 hints. The callback receives a CUDA int64 index tensor and changes declared state in place. Its
