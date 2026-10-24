@@ -1881,7 +1881,7 @@ class Executor:
 
     def _model_classes(self) -> list[type[Model[Any]]]:
         """The classes the package's constructed Model slots declare, wherever they are
-        defined (a script's come from its libraries, not its entry module)."""
+        defined (a library's, not only the entry module's)."""
         surfaces = getattr(self.discovered, "surfaces", ())
         slots = [s for surface in surfaces for s in surface.model_bindings if not s.weights]
         return list(dict.fromkeys(slot.model_class for slot in slots))

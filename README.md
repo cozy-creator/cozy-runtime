@@ -223,12 +223,9 @@ declaring a `cozy.application` entry point — the same fact `discovery.py` call
 declares none, site-packages is never a root, and a sibling package supplies TYPES only: its
 own callables are its own, never scanned as registrations (cr-117).
 
-A generated SCRIPT app — Creator's `app = script_app("<module>")` adapter — is read the same
-way. It registers the script's one `main` as an entrypoint; `[tool.cozy.models]` names its
-default releases and `[tool.cozy] accelerator = false` keeps it on CPU.
-`author/_script_metadata.py` is the ONE definition of that shape, run by the adapter and the
-reader over the same parsed tree. Every attempt may call children: the executor's Start
-carries the call interfaces.
+A script is an ordinary package (xs-099): its PEP 723 block is its `pyproject.toml` and it
+declares `app = App()` and its functions as any package does, so nothing here reads it
+differently. Every attempt may call children: the executor's Start carries the call interfaces.
 
 The reader is also what the DEVELOPMENT placement is built from (the worker session's own
 staging): it supervises and does not execute, so it reads the source and takes its model
@@ -474,8 +471,8 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 model — and it is what the end-to-end suite builds, installs and runs.
 
 **One registration (xs-040).** `@app.entrypoint` is the only registration and every keyword
-works on every function: `weights=`, `publishes=`/`emits_media=`, `accelerator=False` (absent
-means the machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`,
+works on every function: `weights=`, `publishes=`/`emits_media=`, `accelerator=` (False: CPU only;
+True or absent: the machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`,
 `components=`, `memoize=`, `hidden=`, `internal=`. A writer (`weights=`, `publishes=`,
 `emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
 repeat.
@@ -497,9 +494,7 @@ success reaches the executor. `ctx.adopt_model(native_receipt)` returns the veri
 `ModelArtifact`. Source and writer handles are fenced with the attempt, while retained native
 partial and committed bytes survive process loss for authorized recovery.
 
-Plain PEP 723 producers that declare `[tool.cozy.weights]` use an explicit `ctx: Context`
-parameter. Ordinary client scripts can keep their lightweight `ScriptContext` for composing
-managed calls. `Weights.read_values_into` provides logical float32 reconstruction over the same
+`Weights.read_values_into` provides logical float32 reconstruction over the same
 TensorFS source handle; its geometry, encoded identities, byte reads and lease lifetime are all
 TensorFS-owned.
 

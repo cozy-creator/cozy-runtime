@@ -154,7 +154,6 @@ from cozy_runtime.author._recipes import (
     Recipe,
     SelectionPlan,
 )
-from cozy_runtime.author._script import ScriptContext, script_app
 from cozy_runtime.author._services import (
     AdjustmentRow,
     Adjustments,
@@ -294,7 +293,6 @@ __all__ = [
     "SavedVideo",
     "Scheduler",
     "ScopeCall",
-    "ScriptContext",
     "Secrets",
     "Seed",
     "SelectionPlan",
@@ -336,7 +334,6 @@ __all__ = [
     "register_adapter",
     "register_attention",
     "registered_adapters",
-    "script_app",
     "sequence_parallel",
     "split",
     "spread",

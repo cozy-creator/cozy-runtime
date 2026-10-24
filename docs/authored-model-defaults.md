@@ -17,7 +17,7 @@ async def generate(ctx: Context, *, model: SDXL, prompt: str) -> Image: ...
 - A default with no org names a first-party model, the root namespace's (`sdxl@1.0.0`), whoever
   publishes the package. Another account's model names its org (`you/my-model@1.0.0`).
 - Declare defaults on one registration layer. Defaults on both `invocable` and its App
-  registration are refused. A script's `[tool.cozy.models]` takes the same strings.
+  registration are refused.
 
 The Model class declares how far the lane rules may lower its precision:
 

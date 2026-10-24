@@ -440,45 +440,6 @@ def _refusal(variant: Variant, device: DeviceFacts, step: Step) -> str:
     )
 
 
-def script_plan(
-    *,
-    rows: Sequence[PlanRow],
-    components: Sequence[str],
-    release: str,
-    store: str,
-    snapshot: str,
-    providers: Mapping[str, tuple[Provider, ...]],
-    device: DeviceFacts,
-    runtime: RuntimeIdentity,
-    dtype_name: Callable[[str], str],
-    snapshots: Mapping[str, str] | None = None,
-    placement: str = "all_resident",
-    encoded_leaves: str = "accept",
-) -> ResolvedModelPlan:
-    """MODEL-LESS resolution for a driver script: these header rows, through THE SAME
-    `resolve()`, with the construction identity built from the rows alone
-    (`script:<components>`)."""
-    construction = ConstructionFacts(
-        release=release,
-        model_class="script:" + "+".join(components),
-        components=tuple(components),
-    )
-    variant = Variant(
-        name="script", store=store, snapshot=snapshot, snapshots=dict(snapshots or {})
-    )
-    return resolve(
-        variant=variant,
-        rows=rows,
-        providers=providers,
-        device=device,
-        runtime=runtime,
-        construction=construction,
-        placement=placement,
-        encoded_leaves=encoded_leaves,
-        dtype_name=dtype_name,
-    )
-
-
 def _build(
     *,
     variant: Variant,
