@@ -31,6 +31,7 @@ from typing import Any, NamedTuple, cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _work as work
+from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
@@ -384,6 +385,8 @@ class _Recorder:
         self.changes: dict[str, int] = {}
         self.eager: _Timing = _Timing()
         self.replayed: _Timing = _Timing()
+        #: why a capture on a request's thread (`_record_now`) did not happen, by reason
+        self.request_waits: Counter[str] = Counter()
         #: the counters when the current attempt opened (`mark`): receipts are per request
         self.base: dict[str, Any] = {}
 
@@ -725,6 +728,7 @@ def describe(root: Any) -> dict[str, Any]:
                     "call_ms": round(since("call_ms"), 3),
                     "prepare_ms": round(since("prepare_ms"), 3),
                     "held": since("held"),
+                    "request_waits": dict(recorder.request_waits),
                     "eager": recorder.eager.document(base.get("eager", (0, 0, 0.0, 0.0))),
                     "replay": recorder.replayed.document(base.get("replayed", (0, 0, 0.0, 0.0))),
                 }
@@ -905,7 +909,7 @@ def _region_call(
         recorder.attempts += 1
         attempt = placed[0].attempts if placed is not None else recorder.attempts
         entry = recorder.recordings.get(key)
-        if entry is None:  # as written; an idle period records it
+        if entry is None:  # as written; this call records it (`_record_now`), else an idle period
             pending = recorder.queued.get(key)
             if pending is None and key not in recorder.failed and key not in recorder.judged:
                 pending = recorder.queued[key] = _Pending(
@@ -922,7 +926,15 @@ def _region_call(
                     ],
                 )
                 IDLE.add(pending)
-            return eager()
+            if (
+                pending is None
+                or recorder.waiting.get(key) == attempt
+                or not _record_now(torch, module, pending, recorder, placed, attempt)
+            ):
+                return eager()
+            entry = recorder.recordings.get(key)
+            if entry is None:
+                return eager()
         if recorder.waiting.get(key) == attempt:
             return eager()
         if placed is not None:
@@ -1030,7 +1042,9 @@ def _capture_pending(pending: _Pending) -> bool:
             owner.initialize()
             owner.prime_blas()  # before the idle request: torch keeps them, in the process arena
             with idle:
-                done = _record(torch, module, pending, recorder, placed, submit)
+                done = _record(
+                    torch, module, pending, recorder, placed, submit, IDLE_REQUEST, IDLE.waits
+                )
         except Exception as exc:  # the signature runs as written; the period goes on
             if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
                 raise
@@ -1050,12 +1064,14 @@ def _record(
     recorder: _Recorder,
     placed: Any,
     submit: float,
+    request: str,
+    waits: Counter[str],
 ) -> bool:
-    """Records `pending`'s signature at idle on seeded inputs of its layout, in the device's
-    capture pool: a warm-up run, its device-busy time (`_busy`), then the capture only when its
-    eager calls were launch-bound: their host submission took longer than the device's work, so
-    the device sat idle inside them. False tries again at a later period (no free room, a kernel
-    building)."""
+    """Records `pending`'s signature on seeded inputs of its layout, in the device's capture
+    pool, at idle or on `request`'s thread: a warm-up run, its device-busy time (`_busy`), then
+    the capture only when its eager calls were launch-bound: their host submission took longer
+    than the device's work, so the device sat idle inside them. False tries again later (no free
+    room, a kernel building), its reason counted in `waits`."""
     # This path is restricted to the shipped pure contracts. Warmup discovers capacity in
     # the exact capture pool; it does not time or select kernels, or run arbitrary package code.
     key, call, owner = pending.key, pending.call, recorder.domain
@@ -1089,7 +1105,7 @@ def _record(
             pool = recorder.pool
             state = _State(torch, module)
             with torch.cuda.stream(stream):
-                # The warm-up runs in the idle request's arena: its high-water is the capture's.
+                # The warm-up runs in `request`'s arena: its high-water is the capture's.
                 seeded = torch.Generator(device=current.device).manual_seed(_SEED)
                 inputs = [
                     _input(torch, v, seeded) if isinstance(v, _Leaf) else None
@@ -1112,7 +1128,7 @@ def _record(
                 if why := _device_bound(submit, busy):
                     recorder.judged[key] = why
                     return True
-                pool.prepare(IDLE_REQUEST)
+                pool.prepare(request)
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so they live as long as the graph and never in a request's arena.
                 statics: list[Any] = []
@@ -1162,9 +1178,9 @@ def _record(
         return True
     except Exception as exc:
         if isinstance(exc, Building):
-            return IDLE.wait("kernel building")
+            return _waited(waits, "kernel building")
         if is_capacity(exc) or _unprepared(exc):
-            return IDLE.wait("no free room")
+            return _waited(waits, "no free room")
         if not isinstance(exc, domain.Unavailable):
             raise
         _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
@@ -1181,6 +1197,44 @@ def _record(
             # Warmup can queue reads before refusing an allocation. Join even the failure
             # path before the lease records its completion event.
             current.wait_stream(stream)
+
+
+def _waited(waits: Counter[str], why: str) -> bool:
+    """A capture not done now, and why: False, so it is tried again later."""
+    waits[why] += 1
+    return False
+
+
+def _record_now(
+    torch: Any, module: Any, pending: _Pending, recorder: _Recorder, placed: Any, attempt: int
+) -> bool:
+    """`pending` recorded on its request's thread once two eager calls measured it, as 0.30's
+    graphs did at its second call: a lone request never has an idle period, so its launch-bound
+    steps would all run as written (SDXL, gate run 16272: 121 ms a step eager, 81 ms replayed in
+    0.30.18's 15247). Ruled out (device-bound, a replay no faster), it runs as written for good.
+    Not now (one call measured, its pages not resident, no room), it is tried at idle and in the
+    next attempt, never again in this one."""
+    submit = recorder.eager.submit_ms()
+    context = CURRENT.get()
+    if submit is None or context is None:
+        return False
+    if placed is not None:
+        if recorder.binding is None:
+            recorder.binding = placed[0].retain(placed[1], (_REGIONS[module][1],))
+        if not placed[0].graph_resident(recorder.binding):
+            recorder.waiting[pending.key] = attempt
+            return _waited(recorder.request_waits, "pages not resident")
+    owner = recorder.domain
+    assert owner is not None
+    with request_path.known("cozy_runtime.graphs._record"):  # cr-210
+        owner.initialize()
+        args = (pending, recorder, placed, submit, context.request_id, recorder.request_waits)
+        done = _record(torch, module, *args)
+    if done:
+        recorder.queued.pop(pending.key, None)
+    else:
+        recorder.waiting[pending.key] = attempt
+    return done
 
 
 def _hooked(module: Any) -> str:
