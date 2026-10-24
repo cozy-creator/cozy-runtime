@@ -2413,8 +2413,8 @@ class Executor:
             attention.reserve(command.attention_pin, device_facts)
         stage("measure_device")
         hardware_variant = binding.variant
-        if not hardware_variant and device_facts.kind == "mps":
-            hardware_variant = "mps"
+        if not hardware_variant and device_facts.kind in ("mps", "cpu"):
+            hardware_variant = device_facts.kind
         if not hardware_variant:
             if device_facts.kind != "cuda" or device_facts.sm <= 0:
                 self.poisoned = "modeled accelerator unavailable"
