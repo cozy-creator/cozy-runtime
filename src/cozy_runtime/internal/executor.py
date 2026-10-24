@@ -811,8 +811,6 @@ class Executor:
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
         self.leases: int | None = None
-        #: HOST ONLY: this executor's local per-GPU allowance, fixed before the device opens.
-        self.gpu_memory_limit: int | None = None
         #: The machine's sealed TensorFS cache directory.
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -1042,19 +1040,7 @@ class Executor:
         # TensorD's lease namespace, when it leases this GPU's weight pages. A follower that
         # dials before rank 0's progress frame registers it is held until TensorD has.
         leases = host.leases if device.type == "cuda" else None
-        if host.gpu_memory_limit is not None and device.type != "cuda":
-            raise VarenaError("a configured GPU memory limit requires standalone CUDA")
-        limit = host.gpu_memory_limit if device.type == "cuda" else None
-        if limit is None:
-            memory = Memory.open(device, leases=leases)
-        else:
-            try:
-                memory = Memory.open(device, leases=leases, limit=limit)
-            except TypeError as exc:
-                raise VarenaError(
-                    "TensorFS cannot honor the configured GPU memory limit; update its adapter"
-                ) from exc
-        host.memory, host.execution = memory, execution
+        host.memory, host.execution = Memory.open(device, leases=leases), execution
         if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
             host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
         if device.type == "cuda":  # steps report the device's time beside the host's
@@ -1581,17 +1567,6 @@ class Executor:
         # here, they close. Skew degrades: whatever leases nothing runs standalone.
         for fd in self.channel.recv_fds(2 * command.ledgers):
             os.close(fd)
-        if command.gpu_memory_limit is not None and (
-            command.gpu_memory_limit < 0 or not command.devices
-        ):
-            return self._refusal(
-                "gpu_memory_limit", "a GPU memory limit needs GPUs and nonnegative bytes"
-            )
-        if self.started and command.gpu_memory_limit != self.gpu_memory_limit:
-            return self._refusal(
-                "gpu_memory_limit", "this executor already opened a different GPU limit"
-            )
-        self.gpu_memory_limit = command.gpu_memory_limit
         self.leases = _leases(command)
         if command.devices and self.leases is None and not self.standalone:
             self.standalone = (
@@ -1896,7 +1871,6 @@ class Executor:
             "follower_stages": self.follower_stages,
             "device_total_bytes": total,
             "device_free_bytes": free,
-            "gpu_memory_limit": self.gpu_memory_limit,
             "torch": self.torch is not None,
             "warmed": not warmup_error,
             "warmup_error": warmup_error,
