@@ -31,6 +31,7 @@ from typing import Any, NamedTuple, cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _work as work
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
@@ -789,7 +790,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         region is None  # a copy of a region's module: no region of its own
         or BYPASS.get()
         or _WARMING.get()
-        or not torch.cuda.is_available()
+        or placed_device().type != "cuda"
         or torch.cuda.is_current_stream_capturing()
     ):
         return call(module, *args, **kwargs)

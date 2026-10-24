@@ -79,7 +79,7 @@ from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import _Broker, _CallType, _export
-from cozy_runtime.author._context import CURRENT, AdapterRef, Device
+from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
     DEVICE_FAULT,
@@ -1024,6 +1024,7 @@ class Executor:
             torch.cuda.set_device(self.rank)
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
+        place(self._device())
         return None
 
     def _open_memory(self, torch: Any) -> None:
@@ -2547,7 +2548,6 @@ class Executor:
         registry = ModelRegistry(
             release=binding.release,
             backend=backend,
-            device=self._device(),
             substrate=lambda: serving_substrate(hardware_variant, seen),
         )
         try:
@@ -4435,9 +4435,13 @@ class Executor:
         return cached
 
     def _device(self) -> Device:
-        """No torch in this process means no device to name (cl-013). Ordinal 0 IS the
-        lane's device: the worker sealed this process to exactly its lane (cr-066)."""
-        return Device(self.device_kind, 0) if self.torch is not None else Device()
+        """This executor's device as `author.device()` names it: its rank's GPU (`cuda:0`
+        alone; the worker sealed this process to its lane, cr-066), MPS, or the CPU where none
+        is present. No torch in this process means no device to name (cl-013)."""
+        if self.torch is None:
+            return Device()
+        placed = self._rank_device(self.torch)
+        return Device(placed.type, placed.index)
 
     @contextlib.contextmanager
     def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:

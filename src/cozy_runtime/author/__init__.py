@@ -47,6 +47,7 @@ from cozy_runtime.author._context import (
     Context,
     Device,
     RequestView,
+    device,
 )
 from cozy_runtime.author._data import data_values
 from cozy_runtime.author._decode import (
@@ -322,6 +323,7 @@ __all__ = [
     "data_values",
     "decode_request",
     "describe",
+    "device",
     "expect_attention",
     "graph_keys",
     "held",

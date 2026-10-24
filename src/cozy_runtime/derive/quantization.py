@@ -26,6 +26,7 @@ import numpy as np
 
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
@@ -573,7 +574,7 @@ def _fit_tensor(
     started = time.perf_counter()
     values = np.concatenate(list(read_chunks()))
     torch = calibration.torch
-    cuda = torch.cuda.is_available()
+    cuda = placed_device().type == "cuda"
     if cuda:
         torch.cuda.reset_peak_memory_stats()
     read = time.perf_counter()

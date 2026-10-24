@@ -33,7 +33,7 @@ from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_ch
 
 import msgspec
 
-from cozy_runtime.author._context import AdapterRef, Device
+from cozy_runtime.author._context import AdapterRef, Device, device
 from cozy_runtime.author._errors import CapabilityError, ConformanceError, InvalidRequest
 
 T = TypeVar("T")
@@ -776,7 +776,6 @@ class Loader:
         "_assets",
         "_backend",
         "_caches",
-        "_device",
         "_mode",
         "_objects",
         "_open",
@@ -791,13 +790,11 @@ class Loader:
         owner: _ScopeHost,
         backend: Backend | None = None,
         mode: Mode = "serve",
-        device: Device | None = None,
     ) -> None:
         self._artifact = artifact
         self._assets = ModelAssets(artifact.assets, self._require_open)
         self._backend: Backend = backend if backend is not None else _NullBackend()
         self._mode: Mode = mode
-        self._device = device or Device()
         self._owner = owner
         self._open = True
         self._records: list[ConstructionRecord] = []
@@ -806,9 +803,10 @@ class Loader:
 
     @property
     def device(self) -> Device:
-        """Read-only device identity. Placement is the runtime's; naming it is not a door."""
+        """This process's device (`author.device()`). Placement is the runtime's; naming it is
+        not a door."""
         self._require_open("loader.device")
-        return self._device
+        return device()
 
     @property
     def assets(self) -> ModelAssets:
