@@ -72,8 +72,7 @@ from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _split, describe
-from cozy_runtime.author import _work as work
-from cozy_runtime.author._activity import ThreadPoolExecutor, own_thread
+from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import GrantedInput
@@ -1639,7 +1638,6 @@ class Executor:
             now = time.perf_counter()
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
-            work.done += 1
 
         imported = self.imported
         warmup_error = ""
@@ -2280,7 +2278,6 @@ class Executor:
             now = time.perf_counter()
             stages.append((name, round((now - _mark[0]) * 1000, 1)))
             _mark[0] = now
-            work.done += 1
 
         self._stages = stages
         if not binding.model_class:
@@ -3364,7 +3361,6 @@ class Executor:
                         models=self.models,
                         recipes=self.discovered.recipes,
                         progress=boundary,
-                        activity=self._activity_sink(command.request_id),
                         plan=functools.partial(self._plan_request, command.request_id),
                         # cr-012: the inputs the WORKER already fetched, verified and spooled.
                         # Every value is a path inside this attempt's own spool: this process is
@@ -4364,22 +4360,6 @@ class Executor:
         except msgspec.ValidationError as exc:
             raise SeamError("seam_answer_malformed", f"{exchange}: {exc}") from exc
 
-    def _activity_sink(self, request_id: str) -> Callable[[int, bool, bool, bool], None]:
-        def activity(sequence: int, active: bool, known: bool, finished: bool) -> None:
-            self.channel.send(
-                {
-                    "event": "progress",
-                    "request_id": request_id,
-                    "kind": "execution_activity",
-                    "sequence": sequence,
-                    "active": active,
-                    "known": known,
-                    "finished": finished,
-                }
-            )
-
-        return activity
-
     def _progress_sink(self, request_id: str) -> Any:
         """The lossy lane's sink for one attempt — the same one `invoke` installs."""
 
@@ -4893,7 +4873,6 @@ def _idle(executor: Executor, order: _Order) -> None:
     """Graphs record off the request path (`graphs.capture_idle`): after a command is answered,
     while no other is open. One arriving makes the capture yield at its next region boundary. A
     device fault there poisons the executor, as one in a request does (the machine ends it)."""
-    own_thread()
     answered = 0
     while True:
         with order.idle(answered, lambda: bool(graphs.IDLE.jobs)) as answered:
@@ -4911,10 +4890,8 @@ def serve(executor: Executor, channel: Channel) -> int:
     keeps reading: a call's commands run on the pool, and so does a process-wide one that must
     wait for calls in flight; one that need not runs here, where Start and Fork always ran."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
-    if executor.rank == 0:
-        work.follow(functools.partial(_tell, channel))
-    # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
-    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
+    # Runtime-owned workers, none before the first is needed.
+    pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call")
     order = _Order()
     idle = False
     while True:
@@ -4955,11 +4932,6 @@ def _shut(executor: Executor, channel: Channel) -> int:
     return int(Exit.ok)
 
 
-def _tell(channel: Channel, frame: Frame) -> None:
-    with contextlib.suppress(SeamError):
-        channel.send(frame)
-
-
 def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextManager[None]) -> None:
     """One command on a pool worker, in its turn. A BaseException, or a reply the seam would
     not take, ends the process, as either did when commands ran on the main thread; so does a
@@ -4968,12 +4940,7 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
         with turn:
             call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
             _CALL.set(call)
-            if call:
-                work.begin(call)
-            try:
-                reply = _reply(executor, frame)
-            finally:
-                work.end(call)
+            reply = _reply(executor, frame)
             if reply is None:
                 code = _shut(executor, executor.channel)
                 sys.stdout.flush()

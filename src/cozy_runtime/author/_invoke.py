@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any, get_args, get_type_hints
 
 import msgspec
 
-from cozy_runtime.author._activity import asides, event_loop, observing
+from cozy_runtime.author._activity import asides
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import (
@@ -138,7 +138,6 @@ class Invocation:
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
-    activity: Callable[[int, bool, bool, bool], None] | None = None
     plan: Callable[[Sequence[str | Collection[str]]], None] | None = None
     calls: _Broker | None = None
     publish: Callable[[Publish], Published] | None = None
@@ -332,7 +331,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         inv.calls.bind(ctx, Telemetry(record, ctx), record.media)
     token, context = _current.set(inv.calls), CURRENT.set(ctx)
     try:
-        result = _call(surface, kwargs, inv.activity)
+        result = _call(surface, kwargs)
         if inv.calls is not None:
             inv.calls.finish()
     finally:
@@ -1006,7 +1005,6 @@ def _settings_value(schema: object, value: object, what: str) -> Any:
 def _call(
     surface: Surface,
     kwargs: Mapping[str, object],
-    activity_sink: Callable[[int, bool, bool, bool], None] | None = None,
 ) -> object:
     """`def` runs right here on the calling (executor) thread; `async def` runs on a
     PRIVATE event loop created for THIS attempt and closed with it.
@@ -1014,23 +1012,22 @@ def _call(
     `await` interleaves I/O within one attempt and never admits a second — this function
     is synchronous, so law 8's one-active-GPU-attempt rule is unchanged by the spelling.
     """
-    with observing(activity_sink):
-        if not surface.is_async:
-            return surface.fn(**kwargs)
-        loop = event_loop()
-        try:
-            coroutine = surface.fn(**kwargs)
-            assert asyncio.iscoroutine(coroutine)
-            return loop.run_until_complete(coroutine)
-        finally:
-            if (broker := _current.get()) is not None:
-                broker.closed = True
-            pending = asyncio.all_tasks(loop)
-            for task in pending:
-                task.cancel()
-            if pending:
-                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
-            loop.close()
+    if not surface.is_async:
+        return surface.fn(**kwargs)
+    loop = asyncio.new_event_loop()
+    try:
+        coroutine = surface.fn(**kwargs)
+        assert asyncio.iscoroutine(coroutine)
+        return loop.run_until_complete(coroutine)
+    finally:
+        if (broker := _current.get()) is not None:
+            broker.closed = True
+        pending = asyncio.all_tasks(loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+        loop.close()
 
 
 # ------------------------------------------------------------------------- result
