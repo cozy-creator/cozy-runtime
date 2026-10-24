@@ -19,6 +19,7 @@ import zlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
@@ -754,10 +755,12 @@ class _Bakes:
         device = backend.device
         self.gpu = (device.index or 0) if device.type == "cuda" else None
         self.bakes: dict[str, _Bake] = {}
-        self.strategy: lora_bake.Strategy = "bake"
-        #: what this forward serves (`prepare`): per step while the bake kernels build
-        self.serving: lora_bake.Strategy = "per_step"
-        self.how: lora_bake.How | None = None
+        #: Each attempt chooses once; a kernel landing at a later step cannot change its fill.
+        #: Concurrent attempts keep their own choice. Idle capture uses the last served one.
+        self._choice: ContextVar[tuple[lora_bake.Strategy, lora_bake.How | None] | None] = (
+            ContextVar("cozy_lora_fill", default=None)
+        )
+        self._last: tuple[lora_bake.Strategy, lora_bake.How | None] = ("per_step", None)
         self.baked = 0
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
@@ -791,19 +794,36 @@ class _Bakes:
                         bake.layer = layer
             if bake.layer is not None or bake.hooks:
                 self.bakes[stored] = bake
+        if self.bakes:
+            self.choose("bake")  # A lazily constructed model's first attempt uses the default.
+
+    def choose(self, strategy: lora_bake.Strategy) -> None:
+        """Choose the attempt's serving recipe once, before its first component scope."""
+        if not self.bakes:
+            return
+        gpu = self.gpu if strategy == "bake" else None
+        how: lora_bake.How | None = "eager" if gpu is None else lora_bake.serving(gpu)
+        self._choice.set((strategy if how is not None else "per_step", how))
+
+    @property
+    def serving(self) -> lora_bake.Strategy:
+        return (self._choice.get() or self._last)[0]
+
+    @property
+    def how(self) -> lora_bake.How | None:
+        return (self._choice.get() or self._last)[1]
 
     @property
     def identity(self) -> str | None:
         """What a bake writes now, the same in every process (`Filling.identity`): the strategy
         and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each baked
         weight's stored name and encoding with each delta's content (a stored factor pair of
-        this checkpoint, or the identity a hook's package declares), dtypes and scale. A bake
-        waits for no kernel: while its kernels build the LoRAs serve per step, and pages bake
-        once they serve (the identity changes, so varena refills them)."""
+        this checkpoint, or the identity a hook's package declares), dtypes and scale. The
+        attempt's serving recipe is fixed by `choose`: a kernel becoming ready affects the next
+        attempt, never a refault halfway through this one. Package hooks still name their
+        currently armed overlay at the pass boundary; those hooked roots are not graphed."""
         torch = self.torch
-        gpu = self.gpu if self.strategy == "bake" else None
-        self.how = "eager" if gpu is None else lora_bake.serving(gpu)
-        self.serving = self.strategy if self.how is not None else "per_step"
+        self._last = self._choice.get() or self._last
         baked = self.serving == "bake"
         for bake in self.bakes.values():  # each LoRA'd linear told whether its bytes carry it
             if bake.layer is not None:
@@ -922,6 +942,8 @@ class Placement:
         self.notes.clear()
         self.steps = []
         self.release()
+        for bakes in self.bakes.values():
+            bakes.choose("bake")  # Followers open here; the invoke may then select per_step.
         for model in self.models.values():
             graphs.mark(model.module)
 
@@ -936,6 +958,8 @@ class Placement:
         pages (S3). A component with no free room binds per block."""
         entering = {name for name in components if name in self.models}
         self.release(keep=entering.union(*(s for s in self.steps if s & entering)))
+        for name in sorted(entering):  # graphs of another fill go before this one binds
+            graphs.retire_stale(self.torch, self.models[name].module)
         stream = self.torch.cuda.current_stream() if self.memory.cuda else None
         for name in sorted(entering - self.holds.keys() - self.unheld):
             shed = functools.partial(self.holds.pop, name, None)
@@ -966,9 +990,9 @@ class Placement:
         return None if held is None else held[1]
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
-        """A request's LoRA serving (`lora_mode`): baked, or per step."""
+        """Fix the request's LoRA serving (`lora_mode`) and implementation before its scopes."""
         for bakes in self.bakes.values():
-            bakes.strategy = strategy
+            bakes.choose(strategy)
 
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
         """The region's address ownership, independent of its physical replay lease."""
@@ -986,15 +1010,9 @@ class Placement:
         return self.memory.region(owner, kind, sets=sets)
 
     def graph_pool(self, component: str) -> graphs.domain.Pool:
-        """`component`'s graph region of the device's one capture pool: it holds the
-        component's weights bound while its graphs live, and varena drops it between replays."""
-        model = self.models[component]
-        region = self.memory.graph_region(sets=model, retained=model)
+        """A capture pool and replay/drop word. Binding owns each capture/replay's weights."""
+        region = self.memory.graph_region()
         return graphs.domain.Pool(region.pool, region, self.memory)
-
-    def graph_segments(self, component: str) -> tuple[str, ...]:
-        """The model's declared block topology, which graph regions align with."""
-        return tuple(self.models[component].blocks)
 
     def graph_pass(self, component: str, entry: str) -> Any:
         return self.models[component].passing(entry)
