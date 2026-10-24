@@ -49,7 +49,6 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any, NamedTuple
 
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author import _work as work
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
@@ -1365,7 +1364,6 @@ class _Engine:
                 self.unfenced.discard(stream)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
-        work.done += 1
         for request in {id(row.request): row.request for row in rows}.values():
             request.steps += 1
             request.live += len(rows)

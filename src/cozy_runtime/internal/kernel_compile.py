@@ -44,7 +44,6 @@ from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author import _work as work
 from cozy_runtime.internal import config, filelock, kernel_cache, liveness, proctree
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
@@ -202,7 +201,7 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     if state.state != "compiling":
         return state
     name = waiter or state.kernel
-    pace, sampled, reported = liveness.Pace(), float("-inf"), None
+    pace, sampled = liveness.Pace(), float("-inf")
     with request_path.forbid(f"kernel build wait: {name}"), held.get()(name) as sleep:
         while state.state == "compiling":
             now = time.monotonic()
@@ -210,13 +209,7 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
                 sampled = now
                 if waiting is not None and told.get():
                     waiting(replace(state, kernel=name))
-                # The call waiting moves as its builder says it moves (cl-648): its share done
-                # and its own CPU, which a sandboxed executor cannot read from its processes.
-                words = _words(store)
-                if words != reported:
-                    reported = words
-                    work.done += 1
-                pace.observe(_activity(words), now)
+                pace.observe(_activity(_words(store)), now)
                 if pace.wedged(liveness.noise_floor(), now):
                     verdict = pace.verdict(liveness.noise_floor(), now)
                     _record_failure(job.key, "compile_stalled", verdict)

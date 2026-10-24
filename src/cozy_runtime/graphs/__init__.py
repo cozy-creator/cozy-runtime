@@ -30,7 +30,6 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author import _work as work
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
@@ -197,7 +196,6 @@ class _Recording:
                     static.copy_(value)
                     copied += static.nbytes
             self.graph.replay()
-            work.done += 1
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
             if out is None:
