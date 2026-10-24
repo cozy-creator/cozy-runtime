@@ -86,10 +86,10 @@ def restore(request: Request, reads: Iterable[object], spare: int) -> None:
     and `spare` (the site's finest need); otherwise they stay mapped, read over the bus."""
     back = 0
     for t in _tensors(reads):
-        storage = t.untyped_storage()
-        nbytes = _PARKED.get(storage.data_ptr())
+        nbytes = _PARKED.get(_at(t))
         if nbytes is None:
             continue
+        storage = t.untyped_storage()
         room = request.room()
         if room.free + room.cold < nbytes + spare:
             continue
@@ -217,7 +217,7 @@ def _idle(
     request: Request, device: torch.device, reads: Iterable[object], block: CodeType
 ) -> list[UntypedStorage]:
     """The storages the model call's frames hold that may park, largest first."""
-    skip = {t.untyped_storage().data_ptr() for t in _tensors(reads) if t.is_cuda}
+    skip = {_at(t) for t in _tensors(reads)}
     skip |= _kept(request)
     lent = list(graphs._LENT)
     found: dict[int, UntypedStorage] = {}
@@ -263,12 +263,16 @@ def _kept(request: Request) -> set[int]:
     kept: set[int] = set()
     for root in list(request.memory.models):
         for module in root.modules():
-            for t in tensors(vars(module)):
-                try:
-                    kept.add(t.untyped_storage().data_ptr())
-                except RuntimeError:  # a placeholder: no storage
-                    continue
+            kept.update(_at(t) for t in tensors(vars(module)))
     return kept
+
+
+def _at(t: Tensor) -> int:
+    """Its storage's address; 0 for a tensor with none (a weight's placeholder)."""
+    try:
+        return int(t.untyped_storage().data_ptr())
+    except RuntimeError:
+        return 0
 
 
 def _host_room() -> int:
