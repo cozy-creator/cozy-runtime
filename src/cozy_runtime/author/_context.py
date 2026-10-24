@@ -172,8 +172,8 @@ class Context:
         return self._tensorfs_output(slot, derivation)
 
     def adopt_model(self, output: Output) -> ModelArtifact:
-        """Commit `output` (a committed one replays), upload it to the run's destination when
-        it names one, and keep it as this attempt's model."""
+        """Commit `output` and keep it as this attempt's model. A committed output replays;
+        TensorD uploads it when the run names a destination."""
         self.raise_if_cancelled()
         if self._tensorfs_adopt is None:
             raise CapabilityError(
