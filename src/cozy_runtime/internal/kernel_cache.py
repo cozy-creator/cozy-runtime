@@ -264,7 +264,7 @@ def _read(namespace: Path, key: Key, *, repair: bool) -> bytes | None:
 
 
 def _write(path: Path, data: bytes) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o644)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o644)
     try:
         view = memoryview(data)
         while view:
@@ -275,6 +275,9 @@ def _write(path: Path, data: bytes) -> None:
 
 
 def _fsync_dir(path: Path) -> None:
+    """A directory's entries made durable; Windows has none to sync (NTFS journals them)."""
+    if os.name != "posix":
+        return
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     try:
         os.fsync(fd)

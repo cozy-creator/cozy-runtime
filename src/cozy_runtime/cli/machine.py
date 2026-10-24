@@ -199,49 +199,76 @@ def describe() -> int:
 # --------------------------------------------------------------------------- frame-codec
 
 
-def _regular(directory: int, name: str) -> int:
-    """The spool file `name`, opened as a path: a regular file, never a link or elsewhere."""
+#: Linux opens spool names under the directory's own descriptor.
+_DIR_FD = sys.platform == "linux"
+
+
+def _single(name: str, refusal: str) -> str:
     if not name or name != os.path.basename(name) or name in (".", ".."):
-        raise ValueError("SDK output has no single owned spool name")
-    handle = os.open(name, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
-    try:
-        if not stat.S_ISREG(os.fstat(handle).st_mode):
+        raise ValueError(refusal)
+    return name
+
+
+class _Spool:
+    """The machine's spool directory. A name in it is read only as the regular file it is, never
+    through a link, and written whole by replacing it. Linux holds the directory open and opens
+    names under it; elsewhere (no `O_PATH`, `/proc` or `dir_fd`) a name is read by path, refused
+    unless the file opened is the regular file `lstat` saw."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self.fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC) if _DIR_FD else None
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+
+    def read(self, name: str) -> bytes:
+        name = _single(name, "SDK output has no single owned spool name")
+        if self.fd is not None:
+            handle = os.open(name, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=self.fd)
+            try:
+                if not stat.S_ISREG(os.fstat(handle).st_mode):
+                    raise ValueError("SDK output is not a regular file")
+                with open(f"/proc/self/fd/{handle}", "rb") as stream:
+                    return stream.read()
+            finally:
+                os.close(handle)
+        path = os.path.join(self.path, name)
+        seen = os.lstat(path)
+        if not stat.S_ISREG(seen.st_mode):
             raise ValueError("SDK output is not a regular file")
-        return handle
-    except BaseException:
-        os.close(handle)
-        raise
-
-
-def _read_regular(directory: int, name: str) -> bytes:
-    handle = _regular(directory, name)
-    try:
-        with open(f"/proc/self/fd/{handle}", "rb") as stream:
+        with open(path, "rb") as stream:
+            if not os.path.samestat(seen, os.fstat(stream.fileno())):
+                raise ValueError("SDK output changed while it opened")
             return stream.read()
-    finally:
-        os.close(handle)
+
+    def write(self, name: str, data: bytes) -> None:
+        temporary = ".codec-" + uuid.uuid4().hex
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        if self.fd is not None:
+            fd = os.open(temporary, flags | os.O_CLOEXEC, 0o600, dir_fd=self.fd)
+            with os.fdopen(fd, "wb") as stream:
+                stream.write(data)
+            os.rename(temporary, name, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            return
+        temporary = os.path.join(self.path, temporary)
+        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as stream:
+            stream.write(data)
+        os.replace(temporary, os.path.join(self.path, name))
 
 
-def _encode(request: dict[str, object], directory: int) -> dict[str, object]:
+def _encode(request: dict[str, object], spool: _Spool) -> dict[str, object]:
     """Each frame encoded into the spool name the machine gave it: its media type, by handle."""
     media: dict[str, str] = {}
     frames = request["frames"]
     assert isinstance(frames, list)
     for frame in frames:
-        raw = _read_regular(directory, frame["raw"])
+        raw = spool.read(frame["raw"])
         if len(raw) != frame["raw_bytes"]:
             raise ValueError("registered raw frame length changed")
-        name = frame["name"]
-        if not name or name != os.path.basename(name) or name in (".", ".."):
-            raise ValueError("SDK frame has no owned output binding")
-        encoded = encode_frame(frame["codec"], frame.get("facts") or {}, raw)
-        temporary = ".codec-" + uuid.uuid4().hex
-        fd = os.open(
-            temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600, dir_fd=directory
-        )
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(encoded)
-        os.rename(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        name = _single(frame["name"], "SDK frame has no owned output binding")
+        spool.write(name, encode_frame(frame["codec"], frame.get("facts") or {}, raw))
         media[frame["handle"]] = FRAME_MEDIA_TYPES[frame["codec"]]
     return {"media": media}
 
@@ -253,11 +280,11 @@ def frame_codec() -> int:
         answer: dict[str, object]
         try:
             request = json.loads(line)
-            directory = os.open(request["spool"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            spool = _Spool(request["spool"])
             try:
-                answer = _encode(request, directory)
+                answer = _encode(request, spool)
             finally:
-                os.close(directory)
+                spool.close()
         except Exception as exc:
             answer = {"error": f"{type(exc).__name__}: {exc}"[:2000]}
         sys.stdout.write(json.dumps(answer, separators=(",", ":")) + "\n")
