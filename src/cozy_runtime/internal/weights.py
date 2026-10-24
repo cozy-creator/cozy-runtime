@@ -13,7 +13,6 @@ and notes.
 from __future__ import annotations
 
 import functools
-import threading
 import time
 import zlib
 from collections import Counter
@@ -113,8 +112,6 @@ class Backend:
         #: id(module) -> the loaded model (of any construction) and path holding it, and the module
         self.owned: dict[int, tuple[Model, str, object]] = {}
         self.indexed: tuple[int, ...] = ()
-        #: each component's bind routes, which keep its decoded tensors for the generation
-        self.routes: dict[str, _Routes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
         #: Persistent buffers the checkpoint does not store (full keys): they keep their values.
         self.unstored: set[str] = set()
@@ -427,9 +424,6 @@ class Backend:
             model.close()
         self.models.clear()
         self.owned, self.indexed = {}, ()
-        for routes in self.routes.values():
-            routes.close()
-        self.routes.clear()
 
     def sizes(self) -> dict[str, int]:
         """Each loaded component's stored bytes."""
@@ -485,7 +479,7 @@ class Backend:
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
-        routes = self.routes[name] = _Routes(self, name, rows, root)
+        routes = _Routes(self, rows)
         leg = self._leg(f"{name}.routes", leg)
         bound = {stored: row.key.partition(".")[2] for stored, row in rows.items()}
         vars(root)["_cozy_weights"] = Declared(
@@ -572,18 +566,13 @@ class Backend:
 
 
 class _Routes:
-    """A stored tensor's parts as the module's tensors (`Declared.bind`): as stored, decoded
-    into a float tensor, or a native leaf's role buffers (derived roles made from the stored
-    ones). A decoded tensor is decoded once a generation (`delivery.cost_class`), not once a
-    bind: it is kept under the fill identity it was decoded from, in the component's derived
-    cache, pinned while the component is in use (`Placement.using`). Between uses the residency
-    owner may discard it, and the next bind decodes again. Leaf buffers
-    live for that bind."""
+    """Bind stored parts as ordinary weights, decoded floats, or native leaf role buffers.
 
-    def __init__(
-        self, backend: Backend, component: str, rows: Mapping[str, PlanRow], root: Module
-    ) -> None:
-        self.backend, self.component, self.root = backend, component, root
+    Residency owns and caches the returned tensors with their block. Dropping that block
+    releases its decoded storage too; active scopes and graph bindings keep their own owners.
+    """
+
+    def __init__(self, backend: Backend, rows: Mapping[str, PlanRow]) -> None:
         self.torch = backend.torch
         self.rows = dict(rows)
         self.routes = {stored: backend._route(row.key) for stored, row in rows.items()}
@@ -595,11 +584,6 @@ class _Routes:
             for stored, row in rows.items()
             if row.key in backend.leaves
         }
-        self.lock = threading.Lock()
-        #: stored key -> (the fill identity it was decoded under, the decoded tensor)
-        self.decoded: dict[str, tuple[str, Tensor]] = {}
-        #: the decoded tensors' region, made with the first one kept
-        self.region: Region | None = None
 
     def __call__(self, key: str, parts: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
         torch, row = self.torch, self.rows[key]
@@ -608,24 +592,10 @@ class _Routes:
         if route == "verbatim":
             return {name: parts["value"]}
         if route == "decoded_float":
-            identity = self._identity()
-            with self.lock:
-                held = self.decoded.get(key)
-                if held is not None and held[0] == identity:
-                    return {name: held[1]}
             dtype = getattr(torch, TORCH_DTYPES[row.dtype])
             device = next(iter(parts.values())).device
-            if not identity:  # never kept: the bind's own
-                out = torch.empty(row.shape, dtype=dtype, device=device)
-                self.providers[key].decode(torch, parts, out)
-                return {name: out}
-            with self._region().allocating() as fresh:
-                if fresh:
-                    self.forget()
-                out = torch.empty(row.shape, dtype=dtype, device=device)
-                self.providers[key].decode(torch, parts, out)
-            with self.lock:
-                self.decoded[key] = (identity, out)
+            out = torch.empty(row.shape, dtype=dtype, device=device)
+            self.providers[key].decode(torch, parts, out)
             return {name: out}
         leaf, replaced, derived = self.leaves[key]
         provider = cast(LeafProvider, self.providers[key])
@@ -633,34 +603,6 @@ class _Routes:
             leaf, derived, parts, lambda: provider.leaf(torch, parts, replaced, leaf.out_dtype)
         )
         return {f"{name.removesuffix('.weight')}.{buffer}": t for buffer, t in made.items()}
-
-    def _identity(self) -> str:
-        """What the stored bytes are now: as stored, or the fill (LoRA bake) identity they were
-        baked under; "" where the fill declares none, whose decode is never kept."""
-        model = self.backend.models.get(self.component)
-        if model is None or model.fill is None:
-            return "stored"
-        return model.identity or ""
-
-    def _region(self) -> Region:
-        if self.region is None:
-            memory = self.backend.memory
-            self.region = memory.region(
-                f"decoded:{self.component}", "derived", self.root, release=self.forget
-            )
-        return self.region
-
-    def forget(self) -> None:
-        """Its region came back empty: every decoded tensor goes (the next bind decodes)."""
-        with self.lock:
-            self.decoded.clear()
-
-    def close(self) -> None:
-        """The generation ends: every decoded tensor, and their region."""
-        self.forget()
-        if self.region is not None:
-            self.region.close()
-            self.region = None
 
 
 def _float32(torch: ModuleType, root: Module) -> None:
@@ -942,7 +884,6 @@ class Placement:
         self._lora_mode: ContextVar[lora_bake.Strategy] = ContextVar(
             "cozy_lora_mode", default="bake"
         )
-        self.routes = backend.routes
         self.notes: dict[str, str] = {}
         self.attempts = 0
         #: the request's plan (`ctx.plan`): the components each step runs together
@@ -998,11 +939,6 @@ class Placement:
                 self.holds[name] = (hold, stream)
         with ExitStack() as passes:
             for name in sorted(entering):
-                # its decoded tensors stay while it runs; dropped while unused, binds decode again
-                routes = self.routes.get(name)
-                region = routes.region if routes is not None else None
-                if routes is not None and region is not None and passes.enter_context(region.pin()):
-                    routes.forget()
                 passes.enter_context(self.models[name].passing(method))
             yield
 
