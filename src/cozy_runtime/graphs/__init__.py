@@ -24,8 +24,8 @@ import threading
 import time
 import weakref
 from collections import deque
-from collections.abc import Callable, Mapping
-from contextlib import nullcontext
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
@@ -610,20 +610,29 @@ def _placed(module: Any) -> tuple[Any, str] | None:
     return PLACED.get(region[0]()) if region is not None else PLACED.get(module)
 
 
+def retire(torch: Any, root: Any) -> None:
+    """An idle construction offloads: drain its graphs and readers, keeping root registration."""
+    for module, (owner, _) in list(_REGIONS.items()):
+        if owner() is not root or (recorder := _RECORDERS.get(module)) is None:
+            continue
+        scope = recorder.domain.using() if recorder.domain is not None else nullcontext()
+        with scope, recorder.lock:
+            for entry in recorder.recordings.values():
+                if not entry.fenced and entry.stream is not None:
+                    entry.stream.synchronize()
+                if entry.done is not None:
+                    entry.done.synchronize()
+                for reader in entry.readers:
+                    reader.synchronize()
+            recorder.drop()
+
+
 def release(torch: Any, root: Any) -> None:
     """A generation's explicit teardown: finish its output copies before releasing addresses."""
+    retire(torch, root)
     modules = [module for module, (owner, _) in _REGIONS.items() if owner() is root]
     for module in modules:
-        recorder = _RECORDERS.pop(module, None)
-        if recorder is not None:
-            with recorder.lock:
-                for entry in recorder.recordings.values():
-                    if not entry.fenced:
-                        entry.stream.synchronize()
-                        entry.fenced = True
-                    elif entry.done is not None:
-                        entry.done.synchronize()
-                recorder.forget(torch)
+        _RECORDERS.pop(module, None)
         _REGIONS.pop(module, None)
         _GAPS.pop(module, None)
     domain.release(root)
@@ -903,16 +912,7 @@ def _region_call(
                 return eager()
             if recorder.binding is None:
                 recorder.binding = placed[0].retain(placed[1], (_REGIONS[module][1],))
-        # The graph region is acquired from reading its recording through the replay, released by
-        # an event after it: varena drops it only between replays. Being dropped, its graphs go
-        # and the call runs as written; an idle period records it again.
-        pool = recorder.pool
-        assert pool is not None
-        with pool.replaying(torch.cuda.current_stream()) as ok:
-            result = _replay(torch, module, leaves, placed, recorder, key, entry) if ok else None
-        if not ok:
-            recorder.drop()
-            return eager()
+        result = _replay(torch, module, leaves, placed, recorder, key, entry)
         return eager() if result is _EAGER else result
 
 
@@ -959,14 +959,26 @@ def _replay(
         recorder.waiting[key] = attempt
         _refused(module, placed, f"its weights cannot all be resident at once ({exc})")
         return _EAGER
+    pool = recorder.pool
+    assert pool is not None
+
+    def replay() -> Any:
+        # Preparation may allocate/map/revoke. Hold the drop word only for actual execution
+        # and copies, so the mechanism thread can keep serving preparation while a drop waits.
+        with pool.replaying(torch.cuda.current_stream()) as ok:
+            return entry(leaves, out) if ok else _EAGER
+
     try:
-        result = recorder.replayed.run(torch, lambda: entry(leaves, out))
-        _GAPS.pop(module, None)
-        recorder.replays += 1
-        recorder.copy_bytes += entry.copied
-        return result
+        result = recorder.replayed.run(torch, replay)
     finally:
         lease.__exit__(None, None, None)
+    if result is _EAGER:
+        recorder.drop()
+        return _EAGER
+    _GAPS.pop(module, None)
+    recorder.replays += 1
+    recorder.copy_bytes += entry.copied
+    return result
 
 
 def _capture_pending(pending: _Pending) -> bool:
@@ -1028,7 +1040,8 @@ def _record(
     # the exact capture pool; it does not time or select kernels, or run arbitrary package code.
     key, call, owner = pending.key, pending.call, recorder.domain
     assert owner is not None
-    current, stream, state = torch.cuda.current_stream(), None, None
+    current = torch.cuda.current_stream()
+    graph = None
     recorder.capture_attempts += 1
     began = time.perf_counter()
     try:
@@ -1045,17 +1058,9 @@ def _record(
         )
         # Discovery owns the complete range set and then the admitted free headroom.
         lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
-        with scope, lease:
+        with scope, lease, _capture_state(torch, module, owner.stream) as state:
             stream = owner.stream
             stream.wait_stream(current)
-            if recorder.pool is None:
-                recorder.pool = (
-                    placed[0].graph_pool(placed[1])
-                    if placed is not None
-                    else domain.Pool(torch.cuda.graph_pool_handle())
-                )
-            pool = recorder.pool
-            state = _State(torch, module)
             with torch.cuda.stream(stream):
                 # The warm-up runs in the idle request's arena: its high-water is the capture's.
                 seeded = torch.Generator(device=current.device).manual_seed(_SEED)
@@ -1080,6 +1085,13 @@ def _record(
                 if why := _device_bound(submit, busy):
                     recorder.judged[key] = why
                     return True
+                if recorder.pool is None:
+                    recorder.pool = (
+                        placed[0].graph_pool(placed[1])
+                        if placed is not None
+                        else domain.Pool(torch.cuda.graph_pool_handle())
+                    )
+                pool = recorder.pool
                 pool.prepare(IDLE_REQUEST)
                 # Its static inputs are the pool's, made in the capture (an allocation launches
                 # nothing), so they live as long as the graph and never in a request's arena.
@@ -1102,6 +1114,7 @@ def _record(
                 if changed := state.restore():
                     recorder.judged[key] = f"recording it changed the model's state: {changed}"
                     graph.reset()
+                    graph = None
                     return True
                 if not _clonable(torch, outputs[0]):
                     _failed(module, recorder, key, "captured output is not a tensor tree")
@@ -1121,6 +1134,7 @@ def _record(
                 if why := _no_gain(torch, entry, root, recorder.eager):
                     recorder.judged[key] = why
                     entry.close()
+                    graph = None
                     return True
         recorder.recordings[key] = entry
         recorder.captures += 1
@@ -1136,17 +1150,30 @@ def _record(
         _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
         return True
     finally:
+        recorder.capture_ms += (time.perf_counter() - began) * 1e3
+        if key not in recorder.recordings:
+            if graph is not None:
+                graph.reset()
+            if recorder.pool is not None and not recorder.recordings:
+                recorder.pool.close()
+                recorder.pool = None
+
+
+@contextmanager
+def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
+    """Restore warm-up state and join its stream before the prepared weight lease ends."""
+    current, state = torch.cuda.current_stream(), None
+    try:
+        state = _State(torch, module)
+        yield state
+    finally:
+        current.wait_stream(stream)
         settling = _SETTLING.set(True)
         try:
             if state is not None:
                 state.restore()
         finally:
             _SETTLING.reset(settling)
-        recorder.capture_ms += (time.perf_counter() - began) * 1e3
-        if stream is not None:
-            # Warmup can queue reads before refusing an allocation. Join even the failure
-            # path before the lease records its completion event.
-            current.wait_stream(stream)
 
 
 def _hooked(module: Any) -> str:

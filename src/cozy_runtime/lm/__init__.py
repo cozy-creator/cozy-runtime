@@ -1824,22 +1824,22 @@ class _Engine:
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             if key not in self.warmed:
-                if self.pool is None:
-                    self.pool = (
-                        placed[0].graph_pool(placed[1])
-                        if placed is not None
-                        else Pool(torch.cuda.graph_pool_handle())
-                    )
                 # This is the caller's actual next token, never an extra speculative warmup.
                 with self._graph_memory():
                     self._advance(size)
                 self.warmed.add(key)
                 self.eager += 1
                 return
-            pool = self.pool
             capturing = time.perf_counter()
             try:
                 with self._graph_memory(), request_path.known("cozy_runtime.lm._Engine._replay"):
+                    if self.pool is None:
+                        self.pool = (
+                            placed[0].graph_pool(placed[1])
+                            if placed is not None
+                            else Pool(torch.cuda.graph_pool_handle())
+                        )
+                    pool = self.pool
                     context = CURRENT.get()
                     # The driver's request high-water bounds the step's working set (an idle
                     # capture measures it exactly: cr-210 moves this off the request).
@@ -1847,6 +1847,10 @@ class _Engine:
                     graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
+            finally:
+                if graph is None and not self.graphs and self.pool is not None:
+                    self.pool.close()
+                    self.pool = None
             self.captured[0] += 1
             self.captured[1] += time.perf_counter() - capturing
             if graph is not None:

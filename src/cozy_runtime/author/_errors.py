@@ -182,7 +182,7 @@ _CUDA_OOM = 2
 #: CUDA's sticky errors (cudaError_t): ECC uncorrectable, NVLink uncorrectable, illegal
 #: address, launch timeout, context destroyed, device assert, hardware stack, illegal
 #: instruction, misaligned address, invalid address space, invalid PC, launch failure.
-_STICKY = frozenset({214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719})
+_STICKY = frozenset({214, 220, 700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 721, 911})
 #: The one documented list of how libraries that raise no typed error name running out of
 #: memory. The CUDA libraries name their allocation status (their code) in torch's message.
 _ALLOC_FAILED = (

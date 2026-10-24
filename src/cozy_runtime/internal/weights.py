@@ -1008,10 +1008,8 @@ class Placement:
         return self.memory.region(owner, kind, sets=sets)
 
     def graph_pool(self, component: str) -> graphs.domain.Pool:
-        """`component`'s graph region of the device's one capture pool: it holds the
-        component's weights bound while its graphs live, and varena drops it between replays."""
-        model = self.models[component]
-        region = self.memory.graph_region(sets=model, retained=model)
+        """A capture pool and replay/drop word. Binding owns each capture/replay's weights."""
+        region = self.memory.graph_region()
         return graphs.domain.Pool(region.pool, region, self.memory)
 
     def graph_pass(self, component: str, entry: str) -> Any:
