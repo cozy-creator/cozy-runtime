@@ -180,7 +180,17 @@ class _PreparedScope:
                 if cancel_error is not None:
                     raise cancel_error
         except BaseException as error:
+            complete = False
             if execution is not None and fault(error) not in (Fault.STICKY, Fault.DEVICE):
+                try:
+                    complete = execution.poll().done
+                except BaseException:
+                    pass
+            if (
+                execution is not None
+                and not complete
+                and fault(error) not in (Fault.STICKY, Fault.DEVICE)
+            ):
                 self.failure = RuntimeFailure(
                     "prepared-work completion is unproven; retire executor", code="device_fault"
                 )
@@ -202,7 +212,12 @@ class _PreparedScope:
             (
                 error
                 for error in errors
-                if error is not None and fault(error) in (Fault.STICKY, Fault.DEVICE)
+                if error is not None
+                and (
+                    fault(error) in (Fault.STICKY, Fault.DEVICE)
+                    or isinstance(error, RuntimeFailure)
+                    and error.code == "device_fault"
+                )
             ),
             None,
         )
