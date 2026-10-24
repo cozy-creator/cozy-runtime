@@ -165,6 +165,7 @@ from cozy_runtime.internal.executor_commands import (
     Binding,
     CallInterface,
     Fork,
+    Form,
     GroupHardware,
     Hello,
     Invoke,
@@ -202,7 +203,8 @@ from cozy_runtime.internal.parallel.group import (
     RankGroup,
     RankSpec,
     abort_process_group,
-    join_rank,
+    form_rank,
+    ready_rank,
 )
 from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
@@ -843,6 +845,8 @@ class Executor:
         self.world = int(world)
         self.group: RankGroup | None = None
         self.pg: Any = None
+        #: between `join` and `form`: this follower's rank spec and the store it reached
+        self._forming: tuple[RankSpec, Any] | None = None
         #: HOST ONLY: the group's handle as every installed component reads it (`CpComms`)
         self.comms: cp.CpComms | None = None
         #: rank 0 only: the measured links and route this group formed over
@@ -925,6 +929,8 @@ class Executor:
                 return self.hello()
             case Join():
                 return self.join(command)
+            case Form():
+                return self.form(command)
             case Attention():
                 return self.select_attention(command)
             case Kernels():
@@ -1120,9 +1126,11 @@ class Executor:
         return torch.device("cpu")
 
     def join(self, command: Join) -> dict[str, Any]:
-        """A FOLLOWER joins rank 0's store and forms its half of the process group."""
+        """A FOLLOWER's first half of the group: rank 0's store reached and its device current.
+        Its answer is the readiness every GPU gives before any enters group init (`form`)."""
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
+        self._forming = None
         if command.abort:
             watcher = socket.socket(fileno=self.channel.recv_descriptor())
             threading.Thread(
@@ -1156,25 +1164,44 @@ class Executor:
                 self.poisoned = f"join refused: {refused['code']}"
                 return refused
         try:
-            self.pg = join_rank(torch, spec, _SEALED)
+            self._forming = (spec, ready_rank(torch, spec, _SEALED))
         except Exception as exc:
-            self.poisoned = f"join failed: {type(exc).__name__}"
+            return self._unformed(exc, "join")
+        return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
+
+    def form(self, command: Form) -> dict[str, Any]:
+        """A FOLLOWER's second half: every GPU said it is ready, so it enters group init."""
+        forming, self._forming = self._forming, None
+        if forming is None:
             return {
                 "ok": False,
                 "code": "group_unformed",
-                "detail": f"{_gpu(self.rank)} could not join the group: "
-                f"{type(exc).__name__}: {exc}"[:900],
-                "traceback": prepare_diagnostics.exception_trace(exc),
+                "detail": f"{_gpu(self.rank)} was not joined",
             }
+        spec, store = forming
+        try:
+            self.pg = form_rank(self.torch, spec, store)
+        except Exception as exc:
+            return self._unformed(exc, "form")
         if self.comms is not None:
             self.comms.pg = self.pg
         reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
         if command.calibrate:
             exchange, reply["calibration"] = copy_engine.calibrate(
-                torch, self.pg, self.rank, self.world
+                self.torch, self.pg, self.rank, self.world
             )
             copy_engine.install(exchange, self.pg)
         return reply
+
+    def _unformed(self, exc: Exception, step: str) -> dict[str, Any]:
+        self.poisoned = f"{step} failed: {type(exc).__name__}"
+        detail = f"{_gpu(self.rank)} could not {step} the group: {type(exc).__name__}: {exc}"
+        return {
+            "ok": False,
+            "code": "group_unformed",
+            "detail": detail[:900],
+            "traceback": prepare_diagnostics.exception_trace(exc),
+        }
 
     def _calibrated(self, pg: Any) -> None:
         """Rank 0's half of the formation's calibration: NCCL against the copy engines."""
@@ -4690,6 +4717,7 @@ _FOLLOWER_COMMANDS = frozenset(
         "hello",
         "start",
         "join",
+        "form",
         "load",
         "activate",
         "unload",
@@ -4728,7 +4756,7 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
 
 
 #: The commands whose refusals carry the raising traceback to the worker.
-_TRACED_COMMANDS = frozenset({"start", "load", "join"})
+_TRACED_COMMANDS = frozenset({"start", "load", "join", "form"})
 
 #: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
 #: forming, named with the follower's own detail.
