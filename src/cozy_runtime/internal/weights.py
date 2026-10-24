@@ -487,8 +487,17 @@ class Backend:
         checkpoint = self.checkpoints[name]
         routes = self.routes[name] = _Routes(self, name, rows, root)
         leg = self._leg(f"{name}.routes", leg)
+        # Blocks are module paths: a checkpoint stored under other names (Qwen2.5-VL's legacy
+        # `model.layers.N`) splits into its blocks by where each key binds.
+        bound = {stored: row.key.partition(".")[2] for stored, row in rows.items()}
         vars(root)["_varena"] = Declared(
-            Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
+            Weights(
+                checkpoint.ck,
+                name,
+                release=self.release,
+                keys=tuple(rows),
+                bound={stored: path for stored, path in bound.items() if path != stored},
+            ),
             fill=bakes if bakes.bakes else None,
             bind=routes,
         )
