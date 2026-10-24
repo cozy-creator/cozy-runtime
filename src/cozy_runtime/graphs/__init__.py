@@ -337,6 +337,8 @@ class _Recorder:
         self.copy_bytes = 0
         #: why its last call ran as written beside its graphs (a refusal), "" when none
         self.gap = ""
+        #: DIAGNOSTIC (proof-only build): a profile of one eager call per attempt, idle measures
+        self.diag: dict[str, Any] = {}
         self.landed = LANDED[0]
         self.domain: domain.Domain | None = None
         #: host time preparing and capturing at idle (warm-up, its busy measure and the
@@ -658,6 +660,7 @@ def describe(root: Any) -> dict[str, Any]:
                 eager=recorder.eager.document(base.get("eager", (0, 0, 0.0, 0.0))),
                 replay=recorder.replayed.document(base.get("replayed", (0, 0, 0.0, 0.0))),
                 eager_gap=recorder.gap,
+                diag=dict(recorder.diag),
             )
             # A device's shared pool and domain count once.
             if recorder.pool is not None and recorder.recordings:
@@ -814,7 +817,46 @@ def _region_call(
             return result
     elif key not in recorder.queued and key not in recorder.failed and key not in recorder.judged:
         _queue(torch, module, recorder, call, key, spec, leaves, placed)
+    if recorder.since("attempts") == 6:
+        return _profiled(torch, module, recorder, placed, lambda: call(module, *args, **kwargs))
     return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+
+
+def _profiled(torch: Any, module: Any, recorder: _Recorder, placed: Any, run: Any) -> Any:
+    """DIAGNOSTIC: one eager call under cProfile, its top host functions into the receipt."""
+    import cProfile  # noqa: PLC0415 - proof-only diagnostic build
+    import pstats  # noqa: PLC0415
+
+    torch.cuda.synchronize()
+    began = time.perf_counter()
+    plain = run()
+    torch.cuda.synchronize()
+    plain_ms = (time.perf_counter() - began) * 1e3
+    profile = cProfile.Profile()
+    began = time.perf_counter()
+    profile.enable()
+    try:
+        out = run()
+    finally:
+        profile.disable()
+    host_ms = (time.perf_counter() - began) * 1e3
+    torch.cuda.synchronize()
+    stats = pstats.Stats(profile)
+    rows = sorted(stats.stats.items(), key=lambda kv: kv[1][2], reverse=True)[:30]  # type: ignore[attr-defined]
+    cum = sorted(stats.stats.items(), key=lambda kv: kv[1][3], reverse=True)[:30]  # type: ignore[attr-defined]
+    fmt = lambda kv: f"{kv[0][0].rsplit('/', 2)[-1]}:{kv[0][1]}({kv[0][2]}) n={kv[1][1]} tot={kv[1][2]*1e3:.2f}ms cum={kv[1][3]*1e3:.2f}ms"  # noqa: E731
+    held = placed[0].graph_held(placed[1]) if placed is not None else None
+    recorder.diag["eager_profile"] = {
+        "plain_synced_ms": round(plain_ms, 3),
+        "profiled_host_ms": round(host_ms, 3),
+        "held": held is not None,
+        "unheld": sorted(getattr(placed[0], "unheld", ())) if placed is not None else [],
+        "holds": sorted(getattr(placed[0], "holds", {})) if placed is not None else [],
+        "tottime": [fmt(kv) for kv in rows],
+        "cumtime": [fmt(kv) for kv in cum],
+    }
+    del plain
+    return out
 
 
 def _queue(
@@ -1027,6 +1069,16 @@ def _record(
                             _failed(module, recorder, key, "output is not a tensor tree")
                             return True
                         busy = _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
+                        busy3 = _busy(torch, lambda: call(module, *cargs, **ckwargs), 3 * took)
+                        recorder.diag.setdefault("busy", []).append(
+                            {
+                                "submit_ms": round(submit, 3),
+                                "warmup_host_ms": round(took, 3),
+                                "busy_ms": round(busy, 3),
+                                "busy_gate3x_ms": round(busy3, 3),
+                                "cycles_per_ms": round(_CYCLES.get(torch.cuda.current_device(), 0.0), 1),
+                            }
+                        )
                 finally:
                     _WARMING.reset(warming)
                 recorder.bound[key] = (submit, busy, None)
