@@ -68,6 +68,8 @@ _DTYPES = {
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
+# A failed graph completion must retain the actual storage owners until executor exit.
+_UNPROVEN: list[Binding] = []
 
 
 class ResidencyError(RuntimeError):
@@ -291,8 +293,11 @@ class Model:
             groups = self.groups()
             missing = sum(b.nbytes for b in groups if b.data is None)
             if free_only and missing > self.memory.room().free:
-                self._release()
-                return None
+                if self.memory.cuda:
+                    torch.cuda.empty_cache()
+                if missing > self.memory.room().free:
+                    self._release()
+                    return None
             entered: list[_Block] = []
             try:
                 for block in groups:
@@ -381,6 +386,7 @@ class Binding:
             repr((model.name, self.fill, self.generation, [b.index for b in groups])).encode()
         ).hexdigest()
         self.closed = False
+        self.completion_lost = False
         self.held: list[tuple[_Block, int]] = []
         self.lock = threading.RLock()
         self.last: Any = None
@@ -389,6 +395,7 @@ class Binding:
         # A caller retires this graph before _declare changes the model's cached fill.
         return (
             not self.closed
+            and not self.completion_lost
             and not self.model.closed
             and self.fill is not None
             and self.fill == self.model.wanted_identity()
@@ -445,22 +452,74 @@ class Binding:
                     finally:
                         try:
                             if memory.cuda and entered:
-                                self.last = torch.cuda.Event()
-                                self.last.record(stream)
+                                self._finish(stream)
                         finally:
                             for block in reversed(entered):
                                 memory._exit(block)
             finally:
                 self.model._release()
 
+    @contextmanager
+    def replay_use(self, stream: Any = None) -> Iterator[Binding]:
+        """Use already-captured storage without rebinding every module or touching its weights.
+
+        The graph reads the retained allocations directly. Its complete launch/output-copy
+        interval is serialized here, and close joins the final use before releasing storage.
+        """
+        memory = self.model.memory
+        stream = memory.stream() if stream is None else stream
+        with self.lock:
+            self.model._claim()
+            try:
+                if not self.valid() or len(self.held) != len(self.groups):
+                    raise StaleBinding("graph weight storage is not retained")
+                if self.last is not None:
+                    stream.wait_event(self.last)
+                try:
+                    yield self
+                finally:
+                    if memory.cuda:
+                        self._finish(stream)
+            finally:
+                self.model._release()
+
+    def _unproven(self, cause: BaseException) -> None:
+        if not self.completion_lost:
+            self.completion_lost = True
+            _UNPROVEN.append(self)
+        error = torch.AcceleratorError(f"graph completion is unproven; retire executor: {cause}")
+        error.error_code = 999
+        raise error from cause
+
+    def _finish(self, stream: Any) -> None:
+        try:
+            event = torch.cuda.Event()
+            event.record(stream)
+            self.last = event
+        except BaseException:
+            try:
+                torch.cuda.synchronize(self.model.memory.device)
+            except BaseException as incomplete:
+                self._unproven(incomplete)
+            self.last = None
+            raise
+
     def close(self) -> None:
-        with self.lock, self.model.memory.lock:
+        with self.lock:
             if self.closed:
                 return
+            if self.completion_lost:
+                self._unproven(ResidencyError("the previous completion failed"))
+            if self.last is not None:
+                try:
+                    self.last.synchronize()
+                except BaseException as incomplete:
+                    self._unproven(incomplete)
             self.closed = True
-            for block, _ in self.held:
-                block.retained -= 1
-            self.held.clear()
+            with self.model.memory.lock:
+                for block, _ in self.held:
+                    block.retained -= 1
+                self.held.clear()
 
 
 class Region:
@@ -585,8 +644,10 @@ class Memory:
         self.apply_budget()
         if self.cuda:
             free, _ = torch.cuda.mem_get_info(self.device)
-            allocated, reserved, _ = self._figures()
-            free = max(int(free) - _RESERVE, 0) + max(reserved - allocated, 0)
+            allocated, _, _ = self._figures()
+            # reserved - allocated includes graph-private storage that ordinary eager
+            # allocation cannot necessarily reuse. Driver free is a conservative bound.
+            free = max(int(free) - _RESERVE, 0)
             if self.budget_bytes is not None:
                 free = min(free, max(self.budget_bytes - allocated, 0))
         else:
@@ -708,7 +769,8 @@ class Memory:
         """Discard idle local owners at a preparation boundary; never inside an allocator."""
         if self.capturing():
             return 0
-        before = self._figures()[0]
+        before_allocated, before_reserved, _ = self._figures()
+        before_free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
         with self.lock:
             blocks = sorted(
                 (b for m in self.models.values() for b in m.groups()),
@@ -718,9 +780,9 @@ class Memory:
             if need and self.room(current).free >= need:
                 break
             self._discard(block)
-        if need and self.room(current).free < need:
+        if not need or self.room(current).free < need:
             for model in sorted(list(self.models.values()), key=lambda m: m.name in current):
-                if self.room(current).free >= need:
+                if need and self.room(current).free >= need:
                     break
                 if self._retire(model):
                     for block in model.groups():
@@ -733,7 +795,9 @@ class Memory:
             region.discard()
         if self.cuda:
             torch.cuda.empty_cache()
-        return max(before - self._figures()[0], 0)
+        allocated, reserved, _ = self._figures()
+        free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
+        return max(before_allocated - allocated, before_reserved - reserved, free - before_free, 0)
 
     def trim(self) -> int:
         """Idle offload: release eligible owners and return actual reserved-byte reduction."""
@@ -761,17 +825,10 @@ class Memory:
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
         self.apply_budget()
-        if not self.capturing() and self.room().free < nbytes:
-            if reclaim:
-                self.reclaim(nbytes)
-            if self.room().free < nbytes:
-                raise torch.OutOfMemoryError(
-                    f"weight allocation needs {nbytes} bytes beyond available room"
-                )
         try:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
         except torch.OutOfMemoryError:
-            if not reclaim or self.capturing() or not self.reclaim(nbytes):
+            if not reclaim or self.capturing() or not self.reclaim():
                 raise
             # Only the failed allocation is retried. No read, fill transform or forward ran.
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
