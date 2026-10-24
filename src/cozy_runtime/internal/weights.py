@@ -38,7 +38,7 @@ from tensorfs.varena.torch import (
 
 from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
-from cozy_runtime.author._model import PLACED
+from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
@@ -802,7 +802,14 @@ class _Bakes:
         if not self.bakes:
             return
         gpu = self.gpu if strategy == "bake" else None
-        how: lora_bake.How | None = "eager" if gpu is None else lora_bake.serving(gpu)
+        # Rank-local compilation can finish at different times, and the cards may differ.
+        # A group uses the reference implementation on every rank until a common fused
+        # readiness contract exists. This choice is fixed before any scope binds its weights.
+        group = (
+            self.torch.distributed.is_initialized()
+            and self.torch.distributed.get_world_size() > 1
+        )
+        how: lora_bake.How | None = "eager" if gpu is None or group else lora_bake.serving(gpu)
         self._choice.set((strategy if how is not None else "per_step", how))
 
     @property
@@ -925,6 +932,10 @@ class Placement:
         self.torch = backend.torch
         self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
+        # Retain the requested mode even for a component hosted entirely on a follower.
+        self._lora_mode: ContextVar[lora_bake.Strategy] = ContextVar(
+            "cozy_lora_mode", default="bake"
+        )
         self.routes = backend.routes
         self.notes: dict[str, str] = {}
         self.attempts = 0
@@ -942,6 +953,7 @@ class Placement:
         self.notes.clear()
         self.steps = []
         self.release()
+        self._lora_mode.set("bake")
         for bakes in self.bakes.values():
             bakes.choose("bake")  # Followers open here; the invoke may then select per_step.
         for model in self.models.values():
@@ -991,8 +1003,36 @@ class Placement:
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
         """Fix the request's LoRA serving (`lora_mode`) and implementation before its scopes."""
+        self._lora_mode.set(strategy)
         for bakes in self.bakes.values():
             bakes.choose(strategy)
+        if (
+            strategy == "bake"
+            and self.torch.distributed.is_initialized()
+            and self.torch.distributed.get_world_size() > 1
+        ):
+            self.note("lora.bake", "eager reference on every executor rank")
+
+    def lora_choices(self, components: tuple[str, ...]) -> dict[str, LoRAServing]:
+        """The choice in this attempt's context, including entirely remote components."""
+        return {
+            name: (bakes._choice.get() or bakes._last)
+            if (bakes := self.bakes.get(name)) is not None
+            else (self._lora_mode.get(), "eager")
+            for name in components
+        }
+
+    @contextmanager
+    def mirrored_lora(self, choices: Mapping[str, LoRAServing]) -> Iterator[None]:
+        """A follower uses the transmitted recipe, never its own kernel-readiness timing."""
+        with ExitStack() as stack:
+            for name, choice in choices.items():
+                if choice[1] == "fused":
+                    raise ValueError("a mirrored LoRA scope requires the common eager recipe")
+                if (bakes := self.bakes.get(name)) is not None:
+                    token = bakes._choice.set(choice)
+                    stack.callback(bakes._choice.reset, token)
+            yield
 
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
         """The region's address ownership, independent of its physical replay lease."""

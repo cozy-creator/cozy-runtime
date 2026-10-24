@@ -1247,6 +1247,7 @@ class Executor:
         # A spread call rank 0 waits on over the group: a header always answers it.
         answered = False
         try:
+            scoped = {scope.model: scope for scope in wire.RunCommand.read(command).scopes}
             spool = Path(command["spool"])
             held = attention.observed(
                 {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
@@ -1278,6 +1279,13 @@ class Executor:
                         # priced, so it may always make room: demand-pull when measured.
                         residency.open_attempt()
                         self._group_attempts[key] = spool
+                    if residency is not None:
+                        choices = scoped[key].lora
+                        if set(choices) != set(components):
+                            raise GroupRefusal(
+                                "mirrored LoRA choices do not cover the scope's components"
+                            )
+                        stack.enter_context(residency.mirrored_lora(choices))
                     stack.enter_context(models[key]._cozy_scope(scope["method"], components))
                     active[key] = components
                 if name[0] not in active or name[1] not in active[name[0]]:
@@ -4495,6 +4503,13 @@ class Executor:
                                     release(model.module)
                                 graphs.retire(self.torch, model.module)
                             self.memory.load(model.module, command.level)
+                if (
+                    command.level == "ram"
+                    and (trim := getattr(self.memory, "trim", None)) is not None
+                ):
+                    # Graph/static tensors and weights have retired; return quiet torch spans,
+                    # including the allocation float, through the adapter's existing operation.
+                    trim()
             for reply in group.collect("map") if group is not None else ():
                 if not reply.get("ok"):
                     raise GroupRefusal(

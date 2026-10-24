@@ -33,6 +33,7 @@ from types import MappingProxyType
 from typing import (
     Any,
     Concatenate,
+    Literal,
     ParamSpec,
     Protocol,
     Self,
@@ -288,6 +289,9 @@ class _Scope(Protocol):
     def __exit__(self, *exc: object) -> None: ...
 
 
+LoRAServing = tuple[Literal["bake", "per_step"], Literal["eager", "fused"] | None]
+
+
 class Residency(Protocol):
     """What a Runtime mechanism handed a placed component reaches, installed on a constructed
     generation. Memory itself is varena's: it sees each forward through its own hooks.
@@ -339,6 +343,14 @@ class Residency(Protocol):
 
     def graph_resident(self, binding: Any) -> bool:
         """Every page a retained region covers is on the device now."""
+        ...
+
+    def lora_choices(self, components: tuple[str, ...]) -> dict[str, LoRAServing]:
+        """The attempt's selected serving recipe, carried with each mirrored scope."""
+        ...
+
+    def mirrored_lora(self, choices: Mapping[str, LoRAServing]) -> AbstractContextManager[None]:
+        """Apply the leader's recipes in the follower's call context."""
         ...
 
     #: How many attempts (requests) it has opened.
