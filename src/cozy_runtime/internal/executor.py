@@ -3507,7 +3507,13 @@ class Executor:
         arena = own_memory[0].torch_peak if own_memory else 0
         live = accel.allocated(torch, self.device_kind, own) if torch is not None else 0
         peak_vram = allocated_at_start + arena if self.device_kind == "cuda" else live
-        peak_reserved = accel.reserved(torch, self.device_kind, own) if torch is not None else 0
+        # The device bytes it held at its fullest pass end, varena's pages and torch's: what 0.30's
+        # torch-pool reserved peak gave. Without a varena record, the allocator's figure now.
+        varena_peaks = [p for row in own_memory if isinstance(p := row.stats.get("peak"), int)]
+        if varena_peaks:
+            peak_reserved = max(varena_peaks)
+        else:
+            peak_reserved = accel.reserved(torch, self.device_kind, own) if torch is not None else 0
         residency_document = self.residency.document() if self.residency else {}
         working_peak = max(peak_vram - allocated_at_start, 0)
         if self.group is not None:
