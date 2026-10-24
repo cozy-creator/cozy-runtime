@@ -28,7 +28,6 @@ import signal
 import stat
 import sys
 import threading
-import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -848,39 +847,6 @@ def executor_cgroup_exists(scope: CgroupScope) -> bool:
     return True
 
 
-def freeze_executor_cgroup(scope: CgroupScope, *, seconds: float = 10.0) -> set[ProcessIdentity]:
-    """Freeze and census an executor subtree before its durable kill boundary."""
-    path = _scope_path(scope)
-    deadline = time.monotonic() + seconds
-    try:
-        (path / "cgroup.freeze").write_text("1\n")
-        while _cgroup_event(path, "populated") and not _cgroup_event(path, "frozen"):
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"could not freeze executor cgroup {scope.relative_path}")
-            time.sleep(0.01)
-        return _cgroup_processes(path)
-    except OSError as exc:
-        raise ContainmentUnavailable(
-            f"cannot freeze executor cgroup {scope.relative_path}: {exc}"
-        ) from exc
-
-
-def kill_frozen_executor_cgroup(scope: CgroupScope, *, seconds: float = 10.0) -> None:
-    """Kill a frozen subtree whose exact process census is already durable."""
-    path = _scope_path(scope)
-    deadline = time.monotonic() + seconds
-    try:
-        (path / "cgroup.kill").write_text("1\n")
-        while _cgroup_event(path, "populated"):
-            if time.monotonic() >= deadline:
-                raise TimeoutError(f"executor cgroup {scope.relative_path} remained populated")
-            time.sleep(0.01)
-    except OSError as exc:
-        raise ContainmentUnavailable(
-            f"cannot reclaim executor cgroup {scope.relative_path}: {exc}"
-        ) from exc
-
-
 def remove_executor_cgroup(scope: CgroupScope) -> None:
     """Remove the exact, proven-empty scope and any empty descendant cgroups."""
     path = _scope_path(scope)
@@ -1018,56 +984,6 @@ def _same_uid_processes(scope: ProcessTreeScope) -> dict[int, _ProcessSnapshot]:
     return snapshots
 
 
-def _process_tree_census(
-    scope: ProcessTreeScope,
-    leader: ProcessIdentity | None,
-    known: set[ProcessIdentity],
-    *,
-    worker_pid: int,
-) -> dict[ProcessIdentity, str]:
-    snapshots = _same_uid_processes(scope)
-    uid_domain = scope.uid != os.geteuid()
-    owned: set[ProcessIdentity] = {
-        row.identity for row in snapshots.values() if uid_domain or row.scope_token
-    }
-    for process in known:
-        row = snapshots.get(process.pid)
-        if row is not None and row.identity == process:
-            owned.add(process)
-    if leader is not None:
-        row = snapshots.get(leader.pid)
-        if row is not None and row.identity == leader:
-            owned.add(leader)
-
-    while True:
-        pids = {process.pid for process in owned}
-        expanded = {
-            row.identity
-            for row in snapshots.values()
-            if row.parent_pid in pids
-            or (row.parent_pid == worker_pid and (row.scope_token or row.state == "Z"))
-        }
-        group_id = leader.pid if leader is not None else 0
-        group_is_pinned = group_id > 0 and any(
-            snapshots.get(process.pid) is not None
-            and snapshots[process.pid].process_group == group_id
-            for process in owned
-        )
-        if group_is_pinned:
-            expanded.update(
-                row.identity for row in snapshots.values() if row.process_group == group_id
-            )
-        before = len(owned)
-        owned.update(expanded)
-        if len(owned) == before:
-            break
-    return {
-        process: snapshots[process.pid].state
-        for process in owned
-        if snapshots.get(process.pid) is not None and snapshots[process.pid].identity == process
-    }
-
-
 def process_scope_contains(scope: ProcessTreeScope, process: ProcessIdentity) -> bool:
     row = _same_uid_processes(scope).get(process.pid)
     return (
@@ -1076,54 +992,6 @@ def process_scope_contains(scope: ProcessTreeScope, process: ProcessIdentity) ->
         and (scope.uid != os.geteuid() or row.scope_token)
         and row.process_group == process.pid
     )
-
-
-def wait_process_stopped(process: ProcessIdentity, *, seconds: float = 10.0) -> None:
-    """Wait for the trampoline's pre-import self-stop without reaping the child."""
-    deadline = time.monotonic() + seconds
-    while True:
-        if not same_process(process):
-            raise ProcessLookupError(process.pid)
-        waited, status = os.waitpid(process.pid, os.WNOHANG | os.WUNTRACED)
-        if waited:
-            if os.WIFSTOPPED(status):
-                return
-            raise ProcessLookupError(process.pid)
-        if time.monotonic() >= deadline:
-            raise TimeoutError(f"process-tree trampoline {process.pid} did not stop before import")
-        time.sleep(0.01)
-
-
-def freeze_process_tree(
-    scope: ProcessTreeScope,
-    leader: ProcessIdentity | None,
-    known: set[ProcessIdentity],
-    *,
-    worker_pid: int,
-    seconds: float = 10.0,
-) -> set[ProcessIdentity]:
-    """Converge on two equal all-stopped first-party descendant censuses."""
-    deadline = time.monotonic() + seconds
-    stable: frozenset[ProcessIdentity] | None = None
-    captured = set(known)
-    while True:
-        observed = _process_tree_census(scope, leader, captured, worker_pid=worker_pid)
-        captured.update(observed)
-        for process, state in observed.items():
-            if state not in {"T", "t", "Z"}:
-                with contextlib.suppress(ProcessLookupError):
-                    signal_process(process, signal.SIGSTOP)
-        census = _process_tree_census(scope, leader, captured, worker_pid=worker_pid)
-        captured.update(census)
-        identities = frozenset(census)
-        stopped = all(state in {"T", "t", "Z"} for state in census.values())
-        if stopped and identities == stable:
-            return captured
-        stable = identities if stopped else None
-        if time.monotonic() >= deadline:
-            states = {process.pid: state for process, state in census.items()}
-            raise TimeoutError(f"could not freeze first-party process tree: states={states}")
-        time.sleep(0.01)
 
 
 def kill_process_tree(processes: set[ProcessIdentity]) -> None:
@@ -1307,61 +1175,6 @@ def peek_child_exit(process: ProcessIdentity) -> int | None:
     if info.si_code == os.CLD_EXITED:
         return info.si_status << 8
     return info.si_status | (0x80 if info.si_code == os.CLD_DUMPED else 0)
-
-
-def progress_burn(pid: int, tid: int = 0, *, cpu: bool = True) -> int:
-    """The progress meter: CPU nanoseconds PLUS every byte moved — read from and written to
-    storage, and read from or written through any descriptor (`rchar`/`wchar`, which is how
-    a socket or a network filesystem shows up). A child can be making progress by computing,
-    by waiting on a cold page cache, by draining a socket or by writing its result, and a
-    meter missing any one hand kills that one. THIS process, threads included and exited
-    threads folded in, unreaped children excluded — or ONE thread of it when `tid` names
-    one, which is how a lane is judged apart from the pollers beside it. -1 is UNREADABLE,
-    never a zero (an unreadable meter decides nothing). Without `cpu`, only the bytes: a
-    process spinning in a wait (a GPU waiting on a collective) burns CPU and moves none."""
-    _linux_only("progress_burn")
-    if not pid:
-        return -1
-    base = f"/proc/{pid}/task/{tid}" if tid else f"/proc/{pid}"
-    try:
-        fields = Path(f"{base}/stat").read_text().rsplit(") ", 1)[-1].split()
-        ticks = int(fields[11]) + int(fields[12])  # utime + stime, after `state`
-    except (OSError, IndexError, ValueError):
-        return -1
-    burned = ticks * (1_000_000_000 // os.sysconf("SC_CLK_TCK")) if cpu else 0
-    try:
-        io = dict(
-            line.split(": ", 1) for line in Path(f"{base}/io").read_text().splitlines() if line
-        )
-        return burned + sum(
-            int(io[hand]) for hand in ("rchar", "wchar", "read_bytes", "write_bytes")
-        )
-    except (OSError, KeyError, ValueError):
-        return burned  # no `io` for this process; the CPU hand still decides
-
-
-def descendants(pid: int) -> list[int]:
-    """Every live process under `pid`, from ONE /proc census — an executor, a `uv` install,
-    a native-operator probe. Zombies included: an exited child still holds its counters
-    until it is reaped."""
-    _linux_only("descendants")
-    parents: dict[int, int] = {}
-    for entry in os.scandir("/proc"):
-        if not entry.name.isdigit():
-            continue
-        try:
-            tail = Path(entry.path, "stat").read_text().rsplit(") ", 1)[-1].split()
-            parents[int(entry.name)] = int(tail[1])  # ppid, after `state`
-        except (OSError, IndexError, ValueError):
-            continue
-    found: list[int] = []
-    frontier = [pid]
-    while frontier:
-        parent = frontier.pop()
-        children = [child for child, above in parents.items() if above == parent]
-        found.extend(children)
-        frontier.extend(children)
-    return sorted(found)
 
 
 def rss_bytes(pid: int) -> int:

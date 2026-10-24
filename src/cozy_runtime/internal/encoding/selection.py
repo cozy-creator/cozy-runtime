@@ -16,7 +16,6 @@ generic one (cuBLASLt, Triton, torch). `resolution.py` takes one route per tenso
 from __future__ import annotations
 
 import platform
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, NoReturn
@@ -144,6 +143,7 @@ def measure_device(torch: Any, index: int = 0, kind: str = "") -> DeviceFacts:
             configuration=accel.memory_class(kind),
             os_arch=os_arch,
         )
+    driver, power, mig = accel.device_settings(index)
     return DeviceFacts(
         kind=kind,
         name=str(identity["name"]),
@@ -152,34 +152,12 @@ def measure_device(torch: Any, index: int = 0, kind: str = "") -> DeviceFacts:
         # which is the wheel's build-time CUDA runtime and rides beside it as such (#549.9).
         # The CUDA driver API version torch reports is folded in so an unreadable NVML still
         # leaves a driver fact in the key rather than a bare "unreadable".
-        driver=f"{_nvml('driver_version', index)}/api{identity['driver_api']}",
-        configuration=f"{_nvml('power.limit', index)}W/{_nvml('mig.mode.current', index)}",
+        driver=f"{driver}/api{identity['driver_api']}",
+        configuration=f"{power}W/{mig}",
         index=int(index),
         cuda_runtime=str(identity["cuda_runtime"]),
         os_arch=os_arch,
     )
-
-
-def _nvml(query: str, index: int) -> str:
-    """One bounded NVML read OF THE SELECTED DEVICE (`-i {index}`, #549.9). `N/A` and a
-    failure are both SPELLED."""
-    try:
-        out = subprocess.run(
-            [
-                "nvidia-smi",
-                "-i",
-                str(index),
-                f"--query-gpu={query}",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        return "unreadable"
-    return (out.splitlines() or ["unreadable"])[0].strip().replace(" ", "") or "unreadable"
 
 
 def device_line(device: DeviceFacts) -> str:

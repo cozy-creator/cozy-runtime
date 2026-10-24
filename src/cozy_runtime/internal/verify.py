@@ -8,10 +8,11 @@ again. No stored verdict ever turns a kernel off (owner, 2026-10-22).
 
 The one thing kept on the machine is a probe that never finished: a marker written before the
 probe and removed after it, so a kernel that ends its process (a sticky CUDA error) is refused by
-the next process instead of crash-looping it. The marker is keyed by the kernel, its artifact's
-digest, the card, the driver and the Runtime build, so an upgrade or a driver update checks it
-again. A device that ran out of memory during the probe keeps nothing: the error raises for the
-memory manager.
+the next process of this boot instead of crash-looping it. The marker is keyed by the kernel, its
+artifact's digest, the card, the driver and the Runtime build, so an upgrade or a driver update
+checks it again, and it names its boot: a probe a reboot interrupted says nothing of its kernel,
+which the next boot checks again. A device that ran out of memory during the probe keeps nothing:
+the error raises for the memory manager.
 
 A kernel first opens at a leaf's bind, inside its model's construction: the probe runs with the
 construction guard stepped aside (`derive.placing`), as the runtime's own placement does.
@@ -96,7 +97,7 @@ def _probed(key: Key, probe: Callable[[], Verdict]) -> Verdict:
         return _run(probe)
     with lock:
         filelock.lock(lock)  # another process of this machine probing it finishes first
-        if path.exists():  # its marker outlived the probe: that probe ended its process
+        if _boot_of(path) == _BOOT:  # its marker outlived the probe: it ended its process
             return Verdict(False, CRASHED)
         _write(path, key, Verdict(False, CRASHED))
         try:
@@ -125,11 +126,31 @@ def _path(key: Key) -> Path | None:
     return store.own / VERDICTS / f"{key[0]}-{digest}.json"
 
 
+def _read_boot() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+#: This boot. Where the OS does not say, every marker counts as this boot's.
+_BOOT = _read_boot()
+
+
+def _boot_of(path: Path) -> str | None:
+    """The boot whose probe left `path`'s marker; None when there is none."""
+    try:
+        row = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return str(row.get("boot", "")) if isinstance(row, dict) else ""
+
+
 def _write(path: Path, key: Key, verdict: Verdict) -> None:
     """Kept whole or not at all; a store that cannot take it guards nothing next process."""
     kernel, artifact, sm, driver, runtime = key
     row = {"kernel": kernel, "artifact": artifact, "sm": sm, "driver": driver, "runtime": runtime,
-           **asdict(verdict)}  # fmt: skip
+           "boot": _BOOT, **asdict(verdict)}  # fmt: skip
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
     try:
         temporary.write_text(json.dumps(row))

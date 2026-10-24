@@ -354,6 +354,45 @@ def device_capability(device: str) -> int:
     return major.value * 10 + minor.value if answer == _NVML_SUCCESS else 0
 
 
+_NVML_NOT_SUPPORTED = 3
+
+
+def device_settings(index: int) -> tuple[str, str, str]:
+    """NVML device `index`'s driver version, power limit (W) and MIG mode, spelled as
+    `nvidia-smi --query-gpu=driver_version,power.limit,mig.mode.current` spells them. In-process
+    where the library is present, else `nvidia-smi` run to its answer: the answer decides, never
+    how long it took. `[N/A]` is the driver saying so; `unreadable` is no driver answering."""
+    library = _nvml_library()
+    handle = _nvml_handle(library, str(index)) if library is not None else None
+    if library is None or handle is None:
+        try:
+            out = _smi("-i", str(index), "--query-gpu=driver_version,power.limit,mig.mode.current")
+        except (OSError, subprocess.SubprocessError):
+            return ("unreadable",) * 3
+        fields = [field.strip().replace(" ", "") or "unreadable" for field in out.stdout.split(",")]
+        if len(fields) != 3:
+            return ("unreadable",) * 3
+        return fields[0], fields[1], fields[2]
+    version = ctypes.create_string_buffer(96)
+    driver = (
+        version.value.decode()
+        if library.nvmlSystemGetDriverVersion(version, ctypes.c_uint(96)) == _NVML_SUCCESS
+        else "unreadable"
+    )
+    milliwatts, current, pending = ctypes.c_uint(), ctypes.c_uint(), ctypes.c_uint()
+
+    def spelled(answer: int, value: str) -> str:
+        if answer == _NVML_SUCCESS:
+            return value
+        return "[N/A]" if answer == _NVML_NOT_SUPPORTED else "unreadable"
+
+    answer = library.nvmlDeviceGetPowerManagementLimit(handle, ctypes.byref(milliwatts))
+    power = spelled(answer, f"{milliwatts.value / 1000:.2f}")
+    answer = library.nvmlDeviceGetMigMode(handle, ctypes.byref(current), ctypes.byref(pending))
+    mig = spelled(answer, "Enabled" if current.value else "Disabled")
+    return driver, power, mig
+
+
 def driver_version() -> str:
     """The loaded NVIDIA driver's version, read from the kernel: no NVML and no thread, so a
     fork parent may ask. A compiled kernel's key carries it. Empty where there is none."""
