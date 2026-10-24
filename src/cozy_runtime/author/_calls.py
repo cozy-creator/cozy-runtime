@@ -23,6 +23,7 @@ from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import MediaReads
+from cozy_runtime.author._defaults import undeclared
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._executor_requests import (
     MAX_CALL_INDEX,
@@ -38,7 +39,7 @@ from cozy_runtime.author._executor_requests import (
 )
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
-from cozy_runtime.author._model import Model
+from cozy_runtime.author._model import WARNINGS, Model
 from cozy_runtime.author._model_defaults import model_components, model_defaults
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 from cozy_runtime.author._weights import Weights
@@ -375,7 +376,18 @@ class _Broker:
                     ]
                 return _input_ref(value, ctx.request_id)
 
-            plain = msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
+            plain, ignored = undeclared(
+                binding.request, msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
+            )
+            if ignored:
+                # A field the installed callee does not declare is a warning, never a refusal.
+                row = (
+                    "a package call named fields its callee does not declare; they were dropped",
+                    {"callee": f"{module}:{export}", "fields": ", ".join(ignored)},
+                )
+                if row not in WARNINGS:
+                    WARNINGS.append(row)
+                _LOG.warning("%s:%s does not declare %s; dropped", module, export, ignored)
             request = msgspec.convert(
                 plain, type=binding.request, dec_hook=asset_dec_hook, strict=True
             )
