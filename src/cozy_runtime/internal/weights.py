@@ -431,6 +431,17 @@ class Backend:
             routes.close()
         self.routes.clear()
 
+    def offload(self) -> None:
+        """Its component roots' graphs and LM decode buffers retire, eager until recorded again,
+        and its decoded weights go (decoded again on the next bind): an offload (`Map(Ram)`)
+        then leaves no page of it pinned on the device."""
+        for model in self.models.values():
+            for _, release in graphs.DECODERS:
+                release(model.module)
+            graphs.retire(self.torch, model.module)
+        for routes in self.routes.values():
+            routes.close()
+
     def sizes(self) -> dict[str, int]:
         """Each loaded component's stored bytes."""
         held: dict[str, int] = {}

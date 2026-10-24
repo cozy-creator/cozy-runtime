@@ -638,6 +638,13 @@ class DerivedCache:
         self._entries.clear()
         self._bytes = 0
 
+    def close(self) -> None:
+        """Its entries and its region go (an offload): the next `get` builds and maps again."""
+        self.drop()
+        if self._region is not None and not self._pins:
+            self._region.close()
+            self._region = None
+
     def _made(self) -> _Region | None:
         """Its region, made with its first entry on a placed model (None unplaced)."""
         residency = self._owner._cozy_residency
@@ -688,6 +695,8 @@ class _Region(Protocol):
     def pin(self) -> AbstractContextManager[bool]: ...
 
     def allocating(self) -> AbstractContextManager[bool]: ...
+
+    def close(self) -> object: ...
 
 
 class _Residency(Protocol):

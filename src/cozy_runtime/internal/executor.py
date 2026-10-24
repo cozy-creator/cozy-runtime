@@ -803,8 +803,8 @@ class Executor:
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: Why a GPU runs standalone ("" it does not): TensorD leases nothing here (its memory
-        #: protocol), or it asked and no manager answers (`Memory.standalone`)
+        #: Why a GPU runs standalone though TensorD asked to lease it and no manager answers
+        #: (`Memory.standalone`); "" otherwise. A Start with no leases is the local path.
         self.standalone = ""
         #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
         self.cuts: dict[str, object] = {}
@@ -1568,11 +1568,6 @@ class Executor:
         for fd in self.channel.recv_fds(2 * command.ledgers):
             os.close(fd)
         self.leases = _leases(command)
-        if command.devices and self.leases is None and not self.standalone:
-            self.standalone = (
-                f"TensorD's memory protocol {command.memory_protocol} leases nothing here: "
-                "each GPU runs standalone"
-            )
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:
@@ -4471,8 +4466,11 @@ class Executor:
         return accel.streams_idle(self.torch, self.device_kind)
 
     def map(self, command: Map) -> dict[str, Any]:
-        """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
-        of a group."""
+        """TensorD's warming and coarse offload: one loaded construction's models at
+        `command.level`, on every GPU of a group. `ram` offloads an idle executor's construction:
+        its graphs retire (eager after, recorded again on later use), its holds and regions go,
+        its weights go to host, and torch's idle memory goes back to the driver, so the GPU
+        keeps its context and what is still live (design varena-local). `gpu` brings it back."""
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         child = self.constructions.get(command.construction)
@@ -4480,15 +4478,25 @@ class Executor:
             return self._refusal(
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
+        if command.level == "ram" and self.host.requests:
+            return self._refusal("offload_busy", "a request is in flight: offload waits for idle")
         group = self.group if self.rank == 0 else None
         try:
             if group is not None:
                 group.broadcast(executor_commands.encode(command))
             if self.memory is not None:
                 for member in child.model_executors or [child]:
-                    if member.backend is not None:
-                        for model in member.backend.models.values():
-                            self.memory.load(model.module, command.level)
+                    if member.backend is None:
+                        continue
+                    if command.level == "ram":
+                        member._offload()
+                    for model in member.backend.models.values():
+                        self.memory.load(model.module, command.level)
+                # torch's idle spans, its float included (a TensorFS before `trim` keeps them
+                # until its poller trims to the float)
+                trim = getattr(self.memory, "trim", None)
+                if command.level == "ram" and trim is not None:
+                    trim()
             for reply in group.collect("map") if group is not None else ():
                 if not reply.get("ok"):
                     raise GroupRefusal(
@@ -4499,6 +4507,18 @@ class Executor:
         except GroupRefusal as exc:
             return self._group_refusal(exc, closing=False)
         return {"ok": True}
+
+    def _offload(self) -> None:
+        """Before this model's weights go to host: nothing of it pins a device page. Its graphs
+        and LM decode buffers retire, its decoded weights and derived caches go (made again on
+        their next use) and its residency's holds are released."""
+        assert self.backend is not None
+        self.backend.offload()
+        for model in self.models.values():
+            for cache in getattr(model, "_cozy_caches", ()):
+                cache.close()
+        if self.residency is not None:
+            self.residency.release()
 
     def _active_residency(self) -> dict[str, Any]:
         child = self.constructions.get(self.active)
