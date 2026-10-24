@@ -941,12 +941,17 @@ class Memory:
             block.count += 1
             nested = block.count > 1
         try:
+            capturing = self.capturing()
+            if capturing and (not nested or not block.retained or block.assigned is None):
+                raise ResidencyError("capture requires an active prepared weight binding")
             if not nested:
                 request = _REQUEST.get()
                 self._ensure(block, reclaim and not (request is not None and request.idle))
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # record_stream protects lifetime, but every consumer also needs readiness.
-            if block.ready is not None:
+            # Capture's owner joined the prepared stream before capture began. Waiting on
+            # its external readiness event now would violate CUDA capture isolation.
+            if block.ready is not None and not capturing:
                 self.stream().wait_event(block.ready)
             if not nested:
                 if block.assigned is None:
