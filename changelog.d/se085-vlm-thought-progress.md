@@ -1,0 +1,1 @@
+`vlm.ask` with `thinking`: a thought that `max_tokens` cuts short is returned as it stands, with a run warning, instead of an empty answer. `lm.generate(progress=)` is told the decode steps so far, at most every quarter second, and `vlm.ask` reports them as the answering stage's progress, for display only.
