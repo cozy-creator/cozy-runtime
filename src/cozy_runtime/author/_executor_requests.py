@@ -87,8 +87,8 @@ class Publish(_Request, frozen=True, kw_only=True, tag="publish"):
 
 
 class CheckpointItem(_Request, frozen=True, kw_only=True, tag="checkpoint_item"):
-    """A checkpoint output reference: the commit (`revision`, its tree id) and the private tag
-    the Runtime moved there; a later uploaded reference replaces its local one."""
+    """A local checkpoint commit (`revision`, its tree id), in the output's lane.
+    TensorD uploads it when the request names a remote destination."""
 
     output: str
     repo_id: str
