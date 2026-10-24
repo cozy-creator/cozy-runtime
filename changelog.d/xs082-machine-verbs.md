@@ -1,0 +1,1 @@
+The Runtime owns what a machine asks of it in a generation: `cozy-runtime machine-describe` (a project's, an installed distribution's or the whole environment's description, JSON in and out) and `cozy-runtime frame-codec` (an executor's registered frames encoded, JSON lines). Both read no config. TensorD runs these instead of its own copies, which imported Runtime internals.
