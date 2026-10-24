@@ -1,12 +1,14 @@
-name: Publish to PyPI
+name: runtime-publish
 
 # Explicit publication only: creating a tag never starts a companion source build. Nothing reaches PyPI before its
 # release gate passed (cozy-creator release-gate/, tracker design ci-v2, pre-release and promotion):
 #   Candidate: build the tag into its GitHub prerelease (the files, SHA256SUMS), no PyPI. The gate takes its Linux
 #   x86_64 wheel by URL#sha256:
-#     gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
-#   Promotion: exactly those release assets to PyPI, given the passed gate run (its id) or `hand` (a lead's hand gate):
-#     gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt -f gated_sha256sums='<sha256> <filename> ...' -f gate_run=<id>
+#     gh workflow run runtime-publish.yaml -f release_tag=vX.Y.Z -f mode=source
+#   Promotion: exactly those release assets to PyPI, given the passing gate the release agent recorded (testing is
+#   manual): a cozy-creator release-gate.yml run id, or the URL of a recorded hand gate. PyPI's trusted publisher
+#   names this file:
+#     gh workflow run runtime-publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt -f gated_sha256sums='<sha256> <filename> ...' -f gate_run=<id>
 # Add -f rehearsal=true to verify a tag/files without entering the publish job.
 # Build/download jobs have read-only repository access. Only publish obtains PyPI OIDC.
 on:
@@ -33,7 +35,7 @@ on:
         type: string
         default: ''
       gate_run:
-        description: "prebuilt: the cozy-creator release-gate run that passed these files (its id), or hand"
+        description: "prebuilt: the passing cozy-creator release-gate run id, or the URL of a recorded hand gate"
         type: string
         default: ''
 
@@ -238,8 +240,8 @@ jobs:
         run: |
           set -euo pipefail
           case $GATE in
-            '') echo "::error::Prebuilt mode requires gate_run: a passed release-gate run, or hand"; exit 1 ;;
-            hand) echo "gated by hand, the dispatcher vouches" ;;
+            https://*) echo "gated by hand, recorded at $GATE" | tee -a "$GITHUB_STEP_SUMMARY" ;;
+            *[!0-9]* | '') echo "::error::Prebuilt mode requires gate_run: a release-gate run id or a record URL"; exit 1 ;;
             *) git clone -q --depth 1 https://github.com/cozy-creator/cozy-creator creator
                sha=$(creator/release-gate/verify.sh "$GATE" | jq -r .runtime_sha256)
                [ -n "$sha" ] && grep -qw "$sha" <<< "$SUMS" || { echo "::error::gate $GATE ran no file of $SUMS"; exit 1; } ;;
@@ -292,7 +294,7 @@ jobs:
             gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- *.whl *.tar.gz SHA256SUMS
           else
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease --title "cozy-runtime ${TAG#v} (candidate)" \
-              --notes "Gate, then publish: .github/workflows/publish.yaml" -- *.whl *.tar.gz SHA256SUMS
+              --notes "Gate, then publish: .github/workflows/runtime-publish.yaml" -- *.whl *.tar.gz SHA256SUMS
           fi
           w=$(grep -E 'manylinux_2_28_x86_64\.whl$' SHA256SUMS)
           { echo "gate with: runtime_wheel=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${w##* }#sha256=${w%% *}"

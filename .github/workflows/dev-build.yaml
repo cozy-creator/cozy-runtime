@@ -1,5 +1,5 @@
 name: dev-build
-# Builds publish.yaml's release files for any ref, off the dev box:
+# Builds runtime-publish.yaml's release files for any ref, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure]
 # The artifact is cozy-runtime-<sha>[-aarch64]. The files carry the ref's pyproject version; the
 # commit is stamped in cozy_runtime._build_provenance.
@@ -66,7 +66,7 @@ jobs:
           version=$(grep -A1 '^name = "tensorfs"$' uv.lock | sed -n 's/^version = "\(.*\)"$/\1/p')
           uv pip install "tensorfs @ git+https://github.com/cozy-creator/tensorfs@v$version"
           echo UV_NO_SYNC=1 >> "$GITHUB_ENV"
-      # From here to the wheel check: publish.yaml's build job, step for step.
+      # From here to the wheel check: runtime-publish.yaml's build job, step for step.
       # On either arch the Linux wheel is the pure one plus its kernels.
       - name: Build (sdist + pure-py wheel)
         working-directory: source

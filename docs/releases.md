@@ -1,35 +1,42 @@
 # Publishing Runtime
 
-Creating an immutable `vX.Y.Z` tag does not start publication. Explicitly select one
-entrypoint in `publish.yaml`; both use the same per-tag concurrency group and PyPI
-trusted-publishing job. The tag must match a clean source checkout and its declared
+Creating an immutable `vX.Y.Z` tag does not start publication. `runtime-publish.yaml` has two
+entrypoints with one per-tag concurrency group: source mode builds a candidate users don't get,
+and prebuilt mode publishes it to PyPI (trusted publishing names this workflow file) once a
+recorded gate passed it. Release testing is manual, at the release agent's discretion (cozy-creator
+`release-gate/`, tracker design ci-v2). The tag must match a clean source checkout and its declared
 version. Actual publication refuses versions already present on PyPI, including partial
 uploads. Never move a published tag or fill an existing version from different source.
 
-## Build from source
+## Candidate: build from source
 
 ```sh
-gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
+gh workflow run runtime-publish.yaml -f release_tag=vX.Y.Z -f mode=source
 ```
 
 The hosted job builds the source and pure wheel, and adds each platform's kernel modules to make
 the native wheels (Linux x86_64 and aarch64, Windows x86_64): `kernels.yaml` reuses cached modules
 when `kernels/` is unchanged, and compiles otherwise. No wheel carries a machine: TensorD ships in
 the `cozy` binary. An unreleased TensorFS is a git source on the public cozy-creator repository.
+The release set and SHA256SUMS land on the tag's GitHub prerelease, the candidate; source mode never
+publishes. Its summary prints the gate's `runtime_wheel=URL#sha256` and the `gated_sha256sums`.
 
 A local authenticated source build followed by the prebuilt entrypoint is also supported.
 This requires neither a new deploy key nor copying a personal token into the repository.
 Use the tracked build/bundle scripts and record the files proven by the release checks.
 
-## Publish approved prebuilt files
+## Promote a gated candidate
 
-Attach the tested distributions to the GitHub release for the immutable tag, record each
-SHA-256, then select those exact files:
+Test the candidate (cozy-creator `release-gate/`, the suites the release calls for) and record the
+result, then publish exactly the candidate's files:
 
 ```sh
-gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt \
-  -f gated_sha256sums='<sha256> <filename> <sha256> <filename> ...'
+gh workflow run runtime-publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt \
+  -f gated_sha256sums='<sha256> <filename> <sha256> <filename> ...' \
+  -f gate_run=<release-gate run id | URL of the recorded hand gate>
 ```
+
+A run id is checked: the gate passed, and its `candidate.json` holds one of these files.
 
 This path needs no source credentials. It verifies tag identity, downloads the release assets
 and requires the three native wheels, pure wheel and sdist for that same verified version. It
