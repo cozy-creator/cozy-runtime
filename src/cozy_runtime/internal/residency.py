@@ -781,7 +781,9 @@ class Memory:
             else:
                 model.common = block
         if self.native is not None:
-            self.window_bytes = max([self.window_bytes, *(b.allocation_bytes for b in model.groups())])
+            self.window_bytes = max(
+                [self.window_bytes, *(b.allocation_bytes for b in model.groups())]
+            )
             self.native.set_streaming_limit(self.window_bytes)
         _placeholders(model)
         _hooks(model)
@@ -1028,6 +1030,10 @@ class Memory:
                     raise StaleBinding(
                         "native weight backing changed before idle graph preparation"
                     )
+                if use.needs_fill:
+                    # commit() publishes the whole logical region, including alignment
+                    # gaps between stored parts. Initialize them before publication.
+                    use.tensor.zero_()
                 block.native_storage = int(use.tensor.untyped_storage().data_ptr())
             offset = 0
             for key, parts in block.parts.items():
