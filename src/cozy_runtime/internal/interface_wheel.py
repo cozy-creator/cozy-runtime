@@ -58,7 +58,7 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         "ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
         "from cozy_runtime.author import ModelArtifact",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
-        "from cozy_runtime.author import ActivationCapture, PendingCall",
+        "from cozy_runtime.author import PendingCall",
         "",
     ]
     declarations: dict[str, tuple[bytes, str]] = {}
@@ -253,17 +253,16 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                 + ".items() if value is not msgspec.UNSET}"
             )
         model_names = [slot.parameter for slot in entry.models]
-        all_names = [*metadata.parameters, *model_names, "capture"]
+        all_names = [*metadata.parameters, *model_names]
         if len(set(all_names)) != len(all_names):
             raise ConformanceError(
-                "request fields collide with model slots or capture options",
+                "request fields collide with model slots",
                 code="interface_name_conflict",
             )
         # Model arguments override injected slots. None leaves selection to the
         # host, which knows both owner bindings and the callee's authored defaults.
         model_overrides = [f"{name}: ModelArtifact | None = None" for name in model_names]
         parameters += model_overrides
-        parameters.append("capture: ActivationCapture | None = None")
         models_name, call_name = f"__cozy_{export}Models", f"__cozy_{export}Call"
         model_fields = [f"    {field}" for field in model_overrides]
         _declare(
@@ -286,7 +285,7 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         functions.append(
             f"def {export}({', '.join(parameters)}) -> {returned}:\n"
             f"    return cast({returned}, "
-            f"_invoke_proxy({module!r}, {export!r}, {arguments}, capture=capture))\n"
+            f"_invoke_proxy({module!r}, {export!r}, {arguments}))\n"
         )
         bindings.append(
             f"    {export!r}: _CallType({digest!r}, {module!r}, {export!r}, "

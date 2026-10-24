@@ -1,0 +1,1 @@
+Activation capture is gone: `ActivationCapture`, `ActivationCaptureResult`, `ExecutionObservation`, `ExecutionEnvironment`, the `capture=` argument of package calls, `cozy_runtime.probe`, and a child call's `observation`. No machine ever sent a capture or an observation, so nothing that ran used them.

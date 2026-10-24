@@ -308,8 +308,6 @@ class InputFile(msgspec.Struct, frozen=True, kw_only=True):
 
 class _Attempt(Command, frozen=True, kw_only=True):
     request_id: str
-    #: The InvocationSpec's activation capture; the executor validates it against its models.
-    capture: Json = None
 
 
 class PrepareRequest(_Attempt, frozen=True, kw_only=True, tag="prepare_request"):

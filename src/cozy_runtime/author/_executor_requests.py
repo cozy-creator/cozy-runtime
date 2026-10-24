@@ -17,7 +17,6 @@ from typing import Annotated, Protocol, TypedDict, get_args
 import msgspec
 
 from cozy_runtime.author._assets import FileState
-from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._errors import CapabilityError, InvalidRequest
 
 MAX_CALL_INDEX = (1 << 32) - 1
@@ -38,7 +37,6 @@ class ChildCall(_Request, frozen=True, kw_only=True, tag="child_call"):
     #: The callee's canonical request document.
     payload: str
     progress_label: str = ""
-    capture: ActivationCapture | None = None
 
 
 class _Indexed(_Request, frozen=True, kw_only=True):
@@ -208,8 +206,6 @@ class CallState(Answer, frozen=True, kw_only=True):
     # consumed fields into a typed record before constructing any handle.
     byte_grants: tuple[Mapping[str, object], ...] = ()
     progress: CallProgress | None = None
-    #: The child's execution observation document.
-    observation: object = None
     #: A failed child's traceback, from its triage (its `detail` is untruncated too).
     traceback: str = ""
 

@@ -31,7 +31,6 @@ from typing import Any, NamedTuple, cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _work as work
-from cozy_runtime.author._capture import _capture_clock
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
@@ -853,8 +852,6 @@ def _region_call(
     why = (
         "with gradients"
         if torch.is_grad_enabled()
-        else "under activation capture"
-        if _capture_clock.get() is not None
         else "under custom tensor dispatch"
         if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"

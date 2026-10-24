@@ -80,7 +80,6 @@ from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import _Broker, _CallType, _export
-from cozy_runtime.author._capture import ActivationCapture
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
@@ -432,7 +431,7 @@ class _Slot:
 class _InFlight:
     """The attempts in flight, side by side. The first in readies the plane and the last out
     drains it, each with no other attempt running. One that changes what every attempt runs on
-    (a pinned kernel, a capture, a GPU group's call) runs alone, and later ones wait for it."""
+    (a pinned kernel, a GPU group's call) runs alone, and later ones wait for it."""
 
     def __init__(self) -> None:
         self._changed = threading.Condition()
@@ -3124,11 +3123,7 @@ class Executor:
         if isinstance(target, dict):
             return target
         requested = _attention_pin(command.attention_kernel, command.bits)
-        alone = (
-            self.world > 1
-            or command.capture is not None
-            or bool(requested and target._attention_reaches(requested))
-        )
+        alone = self.world > 1 or bool(requested and target._attention_reaches(requested))
         with self.in_flight.attempt(alone) as slot, request_path.serving():
             # Admitted only now: an attempt before it may have poisoned the generation. Its
             # record is taken once nothing can refuse it, so a refused call may come again.
@@ -3215,7 +3210,6 @@ class Executor:
             finally:
                 kernel_compile.held.reset(held)
         try:
-            self._capture_options(command, registration.surface)
             prepared = prepare(registration, command.payload, input_metadata=command.input_metadata)
         except Exception as exc:
             outcome = classify(exc)
@@ -3348,8 +3342,6 @@ class Executor:
             if row["observed"] != segments[-1]["observed"] or row["dense"] != segments[-1]["dense"]:
                 segments.append(row)
 
-        capture = None
-        capture_result: dict[str, Any] | None = None
         record: AuthorAttempt | None = None
         # Weights grants are the attempt's own: its sources and outputs end with it.
         sources: dict[str, RawWeights[Any]] = {
@@ -3392,62 +3384,56 @@ class Executor:
                 attention_ulysses.observing() as served_impls,
             ):
                 served_attention = self._attention_selection(served_attention)
-                capture = self._capture_session(command, surface)
-                with capture if capture is not None else contextlib.nullcontext():
-                    envelope, outcome, record = run_prepared(
-                        prepared,
-                        Invocation(
-                            request_id=command.request_id,
-                            spool=spool,
-                            deadline=deadline,
-                            device=self._device(),
-                            cancel=functools.partial(
-                                _cancelled, self.host.mux, self.root, command.request_id
-                            ),
-                            models=self.models,
-                            recipes=self.discovered.recipes,
-                            progress=boundary,
-                            activity=self._activity_sink(command.request_id),
-                            plan=functools.partial(self._plan_request, command.request_id),
-                            # cr-012: the inputs the WORKER already fetched, verified and spooled.
-                            # Every value is a path inside this attempt's own spool: this process is
-                            # `sandbox.refuse_network` rejects ungranted network access.
-                            # Input bytes arrive only through the worker grant.
-                            # That fence is Python-level (cr-042) — it bounds a buggy package, not a
-                            # hostile one, and there is no netns or seccomp under it.
-                            trees=_trees(command),
-                            assets=_granted_inputs(command),
-                            max_input_bytes=(
-                                None
-                                if command.max_input_bytes is None
-                                else command.max_input_bytes or 64 << 20
-                            ),
-                            max_output_bytes=command.max_output_bytes,
-                            sources=sources,
-                            weights_values=functools.partial(read_values_into, self.torch),
-                            tensorfs_source=(
-                                functools.partial(
-                                    weights_store.open_checkpoint,
-                                    self._store(),
-                                    connection=connection,
-                                )
-                                if sources
-                                else None
-                            ),
-                            tensorfs_output=(
-                                weight_outputs.open if weight_outputs is not None else None
-                            ),
-                            tensorfs_adopt=(
-                                weight_outputs.adopt if weight_outputs is not None else None
-                            ),
-                            publish=lambda request: exchange(request, Published),
-                            calls=self.host._call_broker(
-                                command.request_id, self.host.call_interfaces
-                            ),
+                envelope, outcome, record = run_prepared(
+                    prepared,
+                    Invocation(
+                        request_id=command.request_id,
+                        spool=spool,
+                        deadline=deadline,
+                        device=self._device(),
+                        cancel=functools.partial(
+                            _cancelled, self.host.mux, self.root, command.request_id
                         ),
-                    )
-                if capture is not None and outcome.terminal == "succeeded":
-                    capture_result = capture.write(spool)
+                        models=self.models,
+                        recipes=self.discovered.recipes,
+                        progress=boundary,
+                        activity=self._activity_sink(command.request_id),
+                        plan=functools.partial(self._plan_request, command.request_id),
+                        # cr-012: the inputs the WORKER already fetched, verified and spooled.
+                        # Every value is a path inside this attempt's own spool: this process is
+                        # `sandbox.refuse_network` rejects ungranted network access.
+                        # Input bytes arrive only through the worker grant.
+                        # That fence is Python-level (cr-042) — it bounds a buggy package, not a
+                        # hostile one, and there is no netns or seccomp under it.
+                        trees=_trees(command),
+                        assets=_granted_inputs(command),
+                        max_input_bytes=(
+                            None
+                            if command.max_input_bytes is None
+                            else command.max_input_bytes or 64 << 20
+                        ),
+                        max_output_bytes=command.max_output_bytes,
+                        sources=sources,
+                        weights_values=functools.partial(read_values_into, self.torch),
+                        tensorfs_source=(
+                            functools.partial(
+                                weights_store.open_checkpoint,
+                                self._store(),
+                                connection=connection,
+                            )
+                            if sources
+                            else None
+                        ),
+                        tensorfs_output=(
+                            weight_outputs.open if weight_outputs is not None else None
+                        ),
+                        tensorfs_adopt=(
+                            weight_outputs.adopt if weight_outputs is not None else None
+                        ),
+                        publish=lambda request: exchange(request, Published),
+                        calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
+                    ),
+                )
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)
@@ -3605,7 +3591,6 @@ class Executor:
                 ),
                 "cuts": self.host.cuts.pop(command.request_id, {"sites": [], "oom_floor": 0}),
             },
-            "capture": capture_result,
             "quiescent": quiescent,
             **_env_document(),
             "poisoned": self.poisoned,
@@ -4179,40 +4164,6 @@ class Executor:
             # here would replace the failure that broke it.
             if not self.group.broken:
                 self._followers_attention()
-
-    @staticmethod
-    def _capture_options(
-        command: PrepareRequest | Invoke, surface: Any
-    ) -> ActivationCapture | None:
-        from cozy_runtime.probe._capture import validate_components
-
-        if command.capture is None:
-            return None
-        options = msgspec.convert(command.capture, type=ActivationCapture, strict=True)
-        validate_components(options, [binding.model_class for binding in surface.model_bindings])
-        return options
-
-    def _capture_session(self, command: PrepareRequest | Invoke, surface: Any) -> Any:
-        from cozy_runtime.author._errors import InvalidRequest
-        from cozy_runtime.probe._capture import CaptureSession
-
-        options = self._capture_options(command, surface)
-        if options is None:
-            return None
-        roots: dict[str, Any] = {}
-        for executor in self.model_executors or [self]:
-            if executor.backend is None:
-                continue
-            for name, root in executor.backend.roots.items():
-                if name not in options.components:
-                    continue
-                if name in roots and roots[name] is not root:
-                    raise InvalidRequest(
-                        f"capture component {name!r} occurs in more than one bound model",
-                        code="capture_component_ambiguous",
-                    )
-                roots[name] = root
-        return CaptureSession(options, roots)
 
     @staticmethod
     def _emit_attention(record: AuthorAttempt, choices: attention.Applied, name: str) -> None:

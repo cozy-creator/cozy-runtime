@@ -21,7 +21,6 @@ from cozy_runtime import _application_json as application_json
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
-from cozy_runtime.author._capture import ActivationCapture, ExecutionObservation
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
@@ -169,13 +168,7 @@ def invocable[**P, R](
             raise CapabilityError(
                 "package call has no admitted attempt", code="child_broker_absent"
             )
-        arguments = dict(kwargs)
-        capture = arguments.pop("capture", None)
-        if capture is not None and not isinstance(capture, ActivationCapture):
-            raise ConformanceError("capture needs ActivationCapture", code="capture_option")
-        call = broker.reserve(export.module, export.name, arguments)
-        call.capture = capture
-        return cast(PendingCall[R], call)
+        return cast(PendingCall[R], broker.reserve(export.module, export.name, dict(kwargs)))
 
     proxy.__name__ = fn.__name__
     proxy.__qualname__ = fn.__qualname__
@@ -254,7 +247,7 @@ class _CallType:
 
 
 class PendingCall[R](Awaitable[R]):
-    """Awaiting returns R unchanged; observation is available after the call settles."""
+    """Awaiting returns R unchanged."""
 
     def __init__(
         self, broker: _Broker, index: int, binding: _CallType, payload: bytes, ctx: Context
@@ -263,8 +256,6 @@ class PendingCall[R](Awaitable[R]):
         self.ctx = ctx
         self.request_id = ""
         self.task: asyncio.Task[R] | None = None
-        self.capture: ActivationCapture | None = None
-        self.observation: ExecutionObservation | None = None
         self.progress_scope = _progress_scope.get()
         self.progress_sequence = 0
 
@@ -442,13 +433,12 @@ class _Broker:
                                 )
                             call.ctx.raise_if_cancelled()
 
-                        result, call.observation = decode(
+                        result = decode(
                             value,
                             call.binding.result,
                             list(answer.byte_grants),
                             request_id=self.request_id,
                             guard=guard,
-                            observation=call.observation,
                             grant_token=self.grant_token,
                             python_type=call.binding.python_result,
                             media=self.media,
@@ -533,18 +523,6 @@ class _Broker:
                 scope = _ProgressScope(call.broker.telemetry, call.binding.export, None)
             if scope is not None:
                 scope.telemetry._child_progress(progress.payload, scope)
-        if answer.observation is None:
-            return
-        try:
-            call.observation = msgspec.convert(
-                answer.observation,
-                type=ExecutionObservation,
-                dec_hook=asset_dec_hook,
-                strict=True,
-            )
-        except (ValueError, TypeError, msgspec.ValidationError) as exc:
-            # An observation is evidence about the child, never its result.
-            _LOG.warning("child call %d: unreadable execution observation: %s", call.index, exc)
 
     @staticmethod
     def _intent(call: PendingCall[Any]) -> ChildCall:
@@ -554,7 +532,6 @@ class _Broker:
             export=call.binding.export,
             payload=call.payload.decode(),
             progress_label=call.progress_scope.name if call.progress_scope else "",
-            capture=call.capture,
         )
 
     @staticmethod
@@ -589,14 +566,8 @@ def _invoke_proxy(
     module: str,
     export: str,
     arguments: Mapping[str, object],
-    *,
-    capture: ActivationCapture | None = None,
 ) -> PendingCall[Any]:
     broker = _current.get()
     if broker is None:
         raise CapabilityError("package call has no admitted attempt", code="child_broker_absent")
-    if capture is not None and not isinstance(capture, ActivationCapture):
-        raise ConformanceError("capture needs ActivationCapture", code="capture_option")
-    call = broker.reserve(module, export, arguments)
-    call.capture = capture
-    return call
+    return broker.reserve(module, export, arguments)

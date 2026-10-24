@@ -64,7 +64,7 @@ hook/scoping/rollback tests and architecture fences. No GPU performance, model q
 qualification is established by these tests.
 
 Request observations record selected and restored backend names and per-component
-site counts. `ExecutionObservation.kernel_symbol` carries the selected backend
+site counts. The reply's `kernel_symbol` carries the selected backend
 names, not a claim of a GPU profiler trace. Sol additionally records request-local
 sparse, dense-step, dense-path and dense-prefix call counts, tagged with rank and
 world size. The leader records its resolved dense reference. Follower counts travel
