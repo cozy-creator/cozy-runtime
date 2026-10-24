@@ -44,7 +44,6 @@ from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author import _work as work
 from cozy_runtime.internal import config, filelock, kernel_cache
 
 #: kind -> the `module:function` a builder runs: `build(spec, staging, report) -> facts`. The
@@ -204,7 +203,7 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
     if state.state != "compiling":
         return state
     name = waiter or state.kernel
-    sampled, reported = float("-inf"), None
+    sampled = float("-inf")
     with request_path.forbid(f"kernel build wait: {name}"), held.get()(name) as sleep:
         while state.state == "compiling":
             now = time.monotonic()
@@ -212,26 +211,10 @@ def wait(store: kernel_cache.Store, job: Job, waiter: str = "") -> State:
                 sampled = now
                 if waiting is not None and told.get():
                     waiting(replace(state, kernel=name))
-                # The call waiting moves as its builder says it moves (cl-648): its share done
-                # and its own CPU, which a sandboxed executor cannot read from its processes.
-                words = _words(store)
-                if words != reported:
-                    reported = words
-                    work.done += 1
             if sleep(POLL_SECONDS):
                 raise Canceled(f"canceled waiting for {name} to compile; the compile goes on")
             state = submit(store, job)
     return state
-
-
-def _words(store: kernel_cache.Store) -> tuple[str, ...]:
-    """Every live build's word in this machine's store: its phase, share done and own CPU."""
-    words: list[str] = []
-    for namespace in (store.own, store.trusted):
-        for path in sorted(namespace.glob("*/*.state.json")) if namespace is not None else ():
-            with contextlib.suppress(OSError):
-                words.append(path.read_text())
-    return tuple(words)
 
 
 def learn(store: kernel_cache.Store, scope: str, job: Job) -> None:
