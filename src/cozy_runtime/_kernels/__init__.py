@@ -1,8 +1,9 @@
 """Cozy's prebuilt CUDA kernels (`kernels/`), carried by cozy-runtime's native wheels: one per OS
 and CPU, every GPU target inside. The pure wheel carries none (`ABSENT` says why).
 
-Each module is nanobind over the CUDA runtime (linked static) on Python's stable ABI. A module
-carries a cubin for each target in `ARCHS` and PTX that the driver compiles for a card none names.
+The `ARCHS` modules use nanobind and Python's stable ABI over the static CUDA runtime. Each
+carries cubins and PTX. `TORCH_ABI` separately declares plain Torch custom-op libraries, loaded
+only after their matching Torch build; those have no Python entrypoint or embedded GPU code.
 Runtime verifies every kernel on the device before it serves (`internal.prebuilt`); package
 authors reach `_norm` through `author.kernels`.
 """
@@ -35,6 +36,9 @@ except ImportError as broken:
 #: `sys.platform`. cozy's `platform::gpu` holds the same floor for TensorD's startup check.
 CUDA = "13.0"
 DRIVER_FLOOR = {"linux": "580.65.06", "win32": "580.88"}
+
+#: Plain shared libraries: exact Torch release and CUDA ABI, checked before load_library.
+TORCH_ABI: dict[str, tuple[str, str]] = {"_residency": ("2.14.1", "13.0")}
 
 #: The tensor-core families, by Runtime's `arch` names, in the index order `_gemm.gemm` takes.
 FAMILIES = ("mma.sync", "wgmma", "tcgen05")

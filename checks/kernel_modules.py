@@ -5,10 +5,15 @@ cozy-runtime wheels promise. `<modules>/cozy_runtime/_kernels` holds exactly the
 PTX (cuobjdump). Each needs only the OS's C runtime (readelf, dumpbin): no torch, no CUDA library,
 no version-specific libpython (Windows' stable-ABI `python3.dll` is the one Python it may name).
 Each loads on every Python given, and a call on a machine without a GPU returns CUDA's error
-rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`, the Rust source
-TensorD checks at startup). Each exports `PyInit_*` alone (nm, dumpbin): an exported libstdc++
+rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`,
+the Rust source TensorD checks at startup). Each exports `PyInit_*` alone (nm, dumpbin):
+an exported libstdc++
 symbol binds process-wide and crashed torch imported after it. With `--torch-python`, each module
 loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
+
+TORCH_ABI libraries are separate plain shared libraries with no Python ABI or embedded GPU
+code. They may link the declared Torch/CUDA runtime, load only after that exact Torch build,
+and must register their operators without initializing CUDA.
 """
 
 from __future__ import annotations
@@ -25,6 +30,10 @@ from typing import Any
 SYSTEM = re.compile(
     r"(libc|libm|libdl|libpthread|librt|ld-linux[\w.-]*)\.so(\.\d+)*"
     r"|(?i:(kernel32|python3|ucrtbase|vcruntime140(_1)?|api-ms-win-[\w-]+)\.dll)"
+)
+TORCH_RUNTIME = re.compile(
+    r"lib(c10(_cuda)?|torch(_cpu|_cuda)?|cudart|stdc\+\+|gcc_s)\.so(\.\d+)*"
+    r"|(?i:(c10(_cuda)?|torch(_cpu|_cuda)?|cudart64_13|msvcp140(_atomic_wait)?)\.dll)"
 )
 #: The `platform` crate's `gpu::DRIVER_FLOOR`: Windows', then everything else's.
 RUST_FLOOR = re.compile(
@@ -88,7 +97,7 @@ def embedded(module: Path) -> tuple[set[str], set[str]]:
 
 
 def needed(module: Path) -> list[str]:
-    windows = module.suffix == ".pyd"
+    windows = module.suffix in (".pyd", ".dll")
     tool = ["dumpbin", "/dependents"] if windows else ["readelf", "-d"]
     out = subprocess.run([*tool, str(module)], capture_output=True, text=True).stdout
     if windows:
@@ -105,10 +114,21 @@ import torch
 print(f"{sys.argv[1]} before torch {torch.__version__}: ok")
 """
 
+TORCH_LIBRARY = """
+import sys, torch
+assert torch.__version__.split("+")[0] == sys.argv[2], torch.__version__
+assert torch.version.cuda == sys.argv[3], torch.version.cuda
+assert not torch.cuda.is_initialized()
+torch.ops.load_library(sys.argv[1])
+for name in ("put", "take", "present", "drop", "counters"):
+    print(getattr(torch.ops.cozy_residency, name).default._schema)
+assert not torch.cuda.is_initialized(), "loading the residency owner initialized CUDA"
+"""
+
 
 def exported(module: Path) -> list[str]:
     """The module's exported (dynamic, defined) symbols."""
-    if module.suffix == ".pyd":
+    if module.suffix in (".pyd", ".dll"):
         out = subprocess.run(["dumpbin", "/exports", str(module)], capture_output=True, text=True)
         return re.findall(r"^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]{8}\s+(\S+)", out.stdout, re.MULTILINE)
     out = subprocess.run(
@@ -122,7 +142,9 @@ def main() -> int:
     parser.add_argument("modules", type=Path, help="the install prefix: <it>/cozy_runtime/_kernels")
     parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
     parser.add_argument("--platform-floor", type=Path, help="cozy's crates/platform/src/gpu/mod.rs")
-    parser.add_argument("--torch-python", help="an interpreter with torch: each module before it")
+    parser.add_argument(
+        "--torch-python", help="matching CUDA Torch for load-order and library checks"
+    )
     parser.add_argument(
         "--without",
         action="append",
@@ -133,7 +155,10 @@ def main() -> int:
     package: Path = options.modules / "cozy_runtime" / "_kernels"
     failed: list[str] = []
     archs = declared("ARCHS")
-    stray = [p.name for p in package.iterdir() if p.name.split(".")[0] not in archs]
+    torch_abi = declared("TORCH_ABI")
+    stray = [
+        p.name for p in package.iterdir() if p.name.split(".")[0] not in {*archs, *torch_abi}
+    ]
     if stray:
         failed.append(f"files beside the modules: {stray}")
     if options.platform_floor is not None:
@@ -183,6 +208,41 @@ def main() -> int:
                 failed.append(
                     f"{name} before torch exits {run.returncode}: {run.stderr.strip()[-400:]}"
                 )
+    for name, (release, cuda) in torch_abi.items():
+        libraries = [p for p in package.glob(f"{name}.*") if p.suffix in (".so", ".dll")]
+        if name in options.without:
+            if libraries:
+                failed.append(f"{name}: carried, but this target omits it")
+            continue
+        if len(libraries) != 1:
+            failed.append(f"{name}: {len(libraries)} shared libraries")
+            continue
+        library = libraries[0]
+        cubin, ptx = embedded(library)
+        if cubin or ptx:
+            failed.append(f"{name}: a residency owner must carry no GPU kernels")
+        links = needed(library)
+        foreign = [
+            lib for lib in links
+            if "python" in lib.lower()
+            or not (SYSTEM.fullmatch(lib) or TORCH_RUNTIME.fullmatch(lib))
+        ]
+        if foreign or not links:
+            failed.append(f"{name} needs {foreign or 'nothing readable'}")
+        if symbols := exported(library):
+            failed.append(f"{name}: unexpected exported symbols {symbols[:5]}")
+        if not options.torch_python:
+            failed.append(f"{name}: --torch-python is required for its declared ABI")
+            continue
+        run = subprocess.run(
+            [options.torch_python, "-I", "-c", TORCH_LIBRARY, str(library), release, cuda],
+            capture_output=True,
+            text=True,
+        )
+        print(f"{name}: Torch {release}, CUDA {cuda}; needs {' '.join(links)}")
+        print(run.stdout.strip())
+        if run.returncode:
+            failed.append(f"{name}: load exits {run.returncode}: {run.stderr.strip()[-600:]}")
     for python in options.python:
         call = [python, "-I", "-c", CALL, str(package), *options.without]
         run = subprocess.run(call, capture_output=True, text=True)
