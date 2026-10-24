@@ -190,10 +190,16 @@ def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callab
         tokens = x.numel() // max(x.shape[-1], 1)
         if tokens < 2:
             return forward(x)
+        shape = _ffn_shape(module, x)
+        if shape is None:
+            whole.append(True)
+            print(
+                f"cozy-runtime: {site} has no feed-forward layout it reads: whole", file=sys.stderr
+            )
+            return forward(x)
         try:
             run = functools.partial(_tokens, forward, x, tokens)
-            need = levelled(tokens, _ffn_shape(module, x).need(tokens))
-            return catch.cut(site, levels(tokens), need, run, (x,))
+            return catch.cut(site, levels(tokens), levelled(tokens, shape.need(tokens)), run, (x,))
         except _Whole:
             whole.append(True)
         return forward(x)
@@ -206,25 +212,44 @@ _FUSED = frozenset({"GELU"})
 _GATED = frozenset({"GEGLU", "SwiGLU"})
 
 
-def _ffn_shape(module: nn.Module, x: Tensor) -> sizing.Ffn:
-    """A Diffusers feed-forward's widths (or its activation projection's alone, whose output
-    is its inner width): the projection, the activation's temporaries, the down projection, and
-    whether an encoding leaf quantizes the linears' input rows."""
-    net = getattr(module, "net", None)
+def _ffn_shape(module: nn.Module, x: Tensor) -> sizing.Ffn | None:
+    """A Diffusers feed-forward's widths, read from the linears it has: its `net`'s activation
+    projection (`proj`) and down projection, an activation projection alone (whose output is its
+    inner width), or up projections from the input's width beside one down projection (Z-Image's
+    and Bria FIBO's gated `w1`/`w3` and `w2`); the activation's temporaries; and whether an
+    encoding leaf quantizes the linears' input rows. None when it has none of these."""
+    din, net = int(x.shape[-1]), getattr(module, "net", None)
     act = net[0] if isinstance(net, nn.ModuleList) else module
     kinds = {c.__name__ for c in type(act).__mro__}
-    projected = int(act.proj.out_features)
-    inner = projected // 2 if kinds & _GATED else projected
-    downs = [m for m in net if hasattr(m, "out_features")] if isinstance(net, nn.ModuleList) else []
+    projection = _widths(getattr(act, "proj", None))
+    if projection is not None:
+        projected = projection[1]
+        inner = projected // 2 if kinds & _GATED else projected
+        nets = [w for m in net if (w := _widths(m))] if isinstance(net, nn.ModuleList) else []
+        dout = nets[-1][1] if nets else inner
+        temps = 1 if kinds & _FUSED and not kinds & _GATED else 2
+    else:
+        widths = [w for m in module.children() if (w := _widths(m))]
+        ups, down = [o for i, o in widths if i == din], [w for w in widths if w[0] != din]
+        if not ups or len(down) != 1:
+            return None
+        projected, (inner, dout), temps = sum(ups), down[0], 2
     return sizing.Ffn(
-        din=int(x.shape[-1]),
-        dout=int(downs[-1].out_features) if downs else inner,
+        din=din,
+        dout=dout,
         inner=inner,
         projected=projected,
-        temps=1 if kinds & _FUSED and not kinds & _GATED else 2,
+        temps=temps,
         itemsize=x.element_size(),
         quantized=any(getattr(c, "provider", None) is not None for c in module.modules()),
     )
+
+
+def _widths(module: object) -> tuple[int, int] | None:
+    """A projection's (in, out) widths as it states them: a Linear, or an encoding leaf in its
+    place; None for anything else."""
+    i, o = (getattr(module, k, None) for k in ("in_features", "out_features"))
+    return (i, o) if isinstance(i, int) and isinstance(o, int) else None
 
 
 def _token_local(module: nn.Module) -> bool:
