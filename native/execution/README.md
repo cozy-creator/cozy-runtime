@@ -12,6 +12,13 @@ hints. The callback receives a CUDA int64 index tensor and changes declared stat
 timestep, guidance and noise tables are ordinary immutable GPU tensors captured by the callback.
 ATen operations tagged as seeded nondeterminism are refused: native launch does not invoke Torch's
 generator replay prologue. No arbitrary Python branches, scalar reads or functions are compiled.
+The prepared object is an immutable fixed program: Python branches, precision, attention choices
+and kernel implementations are those selected during capture. Changed choices require preparation
+of a new program. A higher-level reusable model-plan cache must key those choices and its source,
+target representation and transform/LoRA identity; this primitive introduces no such registry.
+Supplied Runtime Bindings are checked for validity and identity once per submission, along with
+every external tensor's geometry and storage pointers. Non-ATen launchers must supply their native
+module and storage owners explicitly.
 
 The complete source graph is walked recursively. Only kernel, empty, memcpy, memset and ordinary
 child graph nodes are accepted. CUDA instantiation enforces the conditional body's additional
@@ -24,6 +31,15 @@ it after a complete body. Progress uses a control-stream kernel reading device a
 owned snapshot, followed by ordered D2H and an event; CPU never races a device write to the same
 host flag. Observers can stop polling without stopping the GPU. Cancellation latency depends on
 the longest body/kernel and scheduling of the control kernel; it is not GPU preemption.
+All three control kernels are loaded during preparation with `cudaFuncGetAttributes`. The real
+gate caught a lazy-loading serialization: without this preparation cancellation was submitted
+promptly but ran only after the loop ended. Stream priority alone did not fix it.
+
+Real default-CLI gate 17019 passed on Torch 2.14.1+cu130 and TensorFS 0.15.2: a 21-node denoiser
+body executed 30 steps while the submitter slept, with exactly two Python preparation calls and
+zero numerical difference from eager. Reuse, stale handles, owned outputs and eligibility refusals
+passed; cancellation stopped a 100000-step run at step 1094, and teardown reclaimed 2 MiB of
+native weight backing. This is one tested device/cohort, not a general cancellation latency claim.
 
 Each definition can be submitted repeatedly after its prior execution finishes. Native epoch
 tokens reject stale cancel/wait/close operations. Every execution owns distinct output buffers;

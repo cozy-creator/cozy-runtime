@@ -27,6 +27,11 @@ class Progress:
 def _native_error(error: Exception) -> NoReturn:
     import torch
 
+    from cozy_runtime.author._errors import CapabilityError
+
+    if getattr(error, "eligibility_refusal", False):
+        raise CapabilityError(str(error), code="prepared_graph_ineligible") from error
+
     code = getattr(error, "error_code", None)
     if code == 2:
         raise torch.OutOfMemoryError(str(error)) from error
@@ -58,7 +63,7 @@ class PreparedRepeat:
     ) -> None:
         self._native, self.state, self.device, self.steps = native, state, device, steps
         self._active: Execution | None = None
-        self._submission = threading.Lock()
+        self._submission = threading.RLock()
         self._dependencies, self._bindings = dependencies, bindings
         self._closed = False
 

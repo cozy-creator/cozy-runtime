@@ -60,11 +60,11 @@ __global__ void snapshot(Control *state, Snapshot *out) {
 // Reject every operation whose ownership/side effects cannot be represented by a resident body.
 // cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle.
 static cudaError_t inspect(cudaGraph_t graph, unsigned &total, unsigned depth = 0) {
-    if (depth > 32) return cudaErrorNotSupported;
+    if (depth > 32) return static_cast<cudaError_t>(-100);
     size_t count = 0;
     auto error = cudaGraphGetNodes(graph, nullptr, &count);
     if (error != cudaSuccess) return error;
-    if (count > 1000000 || total > 1000000 - count) return cudaErrorNotSupported;
+    if (count > 1000000 || total > 1000000 - count) return static_cast<cudaError_t>(-100);
     std::vector<cudaGraphNode_t> nodes(count);
     error = cudaGraphGetNodes(graph, nodes.data(), &count);
     if (error != cudaSuccess) return error;
@@ -80,7 +80,7 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, unsigned depth = 
             if (error != cudaSuccess) return error;
         } else if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeEmpty
                    && type != cudaGraphNodeTypeMemcpy && type != cudaGraphNodeTypeMemset) {
-            return cudaErrorNotSupported;
+            return static_cast<cudaError_t>(-100);
         }
     }
     return cudaSuccess;
@@ -126,12 +126,19 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     auto checked = [&](cudaError_t result) { return result; };
 #define CHECK(call) do { error = checked(call); if (error != cudaSuccess) return error; } while (0)
     CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes));
-    if (!run->nodes) return cudaErrorInvalidValue;
+    if (!run->nodes) return -101;
     CHECK(cudaStreamCreateWithFlags(&run->work, cudaStreamNonBlocking));
-    CHECK(cudaStreamCreateWithFlags(&run->control_stream, cudaStreamNonBlocking));
+    int lowest_priority, highest_priority;
+    CHECK(cudaDeviceGetStreamPriorityRange(&lowest_priority, &highest_priority));
+    CHECK(cudaStreamCreateWithPriority(&run->control_stream, cudaStreamNonBlocking, highest_priority));
     CHECK(cudaEventCreateWithFlags(&run->done, cudaEventDisableTiming));
     CHECK(cudaEventCreateWithFlags(&run->initialized, cudaEventDisableTiming));
     CHECK(cudaEventCreateWithFlags(&run->sampled, cudaEventDisableTiming));
+    // A first control-kernel launch must never trigger lazy loading while the repeat runs.
+    cudaFuncAttributes attributes;
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(advance)));
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(cancel_repeat)));
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(snapshot)));
     CHECK(cudaMalloc(&run->control, sizeof(Control)));
     CHECK(cudaMalloc(&run->device_snapshot, sizeof(Snapshot)));
     CHECK(cudaMallocHost(&run->host_snapshot, sizeof(Snapshot)));

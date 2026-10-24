@@ -27,6 +27,15 @@ unsafe extern "C" {
 }
 
 fn cuda_error(py: Python<'_>, operation: &str, code: i32) -> PyErr {
+    if matches!(code, -100 | -101) {
+        let error = NativeExecutionError::new_err(if code == -101 {
+            "prepared graph body is empty"
+        } else {
+            "prepared graph contains unsupported node types or exceeds bounded inspection limits"
+        });
+        let _ = error.value(py).setattr("eligibility_refusal", true);
+        return error;
+    }
     if code < 0 {
         return PyRuntimeError::new_err(match code {
             -1 => "stale execution token",
@@ -256,10 +265,13 @@ impl ResidentRepeat {
             Ok(())
         })
         .map_err(|code| cuda_error(py, "close resident repeat", code))?;
-        self.owners
-            .lock()
-            .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?
-            .clear();
+        let owners = {
+            let mut held = self.owners.lock()
+                .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?;
+            std::mem::take(&mut *held)
+        };
+        // Python destructors may reenter close. No native mutex may span their execution.
+        drop(owners);
         Ok(())
     }
 }
