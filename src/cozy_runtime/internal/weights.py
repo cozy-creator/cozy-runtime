@@ -49,8 +49,6 @@ from cozy_runtime.internal.encoding import (
     device_line,
     implementation_digest,
     launch_providers,
-    measure_device,
-    measure_runtime,
 )
 from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.fill import (
@@ -64,7 +62,7 @@ from cozy_runtime.internal.fill import (
 )
 from cozy_runtime.internal.fill import fit as fill_fit
 from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (Ulysses' torch side, served)
-from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution, script_plan
+from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 
 if TYPE_CHECKING:
     import torch
@@ -145,48 +143,6 @@ class Backend:
         self.leaves: dict[str, tuple[Any, Any, tuple[str, ...]]] = {}
         #: (component, provider) -> installed leaves, counted when they install (`gemm.selected`)
         self.gemm_sites: Counter[tuple[str, str]] = Counter()
-
-    @classmethod
-    def for_script(
-        cls,
-        checkpoints: Mapping[str, Checkpoint],
-        rows: Sequence[PlanRow],
-        *,
-        torch: ModuleType,
-        memory: Memory,
-        device: torch.device,
-        construction: str,
-        release: str,
-        encoded_leaves: str = "accept",
-    ) -> Backend:
-        """A backend for a driver script with no model class: resolve a `script_plan` over
-        these rows, then construct, through the executor's own authority."""
-        facts = measure_device(torch, device.index or 0, device.type)
-        providers = launch_providers()
-        plan = script_plan(
-            rows=rows,
-            components=sorted({row.component for row in rows}),
-            release=release,
-            store="script",
-            snapshot=next(iter(checkpoints.values())).id,
-            snapshots={name: book.id for name, book in checkpoints.items()},
-            providers=providers,
-            device=facts,
-            runtime=measure_runtime(torch, release),
-            encoded_leaves=encoded_leaves,
-            dtype_name=dtype_name,
-        )
-        return cls(
-            checkpoints,
-            rows,
-            torch=torch,
-            plan=plan,
-            memory=memory,
-            device=device,
-            construction=construction,
-            device_facts=facts,
-            release=release,
-        )
 
     def _select(self, key: str, row: PlanRow) -> Selection:
         """The plan's provider for one destination, matched by digest against this build and

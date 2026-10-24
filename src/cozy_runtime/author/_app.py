@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Literal, ParamSpec, TypeVar, overload
+from typing import Any, ParamSpec, TypeVar, overload
 
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
@@ -126,7 +126,7 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
-        accelerator: Literal[False] | None = None,
+        accelerator: bool | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
     ) -> Callable[P, R]: ...
 
@@ -149,7 +149,7 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
-        accelerator: Literal[False] | None = None,
+        accelerator: bool | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -172,15 +172,15 @@ class App:
         publishes: bool = False,
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
-        accelerator: Literal[False] | None = None,
+        accelerator: bool | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
 
         `weights=` names the TensorFS model outputs it writes; `publishes=`/`emits_media=`
-        declare its `Outputs`. `accelerator=False` runs it on CPU only; otherwise it gets the
-        machine's GPU when there is one. `hidden=True` keeps it out of the published
-        interface; `internal=True` admits same-package managed calls only.
+        declare its `Outputs`. `accelerator=False` runs it on CPU only; otherwise (`True`,
+        or absent) it gets the machine's GPU when there is one. `hidden=True` keeps it out of
+        the published interface; `internal=True` admits same-package managed calls only.
 
         `memoize=True` admits deterministic results to the operation cache (never for a
         writer); `memo_dependencies`/`memo_version` declare what else decides the result, and
@@ -193,10 +193,10 @@ class App:
         policy = memo_policy(memoize)
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
-        if accelerator is not None and accelerator is not False:
+        if accelerator is not None and type(accelerator) is not bool:
             raise RegistrationError(
-                "accelerator=False is the only value: a function gets the machine's GPU unless "
-                "it declares accelerator=False"
+                "accelerator is True or False: a function gets the machine's GPU unless it "
+                "declares accelerator=False"
             )
         if hidden and internal:
             raise RegistrationError("an internal callable cannot also be hidden")
@@ -248,7 +248,7 @@ class App:
                 preflight=preflight,
                 hidden=hidden,
                 internal=internal,
-                accelerator=accelerator is None,
+                accelerator=accelerator is not False,
             )
             return target
 

@@ -26,6 +26,7 @@ import email.parser
 import enum
 import hashlib
 import json
+import operator
 import os
 import re
 import sysconfig
@@ -35,7 +36,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import msgspec
 
@@ -66,13 +67,6 @@ from cozy_runtime.author._model_defaults import (
 )
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
-from cozy_runtime.author._script_metadata import (
-    Unfolded,
-    byte_parameter,
-    declarations,
-    fold_constant,
-    main_definition,
-)
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import (
     AssetsBinding,
@@ -193,6 +187,89 @@ _VOCAB_MODULES = {
 }
 #: Runtime modules a package builds its surface from: followed for types, models and constants.
 _TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm")
+
+
+_ARITHMETIC: dict[type[ast.operator], Callable[[Any, Any], object]] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_INTEGER: dict[type[ast.operator], Callable[[int, int], int]] = {
+    ast.LShift: operator.lshift,
+    ast.RShift: operator.rshift,
+    ast.BitOr: operator.or_,
+    ast.BitAnd: operator.and_,
+    ast.BitXor: operator.xor,
+}
+
+
+class Unfolded(ValueError):
+    """The node the constant folder stops at, and why."""
+
+    def __init__(self, node: ast.AST, why: str) -> None:
+        super().__init__(why)
+        self.node = node
+
+
+def fold_constant(node: ast.expr, other: Callable[[ast.expr], Any]) -> Any:
+    """A literal/arithmetic expression's value, executing nothing: `other` values names and
+    calls."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.Tuple, ast.List)):
+        items: list[Any] = []
+        for item in node.elts:
+            if isinstance(item, ast.Starred):
+                spread = fold_constant(item.value, other)
+                if not isinstance(spread, (tuple, list)):
+                    raise Unfolded(item, "a splat of a non-sequence")
+                items.extend(spread)
+            else:
+                items.append(fold_constant(item, other))
+        return tuple(items) if isinstance(node, ast.Tuple) else items
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.FormattedValue):
+                if value.conversion != -1 or value.format_spec is not None:
+                    raise Unfolded(value, "a formatted f-string field")
+                value = value.value
+            part = fold_constant(value, other)
+            if not isinstance(part, str):
+                raise Unfolded(value, "an f-string field that is not a string")
+            parts.append(part)
+        return "".join(parts)
+    if isinstance(node, ast.Dict):
+        if any(key is None for key in node.keys):
+            raise Unfolded(node, "a dict splat")
+        return {
+            fold_constant(key, other): fold_constant(value, other)
+            for key, value in zip(node.keys, node.values, strict=True)
+            if key is not None
+        }
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
+        operand = fold_constant(node.operand, other)
+        if isinstance(operand, bool) or not isinstance(operand, (int, float)):
+            raise Unfolded(node, "unary arithmetic on a non-number")
+        if isinstance(node.op, ast.USub):
+            return -operand
+        return +operand if isinstance(node.op, ast.UAdd) else ~int(operand)
+    if isinstance(node, ast.BinOp):
+        left, right = fold_constant(node.left, other), fold_constant(node.right, other)
+        if isinstance(node.op, ast.Add) and isinstance(left, str) and isinstance(right, str):
+            return left + right
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in (left, right)):
+            raise Unfolded(node, "arithmetic on non-numbers")
+        if (arithmetic := _ARITHMETIC.get(type(node.op))) is not None:
+            return arithmetic(left, right)
+        if isinstance(left, int) and isinstance(right, int) and type(node.op) in _INTEGER:
+            return _INTEGER[type(node.op)](left, right)
+        raise Unfolded(node, "an operator the constant folder does not evaluate")
+    return other(node)
 
 
 def _author_structs() -> tuple[str, ...]:
@@ -1438,14 +1515,9 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
     app = reader.lookup(entry, attribute, entry.tree)
-    if isinstance(app, Assigned) and _is_script_call(reader, app):
-        return package_interface.assemble(
-            application, [_script_doc(reader, app)], installed=installed
-        )
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
-            f"{application}: {attribute!r} is not `{attribute} = App()` or "
-            f'`{attribute} = script_app("<module>")` at module scope of '
+            f"{application}: {attribute!r} is not `{attribute} = App()` at module scope of "
             f"{reader.spell(entry.path)}",
             code="not_an_app",
         )
@@ -1851,9 +1923,9 @@ def _registration(
                 reader.refuse(module, keyword.value, "internal must be a boolean")
             internal = value
         elif keyword.arg == "accelerator":
-            if value is not False:
-                reader.refuse(module, keyword.value, "accelerator=False is the only value")
-            accelerator = False
+            if type(value) is not bool:
+                reader.refuse(module, keyword.value, "accelerator is True or False")
+            accelerator = value
         elif keyword.arg == "publishes":
             publishes = bool(value)
         elif keyword.arg == "emits_media":
@@ -2086,154 +2158,3 @@ def environment_roots(python: Path | None, *, project: Path) -> tuple[Path, ...]
             "venv source roots are absent or exceed the bound", code="static_environment"
         )
     return tuple(dict.fromkeys(roots))
-
-
-def _is_script_call(reader: Reader, app: Assigned) -> bool:
-    if not isinstance(app.value, ast.Call):
-        return False
-    found = reader.resolve(app.module, app.value.func)
-    return isinstance(found, Vocab) and found.key == "author.script_app"
-
-
-def _script_annotation(reader: Reader, module: Module, node: ast.expr) -> ast.expr:
-    """Use the same imported-type spelling as the execution adapter, without importing."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        node = ast.parse(node.value, mode="eval").body
-    imported = {
-        alias.asname or (alias.name.split(".")[0] if isinstance(stmt, ast.Import) else alias.name)
-        for stmt in module.tree.body
-        if isinstance(stmt, (ast.Import, ast.ImportFrom))
-        for alias in stmt.names
-    }
-    for part in ast.walk(node):
-        if isinstance(part, ast.Name) and part.id not in {*_BUILTIN_TYPES, *imported}:
-            reader.refuse(module, part, "script types must be explicitly imported or builtin")
-        if isinstance(part, ast.Call):
-            metadata = reader.resolve(module, part.func)
-            if not isinstance(metadata, Vocab) or metadata.key != "author.AssetBound":
-                reader.refuse(module, part, "a call in a script annotation", "static_computed")
-    return node
-
-
-def _script_doc(reader: Reader, app: Assigned) -> dict[str, Json]:
-    call = app.value
-    assert isinstance(call, ast.Call)
-    if (
-        len(call.args) != 1
-        or call.keywords
-        or not isinstance(call.args[0], ast.Constant)
-        or not isinstance(call.args[0].value, str)
-        or not call.args[0].value.isidentifier()
-    ):
-        reader.refuse(app.module, call, "script_app requires one literal module name")
-    module = reader.module(call.args[0].value, where=(app.module, call))
-    if len(module.source.encode()) > 32 << 20:
-        reader.refuse(module, module.tree, "script exceeds its source bound")
-    try:
-        fn = main_definition(module.tree)
-    except author.ConformanceError as exc:
-        reader.refuse(module, module.tree.body[0] if module.tree.body else call, str(exc))
-    try:
-        defaults, weights, accelerator = declarations(module.source.encode())
-    except (ValueError, TypeError, author.ConformanceError) as exc:
-        reader.refuse(module, fn, f"invalid script metadata: {exc}")
-    models: list[dict[str, Json]] = []
-    payload_fields: list[tuple[str, type]] = []
-    model_names: set[str] = set()
-    services: set[str] = set()
-    native_context = False
-    for arg in [*fn.args.posonlyargs, *fn.args.args, *fn.args.kwonlyargs]:
-        if arg.arg == "ctx":
-            if arg.annotation is not None:
-                found_context = reader.resolve(
-                    module, _script_annotation(reader, module, arg.annotation)
-                )
-                native_context = (
-                    isinstance(found_context, Vocab) and found_context.key == "author.Context"
-                )
-            continue
-        if arg.annotation is None:
-            reader.refuse(module, arg, "script injected parameters require a type")
-        node = _script_annotation(reader, module, arg.annotation)
-        slot = reader.model_annotation(module, node)
-        if slot is None:
-            target = node.value if isinstance(node, ast.Subscript) else node
-            found = reader.resolve(module, target)
-            service = next(
-                (
-                    key
-                    for key, cls in SERVICES.items()
-                    if isinstance(found, Vocab) and found.key == "author." + cls.__name__
-                ),
-                None,
-            )
-            if service is not None:
-                if service in services:
-                    reader.refuse(module, arg, "script requests a service twice")
-                if service in ("settings", "secrets"):
-                    if not isinstance(node, ast.Subscript):
-                        reader.refuse(module, arg, "script typed service needs its schema")
-                    reader.translate(module, node.slice)
-                services.add(service)
-                continue
-            translated = reader.translate(module, node)
-            if byte_parameter(translated):
-                payload_fields.append((arg.arg, typing.cast(type, translated)))
-                continue
-            reader.refuse(
-                module,
-                arg,
-                "script parameters must be declared models, Weights or services, or typed assets",
-            )
-        spec, raw = slot
-        model_names.add(arg.arg)
-        models.append(
-            package_interface.model_slot(
-                f"main.models.{arg.arg}",
-                spec,
-                default=defaults.get(arg.arg),
-                weights=raw,
-            )
-        )
-    check_model_arguments(defaults, sorted(model_names))
-    if weights and not native_context:
-        reader.refuse(module, fn, "script model outputs require ctx: Context")
-    if weights and "save" in services:
-        reader.refuse(module, fn, "script weights cannot mix with media outputs")
-    returned = (
-        reader.translate(module, _script_annotation(reader, module, fn.returns))
-        if fn.returns
-        else type(None)
-    )
-    result = (
-        msgspec.defstruct("_ScriptResult", [("value", typing.cast(type, returned))])
-        if returned is not type(None)
-        else msgspec.defstruct("_ScriptCompleted", [])
-    )
-    payload = msgspec.defstruct("_ScriptRequest", payload_fields)
-    assert_declaration_shape(payload)
-    assert_declaration_shape(result, result=True)
-    doc = package_interface.callable_doc(
-        name="main",
-        payload_type=payload,
-        result_type=result,
-        models=models,
-        assets=None,
-        publishes=False,
-        weights_outputs=weights,
-        accelerator=accelerator is None,
-    )
-    doc["invocable"] = invocable_interface.serving_metadata(
-        payload,
-        result,
-        module=module.name,
-        export="main",
-        context="_script_context",
-        capabilities=sorted(
-            services
-            | {"telemetry"}
-            | ({"weights"} if weights else set())
-            | ({"media_decode"} if media_kinds(payload) else set())
-        ),
-    )
-    return doc
