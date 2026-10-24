@@ -662,6 +662,12 @@ class _CompositeResidency:
         }
 
 
+def _leases(command: Start) -> int | None:
+    """TensorD's lease namespace when it leases this executor's pages (memory protocol 2), else
+    None: off Linux, with no manager, or an older TensorD, varena runs each GPU standalone."""
+    return command.leases if command.memory_protocol == 2 else None
+
+
 def _construction_record(facts: Mapping[str, Any]) -> dict[str, Any]:
     """A prepare's run-record entry: when it ended, how long it took and its legs."""
     return {
@@ -797,8 +803,8 @@ class Executor:
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: Why a GPU runs standalone ("" it does not): TensorD asked to lease and no manager
-        #: answers (`Memory.standalone`)
+        #: Why a GPU runs standalone ("" it does not): TensorD leases nothing here (its memory
+        #: protocol), or it asked and no manager answers (`Memory.standalone`)
         self.standalone = ""
         #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
         self.cuts: dict[str, object] = {}
@@ -966,8 +972,8 @@ class Executor:
             "pgid": _group(),
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
-            # 2: each GPU's weight pages leased from TensorD's manager beside its two ledger
-            # descriptors. TensorD checks this before transferring Start's memory authority.
+            # 2: each GPU's weight pages leased from TensorD's manager (`Start.leases`); a
+            # Start of any other runs standalone.
             "memory_protocol": 2,
             "sealed": dict(_SEALED),
             "rank": self.rank,
@@ -1557,19 +1563,16 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        if (command.devices or command.ledgers) and command.memory_protocol != 2:
-            # Another TensorD's grant layout is unknown here: its descriptors stay unread.
-            self.poisoned = "incompatible memory protocol"
-            return {
-                "ok": False,
-                "code": "memory_protocol_incompatible",
-                "detail": "GPU Start requires memory_protocol 2 (leases) before ledger transfer; "
-                f"TensorD supplied {command.memory_protocol}. Upgrade TensorD, Runtime "
-                "and TensorFS together.",
-            }
-        for fd in self.channel.recv_fds(2 * command.ledgers):  # TensorD's rows: leases serve
+        # An older TensorD's GPU ledgers follow its Start (a memfd and an eventfd each): unused
+        # here, they close. Skew degrades: whatever leases nothing runs standalone.
+        for fd in self.channel.recv_fds(2 * command.ledgers):
             os.close(fd)
-        self.leases = command.leases
+        self.leases = _leases(command)
+        if command.devices and self.leases is None and not self.standalone:
+            self.standalone = (
+                f"TensorD's memory protocol {command.memory_protocol} leases nothing here: "
+                "each GPU runs standalone"
+            )
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:

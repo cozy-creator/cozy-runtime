@@ -171,7 +171,7 @@ class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The session's GPUs; empty runs on the CPU and never opens CUDA (`accelerator=False`).
     devices: str = ""
-    #: 2: leases beside two ledger descriptors per GPU; checked before reading either.
+    #: 2: TensorD leases each GPU's pages (`leases`); any other, or absent: standalone.
     memory_protocol: int = 0
     sequence_parallel_degree: int = 1
     application: str = ""
@@ -180,11 +180,11 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
-    #: Its GPUs' grants follow the frame, a table and a row description per GPU in `devices`
-    #: order: rank 0 opens its memory on the first and hands follower r the r-th.
+    #: An older TensorD's GPU ledgers, a memfd and an eventfd each, follow the frame: read and
+    #: closed, unused (this TensorD sends none).
     ledgers: int = 0
     #: TensorD's namespace (its uid) each GPU's lease listener is named in: given only when it
-    #: leases this executor's weight pages (memory protocol 2); none, its ledger rows alone.
+    #: leases this executor's weight pages (memory protocol 2).
     leases: int | None = None
     #: The callables its attempts may call: their proxies are installed before the package is
     #: imported, and every attempt gets the call broker over them.
