@@ -1,10 +1,12 @@
 name: Publish to PyPI
 
-# Explicit publication only: creating a tag never starts a companion source build.
-# Source build:
-#   gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
-# Approved existing release assets:
-#   gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt -f gated_sha256sums='<sha256> <filename> ...'
+# Explicit publication only: creating a tag never starts a companion source build. Nothing reaches PyPI before its
+# release gate passed (cozy-creator release-gate/, tracker design ci-v2, pre-release and promotion):
+#   Candidate: build the tag into its GitHub prerelease (the files, SHA256SUMS), no PyPI. The gate takes its Linux
+#   x86_64 wheel by URL#sha256:
+#     gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=source
+#   Promotion: exactly those release assets to PyPI, given the passed gate run (its id) or `hand` (a lead's hand gate):
+#     gh workflow run publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt -f gated_sha256sums='<sha256> <filename> ...' -f gate_run=<id>
 # Add -f rehearsal=true to verify a tag/files without entering the publish job.
 # Build/download jobs have read-only repository access. Only publish obtains PyPI OIDC.
 on:
@@ -28,6 +30,10 @@ on:
         default: false
       gated_sha256sums:
         description: '"<sha256> <filename>" pairs, space separated: publish exactly these release assets, no build'
+        type: string
+        default: ''
+      gate_run:
+        description: "prebuilt: the cozy-creator release-gate run that passed these files (its id), or hand"
         type: string
         default: ''
 
@@ -224,6 +230,20 @@ jobs:
       - id: release
         name: Verify immutable release identity without executing artifact code
         run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }}
+      - name: The release gate passed these files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GATE: ${{ inputs.gate_run }}
+          SUMS: ${{ inputs.gated_sha256sums }}
+        run: |
+          set -euo pipefail
+          case $GATE in
+            '') echo "::error::Prebuilt mode requires gate_run: a passed release-gate run, or hand"; exit 1 ;;
+            hand) echo "gated by hand, the dispatcher vouches" ;;
+            *) git clone -q --depth 1 https://github.com/cozy-creator/cozy-creator creator
+               sha=$(creator/release-gate/verify.sh "$GATE" | jq -r .runtime_sha256)
+               [ -n "$sha" ] && grep -qw "$sha" <<< "$SUMS" || { echo "::error::gate $GATE ran no file of $SUMS"; exit 1; } ;;
+          esac
       - id: dist
         name: The release holds exactly the approved files
         env:
@@ -234,7 +254,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$SUMS" || { echo "::error::Prebuilt mode requires gated_sha256sums."; exit 1; }
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist -p 'cozy_runtime-*'
           uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION"
       - uses: actions/upload-artifact@v4
         with:
@@ -242,9 +262,45 @@ jobs:
           path: dist/
           if-no-files-found: error
 
+  # The candidate: the release set on the tag's GitHub prerelease, for the gate. Never PyPI.
+  candidate:
+    needs: [build, build-aarch64]
+    if: ${{ !cancelled() && !inputs.rehearsal && needs.build.result == 'success' && needs.build-aarch64.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.release_tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-dist-aarch64
+          path: dist
+      - working-directory: dist
+        run: |
+          sha256sum -- *.whl *.tar.gz > SHA256SUMS && cat SHA256SUMS
+          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            [ -z "$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')" ] \
+              || { echo "::error::$TAG already holds files: a candidate's files never change"; exit 1; }
+            gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- *.whl *.tar.gz SHA256SUMS
+          else
+            gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease --title "cozy-runtime ${TAG#v} (candidate)" \
+              --notes "Gate, then publish: .github/workflows/publish.yaml" -- *.whl *.tar.gz SHA256SUMS
+          fi
+          w=$(grep -E 'manylinux_2_28_x86_64\.whl$' SHA256SUMS)
+          { echo "gate with: runtime_wheel=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${w##* }#sha256=${w%% *}"
+            echo "publish with: gated_sha256sums='$(tr '\n' ' ' < SHA256SUMS)'"; } | tee -a "$GITHUB_STEP_SUMMARY"
+
   publish:
-    needs: [build, build-aarch64, gated]
-    if: ${{ !cancelled() && !inputs.rehearsal && (needs.build.result == 'success' && needs.build-aarch64.result == 'success' || needs.gated.result == 'success') }}
+    needs: [gated]
+    if: ${{ !cancelled() && !inputs.rehearsal && needs.gated.result == 'success' }}
     runs-on: ubuntu-latest
     environment: pypi
     # Hang bound, not a work budget.
@@ -256,17 +312,11 @@ jobs:
         with:
           name: release-dist
           path: dist
-      - if: needs.build-aarch64.result == 'success'
-        uses: actions/download-artifact@v4
-        with:
-          name: release-dist-aarch64
-          path: dist
       - id: sums
         env:
-          SUMS: ${{ needs.build.outputs.sha256sums || needs.gated.outputs.sha256sums }}
-          AARCH64: ${{ needs.build-aarch64.outputs.sha256sum }}
+          SUMS: ${{ needs.gated.outputs.sha256sums }}
         run: |
-          { echo 'all<<SUMS'; printf '%s\n' "$SUMS"; [ -z "$AARCH64" ] || printf '%s\n' "$AARCH64"; echo SUMS; } >> "$GITHUB_OUTPUT"
+          { echo 'all<<SUMS'; printf '%s\n' "$SUMS"; echo SUMS; } >> "$GITHUB_OUTPUT"
       - name: Upload set is exactly what build hashed
         env:
           SUMS: ${{ steps.sums.outputs.all }}
@@ -280,7 +330,7 @@ jobs:
       # files. Wait while files are absent, refuse at once on any file this run did not build.
       - name: PyPI serves exactly the built files
         env:
-          VERSION: ${{ needs.build.outputs.version || needs.gated.outputs.version }}
+          VERSION: ${{ needs.gated.outputs.version }}
           SUMS: ${{ steps.sums.outputs.all }}
         run: |
           python3 - <<'PY'
