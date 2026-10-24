@@ -1,9 +1,8 @@
-"""Pure-site cuts sized from their operands against the room varena reports (design
-varena-leases §8 "No learning loop"; `sizing`).
+"""Pure-site cuts sized from their operands against executor-local residency (`sizing`).
 
-A pure cut site picks its level at dispatch from its op's live shapes (`need`) against the
-request's room (`r.room()`), so its first try fits: no OOM probing, nothing remembered. A refusal
-above the finest re-reads the room and runs finer (`sizing.descend`); only the finest's refusal
+A pure cut site estimates its level from live shapes (`need`) and local room (`r.room()`).
+An unexpected capacity refusal reclaims inactive owners and retries that pure level once if
+memory was released; otherwise it descends (`sizing.descend`). Failure at the finest level
 ends the request, typed (device_out_of_memory). Model blocks and package code always run once.
 """
 
@@ -19,16 +18,17 @@ from dataclasses import dataclass, field
 
 import msgspec
 import torch
-from tensorfs.varena.torch import Request
 from torch import Tensor, nn
 
+from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.execution import sizing
+from cozy_runtime.internal.residency import Request
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
 
-#: the varena request being served (`serving`): its pure cut sites size from its room
+#: the request being served (`serving`): its pure cut sites size from its local room
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
 
 
@@ -41,6 +41,8 @@ class Cut(msgspec.Struct, frozen=True, kw_only=True):
     need: int
     tier: str
     descent: int
+    #: Same-level pure retries after observed local reclamation.
+    retries: int = 0
 
 
 class Cuts(msgspec.Struct, kw_only=True):
@@ -105,8 +107,23 @@ def site(kind: str) -> str | None:
 
 def piece() -> None:
     """A cut's next piece starts: the ops inside it are numbered from the start again."""
+    checkpoint()
     if _local.scopes:
         _local.scopes[-1].ordinals.clear()
+
+
+def checkpoint() -> None:
+    """Stop at an owned eager boundary; group cancellation stays with mirrored calls.
+
+    One rank must not leave a collective while another enters it. A CUDA capture also keeps
+    its prepared interval intact; its caller checks cancellation before the next launch.
+    """
+    context = ATTEMPT.get()
+    if context is None or _capturing():
+        return
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        return
+    context.raise_if_cancelled()
 
 
 def short(exc: BaseException) -> bool:
@@ -141,30 +158,59 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     attention pieces, a package's split, a norm's or a conv's bands), at the coarsest level
     whose `need` fits the request's room; a refusal descends. Outside a request it runs whole;
     inside a capture at the level the room gives now (its pool was prepared for it)."""
+    checkpoint()
     request = CURRENT.get()
     if request is None:
         return run(0)
     scope = Scope(site)
     _local.scopes.append(scope)
+    available = request.room()
+    retries = 0
+
+    def room() -> sizing.Room:
+        nonlocal available
+        available = request.room()
+        return available
 
     def whole(level: int) -> T:
+        nonlocal retries
+        checkpoint()
         scope.ordinals.clear()
+        # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
+        # site's predicted cold/warm bytes must be reclaimed before running that site.
+        if not _capturing() and (wanted := need(level, available.granularity)) > available.free:
+            request.reclaim(wanted)
+        try:
+            return run(level)
+        except Exception as exc:
+            if not short(exc):
+                raise
+            _clear(exc)
+            # A failed allocation can reveal pressure the shape estimate cannot predict.
+            # This also runs at the finest level, which sizing.descend cannot make smaller.
+            # Retry only this declared pure operation, and only after actual reclamation.
+            if request.reclaim() <= 0:
+                raise
+        retries += 1
+        checkpoint()
         return run(level)
 
     try:
         if _capturing():
-            return whole(sizing.choose(finest, need, request.room())[0])
+            return whole(sizing.choose(finest, need, available)[0])
         try:
-            result, level, steps, tier = sizing.descend(finest, need, request.room, whole, _refused)
+            result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
         except Exception as exc:
             if short(exc):
                 with _ROWS_LOCK:
                     _ROWS.setdefault(id(request), Cuts()).oom_floor += 1
             raise
-        row = Cut(site=site, level=level, need=need(level, 1), tier=tier, descent=steps)
+        row = Cut(
+            site=site, level=level, need=need(level, 1), tier=tier, descent=steps, retries=retries
+        )
         with _ROWS_LOCK:
             rows = _ROWS.setdefault(id(request), Cuts())
-            if steps or all(r.site != site for r in rows.sites):
+            if steps or retries or all(r.site != site for r in rows.sites):
                 rows.sites.append(row)
         return result
     finally:
@@ -184,6 +230,7 @@ def wrap(
         outer = _local.named, _local.ordinals
         _local.named, _local.ordinals = name, {}
         try:
+            checkpoint()
             with nullcontext() if around is None else around(module, args, kwargs):
                 return forward(*args, **kwargs)
         finally:

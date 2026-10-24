@@ -6,8 +6,8 @@ small owner graph on the library stream is reset only at final domain teardown; 
 replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
 
 A placed model's components run one after another on a device, so all their graphs share the
-device's one domain and its one capture pool (`Memory.graph_pool`), each component's graphs a
-graph region of it (`Pool`). `using` serializes every region call on the device (a host lock and
+device's one domain and its capture-pool token (`Pool`). `using` serializes graph use on the
+device (a host lock and
 a completion event across streams), and each replay copies its inputs in and its outputs out
 inside that interval, so no two graphs' scratch is ever live at once: the pool holds one
 region's working set plus every graph's static buffers.
@@ -20,7 +20,7 @@ import sys
 import threading
 import weakref
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -41,52 +41,13 @@ def unsupported(torch: Any) -> str:
 
 @dataclass(eq=False, slots=True)
 class Pool:
-    """A component's graphs' capture pool: its graph region of the device's one pool, which
-    varena serves and may drop (`region`), or, with no varena memory, a torch pool of its own.
-    A capture is served from bytes `prepare` mapped ahead, never by making room inside it."""
+    """A stock Torch graph-pool token. Graphs and their static tensors own its allocations.
+
+    Runtime retires every graph and waits for its readers before dropping those tensors.
+    The native weight manager does not own this activation/scratch pool.
+    """
 
     handle: tuple[int, int]
-    region: Any = None
-    memory: Any = None
-
-    def prepare(self, request: str) -> None:
-        """Before a capture into the pool begins: the working set its warm-up reached in open
-        request `request`'s arena, mapped into the pool now."""
-        if self.region is not None:
-            self.region.prepare(accel.arena_peak(self.memory, request))
-
-    @contextmanager
-    def replaying(self, stream: Any) -> Iterator[bool]:
-        """Around a replay and its outputs' readers on `stream`: False while varena drops the
-        region (its graphs go, run eager); a True one is released after, by an event on
-        `stream`, even when the replay raises."""
-        if self.region is None:
-            yield True
-            return
-        with self.region.replaying(stream) as ok:
-            yield ok
-
-    def captured(self, ns: int) -> None:
-        """What capturing a graph into it took: varena's drop-versus-keep choice."""
-        if self.region is not None:
-            self.region.captured(ns)
-
-    def failed(self) -> None:
-        """A capture into the pool that torch never ended (its begin or end raised): varena
-        stops routing the capturing thread into it."""
-        if self.memory is not None:
-            self.memory.capture_failed(self.handle)
-
-    def nbytes(self) -> int:
-        """Bytes varena maps in the pool (the device's, every graph region of it)."""
-        if self.memory is None:
-            return 0
-        return int(self.memory.torch_stats()["pools"].get(self.handle, (0, 0))[0])
-
-    def close(self) -> None:
-        """Its graphs are reset: the region's pins and its use of the pool go."""
-        if self.region is not None:
-            self.region.close()
 
 
 class Domain:
@@ -137,6 +98,12 @@ class Domain:
             return "library workspace configuration changed while graphs retain its pointers"
         return unsupported(self.torch)
 
+    def recovery_blocked(self) -> AbstractContextManager[Any]:
+        """Block native reclaim on every thread while this device captures or replays."""
+        from tensorfs import varena
+
+        return varena.capture(self.device)
+
     def initialize(self) -> None:
         """Preparation, including the never-replayed owner, uses the admitted budget."""
         if why := self.refusal():
@@ -153,7 +120,7 @@ class Domain:
             self.owner = self.torch.cuda.CUDAGraph()
             # No library work or allocation inside this owner graph. Recording an event makes
             # its capture stream explicit; reset later clears only this stream.
-            with self.torch.cuda.stream(self.stream):
+            with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
                 self.owner.capture_begin(capture_error_mode="thread_local")
                 self.join.record(self.stream)
                 self.owner.capture_end()
@@ -184,7 +151,7 @@ class Domain:
     def prime_blas(self) -> None:
         """The library stream's cuBLAS and cuDNN handles and workspaces, which torch keeps per
         stream for the process's life: made once, outside any request, so they live in the
-        process arena and never in a request's or a capture's."""
+        process and never depend on a request's temporary allocations."""
         if why := self.refusal():
             raise Unavailable(why)
         if not self.primed:
@@ -233,7 +200,7 @@ def device(torch: Any, memory: Any) -> Domain:
         found = _DEVICES.get(memory)
         if found is None:
             found = _DEVICES[memory] = Domain(torch, memory)
-            finalizer = weakref.finalize(memory, found.finish)
+            finalizer: Any = weakref.finalize(memory, found.finish)
             finalizer.atexit = False
         return found
 
@@ -244,7 +211,7 @@ def acquire(torch: Any, root: Any, memory: Any = None) -> Domain:
         if found is None:
             found = Domain(torch, memory)
             _OWNERS[root] = found
-            finalizer = weakref.finalize(root, found.finish)
+            finalizer: Any = weakref.finalize(root, found.finish)
             finalizer.atexit = False
         return found
 

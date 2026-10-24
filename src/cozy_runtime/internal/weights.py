@@ -1,5 +1,5 @@
-"""Model weights (varena-slim §3): Runtime builds each model on meta, and one
-`tensorfs.varena.torch.Memory` per executor decides where every weight byte lives.
+"""Model weights: Runtime builds each model on meta, and its local residency module
+fills ordinary Torch tensors from TensorFS at declared component/block boundaries.
 
 `Backend` is the loader's backend. `fit` judges, `materialize` keeps weights on meta and derived
 buffers real, `fill` checks each destination against its stored row, and `commit` installs
@@ -13,31 +13,19 @@ and notes.
 from __future__ import annotations
 
 import functools
-import threading
 import time
 import zlib
 from collections import Counter
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
-from tensorfs.varena.torch import (
-    Binding,
-    Declared,
-    Hold,
-    Level,
-    Memory,
-    Model,
-    Region,
-    Weights,
-    blocks_of,
-)
-
 from cozy_runtime import graphs
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members
-from cozy_runtime.author._model import PLACED
+from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding import (
@@ -62,6 +50,17 @@ from cozy_runtime.internal.fill import (
 )
 from cozy_runtime.internal.fill import fit as fill_fit
 from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (Ulysses' torch side, served)
+from cozy_runtime.internal.residency import (
+    Binding,
+    Declared,
+    Hold,
+    Level,
+    Memory,
+    Model,
+    Region,
+    Weights,
+    blocks_of,
+)
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 
 if TYPE_CHECKING:
@@ -111,8 +110,6 @@ class Backend:
         #: id(module) -> the loaded model (of any construction) and path holding it, and the module
         self.owned: dict[int, tuple[Model, str, object]] = {}
         self.indexed: tuple[int, ...] = ()
-        #: each component's bind routes, which keep its decoded tensors for the generation
-        self.routes: dict[str, _Routes] = {}
         self.derived: dict[str, dict[tuple[Module, str], Tensor]] = {}
         #: Persistent buffers the checkpoint does not store (full keys): they keep their values.
         self.unstored: set[str] = set()
@@ -383,9 +380,6 @@ class Backend:
             model.close()
         self.models.clear()
         self.owned, self.indexed = {}, ()
-        for routes in self.routes.values():
-            routes.close()
-        self.routes.clear()
 
     def sizes(self) -> dict[str, int]:
         """Each loaded component's stored bytes."""
@@ -441,10 +435,17 @@ class Backend:
         rows = {self.plan[key].name: self.plan[key] for key in keys}
         bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
-        routes = self.routes[name] = _Routes(self, name, rows, root)
+        routes = _Routes(self, rows)
         leg = self._leg(f"{name}.routes", leg)
-        vars(root)["_varena"] = Declared(
-            Weights(checkpoint.ck, name, release=self.release, keys=tuple(rows)),
+        bound = {stored: row.key.partition(".")[2] for stored, row in rows.items()}
+        vars(root)["_cozy_weights"] = Declared(
+            Weights(
+                checkpoint.ck,
+                name,
+                release=self.release,
+                keys=tuple(rows),
+                bound={stored: path for stored, path in bound.items() if path != stored},
+            ),
             fill=bakes if bakes.bakes else None,
             bind=routes,
         )
@@ -521,18 +522,13 @@ class Backend:
 
 
 class _Routes:
-    """A stored tensor's parts as the module's tensors (`Declared.bind`): as stored, decoded
-    into a float tensor, or a native leaf's role buffers (derived roles made from the stored
-    ones). A decoded tensor is decoded once a generation (`delivery.cost_class`), not once a
-    bind: it is kept under the fill identity it was decoded from, in the component's derived
-    region, pinned while the component is in use (`Placement.using`). Between uses varena may
-    drop the region, and its next pin finds it fresh: the next bind decodes again. Leaf buffers
-    live for that bind."""
+    """Bind stored parts as ordinary weights, decoded floats, or native leaf role buffers.
 
-    def __init__(
-        self, backend: Backend, component: str, rows: Mapping[str, PlanRow], root: Module
-    ) -> None:
-        self.backend, self.component, self.root = backend, component, root
+    Residency owns and caches the returned tensors with their block. Dropping that block
+    releases its decoded storage too; active scopes and graph bindings keep their own owners.
+    """
+
+    def __init__(self, backend: Backend, rows: Mapping[str, PlanRow]) -> None:
         self.torch = backend.torch
         self.rows = dict(rows)
         self.routes = {stored: backend._route(row.key) for stored, row in rows.items()}
@@ -544,11 +540,6 @@ class _Routes:
             for stored, row in rows.items()
             if row.key in backend.leaves
         }
-        self.lock = threading.Lock()
-        #: stored key -> (the fill identity it was decoded under, the decoded tensor)
-        self.decoded: dict[str, tuple[str, Tensor]] = {}
-        #: the decoded tensors' region, made with the first one kept
-        self.region: Region | None = None
 
     def __call__(self, key: str, parts: Mapping[str, Tensor]) -> Mapping[str, Tensor]:
         torch, row = self.torch, self.rows[key]
@@ -557,24 +548,10 @@ class _Routes:
         if route == "verbatim":
             return {name: parts["value"]}
         if route == "decoded_float":
-            identity = self._identity()
-            with self.lock:
-                held = self.decoded.get(key)
-                if held is not None and held[0] == identity:
-                    return {name: held[1]}
             dtype = getattr(torch, TORCH_DTYPES[row.dtype])
             device = next(iter(parts.values())).device
-            if not identity:  # never kept: the bind's own
-                out = torch.empty(row.shape, dtype=dtype, device=device)
-                self.providers[key].decode(torch, parts, out)
-                return {name: out}
-            with self._region().allocating() as fresh:
-                if fresh:
-                    self.forget()
-                out = torch.empty(row.shape, dtype=dtype, device=device)
-                self.providers[key].decode(torch, parts, out)
-            with self.lock:
-                self.decoded[key] = (identity, out)
+            out = torch.empty(row.shape, dtype=dtype, device=device)
+            self.providers[key].decode(torch, parts, out)
             return {name: out}
         leaf, replaced, derived = self.leaves[key]
         provider = cast(LeafProvider, self.providers[key])
@@ -582,32 +559,6 @@ class _Routes:
             leaf, derived, parts, lambda: provider.leaf(torch, parts, replaced, leaf.out_dtype)
         )
         return {f"{name.removesuffix('.weight')}.{buffer}": t for buffer, t in made.items()}
-
-    def _identity(self) -> str:
-        """What the stored bytes are now: as stored, or the fill (LoRA bake) identity they were
-        baked under; "" where the fill declares none, whose decode is never kept."""
-        model = self.backend.models.get(self.component)
-        if model is None or model.fill is None:
-            return "stored"
-        return model.identity or ""
-
-    def _region(self) -> Region:
-        if self.region is None:
-            memory = self.backend.memory
-            self.region = memory.region(f"decoded:{self.component}", "derived", self.root, False)
-        return self.region
-
-    def forget(self) -> None:
-        """Its region came back empty: every decoded tensor goes (the next bind decodes)."""
-        with self.lock:
-            self.decoded.clear()
-
-    def close(self) -> None:
-        """The generation ends: every decoded tensor, and their region."""
-        self.forget()
-        if self.region is not None:
-            self.region.close()
-            self.region = None
 
 
 def _float32(torch: ModuleType, root: Module) -> None:
@@ -710,10 +661,12 @@ class _Bakes:
         device = backend.device
         self.gpu = (device.index or 0) if device.type == "cuda" else None
         self.bakes: dict[str, _Bake] = {}
-        self.strategy: lora_bake.Strategy = "bake"
-        #: what this forward serves (`prepare`): per step while the bake kernels build
-        self.serving: lora_bake.Strategy = "per_step"
-        self.how: lora_bake.How | None = None
+        #: Each attempt chooses once; a kernel landing at a later step cannot change its fill.
+        #: Concurrent attempts keep their own choice. Idle capture uses the last served one.
+        self._choice: ContextVar[tuple[lora_bake.Strategy, lora_bake.How | None] | None] = (
+            ContextVar("cozy_lora_fill", default=None)
+        )
+        self._last: tuple[lora_bake.Strategy, lora_bake.How | None] = ("per_step", None)
         self.baked = 0
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
@@ -747,19 +700,43 @@ class _Bakes:
                         bake.layer = layer
             if bake.layer is not None or bake.hooks:
                 self.bakes[stored] = bake
+        if self.bakes:
+            self.choose("bake")  # A lazily constructed model's first attempt uses the default.
+
+    def choose(self, strategy: lora_bake.Strategy) -> None:
+        """Choose the attempt's serving recipe once, before its first component scope."""
+        if not self.bakes:
+            return
+        gpu = self.gpu if strategy == "bake" else None
+        # Rank-local compilation can finish at different times, and the cards may differ.
+        # A group uses the reference implementation on every rank until a common fused
+        # readiness contract exists. This choice is fixed before any scope binds its weights.
+        group = (
+            self.torch.distributed.is_initialized()
+            and self.torch.distributed.get_world_size() > 1
+        )
+        how: lora_bake.How | None = "eager" if gpu is None or group else lora_bake.serving(gpu)
+        self._choice.set((strategy if how is not None else "per_step", how))
+
+    @property
+    def serving(self) -> lora_bake.Strategy:
+        return (self._choice.get() or self._last)[0]
+
+    @property
+    def how(self) -> lora_bake.How | None:
+        return (self._choice.get() or self._last)[1]
 
     @property
     def identity(self) -> str | None:
         """What a bake writes now, the same in every process (`Filling.identity`): the strategy
         and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each baked
         weight's stored name and encoding with each delta's content (a stored factor pair of
-        this checkpoint, or the identity a hook's package declares), dtypes and scale. A bake
-        waits for no kernel: while its kernels build the LoRAs serve per step, and pages bake
-        once they serve (the identity changes, so varena refills them)."""
+        this checkpoint, or the identity a hook's package declares), dtypes and scale. The
+        attempt's serving recipe is fixed by `choose`: a kernel becoming ready affects the next
+        attempt, never a refault halfway through this one. Package hooks still name their
+        currently armed overlay at the pass boundary; those hooked roots are not graphed."""
         torch = self.torch
-        gpu = self.gpu if self.strategy == "bake" else None
-        self.how = "eager" if gpu is None else lora_bake.serving(gpu)
-        self.serving = self.strategy if self.how is not None else "per_step"
+        self._last = self._choice.get() or self._last
         baked = self.serving == "bake"
         for bake in self.bakes.values():  # each LoRA'd linear told whether its bytes carry it
             if bake.layer is not None:
@@ -852,16 +829,17 @@ def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:
 
 
 class Placement:
-    """What a Runtime mechanism handed a placed component's module reaches (`PLACED`): graph
-    pins and KV caches as the memory's caches, a request's LoRA serving, notes, and each
-    scope's varena pass and step hold (`using`)."""
+    """A placed component's Runtime-owned residency, graph/cache lifetime, and LoRA choice."""
 
     def __init__(self, memory: Memory, backend: Backend) -> None:
         self.memory = memory
         self.torch = backend.torch
         self.models = dict(backend.models)
         self.bakes = dict(backend.bakes)
-        self.routes = backend.routes
+        # Retain the requested mode even for a component hosted entirely on a follower.
+        self._lora_mode: ContextVar[lora_bake.Strategy] = ContextVar(
+            "cozy_lora_mode", default="bake"
+        )
         self.notes: dict[str, str] = {}
         self.attempts = 0
         #: the request's plan (`ctx.plan`): the components each step runs together
@@ -872,12 +850,25 @@ class Placement:
         self.unheld: set[str] = set()
         for name, model in self.models.items():
             PLACED[model.module] = (self, name)
+            # A cached graph owns its exact weight tensors. Residency may ask this owner
+            # to retire it only when the model is idle and a later scope actually needs room.
+            model.retire_graphs = functools.partial(self._retire_graphs, name)
+
+    def _retire_graphs(self, component: str) -> None:
+        root = self.models[component].module
+        for _, release in graphs.DECODERS:
+            release(root)
+        graphs.retire(self.torch, root)
 
     def open_attempt(self) -> None:
         self.attempts += 1
         self.notes.clear()
         self.steps = []
         self.release()
+        self.unheld.clear()  # A previous request's failed whole-model hold is not a future limit.
+        self._lora_mode.set("bake")
+        for bakes in self.bakes.values():
+            bakes.choose("bake")  # Followers open here; the invoke may then select per_step.
         for model in self.models.values():
             graphs.mark(model.module)
 
@@ -886,15 +877,17 @@ class Placement:
 
     @contextmanager
     def using(self, method: str, components: tuple[str, ...]) -> Iterator[None]:
-        """A local scope (`_ComponentScope`): one varena pass per component for the call, its
+        """A local scope (`_ComponentScope`): one residency pass per component for the call, its
         forwards nested in it, and its blocks held bound from free bytes while its plan step
         lasts. A hold never outlives the step: a later step's activations cannot evict pinned
         pages (S3). A component with no free room binds per block."""
         entering = {name for name in components if name in self.models}
         self.release(keep=entering.union(*(s for s in self.steps if s & entering)))
+        for name in sorted(entering):  # graphs of another fill go before this one binds
+            graphs.retire_stale(self.torch, self.models[name].module)
         stream = self.torch.cuda.current_stream() if self.memory.cuda else None
         for name in sorted(entering - self.holds.keys() - self.unheld):
-            shed = functools.partial(self.holds.pop, name, None)
+            shed = functools.partial(self._shed, name)
             hold = self.models[name].hold(shed, free_only=True)
             if hold is None:
                 self.unheld.add(name)
@@ -902,11 +895,6 @@ class Placement:
                 self.holds[name] = (hold, stream)
         with ExitStack() as passes:
             for name in sorted(entering):
-                # its decoded tensors stay while it runs; dropped while unused, binds decode again
-                routes = self.routes.get(name)
-                region = routes.region if routes is not None else None
-                if region is not None and passes.enter_context(region.pin()):
-                    routes.forget()
                 passes.enter_context(self.models[name].passing(method))
             yield
 
@@ -916,41 +904,71 @@ class Placement:
             self.holds.pop(name)[0].release()
             self.unheld.clear()  # room came back
 
+    def _shed(self, component: str) -> None:
+        self.holds.pop(component, None)
+
     def graph_held(self, component: str) -> Any:
         """The stream `component`'s held blocks bound on, or None when they are not held."""
         held = self.holds.get(component)
         return None if held is None else held[1]
 
     def serve_lora(self, strategy: lora_bake.Strategy) -> None:
-        """A request's LoRA serving (`lora_mode`): baked, or per step."""
+        """Fix the request's LoRA serving (`lora_mode`) and implementation before its scopes."""
+        self._lora_mode.set(strategy)
         for bakes in self.bakes.values():
-            bakes.strategy = strategy
+            bakes.choose(strategy)
+        if (
+            strategy == "bake"
+            and self.torch.distributed.is_initialized()
+            and self.torch.distributed.get_world_size() > 1
+        ):
+            self.note("lora.bake", "eager reference on every executor rank")
+
+    def lora_choices(self, components: tuple[str, ...]) -> dict[str, LoRAServing]:
+        """The choice in this attempt's context, including entirely remote components."""
+        return {
+            name: (bakes._choice.get() or bakes._last)
+            if (bakes := self.bakes.get(name)) is not None
+            else (self._lora_mode.get(), "eager")
+            for name in components
+        }
+
+    @contextmanager
+    def mirrored_lora(self, choices: Mapping[str, LoRAServing]) -> Iterator[None]:
+        """A follower uses the transmitted recipe, never its own kernel-readiness timing."""
+        with ExitStack() as stack:
+            for name, choice in choices.items():
+                if choice[1] == "fused":
+                    raise ValueError("a mirrored LoRA scope requires the common eager recipe")
+                if (bakes := self.bakes.get(name)) is not None:
+                    token = bakes._choice.set(choice)
+                    stack.callback(bakes._choice.reset, token)
+            yield
 
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
         """The region's address ownership, independent of its physical replay lease."""
         return self.models[component].retain(paths)
 
     def graph_accounted(self) -> bool:
-        return self.memory.cuda and self.memory.native.context_measurable()
+        return bool(self.memory.cuda)
 
     def graph_domain(self, component: str) -> Any:
         return graphs.capture_device(self.torch, self.memory)
 
-    def region(self, owner: str, kind: str, sets: Module | Sequence[Module]) -> Region:
-        """A long-lived intermediate's region serving `sets` (`Memory.region`): varena spills
-        or drops it between pins, and its next pin says fresh."""
-        return self.memory.region(owner, kind, sets=sets)
+    def region(
+        self,
+        owner: str,
+        kind: str,
+        sets: Module | Sequence[Module],
+        *,
+        release: Callable[[], None] | None = None,
+    ) -> Region:
+        """An explicitly owned cache. Its owner releases entries at safe scope boundaries."""
+        return self.memory.region(owner, kind, sets=sets, release=release)
 
     def graph_pool(self, component: str) -> graphs.domain.Pool:
-        """`component`'s graph region of the device's one capture pool: it holds the
-        component's weights bound while its graphs live, and varena drops it between replays."""
-        model = self.models[component]
-        region = self.memory.graph_region(sets=model, retained=model)
-        return graphs.domain.Pool(region.pool, region, self.memory)
-
-    def graph_segments(self, component: str) -> tuple[str, ...]:
-        """The model's declared block topology, which graph regions align with."""
-        return tuple(self.models[component].blocks)
+        """Stock Torch owns the graph pool; the recording retains its binding and tensors."""
+        return graphs.domain.Pool(self.torch.cuda.graph_pool_handle())
 
     def graph_pass(self, component: str, entry: str) -> Any:
         return self.models[component].passing(entry)
