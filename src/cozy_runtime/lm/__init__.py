@@ -51,7 +51,7 @@ from typing import Any, NamedTuple
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author import _work as work
 from cozy_runtime.author._context import CURRENT, Context
-from cozy_runtime.author._errors import is_capacity
+from cozy_runtime.author._errors import Cancelled, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, say
@@ -159,9 +159,9 @@ def generate(
     model's own rotary embedding. It speeds up a
     batch of one, each token computed as decode computes it. Without one, the head `drafting`
     names is used.
-    `progress(steps)` is told the decode steps taken so far, at most every `PROGRESS_S`, so a long
-    decode is seen moving (a machine ends a call that shows no progress); one that raises is
-    dropped, with a run warning."""
+    `progress(steps)` is told the decode steps taken so far, at most every `PROGRESS_S`, for
+    display only; one that raises is dropped, with a run warning (a cancel is the decode's own
+    check's to act on)."""
     draft = draft if draft is not None else _DRAFT.get()
     if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
         raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
@@ -673,6 +673,8 @@ class _Tell:
         self.told = now
         try:
             self.progress(steps)
+        except Cancelled:  # the decode's own check ends the call
+            return
         except Exception as exc:  # the decode (perhaps other calls' too) outlives its report
             self.progress = None
             WARNINGS.append(
