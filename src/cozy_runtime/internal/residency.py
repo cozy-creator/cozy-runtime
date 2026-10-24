@@ -879,8 +879,6 @@ class Memory:
     @torch.inference_mode(False)  # type: ignore[untyped-decorator]
     def _ensure(self, block: _Block, reclaim: bool) -> None:
         if block.data is not None:
-            if block.ready is not None:
-                self.stream().wait_event(block.ready)
             return
         if self.capturing():
             raise ResidencyError("all graph weights must be resident before capture")
@@ -944,8 +942,20 @@ class Memory:
             if not nested:
                 request = _REQUEST.get()
                 self._ensure(block, reclaim and not (request is not None and request.idle))
+            # A cached Hold can keep count > 0 across sequential threads or streams.
+            # record_stream protects lifetime, but every consumer also needs readiness.
+            if block.ready is not None:
+                self.stream().wait_event(block.ready)
+            if not nested:
                 if block.assigned is None:
-                    block.assigned = _assign(block)
+                    assigned = _assign(block)
+                    ready = block.ready
+                    if self.cuda:
+                        ready = torch.cuda.Event()
+                        ready.record(self.stream())
+                    # Binding/decoding and dtype conversion may enqueue more producer work
+                    # than the fill alone. Publish their owners and completion together.
+                    block.assigned, block.ready = assigned, ready
                 for site, value in block.assigned:
                     block.saved.append((site, site.table[site.name]))
                     site.table[site.name] = value
