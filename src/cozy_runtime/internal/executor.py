@@ -4178,40 +4178,58 @@ class Executor:
 
         App registrations keep their original implementations. Only public module
         exports in this caller process become typed proxies; installed files and
-        the independently executing callee remain ordinary uv installations.
+        the independently executing callee remain ordinary uv installations. Each
+        row's export comes from its own document: two Apps may export from one
+        module, each with its own document.
         """
         from types import ModuleType
 
         from cozy_runtime.internal import call_types, interface_wheel
 
-        prepared: set[str] = set()
+        companions: dict[tuple[str, str], ModuleType] = {}
         for row in rows:
             document, module = row.interface_document, row.module
-            if not document or module in prepared:
-                continue
-            prepared.add(module)
-            imported = importlib.import_module(module)
-            generated = interface_wheel.generate(package_interface.canonical_bytes(document))
-            source = generated.get(module.replace(".", "/") + "/__init__.py")
-            if source is None:
+            if not document:
+                # A TensorD before 0.11.18 documents a module on its first row only.
+                companion = next(
+                    (
+                        c
+                        for (m, _), c in companions.items()
+                        if m == module and row.export in c.__dict__["__cozy_bindings__"]
+                    ),
+                    None,
+                )
+                if companion is None:
+                    continue
+            else:
+                canonical = package_interface.canonical_bytes(document)
+                digest = hashlib.sha256(canonical).hexdigest()[:16]
+                companion = companions.get((module, digest))
+                if companion is None:
+                    generated_files = interface_wheel.generate(canonical)
+                    source = generated_files.get(module.replace(".", "/") + "/__init__.py")
+                    if source is None:
+                        raise CapabilityError(
+                            "installed dependency export is absent", code="child_interface"
+                        )
+                    companion_name = f"{module}._cozy_runtime_callers_{digest}"
+                    companion = companions[(module, digest)] = ModuleType(companion_name)
+                    sys.modules[companion_name] = companion
+                    exec(compile(source, "<installed package callers>", "exec"), companion.__dict__)
+            generated = companion.__dict__["__cozy_bindings__"].get(row.export)
+            if generated is None:
                 raise CapabilityError(
                     "installed dependency export is absent", code="child_interface"
                 )
-            companion_name = module + "._cozy_runtime_callers"
-            companion = ModuleType(companion_name)
-            sys.modules[companion_name] = companion
-            exec(compile(source, "<installed package callers>", "exec"), companion.__dict__)
-            bindings = {
-                export: call_types.public_result(imported, binding)
-                for export, binding in companion.__dict__["__cozy_bindings__"].items()
-            }
+            imported = importlib.import_module(module)
+            bindings = dict(imported.__dict__.get("__cozy_bindings__", {}))
+            bindings[row.export] = call_types.public_result(imported, generated)
             imported.__dict__["__cozy_bindings__"] = bindings
-            for export in bindings:
-                proxy = companion.__dict__[export]
-                # Callable lookup (including prefetch) uses the admitted public
-                # module. Generated wire types stay private to the companion.
-                proxy.__module__ = module
-                imported.__dict__[export] = proxy
+            proxy = companion.__dict__[row.export]
+            # Callable lookup (including prefetch) uses the admitted public
+            # module. Generated wire types stay private to the companion.
+            proxy.__module__ = module
+            imported.__dict__[row.export] = proxy
 
     def _call_broker(self, request_id: str, rows: tuple[CallInterface, ...]) -> Any:
         """This attempt's broker over `rows`, bound once per executor (a served package's
