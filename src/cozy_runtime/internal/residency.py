@@ -1208,11 +1208,15 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
             raise ResidencyError(f"{model.name}: encoded {key} needs a declared binder")
         for name, value in values.items():
             sites = model.sites.get(name, ())
+            if not sites:
+                continue
+            old = sites[0].table[sites[0].name]
+            tensor = value if old is None or old.dtype == value.dtype else value.to(old.dtype)
+            if any(site.parameter for site in sites):
+                tensor = nn.Parameter(tensor, requires_grad=False)
             for site in sites:
-                old = site.table[site.name]
-                tensor = value if old is None or old.dtype == value.dtype else value.to(old.dtype)
-                if site.parameter:
-                    tensor = nn.Parameter(tensor, requires_grad=False)
+                # All names originally tied to one object receive the same Parameter object,
+                # not merely distinct wrappers sharing its storage.
                 assigned[(id(site.table), site.name)] = site, tensor
     return list(assigned.values())
 
