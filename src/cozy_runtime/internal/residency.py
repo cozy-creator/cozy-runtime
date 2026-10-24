@@ -296,7 +296,6 @@ class Model:
                 if self.memory.cuda:
                     torch.cuda.empty_cache()
                 if missing > self.memory.room().free:
-                    self._release()
                     return None
             entered: list[_Block] = []
             try:
@@ -307,7 +306,6 @@ class Model:
                 for block in reversed(entered):
                     self.memory._exit(block)
                 if free_only:
-                    self._release()
                     return None
                 raise
             except BaseException:
@@ -317,9 +315,8 @@ class Model:
             hold = Hold(self, entered, shed, free_only)
             self.holds.append(hold)
             return hold
-        except BaseException:
+        finally:
             self._release()
-            raise
 
     def close(self) -> None:
         self.memory._retire(self)
@@ -357,11 +354,8 @@ class Hold:
             groups, self.groups = self.groups, []
             if self in self.model.holds:
                 self.model.holds.remove(self)
-        try:
-            for block in reversed(groups):
-                self.model.memory._exit(block)
-        finally:
-            self.model._release()
+        for block in reversed(groups):
+            self.model.memory._exit(block)
 
     def shed(self) -> None:
         self.release()
@@ -786,6 +780,16 @@ class Memory:
         before_allocated, before_reserved, _ = self._figures()
         before_free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
         with self.lock:
+            holds = [
+                hold
+                for model in self.models.values()
+                if not model.users
+                for hold in model.holds
+                if hold.reclaimable
+            ]
+        for hold in holds:
+            hold.shed()
+        with self.lock:
             blocks = sorted(
                 (b for m in self.models.values() for b in m.groups()),
                 key=lambda b: (b.model.name in current, b.last),
@@ -906,8 +910,9 @@ class Memory:
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
         global progress
-        block.model._claim()
         with self.lock:
+            if not block.model.users or block.model.thread != threading.get_ident():
+                raise ResidencyError("weight preparation requires an active model scope")
             block.count += 1
             nested = block.count > 1
         try:
@@ -942,7 +947,6 @@ class Memory:
                         site.table[site.name] = previous
                     block.saved.clear()
                     block.last = time.monotonic_ns()
-            block.model._release()
 
     def _read(self, block: _Block, site: _Site) -> Tensor:
         model = block.model
@@ -1243,10 +1247,18 @@ def _hooks(model: Model) -> None:
         sub = model.module.get_submodule(block.path)
 
         def entered(*_: object, b: _Block = block) -> None:
-            memory._enter(b)
+            model._claim()
+            try:
+                memory._enter(b)
+            except BaseException:
+                model._release()
+                raise
 
         def exited(b: _Block = block) -> None:
-            memory._exit(b)
+            try:
+                memory._exit(b)
+            finally:
+                model._release()
 
         model.handles.extend(_paired(sub, entered, exited))
 
