@@ -1,4 +1,9 @@
-"""Authorized hardware proof for one already-materialized native package environment."""
+"""Authorized hardware proof for one native package environment the machine installed.
+
+The environment is a generation `cozy package install` left (TensorD's one installer): its
+root directory, which holds `generation.json` and `env/`. The proof holds it as a run does, so
+the machine's collector leaves it in place, and builds nothing.
+"""
 
 from __future__ import annotations
 
@@ -8,28 +13,31 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import uuid
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+
+import msgspec
 
 from cozy_runtime.cli.io import CliError, Options, emit_error
 from cozy_runtime.internal import (
     base_observation,
     canonical,
+    child_env,
     config,
-    jit_cache,
+    filelock,
     native_wheel,
     package_environment,
-    package_installation,
     spawn,
 )
 from cozy_runtime.internal.exits import Exit
 
 REQUEST_FIELDS = {
     "device_index",
-    "installation_id",
-    "install_root",
+    "generation",
     "expected_result_digest",
     "fixture",
     "python",
@@ -39,11 +47,44 @@ REQUEST_FIELDS = {
 @dataclass(frozen=True, slots=True)
 class Request:
     device_index: int | None
-    installation_id: str
-    install_root: Path
+    generation: Path
     expected_result_digest: str
     fixture: str
     python: Path
+
+
+class Generation(msgspec.Struct, frozen=True):
+    """What the proof reads of a generation's `generation.json` (TensorD's record)."""
+
+    identity: str
+    package: str
+    version: str
+    python: str
+
+
+@contextmanager
+def held(root: Path) -> Iterator[tuple[Generation, Path]]:
+    """The generation published at `root` and its site-packages, held shared, as its runs
+    hold it, until the proof ends."""
+    with (root / ".hold").open("rb") as hold:
+        filelock.lock(hold, shared=True)
+        try:
+            record = msgspec.json.decode((root / "generation.json").read_bytes(), type=Generation)
+        except (OSError, msgspec.DecodeError) as exc:
+            raise package_environment.EnvironmentRefusal(
+                "package_generation_invalid", f"{root}: no readable generation.json"
+            ) from exc
+        sites = sorted((root / "env").glob("lib/python*/site-packages"))
+        python = Path(record.python)
+        if record.identity != root.name or python.parent.parent != root / "env":
+            raise package_environment.EnvironmentRefusal(
+                "package_generation_invalid", f"{root} is not the generation its record names"
+            )
+        if len(sites) != 1 or not python.is_file():
+            raise package_environment.EnvironmentRefusal(
+                "package_generation_invalid", f"{root}/env is not one complete environment"
+            )
+        yield record, sites[0]
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -56,72 +97,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         evidence_path = _fresh_output(_absolute(args[1], "evidence"))
         request = _request(request_path)
         base = package_environment.observe_base(request.python)
-        installed = package_installation.open_installation(
-            request.install_root, request.installation_id
-        )
-        inspection = native_wheel.inspect_installed(installed.site_packages)
-        runtime_config = config.read_config()
-        base_environment = spawn.seal(runtime_config.child_base_env, {})
-        selected_seat = native_wheel.observe_seat(request.python, base_environment)
-        running_seat = native_wheel.observe_seat(Path(sys.executable), base_environment)
-        gpu = (
-            native_wheel.observe_gpu(request.device_index)
-            if request.device_index is not None
-            else None
-        )
-        gpu_sm = gpu["sm"] if gpu is not None else None
-        native_wheel.verify_seat(base, running_seat, gpu=gpu)
-        native_wheel.verify_seat(base, selected_seat, gpu=gpu)
-        if canonical.digest(running_seat) != canonical.digest(selected_seat):
-            raise native_wheel.NativeWheelRefusal(
-                "package_environment_native_python_seat_mismatch",
-                "proof executable and requested base Python report different seats",
-            )
-        host = native_wheel.qualify_host(inspection, gpu_sm=gpu_sm)
-        proof_pod_scope = f"native-proof-{uuid.uuid4().hex}"
-        try:
-            cache_scope = jit_cache.scope(
-                runtime_config.cozy_home,
-                installed.installation_id,
-                pod_scope=proof_pod_scope,
-            )
-        except jit_cache.JITCacheRefusal as exc:
-            raise native_wheel.NativeWheelRefusal(
-                "package_environment_native_jit_cache_invalid", str(exc)
-            ) from exc
-        imposed = {
-            **cache_scope.environment,
-            "OMP_NUM_THREADS": "1",
-            "PYTORCH_CUDA_ALLOC_CONF": "",
-        }
-        if request.device_index is not None:
-            imposed["CUDA_VISIBLE_DEVICES"] = str(request.device_index)
-        try:
-            operator = native_wheel.qualify_operator(
-                python=installed.python,
-                fixture=request.fixture,
-                expected_result_digest=request.expected_result_digest,
-                environment=spawn.seal(runtime_config.child_base_env, imposed),
-            )
-        finally:
-            try:
-                jit_cache.remove_pod(runtime_config.cozy_home, proof_pod_scope)
-            except jit_cache.JITCacheRefusal as exc:
-                raise native_wheel.NativeWheelRefusal(
-                    "package_environment_native_jit_cache_invalid", str(exc)
-                ) from exc
-        evidence = {
-            "base_worker_profile": _profile_id(base),
-            "installation_id": request.installation_id,
-            "host_capability": {
-                "gpu": gpu,
-                "seat": running_seat,
-            },
-            "host_qualification": host,
-            "operator_observation": operator,
-            "package_environment_installation_id": installed.installation_id,
-            "static_inspection": inspection.document(),
-        }
+        with held(request.generation) as (generation, site_packages):
+            evidence = _proof(request, base, generation, site_packages)
         payload = canonical.write(evidence)
         _publish(evidence_path, payload)
         print(
@@ -159,6 +136,56 @@ def main(argv: Sequence[str] | None = None) -> int:
         return int(Exit.structural)
 
 
+def _proof(
+    request: Request,
+    base: base_observation.Observation,
+    generation: Generation,
+    site_packages: Path,
+) -> dict[str, object]:
+    inspection = native_wheel.inspect_installed(site_packages)
+    runtime_config = config.read_config()
+    base_environment = spawn.seal(runtime_config.child_base_env, {})
+    selected_seat = native_wheel.observe_seat(request.python, base_environment)
+    running_seat = native_wheel.observe_seat(Path(sys.executable), base_environment)
+    gpu = (
+        native_wheel.observe_gpu(request.device_index) if request.device_index is not None else None
+    )
+    native_wheel.verify_seat(base, running_seat, gpu=gpu)
+    native_wheel.verify_seat(base, selected_seat, gpu=gpu)
+    if canonical.digest(running_seat) != canonical.digest(selected_seat):
+        raise native_wheel.NativeWheelRefusal(
+            "package_environment_native_python_seat_mismatch",
+            "proof executable and requested base Python report different seats",
+        )
+    host = native_wheel.qualify_host(inspection, gpu_sm=gpu["sm"] if gpu is not None else None)
+    with tempfile.TemporaryDirectory(prefix="native-proof-jit-") as caches:
+        imposed = {
+            **child_env.jit_environment(Path(caches)),
+            "OMP_NUM_THREADS": "1",
+            "PYTORCH_CUDA_ALLOC_CONF": "",
+        }
+        if request.device_index is not None:
+            imposed["CUDA_VISIBLE_DEVICES"] = str(request.device_index)
+        operator = native_wheel.qualify_operator(
+            python=Path(generation.python),
+            fixture=request.fixture,
+            expected_result_digest=request.expected_result_digest,
+            environment=spawn.seal(runtime_config.child_base_env, imposed),
+        )
+    return {
+        "base_worker_profile": _profile_id(base),
+        "generation": generation.identity,
+        "package": f"{generation.package}=={generation.version}",
+        "host_capability": {
+            "gpu": gpu,
+            "seat": running_seat,
+        },
+        "host_qualification": host,
+        "operator_observation": operator,
+        "static_inspection": inspection.document(),
+    }
+
+
 def _request(path: Path) -> Request:
     try:
         value = canonical.parse(_bounded_bytes(path, "request"))
@@ -182,8 +209,7 @@ def _request(path: Path) -> Request:
         raise _error("fixture or device")
     return Request(
         device,
-        str(value["installation_id"]),
-        _existing_directory(_absolute(value["install_root"], "install_root")),
+        _existing_directory(_absolute(value["generation"], "generation")),
         str(value["expected_result_digest"]),
         fixture,
         _existing_executable(_absolute(value["python"], "python")),
@@ -225,7 +251,7 @@ def _existing_executable(path: Path) -> Path:
 def _existing_directory(path: Path) -> Path:
     resolved = path.resolve(strict=True)
     if not stat.S_ISDIR(resolved.lstat().st_mode):
-        raise _error("install_root is not a directory")
+        raise _error("generation is not a directory")
     return resolved
 
 
@@ -269,6 +295,7 @@ def _error(detail: str, code: Exit = Exit.validation) -> CliError:
     return CliError(
         "native_wheel_proof_request_invalid",
         detail,
-        "provide one closed cozy-native-wheel-proof request over an exact package environment",
+        "provide one closed cozy-native-wheel-proof request over a generation `cozy package "
+        "install` left",
         code,
     )

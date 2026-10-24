@@ -41,24 +41,9 @@ class Layout:
         return self._at("var/lib/cozy/boot")
 
     @property
-    def install_root(self) -> Path:
-        return self._at("var/lib/cozy/installs")
-
-    @property
     def runtime_settings(self) -> Path:
         """The Runtime's settings file (`memo:`), written from the owner's config."""
         return self._at("etc/cozy/runtime.yaml")
-
-    @property
-    def machine_wheels(self) -> Path:
-        """The Runtime and TensorFS wheels this machine was installed from, kept verbatim."""
-        return self._at("opt/cozy/wheels")
-
-    @classmethod
-    def of_install_root(cls, install_root: Path) -> Layout | None:
-        """The machine layout an install root belongs to, or None for a root outside one."""
-        root = install_root.parents[3] if len(install_root.parents) > 3 else None
-        return cls(root) if root is not None and cls(root).install_root == install_root else None
 
     @property
     def dependency_cache(self) -> Path:
