@@ -319,11 +319,18 @@ def gemm(
 
 def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: Tensor) -> Tensor:
     """The same W8A8 arithmetic in torch ops: rotate, per-token int8, int8 GEMM, both scales."""
+    quantized, row_scale = quantize_rows(torch, x)
+    out = _product(torch, quantized, row_scale, data, scale, out_dtype)
+    return out.reshape(*x.shape[:-1], -1)
+
+
+def quantize_rows(torch: ModuleType, x: Tensor) -> tuple[Tensor, Tensor]:
+    """`x`'s rows rotated (H/16 per 256 channels) and quantized per row in torch ops: int8
+    `[M, K]` and their f32 scales `[M, 1]`, the operand `eager` multiplies."""
     rotated = hadamard256(torch, x.reshape(-1, x.shape[-1]).float()).mul_(1.0 / 16)
     row_scale = (rotated.abs().amax(-1, keepdim=True) / 127.0).clamp_(min=1e-12)
     quantized = torch.round(rotated / row_scale).clamp_(-127, 127).to(torch.int8)
-    out = _product(torch, quantized, row_scale, data, scale, out_dtype)
-    return out.reshape(*x.shape[:-1], -1)
+    return quantized, row_scale
 
 
 def _product(

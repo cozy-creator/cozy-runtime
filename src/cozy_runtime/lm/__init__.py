@@ -445,12 +445,8 @@ def _unsupported(model: Any) -> str:
     if getattr(config, "is_encoder_decoder", False):
         return "an encoder-decoder"
     text = config.get_text_config(decoder=True)
-    if (
-        "moe" in type(model).__name__.lower()
-        or max(int(getattr(text, field, 0) or 0) for field in ("num_experts", "num_local_experts"))
-        > 1
-    ):
-        return "MoE routing has no bounded decode graph contract"
+    if _fused_experts(model, text):
+        return "MoE routing has no bounded decode graph contract (experts not split per expert)"
     attention = getattr(text, "_attn_implementation", None) or getattr(
         config, "_attn_implementation", ""
     )
@@ -468,8 +464,32 @@ def _unsupported(model: Any) -> str:
     return f"its generation config adds {extras}" if extras else ""
 
 
+#: Models whose experts were found fused (Transformers' host loop) or split (`moe.split`).
+_FUSED: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
+
+
+def _fused_experts(model: Any, text: Any) -> bool:
+    """A mixture of experts whose experts are not all `cozy_runtime.moe.Experts`: Transformers'
+    routes each in a host loop. Split ones decode in two launches a layer (`moe`)."""
+    found = _FUSED.get(model)
+    if found is None:
+        width = max(int(getattr(text, f, 0) or 0) for f in ("num_experts", "num_local_experts"))
+        mixture = "moe" in type(model).__name__.lower() or width > 1
+        split = any(
+            type(m).__name__ == "Experts" and type(m).__module__ == "cozy_runtime.moe"
+            for m in model.modules()
+        )
+        fused = any(
+            p.dim() == 3 and name.endswith(("experts.gate_up_proj", "experts.down_proj"))
+            for name, p in model.named_parameters()
+        )
+        found = _FUSED[model] = mixture and (fused or not split)
+    return found
+
+
 def _capture_contract(model: Any) -> str:
-    """Shipped dense decode contracts; persistent KV, positions and counters are device buffers.
+    """Shipped decode contracts, dense and with experts split (`moe`); persistent KV, positions
+    and counters are device buffers.
 
     The real warm step initializes cache views and advances accepted history once. Capture
     only records the next step's device writes. Custom Python hooks and arbitrary model code
@@ -480,8 +500,10 @@ def _capture_contract(model: Any) -> str:
         "Qwen3ForCausalLM",
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3_5MoeForConditionalGeneration",
     }:
-        return "no shipped dense decode capture contract"
+        return "no shipped decode capture contract"
     if model.training:
         return "training state"
     for sub in model.modules():
