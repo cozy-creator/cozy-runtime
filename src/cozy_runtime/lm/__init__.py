@@ -19,8 +19,8 @@ draw depends only on its own row's scores, seed and position, so it replays insi
 not depend on what else is in the batch, and a drafted token is verified exactly as a greedy
 one. Temperature 0 is the plain argmax.
 
-A graph reads retained virtual addresses: a refill maps physical backing at those same
-addresses. The loop leases every block the step reads only while its driver is active. If
+A graph keeps its ordinary weight tensors and their addresses alive while cached. Offload
+retires the graph before releasing those tensors; a later call can refill and capture anew. If
 the full set cannot be prepared before execution, the call uses Transformers' loop. Errors
 after execution starts are final; package code is never restarted. On a CPU, or after a safe
 capture refusal (a run warning), the same step runs eagerly. A model this does not

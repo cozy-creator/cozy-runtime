@@ -22,7 +22,7 @@ class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
     gpu: int
     ceiling: Ceiling | None = None
     stats: dict[str, object] = msgspec.field(default_factory=dict)
-    torch_peak: int = 0
+    torch_peak: int | None = None
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):

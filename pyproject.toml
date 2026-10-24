@@ -117,8 +117,8 @@ derive = ["torch>=2.14"]
 media = [
     "av>=19.0.1",
 ]
-# Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
-# package environments select this capability; worker images provide the same range.
+# Executors read stored weights through TensorFS into ordinary Torch storage. Local package
+# environments select this capability; worker images provide the same range.
 model-execution = ["tensorfs>=0.15.1,<0.16"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.

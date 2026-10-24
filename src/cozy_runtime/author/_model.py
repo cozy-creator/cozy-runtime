@@ -294,11 +294,11 @@ LoRAServing = tuple[Literal["bake", "per_step"], Literal["eager", "fused"] | Non
 
 class Residency(Protocol):
     """What a Runtime mechanism handed a placed component reaches, installed on a constructed
-    generation. Memory itself is varena's: it sees each forward through its own hooks.
+    generation. Runtime's local residency scopes bind weights around each forward.
 
     Declared here because the contract has one home; implemented nowhere in this package,
     because it needs a device and this package is torch-free by construction. cozy-runtime
-    supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
+    supplies the body in `internal/weights.py`'s `Placement`.
     """
 
     def note(self, key: str, value: str) -> None:
@@ -306,7 +306,7 @@ class Residency(Protocol):
         ...
 
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
-        """Retain a region's virtual addresses; prepare() leases backing only during use."""
+        """Retain ordinary weight storage after prepare(), until the binding closes."""
         ...
 
     def graph_accounted(self) -> bool:
@@ -324,7 +324,7 @@ class Residency(Protocol):
         ...
 
     def graph_pool(self, component: str) -> Any:
-        """`component`'s graph region of the device's one capture pool."""
+        """`component`'s ordinary Torch graph pool, owned with its cached recordings."""
         ...
 
     def graph_pass(self, component: str, entry: str) -> Any:
@@ -1071,7 +1071,7 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 @final
 class _ComponentScope:
     """A method's declared components, nested or on any of the call's threads (cr-202), each
-    marking its own context (`Model._cozy_active`). Varena sees each forward itself, and the
+    marking its own context (`Model._cozy_active`). Residency hooks see each forward, and the
     scope's components are held bound for its plan step (`Residency.using`, which covers a
     component with no blocks that another's forward reads, cr-207). Calls still take scopes one
     at a time (`SCOPES`): the sites they read change between turns (cr-202 U4 lifts it).

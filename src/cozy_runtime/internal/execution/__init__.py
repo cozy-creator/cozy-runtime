@@ -62,7 +62,7 @@ class Steps:
 
 
 def record(
-    request: Request, gpu: int, device: int | None, store: Path, torch_peak: int
+    request: Request, gpu: int, device: int | None, store: Path, torch_peak: int | None
 ) -> GpuMemory:
     """Physical GPU `gpu`'s memory observation. The historical `varena` wire key remains;
     the record identifies stock Torch's process-wide allocator scope explicitly."""
@@ -70,7 +70,7 @@ def record(
         gpu=gpu,
         ceiling=_ceiling(device, store),
         stats=request.stats(),
-        torch_peak=torch_peak,
+        torch_peak=torch_peak if device is not None else None,
     )
 
 

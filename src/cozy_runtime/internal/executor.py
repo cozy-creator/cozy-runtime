@@ -3486,7 +3486,7 @@ class Executor:
         released_us = execution_evidence.now_us()
         # Stock Torch's peak is absolute and process-wide. Overlapping attempts share it;
         # never add the request-start allocation again or present it as exclusive ownership.
-        arena = own_memory[0].torch_peak if own_memory else 0
+        arena = (own_memory[0].torch_peak or 0) if own_memory else 0
         live = accel.allocated(torch, self.device_kind, own) if torch is not None else 0
         peak_vram = max(arena, live) if self.device_kind == "cuda" else live
         peak_reserved = accel.reserved(torch, self.device_kind, own) if torch is not None else 0
@@ -4431,7 +4431,7 @@ class Executor:
         request: MemoryRequest | None = None
         cuda = host.memory.cuda
         device = host.memory.device.index if cuda else None
-        peak = 0
+        peak: int | None = None
         try:
             with host.memory.request(request_id) as request, host.execution.serving(request):
                 host.requests[request_id] = request
