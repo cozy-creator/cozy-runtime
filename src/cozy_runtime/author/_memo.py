@@ -34,6 +34,15 @@ def memo_policy(memoize: bool | Memoize) -> Memoize | None:
     return Memoize() if memoize else None
 
 
+def one_memo(invocable: Memoize | None, registration: Memoize | None) -> Memoize | None:
+    """`memoize` is declared once: on `@invocable` or on the App registration."""
+    if invocable is not None and registration is not None:
+        raise ConformanceError(
+            "declare memoize once, on invocable or App registration", code="invocable_memoize"
+        )
+    return registration if invocable is None else invocable
+
+
 @dataclass(frozen=True, slots=True)
 class MemoResource:
     """One named package resource whose bytes affect the operation's result."""

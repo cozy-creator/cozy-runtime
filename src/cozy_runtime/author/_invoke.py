@@ -465,7 +465,7 @@ def _preflight(surface: Surface, overlay: Overlay, settings: object) -> tuple[ob
 
 
 def _payload_value(surface: Surface, payload: object) -> object:
-    if surface.assets_binding is None or surface.invocable:
+    if surface.assets is None or surface.invocable:
         return payload
     annotation = next(p.annotation for p in surface.params if p.role == "payload")
     cls: Any = annotation
@@ -475,7 +475,7 @@ def _payload_value(surface: Surface, payload: object) -> object:
 def _prepare_assets(
     surface: Surface, payload: object, metadata: Mapping[str, InputMetadata]
 ) -> dict[str, AssetBound | None]:
-    binding = surface.assets_binding
+    binding = surface.assets
     if binding is None:
         return {}
     values = getattr(payload, binding.parameter)

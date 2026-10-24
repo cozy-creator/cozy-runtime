@@ -13,7 +13,6 @@ dtype, `class MyGan(Model): generator: nn.Module`) while preventing nothing.
 
 from __future__ import annotations
 
-import inspect
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -22,9 +21,9 @@ from cozy_runtime.author._decode import require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._markers import AssetBound
-from cozy_runtime.author._model import EXCLUDED_KEYWORDS, Model
+from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._services import UNGRANTABLE
-from cozy_runtime.author._signature import ModelBinding, Surface, media_kinds
+from cozy_runtime.author._signature import Declaration, Surface, media_kinds
 from cozy_runtime.author._walker import walk
 from cozy_runtime.author._weights import MAX_WEIGHTS_OUTPUTS
 
@@ -65,79 +64,129 @@ def assert_declaration_shape(declaration: object, *, result: bool = False) -> No
             )
 
 
-def _grantable(surface: Surface) -> None:
-    """A capability nothing can grant refuses at BUILD, not at the first request.
+def validate(declared: Declaration) -> None:
+    """Every build refusal over one callable, whichever reader filled its record (§1.7).
 
-    `net: Egress` passed describe, passed deploy, and then raised
-    `egress_broker_unavailable` the first time a real request reached the handler — the one
-    clock on which a package author can do nothing about it and a caller pays for it. A
-    declaration the platform cannot honour is a conformance fact about the package, so it
-    belongs in the same verdict class as a schema violation (§1.7), and the refusal names
-    what has to land rather than only that something is missing.
-    """
-    for capability in sorted(surface.capabilities & set(UNGRANTABLE)):
+    The package interface is assembled through it (`package_interface.assemble`), so publish,
+    install and the machine's import refuse the same package for the same reason."""
+    name = declared.name
+    assert_declaration_shape(declared.payload_type)
+    assert_declaration_shape(declared.result_type, result=True)
+    feature_specs(declared.payload_type)
+    if len(declared.contexts) > 1:
+        raise ConformanceError(f"{name}: Context is injected at most once", code="context_arity")
+    if declared.facts > 1:
+        raise ConformanceError(f"{name}: at most one Preflight[T] parameter", code="facts_arity")
+    services = declared.services
+    for capability in sorted({c for c in services if services.count(c) > 1}):
         raise ConformanceError(
-            f"{surface.name} declares the {capability!r} capability: {UNGRANTABLE[capability]}",
+            f"{name}: service {capability!r} requested twice", code="service_arity"
+        )
+    if declared.memoize and {"egress", "secrets"} & set(services):
+        raise ConformanceError(
+            "a memoized invocable cannot depend on external egress or unrecorded secrets",
+            code="invocable_memoize_effect",
+        )
+    # A capability nothing can grant refuses at BUILD, not at the first request: a package
+    # author can do nothing about it on that clock, and a caller pays for it.
+    for capability in sorted(set(services) & set(UNGRANTABLE)):
+        raise ConformanceError(
+            f"{name} declares the {capability!r} capability: {UNGRANTABLE[capability]}",
             code="ungrantable_capability",
         )
+    _writes(declared)
+    _models(declared)
 
 
-def _writes(surface: Surface) -> None:
+def _writes(declared: Declaration) -> None:
     """What a function writes is its own declaration, and grants mint off it (§2)."""
-    writer = bool(surface.weights_outputs or surface.publishes or surface.emits_media)
-    if writer and surface.memoize:
+    name = declared.name
+    names = [output.name for output in declared.weights_outputs]
+    publishes = declared.publishes or declared.emits_media
+    if (names or publishes) and declared.memoize:
         raise ConformanceError(
-            f"{surface.name}: memoize on a function that declares weights=, publishes= or "
+            f"{name}: memoize on a function that declares weights=, publishes= or "
             "emits_media= — a writer's repeat is answered by TensorFS derivation replay and "
             "its destination, never by the memo",
             code="memoized_writer",
         )
-    if (surface.publishes or surface.emits_media) and "save" not in surface.capabilities:
+    if publishes and "save" not in declared.services:
         raise ConformanceError(
-            f"{surface.name}: declares publishes/emits_media but its signature names no "
+            f"{name}: declares publishes/emits_media but its signature names no "
             "Outputs — a declaration the body cannot act on would grant a destination "
             "nothing can write",
             code="publication_declaration",
         )
-    names = [output.name for output in surface.weights_outputs]
     if len(names) > MAX_WEIGHTS_OUTPUTS:
         raise ConformanceError(
-            f"{surface.name}: declares {len(names)} weights outputs; "
-            f"the bound is {MAX_WEIGHTS_OUTPUTS}",
+            f"{name}: declares {len(names)} weights outputs; the bound is {MAX_WEIGHTS_OUTPUTS}",
             code="weights_output_bound",
         )
     if len(set(names)) != len(names):
         raise ConformanceError(
-            f"{surface.name}: weights output names are not unique",
-            code="weights_output_duplicate",
+            f"{name}: weights output names are not unique", code="weights_output_duplicate"
         )
-    if names and not any(param.role == "context" for param in surface.params):
+    if names and not declared.contexts:
         raise ConformanceError(
-            f"{surface.name}: declares weights outputs but its signature has no Context",
+            f"{name}: declares weights outputs but its signature has no Context",
             code="weights_sink_declaration",
         )
-    if names and ("save" in surface.capabilities or surface.publishes):
+    if names and ("save" in declared.services or declared.publishes):
         raise ConformanceError(
-            f"{surface.name}: a model-producing function cannot mix TensorFS outputs with "
+            f"{name}: a model-producing function cannot mix TensorFS outputs with "
             "Outputs/publishes",
             code="mixed_weights_outputs",
         )
 
 
-def check(surface: Surface) -> Surface:
-    """Every build-time refusal that needs the WHOLE surface, not just one signature."""
-    assert_declaration_shape(surface.payload_type)
-    assert_declaration_shape(surface.result_type, result=True)
-    if surface.memoize and surface.capabilities & {"egress", "secrets"}:
+def _models(declared: Declaration) -> None:
+    """The SOURCE clock over the model slots: arguments, classes and shard degrees. It cannot
+    prove a component exists in an artifact not yet selected; exact binding does (§1.1)."""
+    slots = [slot.parameter for slot in declared.slots]
+    constructed = [slot.parameter for slot in declared.slots if not slot.weights]
+    check_model_arguments(declared.model_defaults, slots)
+    check_model_arguments(declared.model_components, slots, what="components")
+    check_model_arguments(dict.fromkeys(declared.model_on_demand), constructed, what="on_demand")
+    degrees = [set(slot.spec.sequence_parallel) for slot in declared.slots]
+    if any(degrees) and not set.intersection(*degrees):
         raise ConformanceError(
-            "a memoized invocable cannot depend on external egress or unrecorded secrets",
-            code="invocable_memoize_effect",
+            f"{declared.name}: its Model slots declare @sequence_parallel degrees {degrees} "
+            "with none in common; a group shards every slot, so each must share a degree",
+            code="sequence_parallel_declaration_conflict",
         )
-    specs = feature_specs(surface.payload_type)
-    _grantable(surface)
-    _writes(surface)
-    _media_decode_bounds(surface)
+    for slot in declared.slots:
+        if slot.weights:
+            continue
+        path, spec = f"{declared.name}.models.{slot.parameter}", slot.spec
+        uses = declared.model_components.get(slot.parameter, ())
+        unknown = sorted(set(uses) - {c for names in spec.components.values() for c in names})
+        if unknown:
+            raise ConformanceError(
+                f"{path}: components names {', '.join(unknown)}, which no "
+                f"@uses_components method of {spec.name} declares",
+                code="model_components",
+                fields=unknown,
+            )
+        if not spec.loads:
+            raise ConformanceError(
+                f"{path}: {spec.name} defines no load(loader) — a Model constructs "
+                "through loader.construct(T, factory=…), the one construction primitive (§1.1)",
+                code="no_load",
+            )
+        if spec.arguments:
+            raise ConformanceError(
+                f"{path}: {spec.name}() takes constructor arguments — the runtime "
+                "owns WHEN construction runs, so a Model is built empty and filled by load()",
+                code="model_init",
+            )
 
+
+def check(surface: Surface) -> Surface:
+    """The imported callable's build refusals: `validate`, plus the two only an import can
+    state — its release's media decoder, and its preflight hook, whose byte reads and
+    demand tables are code the source reader never evaluates."""
+    validate(surface)
+    _media_decode_bounds(surface)
     if surface.preflight is not None:
         settings = [p for p in surface.params if p.capability == "settings"]
         declared = surface.preflight.settings_type
@@ -162,10 +211,7 @@ def check(surface: Surface) -> Surface:
                 "SAME value admission hashed",
                 code="preflight_result",
             )
-        _two_producers(surface, specs)
-    for binding in surface.model_bindings:
-        if not binding.weights:
-            _check_model(binding)
+        _two_producers(surface, feature_specs(surface.payload_type))
     return surface
 
 
@@ -174,7 +220,7 @@ def _media_decode_bounds(surface: Surface) -> None:
     declared decoded bound: Runtime decodes what the call reads, within what the machine holds."""
     if "media_decode" not in surface.capabilities:
         return
-    if not media_kinds(surface.payload_type, surface.assets_binding) & {"video", "audio"}:
+    if not media_kinds(surface.payload_type, surface.assets) & {"video", "audio"}:
         return
     try:
         require_decoder_dependency()
@@ -184,39 +230,6 @@ def _media_decode_bounds(surface: Surface) -> None:
             "PyAV; install cozy-runtime[media] in the package closure",
             code="media_decoder_dependency",
         ) from exc
-
-
-def _check_model(binding: ModelBinding) -> None:
-    """The SOURCE clock over one model slot: syntax, placement and excluded surfaces only.
-
-    It cannot prove a component name exists in an artifact that has not been selected —
-    that existence proof runs at exact binding against the censused construction (§1.1).
-    """
-    cls = binding.model_class
-    if cls.load is Model.load:
-        raise ConformanceError(
-            f"{binding.path}: {cls.__name__} defines no load(loader) — a Model constructs "
-            "through loader.construct(T, factory=…), the one construction primitive (§1.1)",
-            code="no_load",
-        )
-    try:
-        inspect.signature(cls).bind()
-    except TypeError:
-        raise ConformanceError(
-            f"{binding.path}: {cls.__name__}() takes constructor arguments — the runtime "
-            "owns WHEN construction runs, so a Model is built empty and filled by load()",
-            code="model_init",
-        ) from None
-    for method, names in binding.components.items():
-        del names
-        member = inspect.getattr_static(cls, method)
-        for name in inspect.signature(member).parameters:
-            if (why := EXCLUDED_KEYWORDS.get(name)) is not None:
-                raise ConformanceError(
-                    f"{cls.__name__}.{method}({name}=): {why}",
-                    code="excluded_keyword",
-                    fields=[name],
-                )
 
 
 def _two_producers(surface: Surface, specs: Sequence[FeatureSpec]) -> None:

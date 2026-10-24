@@ -11,13 +11,14 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError, Surface, WeightsOutput
+from cozy_runtime.author import ConformanceError
+from cozy_runtime.author._describe import validate
 from cozy_runtime.author._markers import (
     AUDIO_PREPARATION_PROFILE,
     IMAGE_PREPARATION_PROFILE,
@@ -28,11 +29,11 @@ from cozy_runtime.author._markers import (
     VideoPreparation,
 )
 from cozy_runtime.author._media import KIND_MEDIA
-from cozy_runtime.author._model import ENCODED_LEAVES, Model, component_use
+from cozy_runtime.author._model import ENCODED_LEAVES
 from cozy_runtime.author._model_defaults import model_default
 from cozy_runtime.author._recipes import DeclaredRecipe
-from cozy_runtime.author._signature import AssetInputValue, AssetsBinding
-from cozy_runtime.internal import canonical, invocable_interface, schema
+from cozy_runtime.author._signature import AssetInputValue, Declaration, Slot
+from cozy_runtime.internal import canonical, invocable_interface, memo_implementation, schema
 from cozy_runtime.internal.canonical import Json
 
 if TYPE_CHECKING:
@@ -190,30 +191,40 @@ class PackageInterface(msgspec.Struct, frozen=True, kw_only=True):
 
 def build(found: Discovered, *, installed: bool = False) -> dict[str, Json]:
     """Derive one package interface from the frozen (imported) application."""
-    docs = [_callable(surface) for surface in found.surfaces if not surface.hidden]
+    # A writer's identity keys TensorFS derivation replay, as a memoized one's keys the memo.
+    declared = [
+        replace(surface, identity=memo_implementation.describe(surface.fn))
+        if surface.memoize or surface.weights_outputs
+        else surface
+        for surface in found.surfaces
+        if not surface.hidden
+    ]
     recipes = [msgspec.to_builtins(recipe) for recipe in found.recipes]
-    return assemble(found.application, docs, installed=installed, recipes=recipes)
+    return assemble(found.application, declared, installed=installed, recipes=recipes)
 
 
 def assemble(
     application: str,
-    docs: Sequence[dict[str, Json]],
+    declared: Sequence[Declaration],
     *,
     installed: bool = False,
     recipes: Sequence[dict[str, Json]] = (),
 ) -> dict[str, Json]:
-    """One package interface from its callable documents, whichever reader produced them.
+    """One package interface from its callables' records, whichever reader filled them: each
+    passes the one rule set (`validate`), then renders its entry.
 
     `installed` describes a published wheel, so it holds that release to the rules it was
     published under."""
-    for doc in docs:
-        declared = doc.get("invocable")
-        if isinstance(declared, dict) and "memo_requires" in declared:
-            invocable_interface.check_memo_requires(
-                msgspec.convert(declared, invocable_interface.Invocable, strict=True),
-                doc["request"],
-                authoring=not installed,
-            )
+    docs = []
+    for row in declared:
+        validate(row)
+        doc = entry(row)
+        invocable_interface.check_memo_requires(
+            msgspec.convert(doc["invocable"], invocable_interface.Invocable, strict=True),
+            doc["request"],
+            authoring=not installed,
+        )
+        docs.append(doc)
     body: dict[str, Json] = {
         "format": SCHEMA,
         "application": application,
@@ -234,64 +245,19 @@ def _by_name(doc: Json) -> str:
     return name
 
 
-def _callable(surface: Surface) -> dict[str, Json]:
-    doc = callable_doc(
-        name=surface.name,
-        payload_type=surface.payload_type,
-        result_type=surface.result_type,
-        models=[
-            model_slot(
-                binding.path,
-                ModelSpec.of(binding.model_class),
-                default=surface.model_defaults.get(binding.param),
-                uses=surface.model_components.get(binding.param, ()),
-                weights=binding.weights,
-                on_demand=binding.param in surface.model_on_demand,
-            )
-            for binding in surface.model_bindings
-        ],
-        assets=surface.assets_binding,
-        publishes=surface.publishes,
-        weights_outputs=surface.weights_outputs,
-        internal=surface.internal,
-        accelerator=surface.accelerator,
-    )
-    doc["invocable"] = invocable_interface.metadata(surface)
-    if surface.invocable:
-        invocable_interface.project_serving_models(doc)
-    return doc
-
-
-def callable_doc(
-    *,
-    name: str,
-    payload_type: object,
-    result_type: object,
-    models: Sequence[dict[str, Json]],
-    assets: AssetsBinding | None,
-    publishes: bool,
-    weights_outputs: Sequence[WeightsOutput],
-    internal: bool = False,
-    accelerator: bool = True,
-) -> dict[str, Json]:
-    """One callable's document from plain facts — the import and static readers meet here."""
+def entry(declared: Declaration) -> dict[str, Json]:
+    """One callable's interface entry, rendered from its record."""
+    name, payload, result = declared.name, declared.payload_type, declared.result_type
     doc: dict[str, Json] = {
         "name": name,
-        "request": schema.request(payload_type),
-        "result": schema.render(result_type, decoded_bounds=True),
+        "request": schema.request(payload),
+        "result": schema.render(result, decoded_bounds=True),
     }
-    if internal:
+    if declared.internal:
         doc["internal"] = True
-    if models:
-        degrees = [set(model.get("sequence_parallel", {}).get("degrees", [])) for model in models]
-        if any(degrees) and not set.intersection(*degrees):
-            raise ConformanceError(
-                f"{name}: its Model slots declare @sequence_parallel degrees {degrees} with "
-                "none in common; a group shards every slot, so each must share a degree",
-                code="sequence_parallel_declaration_conflict",
-            )
-        doc["models"] = list(models)
-    if assets:
+    if declared.slots:
+        doc["models"] = [model_slot(declared, slot) for slot in declared.slots]
+    if assets := declared.assets:
         kinds: list[Json] = []
         for cls, bound in assets.kinds:
             row: dict[str, Json] = {
@@ -311,64 +277,53 @@ def callable_doc(
                 row["prepare"] = dict(preparation.descriptor())
             kinds.append(row)
         doc["assets"] = {"parameter": assets.parameter, "kinds": kinds}
-    if publishes:
+    if declared.publishes:
         doc["publishes"] = True
-    if not accelerator:
+    if not declared.accelerator:
         doc["accelerator"] = False
-    if weights_outputs:
+    if declared.weights_outputs:
         doc["weights_outputs"] = [
             {
                 "output_id": output.name,
                 "mime_type": "application/vnd.cozy.model-manifest",
                 "max_bytes": output.max_new_bytes,
             }
-            for output in sorted(weights_outputs, key=lambda row: row.name)
+            for output in sorted(declared.weights_outputs, key=lambda row: row.name)
         ]
+    doc["invocable"] = {
+        **invocable_interface.from_types(
+            payload,
+            result,
+            module=declared.module,
+            export=declared.export,
+            context=declared.contexts[0] if declared.contexts else "",
+            parameters=declared.parameters,
+            parameter_defaults=declared.parameter_defaults,
+            memoize=declared.memoize,
+            capabilities=sorted(declared.capabilities),
+        ),
+        **declared.identity,
+    }
+    if declared.parameters is None:
+        return doc
+    invocable_interface.project_serving_models(doc)
+    invocable_interface.validate(
+        msgspec.convert(doc["invocable"], invocable_interface.Invocable, strict=True),
+        doc["request"],
+        doc["result"],
+    )
     return doc
 
 
-@dataclass(frozen=True, slots=True)
-class ModelSpec:
-    """A Model class's interface facts, read by import (`of`) or from source alone."""
-
-    name: str
-    encoded_leaves: str = "refuse"
-    min_bits: int = 8
-    phase: str = "compute"
-    sequence_parallel: tuple[int, ...] = ()
-    components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
-    placeable: tuple[str, ...] = ()
-
-    @classmethod
-    def of(cls, model: type[Model[Any]]) -> ModelSpec:
-        return cls(
-            model.__name__,
-            model.__encoded_leaves__,
-            model.__min_bits__,
-            model.__phase__,
-            tuple(model.__sequence_parallel__),
-            component_use(model),
-            tuple(model.__placeable__),
-        )
-
-
-def model_slot(
-    path: str,
-    spec: ModelSpec,
-    *,
-    default: str | None = None,
-    uses: Sequence[str] = (),
-    weights: bool = False,
-    on_demand: bool = False,
-) -> dict[str, Json]:
+def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves` and
     the precision tolerances, and the per-public-method component sets are the
     ComponentUseContracts. `default` is an unresolved release; the machine resolves it and
-    picks its lane. `uses` names the components the callable runs (`components`); empty
-    means all. A `weights` slot is raw checkpoint data, so `uses` names its checkpoint
-    components."""
+    picks its lane. `components` names the components the callable runs; absent means all. A
+    `weights` slot is raw checkpoint data, so its `components` are checkpoint components."""
+    spec, parameter = slot.spec, slot.parameter
     doc: dict[str, Json] = {
-        "path": path,
+        "path": f"{declared.name}.models.{parameter}",
         "class": spec.name,
         "encoded_leaves": spec.encoded_leaves,
         # Declaration order encodes no control flow and no residency choice (§1.1), so the
@@ -377,22 +332,13 @@ def model_slot(
             method: sorted(names) for method, names in sorted(spec.components.items())
         },
     }
-    if default:
+    if default := declared.model_defaults.get(parameter):
         doc["default"] = default
     if spec.min_bits != 8:
         doc["min_bits"] = spec.min_bits
     if spec.phase != "compute":
         doc["phase"] = spec.phase
-    if uses:
-        declared = {name for names in spec.components.values() for name in names}
-        unknown = sorted(set(uses) - declared)
-        if unknown and not weights:
-            raise ConformanceError(
-                f"{path}: components names {', '.join(unknown)}, which no "
-                f"@uses_components method of {spec.name} declares",
-                code="model_components",
-                fields=unknown,
-            )
+    if uses := declared.model_components.get(parameter):
         doc["components"] = sorted(set(uses))
     if spec.sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
@@ -401,9 +347,9 @@ def model_slot(
     if spec.placeable:
         # TensorD names each one's GPU in a group's Load (`Binding.homes`).
         doc["placeable"] = sorted(spec.placeable)
-    if weights:
+    if slot.weights:
         doc["weights"] = True
-    if on_demand:
+    if parameter in declared.model_on_demand:
         doc["on_demand"] = True
     return doc
 
