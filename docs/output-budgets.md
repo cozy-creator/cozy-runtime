@@ -21,6 +21,4 @@ keeps its separate existing 256 MiB limit. Native storage admission still reserv
 capacity before writes.
 
 `Annotated[Tree, AssetBound(max_bytes=...)]` and its optional form have identical
-static and imported interfaces. Tree bounds cover total member bytes. Media and
-decoded-byte bounds belong on `tree.member(...)`, which checks each projected
-typed asset before a read or child forwarding can consume it.
+static and imported interfaces. Tree bounds cover total member bytes.

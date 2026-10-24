@@ -16,7 +16,6 @@ from typing import Annotated, Protocol, TypedDict, get_args
 
 import msgspec
 
-from cozy_runtime.author._assets import FileState
 from cozy_runtime.author._errors import CapabilityError, InvalidRequest
 
 MAX_CALL_INDEX = (1 << 32) - 1
@@ -120,14 +119,6 @@ class StageMemoStore(_Request, frozen=True, kw_only=True, tag="stage_memo_store"
     reason: str = ""
 
 
-class TreeMember(_Request, frozen=True, kw_only=True, tag="tree_member"):
-    tree: str
-    path: str
-    asset_kind: str
-    max_bytes: int
-    media_types: tuple[str, ...] = ()
-
-
 type _Tagged = (
     ChildEvents
     | ChildCall
@@ -136,7 +127,6 @@ type _Tagged = (
     | ChildForget
     | GpuRelease
     | ModelPrefetch
-    | TreeMember
     | Publish
     | CheckpointItem
     | StageMemoLookup
@@ -175,7 +165,7 @@ class CallProgress(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class ByteMetadata(TypedDict):
-    """Verified native byte metadata retained for forwarding and tree members."""
+    """Verified native byte metadata retained for forwarding."""
 
     kind: str
     digest: str
@@ -231,16 +221,6 @@ class Published(Answer, frozen=True, kw_only=True):
     digest: str = ""
     length: int = 0
     sequence: int = 0
-
-
-class Member(Answer, frozen=True, kw_only=True):
-    tree: str = ""
-    path: str = ""
-    digest: str = ""
-    length: int = 0
-    media_type: str = ""
-    local: str = ""
-    file_state: FileState | None = None
 
 
 class Exchange(Protocol):
