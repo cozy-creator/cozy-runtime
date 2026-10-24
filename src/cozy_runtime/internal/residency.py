@@ -266,16 +266,21 @@ class Model:
             self.memory._close(self)
 
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
-        selected = [
-            b
-            for b in self.groups()
-            if not b.path
-            or any(
-                not p or b.path == p or b.path.startswith(p + ".") or p.startswith(b.path + ".")
-                for p in paths
-            )
-        ]
-        return Binding(self, selected)
+        self._claim()
+        try:
+            self.memory._declare(self)
+            selected = [
+                b
+                for b in self.groups()
+                if not b.path
+                or any(
+                    not p or b.path == p or b.path.startswith(p + ".") or p.startswith(b.path + ".")
+                    for p in paths
+                )
+            ]
+            return Binding(self, selected)
+        finally:
+            self._release()
 
     def hold(
         self, shed: Callable[[], None] | None = None, *, free_only: bool = False
@@ -304,7 +309,7 @@ class Model:
                 for block in reversed(entered):
                     self.memory._exit(block)
                 raise
-            hold = Hold(self, entered, shed)
+            hold = Hold(self, entered, shed, free_only)
             self.holds.append(hold)
             return hold
         except BaseException:
@@ -328,8 +333,15 @@ class Model:
 
 
 class Hold:
-    def __init__(self, model: Model, groups: list[_Block], shed: Callable[[], None] | None) -> None:
+    def __init__(
+        self,
+        model: Model,
+        groups: list[_Block],
+        shed: Callable[[], None] | None,
+        reclaimable: bool,
+    ) -> None:
         self.model, self.groups, self.on_shed = model, groups, shed
+        self.reclaimable = reclaimable
         self.active = True
 
     def release(self) -> None:
@@ -400,24 +412,32 @@ class Binding:
             try:
                 if not self.valid():
                     raise StaleBinding("graph weight storage or fill changed")
+                request = _REQUEST.get()
+                if request is not None and request.idle and not self.resident():
+                    raise StaleBinding("idle graph preparation cannot page weights in")
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None:
                         stream.wait_event(self.last)
                     entered: list[_Block] = []
                     retained: list[tuple[_Block, int]] = []
+                    published = False
                     try:
+                        if not self.held:
+                            # Claim the complete dependency set before any preparation. Neither
+                            # another preparation nor a nested fill can evict its later blocks.
+                            with memory.lock:
+                                for block in self.groups:
+                                    block.retained += 1
+                                    retained.append((block, block.generation))
                         for block in self.groups:
                             memory._enter(block)
                             entered.append(block)
-                            if not self.held:
-                                with memory.lock:
-                                    block.retained += 1
-                                retained.append((block, block.generation))
                         if not self.held:
-                            self.held = retained
+                            self.held = [(block, block.generation) for block, _ in retained]
+                            published = True
                         yield self
                     except BaseException:
-                        if retained and self.held is not retained:
+                        if retained and not published:
                             with memory.lock:
                                 for block, _ in retained:
                                     block.retained -= 1
@@ -578,7 +598,10 @@ class Memory:
             for model in self.models.values():
                 for block in model.groups():
                     if block.data is not None and not (
-                        block.count or block.retained or block.loading
+                        block.count
+                        or block.retained
+                        or block.loading
+                        or (model.users and model.thread != threading.get_ident())
                     ):
                         if model.name in current:
                             warm += block.nbytes
@@ -655,7 +678,13 @@ class Memory:
 
     def _discard(self, block: _Block) -> int:
         with self.lock:
-            if block.count or block.retained or block.loading or block.data is None:
+            if (
+                block.count
+                or block.retained
+                or block.loading
+                or block.data is None
+                or (block.model.users and block.model.thread != threading.get_ident())
+            ):
                 return 0
             block.data = block.assigned = block.ready = None
             block.generation += 1
@@ -963,7 +992,24 @@ class Request:
         return self.memory.room(current)
 
     def reclaim(self, need: int = 0) -> int:
-        return 0 if self.idle else self.memory.reclaim(need, current=self.current)
+        """A known pure cut may shed the step's speculative whole-model hold.
+
+        Its currently executing block/common hooks retain their own uses. Explicit holds and
+        graph-owned storage stay pinned. This never retries a package or changes graph backing.
+        """
+        if self.idle or self.memory.capturing():
+            return 0
+        with self.memory.lock:
+            holds = [
+                hold
+                for model in self.memory.models.values()
+                if model.name in self.current and model.thread == threading.get_ident()
+                for hold in model.holds
+                if hold.reclaimable
+            ]
+        for hold in holds:
+            hold.shed()
+        return self.memory.reclaim(need, current=self.current)
 
     @contextmanager
     def on_thread(self) -> Iterator[Request]:
