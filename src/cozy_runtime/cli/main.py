@@ -18,6 +18,8 @@ BUILT = (
     "version",
 )
 PRIVATE = (
+    "machine-describe",
+    "frame-codec",
     "image-prepare",
     "image-preparation-profile",
     "python-interpreters",
@@ -266,6 +268,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if want_help or verb is None:
             print(HELP, end="")
             return int(Exit.ok)
+        # A machine's own exchanges (`cli/machine.py`): JSON in and out, no config read.
+        if verb in ("machine-describe", "frame-codec") and not args:
+            from cozy_runtime.cli import machine
+
+            return machine.describe() if verb == "machine-describe" else machine.frame_codec()
         config = read_config()
         emit(dispatch(verb, args, opts, config), opts)
         return int(Exit.ok)
