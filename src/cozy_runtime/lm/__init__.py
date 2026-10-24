@@ -1142,7 +1142,7 @@ class _Engine:
         self.stale = False
         #: seconds the last admission took: decoding gets as long before the next one
         self.debt = 0.0
-        #: its buffers' KV region (varena reclaims it between drives, never during one)
+        #: its buffers' KV owner, reclaimable between drives and pinned throughout each drive
         self.region: Any = None
         self.retire = False
         self.cache_device: Any = None
@@ -1221,60 +1221,61 @@ class _Engine:
     # ------------------------------------------------------------------ the loop
 
     def _drive(self, mine: _Request) -> None:
-        try:
-            with _PLANE, ExitStack() as stack:
-                # The KV region is pinned while this drive lasts, so no live row is lost; between
-                # drives the owner may release it, and then the buffers are made again.
+        with _PLANE, ExitStack() as lifetime:
+            try:
+                # The KV pin lasts through reholds and failure unwinding. Only weight
+                # bindings below may be replaced while this driver owns live rows.
                 if self.region is None and (placed := PLACED.get(self.model)) is not None:
                     self.region = placed[0].region(
                         f"lm:{type(self.model).__name__}", "kv", self.model, release=self._drop
                     )
-                if self.region is not None and stack.enter_context(self.region.pin()):
+                if self.region is not None and lifetime.enter_context(self.region.pin()):
                     self._drop()
-                held = self._hold(stack)
-                while True:
-                    if self.rehold:  # another head: its blocks are held instead
-                        stack.close()
-                        held, self.rehold = self._hold(stack), False
-                    if held is False and self.draft is not None and not self._occupied():
-                        # The head's weights and keys cost room the model's own decode set may
-                        # need: the graphed decode without drafts beats Transformers' loop.
-                        say(
-                            f"lm:{type(self.model).__name__}:undrafted",
-                            "[lm] drafting does not fit at home",
-                        )
-                        self.unfit.add(id(self.draft))
-                        self._drop()
-                        self.draft = None
-                        stack.close()
-                        held = self._hold(stack)
-                    with self.cond:
-                        self.incoming = list(self.pending)
-                        self.pending.clear()
-                    if held is False:
-                        if self._occupied():
-                            raise self.unprepared or RuntimeError("decode residency was lost")
-                        for request in self.incoming:
-                            request.fallback = "its decode set does not fit at home"
-                        self.incoming = []
-                    if self.incoming or self.retire:
-                        self._settle(self.incoming)
-                        self.incoming = []
-                    occupied = sum(row is not None for row in self.slots)
-                    with self.cond:
-                        if not occupied and not self.pending:
-                            break
-                        if mine.finished and (occupied or self.pending):
-                            break  # a waiting caller drives on
-                    if occupied:
-                        self._steps()
-        except BaseException as exc:  # post-start failures never restart package generation
-            self._fail(exc)
-            raise
-        finally:
-            with self.cond:
-                self.driver = None
-                self.cond.notify_all()
+                with ExitStack() as stack:
+                    held = self._hold(stack)
+                    while True:
+                        if self.rehold:  # another head: its blocks are held instead
+                            stack.close()
+                            held, self.rehold = self._hold(stack), False
+                        if held is False and self.draft is not None and not self._occupied():
+                            # The head's weights and keys cost room the model's own decode set may
+                            # need: the graphed decode without drafts beats Transformers' loop.
+                            say(
+                                f"lm:{type(self.model).__name__}:undrafted",
+                                "[lm] drafting does not fit at home",
+                            )
+                            self.unfit.add(id(self.draft))
+                            self._drop()
+                            self.draft = None
+                            stack.close()
+                            held = self._hold(stack)
+                        with self.cond:
+                            self.incoming = list(self.pending)
+                            self.pending.clear()
+                        if held is False:
+                            if self._occupied():
+                                raise self.unprepared or RuntimeError("decode residency was lost")
+                            for request in self.incoming:
+                                request.fallback = "its decode set does not fit at home"
+                            self.incoming = []
+                        if self.incoming or self.retire:
+                            self._settle(self.incoming)
+                            self.incoming = []
+                        occupied = sum(row is not None for row in self.slots)
+                        with self.cond:
+                            if not occupied and not self.pending:
+                                break
+                            if mine.finished and (occupied or self.pending):
+                                break  # a waiting caller drives on
+                        if occupied:
+                            self._steps()
+            except BaseException as exc:  # post-start failures never restart package generation
+                self._fail(exc)
+                raise
+            finally:
+                with self.cond:
+                    self.driver = None
+                    self.cond.notify_all()
 
     def _fail(self, exc: BaseException) -> None:
         """Every held and waiting call fails; no partially executed generation is restarted."""
@@ -1293,10 +1294,11 @@ class _Engine:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
     def _hold(self, stack: ExitStack) -> bool:
-        """Retain graph addresses, but lease their physical backing only while this driver runs.
+        """Prepare the retained weight tensors while this driver runs.
 
         A full decode that cannot prepare its dependencies refuses before model execution;
-        Transformers can then use Runtime's individual graph segments while streaming.
+        Transformers can then stream the blocks eagerly. The KV pin has a separate lifetime
+        so changing these bindings cannot make live decode rows reclaimable.
         """
         self.unprepared = None
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
@@ -1323,7 +1325,7 @@ class _Engine:
             stack.enter_context(leases.pop_all())
         return True
 
-    #: Immutable address/fill generations, not cached physical pins.
+    #: The retained bindings' fill generations and derived tensor addresses.
     where: tuple[object, ...] = ()
 
     def _cancelled(self) -> bool:
