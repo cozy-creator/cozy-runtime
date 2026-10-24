@@ -38,7 +38,12 @@ def main() -> None:
     )
     kernels: dict[str, tuple[str, ...]] = {
         "py3-none-any": (),
-        linux: ("_gemm.abi3.so", "_norm.abi3.so", *(("_fa3.abi3.so",) * (arch == "x86_64"))),
+        linux: (
+            "_gemm.abi3.so",
+            "_norm.abi3.so",
+            "_execution.abi3.so",
+            *(("_fa3.abi3.so",) * (arch == "x86_64")),
+        ),
     }
     if arch == "x86_64" and any(w.name.endswith(f"-{WINDOWS}.whl") for w in wheels):
         kernels[WINDOWS] = ("_gemm.pyd", "_norm.pyd")

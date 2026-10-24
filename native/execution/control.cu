@@ -4,6 +4,22 @@
 #include <new>
 #include <vector>
 
+template<class Body> static int on_device(int device, Body body) {
+    int previous = 0;
+    auto selected = cudaGetDevice(&previous);
+    if (selected != cudaSuccess) return selected;
+    if (previous != device) {
+        selected = cudaSetDevice(device);
+        if (selected != cudaSuccess) return selected;
+    }
+    int result;
+    try { result = body(); }
+    catch (const std::bad_alloc &) { result = cudaErrorMemoryAllocation; }
+    catch (...) { result = cudaErrorUnknown; }
+    const auto restored = previous == device ? cudaSuccess : cudaSetDevice(previous);
+    return result == cudaSuccess ? restored : result;
+}
+
 struct Control { unsigned completed; unsigned cancel; };
 struct Snapshot { unsigned completed; unsigned cancel; };
 struct Repeat {
@@ -15,6 +31,7 @@ struct Repeat {
     cudaStream_t work = nullptr;
     cudaStream_t control_stream = nullptr;
     cudaEvent_t done = nullptr;
+    cudaEvent_t initialized = nullptr;
     cudaEvent_t sampled = nullptr;
     Control *control = nullptr;
     Snapshot *device_snapshot = nullptr;
@@ -86,6 +103,8 @@ static cudaError_t cleanup(Repeat *run) {
     run->host_snapshot = nullptr;
     if (run->done && (error = cudaEventDestroy(run->done)) != cudaSuccess) return error;
     run->done = nullptr;
+    if (run->initialized && (error = cudaEventDestroy(run->initialized)) != cudaSuccess) return error;
+    run->initialized = nullptr;
     if (run->sampled && (error = cudaEventDestroy(run->sampled)) != cudaSuccess) return error;
     run->sampled = nullptr;
     if (run->work && (error = cudaStreamDestroy(run->work)) != cudaSuccess) return error;
@@ -95,12 +114,10 @@ static cudaError_t cleanup(Repeat *run) {
     return cudaSuccess;
 }
 
-extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
-                                  unsigned steps, Repeat **out) {
+static int create(uintptr_t source, uintptr_t index, int device, unsigned steps, Repeat **out) {
     *out = nullptr;
     if (!source || !index || !steps) return cudaErrorInvalidValue;
-    auto error = cudaSetDevice(device);
-    if (error != cudaSuccess) return error;
+    cudaError_t error;
     auto run = new (std::nothrow) Repeat;
     if (!run) return cudaErrorMemoryAllocation;
     run->device = device; run->steps = steps; run->index = reinterpret_cast<int64_t *>(index);
@@ -113,12 +130,11 @@ extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
     CHECK(cudaStreamCreateWithFlags(&run->work, cudaStreamNonBlocking));
     CHECK(cudaStreamCreateWithFlags(&run->control_stream, cudaStreamNonBlocking));
     CHECK(cudaEventCreateWithFlags(&run->done, cudaEventDisableTiming));
+    CHECK(cudaEventCreateWithFlags(&run->initialized, cudaEventDisableTiming));
     CHECK(cudaEventCreateWithFlags(&run->sampled, cudaEventDisableTiming));
     CHECK(cudaMalloc(&run->control, sizeof(Control)));
     CHECK(cudaMalloc(&run->device_snapshot, sizeof(Snapshot)));
     CHECK(cudaMallocHost(&run->host_snapshot, sizeof(Snapshot)));
-    CHECK(cudaMemset(run->control, 0, sizeof(Control)));
-    CHECK(cudaMemset(run->index, 0, sizeof(int64_t)));
     CHECK(cudaGraphCreate(&run->graph, 0));
     cudaGraphConditionalHandle condition;
     CHECK(cudaGraphConditionalHandleCreate(&condition, run->graph, 1, cudaGraphCondAssignDefault));
@@ -145,24 +161,48 @@ extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
 #undef CHECK
 }
 
-extern "C" int cozy_repeat_launch(Repeat *run, uintptr_t producer) {
-    auto error = cudaSetDevice(run->device);
-    if (error != cudaSuccess) return error;
-    if (run->launched) return cudaErrorInvalidValue;
+extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
+                                  unsigned steps, Repeat **out) {
+    *out = nullptr;
+    return on_device(device, [&] { return create(source, index, device, steps, out); });
+}
+
+static int launch(Repeat *run, uintptr_t producer) {
+    cudaError_t error;
+    if (run->launched) {
+        error = cudaEventQuery(run->done); if (error != cudaSuccess) return error;
+        error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
+    }
     // The source inputs are ready before this graph; no cross-stream implicit default ordering.
     error = cudaEventRecord(run->done, reinterpret_cast<cudaStream_t>(producer));
     if (error != cudaSuccess) return error;
     error = cudaStreamWaitEvent(run->work, run->done, 0);
     if (error != cudaSuccess) return error;
+    error = cudaMemsetAsync(run->control, 0, sizeof(Control), run->work);
+    if (error != cudaSuccess) return error;
+    error = cudaMemsetAsync(run->index, 0, sizeof(int64_t), run->work);
+    if (error != cudaSuccess) return error;
+    error = cudaEventRecord(run->initialized, run->work);
+    if (error != cudaSuccess) return error;
+    error = cudaStreamWaitEvent(run->control_stream, run->initialized, 0);
+    if (error != cudaSuccess) return error;
+    run->observed = {}; run->pending_sample = false;
     run->launched = true;
     error = cudaGraphLaunch(run->executable, run->work);
     if (error != cudaSuccess) return error;
     return cudaEventRecord(run->done, run->work);
 }
 
-extern "C" int cozy_repeat_poll(Repeat *run, unsigned *completed, unsigned *canceled, int *done) {
-    auto error = cudaSetDevice(run->device);
-    if (error != cudaSuccess) return error;
+static int ready(Repeat *run, int *done) {
+    cudaError_t error;
+    if (!run->launched) return cudaErrorInvalidValue;
+    error = cudaEventQuery(run->done);
+    *done = error == cudaSuccess;
+    return error == cudaErrorNotReady ? cudaSuccess : error;
+}
+
+static int poll(Repeat *run, unsigned *completed, unsigned *canceled, int *done) {
+    cudaError_t error;
     if (!run->launched) return cudaErrorInvalidValue;
     auto finished = cudaEventQuery(run->done);
     if (finished != cudaSuccess && finished != cudaErrorNotReady) return finished;
@@ -180,37 +220,60 @@ extern "C" int cozy_repeat_poll(Repeat *run, unsigned *completed, unsigned *canc
         error = cudaEventRecord(run->sampled, run->control_stream); if (error != cudaSuccess) return error;
         run->pending_sample = true;
     }
-    *completed = run->observed.completed; *canceled = run->observed.cancel;
+    *completed = run->observed.completed;
+    *canceled = run->observed.cancel && run->observed.completed < run->steps;
     return cudaSuccess;
 }
 
-extern "C" int cozy_repeat_cancel(Repeat *run) {
-    auto error = cudaSetDevice(run->device);
-    if (error != cudaSuccess) return error;
+static int cancel(Repeat *run) {
     cancel_repeat<<<1, 1, 0, run->control_stream>>>(run->control);
     return cudaGetLastError();
 }
 
-extern "C" int cozy_repeat_wait(Repeat *run, unsigned *completed, unsigned *canceled) {
-    auto error = cudaSetDevice(run->device);
-    if (error != cudaSuccess) return error;
+static int wait(Repeat *run, unsigned *completed, unsigned *canceled) {
+    cudaError_t error;
     if (!run->launched) return cudaErrorInvalidValue;
     error = cudaEventSynchronize(run->done); if (error != cudaSuccess) return error;
     error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
     Control state;
     error = cudaMemcpy(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost);
     if (error != cudaSuccess) return error;
-    *completed = state.completed; *canceled = state.cancel;
+    *completed = state.completed; *canceled = state.cancel && state.completed < run->steps;
     return cudaSuccess;
 }
 
 extern "C" unsigned cozy_repeat_nodes(Repeat *run) { return run->nodes; }
 
+static int destroy(Repeat *run) {
+    if (!run) return cudaSuccess;
+    cudaError_t error;
+    if (run->launched) {
+        cancel_repeat<<<1, 1, 0, run->control_stream>>>(run->control);
+        error = cudaGetLastError(); if (error != cudaSuccess) return error;
+    }
+    error = cleanup(run);
+    if (error == cudaSuccess) run->launched = false;
+    return error;
+}
+
+extern "C" int cozy_repeat_launch(Repeat *run, uintptr_t producer) {
+    return on_device(run->device, [&] { return launch(run, producer); });
+}
+extern "C" int cozy_repeat_ready(Repeat *run, int *done) {
+    return on_device(run->device, [&] { return ready(run, done); });
+}
+extern "C" int cozy_repeat_poll(Repeat *run, unsigned *completed, unsigned *canceled, int *done) {
+    return on_device(run->device, [&] { return poll(run, completed, canceled, done); });
+}
+extern "C" int cozy_repeat_cancel(Repeat *run) {
+    return on_device(run->device, [&] { return cancel(run); });
+}
+extern "C" int cozy_repeat_wait(Repeat *run, unsigned *completed, unsigned *canceled) {
+    return on_device(run->device, [&] { return wait(run, completed, canceled); });
+}
 extern "C" int cozy_repeat_destroy(Repeat *run) {
     if (!run) return cudaSuccess;
-    auto error = cudaSetDevice(run->device);
-    if (error != cudaSuccess) return error;
-    error = cleanup(run);
-    if (error == cudaSuccess) delete run;
-    return error;
+    const int code = on_device(run->device, [&] { return destroy(run); });
+    if (code == cudaSuccess) delete run;
+    return code;
 }

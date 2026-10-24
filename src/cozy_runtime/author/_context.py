@@ -26,8 +26,8 @@ from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExce
 if TYPE_CHECKING:
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
-    from cozy_runtime.author._recipes import DeclaredRecipe
     from cozy_runtime.author._prepared import Execution, PreparedRepeat
+    from cozy_runtime.author._recipes import DeclaredRecipe
     from cozy_runtime.author._weights import Weights
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
 
@@ -199,7 +199,11 @@ class Context:
     def plan(self, *steps: str | Collection[str] | PreparedRepeat) -> Execution | None:
         """The models this call runs, in order, so GPU memory evicts and restores by them: each
         step a component name, or a set of names used together (`{"unet", "controlnet"}`).
-        Declare it before the first model runs; calling again replaces it. No sizes or times."""
+        Declare it before the first model runs; calling again replaces it. No sizes or times.
+
+        A single PreparedRepeat instead submits already prepared resident GPU work and returns
+        its Execution observer. It does not reinterpret ordinary component hints as code.
+        """
         from cozy_runtime.author._prepared import PreparedRepeat
 
         if len(steps) == 1 and isinstance(steps[0], PreparedRepeat):

@@ -42,7 +42,6 @@ from cozy_runtime.author._attention_scope import (
 )
 from cozy_runtime.author._calls import ChildCallError, PendingCall, invocable, prefetch
 from cozy_runtime.author._concurrent import concurrently
-from cozy_runtime.author._prepared import Execution, PreparedRepeat, Progress
 from cozy_runtime.author._context import (
     AdapterRef,
     Context,
@@ -148,6 +147,7 @@ from cozy_runtime.author._model import (
     uncaptured,
     uses_components,
 )
+from cozy_runtime.author._prepared import Execution, PreparedRepeat, Progress
 from cozy_runtime.author._recipes import (
     DerivationHook,
     EncodingRule,
@@ -245,6 +245,7 @@ __all__ = [
     "Egress",
     "EgressResponse",
     "EncodingRule",
+    "Execution",
     "FileAsset",
     "Fit",
     "Image",
@@ -279,8 +280,10 @@ __all__ = [
     "PendingCall",
     "Preflight",
     "PreflightViolation",
+    "PreparedRepeat",
     "PreparedRequest",
     "ProducerCall",
+    "Progress",
     "QuantizationPlan",
     "Recipe",
     "ReferenceImages",
@@ -331,9 +334,6 @@ __all__ = [
     "placeable",
     "prefetch",
     "prepare",
-    "PreparedRepeat",
-    "Execution",
-    "Progress",
     "publish_release",
     "register_adapter",
     "register_attention",
