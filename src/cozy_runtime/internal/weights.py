@@ -937,13 +937,6 @@ class Placement:
         entering = {name for name in components if name in self.models}
         self.release(keep=entering.union(*(s for s in self.steps if s & entering)))
         stream = self.torch.cuda.current_stream() if self.memory.cuda else None
-        for name in sorted(entering - self.holds.keys() - self.unheld):
-            shed = functools.partial(self.holds.pop, name, None)
-            hold = self.models[name].hold(shed, free_only=True)
-            if hold is None:
-                self.unheld.add(name)
-            else:
-                self.holds[name] = (hold, stream)
         with ExitStack() as passes:
             for name in sorted(entering):
                 # its decoded tensors stay while it runs; dropped while unused, binds decode again
@@ -952,6 +945,15 @@ class Placement:
                 if region is not None and passes.enter_context(region.pin()):
                     routes.forget()
                 passes.enter_context(self.models[name].passing(method))
+            # Held inside the passes: varena knows the request then, so the hold's fills are its
+            # (prefetched, and in its record), not unattributed binds one block at a time.
+            for name in sorted(entering - self.holds.keys() - self.unheld):
+                shed = functools.partial(self.holds.pop, name, None)
+                hold = self.models[name].hold(shed, free_only=True)
+                if hold is None:
+                    self.unheld.add(name)
+                else:
+                    self.holds[name] = (hold, stream)
             yield
 
     def release(self, keep: Collection[str] = ()) -> None:

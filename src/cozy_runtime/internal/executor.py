@@ -4911,15 +4911,16 @@ def serve(executor: Executor, channel: Channel) -> int:
     keeps reading: a call's commands run on the pool, and so does a process-wide one that must
     wait for calls in flight; one that need not runs here, where Start and Fork always ran."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
-    if executor.rank == 0:
-        work.follow(functools.partial(_tell, channel))
     # Runtime-owned workers (no attempt counts one as its own), none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call", initializer=own_thread)
     order = _Order()
     idle = False
     while True:
         if not idle and executor.started:
-            # After the device Start: a live thread in an import-only executor refuses its forks.
+            # After the device Start, as every thread of ours: a live thread in an import-only
+            # executor refuses its forks (each fresh executor then imports everything again).
+            if executor.rank == 0:
+                work.follow(functools.partial(_tell, channel))
             threading.Thread(
                 target=_idle, args=(executor, order), name="graphs-idle", daemon=True
             ).start()
