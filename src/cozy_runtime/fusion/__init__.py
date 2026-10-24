@@ -338,17 +338,19 @@ def _bf16_cuda(*tensors: Any) -> bool:
 def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     site: _Site = self._cozy_dit
     layout, launch = site.layout, site.switch.launch
+    if launch is None:
+        return self._cozy_eager(*args, **kwargs)
     bound = site.signature.bind(self, *args, **kwargs)
     bound.apply_defaults()
     arguments = bound.arguments
     x = arguments[layout.hidden_states]
-    if launch is None or not _bf16_cuda(x):
-        return super(type(self), self).forward(*args, **kwargs)
+    if not _bf16_cuda(x):
+        return self._cozy_eager(*args, **kwargs)
     rows = layout.modulation(self, arguments)
     if not _bf16_cuda(
         rows.scale_msa, rows.gate_msa, rows.scale_mlp, rows.gate_mlp, rows.shift_msa, rows.shift_mlp
     ):
-        return super(type(self), self).forward(*args, **kwargs)
+        return self._cozy_eager(*args, **kwargs)
     _, normed = _kernels.norm_modulate(
         launch,
         layout.entries.first,
@@ -473,7 +475,7 @@ def _parallel(
 def _head_norm_forward(self: Any, hidden_states: Any) -> Any:
     rope = self._cozy_rope
     if rope is None or hidden_states.dim() != 4 or not _bf16_cuda(hidden_states):
-        return super(type(self), self).forward(hidden_states)
+        return self._cozy_eager(hidden_states)
     launch, entry, tables = rope
     return _kernels.head_norm_rope(launch, entry, hidden_states, self.weight, self.eps, tables)
 
@@ -482,12 +484,18 @@ _FUSED: dict[tuple[type, str], type] = {}
 
 
 def _fused(cls: type, kind: str) -> type:
-    """The installed subclass of `cls`: same parameters, buffers and state-dict keys. A module
-    shared by two blocks is fused once."""
-    if cls in _FUSED.values():
+    """The installed subclass of `cls`: same parameters, buffers and state-dict keys. Its eager
+    forward is `cls.forward`, taken here, so a subclass made after it (graphs' region class) still
+    reaches it; `super(type(self), self)` there resolves to the fused forward again and recurses.
+    A class fused already, or a subclass of one, is returned as is: fusing twice changes nothing."""
+    if getattr(cls, "_cozy_fused", None) == kind:
         return cls
     if (cls, kind) not in _FUSED:
-        body: dict[str, Any] = {"__module__": __name__}
+        body: dict[str, Any] = {
+            "__module__": __name__,
+            "_cozy_fused": kind,
+            "_cozy_eager": cls.forward,
+        }
         if kind == "block":
             body["forward"] = _block_forward
         else:
@@ -526,6 +534,14 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
         if type(module) is layout.block
     ]
     if not blocks:
+        # Installed already (the blocks are fused, a graph region's subclass included): a no-op.
+        if any(
+            getattr(type(m), "_cozy_fused", None) == "block"
+            and getattr(vars(m).get("_cozy_dit"), "layout", None) == layout
+            for root in roots
+            for m in root.modules()
+        ):
+            return _identity(layout)
         _report(plan, {"applied": False, "reason": f"no {layout.block.__qualname__}"})
         return ""
     switch = _Switch()
