@@ -3,9 +3,10 @@
 Each follower has a framed JSON command socket and joins the group's distributed
 collectives. A failed run or lost follower breaks the group and terminates its
 remaining followers, allowing blocked collectives to unwind. Nothing here waits on a clock:
-every wait ends with the reply or the follower's death. A group forms only after every
-follower said it is ready; a follower that fails while GPU 0 is inside group init (which nothing
-can interrupt) ends GPU 0's process, so TensorD sees the exit at once.
+every wait ends with the reply or the follower's death, and one that blocks says which GPU it waits
+on. A group forms only after every follower said it is ready; a follower that fails while GPU 0 is
+inside group init (which nothing can interrupt) ends GPU 0's process, so TensorD sees the exit at
+once. torch's own deadlines (`NEVER`) never end a group.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from types import ModuleType
 from typing import Any, Protocol, TypedDict
 
@@ -43,6 +45,11 @@ NVLS_ENV = "NCCL_NVLS_ENABLE"
 SHORT = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED})
 #: Another GPU ended the collective this one waited in (`RankGroup.interrupt`).
 ENDED = "group_call_ended"
+#: Every group wait's deadline. torch has no "none": its store gives up after 5 min, group init and
+#: every collective after 10 (NCCL) or 30 (gloo), failing a healthy slow group. A group ends with
+#: its members instead: a follower's death or refusal (`RankGroup._break`), or a GPU fault TensorD
+#: sees. Longer than any run, and within what torch's clocks hold.
+NEVER = timedelta(days=36500)
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,10 +164,13 @@ def abortable(backend: str) -> None:
     """Before a process joins an NCCL group: an aborted collective raises in the thread that
     waits on it, and the process lives on to form the group again (`RankGroup.interrupt`).
     torch's watchdog otherwise tears the process down on the error an abort leaves (its
-    default handling), and `_abort_process_group` asks for it off. Read when the
-    communicator is made, and this is its only switch."""
+    default handling), and `_abort_process_group` asks for it off. Its heartbeat monitor kills
+    the process after 8 min without a watchdog beat, a clock on a GPU that may be slow: off too.
+    Read when the communicator is made, and these are its only switches."""
     if "nccl" in backend:
-        update_environment({"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0"})
+        update_environment(
+            {"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0", "TORCH_NCCL_ENABLE_MONITORING": "0"}
+        )
 
 
 def route(nccl: Mapping[str, str]) -> None:
@@ -179,7 +189,9 @@ def ready_rank(torch: Any, spec: RankSpec, sealed: Mapping[str, str]) -> Any:
     require_nvls_off(sealed, spec.backend)
     abortable(spec.backend)
     route(spec.nccl)
-    return torch.distributed.TCPStore("127.0.0.1", spec.port, spec.world, is_master=False)
+    return torch.distributed.TCPStore(
+        "127.0.0.1", spec.port, spec.world, is_master=False, timeout=NEVER
+    )
 
 
 def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
@@ -192,6 +204,7 @@ def form_rank(torch: Any, spec: RankSpec, store: Any) -> Any:
         rank=spec.rank,
         world_size=spec.world,
         device_id=_device(torch, spec.backend),
+        timeout=NEVER,
     )
     dist.barrier()
     warm(torch, spec.backend, spec.rank, spec.world)
@@ -253,6 +266,7 @@ class RankGroup:
         forward: Callable[[dict[str, object]], None] | None = None,
         launch: Callable[[list[str], int], ChildProcess] | None = None,
         devices: Iterable[str] = (),
+        waiting: Callable[[str], None] = lambda what: None,
     ) -> None:
         if degree < 2:
             raise ValueError("a rank group is degree >= 2; degree 1 is a plain executor")
@@ -265,6 +279,8 @@ class RankGroup:
         #: where a follower's progress frame goes: rank 0's own seam, so the worker keeps
         #: reading movement while rank 0 waits on its followers
         self.forward = forward
+        #: told what rank 0 waits on as it starts to block: the call's stage, for people
+        self.waiting = waiting
         #: how a follower's program is started: the trampoline's `inherit` backend under
         #: rank 0's own environment, or the suite's launcher for the gloo arms
         self._launch = launch or self._spawn_follower
@@ -482,7 +498,7 @@ class RankGroup:
             dist.destroy_process_group()
         self.pg, self.formed = None, False
         self.store = dist.TCPStore(
-            "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False
+            "127.0.0.1", 0, self.degree, is_master=True, wait_for_workers=False, timeout=NEVER
         )
         self.port = int(self.store.port)
         join = {"cmd": "join", "port": self.port, "backend": self.backend, "nccl": self.nccl}
@@ -504,12 +520,14 @@ class RankGroup:
         self.initializing = True
         try:
             self.broadcast({"cmd": "form", "calibrate": formed is not None})
+            self.waiting(f"forming the group: {self.gpu(0)} and {len(self.followers)} more in init")
             dist.init_process_group(
                 self.backend,
                 store=self.store,
                 rank=0,
                 world_size=self.degree,
                 device_id=_device(torch, self.backend),
+                timeout=NEVER,
             )
             self.pg = dist.group.WORLD
         finally:
@@ -553,10 +571,11 @@ class RankGroup:
         sends."""
         self.broadcast({**command, "ledgers": 0})
 
-    def collect(self, name: str) -> list[dict[str, Any]]:
+    def collect(self, name: str, shown: bool = True) -> list[dict[str, Any]]:
         """One reply named `name` from every follower, in rank order. Each wait ends with the
-        reply or the follower's death, observed through its seam, never inferred from silence."""
-        return [self._reply(follower, name) for follower in self.followers]
+        reply or the follower's death, observed through its seam, never inferred from silence.
+        A call's replies follow its collectives every step, so those waits are not `shown`."""
+        return [self._reply(follower, name, shown) for follower in self.followers]
 
     def call_one(self, rank: int, command: Mapping[str, object]) -> dict[str, Any]:
         """One command to ONE follower and its reply: a hosted component's call."""
@@ -568,6 +587,10 @@ class RankGroup:
     def hold(self, ranks: Iterable[int]) -> Iterator[None]:
         """Wait until every rank in `ranks` is free, then keep them until the block ends."""
         wanted = frozenset(ranks)
+        with self._leases:
+            busy = wanted & self._busy
+        if busy:  # told outside the lock; the wait below reads it again
+            self.waiting(f"waiting for {', '.join(map(self.gpu, sorted(busy)))}: another call")
         with self._leases:
             self._leases.wait_for(lambda: not wanted & self._busy)
             self._busy |= wanted
@@ -610,7 +633,9 @@ class RankGroup:
     def reply_one(self, rank: int, name: str) -> dict[str, Any]:
         return self._reply(self.followers[rank - 1], name)
 
-    def _reply(self, follower: Follower, name: str) -> dict[str, Any]:
+    def _reply(self, follower: Follower, name: str, shown: bool = True) -> dict[str, Any]:
+        if shown and follower.replies.empty():
+            self.waiting(f"waiting on {follower.gpu}: {name}")
         frame = follower.replies.get()
         if frame is None:
             raise GroupRefusal(f"{self.verdict()} during {name!r}", code="group_broken")
@@ -651,7 +676,8 @@ class RankGroup:
 
     def close(self) -> None:
         """Teardown of THIS group only, idempotent. The cgroup is the authority: followers
-        are told to leave, then killed; the worker proves their absence."""
+        are told to leave, then killed; the worker proves their absence. A killed follower is
+        reaped by its own thread, so one stuck in the kernel (D state) never holds the teardown."""
         pg, self.pg = self.pg, None
         for follower in self.followers:
             with contextlib.suppress(SeamError, OSError):
@@ -660,8 +686,7 @@ class RankGroup:
             with contextlib.suppress(ProcessLookupError, OSError):
                 if follower.exit_status() is None:
                     follower.process.send_signal(signal.SIGKILL)
-            with contextlib.suppress(OSError):
-                follower.process.wait()
+            threading.Thread(target=_reap, args=(follower.process,), daemon=True).start()
             follower.channel.close()
             if follower.abort is not None:
                 follower.abort.close()
@@ -670,3 +695,8 @@ class RankGroup:
                 importlib.import_module("torch.distributed").destroy_process_group()
         self.store = None
         self.formed = False
+
+
+def _reap(process: ChildProcess) -> None:
+    with contextlib.suppress(OSError):
+        process.wait()

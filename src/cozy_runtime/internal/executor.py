@@ -1214,8 +1214,12 @@ class Executor:
         """A follower's collectives end when rank 0 says so (`RankGroup.interrupt`): its main
         thread may be inside one, where no command reaches it."""
         with watcher:
-            while watcher.recv(1):
-                abort_process_group()
+            try:
+                while watcher.recv(1):
+                    abort_process_group()
+                    self._interrupted.set()
+            finally:
+                # Ended (rank 0 closed it, or the abort raised): a join waiting on it goes on.
                 self._interrupted.set()
 
     def _group_reform(self) -> None:
@@ -1680,6 +1684,7 @@ class Executor:
                         forward=self.channel.send,
                         devices=_sealed_entries(),
                         launch=self._follower,
+                        waiting=functools.partial(_waiting, self.channel),
                     )
                 if not self.group.followers:
                     self.group.spawn()
@@ -1753,7 +1758,11 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only:
-                    measured = links.measured(links.directory(_SEALED), _sealed_entries()[:degree])
+                    measured = links.measured(
+                        links.directory(_SEALED),
+                        _sealed_entries()[:degree],
+                        functools.partial(_waiting, self.channel),
+                    )
                     stage("group_links")
                     self.transport = links.Transport(
                         degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured

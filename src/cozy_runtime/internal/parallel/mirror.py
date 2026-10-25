@@ -97,7 +97,9 @@ def mirror_component(
                         ended.append((0, code or ENDED, f"{type(exc).__name__}: {exc}"))
                         group.interrupt()  # the followers wait on GPU 0 in a collective
                     try:
-                        frames = list(zip(group.followers, group.collect("run"), strict=True))
+                        frames = list(
+                            zip(group.followers, group.collect("run", shown=False), strict=True)
+                        )
                     except GroupRefusal as lost:
                         if failure is None:
                             raise
