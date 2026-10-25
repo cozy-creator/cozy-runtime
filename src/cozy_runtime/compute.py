@@ -21,6 +21,27 @@ if TYPE_CHECKING:
     from cozy_runtime.author._context import Context
 
 
+def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
+    """Built-in forward SDPA is tagged seeded even when its dropout is a fixed zero."""
+    schema = func._schema
+    if schema.overload_name or schema.name not in (
+        "aten::scaled_dot_product_attention",
+        "aten::_scaled_dot_product_attention_math",
+        "aten::_scaled_dot_product_flash_attention",
+        "aten::_scaled_dot_product_efficient_attention",
+        "aten::_scaled_dot_product_cudnn_attention",
+    ):
+        return False
+    # Flash, efficient/cuDNN and public/math schemas put dropout at different positions.
+    for position, argument in enumerate(schema.arguments):
+        if argument.name == "dropout_p":
+            value = kwargs.get(
+                "dropout_p", args[position] if position < len(args) else argument.default_value
+            )
+            return type(value) in (int, float) and value == 0
+    return False
+
+
 def _native_error(error: Exception) -> NoReturn:
     import torch
 
@@ -316,7 +337,9 @@ class PreparedRepeat:
             def __torch_dispatch__(
                 self, func: Any, types: Any, args: Any = (), kwargs: Any = None
             ) -> Any:
-                if torch.Tag.nondeterministic_seeded in func.tags:
+                if torch.Tag.nondeterministic_seeded in func.tags and not _zero_dropout_attention(
+                    func, args, kwargs or {}
+                ):
                     raise RuntimeError(
                         "GPU-driven repeats require explicit noise/RNG tensor inputs"
                     )
