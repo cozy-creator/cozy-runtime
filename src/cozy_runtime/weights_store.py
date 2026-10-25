@@ -354,19 +354,25 @@ class Output:
             raise CapabilityError(
                 "calibrated conversion needs a checkpoint", code="quantization_plan"
             )
-        identity = hashlib.sha256(
-            canonical_json.encode(
-                {
-                    "source": source.id,
-                    "calibration": None if calibration is None else calibration.id,
-                    "selection": list(tensors),
-                    "implementation": raw.quantization_implementation(),
-                    "max_relative_frobenius": max_relative_frobenius,
-                    # Finished reuse is scoped; the native journal binds the full plan.
-                    "component": component,
-                }
-            )
-        ).hexdigest()
+
+        implementation = raw.quantization_implementation()
+
+        def accepted_identity(scope: str | None) -> str:
+            return hashlib.sha256(
+                canonical_json.encode(
+                    {
+                        "source": source.id,
+                        "calibration": None if calibration is None else calibration.id,
+                        "selection": list(tensors),
+                        "implementation": implementation,
+                        "max_relative_frobenius": max_relative_frobenius,
+                        # Finished reuse is scoped; the native journal binds the full plan.
+                        "component": scope,
+                    }
+                )
+            ).hexdigest()
+
+        identity = accepted_identity(component)
         if self.done is not None:
             if identity not in self.done.metadata.get("native_quantization", []):
                 raise CapabilityError(
@@ -423,10 +429,21 @@ class Output:
                 control=control,
                 max_relative_frobenius=max_relative_frobenius,
             )
-            # Only successful native completion admits finished-output reuse.
+            # Native success matched the journal's full immutable plan, including quality.
+            # First binding also refuses selected entries written without that identity.
+            # Recover scopes completed before an interruption: has() names journal entries,
+            # never inherited base tensors, and is only the completeness check here.
+            complete: dict[str | None, bool] = {None: True}
+            for row in tensors:
+                present = writer.has(row["component"], row["key"])
+                complete[None] &= present
+                name = row["component"]
+                complete[name] = complete.get(name, True) and present
             identities = cast("list[str]", writer.metadata.setdefault("native_quantization", []))
-            if identity not in identities:
-                identities.append(identity)
+            for scope, completed in complete.items():
+                if completed and (accepted := accepted_identity(scope)) not in identities:
+                    identities.append(accepted)
+            identities.sort()
             return result
 
         return convert, len(pending)
