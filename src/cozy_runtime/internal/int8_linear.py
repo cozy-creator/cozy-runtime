@@ -5,7 +5,8 @@ token in one kernel, then runs an int8 GEMM whose epilogue applies both scales a
 wgmma on Hopper, tcgen05 on datacenter Blackwell, mma.sync on every other card, and a single GEMV
 launch for up to 4 rows. Its leaf hands it bound weights (`kernels.readable`). It serves once
 it passes its probe on the card (`verify`); where it does not, a leaf serves through
-comfy-kitchen's reviewed binary, else eagerly on torch's int8 GEMM, and every run says so once.
+comfy-kitchen's reviewed binary once that passes its own probe, else eagerly on torch's int8
+GEMM, and every run says so once. Each opens through `kernel_ready.serve`.
 
 `torch` is the torch module: this module imports no torch.
 """
@@ -20,7 +21,6 @@ from functools import partial
 from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
-from typing import cast
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import WARNINGS, Building
@@ -33,6 +33,7 @@ from cozy_runtime.internal import (
     kernel_sources,
     prebuilt,
     tools,
+    verify,
 )
 from cozy_runtime.internal.encoding.formats import CONVROT_GROUP, Tensor, hadamard256
 
@@ -53,6 +54,7 @@ _LIBS: dict[int, prebuilt.Prebuilt] = {}
 #: Device index -> the loaded op, and the activation dtypes it takes: every call reads these.
 _OPS: dict[int, Op] = {}
 _HALF: list[object] = []
+_SM: dict[int, int] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,9 +107,9 @@ def _store() -> kernel_cache.Store:
     return store
 
 
-def _kitchen_tree(sm: int, wait: bool) -> Path | None:
-    """comfy-kitchen's reviewed wheel unpacked for this card (`kernel_sources`), None while the
-    machine's compile manager places it and `wait` is not set."""
+def _kitchen_tree(sm: int, wait: bool) -> tuple[Path, str] | None:
+    """comfy-kitchen's reviewed wheel unpacked for this card (`kernel_sources`) and its build's
+    key, None while the machine's compile manager places it and `wait` is not set."""
     try:
         job = kernel_sources.job(ARTIFACT, sm)
     except kernel_sources.Absent as exc:
@@ -119,16 +121,18 @@ def _kitchen_tree(sm: int, wait: bool) -> Path | None:
         return None
     if built.state != "ready":
         raise kernel_sources.Absent(f"{ARTIFACT} sm{sm}: {built.line()}")
-    return Path(built.path) / kernel_cache.SITE
+    return Path(built.path) / kernel_cache.SITE, job.key.digest
 
 
 def native(torch: ModuleType, index: int) -> Op | None:
     """The prebuilt 8-bit op's int8 linear on this card, once it verifies here (`prebuilt`), off
-    any request thread; None until then, and for good where it does not, said once."""
+    any request thread; None until then, and for good where it does not, said once. Raises
+    `Building` while a graph records before it serves (`kernel_ready.serve`)."""
     op = _OPS.get(index)
-    if op is not None or torch.cuda.is_current_stream_capturing():  # an open ends a recording
+    if op is not None:
         return op
-    ops = kernel_ready.ready(f"{NATIVE} cuda:{index}", partial(_library, torch, index))
+    capturing = torch.cuda.is_current_stream_capturing()
+    ops = kernel_ready.serve(f"{NATIVE} cuda:{index}", partial(_library, torch, index), capturing)
     if ops is not None:  # it serves this card from here on
         _HALF[:] = (torch.bfloat16, torch.float16)
         _LIBS[index] = ops
@@ -138,26 +142,27 @@ def native(torch: ModuleType, index: int) -> Op | None:
 
 def _library(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
     """`native`'s opener: the library once each format it serves passes its probe here."""
-    sm = _sm(torch, index)
+    sm = capability(torch, index)
     ops, detail = prebuilt.library(torch, index, sm)
     if ops is None:
-        print(f"[int8] no {NATIVE} for this executor: {detail}"[:400], file=sys.stderr)
+        print(f"[kernels] {NATIVE} refused on sm{sm}: {detail}"[:400], file=sys.stderr)
         raise kernel_sources.Absent(detail)
-    print(f"[int8] prebuilt kernels verified on sm{sm}: {detail}", file=sys.stderr)
+    print(f"[kernels] {NATIVE} verified on sm{sm}: {detail}"[:400], file=sys.stderr)
     return ops
 
 
 def kitchen(torch: ModuleType, index: int) -> ModuleType | None:
-    """`comfy_kitchen`'s CUDA backend on this card, or None while its build runs (it starts on
-    the first ask) and for good when this card or machine cannot have it."""
-    if torch.cuda.is_current_stream_capturing():  # an open would end the graph being recorded
-        return cast("ModuleType | None", kernel_ready.ready(f"{KITCHEN} cuda:{index}"))
-    return kernel_ready.ready(f"{KITCHEN} cuda:{index}", partial(_kitchen, torch, index))
+    """`comfy_kitchen`'s CUDA backend on this card once its int8 GEMM passes its probe here, or
+    None while its build runs (it starts on the first ask) and for good when this card or
+    machine cannot have it (`kernel_ready.serve`)."""
+    capturing = torch.cuda.is_current_stream_capturing()
+    return kernel_ready.serve(f"{KITCHEN} cuda:{index}", partial(_kitchen, torch, index), capturing)
 
 
-def _kitchen(torch: ModuleType, index: int, wait: bool) -> ModuleType | None:
-    """`kitchen`'s opener: the backend imported, its build waited for when `wait`; said once."""
-    sm = _sm(torch, index)
+def kitchen_module(torch: ModuleType, index: int, wait: bool) -> tuple[ModuleType, str] | None:
+    """comfy-kitchen's CUDA backend imported and what identifies its bytes, its build waited
+    for when `wait`: the start of each of its GEMMs' openers."""
+    sm = capability(torch, index)
     try:
         if not arch.row(sm).family:
             raise kernel_sources.Absent(f"comfy-kitchen carries no device code for sm{sm}")
@@ -169,19 +174,53 @@ def _kitchen(torch: ModuleType, index: int, wait: bool) -> ModuleType | None:
             tree = _kitchen_tree(sm, wait)
             if tree is None:
                 return None
-            site.addsitedir(str(tree))
-        module = import_module("comfy_kitchen.backends.cuda")
+            site.addsitedir(str(tree[0]))
+            origin = tree[1]
+        return import_module("comfy_kitchen.backends.cuda"), origin
     except Exception as exc:  # the next path serves this process
-        print(f"[int8] no {KITCHEN} for this executor: {type(exc).__name__}: {exc}"[:400],
+        print(f"[kernels] no {ARTIFACT} on sm{sm}: {type(exc).__name__}: {exc}"[:400],
               file=sys.stderr)  # fmt: skip
         raise
-    print(f"[int8] {KITCHEN} serves sm{sm}", file=sys.stderr)
-    return module
 
 
-def _sm(torch: ModuleType, index: int) -> int:
-    major, minor = torch.cuda.get_device_capability(index)
-    return int(major * 10 + minor)
+def _kitchen(torch: ModuleType, index: int, wait: bool) -> ModuleType | None:
+    """`kitchen`'s opener: the backend, once its int8 GEMM agrees with the exact law here."""
+    found = kitchen_module(torch, index, wait)
+    if found is None:
+        return None
+    module, artifact = found
+    sm, probe = capability(torch, index), partial(_probe_kitchen, torch, index)
+    return kernel_ready.verified(module, "comfy-kitchen-int8", artifact, sm, probe)
+
+
+def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.Verdict:
+    """comfy-kitchen's int8.convrot linear against the exact law in float64 (`prebuilt.law`):
+    bf16 and fp16, a few rows and a GEMM's, a ragged N."""
+    device = torch.device("cuda", index)
+    generator = torch.Generator(device=device).manual_seed(20261025)
+    out_features, width = 520, 1024
+    data = torch.randint(-127, 128, (out_features, width), generator=generator, device=device,
+                         dtype=torch.int8)  # fmt: skip
+    scale = torch.rand(out_features, generator=generator, device=device).add_(0.5).mul_(1e-3)
+    errors: dict[str, float] = {}
+    for name, dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
+        bias = torch.randn(out_features, generator=generator, device=device).to(dtype)
+        for m in (3, 300):
+            x = torch.randn(m, width, generator=generator, device=device).to(dtype)
+            got = module.int8_linear(
+                x, data, scale, bias, dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
+            )
+            want = prebuilt.law(torch, prebuilt.INT8, x.double(), data, scale, bias)
+            errors[f"{name} M={m}"] = verify.error(torch, got, want)
+    return verify.within(errors, prebuilt.BUDGET)
+
+
+def capability(torch: ModuleType, index: int) -> int:
+    """cuda:`index`'s compute capability, e.g. 89."""
+    if index not in _SM:
+        major, minor = torch.cuda.get_device_capability(index)
+        _SM[index] = int(major * 10 + minor)
+    return _SM[index]
 
 
 def kitchen_serves(index: int) -> bool:
@@ -204,14 +243,12 @@ def linear(
         if op is not None and x.dtype in _HALF:
             return op(x, data, scale, bias, out_dtype)
         if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
+            # While a graph records, both raise `Building` until they serve: comfy-kitchen's GEMM
+            # ends a capture (run 10264) and a recording of the eager law replays 5x slower than
+            # kitchen as written (run 10287).
             op = native(torch, index)
             if op is not None:
                 return op(x, data, scale, bias, out_dtype)
-            if torch.cuda.is_current_stream_capturing() and not unserved(index):
-                # comfy-kitchen's GEMM ends a capture (run 10264) and a recording of the eager law
-                # replays 5x slower than kitchen as written (run 10287): record once the op lands.
-                # An op refused for good never lands: the component runs as written.
-                raise Building(OP)
             module = kitchen(torch, index)
             if module is not None:
                 return module.int8_linear(
@@ -230,11 +267,6 @@ def serving(index: int) -> str:
     if _OPS.get(index) is not None:
         return OP
     return ARTIFACT if kitchen_serves(index) else EAGER
-
-
-def unserved(index: int) -> bool:
-    """Whether the op failed to open on this card: it never serves this process."""
-    return kernel_ready.failed(f"{NATIVE} cuda:{index}") is not None
 
 
 def quantize(torch: ModuleType, x: Tensor) -> PreQuantized | None:
