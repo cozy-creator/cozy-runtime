@@ -18,7 +18,7 @@ import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -28,6 +28,9 @@ from tensorfs import raw
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import CapabilityError
+
+if TYPE_CHECKING:
+    from tensorfs.api import QuantizeTensor
 
 #: The store's location when the machine names none (TensorFS's default, owner D3).
 DEFAULT_HOME = "~/.cache/tensorfs"
@@ -327,6 +330,57 @@ class Output:
             writer.put_encoded(
                 key, dtype=dtype, shape=list(shape), scheme=scheme, parts=views, params=dict(params)
             )
+
+    def prepare_quantization(
+        self,
+        source: Checkpoint,
+        tensors: Sequence[QuantizeTensor],
+        *,
+        max_relative_frobenius: float | None,
+    ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
+        """Reserve this output's grant once, then return one owning native Writer call.
+
+        The derivation supplies the full immutable native selection; only missing entries
+        consume this attempt's logical new-byte grant. The caller must join before close.
+        """
+        if self.done is not None:
+            return lambda _: {
+                "encoded_keys": 0,
+                "reused_keys": len(tensors),
+                "source_bytes_read": 0,
+                "new_bytes_written": 0,
+                "saturated_elements": 0,
+                "worst_relative_frobenius": None,
+            }, 0
+        writer = self._writer
+        if writer is None:
+            raise CapabilityError("the output is closed", code="weights_writer_closed")
+        pending = [row for row in tensors if not self.has(row["component"], row["key"])]
+        required = 0
+        for row in pending:
+            rows, columns = row["shape"]
+            match row["encoding"]["scheme"]:
+                case "int8.convrot":
+                    required += rows * columns + rows * 4
+                case "nvfp4":
+                    required += rows * columns // 2 + rows * columns // 16 + 4
+                case _:
+                    raise CapabilityError("unsupported native quantizer", code="quantization_plan")
+        self._spend(required)
+        for component in dict.fromkeys(row["component"] for row in tensors):
+            self.component(component)
+
+        def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
+            return writer.quantize(
+                source,
+                tensors,
+                max_buffer_bytes=8 << 20,
+                max_new_bytes=required,
+                control=control,
+                max_relative_frobenius=max_relative_frobenius,
+            )
+
+        return convert, len(pending)
 
     def copy(
         self,

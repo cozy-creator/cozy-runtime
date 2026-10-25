@@ -394,7 +394,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.32.2"
+version = "0.32.3"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -451,8 +451,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", specifier = ">=0.15.1,<0.16" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.15.1,<0.16" },
+    { name = "tensorfs", specifier = ">=0.15.4,<0.16" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.15.4,<0.16" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.14" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.14" },
