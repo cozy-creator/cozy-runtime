@@ -328,11 +328,29 @@ class PreparedRepeat:
         held: dict[int, Any] = {id(t): t for t in tensors}
         landed = LANDED[0]
 
+        def probe(stage: str) -> None:
+            import sys
+
+            free, total = torch.cuda.mem_get_info(device)
+            print(
+                "[DEBUG-xs103-capture]",
+                stage,
+                {
+                    "free": free,
+                    "total": total,
+                    "allocated": torch.cuda.memory_allocated(device),
+                    "reserved": torch.cuda.memory_reserved(device),
+                },
+                file=sys.stderr,
+                flush=True,
+            )
+
         class CaptureOwners(TorchDispatchMode):  # type: ignore[misc]  # Torch is optional in checks.
             def __init__(self, retain: bool) -> None:
                 super().__init__()
                 self.retain = retain
                 self.produced: dict[int, Any] = {}
+                self.previous: str | None = None
 
             def __torch_dispatch__(
                 self, func: Any, types: Any, args: Any = (), kwargs: Any = None
@@ -351,7 +369,32 @@ class PreparedRepeat:
                         and (prior is None or prior() is not tensor)
                     ):
                         held[id(tensor)] = tensor
-                result = func(*args, **(kwargs or {}))
+                try:
+                    result = func(*args, **(kwargs or {}))
+                    if self.retain and not torch.cuda.is_current_stream_capturing():
+                        raise RuntimeError(f"capture became inactive after {func}")
+                except BaseException as error:
+                    import sys
+
+                    shapes = [
+                        (tuple(t.shape), str(t.dtype), str(t.device))
+                        for t in tree_leaves((args, kwargs or {}))
+                        if isinstance(t, torch.Tensor)
+                    ][:8]
+                    print(
+                        "[DEBUG-xs103-capture] operator failure",
+                        {
+                            "capture": self.retain,
+                            "operator": str(func),
+                            "previous": self.previous,
+                            "shapes": shapes,
+                            "error": repr(error),
+                        },
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    raise
+                self.previous = str(func)
                 for tensor in tree_leaves(result):
                     if isinstance(tensor, torch.Tensor):
                         self.produced[id(tensor)] = weakref.ref(tensor)
@@ -368,11 +411,13 @@ class PreparedRepeat:
             graph = torch.cuda.CUDAGraph(keep_graph=True)
             native = None
             try:
+                probe("before-warmup")
                 with torch.cuda.stream(stream), CaptureOwners(False):
                     step(index)  # instantiate library workspaces before capture
                     for target, original in zip(tensors, saved, strict=True):
                         target.copy_(original)
                 stream.synchronize()
+                probe("after-warmup-before-capture")
                 with varena.capture(device), torch.cuda.stream(stream), CaptureOwners(True):
                     graph.capture_begin(capture_error_mode="global")
                     try:
