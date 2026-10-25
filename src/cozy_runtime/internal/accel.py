@@ -668,7 +668,10 @@ def streams_idle(torch: Any, kind: str) -> bool:
     if kind == "cpu":
         return True
     if kind == "mps":
-        return bool(completion_event(torch, kind).query())
+        # Recording a new event after a drain adds work, so its immediate query can fail.
+        # These completion boundaries need the MPS queue fence, not a fresh poll marker.
+        synchronize(torch, kind)
+        return True
     return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
 
 
