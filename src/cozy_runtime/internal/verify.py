@@ -75,6 +75,24 @@ def within(errors: dict[str, float], budget: float) -> Verdict:
     return Verdict(errors[worst] <= budget, detail)
 
 
+#: How much more a kernel with its own rounding of a format may lose than that format's exact law.
+SLACK = 1.25
+
+
+def against_law(errors: dict[str, tuple[float, float]], slack: float = SLACK) -> Verdict:
+    """Each case's (kernel's, exact law's) relative L2 error against the unquantized product: a
+    kernel that rounds the format its own way may lose at most `slack` times what the law does.
+    Said with the worst ratio."""
+    if not errors:
+        return Verdict(False, "no case ran")
+    ratio = {case: got / max(law, 1e-30) for case, (got, law) in errors.items()}
+    worst = max(ratio, key=lambda case: ratio[case])
+    got, law = errors[worst]
+    detail = (f"rel L2 {got:.2e} at {worst}, {ratio[worst]:.2f}x the law's {law:.2e} "
+              f"(slack {slack:g}, {len(errors)} cases)")  # fmt: skip
+    return Verdict(ratio[worst] <= slack, detail)
+
+
 def verified(kernel: str, artifact: str, sm: int, probe: Callable[[], Verdict]) -> Verdict:
     """`kernel`'s verdict on this card for this process: probed now, unless a probe of it ended
     an earlier process of this Runtime build here. A probe that raises fails with its exception."""

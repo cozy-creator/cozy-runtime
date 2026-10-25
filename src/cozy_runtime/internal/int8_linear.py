@@ -194,15 +194,17 @@ def _kitchen(torch: ModuleType, index: int, wait: bool) -> ModuleType | None:
 
 
 def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.Verdict:
-    """comfy-kitchen's int8.convrot linear against the exact law in float64 (`prebuilt.law`):
-    bf16 and fp16, a few rows and a GEMM's, a ragged N."""
+    """comfy-kitchen's int8.convrot linear against the unquantized product in float64: it rounds
+    the activation its own way, so it may lose `verify.SLACK` times what the exact law does
+    (`prebuilt.law`). bf16 and fp16, a few rows and a GEMM's, a ragged N."""
     device = torch.device("cuda", index)
     generator = torch.Generator(device=device).manual_seed(20261025)
     out_features, width = 520, 1024
     data = torch.randint(-127, 128, (out_features, width), generator=generator, device=device,
                          dtype=torch.int8)  # fmt: skip
     scale = torch.rand(out_features, generator=generator, device=device).add_(0.5).mul_(1e-3)
-    errors: dict[str, float] = {}
+    weight = data.double() * scale.double()[:, None]
+    errors: dict[str, tuple[float, float]] = {}
     for name, dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
         bias = torch.randn(out_features, generator=generator, device=device).to(dtype)
         for m in (3, 300):
@@ -210,9 +212,11 @@ def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.
             got = module.int8_linear(
                 x, data, scale, bias, dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
             )
-            want = prebuilt.law(torch, prebuilt.INT8, x.double(), data, scale, bias)
-            errors[f"{name} M={m}"] = verify.error(torch, got, want)
-    return verify.within(errors, prebuilt.BUDGET)
+            law = prebuilt.law(torch, prebuilt.INT8, x.double(), data, scale, bias)
+            exact = x.double() @ weight.t() + bias.double()
+            case = f"{name} M={m}"
+            errors[case] = (verify.error(torch, got, exact), verify.error(torch, law, exact))
+    return verify.against_law(errors)
 
 
 def capability(torch: ModuleType, index: int) -> int:

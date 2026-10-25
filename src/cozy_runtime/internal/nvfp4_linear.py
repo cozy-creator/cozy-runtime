@@ -56,8 +56,6 @@ GEMV_N, GEMV_W = 64, 32
 DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
 #: comfy-kitchen's W4A4 by its `kernel_ready` name's head.
 KITCHEN = "comfy-kitchen nvfp4 W4A4"
-#: Its quantizer may lose at most this much more of an activation than the exact law does.
-QUANTIZER_SLACK = 1.25
 
 
 try:
@@ -459,14 +457,15 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
 
 def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.Verdict:
     """comfy-kitchen's W4A4 on this card: its GEMM against the exact (float64) product of the
-    operands it was handed, and its quantizer within `QUANTIZER_SLACK` of the exact law's own
-    loss (`svdq_linear.fake`), bf16 and fp16, rows not a multiple of 16."""
+    operands it was handed, and its quantizer, which rounds its own way, within `verify.SLACK` of
+    the exact law's loss (`svdq_linear.fake`). bf16 and fp16, rows not a multiple of 16."""
     device = torch.device("cuda", index)
     generator = torch.Generator(device=device).manual_seed(20261025)
     rows_out, cols = 264, 1024
     weight, linear, blocked, second = _probe_weight(torch, generator, device, rows_out, cols)
     exact = nvfp4_values(torch, weight, linear, second).double()
-    errors: dict[str, float] = {}
+    gemm: dict[str, float] = {}
+    quantizer: dict[str, tuple[float, float]] = {}
     for name, dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
         for m in (40, 300):
             x = torch.randn(m, cols, generator=generator, device=device).to(dtype)
@@ -477,12 +476,12 @@ def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.
             scales = from_blocked(torch, block.view(torch.uint8), int(payload.shape[0]), cols // 16)
             operand = nvfp4_values(torch, payload, scales.view(torch.float8_e4m3fn), tensor_scale)
             operand = operand[:m].double()
-            errors[f"{name} gemm M={m}"] = verify.error(torch, got, operand @ exact.t())
-            law = svdq_linear.fake(torch, x.float(), tensor_scale)
-            lost = verify.error(torch, operand, x) / verify.error(torch, law, x)
-            if not lost <= QUANTIZER_SLACK:
-                return verify.Verdict(False, f"its quantizer loses {lost:.2f}x the law's ({name})")
-    return verify.within(errors, prebuilt.BUDGET)
+            case, law = f"{name} M={m}", svdq_linear.fake(torch, x.float(), tensor_scale)
+            gemm[case] = verify.error(torch, got, operand @ exact.t())
+            quantizer[case] = (verify.error(torch, operand, x), verify.error(torch, law, x))
+    product, rounding = verify.within(gemm, prebuilt.BUDGET), verify.against_law(quantizer)
+    detail = f"GEMM {product.detail}; quantizer {rounding.detail}"
+    return verify.Verdict(product.ok and rounding.ok, detail)
 
 
 def serving(index: int) -> str:
