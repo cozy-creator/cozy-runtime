@@ -194,9 +194,10 @@ def _kitchen(torch: ModuleType, index: int, wait: bool) -> ModuleType | None:
 
 
 def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.Verdict:
-    """comfy-kitchen's int8.convrot linear against the unquantized product in float64: it rounds
-    the activation its own way, so it may lose `verify.SLACK` times what the exact law does
-    (`prebuilt.law`). bf16 and fp16, a few rows and a GEMM's, a ragged N."""
+    """comfy-kitchen's int8.convrot linear against the unquantized product in float64 (the
+    rotated rows times the stored rotated weight): it rounds the activation its own way, so it
+    may lose `verify.SLACK` times what the exact law does (`prebuilt.law`). bf16 and fp16, a few
+    rows and a GEMM's, a ragged N."""
     device = torch.device("cuda", index)
     generator = torch.Generator(device=device).manual_seed(20261025)
     out_features, width = 520, 1024
@@ -213,7 +214,7 @@ def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.
                 x, data, scale, bias, dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
             )
             law = prebuilt.law(torch, prebuilt.INT8, x.double(), data, scale, bias)
-            exact = x.double() @ weight.t() + bias.double()
+            exact = hadamard256(torch, x.double()) / 16 @ weight.t() + bias.double()
             case = f"{name} M={m}"
             errors[case] = (verify.error(torch, got, exact), verify.error(torch, law, exact))
     return verify.against_law(errors)
