@@ -1378,6 +1378,10 @@ class Memory:
             # Only the failed allocation is retried. No read, fill transform or forward ran.
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
+    def _active_beside(self, request: Request | None) -> bool:
+        """Live request concurrency; the caller holds lock across its policy decision."""
+        return any(other is not request and not other.idle for other in self.requests)
+
     def _native_region(
         self, block: _Block, *, final: bool = False, speculative: bool = False
     ) -> Any:
@@ -1408,13 +1412,16 @@ class Memory:
                     self.phase_supported
                     and wanted > free
                     and not self.capturing()
-                    and not (request is not None and (request.idle or request.overlap))
+                    and not (request is not None and request.idle)
                 ):
-                    # Activation growth can consume phase-entry headroom. Shed other idle
-                    # backing before permanently shortening this phase's resident prefix.
-                    # Native capture/replay guards and every physical pin still apply.
-                    self.native.reclaim_unpreferred(wanted - free)
-                    free = self.room().free
+                    # Registration uses this same lock: another request cannot enter
+                    # between the live-concurrency check and preference reclamation.
+                    with self.lock:
+                        if not self._active_beside(request):
+                            free = self.room().free
+                            if wanted > free:
+                                self.native.reclaim_unpreferred(wanted - free)
+                                free = self.room().free
                 block.preferred = free >= wanted
             block.preference_set = True
             if not block.preferred:
@@ -1441,15 +1448,13 @@ class Memory:
     def _activate_phase(self, model: Model) -> None:
         """Prioritize an actual component phase, never each repeated block/denoising call."""
         request = _REQUEST.get()
-        if (
-            not self.phase_supported
-            or self.capturing()
-            or (request is not None and (request.idle or request.overlap))
-        ):
+        if not self.phase_supported or self.capturing() or (request is not None and request.idle):
             return
         names = request.phase(model.name) if request is not None else frozenset({model.name})
         request_id = request.id if request is not None else None
         with self.lock:
+            if self._active_beside(request):
+                return
             if names == self._phase_names and request_id == self._phase_request:
                 return
             self._settle_prefetch(cancel=True)
@@ -1544,7 +1549,6 @@ class Memory:
         if (
             request.queued is None
             or request.idle
-            or request.overlap
             or not self.prefetch_supported
             or self.capturing()
         ):
@@ -1553,7 +1557,7 @@ class Memory:
         if queued is None or not queued.valid():
             return
         with self.lock:
-            if self._prefetch is not None or len(self.requests) != 1:
+            if self._prefetch is not None or self.requests != {request}:
                 return
             for model in queued.models:
                 if model.memory is not self or model.closed or model.retiring:
@@ -2131,7 +2135,7 @@ class Request:
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
         self.peak = 0
-        self.overlap = False
+        self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
         self.final_fills = self.final_hits = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
