@@ -1136,9 +1136,22 @@ class Memory:
                 for held in (block.region, block.final_region)
                 if held is not None and held.resident
             )
-            block.preferred = model.prefix is None and (
-                block.cached() or self.room().free >= missing + self.window_bytes
-            )
+            block.preferred = model.prefix is None
+            if block.preferred and not block.cached():
+                wanted = missing + self.window_bytes
+                free = self.room().free
+                if (
+                    self.phase_supported
+                    and wanted > free
+                    and not self.capturing()
+                    and not (request is not None and (request.idle or request.overlap))
+                ):
+                    # Activation growth can consume phase-entry headroom. Shed other idle
+                    # backing before permanently shortening this phase's resident prefix.
+                    # Native capture/replay guards and every physical pin still apply.
+                    self.native.reclaim_unpreferred(wanted - free)
+                    free = self.room().free
+                block.preferred = free >= wanted
             block.preference_set = True
             if not block.preferred:
                 model.prefix = (
