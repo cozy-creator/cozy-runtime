@@ -1,8 +1,8 @@
 """Compatibility encoders and independent decoders for derived weight formats.
 
-TensorFS owns the versioned NVFP4 and ConvRot numerical producers and acceptance statistics.
+TensorFS owns the versioned offline numerical producers and acceptance statistics.
 Their adapters preserve bounded row chunks and the existing Encoded/Companion result contract.
-FP8/W4A8 producers and independent decode helpers remain here.
+Only thin producer adapters and independent decode helpers remain here.
 """
 
 from __future__ import annotations
@@ -40,35 +40,6 @@ E4M3_MAG32 = E4M3_MAG.astype(np.float32)
 E4M3_MAX = float(E4M3_MAG[-1])  # 448.0
 
 
-def e4m3_encode(values: np.ndarray) -> np.ndarray:
-    """float32 -> E4M3 bytes, RNE, SATURATING at +/-448 (the cast itself does not, which
-    is why every caller in this family clamps and why the border's own note says so)."""
-    v = np.asarray(values, dtype=np.float32)
-    if not np.isfinite(v).all():
-        v = np.nan_to_num(v, nan=0.0, posinf=E4M3_MAX, neginf=-E4M3_MAX)
-    return _e4m3_signed(v, np.minimum(np.abs(v), np.float32(E4M3_MAX)))
-
-
-def _e4m3_signed(values: np.ndarray, magnitude: np.ndarray) -> np.ndarray:
-    """E4M3 bytes of finite `values` whose magnitudes are already at most 448."""
-    bits = magnitude.view(np.uint32)
-    # Normal values discard 20 of float32's 23 mantissa bits. Adding half an
-    # ulp minus one, plus the retained LSB, rounds ties to even; carry also
-    # rounds across exponent boundaries. Adjust exponent bias from 127 to 7.
-    code = bits + np.uint32(0x7FFFF)
-    code += (bits >> 20) & np.uint32(1)
-    code >>= 20
-    code -= np.uint32(120 << 3)
-    # E4M3 subnormals have fixed spacing 2**-9. Multiplication is exact here, and adding
-    # 2**23 rounds to an integer with the same even-tie rule, left in the low bits.
-    small = bits < np.uint32(0x3C800000)
-    sub = (magnitude[small] * np.float32(512) + np.float32(2.0**23)).view(np.uint32)
-    code[small] = sub - np.uint32(0x4B000000)
-    code |= (np.ascontiguousarray(values).view(np.uint32) >> 24) & np.uint32(0x80)
-    out: np.ndarray = code.astype(np.uint8)
-    return out
-
-
 #: byte -> float32, sign in bit 7; the NaN codes 0x7F/0xFF read as the largest magnitude.
 E4M3_DECODE32 = np.concatenate([E4M3_MAG32[np.minimum(np.arange(128), 126)]] * 2)
 E4M3_DECODE32[128:] *= -1
@@ -76,15 +47,6 @@ E4M3_DECODE32[128:] *= -1
 
 def e4m3_decode(raw: np.ndarray) -> np.ndarray:
     out: np.ndarray = E4M3_DECODE32.take(np.asarray(raw, dtype=np.uint8), mode="clip")
-    return out
-
-
-def pack_nibbles(nibbles: np.ndarray) -> np.ndarray:
-    """[r, c] nibbles -> [r, c/2] bytes, element 2k in the LOW nibble (the border's
-    packing; `nvfp4:nibbles-swapped` is one of its own WRONG conformance arms)."""
-    rows, cols = nibbles.shape
-    pairs = nibbles.reshape(rows, cols // 2, 2)
-    out: np.ndarray = (pairs[:, :, 0] | (pairs[:, :, 1] << 4)).astype(np.uint8)
     return out
 
 
@@ -127,15 +89,6 @@ class _Accum:
         self.energy = 0.0
         self.max_abs = 0.0
         self.sat = 0
-
-    def add(self, source: np.ndarray, recon: np.ndarray) -> None:
-        wide = source.astype(np.float64)
-        diff = recon.astype(np.float64)
-        diff -= wide
-        if diff.size:
-            self.max_abs = max(self.max_abs, float(diff.max()), -float(diff.min()))
-        self.sse += float(np.sum(np.square(diff, out=diff)))
-        self.energy += float(np.sum(np.square(wide, out=wide)))
 
     def merge(self, measured: raw.QuantizationStats) -> None:
         self.sse += measured["sse"]
@@ -267,38 +220,44 @@ def encode_nvfp4(key: str, values: np.ndarray, amax: float | None = None) -> Enc
 
 
 def encode_fp8_rowwise(key: str, values: np.ndarray) -> Encoded:
-    """`fp8.rowwise`, rank-1 scale variant: continuous per-output-row f32 scale
-    `clamp(rowmax|v|/448, min 1e-12)`, RNE payload, clamp BEFORE the cast."""
+    """TensorFS's versioned F32 row-scale and E4M3 RNE producer."""
     rows, cols = _require_2d(key, values, 1)
-    payload = np.empty((rows, cols), dtype=np.uint8)
-    row_scale = np.empty((rows,), dtype=np.float32)
+    if not rows:
+        return Encoded(
+            "F8_E4M3",
+            [0, cols],
+            b"",
+            [Companion(".weight_scale", "F32", [0], b"")],
+            0,
+            0.0,
+            0.0,
+            0.0,
+        )
+    if not cols:
+        raise UnsupportedInput(f"{key!r}: FP8 requires nonempty weight columns")
+    payload: list[bytes] = []
+    scales: list[bytes] = []
     acc = _Accum()
     for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
-        v = np.ascontiguousarray(values[sl], dtype=np.float32)
-        amax = np.maximum(v.max(axis=-1), -v.min(axis=-1))
-        scale = np.maximum(amax / np.float32(E4M3_MAX), np.float32(1e-12)).astype(np.float32)
-        rescaled = v / scale[:, None]
-        # Division is monotone, so only a row whose largest element exceeds 448 saturates.
-        over = amax / scale > E4M3_MAX
-        if over.any():
-            acc.sat += int(np.count_nonzero(np.abs(rescaled[over]) > E4M3_MAX))
-            np.clip(rescaled, -E4M3_MAX, E4M3_MAX, out=rescaled)
-        enc = _e4m3_signed(rescaled, np.abs(rescaled))
-        recon = E4M3_DECODE32.take(enc, mode="clip")
-        recon *= scale[:, None]
-        acc.add(v, recon)
-        payload[sl] = enc
-        row_scale[sl] = scale
-
+        encoded, measured = _measured(
+            key,
+            values[sl],
+            "fp8.rowwise",
+            "fp8-rowwise-rne/1",
+            {},
+        )
+        payload.append(encoded.parts["weight"].tobytes())
+        scales.append(encoded.parts["scale"].tobytes())
+        acc.merge(measured)
     return Encoded(
-        payload_dtype="F8_E4M3",
-        payload_shape=[rows, cols],
-        payload=payload.tobytes(),
-        companions=[Companion(".weight_scale", "F32", [rows], row_scale.tobytes())],
-        saturated=acc.sat,
-        sse=acc.sse,
-        energy=acc.energy,
-        max_abs_err=acc.max_abs,
+        "F8_E4M3",
+        [rows, cols],
+        b"".join(payload),
+        [Companion(".weight_scale", "F32", [rows], b"".join(scales))],
+        acc.sat,
+        acc.sse,
+        acc.energy,
+        acc.max_abs,
     )
 
 
@@ -374,9 +333,8 @@ def encode_int8_convrot256(key: str, values: np.ndarray) -> Encoded:
 
 # ------------------------------------------------------------------------------ w4a8
 
-#: comfy-kitchen's frozen Lloyd-Max levels for a group-normalized Gaussian (`_FIXED_LUT`):
-#: ConvRot makes every layer's rotated groups Gaussian, so this one table serves (kitchen fits
-#: its own only past an excess kurtosis of -0.1, which it notes real models never reach).
+#: Metadata for the historical zero-row result only; nonempty tensors get their codebook
+#: and all fitted values from the native producer.
 W4A8_CODEBOOK = np.array(
     [-0.980602, -0.794529, -0.638165, -0.500986, -0.377321, -0.263187, -0.155210, -0.050720,
      0.052541, 0.156985, 0.265284, 0.379533, 0.502636, 0.638953, 0.794876, 0.980671],
@@ -385,61 +343,63 @@ W4A8_CODEBOOK = np.array(
 W4A8_GROUP = 16
 
 
-def _nearest_level(levels: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """The index of `levels` (ascending) nearest each of `x`, ties to the lower."""
-    pos = np.searchsorted(levels, x)
-    lo, hi = np.clip(pos - 1, 0, 15), np.clip(pos, 0, 15)
-    return np.where(np.abs(x - levels[hi]) < np.abs(x - levels[lo]), hi, lo)
-
-
 def encode_w4a8(key: str, values: np.ndarray) -> Encoded:
-    """`w4a8.convrot` as our producer writes it (design `four-bit-lanes.md` §3-4):
-    comfy-kitchen's symmetric codebook quantizer on int8.convrot's rotated rows. Each 16-group's
-    scale is refined by two ALS passes over the frozen codebook; the row scale makes the largest
-    level 127, the group scale relative to it is stored E4M3; each weight then takes the nearest
-    of its group's int8 levels `round(codebook * group_scale)`, the grid the GEMM multiplies."""
+    """TensorFS's fixed-codebook F64 ConvRot and two-pass group-scale producer."""
     rows, cols = _require_2d(key, values, CONVROT_GROUP)
-    groups = cols // W4A8_GROUP
-    codes = np.empty((rows, cols // 2), dtype=np.uint8)
-    group_scale = np.empty((rows, groups), dtype=np.uint8)
-    row_scale = np.empty((rows,), dtype=np.float32)
-    book = W4A8_CODEBOOK.astype(np.float64)
+    if not rows:
+        return Encoded(
+            "I8",
+            [0, cols // 2],
+            b"",
+            [
+                Companion(".weight_s_rel", "F8_E4M3", [0, cols // W4A8_GROUP], b""),
+                Companion(".weight_s_channel", "F32", [0], b""),
+                Companion(".weight_codebook", "F32", [16], W4A8_CODEBOOK.tobytes()),
+            ],
+            0,
+            0.0,
+            0.0,
+            0.0,
+        )
+    if not cols:
+        raise UnsupportedInput(f"{key!r}: W4A8 requires nonempty weight columns")
+    payload: list[bytes] = []
+    scales: list[bytes] = []
+    row_scales: list[bytes] = []
+    codebook: bytes | None = None
     acc = _Accum()
     for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
-        v = np.ascontiguousarray(values[sl], dtype=np.float32)
-        n = v.shape[0]
-        g = (hadamard256(v.astype(np.float64)) / 16.0).reshape(n, groups, W4A8_GROUP)
-        gs = np.maximum(np.abs(g).max(axis=-1, keepdims=True), 1e-8)
-        idx = _nearest_level(book, g / gs)
-        for _ in range(2):
-            c = book[idx]
-            energy = np.maximum((c * c).sum(-1, keepdims=True), 1e-8)
-            gs = np.maximum((g * c).sum(-1, keepdims=True) / energy, 1e-8)
-            idx = _nearest_level(book, g / gs)
-        amax = np.abs(book[idx] * gs).max(axis=(1, 2))
-        scale = np.maximum(amax / INT8_MAX, 1e-8).astype(np.float32)
-        rel = e4m3_encode((gs[..., 0] / scale.astype(np.float64)[:, None]).astype(np.float32))
-        levels = np.clip(np.rint(W4A8_CODEBOOK * e4m3_decode(rel)[..., None]), -INT8_MAX, INT8_MAX)
-        target = g / scale.astype(np.float64)[:, None, None]
-        acc.sat += int(np.count_nonzero(np.abs(target) > INT8_MAX + 0.5))
-        dist = np.abs(target[..., :, None] - levels[..., None, :].astype(np.float64))
-        q = dist.argmin(axis=-1).astype(np.uint8)  # the first of equals: ties to the lower
-        q8 = np.take_along_axis(levels, q.astype(np.intp), axis=-1).reshape(n, cols)
-        acc.add(v, decode_int8_convrot256(q8, scale))
-        codes[sl] = pack_nibbles(q.reshape(n, cols))
-        group_scale[sl] = rel
-        row_scale[sl] = scale
+        encoded, measured = _measured(
+            key,
+            values[sl],
+            "w4a8.convrot",
+            "w4a8-convrot256-fixed/1",
+            {
+                "group_size": W4A8_GROUP,
+                "rotation": "kron_regular_h4",
+                "rotation_size": CONVROT_GROUP,
+            },
+        )
+        payload.append(encoded.parts["weight"].tobytes())
+        scales.append(encoded.parts["group_scale"].tobytes())
+        row_scales.append(encoded.parts["scale"].tobytes())
+        current = encoded.parts["codebook"].tobytes()
+        if codebook is not None and current != codebook:
+            raise RuntimeError("native W4A8 chunks changed their shared codebook")
+        codebook = current
+        acc.merge(measured)
+    assert codebook is not None
     return Encoded(
-        payload_dtype="I8",
-        payload_shape=[rows, cols // 2],
-        payload=codes.tobytes(),
-        companions=[
-            Companion(".weight_s_rel", "F8_E4M3", [rows, groups], group_scale.tobytes()),
-            Companion(".weight_s_channel", "F32", [rows], row_scale.tobytes()),
-            Companion(".weight_codebook", "F32", [16], W4A8_CODEBOOK.tobytes()),
+        "I8",
+        [rows, cols // 2],
+        b"".join(payload),
+        [
+            Companion(".weight_s_rel", "F8_E4M3", [rows, cols // W4A8_GROUP], b"".join(scales)),
+            Companion(".weight_s_channel", "F32", [rows], b"".join(row_scales)),
+            Companion(".weight_codebook", "F32", [16], codebook),
         ],
-        saturated=acc.sat,
-        sse=acc.sse,
-        energy=acc.energy,
-        max_abs_err=acc.max_abs,
+        acc.sat,
+        acc.sse,
+        acc.energy,
+        acc.max_abs,
     )

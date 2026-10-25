@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from contextlib import ExitStack
 from typing import Any
 
 import msgspec
@@ -197,6 +198,7 @@ def _quantize(
     selection: ArtifactQuantizationPlan | None = None,
     preserve_precision: bool = False,
     calibration: svdq.Calibration | None = None,
+    fit_workspace_bytes: int = native_quantization.FIT_WORKSPACE_BYTES,
 ) -> tuple[QuantizeResult, ModelArtifact]:
     opened = source if isinstance(source, Checkpoint) else ctx.tensorfs_source(source)
     keep = (
@@ -220,7 +222,33 @@ def _quantize(
             return "bf16"
         return str(tensor.logical_dtype)
 
-    with ctx.output(output, Derivation(base=opened, order=bf16.order)) as out:
+    with ExitStack() as stack:
+        calibrated = stack.enter_context(
+            native_quantization.snapshot(opened, artifact, plan.encoding, calibration, ctx)
+        )
+        native_provenance = None
+        native_selection = (
+            artifact is not None
+            and plan.encoding is not None
+            and native_quantization.supported(opened, artifact, plan.encoding)
+        )
+        if calibrated is not None and not native_selection:
+            raise UnsupportedInput("calibrated selection needs native Writer support")
+        if native_selection:
+            assert artifact is not None and plan.encoding is not None
+            rows = native_quantization.resolved(opened, artifact, plan.encoding, logical)
+            native_provenance = native_quantization.provenance(opened, rows, calibrated)
+        out = stack.enter_context(
+            ctx.output(
+                output,
+                Derivation(
+                    base=opened,
+                    order=bf16.order,
+                    sources=() if calibrated is None else (calibrated,),
+                    provenance=native_provenance,
+                ),
+            )
+        )
         normalization = write_bf16(opened, out, ctx, tel, plan=bf16, excluded=selected or None)
         read, written = normalization.source_bytes_read, normalization.new_bytes_written
         reused, saturated = normalization.reused_keys, 0
@@ -229,9 +257,7 @@ def _quantize(
             request = ArtifactQuantizationRequest(
                 max_relative_frobenius=plan.max_relative_frobenius
             )
-            if calibration is None and native_quantization.supported(
-                opened, artifact, plan.encoding
-            ):
+            if native_quantization.supported(opened, artifact, plan.encoding):
                 stats = native_quantization.quantize(
                     opened,
                     out,
@@ -241,6 +267,8 @@ def _quantize(
                     ctx=ctx,
                     tel=tel,
                     max_relative_frobenius=plan.max_relative_frobenius,
+                    calibration_checkpoint=calibrated,
+                    fit_workspace_bytes=fit_workspace_bytes,
                 )
                 read += stats.source_bytes_read
                 written += stats.new_bytes_written

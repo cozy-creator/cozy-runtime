@@ -135,7 +135,9 @@ def _run(
     opener = ctx._tensorfs_output
     if opener is None:
         raise UnsupportedInput("this attempt writes no weights", code="weights_output_ungranted")
-    ctx._tensorfs_output = lambda slot, made: opener(slot, replace(made, provenance=provenance))
+    ctx._tensorfs_output = lambda slot, made: opener(
+        slot, replace(made, provenance={**provenance, **(made.provenance or {})})
+    )
     tel.log("recipe", recipe=row.name, lane=row.lane, fingerprint=digest)
     try:
         if isinstance(plan, QuantizationPlan):

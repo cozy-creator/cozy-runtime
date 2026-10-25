@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import tempfile
 import time
-from collections.abc import Callable
+import zlib
+from collections.abc import Callable, Iterator
 from concurrent.futures import CancelledError, Future, TimeoutError
-from contextlib import suppress
+from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import msgspec
 import tensorfs
@@ -29,7 +32,18 @@ from .quantization import (
 if TYPE_CHECKING:
     from tensorfs.api import QuantizeTensor
 
-_STRATEGIES = {"int8.convrot": "int8-convrot256/1", "nvfp4": "nvfp4-min-sse/1"}
+    from .svdq import Calibration
+
+SVDQ_STRATEGY = "svdq-nvfp4-r32-faer/1"
+# Explicit initial calibrated-fit allowance approved for Runtime callers, not total host RAM.
+FIT_WORKSPACE_BYTES = 512 << 20
+_STRATEGIES = {
+    "int8.convrot": "int8-convrot256/1",
+    "nvfp4": "nvfp4-min-sse/1",
+    "svdq.nvfp4": SVDQ_STRATEGY,
+    "fp8.rowwise": "fp8-rowwise-rne/1",
+    "w4a8.convrot": "w4a8-convrot256-fixed/1",
+}
 
 
 def supported(source: Checkpoint, selection: ArtifactQuantizationPlan, encoding: str) -> bool:
@@ -47,6 +61,116 @@ def supported(source: Checkpoint, selection: ArtifactQuantizationPlan, encoding:
         ):
             return False
     return bool(selection.tensors)
+
+
+def resolved(
+    source: Checkpoint,
+    selection: ArtifactQuantizationPlan,
+    encoding: str,
+    logical_dtype: Callable[[QuantizationTensor], str],
+) -> list[QuantizeTensor]:
+    """Exact native tensor declarations, including the explicit per-key sketch seed."""
+    rows: list[QuantizeTensor] = []
+    for row in selection.tensors:
+        scheme = row.encoding or encoding
+        spec: QuantizeTensor = {
+            "component": row.component,
+            "key": row.key,
+            "source_dtype": source.components[row.component].tensors[row.key].dtype,
+            "shape": list(row.shape),
+            "dtype": TENSORFS_NAMES[logical_dtype(row)],
+            "encoding": {"scheme": scheme, "params": dict(_ENCODINGS[scheme].params)},
+            "strategy": _STRATEGIES[scheme],
+        }
+        if scheme == "svdq.nvfp4":
+            spec["fit"] = {
+                "seed": zlib.crc32(row.key.encode()),
+                "component": row.component,
+                "xmax": row.key + ".xmax",
+                "rows": row.key + ".rows",
+            }
+        rows.append(spec)
+    return rows
+
+
+def provenance(
+    source: Checkpoint, rows: list[QuantizeTensor], calibration: Checkpoint | None
+) -> dict[str, Any]:
+    """Bind the completed calibration and native producer before Output replay lookup."""
+    return {
+        "native_quantization": {
+            "source": source.id,
+            "calibration": None if calibration is None else calibration.id,
+            "selection": rows,
+            "implementation": tensorfs.raw.quantization_implementation(),
+        }
+    }
+
+
+@contextmanager
+def snapshot(
+    source: Checkpoint,
+    selection: ArtifactQuantizationPlan | None,
+    encoding: str | None,
+    calibration: Calibration | None,
+    ctx: Context,
+) -> Iterator[Checkpoint | None]:
+    """Serialize finished model hooks once; no live tensors cross the native worker boundary.
+
+    Writer borrows each contiguous CPU view only for its synchronous put. The ordinary
+    checkpoint and its directory outlive the scoped conversion and are closed after join.
+    """
+    fitted = (
+        []
+        if selection is None
+        else [row for row in selection.tensors if (row.encoding or encoding) == "svdq.nvfp4"]
+    )
+    if not fitted:
+        yield None
+        return
+    if calibration is None or not calibration.completed:
+        raise UnsupportedInput(
+            "svdq.nvfp4 requires completed model calibration before conversion",
+            code="quantization_calibration",
+        )
+    torch = calibration.torch
+    with tempfile.TemporaryDirectory(prefix="cozy-svdq-calibration-") as directory:
+        writer = tensorfs.Writer(Path(directory) / "calibration.cozytensors")
+        writer.metadata["provenance"] = {
+            "source": source.id,
+            "collection": "runtime-linear-reservoir/1",
+            "rows_per_linear": 512,
+            "rows_per_call": 32,
+            "sampling_seed": 0,
+            "selection": [[row.component, row.key, list(row.shape)] for row in fitted],
+        }
+        components: dict[str, tensorfs.ComponentWriter] = {}
+        try:
+            for row in fitted:
+                ctx.raise_if_cancelled()
+                stats = calibration.stats(row.component, row.key)
+                component = components.get(row.component)
+                if component is None:
+                    component = components[row.component] = writer.component(row.component)
+                for suffix, value, dtype in (
+                    ("xmax", stats.xmax, "F32"),
+                    ("rows", stats.rows, "BF16"),
+                ):
+                    # Calibration already supplies CPU F32 maxima and CPU BF16 rows.
+                    wanted = torch.float32 if dtype == "F32" else torch.bfloat16
+                    if value.dtype != wanted or value.device.type != "cpu":
+                        raise UnsupportedInput("calibration snapshot has unexpected dtype/device")
+                    held = value.detach().contiguous()
+                    view = memoryview(held.view(torch.uint8).numpy())
+                    component.put(row.key + "." + suffix, view, dtype=dtype, shape=list(held.shape))
+            checkpoint = writer.commit()
+        except BaseException:
+            writer.abandon()
+            raise
+        try:
+            yield checkpoint
+        finally:
+            checkpoint.close()
 
 
 class _Execution:
@@ -153,24 +277,37 @@ def quantize(
     ctx: Context,
     tel: Telemetry,
     max_relative_frobenius: float | None,
+    calibration: Calibration | None = None,
+    calibration_checkpoint: Checkpoint | None = None,
+    fit_workspace_bytes: int = FIT_WORKSPACE_BYTES,
+    component: str | None = None,
 ) -> QuantizationStats:
-    rows: list[QuantizeTensor] = []
-    for row in selection.tensors:
-        scheme = row.encoding or encoding
-        rows.append(
-            {
-                "component": row.component,
-                "key": row.key,
-                "source_dtype": source.components[row.component].tensors[row.key].dtype,
-                "shape": list(row.shape),
-                "dtype": TENSORFS_NAMES[logical_dtype(row)],
-                "encoding": {"scheme": scheme, "params": dict(_ENCODINGS[scheme].params)},
-                "strategy": _STRATEGIES[scheme],
-            }
+    with (
+        snapshot(source, selection, encoding, calibration, ctx)
+        if calibration_checkpoint is None
+        else nullcontext(calibration_checkpoint) as made
+    ):
+        held = calibration_checkpoint if calibration_checkpoint is not None else made
+        rows = resolved(source, selection, encoding, logical_dtype)
+        if any("fit" in row for row in rows) and held is None:
+            raise UnsupportedInput("svdq.nvfp4 requires a completed calibration checkpoint")
+        convert, pending = output.prepare_quantization(
+            source,
+            rows,
+            max_relative_frobenius=max_relative_frobenius,
+            calibration=held,
+            max_buffer_bytes=fit_workspace_bytes if held is not None else 8 << 20,
+            component=component,
         )
-    convert, pending = output.prepare_quantization(
-        source, rows, max_relative_frobenius=max_relative_frobenius
-    )
+        return _run(convert, pending, ctx, tel)
+
+
+def _run(
+    convert: Callable[[tensorfs.ConversionControl], dict[str, object]],
+    pending: int,
+    ctx: Context,
+    tel: Telemetry,
+) -> QuantizationStats:
     # This helper joins before returning, like the existing bounded encoding loop.
     # It must not consume Context.plan's one whole GPU program slot: an author may
     # convert several outputs and then submit that program in the same request.
@@ -189,6 +326,11 @@ def quantize(
             time.sleep(0.05)  # Observation never advances native reads/encoding/publication.
         (result,) = execution.wait()
         stats = msgspec.convert(result, type=QuantizationStats)
+        for row in stats.tensors:
+            if row.get("fit") is not None:
+                tel.log(
+                    "native fitted tensor", component=row["component"], key=row["key"], **row["fit"]
+                )
         tel.progress(1.0, stage="native quantization")
         tel.metric("native_quantized_tensors", float(stats.encoded_keys))
         return stats

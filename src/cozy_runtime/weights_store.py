@@ -18,7 +18,7 @@ import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO, TYPE_CHECKING
+from typing import IO, TYPE_CHECKING, cast
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -338,16 +338,45 @@ class Output:
         tensors: Sequence[QuantizeTensor],
         *,
         max_relative_frobenius: float | None,
+        calibration: Checkpoint | None = None,
+        max_buffer_bytes: int = 8 << 20,
+        component: str | None = None,
     ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
         """Reserve this output's grant once, then return one owning native Writer call.
 
         The derivation supplies the full immutable native selection; only missing entries
         consume this attempt's logical new-byte grant. The caller must join before close.
         """
+        selected = [row for row in tensors if component is None or row["component"] == component]
+        if component is not None and not selected:
+            raise CapabilityError("unknown quantization component", code="quantization_plan")
+        if any(row.get("fit") is not None for row in tensors) and calibration is None:
+            raise CapabilityError(
+                "calibrated conversion needs a checkpoint", code="quantization_plan"
+            )
+        identity = hashlib.sha256(
+            canonical_json.encode(
+                {
+                    "source": source.id,
+                    "calibration": None if calibration is None else calibration.id,
+                    "selection": list(tensors),
+                    "implementation": raw.quantization_implementation(),
+                    "max_relative_frobenius": max_relative_frobenius,
+                    # Finished reuse is scoped; the native journal binds the full plan.
+                    "component": component,
+                }
+            )
+        ).hexdigest()
         if self.done is not None:
+            if identity not in self.done.metadata.get("native_quantization", []):
+                raise CapabilityError(
+                    "finished output has a different calibration or native producer; "
+                    "derive a new output",
+                    code="quantization_identity",
+                )
             return lambda _: {
                 "encoded_keys": 0,
-                "reused_keys": len(tensors),
+                "reused_keys": len(selected),
                 "source_bytes_read": 0,
                 "new_bytes_written": 0,
                 "saturated_elements": 0,
@@ -356,7 +385,7 @@ class Output:
         writer = self._writer
         if writer is None:
             raise CapabilityError("the output is closed", code="weights_writer_closed")
-        pending = [row for row in tensors if not self.has(row["component"], row["key"])]
+        pending = [row for row in selected if not self.has(row["component"], row["key"])]
         required = 0
         for row in pending:
             rows, columns = row["shape"]
@@ -365,21 +394,40 @@ class Output:
                     required += rows * columns + rows * 4
                 case "nvfp4":
                     required += rows * columns // 2 + rows * columns // 16 + 4
+                case "fp8.rowwise":
+                    required += rows * (columns + 4)
+                case "w4a8.convrot":
+                    required += rows * (columns // 2 + columns // 16 + 4) + 64
+                case "svdq.nvfp4":
+                    required += (
+                        rows * columns // 2
+                        + rows * columns // 16
+                        + 8
+                        + columns * 4
+                        + (rows + columns) * 32 * 2
+                    )
                 case _:
                     raise CapabilityError("unsupported native quantizer", code="quantization_plan")
         self._spend(required)
-        for component in dict.fromkeys(row["component"] for row in tensors):
-            self.component(component)
+        for name in dict.fromkeys(row["component"] for row in selected):
+            self.component(name)
 
         def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
-            return writer.quantize(
+            result = writer.quantize(
                 source,
                 tensors,
-                max_buffer_bytes=8 << 20,
+                max_buffer_bytes=max_buffer_bytes,
                 max_new_bytes=required,
+                calibration=calibration,
+                component=component,
                 control=control,
                 max_relative_frobenius=max_relative_frobenius,
             )
+            # Only successful native completion admits finished-output reuse.
+            identities = cast("list[str]", writer.metadata.setdefault("native_quantization", []))
+            if identity not in identities:
+                identities.append(identity)
+            return result
 
         return convert, len(pending)
 

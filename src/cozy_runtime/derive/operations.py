@@ -217,6 +217,7 @@ def quantize_into(
     output: str,
     max_relative_frobenius: float | None = None,
     calibration: svdq.Calibration | None = None,
+    fit_workspace_bytes: int = 512 << 20,
 ) -> ModelArtifact:
     """`plan`'s lane, written into the CALLING job's weights output `output`. A plan with
     `svdq.nvfp4` weights takes the `calibration` its recipe recorded (`calibrate`)."""
@@ -234,6 +235,7 @@ def quantize_into(
         selection=None if plan.encoding is None else _selection(opened, plan),
         preserve_precision=plan.output_precision == "preserve",
         calibration=calibration,
+        fit_workspace_bytes=fit_workspace_bytes,
     )
     return facade._artifact_result(result, artifact, tel, output)
 
