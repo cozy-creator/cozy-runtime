@@ -660,8 +660,8 @@ class Nvfp4NativeLeaf:
     On Blackwell a product of more than 16 rows is W4A4 on the FP4 tensor cores: each activation is
     quantized at dispatch against its own tensor amax, and on real FLUX.3 Klein activations that is
     5-10% from bf16 per linear (int8.convrot: 0.5-1.2%) at 1.3-1.5x the int8 leaf's rate on an RTX
-    5090. Every other product, and every one before Blackwell, is W4A16: Triton decodes the weight
-    in registers onto the bf16 tensor cores, which is the bandwidth-bound decode loop of an LM.
+    5090. Eligible small BF16 products use packed W4A16 GEMV. Other products materialize a
+    floating weight for the matmul; this leaf does not retain that decoded temporary across calls.
     """
 
     encoding: str = "nvfp4"

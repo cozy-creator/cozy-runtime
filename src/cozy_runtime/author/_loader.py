@@ -66,6 +66,8 @@ class TensorLike(Protocol):
     @property
     def dtype(self) -> object: ...
 
+    def detach(self) -> TensorLike: ...
+
 
 @runtime_checkable
 class ModuleLike(Protocol):
@@ -559,7 +561,7 @@ class DerivedCache:
     bound the least recently used entries leave to admit a new one; an entry larger than
     the whole bound refuses. On a placed model its entries live in a latent region of their
     own, pinned while a component scope of its model is open (`enter`/`leave`): between scopes
-    varena may take it, and the next scope finds the cache empty.
+    the residency module may release its entries and the next scope finds the cache empty.
     """
 
     __slots__ = (
@@ -640,7 +642,7 @@ class DerivedCache:
         """Its region, made with its first entry on a placed model (None unplaced)."""
         residency = self._owner._cozy_residency
         if self._region is None and residency is not None:
-            self._region = residency.region(f"cache:{self.name}", "latent", ())
+            self._region = residency.region(f"cache:{self.name}", "latent", (), release=self.drop)
         return self._region
 
     def enter(self) -> None:
@@ -689,13 +691,16 @@ class _Region(Protocol):
 
 
 class _Residency(Protocol):
-    def region(self, owner: str, kind: str, sets: object) -> _Region: ...
+    def region(
+        self, owner: str, kind: str, sets: object, *, release: Callable[[], None] | None = None
+    ) -> _Region: ...
 
 
 class _ScopeHost(Protocol):
     """What a cache needs from the model generation that declared it."""
 
-    _cozy_residency: _Residency | None
+    @property
+    def _cozy_residency(self) -> _Residency | None: ...
 
     def _cozy_require_scope(self, what: str) -> None: ...
 
@@ -1048,7 +1053,9 @@ def census(obj: object) -> Census:
         components.append(name)
         seen: set[int] = set()
         named_buffers = getattr(member, "named_buffers", None)
-        buffers = {id(b) for _, b in named_buffers(remove_duplicate=False)} if named_buffers else set()
+        buffers = (
+            {id(b) for _, b in named_buffers(remove_duplicate=False)} if named_buffers else set()
+        )
         for key, held in member.state_dict(keep_vars=True).items():
             if id(held) in seen:
                 continue
