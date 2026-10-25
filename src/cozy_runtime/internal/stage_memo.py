@@ -2,9 +2,10 @@
 
 One general mechanism: every method marked `@uses_components(..., memoize=True)` takes this
 path, and nothing here names a package, model or component. The key binds the method's code
-and declared helpers, the installation's third-party environment, the weights of the
-components it declares, the checkpoint's non-tensor assets, the call's arguments and the
-numerics it runs under. The lookup happens before the scope opens, so a hit stages nothing.
+and declared helpers, the installation (third-party versions, the Runtime and TensorFS builds),
+the weights of the components it declares, the checkpoint's non-tensor assets, the call's
+arguments and the numerics it runs under. The lookup happens before the scope opens, so a hit
+stages nothing.
 
 Tier 0 is this process's LRU. Tier 1 is the Worker's machine store, reached over the
 attempt's durable exchange when the Worker offers it. Writing there is a value decision made
@@ -48,7 +49,7 @@ from cozy_runtime.author._executor_requests import (
     StageMemoStore,
 )
 from cozy_runtime.author._stage_memo import exactness
-from cozy_runtime.internal import attention, hostfacts
+from cozy_runtime.internal import attention, hostfacts, installed
 from cozy_runtime.internal.executor_commands import MemoSettings
 from cozy_runtime.internal.hostfacts import HostFacts
 from cozy_runtime.internal.memo_implementation import describe
@@ -63,7 +64,8 @@ SCHEMA = "cozy.stage-memo/1"
 VALUE_RATIO = 2.0
 #: The newest measurement's weight in each moving average.
 SMOOTHING = 0.3
-_EXCLUDED = frozenset({"cozy-runtime", "tensorfs"})
+#: Keyed by their installed files, not their version: a Runtime update keys every call anew.
+_BUILDS = ("cozy-runtime", "tensorfs")
 #: Safetensors dtype names, by torch attribute. A result in another dtype is not stored.
 _DTYPES = {
     "float64": "F64",
@@ -363,20 +365,21 @@ def _rebuild(node: object, tensors: Mapping[str, object]) -> object:
 
 @functools.cache
 def environment(model_module: str) -> str:
-    """The installation's third-party distributions. The Runtime, TensorFS and the package
-    itself are excluded: the method's own code enters the key through `describe`."""
+    """The installation: its third-party distributions by version, the Runtime's and TensorFS's
+    builds by their files, read once. The package itself is excluded: the method's own code
+    enters the key through `describe`. Empty when a build is unreadable (an editable install)."""
 
     def spelled(name: str) -> str:
         return name.lower().replace("_", "-")
 
     owned = importlib.metadata.packages_distributions().get(model_module.split(".")[0], [])
-    excluded = _EXCLUDED | {spelled(name) for name in owned}
-    rows = sorted(
-        f"{name}=={dist.version}"
-        for dist in importlib.metadata.distributions()
-        if (name := spelled(str(dist.metadata["Name"] or ""))) and name not in excluded
-    )
-    return _hash(rows)
+    excluded = set(_BUILDS) | {spelled(name) for name in owned}
+    found = {spelled(str(d.metadata["Name"] or "")): d for d in importlib.metadata.distributions()}
+    builds = [installed.record_digest(found.get(name)) for name in _BUILDS]
+    if not all(builds):
+        return ""
+    rows = sorted(f"{n}=={d.version}" for n, d in found.items() if n and n not in excluded)
+    return _hash([rows, builds])
 
 
 def _hash(document: object) -> str:
@@ -639,6 +642,8 @@ class GenerationMemo:
         try:
             if stage is None:
                 raise Unmemoizable("method source unavailable")
+            if not self.environment:
+                raise Unmemoizable("runtime build unidentified")
             bound = signature.bind(model, *args, **kwargs)
             bound.apply_defaults()
             arguments = arguments_digest(dict(list(bound.arguments.items())[1:]), self.torch)

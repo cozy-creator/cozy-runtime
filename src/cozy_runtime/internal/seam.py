@@ -13,7 +13,8 @@ Three properties are structural rather than reviewed:
   is counted. Output bytes never cross this seam — they land in the attempt spool the worker
   brokered, which keeps the executor's writable storage to exactly that spool (§3.1).
 * **Machine credentials stay outside it.** `send` refuses keys from `SECRET_KEYS`; Load,
-  Invoke and `bearer` may carry a signer's supplied bearer at `tensorfs.token`.
+  Invoke and `capability` may carry a signer's run capability at `tensorfs.token`, never an
+  account's sign-in.
 * **A torn frame is typed.** EOF or a peer reset exactly at a frame boundary is the
   disposable executor's normal end (`None`); EOF inside a header or body is
   `seam_eof_mid_frame`, never a silent short read.
@@ -81,8 +82,8 @@ class SeamError(Exception):
         self.detail = detail
 
 
-#: The commands that may carry a signer's supplied bearer, at `tensorfs.token` only.
-SUPPLYING = frozenset({"load", "invoke", "bearer"})
+#: The commands that may carry a signer's run capability, at `tensorfs.token` only.
+SUPPLYING = frozenset({"load", "invoke", "capability"})
 
 
 def _scan(value: Any, path: str = "", *, supplied: bool = False) -> None:
@@ -419,8 +420,8 @@ class _Asked:
 class Mux:
     """One seam shared by every thread of the process. Whoever needs a frame reads the next
     one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
-    mark and to `cancelled`, a frame that may carry a bearer (`SUPPLYING`) to `bearer` as it is
-    read (a `bearer` frame goes nowhere else), anything else to the commands, in order. No
+    mark and to `cancelled`, a frame that may carry a capability (`SUPPLYING`) to `bearer` as it
+    is read (a `capability` frame goes nowhere else), anything else to the commands, in order. No
     reader thread exists, so a process that has served no call stays single-threaded and
     forkable (`zygote`)."""
 
@@ -557,7 +558,7 @@ class Mux:
         elif frame.get("cmd") == "cancel":
             self.cancel(str(frame.get("request_id", "")))
             self._cancelled(str(frame.get("request_id", "")))
-        elif frame.get("cmd") == "bearer":
+        elif frame.get("cmd") == "capability":
             self._bearer(frame)
         else:
             if frame.get("cmd") in SUPPLYING:

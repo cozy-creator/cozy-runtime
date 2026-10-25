@@ -9,7 +9,6 @@ tolerantly (unknown members ignored).
 
 from __future__ import annotations
 
-import hashlib
 import importlib.metadata
 import json
 import os
@@ -23,6 +22,7 @@ import msgspec
 
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
 from cozy_runtime.internal import static_interface
+from cozy_runtime.internal.installed import record_digest
 
 # --------------------------------------------------------------------------- machine-describe
 
@@ -92,20 +92,6 @@ def _normalized(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
-def _record_digest(found: importlib.metadata.Distribution | None) -> str:
-    """A distribution's own installed files by their RECORD hashes: the same wherever this code
-    is installed, so a memoized call's result is reusable there. Empty when unrecorded or
-    editable (a path file's hash says nothing of the code)."""
-    rows = sorted(
-        (str(file), file.hash.value)
-        for file in (found.files if found else None) or []
-        if file.hash and file.parts[0] != ".." and not file.parts[0].endswith(".dist-info")
-    )
-    if not rows or any(path.endswith(".pth") for path, _ in rows):
-        return ""
-    return "sha256:" + hashlib.sha256(msgspec.json.encode(rows)).hexdigest()
-
-
 def _package_name(found: importlib.metadata.Distribution, packages: dict[str, str]) -> str:
     """The Hub package the machine read from the release's lock, else local code."""
     name = _normalized(found.metadata["Name"])
@@ -144,7 +130,7 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
                 distribution.version,
                 applications[0].value,
                 msgspec.Raw(msgspec.json.encode(document)),
-                _record_digest(distribution),
+                record_digest(distribution),
                 _package_name(distribution, request.packages),
             )
         )
@@ -159,7 +145,7 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
                 runtime.version,
                 str(document["application"]),
                 msgspec.Raw(msgspec.json.encode(document)),
-                _record_digest(runtime),
+                record_digest(runtime),
                 BUILTIN_PACKAGE,
             )
         )
@@ -169,7 +155,7 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
             request.root, environment_python=Path(sys.executable)
         )
         own = msgspec.json.encode(built).decode()
-    return DescribedEnvironment(_record_digest(found.get(_normalized(request.root))), callees, own)
+    return DescribedEnvironment(record_digest(found.get(_normalized(request.root))), callees, own)
 
 
 def describe() -> int:
