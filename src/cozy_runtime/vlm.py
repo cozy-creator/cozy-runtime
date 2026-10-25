@@ -38,6 +38,7 @@ from cozy_runtime import lm, moe
 from cozy_runtime.author import (
     AssetBound,
     Config,
+    ConformanceError,
     Context,
     DecodedVideoFrame,
     ImageAsset,
@@ -56,6 +57,11 @@ COMPONENT = "model"
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 #: Where a thought ends: `ask` returns what follows it.
 THOUGHT_END = "</think>"
+#: A saved tokenizer's bookkeeping, not settings its constructor takes.
+TOKENIZER_METADATA = (
+    "added_tokens_decoder", "tokenizer_file", "processor_class", "chat_template", "name_or_path",
+    "backend", "is_local", "local_files_only",
+)
 
 Images = Annotated[
     list[ImageAsset],
@@ -228,9 +234,8 @@ def construct(
         model.tie_weights()
         text = model.config.get_text_config(decoder=True)
         head = None
-        if getattr(text, "mtp_num_hidden_layers", 0) and config.tensor_dtype(
-            f"{COMPONENT}.mtp.fc.weight", default=""
-        ):
+        drafts = getattr(text, "mtp_num_hidden_layers", 0)
+        if drafts and _held(config, f"{COMPONENT}.mtp.fc.weight"):
             head = lm.Draft(model.config, sys.modules[type(model).__module__])
             model.mtp = head.mtp.to(torch.bfloat16)
         moe.split(model)
@@ -241,34 +246,66 @@ def construct(
     return model.eval(), head.eval() if head is not None else None
 
 
-def processor(assets: ModelAssets) -> Any:
-    """The upstream processor from the checkpoint's files, parsed in memory."""
-    names = set(assets.names())
-    image = json.loads(assets.read("preprocessor_config.json"))
-    processor_class = getattr(transformers, image.pop("processor_class"))
-    image_processor = getattr(transformers, image.pop("image_processor_type"))(**image)
-    extra = (
-        json.loads(assets.read("processor_config.json")) if "processor_config.json" in names else {}
-    )
-    extra.pop("processor_class", None)
-    if "video_preprocessor_config.json" in names:
-        video = json.loads(assets.read("video_preprocessor_config.json"))
-        video.pop("processor_class", None)
-        extra["video_processor"] = getattr(transformers, video.pop("video_processor_type"))(**video)
-    tokenizer_config = json.loads(assets.read("tokenizer_config.json"))
-    for key in ("added_tokens_decoder", "tokenizer_file", "processor_class", "chat_template"):
+def _held(config: Config, key: str) -> bool:
+    """Whether the checkpoint stores `key`: a fine-tune may leave out the multi-token-prediction
+    head its config still declares."""
+    try:
+        return bool(config.tensor_dtype(key, default=""))
+    except ConformanceError:
+        return False
+
+
+def processor(
+    assets: ModelAssets,
+    folder: str = "",
+    config: Mapping[str, Any] | None = None,
+    image: Mapping[str, Any] | None = None,
+) -> Any:
+    """The upstream processor from the checkpoint's files under `folder` (`processor/`), parsed in
+    memory. The image and video processors' settings are their own files, one
+    `processor_config.json`, or `config`: TensorFS keeps a component folder's config file as the
+    component's config, not among its files. `image` replaces image settings (None drops one).
+    The chat template is `chat_template.jinja` or `chat_template.json`."""
+    names = {name.removeprefix(folder) for name in assets.names() if name.startswith(folder)}
+
+    def read(name: str) -> bytes:
+        return assets.read(folder + name)
+
+    def held(name: str) -> dict[str, Any]:
+        return json.loads(read(name)) if name in names else {}
+
+    given = dict(config or {})
+    extra = held("processor_config.json") or (given if "image_processor" in given else {})
+    images = dict(extra.pop("image_processor", None) or held("preprocessor_config.json") or given)
+    video = dict(extra.pop("video_processor", None) or held("video_preprocessor_config.json"))
+    named = extra.pop("processor_class", None) or images.get("processor_class", "Qwen3VLProcessor")
+    for settings in (images, video):
+        settings.pop("processor_class", None)
+    for key, value in (image or {}).items():
+        if value is None:
+            images.pop(key, None)
+        else:
+            images[key] = value
+    if video:
+        kind = video.pop("video_processor_type", "Qwen3VLVideoProcessor")
+        extra["video_processor"] = getattr(transformers, kind)(**video)
+    kind = images.pop("image_processor_type", "Qwen2VLImageProcessor")
+    image_processor = getattr(transformers, kind)(**images)
+    tokenizer_config = json.loads(read("tokenizer_config.json"))
+    for key in TOKENIZER_METADATA:
         tokenizer_config.pop(key, None)
-    named = tokenizer_config.pop("tokenizer_class", "")
-    tokenizer_class = getattr(transformers, named, None) if named != "PreTrainedTokenizer" else None
-    tokenizer = (tokenizer_class or PreTrainedTokenizerFast)(
-        tokenizer_object=Tokenizer.from_str(assets.read("tokenizer.json").decode()),
-        **tokenizer_config,
+    named_tokenizer = tokenizer_config.pop("tokenizer_class", "")
+    tokenizer_class = getattr(transformers, named_tokenizer, None)
+    if tokenizer_class is None or named_tokenizer == "PreTrainedTokenizer":
+        tokenizer_class = PreTrainedTokenizerFast
+    tokenizer = tokenizer_class(
+        tokenizer_object=Tokenizer.from_str(read("tokenizer.json").decode()), **tokenizer_config
     )
     if "chat_template.jinja" in names:
-        chat = assets.read("chat_template.jinja").decode()
+        chat = read("chat_template.jinja").decode()
     else:
-        chat = json.loads(assets.read("chat_template.json"))["chat_template"]
-    return processor_class(
+        chat = json.loads(read("chat_template.json"))["chat_template"]
+    return getattr(transformers, named)(
         image_processor=image_processor, tokenizer=tokenizer, chat_template=chat, **extra
     )
 
