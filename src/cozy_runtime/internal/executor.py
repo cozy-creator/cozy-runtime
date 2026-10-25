@@ -4892,8 +4892,10 @@ def _idle(executor: Executor, order: _Order) -> None:
 
 def serve(executor: Executor, channel: Channel) -> int:
     """Answer commands until the machine shuts this executor down or its seam ends. This thread
-    keeps reading: a call's commands run on the pool, and so does a process-wide one that must
-    wait for calls in flight; one that need not runs here, where Start and Fork always ran."""
+    keeps reading, so a `bearer` or `cancel` sent during a long command (a Load streaming its
+    weights) is taken at once: after the device Start every command runs on the pool in its
+    turn. Before it the process stays single-threaded and forkable: Start and Fork run here,
+    as does any other command that is first and not a call's."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
     # Runtime-owned workers, none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call")
@@ -4920,7 +4922,7 @@ def serve(executor: Executor, channel: Channel) -> int:
             _send_reply(channel, reply)
             continue
         ticket = order.ticket(alone=name not in _CALL_COMMANDS)
-        if name in _CALL_COMMANDS or not order.first(ticket):
+        if executor.started or name in _CALL_COMMANDS or not order.first(ticket):
             pool.submit(contextvars.Context().run, _serve, executor, frame, order.turn(ticket))
             continue
         with order.turn(ticket):
