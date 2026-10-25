@@ -125,6 +125,16 @@ class PreparedRepeat:
         from cozy_runtime import graphs
         from cozy_runtime.internal.residency import Binding, StaleBinding
 
+        try:
+            import cozy_runtime._kernels._execution as _execution
+        except ModuleNotFoundError as error:
+            if error.name != "cozy_runtime._kernels._execution":
+                raise
+            raise CapabilityError(
+                "this Runtime wheel has no prebuilt GPU execution module",
+                code="prepared_graph_ineligible",
+            ) from error
+
         if isinstance(steps, bool) or not isinstance(steps, int) or not 0 < steps <= 2**32 - 1:
             raise ValueError("repeat steps must be a positive uint32")
         tensors = tuple(state)
@@ -140,8 +150,6 @@ class PreparedRepeat:
             )
         if load is not None:
             from tensorfs import varena
-
-            from cozy_runtime._kernels import _execution
 
             slot_type = getattr(varena, "LoadSlot", None)
             if (
@@ -292,10 +300,7 @@ class PreparedRepeat:
 
         from cozy_runtime.internal.residency import Binding
 
-        try:
-            from cozy_runtime._kernels import _execution
-        except ImportError as error:
-            raise RuntimeError("this Runtime wheel has no prebuilt GPU execution module") from error
+        from cozy_runtime._kernels import _execution
 
         tensors = tuple(state)
         device = tensors[0].device.index
