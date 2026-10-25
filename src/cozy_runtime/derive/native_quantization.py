@@ -1,4 +1,4 @@
-"""One request-owned native Writer conversion; model policy stays in the derivation."""
+"""One scoped native Writer conversion; model policy stays in the derivation."""
 
 from __future__ import annotations
 
@@ -147,7 +147,10 @@ def quantize(
     convert, pending = output.prepare_quantization(
         source, rows, max_relative_frobenius=max_relative_frobenius
     )
-    execution = ctx.plan(_Work(convert))
+    # This helper joins before returning, like the existing bounded encoding loop.
+    # It must not consume Context.plan's one whole GPU program slot: an author may
+    # convert several outputs and then submit that program in the same request.
+    execution = _Work(convert).submit(ctx)
     observed = -1
     try:
         while True:
