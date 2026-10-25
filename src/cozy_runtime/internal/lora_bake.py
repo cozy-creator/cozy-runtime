@@ -659,6 +659,7 @@ def _built(device: int, wait: bool) -> bool | None:
         boot = json.dumps({"path": sys.path, "device": device})
         command = [sys.executable, "-I", "-c", _CHECK, boot]
         _BUILD = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log), log
+        _say(f"building its kernels in pid {_BUILD[0].pid}; LoRAs serve per step until it ends")
     child, log = _BUILD
     if child.poll() is None and not wait:
         return None
@@ -668,10 +669,16 @@ def _built(device: int, wait: bool) -> bool | None:
     said = log.read().decode(errors="replace").strip().splitlines()
     log.close()
     _BUILD = None
+    how = (f"killed by signal {-code}" if code < 0 else f"exit {code}") if code else ""
+    _say(f"kernel build pid {child.pid} {how or 'built and checked its kernels'}")
     if code:
-        how = f"killed by signal {-code}" if code < 0 else f"exit {code}"
         raise RuntimeError(f"bake kernel build {how}" + (f": {said[-1]}" if said else "")[:300])
     return True
+
+
+def _say(line: str) -> None:
+    """The bake build's start and end in the executor's log: no request waits for it."""
+    print(f"lora bake: {line}", file=sys.stderr, flush=True)
 
 
 def recipe(fused: bool) -> str:
