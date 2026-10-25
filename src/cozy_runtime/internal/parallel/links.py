@@ -31,7 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -291,11 +291,16 @@ def _boot() -> str:
     return hashlib.sha256("\0".join(parts).encode()).hexdigest()[:32]
 
 
-def measured(directory: Path | None, devices: Sequence[str]) -> Links:
+def measured(
+    directory: Path | None,
+    devices: Sequence[str],
+    waiting: Callable[[str], None] = lambda what: None,
+) -> Links:
     """The links between `devices` (`CUDA_VISIBLE_DEVICES` entries, in group order): read from
     this boot's measurement of a set holding them all, else measured now in a child process
     and kept. A probe that dies or wedges leaves its pairs unmeasured, and the group takes
-    the conservative route, saying why."""
+    the conservative route, saying why. A measurement in flight elsewhere is waited for, told
+    to `waiting` with its holder's pid."""
     if len(devices) < 2:
         return Links()
     if directory is None:
@@ -304,8 +309,17 @@ def measured(directory: Path | None, devices: Sequence[str]) -> Links:
     try:
         directory.mkdir(parents=True, exist_ok=True)
         with open(directory / f"{boot}.lock", "a+") as lock:
-            # Held by a measurement in flight, which ends by its own progress (`_probe`).
-            filelock.lock(lock)
+            # Held by a measurement in flight, which ends by its own progress (`_probe`); the
+            # kernel releases it if its holder dies.
+            try:
+                filelock.lock(lock, wait=False)
+            except BlockingIOError:
+                lock.seek(0)
+                waiting(f"waiting for this boot's link probe (pid {lock.read().strip() or '?'})")
+                filelock.lock(lock)
+            lock.truncate(0)
+            lock.write(str(os.getpid()))
+            lock.flush()
             for path in sorted(directory.glob(f"{boot}-*.json")):
                 links = Links.among(json.loads(path.read_text()), devices)
                 if links is not None:
@@ -409,8 +423,10 @@ def _group(torch: Any, rank: int, world: int, port: int, level: str) -> dict[str
     group.route({"NCCL_P2P_LEVEL": level})
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
-    store = dist.TCPStore("127.0.0.1", port, world, is_master=rank == 0)
-    dist.init_process_group("nccl", store=store, rank=rank, world_size=world, device_id=device)
+    store = dist.TCPStore("127.0.0.1", port, world, is_master=rank == 0, timeout=group.NEVER)
+    dist.init_process_group(
+        "nccl", store=store, rank=rank, world_size=world, device_id=device, timeout=group.NEVER
+    )
     report = _unformed(level, "")
     try:
         rows = (_CHUNK // 2 // 1024) // world * world

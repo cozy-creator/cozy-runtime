@@ -97,7 +97,9 @@ def mirror_component(
                         ended.append((0, code or ENDED, f"{type(exc).__name__}: {exc}"))
                         group.interrupt()  # the followers wait on GPU 0 in a collective
                     try:
-                        frames = list(zip(group.followers, group.collect("run"), strict=True))
+                        frames = list(
+                            zip(group.followers, group.collect("run", shown=False), strict=True)
+                        )
                     except GroupRefusal as lost:
                         if failure is None:
                             raise
@@ -283,7 +285,7 @@ def install_spread(
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
-                reply = _accept(name, group, rank, group.reply_one(rank, "run"))
+                reply = _accept(name, group, rank, group.reply_one(rank, "run", shown=False))
                 if result is None:
                     declined[str(rank)] = (reply.declined or "declined")[:300]
                     log["declined"][str(rank)] = declined[str(rank)]
