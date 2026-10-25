@@ -1506,6 +1506,8 @@ class Memory:
                         "torch_unused_bytes": unused,
                         "torch_returned_bytes": returned,
                         "native_reclaimed_bytes": reclaimed,
+                        # Cumulative snapshot; an older native wheel has no reason counters.
+                        "native_reclaimed_by_reason": self.native.stats().get("reclaimed_by_reason"),
                     }
                 )
 
