@@ -380,12 +380,12 @@ class Model:
         return [b for b in (self.common, *self.blocks.values()) if b is not None]
 
     @contextmanager
-    def passing(self, key: str = "") -> Iterator[Model]:
-        self.memory._open(self, key)
+    def passing(self, key: str = "", *, executing: bool = False) -> Iterator[Model]:
+        self.memory._open(self, key, executing=executing)
         try:
             yield self
         finally:
-            self.memory._close(self)
+            self.memory._close(self, executing=executing)
 
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
@@ -749,6 +749,10 @@ class Memory:
         self.window_bytes = 0
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
+        self.phase_supported = False
+        self._phase_names: frozenset[str] | None = None
+        self._phase_request: str | None = None
+        self._forward_depth = 0
         if self.cuda:
             try:
                 from tensorfs import varena
@@ -761,6 +765,7 @@ class Memory:
                     callable(getattr(varena, "replay", None))
                     and getattr(varena, "supports_prefetch", lambda: False)()
                 )
+                self.phase_supported = bool(getattr(varena, "supports_phases", lambda: False)())
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
                     raise
@@ -1131,8 +1136,8 @@ class Memory:
                 for held in (block.region, block.final_region)
                 if held is not None and held.resident
             )
-            block.preferred = (
-                model.prefix is None and self.room().free >= missing + self.window_bytes
+            block.preferred = model.prefix is None and (
+                block.cached() or self.room().free >= missing + self.window_bytes
             )
             block.preference_set = True
             if not block.preferred:
@@ -1147,7 +1152,7 @@ class Memory:
                     held.set_preferred(block.preferred and protect)
         elif created:
             region.set_preferred(block.preferred and (final or not block.final_only()))
-        elif block.preferred and (final or not block.final_only()) and not region.preferred:
+        if block.preferred and (final or not block.final_only()) and not region.preferred:
             # Native activation recovery reduces the prefix without calling Python. Keep
             # later unprepared blocks on the streaming side of that same watermark.
             model.prefix = (
@@ -1155,6 +1160,65 @@ class Memory:
             )
             block.preferred = False
         return region
+
+    def _activate_phase(self, model: Model) -> None:
+        """Prioritize an actual component phase, never each repeated block/denoising call."""
+        request = _REQUEST.get()
+        if (
+            not self.phase_supported
+            or self.capturing()
+            or (request is not None and (request.idle or request.overlap))
+        ):
+            return
+        names = request.phase(model.name) if request is not None else frozenset({model.name})
+        request_id = request.id if request is not None else None
+        with self.lock:
+            if names == self._phase_names and request_id == self._phase_request:
+                return
+            self._settle_prefetch(cancel=True)
+            self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
+            self._phase_names, self._phase_request = names, request_id
+            incoming = [m for m in self.models.values() if m.name in names]
+            missing = 0
+            for member in incoming:
+                member.prefix = None
+                for block in member.groups():
+                    block.preferred = block.preference_set = False
+                    required = [(block.final_region, block.final_bytes)]
+                    if not block.final_only():
+                        required.append((block.region, block.storage_bytes))
+                    for region, size in required:
+                        if not size:
+                            continue
+                        if region is not None and region.resident:
+                            region.set_preferred(True)
+                        else:
+                            missing += (
+                                (size + self.granularity - 1) // self.granularity * self.granularity
+                            )
+                    if block.cached():
+                        block.preferred = block.preference_set = True
+            wanted = missing + self.window_bytes
+            before = int(torch.cuda.memory_reserved(self.device))
+            unused = max(before - int(torch.cuda.memory_allocated(self.device)), 0)
+            if wanted > self.room().free and unused:
+                # The previous phase's inactive Torch segments are not weight capacity.
+                # Return them once here, not on each block or allocation callback.
+                torch.cuda.empty_cache()
+            returned = max(before - int(torch.cuda.memory_reserved(self.device)), 0)
+            # Protect the incoming cached bytes above; only other idle backing may go.
+            need = max(wanted - self.room().free, 0)
+            reclaimed = int(self.native.reclaim_unpreferred(need)) if need else 0
+            if request is not None:
+                request.phase_changes.append(
+                    {
+                        "models": sorted(names),
+                        "missing_bytes": missing,
+                        "torch_unused_bytes": unused,
+                        "torch_returned_bytes": returned,
+                        "native_reclaimed_bytes": reclaimed,
+                    }
+                )
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         model = block.model
@@ -1514,28 +1578,39 @@ class Memory:
         finally:
             model._release()
 
-    def _open(self, model: Model, key: str) -> None:
+    def _open(self, model: Model, key: str, *, executing: bool = False) -> None:
         model._claim()
         depth = getattr(model.local, "depth", 0)
         model.local.depth = depth + 1
-        if depth:
-            return
         request = _REQUEST.get()
+        outer_forward = False
+        if executing:
+            with self.lock:
+                outer_forward = self._forward_depth == 0
+                self._forward_depth += 1
         try:
-            self._declare(model)
+            if not depth:
+                self._declare(model)
+            if outer_forward:
+                self._activate_phase(model)
+            if depth:
+                return
             model.local.request = request
             if request is not None:
                 request.current.add(model.name)
             if model.common is not None:
                 self._enter(model.common)
         except BaseException:
-            model.local.depth = 0
-            if request is not None:
+            model.local.depth = depth
+            if executing:
+                with self.lock:
+                    self._forward_depth -= 1
+            if request is not None and not depth:
                 request.current.discard(model.name)
             model._release()
             raise
 
-    def _close(self, model: Model) -> None:
+    def _close(self, model: Model, *, executing: bool = False) -> None:
         try:
             model.local.depth -= 1
             if model.local.depth == 0:
@@ -1553,6 +1628,9 @@ class Memory:
                         request.current.discard(model.name)
                         request.sample()
         finally:
+            if executing:
+                with self.lock:
+                    self._forward_depth -= 1
             model._release()
 
     @contextmanager
@@ -1605,6 +1683,8 @@ class Request:
         self.memory, self.id, self.idle = memory, id, idle
         self.current: set[str] = set()
         self.steps: list[set[str]] = []
+        self.declared_steps: list[set[str]] = []
+        self.phase_changes: list[dict[str, Any]] = []
         self.peak = 0
         self.overlap = False
         self.moved = self.read_ns = 0
@@ -1632,6 +1712,18 @@ class Request:
             else {name(step)}
             for step in steps
         ]
+        self.declared_steps = [set(step) for step in self.steps]
+
+    def resolve(self, models: Mapping[str, Model]) -> None:
+        """Resolve this request's public component names through its actual Placement."""
+        for index, terms in enumerate(self.declared_steps):
+            mapped = {model.name for name, model in models.items() if name in terms}
+            self.steps[index].difference_update(models)
+            self.steps[index].update(mapped)
+
+    def phase(self, name: str) -> frozenset[str]:
+        matching = [step for step in self.steps if name in step]
+        return frozenset().union(*matching) if matching else frozenset({name})
 
     def room(self, step: int | None = None) -> Room:
         current = self.current if step is None or step >= len(self.steps) else self.steps[step]
@@ -1707,6 +1799,8 @@ class Request:
             "moved": {"store": {"bytes": self.moved, "ns": self.read_ns}},
             "trace": list(self.trace),
             "trace_scope": "fills",
+            "phases": list(self.phase_changes),
+            "phase_policy_supported": self.memory.phase_supported,
             "host": None,
         }
         if self.memory.cuda and torch.cuda.is_initialized():
@@ -1952,9 +2046,9 @@ def _hooks(model: Model) -> None:
                     for d in value.shape
                 )
             )
-            memory._open(model, key)
+            memory._open(model, key, executing=True)
 
-        model.handles.extend(_paired(sub, opened, lambda: memory._close(model)))
+        model.handles.extend(_paired(sub, opened, lambda: memory._close(model, executing=True)))
     for block in model.blocks.values():
         sub = model.module.get_submodule(block.path)
 

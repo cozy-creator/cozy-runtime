@@ -633,9 +633,11 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt()
 
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+    def plan(
+        self, steps: Sequence[str | Collection[str]], request: MemoryRequest | None = None
+    ) -> None:
         for row in self.rows.values():
-            row.plan(steps)
+            row.plan(steps, request=request)
 
     def release(self) -> None:
         for row in self.rows.values():
@@ -4077,7 +4079,7 @@ class Executor:
         if request is not None:
             request.plan(list(steps))
         if self.residency is not None:  # a step's components keep their holds (`using`)
-            self.residency.plan(steps)
+            self.residency.plan(steps, request=request)
         if self.group is not None and self.rank == 0:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps

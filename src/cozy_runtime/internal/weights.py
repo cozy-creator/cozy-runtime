@@ -65,6 +65,7 @@ from cozy_runtime.internal.residency import (
     Memory,
     Model,
     Region,
+    Request,
     ResidencyError,
     TensorLayout,
     Weights,
@@ -957,8 +958,10 @@ class Placement:
         for model in self.models.values():
             graphs.mark(model.module)
 
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+    def plan(self, steps: Sequence[str | Collection[str]], request: Request | None = None) -> None:
         self.steps = [frozenset([step] if isinstance(step, str) else step) for step in steps]
+        if request is not None:
+            request.resolve(self.models)
 
     @contextmanager
     def using(self, method: str, components: tuple[str, ...]) -> Iterator[None]:
@@ -1056,7 +1059,7 @@ class Placement:
         return graphs.domain.Pool(self.torch.cuda.graph_pool_handle())
 
     def graph_pass(self, component: str, entry: str) -> Any:
-        return self.models[component].passing(entry)
+        return self.models[component].passing(entry, executing=True)
 
     def graph_idle(self) -> AbstractContextManager[object]:
         """An idle capture's request: it fills free bytes only and never evicts."""
