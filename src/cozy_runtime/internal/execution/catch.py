@@ -1,9 +1,9 @@
 """Pure-site cuts sized from their operands against executor-local residency (`sizing`).
 
 A pure cut site estimates its level from live shapes (`need`) and local room (`r.room()`).
-An unexpected capacity refusal reclaims inactive owners and retries that pure level once if
-memory was released; otherwise it descends (`sizing.descend`). Failure at the finest level
-ends the request, typed (device_out_of_memory). Model blocks and package code always run once.
+An unexpected capacity refusal tries bounded reclamation before the full recovery fallback,
+retrying only this pure level after memory was released; otherwise it descends. Failure at the
+finest level ends the request, typed (device_out_of_memory). Model blocks and package code run once.
 """
 
 from __future__ import annotations
@@ -188,12 +188,25 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
             _clear(exc)
             # A failed allocation can reveal pressure the shape estimate cannot predict.
             # This also runs at the finest level, which sizing.descend cannot make smaller.
-            # Retry only this declared pure operation, and only after actual reclamation.
-            if request.reclaim() <= 0:
-                raise
-        retries += 1
-        checkpoint()
-        return run(level)
+            # First release a bounded amount, now that failed-frame pins are gone. An
+            # underestimated workspace still gets the existing full-reclaim last chance.
+            fresh = request.room()
+            target = max(need(level, fresh.granularity), fresh.free + fresh.granularity)
+            failure = exc
+            for wanted in (target, 0):
+                if request.reclaim(wanted) <= 0:
+                    continue
+                retries += 1
+                checkpoint()
+                scope.ordinals.clear()
+                try:
+                    return run(level)
+                except Exception as retry_error:
+                    if not short(retry_error):
+                        raise
+                    _clear(retry_error)
+                    failure = retry_error
+            raise failure from None
 
     try:
         if _capturing():

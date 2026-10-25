@@ -1307,7 +1307,25 @@ class Memory:
                     offset += (part.nbytes + 255) // 256 * 256
             try:
                 region = self._native_region(block, speculative=True)
-                read = region.prepare_read(block.model.source.ck, parts, reclaim=False)
+                # Outgoing cached weights may already fill the nonpreferred window even
+                # when the active phase has ample resident-prefix room. Admit its next
+                # block under that same soft preference without growing a cut prefix.
+                preferred = bool(region.preferred)
+                provisional = (
+                    self.phase_supported
+                    and not preferred
+                    and block.model.prefix is None
+                    and block.allocation_bytes + self.window_bytes <= self.room().free
+                )
+                try:
+                    if provisional:
+                        region.set_preferred(True)  # native end-of-prefix watermark still wins
+                    read = region.prepare_read(block.model.source.ck, parts, reclaim=False)
+                finally:
+                    if provisional:
+                        # The prepared Fill owns its pin. Only demand may assign a lasting
+                        # preference, so cancellation/failure cannot leave this one behind.
+                        region.set_preferred(preferred)
             except (torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) is not Fault.OOM:
                     raise
