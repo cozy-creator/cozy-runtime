@@ -14,16 +14,15 @@ class Ceiling(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class GpuMemory(msgspec.Struct, frozen=True, kw_only=True):
-    """One GPU's part of a request: its physical number, the fill ceilings there (None: not
-    measured yet), varena's record of the request (`tensorfs.varena.Stats`, its one definition,
-    copied attribute by attribute: `execution.record`), and its arena's torch high-water (bytes:
-    torch's own statistics don't see varena's allocator). A follower's crosses the group's seam:
-    every field but the GPU has a default, and unknown ones are ignored."""
+    """One physical GPU's request observation. `stats` labels its allocator scope: stock Torch
+    counters are process-wide and can include overlapping attempts. `torch_peak` is the
+    absolute allocator high-water, not bytes exclusively owned by this request. The historic
+    `memory.varena` wire key remains so existing record readers retain these observations."""
 
     gpu: int
     ceiling: Ceiling | None = None
     stats: dict[str, object] = msgspec.field(default_factory=dict)
-    torch_peak: int = 0
+    torch_peak: int | None = None
 
 
 class RankMemory(msgspec.Struct, frozen=True, kw_only=True):
