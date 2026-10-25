@@ -11,7 +11,7 @@ import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext, suppress
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 from cozy_runtime.author._model import LANDED, PLACED
@@ -87,6 +87,8 @@ class PreparedRepeat:
         self._binding_cleanup = ExitStack()
         self._load: Any = None
         self._load_used = False
+        self._load_ordering_requested = "checked"
+        self._load_ordering = "checked"
         self._landed = landed
 
     @staticmethod
@@ -142,6 +144,7 @@ class PreparedRepeat:
         owners: Sequence[object] = (),
         resident_only: bool = False,
         load: Any = None,
+        load_ordering: Literal["checked", "events", "auto"] = "checked",
         prefix: Callable[[], object] | None = None,
         suffix: Callable[[], object] | None = None,
         dtypes: Mapping[object, Any] | None = None,
@@ -151,7 +154,11 @@ class PreparedRepeat:
         A load slot is initialized capture storage, not a cold-model compiler. Capture seals
         its unpublished Fill; one later submission reads its actual stored bytes and, for an
         encoded slot, decodes them through TensorFS before the native graph starts. A native
-        worker checks read/decode completion; this is not an event-only handoff. Loaded
+        worker checks composed completion before publishing results. With load_ordering
+        "events", native producer events order compute and a GPU input guard skips invalid
+        decoded values. Late ownership/device failures discard output and retire; they do
+        not imply that no body ran. "auto" selects events only with both native capabilities,
+        otherwise checked ordering. The selected ordering is reported in facts. Loaded
         submissions are one-shot and require wait/request join
         before output access. Pure resident repeats retain their existing reuse contract.
 
@@ -224,7 +231,22 @@ class PreparedRepeat:
                     "native loading requires a TensorFS LoadSlot",
                     code="prepared_load_unavailable",
                 )
+            event_capable = bool(getattr(slot_type, "supports_event_input", False)) and bool(
+                getattr(_execution.ResidentRepeat, "supports_event_input", False)
+            )
+            if load_ordering not in ("checked", "events", "auto"):
+                raise ValueError("load_ordering must be checked, events or auto")
+            if load_ordering == "events" and not event_capable:
+                raise CapabilityError(
+                    "event-ordered loading requires matching native input capabilities",
+                    code="prepared_load_events_unavailable",
+                )
+            selected_ordering = (
+                "events" if load_ordering != "checked" and event_capable else "checked"
+            )
             owners = (*owners, load)
+        elif load_ordering != "checked":
+            raise ValueError("load_ordering requires a native LoadSlot")
         with (
             torch.cuda.device(device),
             torch.inference_mode(False),
@@ -363,6 +385,8 @@ class PreparedRepeat:
                     plan.close()
                     raise
                 plan._load = load
+                plan._load_ordering_requested = load_ordering
+                plan._load_ordering = selected_ordering
             plan._owned_bindings = tuple(bindings.values())
             for binding in plan._owned_bindings:
                 model = binding.model
@@ -580,7 +604,11 @@ class PreparedRepeat:
 
     def facts(self) -> dict[str, object]:
         """Facts from the actual native graph owner; a PreparedWork protocol is not evidence."""
-        return dict(self._native.facts())
+        return {
+            **self._native.facts(),
+            "load_ordering_requested": self._load_ordering_requested,
+            "load_ordering": self._load_ordering,
+        }
 
     def submit(self, context: Context | None = None) -> Execution:
         import torch
@@ -624,7 +652,10 @@ class PreparedRepeat:
                     # Arm on this OS thread before a TensorFS worker takes over. Its native
                     # continuation owns the recorded caller-ready event and execution epoch.
                     capsule, epoch = self._native.continuation(producer)
-                    job = self._load.submit_native(capsule)
+                    if self._load_ordering == "events":
+                        job = self._load.submit_native(capsule, event_ordered=True)
+                    else:
+                        job = self._load.submit_native(capsule)
                     self._load_used = True
                 self._active = Execution(self, context, epoch, outputs, readout, claimed, job)
                 if context is not None and self._load is None:

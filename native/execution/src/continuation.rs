@@ -73,6 +73,7 @@ struct Progress {
 
 type Operation = unsafe extern "C" fn(*mut c_void) -> Status;
 type Observe = unsafe extern "C" fn(*mut c_void, *mut Progress) -> Status;
+type StartAfter = unsafe extern "C" fn(*mut c_void, *const usize, u32, u64) -> Status;
 #[repr(C)]
 struct Api {
     abi_version: u32,
@@ -88,6 +89,7 @@ struct Api {
     poll: Observe,
     cancel: Operation,
     wait: Observe,
+    start_after: StartAfter,
 }
 // SAFETY: context is an opaque Arc<Continuation>; only its owning DSO dereferences it.
 unsafe impl Send for Api {}
@@ -104,6 +106,7 @@ struct Continuation {
     gate: AtomicU8, // 0: armed, 1: start committed, 2: canceled before start
     cancel_requested: AtomicBool,
     cancel_issued: AtomicBool,
+    input_invalid: AtomicBool,
     // A worker may outlive every public Python definition. Keep its provider module loaded.
     _module: Py<PyAny>,
 }
@@ -134,6 +137,9 @@ impl Continuation {
         Ok(state)
     }
     fn start(&self) -> Result<(), Status> {
+        self.start_input(None)
+    }
+    fn start_input(&self, input: Option<(&[usize], u64)>) -> Result<(), Status> {
         if self.owner.pid != std::process::id() {
             return Err(Status::invalid(
                 "native continuation cannot be used after fork",
@@ -161,7 +167,17 @@ impl Continuation {
             }
         };
         // SAFETY: reserved epoch exclusively owns this handle; its caller-ready event is recorded.
-        let code = unsafe { cozy_repeat_launch_armed(core.pointer as *mut c_void) };
+        let code = unsafe {
+            match input {
+                None => cozy_repeat_launch_armed(core.pointer as *mut c_void),
+                Some((streams, error)) => cozy_repeat_launch_after(
+                    core.pointer as *mut c_void,
+                    streams.as_ptr(),
+                    streams.len() as u32,
+                    error,
+                ),
+            }
+        };
         if code != 0 {
             core.failed = true;
             progress.phase = FAILED;
@@ -252,6 +268,20 @@ impl Continuation {
         progress.completed_steps = completed;
         progress.canceled = canceled;
         if done != 0 {
+            let (mut entered, mut invalid, mut checked) = (0, 0, 0);
+            // SAFETY: wait above completed the owned epoch and populated its host snapshot.
+            unsafe {
+                cozy_repeat_input_status(
+                    core.pointer as *mut c_void,
+                    &mut entered,
+                    &mut invalid,
+                    &mut checked,
+                );
+            }
+            if checked == 0 {
+                return Err(Status::unproven());
+            }
+            self.input_invalid.store(invalid != 0, Ordering::Release);
             progress.phase = DONE;
             progress.done = 1;
             core.pending = None;
@@ -353,6 +383,26 @@ unsafe extern "C" fn release(context: *mut c_void) -> Status {
 unsafe extern "C" fn start(context: *mut c_void) -> Status {
     boundary(context, Continuation::start)
 }
+unsafe extern "C" fn start_after(
+    context: *mut c_void,
+    streams: *const usize,
+    count: u32,
+    error: u64,
+) -> Status {
+    if streams.is_null()
+        || count == 0
+        || count > 4
+        || !(streams as usize).is_multiple_of(std::mem::align_of::<usize>())
+    {
+        return Status::invalid("event input requires one to four owned native streams");
+    }
+    // SAFETY: the retained same-process capability requires count readable native handles.
+    let streams = unsafe { std::slice::from_raw_parts(streams, count as usize) };
+    if streams.iter().any(|stream| *stream <= 2) || error % 4 != 0 {
+        return Status::invalid("event input has a special stream or unaligned error word");
+    }
+    boundary(context, |owner| owner.start_input(Some((streams, error))))
+}
 unsafe extern "C" fn cancel(context: *mut c_void) -> Status {
     boundary(context, Continuation::cancel)
 }
@@ -366,6 +416,11 @@ unsafe extern "C" fn poll(context: *mut c_void, out: *mut Progress) -> Status {
         unsafe {
             out.write(progress);
         }
+        if progress.done != 0 && owner.input_invalid.load(Ordering::Acquire) {
+            return Err(Status::invalid(
+                "native decoder rejected input values before body entry",
+            ));
+        }
         Ok(())
     })
 }
@@ -378,6 +433,11 @@ unsafe extern "C" fn wait(context: *mut c_void, out: *mut Progress) -> Status {
         // SAFETY: importer supplies one writable ABI-sized progress value.
         unsafe {
             out.write(progress);
+        }
+        if progress.done != 0 && owner.input_invalid.load(Ordering::Acquire) {
+            return Err(Status::invalid(
+                "native decoder rejected input values before body entry",
+            ));
         }
         Ok(())
     })
@@ -438,13 +498,14 @@ pub(super) fn export(
         gate: AtomicU8::new(0),
         cancel_requested: AtomicBool::new(false),
         cancel_issued: AtomicBool::new(false),
+        input_invalid: AtomicBool::new(false),
         _module: module,
     });
     let context = Arc::as_ptr(&owner) as *mut c_void;
     let api = Api {
         abi_version: 1,
         struct_size: std::mem::size_of::<Api>() as u32,
-        flags: 7,
+        flags: 15,
         device: owner.owner.device,
         reserved: 0,
         pid: u64::from(owner.owner.pid),
@@ -455,6 +516,7 @@ pub(super) fn export(
         poll,
         cancel,
         wait,
+        start_after,
     };
     let capsule = PyCapsule::new_with_value(
         py,
@@ -468,4 +530,4 @@ const _: () = assert!(std::mem::size_of::<Status>() == 256);
 const _: () = assert!(std::mem::size_of::<Progress>() == 24);
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Api>() == 88);
+const _: () = assert!(std::mem::size_of::<Api>() == 96);
