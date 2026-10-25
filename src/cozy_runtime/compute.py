@@ -42,6 +42,65 @@ def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
     return False
 
 
+def _graph_refusal_summary(graph: Any) -> str:
+    """Temporary diagnostic: bounded DOT metadata after capture, never raw labels/pointers."""
+    import json
+    import re
+    import tempfile
+    from collections import Counter
+    from pathlib import Path
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="cozy-graph-refusal-") as directory:
+            path = Path(directory) / "graph.dot"
+            # keep_graph=True already retains the template; no debug mode or replay needed.
+            graph.debug_dump(str(path))
+            with path.open("rb") as stream:
+                raw = stream.read(4 * 1024 * 1024 + 1)
+        truncated = len(raw) > 4 * 1024 * 1024
+        text = raw[: 4 * 1024 * 1024].decode("utf-8", errors="replace")
+        types: Counter[str] = Counter()
+        copies: Counter[str] = Counter()
+        numeric: Counter[str] = Counter()
+        labels = 0
+        # DOT is diagnostic text, not a stable API: preserve unknown/truncated counts.
+        for found in re.finditer(r'\blabel\s*=\s*"((?:\\.|[^"\\])*)"', text):
+            labels += 1
+            label = found[1]
+            known = re.findall(
+                r"\b(?:cudaGraphNodeType)?(Kernel|Memcpy|Memset|Host|Empty|Graph|"
+                r"EventRecord|WaitEvent|MemAlloc|MemFree|Conditional|"
+                r"ExtSemaphoreSignal|ExtSemaphoreWait)\b",
+                label,
+                flags=re.IGNORECASE,
+            )
+            types.update({name.lower() for name in known} or {"unclassified"})
+            copies.update(
+                {
+                    name.lower()
+                    for name in re.findall(
+                        r"\b(?:cudaMemcpy)?(HostToHost|HostToDevice|DeviceToHost|"
+                        r"DeviceToDevice|HtoH|HtoD|DtoH|DtoD|H2H|H2D|D2H|D2D)\b",
+                        label,
+                        flags=re.IGNORECASE,
+                    )
+                }
+            )
+            numeric.update(re.findall(r"\b(?:node_type|nodeType)\s*[:=]\s*(\d{1,3})\b", label))
+        result = {
+            "bytes_read": min(len(raw), 4 * 1024 * 1024),
+            "truncated": truncated,
+            "labels": labels,
+            "types": dict(types),
+            "copy_kinds": dict(copies),
+            "numeric_types": dict(numeric),
+        }
+        return "graph_dot_best_effort=" + json.dumps(result, separators=(",", ":"))[:900]
+    except Exception as failure:
+        # Preserve the original eligibility classification even if optional bindings/dump fail.
+        return "graph_dot_unavailable=" + type(failure).__name__[:80]
+
+
 def _native_error(error: Exception) -> NoReturn:
     import torch
 
@@ -410,6 +469,8 @@ class PreparedRepeat:
                     ],
                 )
             except _execution.NativeExecutionError as error:
+                if getattr(error, "eligibility_refusal", False):
+                    error.args = (f"{error}; {_graph_refusal_summary(graph)}",)
                 _native_error(error)
             finally:
                 # Restore state even when capture/eligibility fails; no prepared object escapes.
