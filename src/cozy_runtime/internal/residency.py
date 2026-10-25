@@ -260,6 +260,7 @@ class _Block:
     preference_set: bool = False
     native_storage: int | None = None
     aliases: dict[str, dict[str, str]] | None = None
+    raw_views: dict[tuple[int, str], tuple[int, _Part]] = field(default_factory=dict)
     finals: dict[str, dict[str, _Part]] = field(default_factory=dict)
     final_region: Any = None
     final_use: Any = None
@@ -1652,12 +1653,43 @@ class Memory:
                     block.last = time.monotonic_ns()
                     self._idle(block)
 
-    def _read(self, block: _Block, site: _Site) -> Tensor:
+    def _read(
+        self, block: _Block, site: _Site, raw_view: tuple[int, _Part] | None = None
+    ) -> Tensor:
+        global progress
         model = block.model
         model._claim()
         try:
             if not getattr(model.local, "depth", 0):
                 self._declare(model)
+            if (
+                raw_view is not None
+                and model.fill is None
+                and not (block.count or block.retained or block.loading)
+                and block.data is None
+                and block.ready is None
+                and ((pending := self._prefetch) is None or pending.block is not block)
+                and block.region is not None
+                and not self.capturing()
+                and (pin := getattr(block.region, "pin", None)) is not None
+            ):
+                # The atomic ready-only pin never fills or reclaims. Its ordinary storage
+                # alias owns the bytes until the consumer dies, without binding other sites.
+                with torch.inference_mode(False):
+                    use = pin()
+                    if use is not None:
+                        offset, part = raw_view
+                        value = (
+                            use.tensor[offset : offset + part.nbytes]
+                            .view(getattr(torch, _DTYPES[part.dtype]))
+                            .view(part.shape)
+                        )
+                        old = site.table[site.name]
+                        if old is not None and old.dtype != value.dtype:
+                            value = value.to(old.dtype)
+                        block.last = time.monotonic_ns()
+                        progress += 1
+                        return nn.Parameter(value, requires_grad=False) if site.parameter else value
             self._enter(block)
             try:
                 value = site.table[site.name]
@@ -2022,6 +2054,15 @@ def _layout(block: _Block) -> None:
                 row_finals[name] = _Part(layout.dtype, shape, count * width, "", strides)
     block.aliases = aliases
     block.finals = {key: row for key, row in finals.items() if row}
+    if model.fill is None and not block.finals:
+        offset = 0
+        for key, parts in block.parts.items():
+            for role, part in parts.items():
+                for name, source in aliases[key].items():
+                    if source == role:
+                        for site in model.sites[name]:
+                            block.raw_views[(id(site.table), site.name)] = (offset, part)
+                offset += (part.nbytes + 255) // 256 * 256
 
 
 def _placeholders(model: Model) -> None:
@@ -2041,8 +2082,14 @@ def _placeholders(model: Model) -> None:
         if sites[0].parameter:
             held = nn.Parameter(held, requires_grad=False)
 
-        def read(b: _Block = block, site: _Site = sites[0]) -> Tensor:
-            return model.memory._read(b, site)
+        def read(
+            b: _Block = block,
+            site: _Site = sites[0],
+            raw_view: tuple[int, _Part] | None = block.raw_views.get(
+                (id(sites[0].table), sites[0].name)
+            ),
+        ) -> Tensor:
+            return model.memory._read(b, site, raw_view)
 
         held._varena_read = read
         for site in sites:

@@ -1,0 +1,1 @@
+Avoid rebuilding every weight view for an unheld immutable factor read when its existing native region is ready. Keep normal preparation for cold, transformed, active or capturing weights and preserve escaped storage ownership.
