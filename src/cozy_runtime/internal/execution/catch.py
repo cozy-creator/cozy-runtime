@@ -183,7 +183,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         try:
             return run(level)
         except Exception as exc:
-            if not short(exc):
+            if _capturing() or not short(exc):
                 raise
             _clear(exc)
             # A failed allocation can reveal pressure the shape estimate cannot predict.
