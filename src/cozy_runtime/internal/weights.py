@@ -24,7 +24,14 @@ from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from cozy_runtime import graphs
-from cozy_runtime.author._loader import Census, TensorLike, TensorSpec, _members, canonical_dtype
+from cozy_runtime.author._loader import (
+    TENSORFS_NAMES,
+    Census,
+    TensorLike,
+    TensorSpec,
+    _members,
+    canonical_dtype,
+)
 from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.derive import placing
@@ -571,7 +578,9 @@ class _Routes:
             return MappingProxyType(
                 {
                     name: TensorLayout(
-                        row.dtype, row.shape, source="value" if route == "verbatim" else None
+                        TENSORFS_NAMES[row.dtype],
+                        row.shape,
+                        source="value" if route == "verbatim" else None,
                     )
                 }
             )
@@ -586,7 +595,7 @@ class _Routes:
             if value is None:
                 continue
             targets[f"{name.removesuffix('.weight')}.{buffer}"] = TensorLayout(
-                canonical_dtype(value.dtype),
+                TENSORFS_NAMES[canonical_dtype(value.dtype)],
                 tuple(value.shape),
                 tuple(value.stride()),
                 role if role not in derived else None,
