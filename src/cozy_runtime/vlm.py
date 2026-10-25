@@ -17,6 +17,7 @@ import json
 import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Annotated, Any
 
 import msgspec
@@ -26,6 +27,7 @@ from PIL import Image as PILImage
 from PIL.Image import Image
 from tokenizers import Tokenizer
 from transformers import (
+    AddedToken,
     AutoConfig,
     AutoModelForImageTextToText,
     GenerationConfig,
@@ -256,7 +258,7 @@ def _held(config: Config, key: str) -> bool:
 
 
 def processor(
-    assets: ModelAssets,
+    assets: ModelAssets | Path,
     folder: str = "",
     config: Mapping[str, Any] | None = None,
     image: Mapping[str, Any] | None = None,
@@ -265,11 +267,21 @@ def processor(
     memory. The image and video processors' settings are their own files, one
     `processor_config.json`, or `config`: TensorFS keeps a component folder's config file as the
     component's config, not among its files. `image` replaces image settings (None drops one).
-    The chat template is `chat_template.jinja` or `chat_template.json`."""
-    names = {name.removeprefix(folder) for name in assets.names() if name.startswith(folder)}
+    The tokenizer is `tokenizer.json`, or a slow one's `vocab.json` and `merges.txt`; the chat
+    template is `chat_template.jinja`, `chat_template.json` or the tokenizer config's. `assets` may
+    be a directory a package bundles."""
+    if isinstance(assets, Path):
+        root = assets
+        names = {p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file()}
 
-    def read(name: str) -> bytes:
-        return assets.read(folder + name)
+        def read(name: str) -> bytes:
+            return (root / name).read_bytes()
+    else:
+        files = assets
+        names = {name.removeprefix(folder) for name in files.names() if name.startswith(folder)}
+
+        def read(name: str) -> bytes:
+            return files.read(folder + name)
 
     def held(name: str) -> dict[str, Any]:
         return json.loads(read(name)) if name in names else {}
@@ -292,19 +304,31 @@ def processor(
     kind = images.pop("image_processor_type", "Qwen2VLImageProcessor")
     image_processor = getattr(transformers, kind)(**images)
     tokenizer_config = json.loads(read("tokenizer_config.json"))
+    added = tokenizer_config.get("added_tokens_decoder", {})
+    chat = tokenizer_config.get("chat_template")
     for key in TOKENIZER_METADATA:
         tokenizer_config.pop(key, None)
     named_tokenizer = tokenizer_config.pop("tokenizer_class", "")
     tokenizer_class = getattr(transformers, named_tokenizer, None)
     if tokenizer_class is None or named_tokenizer == "PreTrainedTokenizer":
         tokenizer_class = PreTrainedTokenizerFast
-    tokenizer = tokenizer_class(
-        tokenizer_object=Tokenizer.from_str(read("tokenizer.json").decode()), **tokenizer_config
-    )
+    if "tokenizer.json" in names:
+        tokenizer = tokenizer_class(
+            tokenizer_object=Tokenizer.from_str(read("tokenizer.json").decode()), **tokenizer_config
+        )
+    else:  # a slow tokenizer: its vocabulary, merges and added tokens
+        merges = [tuple(line.split(" ")) for line in read("merges.txt").decode().splitlines()]
+        tokenizer = tokenizer_class(
+            vocab=json.loads(read("vocab.json")),
+            merges=[pair for pair in merges if pair[0] and not pair[0].startswith("#")],
+            added_tokens_decoder={int(i): AddedToken(**token) for i, token in added.items()},
+            **tokenizer_config,
+        )
     if "chat_template.jinja" in names:
         chat = read("chat_template.jinja").decode()
-    else:
+    elif "chat_template.json" in names:
         chat = json.loads(read("chat_template.json"))["chat_template"]
+    tokenizer.chat_template = chat
     return getattr(transformers, named)(
         image_processor=image_processor, tokenizer=tokenizer, chat_template=chat, **extra
     )
