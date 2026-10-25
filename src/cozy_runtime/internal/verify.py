@@ -75,8 +75,9 @@ def within(errors: dict[str, float], budget: float) -> Verdict:
     return Verdict(errors[worst] <= budget, detail)
 
 
-#: How much more a kernel with its own rounding of a format may lose than that format's exact law.
-SLACK = 1.25
+#: How much more a kernel with its own rounding of a format may lose than that format's exact law
+#: (comfy-kitchen's int8 linear: 1.18x on sm89, run 17614); garbage loses O(100)x.
+SLACK = 1.5
 
 
 def against_law(errors: dict[str, tuple[float, float]], slack: float = SLACK) -> Verdict:
