@@ -1,0 +1,1 @@
+`Config` drops every `_`-prefixed key the saving library writes about itself (`_name_or_path`, `_class_name`, `_diffusers_version`), not only `_name_or_path`, so `config.section(name).mapping()` is exactly a component constructor's arguments (xs-101).
