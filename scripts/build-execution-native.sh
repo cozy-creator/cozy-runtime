@@ -5,7 +5,7 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 destination=${1:?Usage: build-execution-native.sh INSTALL_PREFIX}
 target=${CARGO_TARGET_DIR:-"$root/native/execution/target"}
 export NVCC="$COZY_CUDA_TOOLKIT/bin/nvcc"
-cargo build --release --manifest-path "$root/native/execution/Cargo.toml"
+cargo build --locked --release --manifest-path "$root/native/execution/Cargo.toml"
 mkdir -p "$destination/cozy_runtime/_kernels"
 case "$(uname -s)" in
   Linux) cp "$target/release/lib_execution.so" "$destination/cozy_runtime/_kernels/_execution.abi3.so" ;;

@@ -1,7 +1,7 @@
 //! One resident graph definition, one GPU-driven loop, and its complete owner lifetime.
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
 use std::{
-    ffi::c_void,
+    ffi::{CStr, c_char, c_void},
     ops::Deref,
     sync::{Arc, Mutex},
 };
@@ -32,20 +32,28 @@ unsafe extern "C" {
     fn cozy_repeat_wait(run: *mut c_void, completed: *mut u32, canceled: *mut u32) -> i32;
     fn cozy_repeat_nodes(run: *mut c_void) -> u32;
     fn cozy_repeat_validated_nodes(run: *mut c_void) -> u32;
+    fn cozy_repeat_inspection(run: *mut c_void) -> *const c_char;
     fn cozy_repeat_destroy(run: *mut c_void) -> i32;
+}
+
+fn ineligible(py: Python<'_>, detail: impl Into<String>) -> PyErr {
+    let error = NativeExecutionError::new_err(detail.into());
+    let _ = error.value(py).setattr("eligibility_refusal", true);
+    error
 }
 
 fn cuda_error(py: Python<'_>, operation: &str, code: i32) -> PyErr {
     if matches!(code, -102..=-100) {
-        let error = NativeExecutionError::new_err(if code == -102 {
-            "prepared submission during CUDA capture is not supported"
-        } else if code == -101 {
-            "prepared graph body is empty"
-        } else {
-            "prepared graph contains unsupported node types or exceeds bounded inspection limits"
-        });
-        let _ = error.value(py).setattr("eligibility_refusal", true);
-        return error;
+        return ineligible(
+            py,
+            if code == -102 {
+                "prepared submission during CUDA capture is not supported"
+            } else if code == -101 {
+                "prepared graph body is empty"
+            } else {
+                "prepared graph contains unsupported node types or exceeds bounded inspection limits"
+            },
+        );
     }
     if code < 0 {
         return PyRuntimeError::new_err(match code {
@@ -201,12 +209,26 @@ impl ResidentRepeat {
             (pointer as usize, code)
         });
         if code != 0 {
+            let inspection = if code == -100 && pointer != 0 {
+                // SAFETY: create returned this live partial Repeat. Its fixed, NUL-terminated
+                // diagnostic contains no pointers and is copied before any owner cleanup.
+                Some(unsafe {
+                    CStr::from_ptr(cozy_repeat_inspection(pointer as *mut c_void))
+                        .to_string_lossy()
+                        .into_owned()
+                })
+            } else {
+                None
+            };
             // SAFETY: the helper returns its partial owner even on failure.
             if pointer != 0 && unsafe { cozy_repeat_destroy(pointer as *mut c_void) } != 0 {
                 // Unknown device completion: retain every Python/Torch storage owner until process exit.
                 std::mem::forget(owners);
             }
-            return Err(cuda_error(py, "prepare resident repeat", code));
+            return Err(match inspection.filter(|detail| !detail.is_empty()) {
+                Some(detail) => ineligible(py, format!("prepared graph ineligible: {detail}")),
+                None => cuda_error(py, "prepare resident repeat", code),
+            });
         }
         // SAFETY: the successfully constructed handle remains exclusively owned here.
         let nodes = unsafe { cozy_repeat_nodes(pointer as *mut c_void) };

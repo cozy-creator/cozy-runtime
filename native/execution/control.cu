@@ -1,6 +1,7 @@
 // Original CUDA graph control, built ahead of time. No Python or host nodes in a loop body.
 #include <cuda_runtime.h>
 #include <cstdint>
+#include <cstdio>
 #include <new>
 #include <vector>
 
@@ -27,6 +28,7 @@ struct Repeat {
     unsigned steps = 0;
     unsigned nodes = 0;
     unsigned validated_nodes = 0;
+    char inspection[256]{};
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
     cudaStream_t work = nullptr;
@@ -59,14 +61,30 @@ __global__ void snapshot(Control *state, Snapshot *out) {
     out->cancel = atomicAdd(&state->cancel, 0u);
 }
 
+// Preserve only the first refusal, without pointers or another lifetime/ownership mechanism.
+static cudaError_t ineligible(Repeat *run, const char *stage, const char *reason,
+                             int type, unsigned depth, size_t count, unsigned total,
+                             int copy_kind = -1, int pointer_type = -1, int pointer_device = -1) {
+    if (!run->inspection[0]) {
+        std::snprintf(run->inspection, sizeof(run->inspection),
+                      "stage=%s reason=%s type=%d depth=%u local=%zu total=%u "
+                      "copy_kind=%d pointer_type=%d pointer_device=%d expected_device=%d",
+                      stage, reason, type, depth, count, total, copy_kind,
+                      pointer_type, pointer_device, run->device);
+    }
+    return static_cast<cudaError_t>(-100);
+}
+
 // Reject every operation whose ownership/side effects cannot be represented by a resident body.
 // cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle.
-static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device, unsigned depth = 0) {
-    if (depth > 32) return static_cast<cudaError_t>(-100);
+static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
+                           Repeat *run, const char *stage, unsigned depth = 0) {
+    if (depth > 32) return ineligible(run, stage, "depth_limit", -1, depth, 0, total);
     size_t count = 0;
     auto error = cudaGraphGetNodes(graph, nullptr, &count);
     if (error != cudaSuccess) return error;
-    if (count > 1000000 || total > 1000000 - count) return static_cast<cudaError_t>(-100);
+    if (count > 1000000 || total > 1000000 - count)
+        return ineligible(run, stage, "node_limit", -1, depth, count, total);
     std::vector<cudaGraphNode_t> nodes(count);
     error = cudaGraphGetNodes(graph, nodes.data(), &count);
     if (error != cudaSuccess) return error;
@@ -78,7 +96,7 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device, unsig
         if (type == cudaGraphNodeTypeGraph) {
             cudaGraph_t child;
             error = cudaGraphChildGraphNodeGetGraph(node, &child);
-            if (error == cudaSuccess) error = inspect(child, total, device, depth + 1);
+            if (error == cudaSuccess) error = inspect(child, total, device, run, stage, depth + 1);
             if (error != cudaSuccess) return error;
         } else if (type == cudaGraphNodeTypeMemcpy) {
             cudaMemcpy3DParms parameters{};
@@ -86,13 +104,18 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device, unsig
             if (error != cudaSuccess) return error;
             if (parameters.srcArray || parameters.dstArray || !parameters.srcPtr.ptr || !parameters.dstPtr.ptr
                 || (parameters.kind != cudaMemcpyDeviceToDevice && parameters.kind != cudaMemcpyDefault))
-                return static_cast<cudaError_t>(-100);
+                return ineligible(run, stage, "memcpy_layout_or_kind", type, depth, count, total,
+                                  parameters.kind);
+            unsigned endpoint = 0;
             for (const void *pointer : {parameters.srcPtr.ptr, parameters.dstPtr.ptr}) {
                 cudaPointerAttributes attributes{};
                 error = cudaPointerGetAttributes(&attributes, pointer);
                 if (error != cudaSuccess) return error;
                 if (attributes.type != cudaMemoryTypeDevice || attributes.device != device)
-                    return static_cast<cudaError_t>(-100);
+                    return ineligible(run, stage, endpoint ? "memcpy_destination" : "memcpy_source",
+                                      type, depth, count, total, parameters.kind,
+                                      attributes.type, attributes.device);
+                ++endpoint;
             }
         } else if (type == cudaGraphNodeTypeMemset) {
             cudaMemsetParams parameters{};
@@ -102,10 +125,11 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device, unsig
             error = cudaPointerGetAttributes(&attributes, parameters.dst);
             if (error != cudaSuccess) return error;
             if (attributes.type != cudaMemoryTypeDevice || attributes.device != device)
-                return static_cast<cudaError_t>(-100);
+                return ineligible(run, stage, "memset_destination", type, depth, count, total,
+                                  -1, attributes.type, attributes.device);
         } else if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeEmpty
                    && type != cudaGraphNodeTypeMemcpy && type != cudaGraphNodeTypeMemset) {
-            return static_cast<cudaError_t>(-100);
+            return ineligible(run, stage, "node_type", type, depth, count, total);
         }
     }
     return cudaSuccess;
@@ -152,7 +176,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     *out = run;
     auto checked = [&](cudaError_t result) { return result; };
 #define CHECK(call) do { error = checked(call); if (error != cudaSuccess) return error; } while (0)
-    CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device));
+    CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device, run, "source"));
     if (!run->nodes) return -101;
     CHECK(cudaStreamCreateWithFlags(&run->work, cudaStreamNonBlocking));
     int lowest_priority, highest_priority;
@@ -190,7 +214,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     cudaGraphNode_t boundary;
     CHECK(cudaGraphAddKernelNode(&boundary, body, &compute, 1, &kernel));
     // Inspect the actual assembled body, including the cloned source child definition.
-    CHECK(inspect(body, run->validated_nodes, device));
+    CHECK(inspect(body, run->validated_nodes, device, run, "assembled"));
     CHECK(cudaGraphInstantiate(&run->executable, run->graph, 0));
     CHECK(cudaGraphUpload(run->executable, run->work));
     CHECK(cudaStreamSynchronize(run->work));
@@ -333,6 +357,7 @@ extern "C" int cozy_repeat_cancel(Repeat *run) {
 extern "C" int cozy_repeat_wait(Repeat *run, unsigned *completed, unsigned *canceled) {
     return on_device(run->device, [&] { return wait(run, completed, canceled); });
 }
+extern "C" const char *cozy_repeat_inspection(Repeat *run) { return run->inspection; }
 extern "C" int cozy_repeat_destroy(Repeat *run) {
     if (!run) return cudaSuccess;
     const int code = on_device(run->device, [&] { return destroy(run); });
