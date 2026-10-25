@@ -42,6 +42,8 @@ def composer(graph: Graph) -> Callable[[object], None]:
         from peft import LoraConfig
         from peft.tuners.lora.layer import Conv2d as PeftConv2d, Linear as PeftLinear
         from torch import nn
+
+        from cozy_runtime import lora
     except ImportError as exc:
         raise _refuse(
             "backend_unavailable",
@@ -57,18 +59,14 @@ def composer(graph: Graph) -> Callable[[object], None]:
         _cozy_baked = False
 
         def forward(self, x: torch.Tensor, *args: object, **kwargs: object) -> torch.Tensor:
-            # Base hooks (Turbo's overlay) run inside `base_layer`. Extra memory: [rows, rank].
+            # Base hooks (Turbo's overlay) run inside `base_layer`.
             result = self.base_layer(x, *args, **kwargs).contiguous()
-            if self._cozy_baked:
-                return result
-            flat, rows = result.view(-1, result.shape[-1]), x.reshape(-1, x.shape[-1])
-            for name in self.active_adapters:
-                low = nn.functional.linear(rows, self.lora_A[name].weight.to(rows.dtype))
-                flat.addmm_(
-                    low.to(flat.dtype),
-                    self.lora_B[name].weight.to(flat.dtype).t(),
-                    alpha=self.scaling[name],
-                )
+            if not self._cozy_baked:
+                for name in self.active_adapters:
+                    lora.accumulate(
+                        x, result, self.lora_A[name].weight, self.lora_B[name].weight,
+                        self.scaling[name],
+                    )
             return result
 
     class _Conv2d(PeftConv2d):  # type: ignore[misc]
