@@ -10,6 +10,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack, suppress
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
@@ -59,6 +60,8 @@ class PreparedRepeat:
         self._submission = threading.RLock()
         self._dependencies, self._bindings = dependencies, bindings
         self._closed = False
+        self._owned_bindings: tuple[Any, ...] = ()
+        self._binding_cleanup = ExitStack()
 
     @staticmethod
     def _layout(tensor: Any) -> tuple[Any, ...]:
@@ -88,6 +91,57 @@ class PreparedRepeat:
 
     @classmethod
     def capture(
+        cls,
+        step: Callable[[Any], object],
+        *,
+        state: Sequence[Any],
+        steps: int,
+        owners: Sequence[object] = (),
+    ) -> PreparedRepeat:
+        """Acquire independent graph bindings; caller bindings remain caller-owned."""
+        import torch
+
+        from cozy_runtime import graphs
+        from cozy_runtime.internal.residency import Binding
+
+        with ExitStack() as cleanup, ExitStack() as preparing:
+            resolved: list[object] = []
+            bindings: dict[int, Any] = {}
+            for owner in owners:
+                if isinstance(owner, Binding):
+                    if not owner.valid():
+                        raise RuntimeError("capture requires a valid weight binding")
+                    binding = bindings.get(id(owner))
+                    if binding is None:
+                        binding = owner.model.retain(tuple(b.path for b in owner.groups if b.path))
+                        bindings[id(owner)] = binding
+                        cleanup.callback(binding.close)
+                        preparing.enter_context(binding.prepare())
+                    resolved.append(binding)
+                else:
+                    resolved.append(owner)
+            bypass = graphs.BYPASS.set(True)
+            try:
+                plan = cls._capture_ready(step, state=state, steps=steps, owners=resolved)
+            finally:
+                graphs.BYPASS.reset(bypass)
+            plan._owned_bindings = tuple(bindings.values())
+            for binding in plan._owned_bindings:
+                model = binding.model
+                graphs.own_prepared(model.module, plan)
+                if model.retire_graphs is None:
+                    root = weakref.ref(model.module)
+
+                    def retire(root: Any = root) -> None:
+                        if (module := root()) is not None:
+                            graphs.retire(torch, module)
+
+                    model.retire_graphs = retire
+            plan._binding_cleanup = cleanup.pop_all()
+            return plan
+
+    @classmethod
+    def _capture_ready(
         cls,
         step: Callable[[Any], object],
         *,
@@ -196,17 +250,57 @@ class PreparedRepeat:
         bindings = tuple(
             (weakref.ref(owner), owner.identity) for owner in owners if isinstance(owner, Binding)
         )
+        # The local mode class has a __class__ closure cycle. Native ownership has taken its
+        # own references; do not leave GPU tensors retained until an unrelated Python GC pass.
+        held.clear()
         return cls(native, tensors, device, steps, dependencies, bindings)
+
+    def _valid_definition(self) -> bool:
+        try:
+            self._validate()
+            return True
+        except RuntimeError:
+            return False
+
+    def _retire_if_idle(self) -> None:
+        with self._submission:
+            if self._closed:
+                return
+            if self._active is not None and self._active._finished is None:
+                _completed, _canceled, done = self._native.poll(self._active._epoch)
+                if not done:
+                    raise RuntimeError(
+                        "cannot retire prepared work while its GPU execution is active"
+                    )
+                self._active.poll()
+            self.close()
+
+    def _release_owned_bindings(self) -> None:
+        from cozy_runtime import graphs
+
+        bindings, self._owned_bindings = self._owned_bindings, ()
+        for binding in bindings:
+            graphs.forget_prepared(binding.model.module, self)
+        self._binding_cleanup.close()
 
     def close(self) -> None:
         with self._submission:
             if self._closed:
                 return
+            if self._active is not None and self._active._finished is None:
+                self._native.cancel(self._active._epoch)
+                completed, canceled = self._native.wait(self._active._epoch)
+                self._active._finish(completed, canceled)
             try:
                 self._native.close_owner()
             except Exception as error:
                 _native_error(error)
             self._closed = True
+            self._release_owned_bindings()
+
+    def __del__(self) -> None:
+        with suppress(BaseException):
+            self.close()
 
     def facts(self) -> dict[str, object]:
         """Facts from the actual native graph owner; a PreparedWork protocol is not evidence."""
@@ -238,17 +332,27 @@ class PreparedRepeat:
                 readout = torch.cuda.Event()
             if context is not None:
                 context.raise_if_cancelled()
+            claimed: list[Any] = []
             try:
+                for binding in self._owned_bindings:
+                    if binding.model not in claimed:
+                        binding.model._claim()
+                        claimed.append(binding.model)
                 epoch = self._native.launch(torch.cuda.current_stream(self.device).cuda_stream)
-                self._active = Execution(self, context, epoch, outputs, readout)
+                self._active = Execution(self, context, epoch, outputs, readout, claimed)
                 return self._active
             except BaseException as error:
                 if isinstance(error, Exception) and getattr(error, "eligibility_refusal", False):
+                    for model in reversed(claimed):
+                        model._release()
                     _native_error(error)  # native preflight rejected before any launch/mutation
                 # A signal or error after launch must not lose an in-flight native owner.
                 try:
                     self._native.close_owner()
                     self._closed = True
+                    for model in reversed(claimed):
+                        model._release()
+                    self._release_owned_bindings()
                 except Exception as cleanup:
                     if getattr(cleanup, "error_code", None) not in (None, 2):
                         _native_error(cleanup)
@@ -271,11 +375,13 @@ class Execution:
         epoch: int,
         outputs: tuple[Any, ...],
         readout: Any,
+        models: list[Any],
     ) -> None:
         self.plan, self.context = plan, context
         self._finished: Progress | None = None
         self._epoch, self._outputs, self._readout = epoch, outputs, readout
         self._observation = threading.RLock()
+        self._models = models
 
     def _finish(self, completed: int, canceled: bool) -> Progress:
         import torch
@@ -287,6 +393,9 @@ class Execution:
                 self._readout.record(torch.cuda.current_stream(self.plan.device))
                 self._readout.synchronize()
             self._finished = Progress(completed, canceled, True)
+            models, self._models = self._models, []
+            for model in reversed(models):
+                model._release()
         return self._finished
 
     def poll(self) -> Progress:
@@ -327,7 +436,12 @@ class Execution:
 
     def close(self) -> None:
         try:
+            if self._finished is None:
+                self.plan._native.cancel(self._epoch)
+                completed, canceled = self.plan._native.wait(self._epoch)
+                self._finish(completed, canceled)
             self.plan._native.close(self._epoch)
             self.plan._closed = True
+            self.plan._release_owned_bindings()
         except Exception as error:
             _native_error(error)
