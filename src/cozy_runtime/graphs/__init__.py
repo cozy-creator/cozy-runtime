@@ -612,7 +612,7 @@ def retire_stale(torch: Any, root: Any) -> None:
         with recorder.lock:
             prepared = tuple(recorder.prepared)
         for definition in prepared:
-            if not definition._valid_definition():
+            if not definition.valid():
                 definition._retire_if_idle()
     if recorder is not None and recorder.binding is not None and not recorder.binding.valid():
         retire(torch, root)

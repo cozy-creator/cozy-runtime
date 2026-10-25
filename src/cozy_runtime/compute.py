@@ -103,19 +103,34 @@ class PreparedRepeat:
             storage.nbytes(),
         )
 
-    def _validate(self) -> None:
+    def _invalid_reason(self) -> str | None:
         if self._closed:
-            raise RuntimeError("prepared repeat is closed")
+            return "prepared repeat is closed"
         if self._landed != LANDED[0]:
-            raise RuntimeError("prepared kernel implementations changed")
+            return "prepared kernel implementations changed"
         for reference, layout in self._dependencies:
             tensor = reference()
             if tensor is None or self._layout(tensor) != layout:
-                raise RuntimeError("prepared tensor storage or geometry changed")
+                return "prepared tensor storage or geometry changed"
         for reference, identity in self._bindings:
             binding = reference()
             if binding is None or not binding.valid() or binding.identity != identity:
-                raise RuntimeError("prepared weight binding or fill identity changed")
+                return "prepared weight binding or fill identity changed"
+        return None
+
+    def _validate(self) -> None:
+        if reason := self._invalid_reason():
+            raise RuntimeError(reason)
+
+    def valid(self) -> bool:
+        """Whether this definition's owners, layouts and implementations still match.
+
+        Input values may change in place between completed submissions. This query neither
+        prepares missing weights nor reserves a future submission; submit checks again.
+        Unexpected storage/device errors propagate rather than becoming a cache miss.
+        """
+        with self._submission:
+            return self._invalid_reason() is None
 
     @classmethod
     def capture(
@@ -480,13 +495,6 @@ class PreparedRepeat:
         # own references; do not leave GPU tensors retained until an unrelated Python GC pass.
         held.clear()
         return cls(native, tensors, device, steps, dependencies, bindings, landed)
-
-    def _valid_definition(self) -> bool:
-        try:
-            self._validate()
-            return True
-        except RuntimeError:
-            return False
 
     def _retire_if_idle(self) -> None:
         with self._submission:
