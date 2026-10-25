@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
+import math
 import mmap
 import os
 import threading
@@ -30,7 +31,7 @@ from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import CapabilityError
 
 if TYPE_CHECKING:
-    from tensorfs.api import QuantizeTensor
+    from tensorfs.api import NormalizeBf16Tensor, QuantizeTensor
 
 #: The store's location when the machine names none (TensorFS's default, owner D3).
 DEFAULT_HOME = "~/.cache/tensorfs"
@@ -331,6 +332,74 @@ class Output:
             writer.put_encoded(
                 key, dtype=dtype, shape=list(shape), scheme=scheme, parts=views, params=dict(params)
             )
+
+    def prepare_bf16(
+        self,
+        source: Checkpoint,
+        tensors: Sequence[NormalizeBf16Tensor],
+        *,
+        max_buffer_bytes: int = 8 << 20,
+    ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
+        """Reserve missing BF16 bytes, then return one owning native normalization call.
+
+        Supply the full immutable normalization selection, even when every key is already
+        journaled. Only native success validates resume and admits completed-output reuse.
+        """
+        if not tensors:
+            raise CapabilityError("normalization needs a selected tensor", code="quantization_plan")
+        identity = hashlib.sha256(
+            canonical_json.encode(
+                {
+                    "operation": "bf16-normalize/1",
+                    "source": source.id,
+                    "selection": list(tensors),
+                    "implementation": raw.normalization_implementation(),
+                }
+            )
+        ).hexdigest()
+        if self.done is not None:
+            if self.done.metadata.get("native_bf16_normalization") != identity:
+                raise CapabilityError(
+                    "finished output has different BF16 normalization work; derive a new output",
+                    code="normalization_identity",
+                )
+            return lambda _: {
+                "identity": identity,
+                "converted_keys": 0,
+                "reused_keys": len(tensors),
+                "source_bytes_read": 0,
+                "logical_source_bytes_read": 0,
+                "new_bytes_written": 0,
+                "required_buffer_bytes": 0,
+                "worst_relative_frobenius": None,
+                "tensors": [],
+            }, 0
+        writer = self._writer
+        if writer is None:
+            raise CapabilityError("the output is closed", code="weights_writer_closed")
+        for row in tensors:
+            if any(type(dimension) is not int or dimension < 0 for dimension in row["shape"]):
+                raise CapabilityError("normalization shape is invalid", code="quantization_plan")
+        pending = [row for row in tensors if not writer.has(row["component"], row["key"])]
+        required = sum(math.prod(row["shape"]) * 2 for row in pending)
+        self._spend(required)
+        for component in dict.fromkeys(row["component"] for row in tensors):
+            self.component(component)
+
+        def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
+            result = writer.normalize_bf16(
+                source,
+                tensors,
+                max_buffer_bytes=max_buffer_bytes,
+                max_new_bytes=required,
+                control=control,
+            )
+            # A successful full-selection call (including all-reused) revalidated the
+            # native journal and every selected entry before this completed acceptance.
+            writer.metadata["native_bf16_normalization"] = identity
+            return result
+
+        return convert, len(pending)
 
     def prepare_quantization(
         self,

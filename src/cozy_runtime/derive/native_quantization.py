@@ -10,7 +10,7 @@ from concurrent.futures import CancelledError, Future, TimeoutError
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 import tensorfs
@@ -308,6 +308,27 @@ def _run(
     ctx: Context,
     tel: Telemetry,
 ) -> QuantizationStats:
+    stats = msgspec.convert(
+        _run_native(convert, pending, ctx, tel, stage="native quantization"),
+        type=QuantizationStats,
+    )
+    for row in stats.tensors:
+        if row.get("fit") is not None:
+            tel.log(
+                "native fitted tensor", component=row["component"], key=row["key"], **row["fit"]
+            )
+    tel.metric("native_quantized_tensors", float(stats.encoded_keys))
+    return stats
+
+
+def _run_native(
+    convert: Callable[[tensorfs.ConversionControl], dict[str, object]],
+    pending: int,
+    ctx: Context,
+    tel: Telemetry,
+    *,
+    stage: str,
+) -> dict[str, object]:
     # This helper joins before returning, like the existing bounded encoding loop.
     # It must not consume Context.plan's one whole GPU program slot: an author may
     # convert several outputs and then submit that program in the same request.
@@ -320,20 +341,13 @@ def _run(
             progress = execution.poll()
             if progress.completed_steps != observed:
                 observed = progress.completed_steps
-                tel.progress(observed / max(1, pending), stage="native quantization")
+                tel.progress(observed / max(1, pending), stage=stage)
             if progress.done:
                 break
             time.sleep(0.05)  # Observation never advances native reads/encoding/publication.
         (result,) = execution.wait()
-        stats = msgspec.convert(result, type=QuantizationStats)
-        for row in stats.tensors:
-            if row.get("fit") is not None:
-                tel.log(
-                    "native fitted tensor", component=row["component"], key=row["key"], **row["fit"]
-                )
-        tel.progress(1.0, stage="native quantization")
-        tel.metric("native_quantized_tensors", float(stats.encoded_keys))
-        return stats
+        tel.progress(1.0, stage=stage)
+        return cast("dict[str, object]", result)
     except BaseException as error:
         failure = error
         raise

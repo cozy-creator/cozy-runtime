@@ -16,7 +16,7 @@ import threading
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import IO, Any, NamedTuple
+from typing import IO, TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
 import numpy as np
@@ -39,6 +39,9 @@ from .microscale import (
     encode_nvfp4,
     encode_w4a8,
 )
+
+if TYPE_CHECKING:
+    from tensorfs.api import NormalizeBf16Tensor
 
 
 class _Encoding(NamedTuple):
@@ -151,8 +154,6 @@ def _uncalibrated(key: str) -> Encoded:
     )
 
 
-#: RNE fp32->bf16 keeps every element within amax * 2^-8 (8-bit significand, half-ulp).
-BF16_ROUND_TRIP_BOUND = 2.0**-8
 _SOURCE_READ_CHUNK = 8 << 20
 _WIDTH = {"bf16": 2, "f16": 2, "f32": 4}
 
@@ -249,6 +250,22 @@ class Bf16Stats(msgspec.Struct):
     source_bytes_read: int
     new_bytes_written: int
     worst_relative_frobenius: float | None
+    #: Actual stored payload/scale bytes read by native normalization; legacy read stays logical.
+    stored_source_bytes_read: int = 0
+    required_buffer_bytes: int = 0
+
+
+class _Bf16Result(msgspec.Struct):
+    """Native normalization facts; selected-count compatibility is applied at the boundary."""
+
+    converted_keys: int
+    reused_keys: int
+    source_bytes_read: int
+    logical_source_bytes_read: int
+    new_bytes_written: int
+    required_buffer_bytes: int
+    worst_relative_frobenius: float | None
+    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
 
 
 def bf16_source_dtypes(sources: Sequence[str]) -> tuple[str, ...]:
@@ -326,57 +343,50 @@ def write_bf16(
     plan: Bf16Plan,
     excluded: set[tuple[str, str]] | None = None,
 ) -> Bf16Stats:
-    """Stream the selected float cut through one bounded RNE conversion, stats recorded: each
-    tensor's round trip is held to `BF16_ROUND_TRIP_BOUND` of its amax and logged."""
+    """Normalize the complete selected cut in TensorFS under one scoped native lifetime.
+
+    Reused keys remain in the declaration so Writer validates its normalization journal
+    before trusting them. Source decoding, BF16 RNE, tripwires and staging are native.
+    """
+    from .native_quantization import _run_native
+
     omitted = excluded or set()
-    selected = [t for t in plan.tensors if (t.component, t.key) not in omitted]
-    read = written = reused = 0
-    worst: float | None = 0.0
-    for done, tensor in enumerate(selected, 1):
-        ctx.raise_if_cancelled()
-        if output.has(tensor.component, tensor.key):
-            reused += 1
-            worst = None
-            tel.progress(done / len(selected), stage="bf16")
-            continue
-        amax = max_error = sse = energy = 0.0
-        with tempfile.TemporaryFile() as spill:
-            for values in _read_chunks(
-                source, tensor.component, tensor.key, tensor.source_dtype, tensor.shape
-            ):
-                raw = st.from_f32(values, "BF16")
-                error = np.abs(values - st.to_f32(raw, "BF16", list(values.shape)))
-                if values.size:
-                    amax = _numeric.worst(amax, float(np.max(np.abs(values))))
-                    max_error = _numeric.worst(max_error, float(np.max(error)))
-                sse += float(np.sum(error.astype(np.float64) ** 2))
-                energy += float(np.sum(values.astype(np.float64) ** 2))
-                read += values.size * _WIDTH[tensor.source_dtype]
-                spill.write(raw)
-            bound = amax * BF16_ROUND_TRIP_BOUND
-            if not _numeric.within(max_error, bound):
-                raise UnsupportedInput(
-                    f"{tensor.component}.{tensor.key}: bf16 round-trip error {max_error:.4g} "
-                    f"exceeds the representational bound {bound:.4g}",
-                    code="quantization_tripwire",
-                )
-            relative = math.sqrt(sse / energy) if energy else 0.0
-            worst = _numeric.worst(worst, relative) if worst is not None else None
-            written += spill.tell()
-            spill.seek(0)
-            output.put(tensor.component, tensor.key, "BF16", tensor.shape, spill)
+    selected = [tensor for tensor in plan.tensors if (tensor.component, tensor.key) not in omitted]
+    if not selected:
+        return Bf16Stats(0, 0, 0, 0, 0.0)
+    ctx.raise_if_cancelled()
+    rows: list[NormalizeBf16Tensor] = [
+        {
+            "component": tensor.component,
+            "key": tensor.key,
+            "source_dtype": TENSORFS_NAMES[tensor.source_dtype],
+            "shape": list(tensor.shape),
+        }
+        for tensor in selected
+    ]
+    convert, pending = output.prepare_bf16(source, rows, max_buffer_bytes=_SOURCE_READ_CHUNK)
+    result = msgspec.convert(
+        _run_native(convert, pending, ctx, tel, stage="bf16"), type=_Bf16Result
+    )
+    for done, tensor in enumerate(result.tensors, result.reused_keys + 1):
         tel.log(
             "normalized tensor",
             level="info",
-            component=tensor.component,
-            key=tensor.key,
-            source_dtype=tensor.source_dtype,
-            relative_frobenius=relative,
+            component=tensor["component"],
+            key=tensor["key"],
+            relative_frobenius=tensor["relative_frobenius"],
             done=done,
             total=len(selected),
         )
-        tel.progress(done / len(selected), stage="bf16")
-    return Bf16Stats(len(selected), reused, read, written, worst)
+    return Bf16Stats(
+        converted_keys=len(selected),
+        reused_keys=result.reused_keys,
+        source_bytes_read=result.logical_source_bytes_read,
+        new_bytes_written=result.new_bytes_written,
+        worst_relative_frobenius=result.worst_relative_frobenius,
+        stored_source_bytes_read=result.source_bytes_read,
+        required_buffer_bytes=result.required_buffer_bytes,
+    )
 
 
 def quantize_component_into(
