@@ -77,7 +77,7 @@ from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import GrantedInput
 from cozy_runtime.author._attention import _close as close_producer_states
-from cozy_runtime.author._calls import _Broker, _CallType, _export
+from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
 from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
@@ -223,6 +223,8 @@ from cozy_runtime.internal.seam import (
 
 if sys.platform == "win32":
     from ctypes import wintypes
+
+    from cozy_runtime.internal import winpipe
 else:
     import resource
 
@@ -336,26 +338,16 @@ def _env_document() -> dict[str, Any]:
 _CALL: contextvars.ContextVar[str] = contextvars.ContextVar("cozy_call", default="")
 
 
-def _cancelled(mux: Mux, root: Path, request_id: str, wait: float = 0.0) -> bool:
-    """Whether a `cancel` named this call, waiting up to `wait` seconds for one. TensorD 0.10
-    marks it in `root`'s `executor.cancel` instead, read once the wait ends."""
-    if mux.cancelled(request_id, wait):
-        return True
-    try:
-        return (root / "executor.cancel").read_text() == request_id
-    except (OSError, UnicodeError):
-        return False
-
-
 @contextlib.contextmanager
 def _held(
-    mux: Mux, root: Path, request_id: str, waits: Attribution, waiter: str
-) -> Iterator[Callable[[float], bool]]:
+    mux: Mux, request_id: str, waits: Attribution, waiter: str, wake: Callable[[], None]
+) -> Iterator[Callable[[], bool]]:
     """A compile wait of this request's preparation (`kernel_compile.held`): a stage of its
-    record, whose polls sleep until a cancel names it (`_cancelled`)."""
+    record, woken at once when a cancel names it."""
     started = time.perf_counter()
     try:
-        yield functools.partial(_cancelled, mux, root, request_id)
+        with mux.watch(request_id, wake):
+            yield functools.partial(mux.cancelled, request_id)
     finally:
         waits.stage(f"waiting for {waiter} compile", (time.perf_counter() - started) * 1000)
 
@@ -427,31 +419,39 @@ class _Slot:
 class _InFlight:
     """The attempts in flight, side by side. The first in readies the plane and the last out
     drains it, each with no other attempt running. One that changes what every attempt runs on
-    (a pinned kernel, a GPU group's call) runs alone, and later ones wait for it."""
+    (a pinned kernel, a GPU group's call) runs alone, and later ones wait for it, told which
+    runs they wait on."""
 
     def __init__(self) -> None:
         self._changed = threading.Condition()
-        self.count = 0
+        #: the runs in flight, by request id
+        self._running: list[str] = []
         self._leaving = 0
         self._alone = False
         self._queued = 0
 
+    @property
+    def count(self) -> int:
+        return len(self._running)
+
     @contextlib.contextmanager
-    def attempt(self, alone: bool) -> Iterator[_Slot]:
+    def attempt(self, alone: bool, request_id: str) -> Iterator[_Slot]:
         with self._changed:
             self._queued += alone
-            self._changed.wait_for(
-                lambda: not self._alone and not (self.count if alone else self._queued)
+            request_path.wait(
+                self._changed,
+                lambda: not self._alone and not (self.count if alone else self._queued),
+                lambda: ", ".join(f"run {running}" for running in self._running),
             )
             self._queued -= alone
-            self.count += 1
+            self._running.append(request_id)
             slot = _Slot(first=self.count == 1)
             self._alone = alone or slot.first
         try:
             yield slot
         finally:
             with self._changed:
-                self.count -= 1
+                self._running.remove(request_id)
                 self._leaving -= slot.leaving
                 self._alone = self._alone and self.count > 0
                 self._changed.notify_all()
@@ -1515,9 +1515,7 @@ class Executor:
 
     def _attempt_cancelled(self) -> bool:
         """A group's one attempt is cancelled (its calls on the other GPUs read this)."""
-        return bool(self._attempt_request) and _cancelled(
-            self.mux, self.root, self._attempt_request
-        )
+        return bool(self._attempt_request) and self.mux.cancelled(self._attempt_request)
 
     def _warm_package(self) -> str:
         """Give the package its ONE chance to pay its deferred import cost off the lock.
@@ -3095,7 +3093,7 @@ class Executor:
             return target
         requested = _attention_pin(command.attention_kernel, command.bits)
         alone = self.world > 1 or bool(requested and target._attention_reaches(requested))
-        with self.in_flight.attempt(alone) as slot, request_path.serving():
+        with self.in_flight.attempt(alone, command.request_id) as slot, request_path.serving():
             # Admitted only now: an attempt before it may have poisoned the generation. Its
             # record is taken once nothing can refuse it, so a refused call may come again.
             refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
@@ -3159,7 +3157,7 @@ class Executor:
         waits = Attribution()
         if pin and self._attention_reaches(pin):
             held = kernel_compile.held.set(
-                functools.partial(_held, self.host.mux, self.root, command.request_id, waits)
+                functools.partial(_held, self.host.mux, command.request_id, waits)
             )
             try:
                 self._attention_plan(pin)
@@ -3362,9 +3360,7 @@ class Executor:
                         spool=spool,
                         deadline=deadline,
                         device=self._device(),
-                        cancel=functools.partial(
-                            _cancelled, self.host.mux, self.root, command.request_id
-                        ),
+                        cancel=functools.partial(self.host.mux.cancelled, command.request_id),
                         models=self.models,
                         recipes=self.discovered.recipes,
                         progress=boundary,
@@ -4315,13 +4311,19 @@ class Executor:
         with store_refusals(f"opening {ref[:23]}"):
             return Checkpoint(weights_store.open_checkpoint(self._store(), ref, connection))
 
-    def _child_events(self, exchange: Exchange) -> int | None:
-        """The worker's nudge socket for this attempt's calls; None when it refuses, and on
-        Windows, whose event loop cannot watch a pipe: its calls are polled."""
-        if sys.platform == "win32":
-            return None
+    def _child_events(self, exchange: Exchange) -> Nudges:
+        """The worker's nudges for this attempt's calls: a socket, a pipe on Windows."""
         answer = exchange(ChildEvents(), Handoff)
-        return answer.descriptor if answer.ok else None
+        if not answer.ok:
+            raise RuntimeFailure(
+                answer.detail or "the machine refused this attempt's call events",
+                code=answer.code or "child_events_refused",
+            )
+        if sys.platform == "win32":
+            return winpipe.Pipe(answer.descriptor)
+        nudges = socket.socket(fileno=answer.descriptor)
+        nudges.setblocking(True)
+        return nudges
 
     def _exchange(self, request_id: str) -> Exchange:
         """One call's durable exchange, naming it from whatever thread its code runs on."""
@@ -4798,16 +4800,21 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _compiling(channel: Channel, state: kernel_compile.State) -> None:
-    """A wait on a compiling kernel, told to the machine as the waiting call's stage ("": the
-    executor's, outside every call)."""
+    """A wait on a compiling kernel, told to the machine as the waiting call's stage."""
+    _waiting(channel, f"waiting for {state.kernel} compile", state.progress)
+
+
+def _waiting(channel: Channel, what: str, fraction: float | None = None) -> None:
+    """A wait, told to the machine as the waiting call's stage ("": the executor's, outside
+    every call)."""
     with contextlib.suppress(SeamError):
         channel.send(
             {
                 "event": "progress",
                 "request_id": _CALL.get(),
                 "kind": "progress",
-                "stage": f"waiting for {state.kernel} compile",
-                "stage_fraction": state.progress,
+                "stage": what,
+                "stage_fraction": fraction,
                 "advance": 0,
             }
         )
@@ -4819,20 +4826,21 @@ _CALL_COMMANDS = frozenset({"prepare_request", "invoke"})
 
 class _Order:
     """Commands in the order they came: a call's run side by side, and a process-wide one
-    alone, after every command before it and before every command after it."""
+    alone, after every command before it and before every command after it. One waiting for
+    its turn is told what it waits on."""
 
     def __init__(self) -> None:
         self._changed = threading.Condition()
-        #: ticket -> whether it runs alone, until its command is answered
-        self._open: dict[int, bool] = {}
+        #: ticket -> whether it runs alone and what it is, until its command is answered
+        self._open: dict[int, tuple[bool, str]] = {}
         self._next = 0
         #: commands answered so far: an idle period follows each (`idle`)
         self.answered = 0
 
-    def ticket(self, alone: bool) -> int:
+    def ticket(self, alone: bool, what: str) -> int:
         with self._changed:
             self._next += 1
-            self._open[self._next] = alone
+            self._open[self._next] = (alone, what)
             return self._next
 
     def first(self, ticket: int) -> bool:
@@ -4842,13 +4850,18 @@ class _Order:
     @contextlib.contextmanager
     def turn(self, ticket: int) -> Iterator[None]:
         with self._changed:
-            alone = self._open[ticket]
-            self._changed.wait_for(
+            alone = self._open[ticket][0]
+            request_path.wait(
+                self._changed,
                 lambda: (
                     min(self._open) == ticket
                     if alone
-                    else not any(a for t, a in self._open.items() if t < ticket)
-                )
+                    else not any(a for t, (a, _) in self._open.items() if t < ticket)
+                ),
+                lambda: next(
+                    (what for t, (a, what) in self._open.items() if t < ticket and (alone or a)),
+                    "",
+                ),
             )
         try:
             yield
@@ -4867,7 +4880,7 @@ class _Order:
             self._changed.wait_for(lambda: not self._open and self.answered != answered and ready())
             self._next += 1
             ticket, answered = self._next, self.answered
-            self._open[ticket] = True
+            self._open[ticket] = (True, "graph capture")
         try:
             yield answered
         finally:
@@ -4903,6 +4916,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     turn. Before it the process stays single-threaded and forkable: Start and Fork run here,
     as does any other command that is first and not a call's."""
     kernel_compile.waiting = functools.partial(_compiling, channel)
+    request_path.told = functools.partial(_waiting, channel)
     # Runtime-owned workers, none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call")
     order = _Order()
@@ -4927,8 +4941,9 @@ def serve(executor: Executor, channel: Channel) -> int:
                 return _shut(executor, channel)
             _send_reply(channel, reply)
             continue
-        ticket = order.ticket(alone=name not in _CALL_COMMANDS)
-        if executor.started or name in _CALL_COMMANDS or not order.first(ticket):
+        call = name in _CALL_COMMANDS
+        ticket = order.ticket(not call, f"run {frame.get('request_id', '')}" if call else name)
+        if executor.started or call or not order.first(ticket):
             pool.submit(contextvars.Context().run, _serve, executor, frame, order.turn(ticket))
             continue
         with order.turn(ticket):
@@ -4950,9 +4965,9 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
     not take, ends the process, as either did when commands ran on the main thread; so does a
     `shutdown` that waited here for the calls before it, once answered."""
     try:
+        call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
+        _CALL.set(call)  # its wait for its turn is told as its own
         with turn:
-            call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
-            _CALL.set(call)
             reply = _reply(executor, frame)
             if reply is None:
                 code = _shut(executor, executor.channel)

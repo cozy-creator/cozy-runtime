@@ -41,6 +41,7 @@ from typing import (
     final,
 )
 
+from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import (
     CURRENT,
     AdapterRef,
@@ -420,8 +421,9 @@ WARNINGS = _Warnings()
 
 class _Scopes:
     """Calls take component scopes one at a time, in the order they ask: a call entering a scope
-    while another call holds one waits for it. Within one call, on any of its threads, scopes
-    nest as they always have; a thread outside every call (`CURRENT` unset) never waits.
+    while another call holds one waits for it, told which run (or the Runtime's kernel swap)
+    holds it. Within one call, on any of its threads, scopes nest as they always have; a thread
+    outside every call (`CURRENT` unset) never waits.
 
     Known limit: a call's threads are those that carry its context (SDK pools, its event loop's
     executor). A plain `threading.Thread` an author starts carries none, so it enters scopes
@@ -440,15 +442,23 @@ class _Scopes:
             if self._holder is not call:
                 ticket = object()
                 self._queue.append(ticket)
-                self._changed.wait_for(
+                request_path.wait(
+                    self._changed,
                     lambda: (
                         self._holder is call or (self._holder is None and self._queue[0] is ticket)
-                    )
+                    ),
+                    self._held_by,
                 )
                 self._queue.remove(ticket)
                 self._holder = call
                 self._changed.notify_all()  # the call's other threads waiting now pass
             self._depth += 1
+
+    def _held_by(self) -> str:
+        holder = self._holder
+        if holder is None:
+            return ""
+        return f"run {holder.request_id}" if isinstance(holder, Context) else "a kernel swap"
 
     def leave(self) -> None:
         with self._changed:

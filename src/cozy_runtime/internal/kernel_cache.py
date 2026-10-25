@@ -226,6 +226,24 @@ class Store:
             os.close(fd)
         return False
 
+    def released(self, key: Key) -> None:
+        """Return once no builder holds this key's lock, own or the worker's: a builder holds
+        it to its exit, so this waits on a live compile. Each is taken shared and let go at
+        once, never held across the other."""
+        for namespace in (self.own, self.trusted):
+            if namespace is None:
+                continue
+            try:
+                fd = os.open(
+                    namespace / key.kernel / f"{key.digest}.lock", os.O_RDONLY | os.O_CLOEXEC
+                )
+            except OSError:
+                continue  # never claimed: nobody builds it there
+            try:
+                filelock.lock(fd, shared=True)
+            finally:
+                os.close(fd)
+
     def _kernel_dir(self, key: Key) -> Path:
         kernel = self.own / key.kernel
         kernel.mkdir(mode=0o755, parents=True, exist_ok=True)

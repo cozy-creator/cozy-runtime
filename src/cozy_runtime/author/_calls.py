@@ -9,11 +9,12 @@ import logging
 import math
 import re
 import socket
+import threading
 import time
 from collections.abc import Awaitable, Callable, Generator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Concatenate, ParamSpec, TypeVar, cast, overload
+from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar, cast, overload
 
 import msgspec
 
@@ -50,8 +51,15 @@ P = ParamSpec("P")
 R = TypeVar("R")
 MAX_ACTIVE_CALLS = 32
 MAX_CALL_BYTES = 48 * 1024
-#: Only a worker that cannot nudge its parent (Runtime before child_events) is polled.
-_UNNOTIFIED_POLL_SECONDS = 0.05
+
+
+class Nudges(Protocol):
+    """The worker's nudges to an attempt: a byte each time one of its calls may have moved,
+    b"" once the worker let go of its calls (a socket; a pipe on Windows)."""
+
+    def recv(self, size: int, /) -> bytes: ...
+
+    def close(self) -> None: ...
 
 
 class ChildCallError(CapabilityError):
@@ -291,16 +299,15 @@ class _Broker:
         request_id: str,
         bindings: Mapping[tuple[str, str], _CallType],
         exchange: Exchange,
-        watch: Callable[[], int | None] | None = None,
+        watch: Callable[[], Nudges],
         yielding: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
-        #: Opens the worker's nudge socket once; None when no peer can nudge.
-        self.watch = watch
+        #: Opens the worker's nudges, at the first wait on a call; None once opened.
+        self.watch: Callable[[], Nudges] | None = watch
         #: Around each wait on a child: the attempt's memory yields its step to the child's.
         self.yielding = yielding
-        self.nudges: socket.socket | None = None
-        self.loop: asyncio.AbstractEventLoop | None = None
+        self.nudges: Nudges | None = None
         self.nudged = 0
         self.nudge = asyncio.Event()
         self.calls: dict[int, PendingCall[Any]] = {}
@@ -460,7 +467,7 @@ class _Broker:
                             call.index,
                         ) from exc
                 with self.yielding() if self.yielding is not None else contextlib.nullcontext():
-                    await self._changed(seen, call.ctx.deadline)
+                    await self._changed(seen, call.ctx.deadline, call.index)
         except asyncio.CancelledError:
             if call.index in self.activated and not self.closed:
                 self.exchange(ChildCancel(call_index=call.index), CallState)
@@ -473,47 +480,50 @@ class _Broker:
                 self.activated.discard(call.index)
                 self.calls.pop(call.index, None)
 
-    async def _changed(self, seen: int, deadline: float) -> None:
-        """Until the worker nudges this attempt after `seen`: a call moved or it was cancelled."""
+    async def _changed(self, seen: int, deadline: float, index: int) -> None:
+        """Until the worker nudges this attempt after `seen`: a call moved or it was cancelled.
+        Its nudges are read on a thread of their own, from the first wait on."""
         if self.watch is not None:
             watch, self.watch = self.watch, None
-            descriptor = watch()
-            if descriptor is not None:
-                self.nudges = socket.socket(fileno=descriptor)
-                self.nudges.setblocking(False)
-                self.loop = asyncio.get_running_loop()
-                self.loop.add_reader(self.nudges.fileno(), self._drain)
-                return  # a change before the socket existed nudged no one: poll once more
-        if self.nudges is None:
-            await asyncio.sleep(_UNNOTIFIED_POLL_SECONDS)
+            self.nudges = watch()
+            loop = asyncio.get_running_loop()
+            threading.Thread(
+                target=self._read, args=(self.nudges, loop), name="call-nudges", daemon=True
+            ).start()
+            return  # a change before they were opened nudged no one: look once more
+        if self.nudged != seen:
             return
-        if self.nudged == seen:
-            remaining = deadline - time.monotonic()
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    self.nudge.wait(), None if math.isinf(remaining) else max(remaining, 0)
-                )
+        if self.nudges is None:
+            raise ChildCallError(
+                "child_events_closed", "the machine let go of this attempt's calls", index
+            )
+        remaining = deadline - time.monotonic()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                self.nudge.wait(), None if math.isinf(remaining) else max(remaining, 0)
+            )
 
-    def _drain(self) -> None:
-        assert self.nudges is not None
-        try:
-            while self.nudges.recv(4096):
-                pass
-            self._unwatch()  # the worker closed the attempt's socket: poll from now on
-        except BlockingIOError:
-            pass
-        except OSError:
+    def _read(self, nudges: Nudges, loop: asyncio.AbstractEventLoop) -> None:
+        with contextlib.suppress(RuntimeError):  # the attempt's loop closed first
+            with contextlib.suppress(OSError):
+                while nudges.recv(4096):
+                    loop.call_soon_threadsafe(self._nudged, False)
+            loop.call_soon_threadsafe(self._nudged, True)
+
+    def _nudged(self, closed: bool) -> None:
+        if closed:
             self._unwatch()
         self.nudged += 1
         nudge, self.nudge = self.nudge, asyncio.Event()
         nudge.set()
 
     def _unwatch(self) -> None:
-        if self.nudges is not None:
-            if self.loop is not None and not self.loop.is_closed():
-                self.loop.remove_reader(self.nudges.fileno())
-            self.nudges.close()
-            self.nudges = None
+        nudges, self.nudges = self.nudges, None
+        if nudges is not None:
+            if isinstance(nudges, socket.socket):
+                with contextlib.suppress(OSError):
+                    nudges.shutdown(socket.SHUT_RDWR)  # its reader's recv returns
+            nudges.close()
 
     @staticmethod
     def _observe(call: PendingCall[Any], answer: CallState) -> None:

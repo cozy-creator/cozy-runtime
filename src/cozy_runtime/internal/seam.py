@@ -36,7 +36,7 @@ import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, NoReturn
 
@@ -436,6 +436,7 @@ class Mux:
         self._asked: dict[int, _Asked] = {}
         self._commands: deque[Frame] = deque()
         self._cancels: dict[str, None] = {}
+        self._wakes: dict[str, list[Callable[[], None]]] = {}
         self._reading = False
         self._ended: SeamError | None = None
         self._changed = threading.Condition()
@@ -485,12 +486,30 @@ class Mux:
             self._cancels[request_id] = None
             while len(self._cancels) > CANCELS_KEPT:
                 del self._cancels[next(iter(self._cancels))]
+            for wake in self._wakes.get(request_id, ()):
+                wake()
             self._changed.notify_all()
 
-    def cancelled(self, request_id: str, wait: float = 0.0) -> bool:
-        """Whether `request_id` is cancelled, waiting up to `wait` seconds for it."""
+    def cancelled(self, request_id: str) -> bool:
         with self._changed:
-            return self._changed.wait_for(lambda: request_id in self._cancels, wait)
+            return request_id in self._cancels
+
+    @contextlib.contextmanager
+    def watch(self, request_id: str, wake: Callable[[], None]) -> Iterator[None]:
+        """While it lasts, `wake` is called when a cancel names `request_id`, at once if one
+        already has."""
+        with self._changed:
+            self._wakes.setdefault(request_id, []).append(wake)
+            if request_id in self._cancels:
+                wake()
+        try:
+            yield
+        finally:
+            with self._changed:
+                wakes = self._wakes[request_id]
+                wakes.remove(wake)
+                if not wakes:
+                    del self._wakes[request_id]
 
     def forget(self, request_id: str) -> None:
         with self._changed:

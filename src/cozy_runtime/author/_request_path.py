@@ -2,13 +2,14 @@
 the executor's request thread while it serves a request (`serving`). Each is a row the attempt
 records as `request_path.blocking` with a warning; none fails the run. Work on another thread runs
 beside the request and is none: a run starts on a kernel that is ready while better ones build in
-the background (owner, 2026-10-09)."""
+the background (owner, 2026-10-09). A request waiting on another's turn says whom it waits on
+(`wait`)."""
 
 from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 
 #: The request path's known violations, by the function holding each; nothing else is allowed.
@@ -22,6 +23,8 @@ _LOCAL = threading.local()
 #: This process's threads serving a request now.
 _SERVING = [0]
 _COUNTED = threading.Lock()
+#: Tells the machine the stage of the call this thread serves (the executor's, when it serves).
+told: Callable[[str], None] | None = None
 
 
 @contextmanager
@@ -78,3 +81,23 @@ def forbid(work: str) -> Iterator[None]:
 def known(site: str) -> AbstractContextManager[None]:
     """`site`'s violation, which `KNOWN` names: the guarded work inside is no row."""
     return _quiet()
+
+
+def wait(
+    changed: threading.Condition, ready: Callable[[], bool], holder: Callable[[], str]
+) -> None:
+    """Wait on `changed`, held, until `ready()`: woken by the holders' own notifications, never
+    a clock. Each holder `holder()` names meanwhile is told as this call's stage ("waiting for
+    run 17"), outside the lock."""
+    named = ""
+    while not ready():
+        now = holder()
+        if told is None or not now or now == named:
+            changed.wait()
+            continue
+        named = now
+        changed.release()
+        try:
+            told(f"waiting for {named}")
+        finally:
+            changed.acquire()
