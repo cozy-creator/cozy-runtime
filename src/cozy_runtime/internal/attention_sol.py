@@ -39,7 +39,8 @@ from types import MethodType
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
-    from torch import Tensor, device as Device
+    from torch import Tensor
+    from torch import device as Device
     from torch.nn import Module
 
 from cozy_runtime.author import _request_path as request_path

@@ -15,9 +15,9 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Protocol, Unpack
 
 if TYPE_CHECKING:
-    from cozy_runtime.internal.attention_ulysses import PartialOptions
-
     from torch import Tensor
+
+    from cozy_runtime.internal.attention_ulysses import PartialOptions
 
 from cozy_runtime.internal import arch, attention_fp8
 from cozy_runtime.internal.attention_ulysses import Local, Options
