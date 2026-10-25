@@ -19,8 +19,8 @@ draw depends only on its own row's scores, seed and position, so it replays insi
 not depend on what else is in the batch, and a drafted token is verified exactly as a greedy
 one. Temperature 0 is the plain argmax.
 
-A graph reads retained virtual addresses: a refill maps physical backing at those same
-addresses. The loop leases every block the step reads only while its driver is active. If
+A graph keeps its ordinary weight tensors and their addresses alive while cached. Offload
+retires the graph before releasing those tensors; a later call can refill and capture anew. If
 the full set cannot be prepared before execution, the call uses Transformers' loop. Errors
 after execution starts are final; package code is never restarted. On a CPU, or after a safe
 capture refusal (a run warning), the same step runs eagerly. A model this does not
@@ -46,6 +46,7 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
+from functools import partial
 from typing import Any, NamedTuple
 
 from cozy_runtime.author import _request_path as request_path
@@ -195,7 +196,7 @@ def release(model: Any) -> None:
         engine = _ENGINES.pop(model, None)
         if engine is None:
             return
-        if engine.driver is not None or engine.pending:
+        if engine.driver is not None or engine.pending or engine._occupied():
             _ENGINES[model] = engine
             raise RuntimeError("cannot unload a language model while decode is active")
         engine._drop()
@@ -513,7 +514,7 @@ def _capture_contract(model: Any) -> str:
     for sub in model.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             if any(
-                not getattr(h, "__module__", "").startswith("tensorfs.varena.")
+                not getattr(h, "__module__", "").startswith("cozy_runtime.internal.residency")
                 for h in hooks.values()
             ):
                 return "custom Python hooks"
@@ -1182,8 +1183,9 @@ class _Engine:
         self.stale = False
         #: seconds the last admission took: decoding gets as long before the next one
         self.debt = 0.0
-        #: its buffers' KV region (varena reclaims it between drives, never during one)
+        #: KV storage stays pinned across driver handoffs while any live row remains.
         self.region: Any = None
+        self.region_use: ExitStack | None = None
         self.retire = False
         self.cache_device: Any = None
         self.open: bool | float
@@ -1262,60 +1264,71 @@ class _Engine:
     # ------------------------------------------------------------------ the loop
 
     def _drive(self, mine: _Request) -> None:
-        try:
-            with _PLANE, ExitStack() as stack:
-                # The KV region is pinned while this drive lasts, so no live row is lost; between
-                # drives varena may take it, and then the buffers are made again.
+        with _PLANE, self.region_use or ExitStack() as lifetime:
+            held_region = self.region_use is not None
+            self.region_use = None
+            try:
+                # The KV pin lasts through reholds and failure unwinding. Only weight
+                # bindings below may be replaced while this driver owns live rows.
                 if self.region is None and (placed := PLACED.get(self.model)) is not None:
                     self.region = placed[0].region(
-                        f"lm:{type(self.model).__name__}", "kv", self.model
+                        f"lm:{type(self.model).__name__}", "kv", self.model, release=self._drop
                     )
-                if self.region is not None and stack.enter_context(self.region.pin()):
+                if (
+                    not held_region
+                    and self.region is not None
+                    and lifetime.enter_context(self.region.pin())
+                ):
                     self._drop()
-                held = self._hold(stack)
-                while True:
-                    if self.rehold:  # another head: its blocks are held instead
-                        stack.close()
-                        held, self.rehold = self._hold(stack), False
-                    if held is False and self.draft is not None and not self._occupied():
-                        # The head's weights and keys cost room the model's own decode set may
-                        # need: the graphed decode without drafts beats Transformers' loop.
-                        say(
-                            f"lm:{type(self.model).__name__}:undrafted",
-                            "[lm] drafting does not fit at home",
-                        )
-                        self.unfit.add(id(self.draft))
-                        self._drop()
-                        self.draft = None
-                        stack.close()
-                        held = self._hold(stack)
-                    with self.cond:
-                        self.incoming = list(self.pending)
-                        self.pending.clear()
-                    if held is False:
-                        if self._occupied():
-                            raise self.unprepared or RuntimeError("decode residency was lost")
-                        for request in self.incoming:
-                            request.fallback = "its decode set does not fit at home"
-                        self.incoming = []
-                    if self.incoming or self.retire:
-                        self._settle(self.incoming)
-                        self.incoming = []
-                    occupied = sum(row is not None for row in self.slots)
-                    with self.cond:
-                        if not occupied and not self.pending:
-                            break
-                        if mine.finished and (occupied or self.pending):
-                            break  # a waiting caller drives on
-                    if occupied:
-                        self._steps()
-        except BaseException as exc:  # post-start failures never restart package generation
-            self._fail(exc)
-            raise
-        finally:
-            with self.cond:
-                self.driver = None
-                self.cond.notify_all()
+                with ExitStack() as stack:
+                    held = self._hold(stack)
+                    while True:
+                        if self.rehold:  # another head: its blocks are held instead
+                            stack.close()
+                            held, self.rehold = self._hold(stack), False
+                        if held is False and self.draft is not None and not self._occupied():
+                            # The head's weights and keys cost room the model's own decode set may
+                            # need: the graphed decode without drafts beats Transformers' loop.
+                            say(
+                                f"lm:{type(self.model).__name__}:undrafted",
+                                "[lm] drafting does not fit at home",
+                            )
+                            self.unfit.add(id(self.draft))
+                            self._drop()
+                            self.draft = None
+                            stack.close()
+                            held = self._hold(stack)
+                        with self.cond:
+                            self.incoming = list(self.pending)
+                            self.pending.clear()
+                        if held is False:
+                            if self._occupied():
+                                raise self.unprepared or RuntimeError("decode residency was lost")
+                            for request in self.incoming:
+                                request.fallback = "its decode set does not fit at home"
+                            self.incoming = []
+                        if self.incoming or self.retire:
+                            self._settle(self.incoming)
+                            self.incoming = []
+                        occupied = sum(row is not None for row in self.slots)
+                        with self.cond:
+                            if not occupied and not self.pending:
+                                break
+                            if mine.finished and (occupied or self.pending):
+                                break  # a waiting caller drives on
+                        if occupied:
+                            self._steps()
+            except BaseException as exc:  # post-start failures never restart package generation
+                self._fail(exc)
+                raise
+            finally:
+                with self.cond:
+                    if self.region is not None and (self._occupied() or self.pending):
+                        # A waiting caller takes the driver next. These rows are still live;
+                        # only an idle decode cache is eligible for owner-driven discard.
+                        self.region_use = lifetime.pop_all()
+                    self.driver = None
+                    self.cond.notify_all()
 
     def _fail(self, exc: BaseException) -> None:
         """Every held and waiting call fails; no partially executed generation is restarted."""
@@ -1334,10 +1347,11 @@ class _Engine:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
     def _hold(self, stack: ExitStack) -> bool:
-        """Retain graph addresses, but lease their physical backing only while this driver runs.
+        """Prepare the retained weight tensors while this driver runs.
 
         A full decode that cannot prepare its dependencies refuses before model execution;
-        Transformers can then use Runtime's individual graph segments while streaming.
+        Transformers can then stream the blocks eagerly. The KV pin has a separate lifetime
+        so changing these bindings cannot make live decode rows reclaimable.
         """
         self.unprepared = None
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
@@ -1364,7 +1378,7 @@ class _Engine:
             stack.enter_context(leases.pop_all())
         return True
 
-    #: Immutable address/fill generations, not cached physical pins.
+    #: The retained bindings' fill generations and derived tensor addresses.
     where: tuple[object, ...] = ()
 
     def _cancelled(self) -> bool:
@@ -1832,7 +1846,7 @@ class _Engine:
             return max(held, default=0)
 
         for request in {id(row.request): row.request for row in self.slots if row}.values():
-            request.tell(lambda request=request: tokens(request))
+            request.tell(partial(tokens, request))
 
     @contextmanager
     def _graph_memory(self) -> Iterator[None]:
@@ -1884,44 +1898,37 @@ class _Engine:
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             if key not in self.warmed:
-                if self.pool is None:
-                    self.pool = (
-                        placed[0].graph_pool(placed[1])
-                        if placed is not None
-                        else Pool(torch.cuda.graph_pool_handle())
-                    )
                 # This is the caller's actual next token, never an extra speculative warmup.
                 with self._graph_memory():
                     self._advance(size)
                 self.warmed.add(key)
                 self.eager += 1
                 return
-            pool = self.pool
             capturing = time.perf_counter()
             try:
                 with self._graph_memory(), request_path.known("cozy_runtime.lm._Engine._replay"):
-                    context = CURRENT.get()
-                    # The driver's request high-water bounds the step's working set (an idle
-                    # capture measures it exactly: cr-210 moves this off the request).
-                    pool.prepare(context.request_id if context is not None else "")
+                    if self.pool is None:
+                        self.pool = (
+                            placed[0].graph_pool(placed[1])
+                            if placed is not None
+                            else Pool(torch.cuda.graph_pool_handle())
+                        )
+                    pool = self.pool
                     graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
+            finally:
+                if graph is None and not self.graphs and self.pool is not None:
+                    self.pool = None
             self.captured[0] += 1
             self.captured[1] += time.perf_counter() - capturing
             if graph is not None:
                 self.graphs[key] = graph
                 self.recorded += 1
-                pool.captured(int((time.perf_counter() - capturing) * 1e9))
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
-            with self.pool.replaying(torch.cuda.current_stream()) as ok:
-                if ok:
-                    graph.replay()
-            if not ok:
-                self._forget()  # varena drops the region: its graphs go, recorded again later
-                graph = None
+            graph.replay()
         if graph is not None:
             self.replayed += 1
         else:
@@ -1938,10 +1945,10 @@ class _Engine:
                 event.synchronize()
             self.completions.clear()
             self.retired_graphs += len(self.graphs)
+            for graph in self.graphs.values():
+                graph.reset()
             self.graphs, self.warmed, self.unrecorded = {}, set(), {}
-            if self.pool is not None:
-                self.pool.close()
-                self.pool = None
+            self.pool = None
 
     def _unrecorded(self, key: tuple[int, int, bool, bool], why: str) -> None:
         """That step runs eagerly from now on, with a warning on the calls it serves."""

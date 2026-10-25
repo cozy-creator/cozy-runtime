@@ -96,6 +96,9 @@ class Map(Command, frozen=True, kw_only=True, tag="map"):
 
     construction: str
     level: Literal["gpu", "ram"] = "gpu"
+    request_id: str = ""
+    entrypoint: str = ""
+    payload: Json | None = None
 
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
@@ -181,8 +184,6 @@ class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The session's GPUs; empty runs on the CPU and never opens CUDA (`accelerator=False`).
     devices: str = ""
-    #: 2: TensorD leases each GPU's pages (`leases`); any other, or absent: standalone.
-    memory_protocol: int = 0
     sequence_parallel_degree: int = 1
     application: str = ""
     package_interface: str = ""
@@ -190,12 +191,6 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     import_only: bool = False
     #: Absent: the executor keeps its in-memory tier at its default.
     memo: MemoSettings | None = None
-    #: An older TensorD's GPU ledgers, a memfd and an eventfd each, follow the frame: read and
-    #: closed, unused (this TensorD sends none).
-    ledgers: int = 0
-    #: TensorD's namespace (its uid) each GPU's lease listener is named in: given only when it
-    #: leases this executor's weight pages (memory protocol 2).
-    leases: int | None = None
     #: The callables its attempts may call: their proxies are installed before the package is
     #: imported, and every attempt gets the call broker over them.
     call_interfaces: tuple[CallInterface, ...] = ()

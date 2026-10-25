@@ -59,6 +59,7 @@ from .quantization import source_rows
         "cozy_runtime.derive.operations",
         "cozy_runtime.derive.facade",
         "cozy_runtime.derive.quantization",
+        "cozy_runtime.derive.native_quantization",
         "cozy_runtime.derive.microscale",
         "cozy_runtime.derive.safetensors_io",
         "cozy_runtime.weights_store",
@@ -87,6 +88,7 @@ async def quantize(
         "cozy_runtime.derive.operations",
         "cozy_runtime.derive.facade",
         "cozy_runtime.derive.quantization",
+        "cozy_runtime.derive.native_quantization",
         "cozy_runtime.derive.microscale",
         "cozy_runtime.derive.svdq",
         "cozy_runtime.derive.safetensors_io",
@@ -133,7 +135,9 @@ def _run(
     opener = ctx._tensorfs_output
     if opener is None:
         raise UnsupportedInput("this attempt writes no weights", code="weights_output_ungranted")
-    ctx._tensorfs_output = lambda slot, made: opener(slot, replace(made, provenance=provenance))
+    ctx._tensorfs_output = lambda slot, made: opener(
+        slot, replace(made, provenance={**provenance, **(made.provenance or {})})
+    )
     tel.log("recipe", recipe=row.name, lane=row.lane, fingerprint=digest)
     try:
         if isinstance(plan, QuantizationPlan):

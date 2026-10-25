@@ -1238,6 +1238,8 @@ class Telemetry(_Bound):
         attempt._step_device = clock.mark() if clock is not None else None
         if attempt._stall_watch is None:
             attempt._stall_watch = _stalls.watch(lambda: not attempt.closed)
+            if attempt._stall_watch is not None:
+                self._ctx._pause_stall_watch = attempt._stall_watch.pause
 
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()
@@ -1537,14 +1539,7 @@ class Telemetry(_Bound):
         attempt.emit("log", "progress omitted", "warn", reason=reason)
 
 
-class Adjustments(_Bound):
-    """Handler-authored rows in the adjustments envelope (`adj`).
-
-    Runtime-owned rows — ModelDefault resolution and deployment policy clamps — reach the
-    envelope WITHOUT this service; a handler requests it only when its own model logic
-    performs an additional caller-visible adjustment (§1.2).
-    """
-
+class _AdjustmentMethods:
     __slots__ = ()
 
     def adjusted(self, field: str, requested: object, applied: object, reason: str) -> None:
@@ -1555,6 +1550,41 @@ class Adjustments(_Bound):
 
     def warn(self, field: str, message: str) -> None:
         self._row("warn", field, None, None, message)
+
+    def _row(
+        self, kind: RowKind, field: str, requested: object, applied: object, reason: str
+    ) -> None:
+        raise NotImplementedError
+
+
+class AdjustmentRows(_AdjustmentMethods):
+    """Pure adjustment collection for shared preflight/handler parameter resolution."""
+
+    __slots__ = ("rows",)
+
+    def __init__(self) -> None:
+        self.rows: list[AdjustmentRow] = []
+
+    def _row(
+        self, kind: RowKind, field: str, requested: object, applied: object, reason: str
+    ) -> None:
+        self.rows.append(AdjustmentRow(kind, field, requested, applied, reason))
+
+
+class Adjustments(_Bound, _AdjustmentMethods):
+    """Handler-authored rows in the adjustments envelope (`adj`).
+
+    Runtime-owned rows — ModelDefault resolution and deployment policy clamps — reach the
+    envelope WITHOUT this service; a handler requests it only when its own model logic
+    performs an additional caller-visible adjustment (§1.2).
+    """
+
+    __slots__ = ()
+
+    def extend(self, rows: Iterable[AdjustmentRow]) -> None:
+        """Publish the exact adjustment rows already computed by this request's preflight."""
+        self._attempt.check_open("Adjustments")
+        self._attempt.rows.extend(rows)
 
     def _row(
         self, kind: RowKind, field: str, requested: object, applied: object, reason: str

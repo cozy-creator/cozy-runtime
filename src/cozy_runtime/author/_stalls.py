@@ -14,7 +14,8 @@ from __future__ import annotations
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import FrameType
 
 PERIOD = 0.1
@@ -42,20 +43,28 @@ class Watch:
     def __init__(self, thread: int, idle: Callable[[], bool], alive: Callable[[], bool]) -> None:
         self.thread, self.idle, self.alive = thread, idle, alive
         self.counts: Counter[str] = Counter()
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.done = threading.Event()
         threading.Thread(target=self._run, name="cozy-host-stalls", daemon=True).start()
 
     def _run(self) -> None:
         while not self.done.wait(PERIOD) and self.alive():
-            try:
-                if not self.idle():
-                    continue
-            except Exception:  # the GPU's queue cannot be read: nothing is said
-                return
-            label = where(sys._current_frames().get(self.thread))
             with self.lock:
+                if self.done.is_set() or not self.alive():
+                    return
+                try:
+                    if not self.idle():
+                        continue
+                except Exception:  # the GPU's queue cannot be read: nothing is said
+                    return
+                label = where(sys._current_frames().get(self.thread))
                 self.counts[label] += 1
+
+    @contextmanager
+    def pause(self) -> Iterator[None]:
+        """Drain an in-flight observation before capture and exclude new CUDA queries."""
+        with self.lock:
+            yield
 
     def take(self) -> dict[str, float]:
         """Each code's stalled milliseconds since the last take, those over `FLOOR_MS`."""
@@ -64,7 +73,8 @@ class Watch:
         return {k: n * PERIOD * 1000 for k, n in counts.items() if n * PERIOD * 1000 >= FLOOR_MS}
 
     def stop(self) -> None:
-        self.done.set()
+        with self.lock:
+            self.done.set()
 
 
 def watch(alive: Callable[[], bool]) -> Watch | None:

@@ -20,7 +20,7 @@ import msgspec
 from cozy_runtime.author._assets import ImageAsset
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._markers import AssetBound, ImagePreparation, ModelDefault
-from cozy_runtime.author._services import Adjustments
+from cozy_runtime.author._services import AdjustmentRows, Adjustments
 
 #: Images, in order, that a request edits or composes; none is text to image. Read upright and
 #: scaled down to 16 MP at most. A package states its model's count by overriding the field with
@@ -68,12 +68,14 @@ class Sizes:
     reason: str
     widest: float = math.inf
 
-    def pixels(self, adj: Adjustments, target: Target) -> float:
+    def pixels(self, adj: Adjustments | AdjustmentRows, target: Target) -> float:
         """The target's pixel count inside `megapixels` (a `clamp` row when it moved)."""
         megapixels = target.pixels / MEGAPIXEL
         return held(adj, "megapixels", megapixels, *self.megapixels, self.reason) * MEGAPIXEL
 
-    def fit(self, adj: Adjustments, ratio: tuple[int, int], pixels: float) -> tuple[int, int]:
+    def fit(
+        self, adj: Adjustments | AdjustmentRows, ratio: tuple[int, int], pixels: float
+    ) -> tuple[int, int]:
         """`pixels` at `W:H` on the grid: the ratio held to the sides and `widest`, then at most
         1/16 over `pixels`. A size off the one the ratio itself rounds to is an `aspect_ratio`
         clamp row."""
@@ -90,8 +92,10 @@ class Sizes:
 
     def _snapped(self, pixels: float, ratio: float) -> tuple[int, int]:
         grid = self.grid
-        return (max(grid, round(math.sqrt(pixels * ratio) / grid) * grid),
-                max(grid, round(math.sqrt(pixels / ratio) / grid) * grid))
+        return (
+            max(grid, round(math.sqrt(pixels * ratio) / grid) * grid),
+            max(grid, round(math.sqrt(pixels / ratio) / grid) * grid),
+        )
 
 
 class ImageRequest(msgspec.Struct):
@@ -135,7 +139,12 @@ class ImageRequest(msgspec.Struct):
         return Target((width, height), pixels)
 
     def size(
-        self, adj: Adjustments, first: tuple[int, int] | None, sizes: Sizes, *, megapixels: float,
+        self,
+        adj: Adjustments,
+        first: tuple[int, int] | None,
+        sizes: Sizes,
+        *,
+        megapixels: float,
         ratio: str = "1:1",
     ) -> tuple[int, int]:
         """The output's width and height: `target` held to the model's `sizes`."""
@@ -154,8 +163,10 @@ class ImageRequest(msgspec.Struct):
                 code="reference_boxes_length",
                 fields=("reference_boxes",),
             )
-        return [None if box is None else corners(box, f"reference_boxes.{index}")
-                for index, box in enumerate(boxes)]
+        return [
+            None if box is None else corners(box, f"reference_boxes.{index}")
+            for index, box in enumerate(boxes)
+        ]
 
     def drawn_seed(self) -> int:
         """The seed given, else a fresh one the result reports."""
@@ -196,7 +207,12 @@ def corners(box: Sequence[float], field: str) -> tuple[float, float, float, floa
 
 
 def held[T: (int, float)](
-    adj: Adjustments, field: str, requested: T, low: T, high: T, reason: str = "the model's range"
+    adj: Adjustments | AdjustmentRows,
+    field: str,
+    requested: T,
+    low: T,
+    high: T,
+    reason: str = "the model's range",
 ) -> T:
     """`requested` inside `low`..`high`; a value that had to move is a `clamp` row (a float shown to
     three decimals)."""

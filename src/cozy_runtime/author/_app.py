@@ -17,7 +17,7 @@ environment or config read, any device/allocator surface. Those are fenced (§7)
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar, overload
 
@@ -31,8 +31,9 @@ from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
     model_on_demand,
+    model_phases,
 )
-from cozy_runtime.author._signature import Surface, analyze
+from cozy_runtime.author._signature import Param, Surface, analyze, preparation_params
 from cozy_runtime.author._weights import WeightsOutput
 
 P = ParamSpec("P")
@@ -63,6 +64,9 @@ class Registration:
     weights_outputs: tuple[WeightsOutput, ...] = ()
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
+    prepare: Callable[..., bool] | None = None
+    prepare_params: tuple[Param, ...] = field(default=(), repr=False)
+    phases: tuple[tuple[str, ...], ...] = ()
     internal: bool = False
     """Managed children from this installed package revision only; never a root request."""
     accelerator: bool = True
@@ -78,7 +82,7 @@ class Registration:
     def surface(self) -> Surface:
         """The derived surface — schemas, capabilities, models, and preflight identity."""
         if self._surface is None:
-            self._surface = analyze(
+            surface = analyze(
                 self.fn,
                 name=self.name,
                 publishes=self.publishes,
@@ -96,6 +100,9 @@ class Registration:
                 model_on_demand=self.model_on_demand,
                 model_classes=self.model_classes,
             )
+            if self.prepare is not None:
+                self.prepare_params = preparation_params(self.prepare, surface)
+            self._surface = surface
         return self._surface
 
 
@@ -114,6 +121,8 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
+        prepare: Callable[..., bool] | None = None,
+        phases: Sequence[str | Collection[str]] = (),
         demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
@@ -137,6 +146,8 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
+        prepare: Callable[..., bool] | None = None,
+        phases: Sequence[str | Collection[str]] = (),
         demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
@@ -160,6 +171,8 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
+        prepare: Callable[..., bool] | None = None,
+        phases: Sequence[str | Collection[str]] = (),
         demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
@@ -189,7 +202,11 @@ class App:
         uses, so a machine fetches those first; absent means all. `on_demand=("upsampler",)`
         names the model arguments a request may leave unused: each is built, and its weights
         fetched, when the function first reads it. `model_classes` names a model argument's class
-        in place of its annotation (the Runtime's own generic functions)."""
+        in place of its annotation (the Runtime's own generic functions). `phases=` declares
+        immutable component groups in execution order, available to queued preparation before
+        handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
+        # Immutable CPU metadata; the source reader uses the same closed validator.
+        declared_phases = model_phases(phases)
         policy = memo_policy(memoize)
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
@@ -246,6 +263,8 @@ class App:
                 weights_outputs=weights,
                 demand_bound=demand,
                 preflight=preflight,
+                prepare=prepare,
+                phases=declared_phases,
                 hidden=hidden,
                 internal=internal,
                 accelerator=accelerator is not False,
