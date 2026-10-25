@@ -256,6 +256,7 @@ class _Block:
     ready: Any = None
     region: Any = None
     preferred: bool = False
+    preference_set: bool = False
     native_storage: int | None = None
     aliases: dict[str, dict[str, str]] | None = None
     finals: dict[str, dict[str, _Part]] = field(default_factory=dict)
@@ -955,6 +956,7 @@ class Memory:
                 # the old reservation alive independently of this model's new identity.
                 block.region = None
                 block.preferred = False
+                block.preference_set = False
             if present or forget:
                 block.generation += 1
             return block.nbytes if present else 0
@@ -1086,7 +1088,9 @@ class Memory:
             # Only the failed allocation is retried. No read, fill transform or forward ran.
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
-    def _native_region(self, block: _Block, *, final: bool = False) -> Any:
+    def _native_region(
+        self, block: _Block, *, final: bool = False, speculative: bool = False
+    ) -> Any:
         model = block.model
         field = "final_region" if final else "region"
         region = getattr(block, field)
@@ -1094,19 +1098,33 @@ class Memory:
         request = _REQUEST.get()
         if request is not None and request.idle and (region is None or not region.resident):
             raise StaleBinding("idle graph preparation cannot fill native weight backing")
-        if region is None:
-            first = block.region is None and block.final_region is None
+        created = region is None
+        if created:
             region = self.native.reserve(size)
             setattr(block, field, region)
-            if first:
-                block.preferred = (
-                    model.prefix is None
-                    and self.room().free >= block.allocation_bytes + self.window_bytes
-                )
+        if speculative:
+            return region  # Only demand may assign or shorten the retained prefix.
+        if not block.preference_set:
+            missing = block.allocation_bytes - sum(
+                int(held.allocated_bytes)
+                for held in (block.region, block.final_region)
+                if held is not None and held.resident
+            )
+            block.preferred = (
+                model.prefix is None and self.room().free >= missing + self.window_bytes
+            )
+            block.preference_set = True
             if not block.preferred:
                 model.prefix = (
                     min(model.prefix, block.index) if model.prefix is not None else block.index
                 )
+            for held, protect in (
+                (block.region, not block.final_only()),
+                (block.final_region, True),
+            ):
+                if held is not None:
+                    held.set_preferred(block.preferred and protect)
+        elif created:
             region.set_preferred(block.preferred and (final or not block.final_only()))
         elif block.preferred and (final or not block.final_only()) and not region.preferred:
             # Native activation recovery reduces the prefix without calling Python. Keep
@@ -1183,7 +1201,7 @@ class Memory:
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
             try:
-                region = self._native_region(block)
+                region = self._native_region(block, speculative=True)
                 read = region.prepare_read(block.model.source.ck, parts, reclaim=False)
             except torch.OutOfMemoryError:
                 if request is not None:
@@ -1255,6 +1273,7 @@ class Memory:
                 if not complete and block.region is pending.region:
                     block.region = None
                     block.preferred = False
+                    block.preference_set = False
                 self._prefetch = None
 
     def _final_views(self, block: _Block, reclaim: bool) -> None:
