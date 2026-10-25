@@ -46,10 +46,10 @@ import weakref
 from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
+from functools import partial
 from typing import Any, NamedTuple
 
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author import _work as work
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
@@ -159,9 +159,9 @@ def generate(
     model's own rotary embedding. It speeds up a
     batch of one, each token computed as decode computes it. Without one, the head `drafting`
     names is used.
-    `progress(steps)` is told the decode steps taken so far, at most every `PROGRESS_S`, for
-    display only; one that raises is dropped, with a run warning (a cancel is the decode's own
-    check's to act on)."""
+    `progress(tokens)` is told the tokens decoded so far (a call's longest row), at most every
+    `PROGRESS_S`, for display only; one that raises is dropped, with a run warning (a cancel is
+    the decode's own check's to act on)."""
     draft = draft if draft is not None else _DRAFT.get()
     if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
         raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
@@ -649,8 +649,8 @@ class _Cancel(StoppingCriteria):  # type: ignore[misc]
     def __call__(self, input_ids: Any, scores: Any, **kwargs: Any) -> Any:
         if self.context is not None:
             self.context.raise_if_cancelled()
-        self.steps += 1
-        self.tell(self.steps)
+        self.steps += 1  # one token a step: this loop drafts none
+        self.tell(lambda: self.steps)
         return torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
 
 
@@ -659,12 +659,13 @@ PROGRESS_S = 0.25
 
 
 class _Tell:
-    """A call's `progress`, told the steps taken so far at most every `PROGRESS_S`."""
+    """A call's `progress`, told its tokens so far at most every `PROGRESS_S`: `count` is read only
+    then."""
 
     def __init__(self, progress: Callable[[int], None] | None) -> None:
         self.progress, self.told = progress, 0.0
 
-    def __call__(self, steps: int) -> None:
+    def __call__(self, count: Callable[[], int]) -> None:
         if self.progress is None:
             return
         now = time.perf_counter()
@@ -672,7 +673,7 @@ class _Tell:
             return
         self.told = now
         try:
-            self.progress(steps)
+            self.progress(count())
         except Cancelled:  # the decode's own check ends the call
             return
         except Exception as exc:  # the decode (perhaps other calls' too) outlives its report
@@ -1419,11 +1420,9 @@ class _Engine:
                 self.unfenced.discard(stream)
         for row in rows:
             row.reach = min(row.reach + per, self.capacity)
-        work.done += 1
         for request in {id(row.request): row.request for row in rows}.values():
             request.steps += 1
             request.live += len(rows)
-            request.tell(request.steps)
 
     def _settle(self, incoming: list[_Request]) -> None:
         """Between steps, with the device caught up: done and cancelled rows leave, the rows
@@ -1817,6 +1816,7 @@ class _Engine:
                 if not cuda:
                     if bool(self.flag[:size].any()) or joining() or self._cancelled():
                         break
+                    self._tell()
                     continue
                 event = torch.cuda.Event()
                 event.record()
@@ -1825,9 +1825,28 @@ class _Engine:
                     queued.popleft().synchronize()
                     if bool(self.flag[:size].any()) or joining() or self._cancelled():
                         break
+                    self._tell()
             if cuda:
                 torch.cuda.current_stream().synchronize()
         self.retire = True
+
+    def _tell(self) -> None:
+        """Each held call's progress, its longest row's tokens: drafting decodes several a step. The
+        flag check has just caught the host up with the device, so reading `n` waits on nothing."""
+        counts: list[int] = []
+
+        def tokens(request: _Request) -> int:
+            if not counts:
+                counts.extend(self.n.tolist())
+            held = (
+                n
+                for n, row in zip(counts, self.slots, strict=False)
+                if row and row.request is request
+            )
+            return max(held, default=0)
+
+        for request in {id(row.request): row.request for row in self.slots if row}.values():
+            request.tell(partial(tokens, request))
 
     @contextmanager
     def _graph_memory(self) -> Iterator[None]:

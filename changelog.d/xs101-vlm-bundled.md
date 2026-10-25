@@ -1,0 +1,1 @@
+`vlm.processor` also reads a package's bundled directory, a slow tokenizer (`vocab.json` + `merges.txt`) and the tokenizer config's chat template, as `from_pretrained` does; MiniMax-H3's own processor builder goes (xs-101).

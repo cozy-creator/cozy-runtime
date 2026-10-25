@@ -1,0 +1,1 @@
+One Qwen-VL loader for packages (xs-101): `vlm.processor(assets, folder, config, image)` reads a checkpoint folder's own files, one `processor_config.json` or the component config, and either chat-template form; `vlm.construct` takes a checkpoint without the MTP head its config declares.

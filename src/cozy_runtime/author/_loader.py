@@ -184,16 +184,14 @@ PATH_KEYS = frozenset(
 #: Key SUFFIXES that name a carrier however the key is spelled (`unet_path`, `vae_dir`).
 PATH_SUFFIXES = ("_path", "_dir", "_file", "_url", "_repo")
 
-#: Where `save_pretrained` says a config came from: provenance in every upstream config, never
-#: construction input. It names a repo or folder, so a factory never sees it: dropped, not refused.
-PROVENANCE = "_name_or_path"
-
-
-def _without_provenance(data: Mapping[str, object]) -> dict[str, object]:
+def _without_bookkeeping(data: Mapping[str, object]) -> dict[str, object]:
+    """Without what the saving library writes about itself (`_name_or_path`, `_class_name`,
+    `_diffusers_version`): never construction input, so a section's `mapping()` is exactly a
+    constructor's arguments. `_name_or_path` names a repo or folder: dropped, not refused."""
     return {
-        key: _without_provenance(value) if isinstance(value, Mapping) else value
+        key: _without_bookkeeping(value) if isinstance(value, Mapping) else value
         for key, value in data.items()
-        if key != PROVENANCE
+        if not key.startswith("_")
     }
 
 
@@ -239,7 +237,7 @@ class Config:
     ) -> None:
         """Freeze one in-memory construction config. `bound` names the components the
         binding selects (None: all); the others' tensors are not in `tensor_dtypes`."""
-        data = _without_provenance(data)
+        data = _without_bookkeeping(data)
         for key, value in data.items():
             carrier = _carrier(key, value)
             if carrier is not None:
