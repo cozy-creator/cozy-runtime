@@ -492,8 +492,22 @@ class Binding:
         self.model, self.groups = model, groups
         self.fill = model.wanted_identity()
         self.generation = model.generation
+        self.targets = [
+            (site, tuple(value.shape), value.dtype)
+            for sites in model.sites.values()
+            for site in sites
+            if (value := site.table[site.name]) is not None
+        ]
         self.identity = hashlib.sha256(
-            repr((model.name, self.fill, self.generation, [b.index for b in groups])).encode()
+            repr(
+                (
+                    model.name,
+                    self.fill,
+                    self.generation,
+                    [b.index for b in groups],
+                    [(shape, str(dtype)) for _, shape, dtype in self.targets],
+                )
+            ).encode()
         ).hexdigest()
         self.closed = False
         self.completion_lost = False
@@ -511,6 +525,12 @@ class Binding:
             and self.fill is not None
             and self.fill == self.model.wanted_identity()
             and self.generation == self.model.generation
+            and all(
+                (value := site.table[site.name]) is not None
+                and tuple(value.shape) == shape
+                and value.dtype == dtype
+                for site, shape, dtype in self.targets
+            )
             and all(
                 b.data is not None and b.generation == generation for b, generation in self.held
             )
@@ -1700,8 +1720,16 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
             if not sites:
                 continue
             old = sites[0].table[sites[0].name]
-            if block.aliases is not None and old is not None and old.dtype != value.dtype:
-                raise ResidencyError(f"{name}: destination dtype changed after binding layout")
+            if (
+                block.aliases is not None
+                and old is not None
+                and old.dtype != value.dtype
+                and (block.retained or model.memory.capturing())
+            ):
+                raise StaleBinding(f"{name}: graph capture needs a matching destination dtype")
+            # An eager module may temporarily widen weights (SDXL's VAE does this).
+            # Keep the declared cached bytes immutable; this conversion is ordinary
+            # owning Torch storage, not a hit for a different prepared representation.
             tensor = value if old is None or old.dtype == value.dtype else value.to(old.dtype)
             if any(site.parameter for site in sites):
                 tensor = nn.Parameter(tensor, requires_grad=False)
