@@ -285,7 +285,7 @@ def install_spread(
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
-                reply = _accept(name, group, rank, group.reply_one(rank, "run"))
+                reply = _accept(name, group, rank, group.reply_one(rank, "run", shown=False))
                 if result is None:
                     declined[str(rank)] = (reply.declined or "declined")[:300]
                     log["declined"][str(rank)] = declined[str(rank)]

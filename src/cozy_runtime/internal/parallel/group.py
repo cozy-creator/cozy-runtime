@@ -630,8 +630,8 @@ class RankGroup:
                 f"{self.gpu(rank)} cannot be commanded: {exc}", code="group_broken"
             ) from exc
 
-    def reply_one(self, rank: int, name: str) -> dict[str, Any]:
-        return self._reply(self.followers[rank - 1], name)
+    def reply_one(self, rank: int, name: str, shown: bool = True) -> dict[str, Any]:
+        return self._reply(self.followers[rank - 1], name, shown)
 
     def _reply(self, follower: Follower, name: str, shown: bool = True) -> dict[str, Any]:
         if shown and follower.replies.empty():
