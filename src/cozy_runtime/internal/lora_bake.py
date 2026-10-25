@@ -506,7 +506,11 @@ def bake(
     returns a small delta to where it was, and loses most of a LoRA's effect on fp8
     (MEASURE.md, TensorD #26). `seed` names the weight's noise. A GPU bakes fused when `how`
     says its kernels serve (`serving`), unless `stats` are asked for (the eager reference
-    measures them)."""
+    measures them). A convolution's weight and factors bake as matrices, each kernel tap one
+    more input column."""
+    if down.dim() > 2:
+        stored = {role: t.view(t.shape[0], -1) if t.dim() > 2 else t for role, t in stored.items()}
+        down, up = down.flatten(1), up.flatten(1)
     device = next(iter(stored.values())).device
     if stats is None and device.type == "cuda" and how == "fused":
         fused(torch, stored, down, up, seed)

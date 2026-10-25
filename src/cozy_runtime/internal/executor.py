@@ -2540,7 +2540,13 @@ class Executor:
                     "one model slot selects different prepared adapter graphs",
                     code="adapter_graph_conflict",
                 )
-            artifact = bind_adapters(artifact, model_cls, data, prepared_snapshot=manifest)
+            artifact = bind_adapters(
+                artifact,
+                model_cls,
+                data,
+                lambda component, name: checkpoints[component].binding(component)(name),
+                prepared_snapshot=manifest,
+            )
         seen = Observations()
         registry = ModelRegistry(
             release=binding.release,
