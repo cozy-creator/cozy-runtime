@@ -18,8 +18,9 @@ def _refuse(code: str, detail: str) -> CapabilityError:
     return CapabilityError(detail, code="adapter_" + code)
 
 
-class Linear(msgspec.Struct, frozen=True):
-    """One ordinary PEFT layer's construction geometry and ordered scaling."""
+class Layer(msgspec.Struct, frozen=True):
+    """One PEFT layer's (a linear's or a 2-D convolution's) construction geometry and ordered
+    scaling."""
 
     component: str
     target: str
@@ -32,7 +33,7 @@ class Linear(msgspec.Struct, frozen=True):
 
 class Graph(msgspec.Struct, frozen=True):
     format: str
-    layers: tuple[Linear, ...]
+    layers: tuple[Layer, ...]
     adapters: tuple[AdapterRef, ...] = ()
 
 
