@@ -32,6 +32,7 @@ struct Repeat {
     cudaStream_t work = nullptr;
     cudaStream_t control_stream = nullptr;
     cudaEvent_t done = nullptr;
+    cudaEvent_t producer_ready = nullptr;
     cudaEvent_t initialized = nullptr;
     cudaEvent_t sampled = nullptr;
     Control *control = nullptr;
@@ -127,6 +128,8 @@ static cudaError_t cleanup(Repeat *run) {
     run->host_snapshot = nullptr;
     if (run->done && (error = cudaEventDestroy(run->done)) != cudaSuccess) return error;
     run->done = nullptr;
+    if (run->producer_ready && (error = cudaEventDestroy(run->producer_ready)) != cudaSuccess) return error;
+    run->producer_ready = nullptr;
     if (run->initialized && (error = cudaEventDestroy(run->initialized)) != cudaSuccess) return error;
     run->initialized = nullptr;
     if (run->sampled && (error = cudaEventDestroy(run->sampled)) != cudaSuccess) return error;
@@ -156,6 +159,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(cudaDeviceGetStreamPriorityRange(&lowest_priority, &highest_priority));
     CHECK(cudaStreamCreateWithPriority(&run->control_stream, cudaStreamNonBlocking, highest_priority));
     CHECK(cudaEventCreateWithFlags(&run->done, cudaEventDisableTiming));
+    CHECK(cudaEventCreateWithFlags(&run->producer_ready, cudaEventDisableTiming));
     CHECK(cudaEventCreateWithFlags(&run->initialized, cudaEventDisableTiming));
     CHECK(cudaEventCreateWithFlags(&run->sampled, cudaEventDisableTiming));
     // A first control-kernel launch must never trigger lazy loading while the repeat runs.
@@ -200,7 +204,7 @@ extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
     return on_device(device, [&] { return create(source, index, device, steps, out); });
 }
 
-static int launch(Repeat *run, uintptr_t producer) {
+static int arm(Repeat *run, uintptr_t producer) {
     cudaError_t error;
     cudaStreamCaptureStatus capturing;
     error = cudaStreamIsCapturing(reinterpret_cast<cudaStream_t>(producer), &capturing);
@@ -210,10 +214,13 @@ static int launch(Repeat *run, uintptr_t producer) {
         error = cudaEventQuery(run->done); if (error != cudaSuccess) return error;
         error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
     }
-    // The source inputs are ready before this graph; no cross-stream implicit default ordering.
-    error = cudaEventRecord(run->done, reinterpret_cast<cudaStream_t>(producer));
-    if (error != cudaSuccess) return error;
-    error = cudaStreamWaitEvent(run->work, run->done, 0);
+    // Record on the caller's OS thread: a per-thread default stream cannot be moved to a worker.
+    return cudaEventRecord(run->producer_ready, reinterpret_cast<cudaStream_t>(producer));
+}
+
+static int launch_armed(Repeat *run) {
+    // The caller-ready event was already recorded before the native read worker was started.
+    cudaError_t error = cudaStreamWaitEvent(run->work, run->producer_ready, 0);
     if (error != cudaSuccess) return error;
     error = cudaMemsetAsync(run->control, 0, sizeof(Control), run->work);
     if (error != cudaSuccess) return error;
@@ -229,7 +236,15 @@ static int launch(Repeat *run, uintptr_t producer) {
     if (error != cudaSuccess) return error;
     error = cudaEventRecord(run->done, run->work);
     if (error != cudaSuccess) return error;
-    // Subsequent ordinary operations on the caller's stream observe the completed native work.
+    return cudaSuccess;
+}
+
+static int launch(Repeat *run, uintptr_t producer) {
+    int status = arm(run, producer);
+    if (status != cudaSuccess) return status;
+    status = launch_armed(run);
+    if (status != cudaSuccess) return status;
+    // Pure resident submit is immediate. Composed async loads instead require an explicit join.
     return cudaStreamWaitEvent(reinterpret_cast<cudaStream_t>(producer), run->done, 0);
 }
 
@@ -299,6 +314,12 @@ static int destroy(Repeat *run) {
 
 extern "C" int cozy_repeat_launch(Repeat *run, uintptr_t producer) {
     return on_device(run->device, [&] { return launch(run, producer); });
+}
+extern "C" int cozy_repeat_arm(Repeat *run, uintptr_t producer) {
+    return on_device(run->device, [&] { return arm(run, producer); });
+}
+extern "C" int cozy_repeat_launch_armed(Repeat *run) {
+    return on_device(run->device, [&] { return launch_armed(run); });
 }
 extern "C" int cozy_repeat_ready(Repeat *run, int *done) {
     return on_device(run->device, [&] { return ready(run, done); });

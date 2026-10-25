@@ -1,6 +1,12 @@
 //! One resident graph definition, one GPU-driven loop, and its complete owner lifetime.
 use pyo3::{exceptions::PyRuntimeError, prelude::*, types::PyDict};
-use std::{ffi::c_void, sync::Mutex};
+use std::{
+    ffi::c_void,
+    ops::Deref,
+    sync::{Arc, Mutex},
+};
+
+mod continuation;
 
 pyo3::create_exception!(_execution, NativeExecutionError, PyRuntimeError);
 
@@ -13,6 +19,8 @@ unsafe extern "C" {
         out: *mut *mut c_void,
     ) -> i32;
     fn cozy_repeat_launch(run: *mut c_void, producer: usize) -> i32;
+    fn cozy_repeat_arm(run: *mut c_void, producer: usize) -> i32;
+    fn cozy_repeat_launch_armed(run: *mut c_void) -> i32;
     fn cozy_repeat_ready(run: *mut c_void, done: *mut i32) -> i32;
     fn cozy_repeat_poll(
         run: *mut c_void,
@@ -43,6 +51,7 @@ fn cuda_error(py: Python<'_>, operation: &str, code: i32) -> PyErr {
         return PyRuntimeError::new_err(match code {
             -1 => "stale execution token",
             -2 => "prepared repeat is closed",
+            -4 => "prepared repeat is reserved by a native load",
             _ => "prepared repeat is not running",
         });
     }
@@ -56,15 +65,12 @@ struct State {
     launched: bool,
     failed: bool,
     epoch: u64,
+    launches: u64,
+    pending: Option<u64>,
     destroy_failed: bool,
 }
 
-#[pyclass(
-    name = "ResidentRepeat",
-    module = "cozy_runtime._kernels._execution",
-    frozen
-)]
-struct ResidentRepeat {
+struct RepeatOwner {
     state: Mutex<State>,
     owners: Mutex<Vec<Py<PyAny>>>,
     pid: u32,
@@ -74,7 +80,23 @@ struct ResidentRepeat {
     steps: u32,
 }
 
-impl ResidentRepeat {
+#[pyclass(
+    name = "ResidentRepeat",
+    module = "cozy_runtime._kernels._execution",
+    frozen
+)]
+struct ResidentRepeat {
+    inner: Arc<RepeatOwner>,
+}
+
+impl Deref for ResidentRepeat {
+    type Target = RepeatOwner;
+    fn deref(&self) -> &RepeatOwner {
+        &self.inner
+    }
+}
+
+impl RepeatOwner {
     fn check_process(&self) -> PyResult<()> {
         if self.pid != std::process::id() {
             return Err(PyRuntimeError::new_err(
@@ -104,6 +126,9 @@ impl ResidentRepeat {
             if state.failed {
                 return Err(999);
             }
+            if state.pending.is_some() {
+                return Err(-4);
+            }
             let result = call(&mut state);
             if result.as_ref().is_err_and(|code| *code >= 0) {
                 state.failed = true;
@@ -114,7 +139,7 @@ impl ResidentRepeat {
     }
 }
 
-impl ResidentRepeat {
+impl RepeatOwner {
     fn dispose(&self, py: Python<'_>, epoch: Option<u64>) -> PyResult<()> {
         self.check_process()?;
         py.detach(|| {
@@ -188,19 +213,23 @@ impl ResidentRepeat {
         // SAFETY: successful preparation inspected this same live native body recursively.
         let validated_nodes = unsafe { cozy_repeat_validated_nodes(pointer as *mut c_void) };
         Ok(Self {
-            state: Mutex::new(State {
-                pointer,
-                launched: false,
-                failed: false,
-                epoch: 0,
-                destroy_failed: false,
+            inner: Arc::new(RepeatOwner {
+                state: Mutex::new(State {
+                    pointer,
+                    launched: false,
+                    failed: false,
+                    epoch: 0,
+                    launches: 0,
+                    pending: None,
+                    destroy_failed: false,
+                }),
+                owners: Mutex::new(owners),
+                pid: std::process::id(),
+                nodes,
+                validated_nodes,
+                device,
+                steps,
             }),
-            owners: Mutex::new(owners),
-            pid: std::process::id(),
-            nodes,
-            validated_nodes,
-            device,
-            steps,
         })
     }
 
@@ -216,7 +245,7 @@ impl ResidentRepeat {
                 .state
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("native owner poisoned"))?;
-            (state.epoch, state.pointer == 0)
+            (state.launches, state.pointer == 0)
         };
         // These facts originate in the actual constructed native handle, never a protocol match.
         let result = PyDict::new(py);
@@ -227,22 +256,31 @@ impl ResidentRepeat {
         result.set_item("steps_per_launch", self.steps)?;
         result.set_item("host_graph_launches", launches)?;
         result.set_item("control_kernels_preloaded", true)?;
+        result.set_item("continuation_abi", 1)?;
         result.set_item("closed", closed)?;
         Ok(result)
     }
 
     fn launch(&self, py: Python<'_>, producer_stream: usize) -> PyResult<u64> {
         self.native(py, "launch resident repeat", None, |state| {
+            if state.pending.is_some() {
+                return Err(-4);
+            }
             // SAFETY: exclusive handle, source owners retained; producer stream belongs to this device.
             match unsafe { cozy_repeat_launch(state.pointer as *mut c_void, producer_stream) } {
                 0 => {
                     state.launched = true;
                     state.epoch += 1;
+                    state.launches += 1;
                     Ok(state.epoch)
                 }
                 code => Err(code),
             }
         })
+    }
+
+    fn continuation(&self, py: Python<'_>, producer_stream: usize) -> PyResult<(Py<PyAny>, u64)> {
+        continuation::export(py, self.inner.clone(), producer_stream)
     }
 
     fn poll(&self, py: Python<'_>, epoch: u64) -> PyResult<(u32, bool, bool)> {
@@ -321,7 +359,7 @@ impl ResidentRepeat {
     }
 }
 
-impl Drop for ResidentRepeat {
+impl Drop for RepeatOwner {
     fn drop(&mut self) {
         if self.pid != std::process::id() {
             // Never acquire inherited CUDA/mutex state, or destroy inherited Torch owners after fork.

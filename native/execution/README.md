@@ -99,3 +99,40 @@ source/recipe/target identity.
 
 This is a resident execution primitive, not a full H3 pipeline or an oversubscribed native plan.
 Streaming, event-based refill, queue policy and the CPU output handoff remain separate work.
+
+## One native load followed by its dependent repeat
+
+`PreparedRepeat.capture(step, state=..., steps=..., load=slot)` accepts a dedicated
+`tensorfs.varena.LoadSlot`. Its initialized U8 capture tensor owns a still-unpublished Varena Fill.
+Python captures the known fixed body and seals the slot before any read producer starts. The first
+`ctx.plan(prepared)` submission reserves a native epoch, records caller readiness on the caller's
+OS thread and passes a checked continuation capsule to TensorFS's existing native worker. That
+worker reads the actual raw stored parts, commits after checked producer completion, retains the
+Pin and calls the native repeat. No Python callback, observer or decoder drives this transition.
+This first load submission is one-shot; native decode and arbitrary cold-model capture are not
+supported by this interface. Setup allocation, zero initialization and capture are preparation
+costs, not hidden parts of the measured stored-byte read.
+
+The two extensions remain separate. `include/cozy_execution_v1.h` is the private C-layout contract:
+version/size/capabilities/device/PID, an opaque owner, and retain/release/start/poll/cancel/wait.
+No Rust object layout crosses the DSO seam and Runtime does not link a second Varena registry.
+The capsule and provider module remain owned through completion. Start/cancel arbitrate through
+an atomic gate. Cancel is nonblocking; the native worker's event-query wait loop delivers a
+pending GPU cancel after launch initialization. Only public progress observers request snapshot
+kernels; internal waiting never generates a millisecond stream of GPU snapshots.
+
+A never-recorded CUDA event is not a promise of future work. While the native read is pending,
+composed submission does not promise immediate ordering of later caller-stream work. Call
+`Execution.wait()` or rely on request-scope joining before output access. The native launch uses
+its explicitly owned stream and the caller-ready event that was already recorded; a worker never
+reinterprets the caller's per-thread default stream. Pure resident submission ordering is unchanged.
+
+`Execution.facts()` includes native load bytes and completion timestamps. Failed or canceled
+reads never launch the graph. A checked ordinary failure remains visible to observers but permits
+close to release graph owners; `completion_proven` comes from the native job, never from an error
+class. Sticky or unproven completion retains actual source, Fill/Pin, graph and module owners.
+The existing request scope still owns the complete submission on success, cancellation and unwind.
+
+Source/build work is not GPU qualification. The corresponding real Creator release-gate cell must
+prove nonzero stored reads feed the known body while Python is parked, active cancellation while
+the native worker waits, zero launches on prelaunch failure/cancel, and final ownership cleanup.

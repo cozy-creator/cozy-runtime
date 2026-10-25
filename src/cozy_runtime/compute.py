@@ -62,6 +62,8 @@ class PreparedRepeat:
         self._closed = False
         self._owned_bindings: tuple[Any, ...] = ()
         self._binding_cleanup = ExitStack()
+        self._load: Any = None
+        self._load_used = False
 
     @staticmethod
     def _layout(tensor: Any) -> tuple[Any, ...]:
@@ -97,13 +99,36 @@ class PreparedRepeat:
         state: Sequence[Any],
         steps: int,
         owners: Sequence[object] = (),
+        load: Any = None,
     ) -> PreparedRepeat:
-        """Acquire independent graph bindings; caller bindings remain caller-owned."""
+        """Capture a fixed body, optionally fed by one native raw LoadSlot.
+
+        A load slot is initialized capture storage, not a cold-model compiler. Capture seals
+        its unpublished Fill; one later submission reads its actual stored bytes before the
+        native graph starts. Loaded submissions are one-shot and require wait/request join
+        before output access. Pure resident repeats retain their existing reuse contract.
+        """
         import torch
 
         from cozy_runtime import graphs
         from cozy_runtime.internal.residency import Binding
 
+        if load is not None:
+            from tensorfs import varena
+
+            from cozy_runtime._kernels import _execution
+
+            slot_type = getattr(varena, "LoadSlot", None)
+            if (
+                slot_type is None
+                or not isinstance(load, slot_type)
+                or not callable(getattr(_execution.ResidentRepeat, "continuation", None))
+            ):
+                raise CapabilityError(
+                    "native loading requires a TensorFS LoadSlot",
+                    code="prepared_load_unavailable",
+                )
+            owners = (*owners, load)
         with ExitStack() as cleanup, ExitStack() as preparing:
             resolved: list[object] = []
             bindings: dict[int, Any] = {}
@@ -125,6 +150,13 @@ class PreparedRepeat:
                 plan = cls._capture_ready(step, state=state, steps=steps, owners=resolved)
             finally:
                 graphs.BYPASS.reset(bypass)
+            if load is not None:
+                try:
+                    load.seal()
+                except BaseException:
+                    plan.close()
+                    raise
+                plan._load = load
             plan._owned_bindings = tuple(bindings.values())
             for binding in plan._owned_bindings:
                 model = binding.model
@@ -266,13 +298,12 @@ class PreparedRepeat:
         with self._submission:
             if self._closed:
                 return
-            if self._active is not None and self._active._finished is None:
-                _completed, _canceled, done = self._native.poll(self._active._epoch)
-                if not done:
-                    raise RuntimeError(
-                        "cannot retire prepared work while its GPU execution is active"
-                    )
-                self._active.poll()
+            if (
+                self._active is not None
+                and self._active._finished is None
+                and not self._active.poll().done
+            ):
+                raise RuntimeError("cannot retire prepared work while its GPU execution is active")
             self.close()
 
     def _release_owned_bindings(self) -> None:
@@ -287,19 +318,28 @@ class PreparedRepeat:
         with self._submission:
             if self._closed:
                 return
+            settled_error: Exception | None = None
             if self._active is not None:
                 active = self._active
                 # A result waiter may hold _observation while waiting for completion.
                 # Deliver cancellation first; it must never need that observer's lock.
                 if active._finished is None:
                     active.cancel()
-                active._join()
+                try:
+                    active._join()
+                except Exception as error:
+                    if active._finished is None:
+                        raise  # No checked completion: preserve every graph/storage owner.
+                    settled_error = error
             try:
                 self._native.close_owner()
             except Exception as error:
                 _native_error(error)
             self._closed = True
             self._release_owned_bindings()
+            self._load = None
+            if settled_error is not None:
+                _native_error(settled_error)
 
     def __del__(self) -> None:
         with suppress(BaseException):
@@ -323,6 +363,8 @@ class PreparedRepeat:
                 raise ValueError("prepared work does not belong to this request's CUDA device")
         with self._submission:
             self._validate()
+            if self._load is not None and self._load_used:
+                raise RuntimeError("a prepared native load is one-shot; prepare a new slot")
             if self._active is not None and not self._active.poll().done:
                 raise RuntimeError("a prepared repeat is already running")
             with torch.cuda.device(self.device):
@@ -341,8 +383,17 @@ class PreparedRepeat:
                     if binding.model not in claimed:
                         binding.model._claim()
                         claimed.append(binding.model)
-                epoch = self._native.launch(torch.cuda.current_stream(self.device).cuda_stream)
-                self._active = Execution(self, context, epoch, outputs, readout, claimed)
+                producer = torch.cuda.current_stream(self.device).cuda_stream
+                job = None
+                if self._load is None:
+                    epoch = self._native.launch(producer)
+                else:
+                    # Arm on this OS thread before a TensorFS worker takes over. Its native
+                    # continuation owns the recorded caller-ready event and execution epoch.
+                    capsule, epoch = self._native.continuation(producer)
+                    job = self._load.submit_native(capsule)
+                    self._load_used = True
+                self._active = Execution(self, context, epoch, outputs, readout, claimed, job)
                 return self._active
             except BaseException as error:
                 if isinstance(error, Exception) and getattr(error, "eligibility_refusal", False):
@@ -379,12 +430,36 @@ class Execution:
         outputs: tuple[Any, ...],
         readout: Any,
         models: list[Any],
+        load_job: Any = None,
     ) -> None:
         self.plan, self.context = plan, context
         self._finished: Progress | None = None
         self._epoch, self._outputs, self._readout = epoch, outputs, readout
         self._observation = threading.RLock()
         self._models = models
+        self._load_job = load_job
+        self._failure: Exception | None = None
+
+    def facts(self) -> dict[str, object]:
+        """Native execution and, when present, its actual owned input read."""
+        facts = self.plan.facts()
+        if self._load_job is not None:
+            facts["native_load"] = dict(self._load_job.facts())
+        return facts
+
+    def _failed_load(self, error: Exception) -> None:
+        """A failed read may still prove cleanup; an exception alone is never that proof."""
+        if self._load_job is None:
+            return
+        self._failure = error
+        facts = self._load_job.facts()
+        if facts.get("completion_proven", False):
+            # No readout of failed/partial input. Public observers retain the original error;
+            # close may now retire the graph and its bindings after this native certificate.
+            self._finished = Progress(0, bool(facts.get("canceled", False)), True)
+            models, self._models = self._models, []
+            for model in reversed(models):
+                model._release()
 
     def _finish(self, completed: int, canceled: bool) -> Progress:
         import torch
@@ -403,20 +478,34 @@ class Execution:
 
     def poll(self) -> Progress:
         with self._observation:
+            if self._failure is not None:
+                _native_error(self._failure)
             if self._finished is not None:
                 return self._finished
             try:
-                completed, canceled, done = self.plan._native.poll(self._epoch)
+                completed, canceled, done = (
+                    self.plan._native.poll(self._epoch)
+                    if self._load_job is None
+                    else self._load_job.poll()
+                )
                 if done:
-                    completed, canceled = self.plan._native.wait(self._epoch)
+                    completed, canceled = (
+                        self.plan._native.wait(self._epoch)
+                        if self._load_job is None
+                        else self._load_job.wait()
+                    )
                     return self._finish(completed, canceled)
                 return Progress(completed, canceled, False)
             except Exception as error:
+                self._failed_load(error)
                 _native_error(error)
 
     def cancel(self) -> None:
         try:
-            self.plan._native.cancel(self._epoch)
+            if self._load_job is None:
+                self.plan._native.cancel(self._epoch)
+            else:
+                self._load_job.cancel()
         except Exception as error:
             _native_error(error)
 
@@ -424,12 +513,19 @@ class Execution:
         with self._observation:
             if self._finished is None:
                 try:
-                    completed, canceled = self.plan._native.wait(self._epoch)
+                    completed, canceled = (
+                        self.plan._native.wait(self._epoch)
+                        if self._load_job is None
+                        else self._load_job.wait()
+                    )
                 except Exception as error:
+                    self._failed_load(error)
                     _native_error(error)
                 self._finish(completed, canceled)
 
     def wait(self) -> tuple[Any, ...]:
+        if self._failure is not None:
+            _native_error(self._failure)
         if self.context is None:
             self._join()
         else:
