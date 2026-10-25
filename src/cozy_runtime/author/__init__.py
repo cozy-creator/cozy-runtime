@@ -68,7 +68,7 @@ from cozy_runtime.author._decode import (
     MediaDecodeError,
     VideoProbe,
 )
-from cozy_runtime.author._defaults import Clamp, DefaultSet, Overlay, decode_request
+from cozy_runtime.author._defaults import Overlay, decode_request
 from cozy_runtime.author._demand import RequestFeatures
 from cozy_runtime.author._describe import assert_declaration_shape, describe
 from cozy_runtime.author._errors import (
@@ -104,8 +104,6 @@ from cozy_runtime.author._invoke import (
     Invocation,
     InvocationResult,
     PreparedRequest,
-    attempt,
-    invoke,
     prepare,
 )
 from cozy_runtime.author._loader import (
@@ -220,7 +218,6 @@ __all__ = [
     "CheckpointRef",
     "CheckpointUnnormalized",
     "ChildCallError",
-    "Clamp",
     "Config",
     "ConformanceError",
     "ConstructionIdentity",
@@ -240,7 +237,6 @@ __all__ = [
     "DecodedVideoFrame",
     "DecoderUnavailable",
     "DefaultResolutionError",
-    "DefaultSet",
     "DerivationHook",
     "DerivedCache",
     "Device",
@@ -318,7 +314,6 @@ __all__ = [
     "active_attention_layout",
     "assert_declaration_shape",
     "attach_assessment",
-    "attempt",
     "attention_scope",
     "canonical_json",
     "classify",
@@ -332,7 +327,6 @@ __all__ = [
     "graph_keys",
     "held",
     "invocable",
-    "invoke",
     "placeable",
     "prefetch",
     "prepare",

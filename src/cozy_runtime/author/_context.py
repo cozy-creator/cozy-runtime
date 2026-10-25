@@ -142,7 +142,6 @@ class Context:
     """Monotonic-clock instant the attempt must not outlive."""
     device: Device = field(default_factory=Device)
     _cancel: Callable[[], bool] = field(default=lambda: False, repr=False)
-    _adapters: tuple[AdapterRef, ...] = field(default=(), repr=False)
     _tensorfs_source: Callable[[Weights[Any]], Checkpoint] | None = field(default=None, repr=False)
     _tensorfs_output: Callable[[str, Derivation], Output] | None = field(default=None, repr=False)
     _tensorfs_adopt: Callable[[Output], ModelArtifact] | None = field(default=None, repr=False)

@@ -123,13 +123,15 @@ from __PKG__ import app
 def main() -> None:
     for surface in describe(app):
         caps = ", ".join(sorted(surface.capabilities)) or "(none)"
-        print(f"registered: {surface.name}  gpu={surface.gpu}  capabilities: {caps}")
-    envelope = invoke_with_fakes(
+        print(f"registered: {surface.name}  gpu={surface.accelerator}  capabilities: {caps}")
+    envelope, outcome, _ = invoke_with_fakes(
         app.get("generate"), {"prompt": "a cozy cabin in the woods", "seed": 7}
     )
-    print("result:  ", envelope.result)
-    print("outputs: ", envelope.outputs)
-    print("features:", envelope.features.values)
+    print("outcome: ", outcome.terminal, outcome.message)
+    if envelope is not None:
+        print("result:  ", envelope.result)
+        print("outputs: ", envelope.outputs)
+        print("features:", envelope.features.values)
 
 
 if __name__ == "__main__":
