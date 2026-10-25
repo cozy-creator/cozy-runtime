@@ -287,10 +287,13 @@ class PreparedRepeat:
         with self._submission:
             if self._closed:
                 return
-            if self._active is not None and self._active._finished is None:
-                self._native.cancel(self._active._epoch)
-                completed, canceled = self._native.wait(self._active._epoch)
-                self._active._finish(completed, canceled)
+            if self._active is not None:
+                active = self._active
+                # A result waiter may hold _observation while waiting for completion.
+                # Deliver cancellation first; it must never need that observer's lock.
+                if active._finished is None:
+                    active.cancel()
+                active._join()
             try:
                 self._native.close_owner()
             except Exception as error:
@@ -417,15 +420,18 @@ class Execution:
         except Exception as error:
             _native_error(error)
 
+    def _join(self) -> None:
+        with self._observation:
+            if self._finished is None:
+                try:
+                    completed, canceled = self.plan._native.wait(self._epoch)
+                except Exception as error:
+                    _native_error(error)
+                self._finish(completed, canceled)
+
     def wait(self) -> tuple[Any, ...]:
         if self.context is None:
-            with self._observation:
-                if self._finished is None:
-                    try:
-                        completed, canceled = self.plan._native.wait(self._epoch)
-                    except Exception as error:
-                        _native_error(error)
-                    self._finish(completed, canceled)
+            self._join()
         else:
             while not self.poll().done:
                 if self.context.cancelled:
@@ -435,13 +441,9 @@ class Execution:
         return self._outputs
 
     def close(self) -> None:
-        try:
-            if self._finished is None:
-                self.plan._native.cancel(self._epoch)
-                completed, canceled = self.plan._native.wait(self._epoch)
-                self._finish(completed, canceled)
-            self.plan._native.close(self._epoch)
-            self.plan._closed = True
-            self.plan._release_owned_bindings()
-        except Exception as error:
-            _native_error(error)
+        with self.plan._submission:
+            if self.plan._active is not self:
+                raise RuntimeError("stale execution token")
+            # Share the definition owner's join/readout path. In particular, don't race
+            # another observer into two readouts or release the same model claim twice.
+            self.plan.close()

@@ -83,6 +83,13 @@ inputs or access outputs until completion. Concurrent submissions are refused. C
 joins before destruction. Device-completion failure retains owners until process death. Forked
 processes cannot use inherited native handles.
 
+Concurrent result observers and definition retirement share one readout/claim-release boundary.
+Close sends cancellation before waiting for the observer lock, so a blocking result waiter cannot
+prevent the control write that ends its GPU work. Retirement serializes against definition reuse;
+an old execution handle cannot close a later submission. Pressure coordination first cancels and
+joins active work, then uses ordinary idle reclamation; allocator recovery never disposes graphs
+or invokes Python. Unrelated native eviction may still join the CUDA context conservatively.
+
 Build through `scripts/build-execution-native.sh INSTALL_PREFIX` with `COZY_CUDA_TOOLKIT` pointing
 to the build-time CUDA 13 toolkit. The artifact is `_kernels/_execution.abi3.so`, carried by the
 existing native wheel assembly. Eight native SASS targets are included; there is no PTX or serving
