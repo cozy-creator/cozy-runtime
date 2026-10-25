@@ -59,7 +59,12 @@ from cozy_runtime.author._model import (
     component_set,
     coverage_patterns,
 )
-from cozy_runtime.author._model_defaults import model_components, model_defaults, model_on_demand
+from cozy_runtime.author._model_defaults import (
+    model_components,
+    model_defaults,
+    model_on_demand,
+    model_phases,
+)
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
 from cozy_runtime.author._services import SERVICES
@@ -364,6 +369,7 @@ _ENTRYPOINT_KEYWORDS = frozenset(
     {
         "name",
         "preflight",
+        "phases",
         "demand",
         "hidden",
         "memoize",
@@ -1429,6 +1435,8 @@ class Registration:
     #: A model argument's class where the registration names it, not its annotation.
     model_classes: Mapping[str, ModelSpec] = field(default_factory=dict)
     emits_media: bool = False
+    #: Local execution advice, not a client callable/schema field. Source identity covers it.
+    phases: tuple[tuple[str, ...], ...] = ()
 
     def declaration(self, **found: Any) -> Declaration:
         """Its record, with what its signature declares (`found`)."""
@@ -1932,6 +1940,7 @@ def _registration(
     hidden = False
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
+    phases: tuple[tuple[str, ...], ...] = ()
     for keyword in keywords:
         if keyword.arg not in _ENTRYPOINT_KEYWORDS:
             reader.refuse(
@@ -1975,6 +1984,8 @@ def _registration(
             used_components = declared_components or used_components
         elif keyword.arg == "on_demand":
             on_demand = model_on_demand(value)
+        elif keyword.arg == "phases":
+            phases = model_phases(value)
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg == "hidden" and value is True:
@@ -2015,6 +2026,7 @@ def _registration(
         used_components,
         on_demand,
         emits_media=emits_media,
+        phases=phases,
     )
 
 

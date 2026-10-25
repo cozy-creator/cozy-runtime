@@ -31,6 +31,7 @@ from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
     model_on_demand,
+    model_phases,
 )
 from cozy_runtime.author._signature import Surface, analyze
 from cozy_runtime.author._weights import WeightsOutput
@@ -196,15 +197,8 @@ class App:
         in place of its annotation (the Runtime's own generic functions). `phases=` declares
         immutable component groups in execution order, available to queued preparation before
         handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
-        # Immutable CPU metadata; no handler or device work runs during registration.
-        if isinstance(phases, str):
-            raise RegistrationError("phases must be a sequence of component groups")
-        declared_phases: list[tuple[str, ...]] = []
-        for phase in phases:
-            names = (phase,) if isinstance(phase, str) else tuple(phase)
-            if not names or any(not isinstance(name, str) or not name for name in names):
-                raise RegistrationError("each phase must name nonempty component strings")
-            declared_phases.append(tuple(sorted(set(names))))
+        # Immutable CPU metadata; the source reader uses the same closed validator.
+        declared_phases = model_phases(phases)
         policy = memo_policy(memoize)
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
@@ -261,7 +255,7 @@ class App:
                 weights_outputs=weights,
                 demand_bound=demand,
                 preflight=preflight,
-                phases=tuple(declared_phases),
+                phases=declared_phases,
                 hidden=hidden,
                 internal=internal,
                 accelerator=accelerator is not False,

@@ -76,6 +76,27 @@ def model_components(value: object) -> dict[str, tuple[str, ...]]:
     return out
 
 
+def model_phases(value: object) -> tuple[tuple[str, ...], ...]:
+    """Normalize literal component groups for both source and imported registration."""
+    if not isinstance(value, (tuple, list)):
+        raise ConformanceError(
+            "phases must be a sequence of component groups", code="model_phases"
+        )
+    out: list[tuple[str, ...]] = []
+    for phase in value:
+        names = (phase,) if isinstance(phase, str) else phase
+        if (
+            not isinstance(names, (tuple, list, set, frozenset))
+            or not names
+            or any(not isinstance(name, str) or not name for name in names)
+        ):
+            raise ConformanceError(
+                "each phase must name nonempty component strings", code="model_phases"
+            )
+        out.append(tuple(sorted(set(names))))
+    return tuple(out)
+
+
 def model_on_demand(value: object) -> tuple[str, ...]:
     """Copy an `on_demand=` declaration: the Model arguments built on first use."""
     if value is None:
