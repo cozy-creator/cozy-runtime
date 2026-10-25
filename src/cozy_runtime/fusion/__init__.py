@@ -13,6 +13,10 @@ A parallel block (one norm, as Flux's single-stream blocks) reads one modulated 
     normed = norm(x) * (1 + scale_msa) [+ shift_msa]
     x      = x + act(gate_msa) * (attention(normed) + down(silu(gate(normed)) * up(normed)))
 
+Without `scale` the norms are plain and the gates are layer scales, one row for every token (a
+ViT block, `x + attention(norm1(x)) * scale1`). Rows are bf16, or fp16 under autocast over an
+fp32 residual stream (`rows`).
+
 Eager, each line is several kernels; fused, one row kernel per line and one per q/k carry it,
 and every GEMM stays the model's own module. Declare the layout at module scope, so its kernels
 compile on the executor's GPUs at boot, and install it in `Model.execution_plan`:
@@ -61,11 +65,11 @@ except ImportError:  # pragma: no cover - only a parallel block composes Diffuse
 class Modulation:
     """One block call's adaLN tables: `[rows, width]` views (any row stride) and each token's
     row, `index` (int64 over `tokens` or `batch * tokens` rows; it wraps). A parallel block
-    reads only the `_msa` tables."""
+    reads only the `_msa` tables; a block without `scale` only the gates."""
 
     index: Any
-    scale_msa: Any
-    gate_msa: Any
+    scale_msa: Any = None
+    gate_msa: Any = None
     scale_mlp: Any = None
     gate_mlp: Any = None
     shift_msa: Any = None
@@ -77,24 +81,28 @@ class Rope:
     """The block's rotary argument. Its q/k norms apply it, so a sequential block's attention
     receives None and must skip RoPE (it still applies the norms). `interleaved`: pairs (2i,
     2i+1), a complex `[seq, rotary/2]` table or a `(cos, sin)` pair; else halves, a `(cos, sin)`
-    `[seq, rotary]` pair. `rotary`: rotated channels per head, 0 for all. `fp32`: the model
-    normalizes and rotates q/k in fp32 and rounds once (Flux)."""
+    `[seq, rotary]` pair. `rotary`: rotated channels per head, 0 for all. `rounding`: how the
+    model rounds q/k to the row dtype. `"sum"`: the norm, then `x * cos + rotated * sin` once,
+    fp32 tables; `"product"`: the norm, the tables, each product and their sum, as eager rotary
+    in the row dtype computes it (`cos.to(x.dtype)`); `"fp32"`: once, at the end (Flux)."""
 
     argument: str
     interleaved: bool
     rotary: int = 0
-    fp32: bool = False
+    rounding: Literal["sum", "product", "fp32"] = "sum"
 
 
 @dataclass(frozen=True, slots=True)
 class GatedMLP:
     """`down(silu(gate(x)) * up(x))`: submodule names, the linears relative to `module`. Without
-    `up`, `gate`'s output holds the gate half, then the up half (one fused linear)."""
+    `up`, `gate`'s output holds the gate half, then the up half (one fused linear), or with
+    `value_first` the up half first (Diffusers' `SwiGLU`: `hidden, gate = proj(x).chunk(2)`)."""
 
     module: str
     gate: str
     down: str
     up: str | None = None
+    value_first: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,12 +111,17 @@ class DiTBlock:
 
     `modulation(block, arguments)` returns the call's `Modulation` from the block forward's
     bound arguments. `norms` are the pre-attention and pre-MLP norms, `"layer"` (no affine)
-    or `"rms"` (weight); one norm makes the block parallel. A sequential block's `attention`
-    is called with `arguments` (keywords taken from the block's) after the normed rows; a
-    parallel block's is composed by Runtime from the module's `to_q`/`to_k`/`to_v`/`to_out`
-    and the kernel Runtime selected for it (Diffusers' attention contract), so its processor
-    is not called. `qk_norms` (relative to it) are per-head RMSNorms with a weight. `gate`:
-    the activation applied to the gates.
+    or `"rms"` (weight); one norm makes the block parallel. `rms_rounding`: Diffusers'
+    RMSNorm rounds the normalized row, then its product with the weight (`"twice"`);
+    `torch.nn.RMSNorm` rounds once. A sequential block's `attention` is called with
+    `arguments` (keywords taken from the block's) after the normed rows; a parallel block's is
+    composed by Runtime from the module's `to_q`/`to_k`/`to_v`/`to_out` and the kernel Runtime
+    selected for it (Diffusers' attention contract), so its processor is not called.
+    `qk_norms` (relative to it) are per-head RMSNorms, with a weight unless not `qk_affine`.
+    `gate`: the activation applied to the gates. `scale`: the norms are modulated by
+    `1 + scale` [`+ shift`]. `rows`: `"bf16"`, each step rounding as eager bf16 does, or
+    `"fp16"`, a block under fp16 autocast over an fp32 residual stream (fp32 norm weights and
+    gates; the residual's `x + branch * gate` in fp32; a norm rounds once to fp16).
     """
 
     block: type[Any]
@@ -123,7 +136,11 @@ class DiTBlock:
     rope: Rope | None = None
     qk_norms: tuple[str, str] = ("norm_q", "norm_k")
     gate: Literal["identity", "tanh"] = "identity"
+    scale: bool = True
     shift: bool = False
+    rows: Literal["bf16", "fp16"] = "bf16"
+    rms_rounding: Literal["twice", "once"] = "twice"
+    qk_affine: bool = True
     hidden_states: str = "hidden_states"
     entries: _kernels.Entries = field(init=False, repr=False, compare=False)
     kernels: TritonKernels = field(init=False, repr=False, compare=False)
@@ -136,20 +153,29 @@ class DiTBlock:
         rotary = self.rope.rotary or self.head_dim if self.rope else None
         if rotary is not None and (rotary > self.head_dim or rotary % 2):
             raise ValueError(f"{self.block.__name__}: rotary {rotary} of {self.head_dim}")
+        if (self.shift and not self.scale) or (self.mlp.value_first and self.mlp.up):
+            raise ValueError(f"{self.block.__name__}: shift without scale, or value_first with up")
+        f16 = self.rows == "fp16"
+        rounding = self.rope.rounding if self.rope else "sum"
         entries = _kernels.entries(
             self.width,
             self.head_dim,
             rotary,
             norm=_kernels.LAYER if self.norm == "layer" else _kernels.RMS,
             weight=self.norm == "rms",
-            shift=self.shift,
+            once=self.rms_rounding == "once",
+            modulate=(1 + self.shift) if self.scale else 0,
             tanh=self.gate == "tanh",
+            f16=f16,
             interleaved=bool(self.rope and self.rope.interleaved),
-            fp32=bool(self.rope and self.rope.fp32),
+            round=_kernels.FP32 if rounding == "fp32" else _kernels.FP16 if f16 else _kernels.BF16,
+            product=rounding == "product",
+            qk_weight=self.qk_affine,
             parallel=self.parallel,
         )
         keys = "\n".join(e.key for e in entries.all())
-        name = f"cozy-dit-{hashlib.sha256(keys.encode()).hexdigest()[:16]}"
+        digest = hashlib.sha256(keys.encode()).hexdigest()[:12]
+        name = f"fused.{self.block.__name__.lower()[:44]}.{digest}"
         object.__setattr__(self, "entries", entries)
         object.__setattr__(
             self, "kernels", TritonKernels(name, entries.all(), origin=_declaring_module())
@@ -163,6 +189,16 @@ class DiTBlock:
     def rotary(self) -> int:
         return self.rope.rotary or self.head_dim if self.rope else 0
 
+    @property
+    def dtype(self) -> Any:
+        """The rows' dtype."""
+        return torch.float16 if self.rows == "fp16" else torch.bfloat16
+
+    @property
+    def wide(self) -> Any:
+        """The residual stream's, the norm weights' and the tables' dtype."""
+        return torch.float32 if self.rows == "fp16" else torch.bfloat16
+
     def contract(self) -> dict[str, object]:
         """What a fused block's numerics depend on, beyond its kernels' sources."""
         return {
@@ -173,11 +209,16 @@ class DiTBlock:
             "norm": self.norm,
             "parallel": self.parallel,
             "gate": self.gate,
+            "scale": self.scale,
             "shift": self.shift,
+            "rows": self.rows,
+            "rms_rounding": self.rms_rounding,
+            "qk_affine": self.qk_affine,
             "fused_up": self.mlp.up is None,
+            "value_first": self.mlp.value_first,
             "rope": None
             if self.rope is None
-            else [self.rope.interleaved, self.rope.rotary, self.rope.fp32],
+            else [self.rope.interleaved, self.rope.rotary, self.rope.rounding],
             "arguments": list(self.arguments),
         }
 
@@ -253,10 +294,10 @@ def _norm(module: Any, layout: DiTBlock, path: str) -> tuple[Any, float]:
     if (
         weight is None
         or tuple(weight.shape) != (layout.width,)
-        or weight.dtype is not torch.bfloat16
+        or weight.dtype is not layout.wide
         or getattr(module, "bias", None)
     ):
-        raise _Mismatch(f"{path}: not a {layout.width}-wide bf16 RMSNorm with a weight")
+        raise _Mismatch(f"{path}: not a {layout.width}-wide {layout.wide} RMSNorm with a weight")
     return weight, _eps(module, path)
 
 
@@ -304,13 +345,13 @@ def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
     found = [_norm(m, layout, f"{path}.{n}") for m, n in zip(norms, layout.norms, strict=True)]
     for norm, name in zip(qk, layout.qk_norms, strict=True):
         weight = getattr(norm, "weight", None)
-        if (
-            weight is None
-            or tuple(weight.shape) != (layout.head_dim,)
-            or weight.dtype is not torch.bfloat16
-            or "forward" in vars(norm)
-        ):
-            raise _Mismatch(f"{path}.{name}: not a {layout.head_dim}-wide bf16 RMSNorm")
+        affine = (
+            weight is not None
+            and tuple(weight.shape) == (layout.head_dim,)
+            and weight.dtype is layout.wide
+        )
+        if affine != layout.qk_affine or "forward" in vars(norm):
+            raise _Mismatch(f"{path}.{name}: not the {layout.head_dim}-wide RMSNorm declared")
         _eps(norm, f"{path}.{name}")
     signature = inspect.signature(layout.block.forward)
     missing = {layout.hidden_states, *layout.arguments} - set(signature.parameters)
@@ -331,8 +372,20 @@ def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
     )
 
 
-def _bf16_cuda(*tensors: Any) -> bool:
-    return all(t is None or (t.dtype is torch.bfloat16 and t.is_cuda) for t in tensors)
+def _cuda(dtype: Any, *tensors: Any) -> bool:
+    return all(t is None or (t.dtype is dtype and t.is_cuda) for t in tensors)
+
+
+def _fusable(layout: DiTBlock, x: Any) -> bool:
+    """The residual stream the kernels take: bf16, or under fp16 autocast fp16 or fp32."""
+    if layout.rows == "bf16":
+        return _cuda(torch.bfloat16, x)
+    return (
+        x.is_cuda
+        and x.dtype in (torch.float16, torch.float32)
+        and torch.is_autocast_enabled("cuda")
+        and torch.get_autocast_dtype("cuda") is torch.float16
+    )
 
 
 def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -344,12 +397,11 @@ def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
     bound.apply_defaults()
     arguments = bound.arguments
     x = arguments[layout.hidden_states]
-    if not _bf16_cuda(x):
+    if not _fusable(layout, x):
         return self._cozy_eager(*args, **kwargs)
     rows = layout.modulation(self, arguments)
-    if not _bf16_cuda(
-        rows.scale_msa, rows.gate_msa, rows.scale_mlp, rows.gate_mlp, rows.shift_msa, rows.shift_mlp
-    ):
+    tables = (rows.scale_msa, rows.gate_msa, rows.scale_mlp, rows.gate_mlp)
+    if not _cuda(layout.wide, *tables, rows.shift_msa, rows.shift_mlp):
         return self._cozy_eager(*args, **kwargs)
     _, normed = _kernels.norm_modulate(
         launch,
@@ -373,11 +425,13 @@ def _inputs(linears: Sequence[Any], normed: Any) -> list[Any]:
 
 
 def _mlp(launch: Launch, site: _Site, hidden: Sequence[Any]) -> Any:
-    if site.layout.mlp.up is None:
+    mlp = site.layout.mlp
+    if mlp.up is None:
         (both,) = hidden
         half = int(both.shape[-1]) // 2
         hidden = (both[..., :half], both[..., half:])
-    return site.down(_kernels.swiglu(launch, *hidden))
+        hidden = hidden[::-1] if mlp.value_first else hidden
+    return site.down(_kernels.swiglu(launch, site.layout.entries.swiglu, *hidden))
 
 
 def _sequential(
@@ -391,7 +445,7 @@ def _sequential(
         )
         call[layout.rope.argument] = None
         for norm in site.qk:
-            norm._cozy_rope = (launch, entries.rope, tables)
+            norm._cozy_rope = (launch, entries.rope, tables, layout)
     try:
         with quantize_once(normed):
             attended = site.attention(normed, **call)
@@ -444,7 +498,9 @@ def _parallel(
             rotary=layout.rotary,
         )
         q, k = (
-            _kernels.head_norm_rope(launch, entries.rope, t, norm.weight, norm.eps, tables)
+            _kernels.head_norm_rope(
+                launch, entries.rope, t, norm.weight, norm.eps, tables, layout.dtype
+            )
             for norm, t in zip(site.qk, (q, k), strict=True)
         )
     processor = site.attention.processor
@@ -474,10 +530,13 @@ def _parallel(
 
 def _head_norm_forward(self: Any, hidden_states: Any) -> Any:
     rope = self._cozy_rope
-    if rope is None or hidden_states.dim() != 4 or not _bf16_cuda(hidden_states):
+    # fp16 rows: the fp16 projection, or a processor's fp32 upcast of it.
+    if rope is None or hidden_states.dim() != 4 or not _fusable(rope[3], hidden_states):
         return self._cozy_eager(hidden_states)
-    launch, entry, tables = rope
-    return _kernels.head_norm_rope(launch, entry, hidden_states, self.weight, self.eps, tables)
+    launch, entry, tables, layout = rope
+    return _kernels.head_norm_rope(
+        launch, entry, hidden_states, self.weight, self.eps, tables, layout.dtype
+    )
 
 
 _FUSED: dict[tuple[type, str], type] = {}
@@ -514,9 +573,12 @@ def _census(module: Any) -> tuple[object, ...]:
     )
 
 
-def _report(plan: Plan, document: dict[str, object]) -> None:
-    plan.report("fused_dit_blocks", document)
-    print(f"[cozy] fused DiT blocks: {json.dumps(document, sort_keys=True)}", file=sys.stderr)
+def _report(plan: Plan, layout: DiTBlock, reason: str = "", blocks: int = 0) -> None:
+    """Under the layout's kernel set name, as Runtime reports that set's failed build."""
+    document: dict[str, object] = {"block": layout.block.__qualname__, "applied": not reason}
+    document |= {"reason": reason} if reason else {"blocks": blocks}
+    plan.report(layout.kernels.name, document)
+    print(f"[cozy] {layout.kernels.name}: {json.dumps(document, sort_keys=True)}", file=sys.stderr)
 
 
 def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
@@ -525,7 +587,7 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
     not the declared layout; reported). Never waits for the kernels' compile."""
     device = torch.device(plan.device)
     if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
-        _report(plan, {"applied": False, "reason": f"fused blocks serve CUDA sm80+, not {device}"})
+        _report(plan, layout, f"fused blocks serve CUDA sm80+, not {device}")
         return ""
     blocks: list[tuple[str, Any]] = [
         (f"{index}.{path}", module)
@@ -542,13 +604,13 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
             for m in root.modules()
         ):
             return _identity(layout)
-        _report(plan, {"applied": False, "reason": f"no {layout.block.__qualname__}"})
+        _report(plan, layout, f"no {layout.block.__qualname__}")
         return ""
     switch = _Switch()
     try:
         sites = [(block, _site(block, layout, switch, path)) for path, block in blocks]
     except _Mismatch as exc:
-        _report(plan, {"applied": False, "reason": str(exc)})
+        _report(plan, layout, str(exc))
         return ""
     before = [_census(root) for root in roots]
     # A sequential block's attention calls its q/k norms; a parallel block launches them.
@@ -564,19 +626,19 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
 
     def activate(launch: Launch) -> None:
         switch.launch = launch
-        _report(plan, {"applied": True, "blocks": len(blocks), "kernels": layout.kernels.name})
+        _report(plan, layout, blocks=len(blocks))
 
     try:
         if plan.when_ready is None:
             activate(plan.load(layout.kernels))
         elif not plan.when_ready(layout.kernels, activate):
-            _report(plan, {"applied": False, "reason": "compiling; fused from the next request on"})
+            _report(plan, layout, "compiling; fused from the next request on")
     except KernelsUnavailable as exc:
         if exc.code == "kernels_corrupt":
             raise
         for module, cls in eager:
             module.__class__ = cls
-        _report(plan, {"applied": False, "reason": f"{exc.code}: {exc}"})
+        _report(plan, layout, f"{exc.code}: {exc}")
         return ""
     return _identity(layout)
 

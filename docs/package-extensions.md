@@ -40,7 +40,12 @@ activation, attention arguments, `Rope` layout, `GatedMLP`), and installs it in 
 modulate, gated residual + norm + modulate, gated residual, SwiGLU, per-head RMSNorm + RoPE),
 compiles them at executor boot and substitutes the fused forward; every GEMM stays the model's
 module. Eager serves until the build is loaded (`Plan.when_ready`), and wherever the layout,
-dtype or device does not match. qwen-image-2 is the reference user.
+dtype or device does not match. The declaration states the model's rounding, so fused equals
+eager up to reduction order: RMSNorm once (`torch.nn.RMSNorm`) or twice (Diffusers'), RoPE
+rounding (`sum`, `product`, `fp32`), a value-first fused SwiGLU (Diffusers' `SwiGLU`), and
+bf16 or fp16 rows (fp16 autocast over an fp32 residual stream). Without `scale` the block is a
+plain pre-norm block whose gates are layer scales. qwen-image-2, flux-3-klein and MiniMax-H3's
+video VAE decoder are the users.
 
 ## Attention producers — `AttentionProducer`, `register_attention`
 
