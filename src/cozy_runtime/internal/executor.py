@@ -843,7 +843,11 @@ class Executor:
         #: world spawns and drives the followers; a follower's channel is rank 0's seam.
         self.rank = int(rank)
         self.world = int(world)
+        if self.world > 1:
+            kernel_ready.group(self.rank, self.world)
         self.group: RankGroup | None = None
+        #: the kernels that began serving as this attempt was admitted (`_grant`)
+        self._granted: list[str] = []
         self.pg: Any = None
         #: between `join` and `form`: this follower's rank spec and the store it reached
         self._forming: tuple[RankSpec, Any] | None = None
@@ -1675,6 +1679,7 @@ class Executor:
         try:
             if degree > 1 and self.rank == 0:
                 self.world = degree
+                kernel_ready.group(0, degree)
                 if self.group is None:
                     self.group = RankGroup(
                         degree=degree,
@@ -2717,6 +2722,7 @@ class Executor:
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
             for follower, reply in zip(self.group.followers, replies, strict=True):
+                kernel_ready.report(follower.rank, reply.get("kernels") or {})
                 if not reply.get("ok"):
                     code = str(reply.get("code") or "group_unformed")
                     return self._group_refusal(
@@ -3151,7 +3157,7 @@ class Executor:
         of whose GPUs may serve otherwise refuses); the first attempt in also opens the
         residency's attempt."""
         turn = object()
-        kernel_ready.boundary()
+        target._granted = kernel_ready.boundary()
         with SCOPES.held(turn):
             target._upgrade_attention(turn)
             refused = target._install_ready_kernels()
@@ -3320,11 +3326,21 @@ class Executor:
         # (`_upgrade_attention`): each selection the run served and from which step.
         segments: list[dict[str, Any]] = []
         later: list[attention.Applied] = []
-        #: each kernel that became ready mid-run, and the step from which it served
-        swapped: list[tuple[str, dict[str, str | int]]] = []
+        #: each kernel that became ready mid-run, and the step from which it served; in a
+        #: group, on which GPU
+        here: dict[str, str | int] = {} if self.group is None else {"gpu": self.group.gpu(0)}
+        point = [{"stage": "", "step": 0, **here}]  # the last boundary
+        swapped = [(name, point[0]) for name in self._granted]
         steps: dict[str, int] = {}
         stage = [""]  # the last stage this attempt itself reported
         handler = threading.get_ident()
+
+        def followed() -> None:
+            """What each follower began serving since the last boundary, at it."""
+            if self.group is not None:
+                began, self.group.began = self.group.began, []
+                gpu = self.group.gpu
+                swapped.extend((kernel, {**point[0], "gpu": gpu(rank)}) for rank, kernel in began)
 
         def boundary(frame: Any) -> None:
             progress(frame)
@@ -3332,9 +3348,10 @@ class Executor:
                 stage[0] = frame.stage
             if not isinstance(frame, ProgressFrame) or threading.get_ident() != handler:
                 return
+            followed()
             if frame.position is not None:
                 steps[frame.stage] = frame.position
-            at: dict[str, str | int] = {"stage": frame.stage, "step": steps.get(frame.stage, 0)}
+            at = point[0] = {"stage": frame.stage, "step": steps.get(frame.stage, 0), **here}
             swapped.extend((name, at) for name in kernel_ready.boundary())
             if pin or served_attention is None:
                 return  # an override holds its kernel for every step
@@ -3462,6 +3479,7 @@ class Executor:
                 took = {"ms": round(ms, 1), "times": times}
                 record.emit("confession", "request_path.blocking", work, **took)
                 record.emit("log", "kernel work blocked the request", "warn", work=work, **took)
+            followed()
             for name, where in swapped:
                 record.emit("confession", "kernel.ready", name, **where)
             members = self.model_executors or [self]
@@ -3937,10 +3955,13 @@ class Executor:
                             model_key=self._group_model_key,
                             adopt=mine,
                             serving=request_path.in_flight(),
+                            kernels=kernel_ready.agreed(),
                         )
                     )
                 )
                 replies = self.group.collect("attention")
+                for follower, reply in zip(self.group.followers, replies, strict=True):
+                    self.group.began.extend((follower.rank, k) for k in reply.get("began") or ())
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
             lacking = {
@@ -4010,8 +4031,9 @@ class Executor:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
         if command.adopt is not UNSET:
+            began = kernel_ready.boundary(command.kernels)
             with request_path.serving() if command.serving else contextlib.nullcontext():
-                return self._adopt_attention(command, command.adopt)
+                return {**self._adopt_attention(command, command.adopt), "began": began}
         self._attention_hold.close()
         self._producer_hold = None
         if command.pin is UNSET:
@@ -4754,14 +4776,20 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
             "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
         }
     if name == "run":
-        # A follower's call serves rank 0's request: what landed before it serves in it.
+        # A follower's call serves rank 0's request, with the kernels the group serves from it.
         with request_path.serving():
-            kernel_ready.boundary()
-            return executor.run(frame)
+            began = kernel_ready.boundary(frame.get("kernels") or ())
+            reply = executor.run(frame)
+        return {**reply, "kernels": kernel_ready.pending(), "began": began}
     if name not in executor_commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
     command = executor_commands.decode(frame)
-    return None if isinstance(command, Shutdown) else executor.handle(command)
+    if isinstance(command, Shutdown):
+        return None
+    reply = executor.handle(command)
+    if name == "load" and executor.rank:  # what it opened loading: the group may serve it at once
+        reply["kernels"] = kernel_ready.pending()
+    return reply
 
 
 #: The commands whose refusals carry the raising traceback to the worker.

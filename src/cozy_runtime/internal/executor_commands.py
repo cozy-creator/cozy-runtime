@@ -126,6 +126,8 @@ class Attention(Command, frozen=True, kw_only=True, tag="attention"):
     adopt: Choice | UnsetType = UNSET
     #: rank 0 asks while it serves a request: this GPU opens no kernel on its own thread
     serving: bool = False
+    #: the kernels the group serves from here (`kernel_ready.agreed`)
+    kernels: tuple[str, ...] = ()
 
 
 class Kernels(Command, frozen=True, kw_only=True, tag="kernels"):
