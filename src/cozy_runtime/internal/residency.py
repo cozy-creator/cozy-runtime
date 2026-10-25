@@ -1518,8 +1518,26 @@ class Memory:
                 self.reclaim(needed, current={model.name})
             if needed > self.room().free:
                 raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
+        # Converted raw bytes are working storage for an admitted preferred final block.
+        # Avoid charging that temporary Fill against the idle streaming window; native
+        # prefix reductions and real allocation pressure still apply to the preparation.
+        provisional = (
+            not final
+            and block.final_only()
+            and block.preferred
+            and block.final_region is not None
+            and block.final_region.preferred
+            and not region.preferred
+            and not region.resident
+        )
         try:
-            return region.prepare()
+            try:
+                if provisional:
+                    region.set_preferred(True)
+                return region.prepare()
+            finally:
+                if provisional:
+                    region.set_preferred(False)  # the returned Fill owns its physical pin
         except torch.OutOfMemoryError:
             if not reclaim:
                 raise
