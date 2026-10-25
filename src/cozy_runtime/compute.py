@@ -383,8 +383,10 @@ class PreparedRepeat:
                 current.synchronize()
                 if native is None:
                     graph.reset()
+                    held.clear()
             if landed != LANDED[0]:
                 native.close_owner()
+                held.clear()
                 raise CapabilityError(
                     "kernel implementations changed during recording",
                     code="prepared_graph_ineligible",
