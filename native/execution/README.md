@@ -116,7 +116,11 @@ Creator/TensorFS51a: phase parity, changed-input reuse, checked stored loading, 
 failure, phase-copy refusals and rollback, cancellation and alias release. Reuse17948 submitted the
 same definition twice within one invocation; production cross-request caching remains separate.
 Final-iteration cancel17954 skipped its suffix; tail17955 joined an already-admitted suffix.
-These results do not qualify the later public `valid()` query or a full production model program.
+On Runtime237ddc / Creator/TensorFS51a, later real GPU runs17977,17979 and17980 passed final-weight
+dtype preparation, public `valid()` changed-input reuse and owner lifetime checks. The dtype gate
+restored each representation from the immutable source, retained escaped aliases correctly, and
+performed no reads or fills on unchanged warm reuse. These are primitive checks, not qualification
+of a complete production model program.
 
 Concurrent result observers and definition retirement share one readout/claim-release boundary.
 Close sends cancellation before waiting for the observer lock, so a blocking result waiter cannot
@@ -133,7 +137,30 @@ is introduced: resident bindings own weights and the future native-fill descript
 source/recipe/target identity.
 
 This is a resident execution primitive, not a full H3 pipeline or an oversubscribed native plan.
-Streaming, event-based refill, queue policy and the CPU output handoff remain separate work.
+Streaming, event-based refill, broader queue policy and the CPU output handoff remain separate work.
+
+## One queued raw weight block
+
+An entrypoint can declare immutable component phases with `@app.entrypoint(phases=...)`. After a
+fully prepared resident submission starts, Runtime may preload one raw block from the exact next
+queued request in the same construction. The pending request and fill identity are checked before
+reuse. Speculation uses spare capacity and never reclaims the current program's pinned dependencies;
+if there is insufficient space, the next request loads the block through its ordinary demand path.
+This path does not predict workspace for arbitrary eager work or prepare an entire future model.
+
+Real default-CLI runs 18001/18002 on the RTX 4070 Laptop 8 GiB, Runtime d53000ed5 and Creator/TensorFS51a,
+copied 64 MiB while the current conditional graph's completion event remained incomplete. The next
+request reused the same Region/checkpoint, read zero additional demand bytes and returned the exact
+matrix result. Runs 18005/18006 held a real Torch allocation to force capacity refusal: speculation
+was skipped, current work completed, and the next request demand-loaded 64 MiB correctly.
+Runs 18009/18010 canceled only the queued request while current work continued. That copy had already
+completed, so this proves queued-token invalidation and cancellation safety, not active-I/O cancellation.
+Each current program performed 300001 finite increments with one host graph launch. These control
+iterations are not denoising steps or generated images. Full-model throughput, encoded/transformed
+preloads and multiple ranks require separate qualification.
+
+Exact fixture/artifact hashes and ordinary CLI receipts are retained in
+`outputs/stock-torch-20261024/queued-preload-d53000ed5-20261025` in the Cozy workspace.
 
 ## One native load followed by its dependent repeat
 
