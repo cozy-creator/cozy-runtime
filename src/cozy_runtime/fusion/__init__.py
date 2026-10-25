@@ -117,7 +117,9 @@ class DiTBlock:
     `arguments` (keywords taken from the block's) after the normed rows; a parallel block's is
     composed by Runtime from the module's `to_q`/`to_k`/`to_v`/`to_out` and the kernel Runtime
     selected for it (Diffusers' attention contract), so its processor is not called.
-    `qk_norms` (relative to it) are per-head RMSNorms, with a weight unless not `qk_affine`.
+    With `compose`, a sequential block's attention is composed that way too: its processor's
+    casts and copies around the q/k norms are skipped. `qk_norms` (relative to the attention)
+    are per-head RMSNorms, with a weight unless not `qk_affine`.
     `gate`: the activation applied to the gates. `scale`: the norms are modulated by
     `1 + scale` [`+ shift`]. `rows`: `"bf16"`, each step rounding as eager bf16 does, or
     `"fp16"`, a block under fp16 autocast over an fp32 residual stream (fp32 norm weights and
@@ -141,6 +143,7 @@ class DiTBlock:
     rows: Literal["bf16", "fp16"] = "bf16"
     rms_rounding: Literal["twice", "once"] = "twice"
     qk_affine: bool = True
+    compose: bool = False
     hidden_states: str = "hidden_states"
     entries: _kernels.Entries = field(init=False, repr=False, compare=False)
     kernels: TritonKernels = field(init=False, repr=False, compare=False)
@@ -172,6 +175,7 @@ class DiTBlock:
             product=rounding == "product",
             qk_weight=self.qk_affine,
             parallel=self.parallel,
+            composed=self.composed,
         )
         keys = "\n".join(e.key for e in entries.all())
         digest = hashlib.sha256(keys.encode()).hexdigest()[:12]
@@ -184,6 +188,11 @@ class DiTBlock:
     @property
     def parallel(self) -> bool:
         return len(self.norms) == 1
+
+    @property
+    def composed(self) -> bool:
+        """Runtime composes the attention from its projections and the selected kernel."""
+        return self.parallel or self.compose
 
     @property
     def rotary(self) -> int:
@@ -214,6 +223,7 @@ class DiTBlock:
             "rows": self.rows,
             "rms_rounding": self.rms_rounding,
             "qk_affine": self.qk_affine,
+            "composed": self.composed,
             "fused_up": self.mlp.up is None,
             "value_first": self.mlp.value_first,
             "rope": None
@@ -247,17 +257,18 @@ class _Switch:
 
 @dataclass(frozen=True, slots=True)
 class _Site:
-    """One installed block: its declaration, launcher and the modules it calls. `inputs`: the
-    linears that read the normed rows besides a sequential block's attention (q, k, v of a
-    parallel block, then the MLP's gate [and up]); `out`: a parallel block's attention output."""
+    """One installed block: its declaration, launcher and the modules it calls. `qkv` and `out`:
+    a composed attention's projections; `inputs`: the MLP's gate [and up]. A norm's weight is
+    read at each call: the bound tensor while the block runs."""
 
     layout: DiTBlock
     switch: _Switch
     signature: inspect.Signature
-    norm_weights: tuple[Any, ...]
+    norms: tuple[Any, ...]
     eps: tuple[float, ...]
     attention: Any
     qk: tuple[Any, ...]
+    qkv: tuple[Any, ...]
     inputs: tuple[Any, ...]
     down: Any
     out: Any = None
@@ -328,15 +339,15 @@ def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
         attention: Any = block.get_submodule(layout.attention)
         mlp: Any = block.get_submodule(layout.mlp.module)
         *inputs, down = (mlp.get_submodule(n) for n in names)
-        fused_qk = layout.rope or layout.parallel
+        fused_qk = layout.rope or layout.composed
         qk = tuple(attention.get_submodule(n) for n in layout.qk_norms) if fused_qk else ()
     except AttributeError as exc:
         raise _Mismatch(f"{path}: {exc}") from exc
     # The fused forward calls neither the norms nor the MLP container: their hooks would not
-    # run. Nor, in a parallel block, the attention module and its q/k norms.
+    # run. Nor, composed, the attention module and its q/k norms.
     bypassed = [*norms, mlp, *(m for m in mlp.children() if m not in (*inputs, down))]
     projections: tuple[Any, ...] = ()
-    if layout.parallel:
+    if layout.composed:
         projections = _projections(attention, layout, f"{path}.{layout.attention}")
         called = (*projections, *qk)
         bypassed += [attention, *qk, *(m for m in attention.children() if m not in called)]
@@ -362,11 +373,12 @@ def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
         layout,
         switch,
         signature,
-        tuple(w for w, _ in found),
+        norms,
         tuple(e for _, e in found),
         attention,
         qk,
-        (*projections[:3], *inputs),
+        projections[:3],
+        tuple(inputs),
         down,
         projections[3] if projections else None,
     )
@@ -407,7 +419,7 @@ def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
         launch,
         layout.entries.first,
         x,
-        site.norm_weights[0],
+        site.norms[0].weight,
         rows.scale_msa,
         rows.shift_msa,
         rows.index,
@@ -434,10 +446,9 @@ def _mlp(launch: Launch, site: _Site, hidden: Sequence[Any]) -> Any:
     return site.down(_kernels.swiglu(launch, site.layout.entries.swiglu, *hidden))
 
 
-def _sequential(
-    site: _Site, launch: Launch, x: Any, normed: Any, rows: Modulation, arguments: Any
-) -> Any:
-    layout, entries = site.layout, site.layout.entries
+def _call_attention(launch: Launch, site: _Site, normed: Any, arguments: Any) -> Any:
+    """The block's attention module on the normed rows, its q/k norms applying RoPE."""
+    layout = site.layout
     call = {name: arguments[name] for name in layout.arguments}
     if layout.rope is not None and call[layout.rope.argument] is not None:
         tables = _kernels.rope_tables(
@@ -445,19 +456,29 @@ def _sequential(
         )
         call[layout.rope.argument] = None
         for norm in site.qk:
-            norm._cozy_rope = (launch, entries.rope, tables, layout)
+            norm._cozy_rope = (launch, layout.entries.rope, tables, layout)
     try:
         with quantize_once(normed):
-            attended = site.attention(normed, **call)
+            return site.attention(normed, **call)
     finally:
         for norm in site.qk:
             norm._cozy_rope = None
+
+
+def _sequential(
+    site: _Site, launch: Launch, x: Any, normed: Any, rows: Modulation, arguments: Any
+) -> Any:
+    layout, entries = site.layout, site.layout.entries
+    if layout.composed:
+        attended = _attend(launch, site, *_inputs(site.qkv, normed), arguments)
+    else:
+        attended = _call_attention(launch, site, normed, arguments)
     assert entries.second is not None
     x, normed = _kernels.norm_modulate(
         launch,
         entries.second,
         x,
-        site.norm_weights[1],
+        site.norms[1].weight,
         rows.scale_mlp,
         rows.shift_mlp,
         rows.index,
@@ -484,8 +505,26 @@ def _sequential(
 def _parallel(
     site: _Site, launch: Launch, x: Any, normed: Any, rows: Modulation, arguments: Any
 ) -> Any:
+    q, k, v, *hidden = _inputs((*site.qkv, *site.inputs), normed)
+    x, _ = _kernels.norm_modulate(
+        launch,
+        site.layout.entries.residual,
+        x,
+        None,
+        None,
+        None,
+        rows.index,
+        0.0,
+        branch=_attend(launch, site, q, k, v, arguments),
+        other=_mlp(launch, site, hidden),
+        gate=rows.gate_msa,
+    )
+    return x
+
+
+def _attend(launch: Launch, site: _Site, q: Any, k: Any, v: Any, arguments: Any) -> Any:
+    """A composed attention: q/k norms and RoPE fused, the kernel Runtime selected, `to_out`."""
     layout, entries = site.layout, site.layout.entries
-    q, k, v, *hidden = _inputs(site.inputs, normed)
     heads = (site.attention.heads, layout.head_dim)
     q, k, v = (t.unflatten(-1, heads) for t in (q, k, v))
     if layout.rope is None or arguments[layout.rope.argument] is None:
@@ -511,21 +550,7 @@ def _parallel(
         backend=processor._attention_backend,
         parallel_config=processor._parallel_config,
     )
-    attended = site.out(attended.flatten(2))
-    x, _ = _kernels.norm_modulate(
-        launch,
-        entries.residual,
-        x,
-        None,
-        None,
-        None,
-        rows.index,
-        0.0,
-        branch=attended,
-        other=_mlp(launch, site, hidden),
-        gate=rows.gate_msa,
-    )
-    return x
+    return site.out(attended.flatten(2))
 
 
 def _head_norm_forward(self: Any, hidden_states: Any) -> Any:
@@ -613,8 +638,8 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
         _report(plan, layout, str(exc))
         return ""
     before = [_census(root) for root in roots]
-    # A sequential block's attention calls its q/k norms; a parallel block launches them.
-    heads = [norm for _, site in sites for norm in site.qk] if not layout.parallel else []
+    # An attention module calls its q/k norms; a composed one launches them.
+    heads = [norm for _, site in sites for norm in site.qk] if not layout.composed else []
     eager = [(m, type(m)) for m in (*(block for block, _ in sites), *heads)]
     for norm in heads:
         norm.__class__ = _fused(type(norm), "head")

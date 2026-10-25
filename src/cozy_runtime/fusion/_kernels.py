@@ -438,9 +438,10 @@ def entries(
     product: bool,
     qk_weight: bool,
     parallel: bool,
+    composed: bool,
 ) -> Entries:
-    """A layout's entries. fp16 rows: x may be fp16 (the stream's first block) or fp32, and a
-    q/k norm's operand fp16 or fp32 (a processor that normalizes in fp32)."""
+    """A layout's entries. fp16 rows: x may be fp16 (the stream's first block) or fp32, and an
+    attention module's q/k norm operand fp16 or fp32 (a processor that normalizes in fp32)."""
     block = _next_pow2(width)
     row, wide = ("*fp16", "*fp32") if f16 else ("*bf16", "*bf16")
 
@@ -510,7 +511,7 @@ def entries(
 
     swiglu = ("gate_ptr", "up_ptr", "out_ptr", "n_cols", "stride_gate", "stride_up", "stride_out")
     first, residual, *second = rows(False)
-    variants = [*rows(True), rope(True)] if f16 else []
+    variants = [*rows(True), *([] if composed else [rope(True)])] if f16 else []
     return Entries(
         first,
         residual,

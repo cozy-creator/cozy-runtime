@@ -44,7 +44,8 @@ dtype or device does not match. The declaration states the model's rounding, so 
 eager up to reduction order: RMSNorm once (`torch.nn.RMSNorm`) or twice (Diffusers'), RoPE
 rounding (`sum`, `product`, `fp32`), a value-first fused SwiGLU (Diffusers' `SwiGLU`), and
 bf16 or fp16 rows (fp16 autocast over an fp32 residual stream). Without `scale` the block is a
-plain pre-norm block whose gates are layer scales. qwen-image-2, flux-3-klein and MiniMax-H3's
+plain pre-norm block whose gates are layer scales; with `compose` Runtime composes a sequential
+block's attention from its projections, as it does a parallel block's. qwen-image-2, flux-3-klein and MiniMax-H3's
 video VAE decoder are the users.
 
 ## Attention producers — `AttentionProducer`, `register_attention`
