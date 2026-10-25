@@ -128,11 +128,13 @@ class PreparedRepeat:
         resident_only: bool = False,
         load: Any = None,
     ) -> PreparedRepeat:
-        """Capture a fixed body, optionally fed by one native raw LoadSlot.
+        """Capture a fixed body, optionally fed by one native LoadSlot.
 
         A load slot is initialized capture storage, not a cold-model compiler. Capture seals
-        its unpublished Fill; one later submission reads its actual stored bytes before the
-        native graph starts. Loaded submissions are one-shot and require wait/request join
+        its unpublished Fill; one later submission reads its actual stored bytes and, for an
+        encoded slot, decodes them through TensorFS before the native graph starts. A native
+        worker checks read/decode completion; this is not an event-only handoff. Loaded
+        submissions are one-shot and require wait/request join
         before output access. Pure resident repeats retain their existing reuse contract.
 
         Placed component roots are resolved to owned weight bindings. `resident_only=True`
@@ -597,7 +599,7 @@ class Execution:
         return facts
 
     def _failed_load(self, error: Exception) -> None:
-        """A failed read may still prove cleanup; an exception alone is never that proof."""
+        """A failed read/decode may prove cleanup; an exception alone is never that proof."""
         if self._load_job is None:
             return
         self._failure = error
