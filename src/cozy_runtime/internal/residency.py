@@ -1224,7 +1224,9 @@ class Memory:
             try:
                 region = self._native_region(block, speculative=True)
                 read = region.prepare_read(block.model.source.ck, parts, reclaim=False)
-            except torch.OutOfMemoryError:
+            except (torch.OutOfMemoryError, torch.AcceleratorError) as error:
+                if fault(error) is not Fault.OOM:
+                    raise
                 if request is not None:
                     request.prefetch_skipped += 1
                 return
@@ -1281,8 +1283,8 @@ class Memory:
                     if complete:
                         request.prefetch_completed += 1
                         request.read(block, 0, int(row.get("bytes", 0)), speculative=True)
-            except tensorfs.Error as error:
-                if fault(error) is not Fault.OTHER:
+            except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
+                if fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
                 # A speculative local-only source may be absent. Demand uses the normal
                 # reader/fetch path after the native adapter has checked its producer drain.
