@@ -33,6 +33,27 @@ Definitions for unrelated component roots remain untouched. Re-capture after ret
 new bindings and addresses. Preparation bypasses existing replay wrappers and captures original
 tensor operations, never a nested Torch executable launch.
 
+Since Runtime 0.32.2, `owners=(component,)` accepts placed component roots directly. Runtime
+resolves their existing placement and retains the complete weight binding; packages never need
+private residency attributes. `resident_only=True` admits only weights already on the device.
+The idle preparation guard refuses a backing change before any source read instead of paging an
+oversized model in to capture it. It does not turn the surrounding inference request into an
+overlapping request: later component transitions keep their normal phase priorities.
+
+Capture refuses package forward hooks and per-step LoRA choices. Fixed baked LoRA uses the
+attempt's existing fill identity. The existing graph state guard restores module buffers/plain
+attributes and rejects a body that changes them. The kernel implementation epoch must stay fixed
+through recording and subsequent submissions. Mutable repeat state must be ordinary tensors,
+allocated or cloned under `torch.inference_mode(False)`; preparation runs with inference mode
+disabled so its saved state remains writable. Immutable inputs may retain their original mode.
+
+Missing residency, unsupported hooks and model-state changes are
+`CapabilityError(code="prepared_graph_ineligible")`. A capture-only capacity failure remains a
+typed OOM. Both paths drain queued warmup and restore declared state before returning; capture
+allocations are reset on failure. An author can continue eagerly after such a preparation refusal,
+but must not catch a submission/execution error and replay the request. Hidden Python side effects
+outside the declared tensor state and component remain outside the deterministic-body contract.
+
 Within a normal invocation, `Context.plan` registers one pending prepared-work owner before
 calling the provider. The request admits one complete prepared submission, rejects late or
 additional submissions, joins before success serialization, and cancels/joins unfinished work on

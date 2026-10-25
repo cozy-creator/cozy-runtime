@@ -1660,10 +1660,11 @@ class Memory:
         request = Request(self, id, idle)
         request.plan(plan)
         with self.lock:
-            if self.requests:
+            if not idle and any(not other.idle for other in self.requests):
                 request.overlap = True
                 for other in self.requests:
-                    other.overlap = True
+                    if not other.idle:
+                        other.overlap = True
             self.requests.add(request)
         token = _REQUEST.set(request)
         try:

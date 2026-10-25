@@ -14,6 +14,7 @@ from contextlib import ExitStack, suppress
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
+from cozy_runtime.author._model import LANDED, PLACED
 from cozy_runtime.author._prepared import Progress
 
 if TYPE_CHECKING:
@@ -43,7 +44,7 @@ class PreparedRepeat:
     tensor; use device tensor indexing, never `.item()` or a Python branch. The step updates
     the declared state in place. All other inputs must remain immutable through completion.
     Capture retains external ATen dependencies, the graph pool, and explicit owners.
-    Caller-provided weight bindings must already pin the complete resident dependency set.
+    Placed component roots or explicit weight bindings name the complete dependency set.
     """
 
     def __init__(
@@ -54,6 +55,7 @@ class PreparedRepeat:
         steps: int,
         dependencies: tuple[Any, ...],
         bindings: tuple[Any, ...],
+        landed: int,
     ) -> None:
         self._native, self.state, self.device, self.steps = native, state, device, steps
         self._active: Execution | None = None
@@ -64,6 +66,7 @@ class PreparedRepeat:
         self._binding_cleanup = ExitStack()
         self._load: Any = None
         self._load_used = False
+        self._landed = landed
 
     @staticmethod
     def _layout(tensor: Any) -> tuple[Any, ...]:
@@ -82,6 +85,8 @@ class PreparedRepeat:
     def _validate(self) -> None:
         if self._closed:
             raise RuntimeError("prepared repeat is closed")
+        if self._landed != LANDED[0]:
+            raise RuntimeError("prepared kernel implementations changed")
         for reference, layout in self._dependencies:
             tensor = reference()
             if tensor is None or self._layout(tensor) != layout:
@@ -99,6 +104,7 @@ class PreparedRepeat:
         state: Sequence[Any],
         steps: int,
         owners: Sequence[object] = (),
+        resident_only: bool = False,
         load: Any = None,
     ) -> PreparedRepeat:
         """Capture a fixed body, optionally fed by one native raw LoadSlot.
@@ -107,12 +113,31 @@ class PreparedRepeat:
         its unpublished Fill; one later submission reads its actual stored bytes before the
         native graph starts. Loaded submissions are one-shot and require wait/request join
         before output access. Pure resident repeats retain their existing reuse contract.
+
+        Placed component roots are resolved to owned weight bindings. `resident_only=True`
+        refuses missing weights before running the body; it never fills them for capture.
+        Missing residency, unsupported hooks or changed model state raises CapabilityError
+        with code `prepared_graph_ineligible`. A caller may continue eagerly after a capture
+        refusal or a capture OOM, but must never retry after submit has begun.
         """
         import torch
 
         from cozy_runtime import graphs
-        from cozy_runtime.internal.residency import Binding
+        from cozy_runtime.internal.residency import Binding, StaleBinding
 
+        if isinstance(steps, bool) or not isinstance(steps, int) or not 0 < steps <= 2**32 - 1:
+            raise ValueError("repeat steps must be a positive uint32")
+        tensors = tuple(state)
+        if not tensors or any(not isinstance(t, torch.Tensor) or not t.is_cuda for t in tensors):
+            raise ValueError("prepared repeat state must contain CUDA tensors")
+        device = tensors[0].device.index
+        if device is None or any(t.device.index != device for t in tensors):
+            raise ValueError("prepared repeat uses one CUDA device")
+        if any(t.is_inference() for t in tensors):
+            raise CapabilityError(
+                "prepared mutable state must be allocated outside inference_mode",
+                code="prepared_graph_ineligible",
+            )
         if load is not None:
             from tensorfs import varena
 
@@ -129,27 +154,106 @@ class PreparedRepeat:
                     code="prepared_load_unavailable",
                 )
             owners = (*owners, load)
-        with ExitStack() as cleanup, ExitStack() as preparing:
+        with (
+            torch.cuda.device(device),
+            torch.inference_mode(False),
+            ExitStack() as cleanup,
+            ExitStack() as preparing,
+        ):
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError("prepare a repeat outside graph capture")
             resolved: list[object] = []
             bindings: dict[int, Any] = {}
+            models: dict[int, Any] = {}
+            idle: set[int] = set()
             for owner in owners:
+                placed = PLACED.get(owner) if isinstance(owner, torch.nn.Module) else None
                 if isinstance(owner, Binding):
-                    if not owner.valid():
-                        raise RuntimeError("capture requires a valid weight binding")
+                    placed = PLACED.get(owner.model.module)
+                if placed is not None:
+                    mode, _ = placed[0].lora_choices((placed[1],))[placed[1]]
+                    if mode == "per_step":
+                        raise CapabilityError(
+                            "prepared repeats require a fixed baked LoRA representation",
+                            code="prepared_graph_ineligible",
+                        )
+                if isinstance(owner, Binding) or placed is not None:
                     binding = bindings.get(id(owner))
                     if binding is None:
-                        binding = owner.model.retain(tuple(b.path for b in owner.groups if b.path))
+                        if isinstance(owner, Binding):
+                            if not owner.valid():
+                                raise CapabilityError(
+                                    "capture requires a valid weight binding",
+                                    code="prepared_graph_ineligible",
+                                )
+                            binding = owner.model.retain(
+                                tuple(b.path for b in owner.groups if b.path)
+                            )
+                        else:
+                            assert placed is not None
+                            binding = placed[0].retain(placed[1], ("",))
                         bindings[id(owner)] = binding
                         cleanup.callback(binding.close)
-                        preparing.enter_context(binding.prepare())
+                        model = binding.model
+                        if not model.memory.cuda or model.memory.device.index not in (None, device):
+                            raise CapabilityError(
+                                "prepared owners must use the state's CUDA device",
+                                code="prepared_graph_ineligible",
+                            )
+                        models[id(model.module)] = model.module
+                        if why := graphs._hooked(model.module):
+                            raise CapabilityError(why, code="prepared_graph_ineligible")
+                        if resident_only:
+                            memory = model.memory
+                            if id(memory) not in idle:
+                                preparing.enter_context(
+                                    memory.request(graphs.IDLE_REQUEST, idle=True)
+                                )
+                                idle.add(id(memory))
+                            if not binding.resident():
+                                raise CapabilityError(
+                                    "capture requires the component's weights to be resident",
+                                    code="prepared_graph_ineligible",
+                                )
+                        try:
+                            preparing.enter_context(binding.prepare())
+                        except StaleBinding as error:
+                            raise CapabilityError(
+                                str(error), code="prepared_graph_ineligible"
+                            ) from error
                     resolved.append(binding)
                 else:
                     resolved.append(owner)
+                    if isinstance(owner, torch.nn.Module):
+                        if why := graphs._hooked(owner):
+                            raise CapabilityError(why, code="prepared_graph_ineligible")
+                        models[id(owner)] = owner
             bypass = graphs.BYPASS.set(True)
+            snapshots: list[Any] = []
+            plan = None
             try:
-                plan = cls._capture_ready(step, state=state, steps=steps, owners=resolved)
+                with torch.no_grad():
+                    try:
+                        snapshots = [graphs._State(torch, module) for module in models.values()]
+                        plan = cls._capture_ready(step, state=tensors, steps=steps, owners=resolved)
+                    finally:
+                        changed = [
+                            change for snapshot in snapshots if (change := snapshot.restore())
+                        ]
+                        if snapshots:
+                            torch.cuda.current_stream().synchronize()
+                    if changed:
+                        raise CapabilityError(
+                            "recording changed the model's state: " + ", ".join(changed),
+                            code="prepared_graph_ineligible",
+                        )
+            except BaseException:
+                if plan is not None:
+                    plan.close()
+                raise
             finally:
                 graphs.BYPASS.reset(bypass)
+            assert plan is not None
             if load is not None:
                 try:
                     load.seal()
@@ -193,15 +297,11 @@ class PreparedRepeat:
         except ImportError as error:
             raise RuntimeError("this Runtime wheel has no prebuilt GPU execution module") from error
 
-        if isinstance(steps, bool) or not isinstance(steps, int) or not 0 < steps <= 2**32 - 1:
-            raise ValueError("repeat steps must be a positive uint32")
         tensors = tuple(state)
-        if not tensors or any(not isinstance(t, torch.Tensor) or not t.is_cuda for t in tensors):
-            raise ValueError("prepared repeat state must contain CUDA tensors")
         device = tensors[0].device.index
-        if device is None or any(t.device.index != device for t in tensors):
-            raise ValueError("prepared repeat uses one CUDA device")
+        assert device is not None
         held: dict[int, Any] = {id(t): t for t in tensors}
+        landed = LANDED[0]
 
         class CaptureOwners(TorchDispatchMode):  # type: ignore[misc]  # Torch is optional in checks.
             def __init__(self, retain: bool) -> None:
@@ -239,6 +339,7 @@ class PreparedRepeat:
             saved = tuple(t.clone() for t in tensors)
             stream.wait_stream(current)
             graph = torch.cuda.CUDAGraph(keep_graph=True)
+            native = None
             try:
                 with torch.cuda.stream(stream), CaptureOwners(False):
                     step(index)  # instantiate library workspaces before capture
@@ -275,9 +376,19 @@ class PreparedRepeat:
                 _native_error(error)
             finally:
                 # Restore state even when capture/eligibility fails; no prepared object escapes.
+                # A failed warm-up may have queued work before throwing on the host.
+                current.wait_stream(stream)
                 for target, original in zip(tensors, saved, strict=True):
                     target.copy_(original)
                 current.synchronize()
+                if native is None:
+                    graph.reset()
+            if landed != LANDED[0]:
+                native.close_owner()
+                raise CapabilityError(
+                    "kernel implementations changed during recording",
+                    code="prepared_graph_ineligible",
+                )
         dependencies = tuple((weakref.ref(t), cls._layout(t)) for t in held.values())
         bindings = tuple(
             (weakref.ref(owner), owner.identity) for owner in owners if isinstance(owner, Binding)
@@ -285,7 +396,7 @@ class PreparedRepeat:
         # The local mode class has a __class__ closure cycle. Native ownership has taken its
         # own references; do not leave GPU tensors retained until an unrelated Python GC pass.
         held.clear()
-        return cls(native, tensors, device, steps, dependencies, bindings)
+        return cls(native, tensors, device, steps, dependencies, bindings, landed)
 
     def _valid_definition(self) -> bool:
         try:
