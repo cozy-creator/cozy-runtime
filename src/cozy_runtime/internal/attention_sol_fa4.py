@@ -23,6 +23,7 @@ import triton
 import triton.language as tl
 
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import attention_sol
 from cozy_runtime.internal import attention_upstream as upstream
 
@@ -40,13 +41,30 @@ def sparse(
 ) -> Tensor:
     """One BF16 BTHD document; every row, the protected prefix's included. `fp8` runs the exact
     tiles in e4m3 with Hadamard-rotated Q/K, as the dense rows' FA4 FP8 does."""
-    import torch
-
     scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
     attention_sol._pin_preprocess()
     kc, vc, threshold = import_module("sol_attn.preprocess").prepare(
         query, key, value, scale=scale, tau=1.0, thresh_type="exact"
     )
+    return _routed(query, key, value, kc, vc, threshold, scale, sink_tokens, fp8=fp8)
+
+
+def _routed(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    kc: Tensor,
+    vc: Tensor,
+    threshold: Tensor,
+    scale: float,
+    sink_tokens: int,
+    *,
+    fp8: bool,
+) -> Tensor:
+    """`sparse` past upstream's preprocess: Sol's route pooled onto FA4's tiles, FA4's exact
+    tiles, then the approximation merged in (`_LAUNCH`'s kernel)."""
+    import torch
+
     pooled = route(query, kc, threshold, scale, sink_tokens)
     count = pooled.sum(-1, dtype=torch.int32)
     index = torch.argsort(pooled.to(torch.int8), dim=-1, descending=True, stable=True)
@@ -72,19 +90,24 @@ def sparse(
 
 
 @request_path.forbid("kernel build: sol fa4")
-def warm(index: int) -> None:
-    """Build this card's FA4 block-sparse forwards (FP8 and BF16) and the merge at preparation,
-    one small call each: FA4's and Triton's caches key neither on length nor on head count, so
-    a run's first sparse step finds them built."""
+def warm(index: int, launch: Launch) -> None:
+    """With the merge loaded (`launch`, built by the compile manager), build this card's FA4
+    block-sparse forwards (FP8 and BF16) at preparation, one small call each on stand-in
+    preprocess outputs: FA4's cache keys neither on length nor on head count, so a run's first
+    sparse step finds them built. FA4 is CuTe-DSL compiled in this process by upstream, which
+    has no object to build elsewhere; upstream's preprocess builds per length (`attention_sol`)."""
     import torch
 
+    _LAUNCH[index] = launch
     device = torch.device("cuda", index)
     with torch.no_grad(), torch.cuda.device(device):
         q, k, v = (
             torch.randn(1, 1024, 2, 128, device=device, dtype=torch.bfloat16) for _ in range(3)
         )
+        kc, vc = (torch.randn(1, 1024 // BLOCK, 2, 128, device=device) for _ in range(2))
+        threshold = torch.zeros(1, 1024 // BLOCK, 2, device=device)
         for fp8 in (True, False):
-            sparse(q, k, v, None, 64, fp8=fp8)
+            _routed(q, k, v, kc.bfloat16(), vc.bfloat16(), threshold, 128**-0.5, 64, fp8=fp8)
         torch.cuda.synchronize(device)
 
 
@@ -126,7 +149,9 @@ def _merge_approximation(
     length = (tokens - torch.arange(blocks, device=query.device) * BLOCK).clamp(1, BLOCK).float()
     keys = kc[0].transpose(0, 1).contiguous()  # head-major block means
     values = (vc[0].float() / length[:, None, None]).to(torch.bfloat16).transpose(0, 1).contiguous()
-    _approximate_and_merge[(triton.cdiv(tokens, 128), heads)](
+    _LAUNCH[query.device.index or 0](
+        _approximate_and_merge,
+        (triton.cdiv(tokens, 128), heads, 1),
         query,
         keys,
         values,
@@ -140,16 +165,13 @@ def _merge_approximation(
         pooled.shape[1],
         pooled.shape[2],
         scale * LOG2E,
-        D=dim,
-        BLOCK_M=128,
-        BLOCK_N=128,
-        num_warps=8,
-        num_stages=2,
+        dim,
+        128,
+        128,
     )
 
 
-# Lengths are not specialized: preparation's small call builds the object every length runs.
-@triton.jit(do_not_specialize=["tokens", "blocks", "heads", "q_tiles", "k_tiles"])  # type: ignore[untyped-decorator]
+@triton.jit  # type: ignore[untyped-decorator]
 def _approximate_and_merge(  # type: ignore[no-untyped-def]
     Q,
     KC,
@@ -215,4 +237,24 @@ def _approximate_and_merge(  # type: ignore[no-untyped-def]
     tl.store(OUT + o_offsets, merged.to(tl.bfloat16), mask=live[:, None])
 
 
-__all__ = ["route", "sparse", "warm"]
+#: The merge, every length and head count: they are runtime sizes.
+KERNELS = TritonKernels(
+    "cozy-sol-fa4-merge",
+    [
+        TritonEntry(
+            _approximate_and_merge,
+            {"Q": "*bf16", "KC": "*bf16", "VM": "*bf16", "BIAS": "*fp32", "POOLED": "*i8",
+             "OUT": "*bf16", "LSE": "*fp32", "tokens": "i32", "blocks": "i32", "heads": "i32",
+             "q_tiles": "i32", "k_tiles": "i32", "scale_log2": "fp32", "D": "constexpr",
+             "BLOCK_M": "constexpr", "BLOCK_N": "constexpr"},
+            {"D": 128, "BLOCK_M": 128, "BLOCK_N": 128},
+            ("Q", "KC", "VM", "BIAS", "POOLED", "OUT", "LSE"),
+            num_warps=8,
+            num_stages=2,
+        )
+    ],
+)  # fmt: skip
+#: Device index -> the merge's loaded launcher (`warm`).
+_LAUNCH: dict[int, Launch] = {}
+
+__all__ = ["KERNELS", "route", "sparse", "warm"]

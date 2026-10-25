@@ -39,7 +39,7 @@ from tensorfs import UnsupportedError
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES
 from cozy_runtime.author._numeric import within, worst
-from cozy_runtime.derive.microscale import encode_nvfp4, encode_w4a8
+from cozy_runtime.derive.microscale import encode_int8_convrot256, encode_nvfp4, encode_w4a8
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.decode_cores import Cores
 from cozy_runtime.internal.decode_schemes import run, sample
@@ -654,10 +654,16 @@ def _weight_roles(torch: Any, provider: Provider, device: Any) -> tuple[Any, dic
         payload = (weight / scale.unsqueeze(0)).clamp(-448.0, 448.0)
         return weight, {"weight": payload.to(torch.float8_e4m3fn), "scale": scale}
     if provider.suite in ("int8-convrot-decode", "int8-convrot256-native"):
-        rotated = hadamard256(torch, weight.double()) / 16
-        scale = (rotated.abs().amax(dim=-1) / 127.0).clamp(min=1e-12).float()
-        payload = torch.round(rotated / scale.double().unsqueeze(-1)).clamp(-127, 127)
-        return weight, {"weight": payload.to(torch.int8), "scale": scale}
+        encoded = encode_int8_convrot256("probe", weight.cpu().numpy())
+        (scale,) = encoded.companions
+        return weight, {
+            "weight": torch.frombuffer(bytearray(encoded.payload), dtype=torch.int8)
+            .reshape(rows, cols)
+            .to(device),
+            "scale": torch.frombuffer(bytearray(scale.raw), dtype=torch.float32)
+            .reshape(rows)
+            .to(device),
+        }
     if provider.suite == "svdq-nvfp4-native":  # an nvfp4 residual, smoothing and a rank-32 branch
         _, roles = _weight_roles(torch, Nvfp4NativeLeaf(), device)
         roles["pre_quant_scale"] = torch.rand(cols, generator=generator).to(device) + 0.5

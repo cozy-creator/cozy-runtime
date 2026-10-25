@@ -8,31 +8,17 @@ upstream's full-head mean. The same callable serves dense steps and protected qu
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from torch import Tensor
 
-from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
-from cozy_runtime.internal.attention_ulysses import Local, Options
+from cozy_runtime.internal import attention_sol, attention_upstream
+from cozy_runtime.internal.attention_ulysses import Local
 
 DENSE_NAME = "sageattention-fixed-kmean"
 SOL_NAME = "sol-attn-sage2-fixed-kmean"
 IMPLEMENTATION = "sageattn_qk_int8_pv_fp8_cuda_sm90(per_thread, fp32+fp32, fixed_kmean)"
-
-
-def _shape(query: Tensor, key: Tensor, value: Tensor) -> None:
-    if any(t.ndim != 4 for t in (query, key, value)):
-        raise ValueError("Fixed-Kmean Sage2 requires B/N/H/D tensors")
-    if (
-        query.shape[0] != 1
-        or key.shape != value.shape
-        or key.shape[0] != 1
-        or query.shape[2:] != key.shape[2:]
-        or query.shape[-1] != 128
-        or min(query.shape[1], key.shape[1], query.shape[2]) <= 0
-    ):
-        raise ValueError("Fixed-Kmean Sage2 requires B1, equal Q/KV heads, D128 and nonempty rows")
 
 
 def forward(
@@ -48,13 +34,8 @@ def forward(
 ) -> Tensor:
     import torch
 
-    attention_upstream._options(DENSE_NAME, attn_mask, dropout_p, scale)
-    if is_causal or enable_gqa:
-        raise ValueError("Fixed-Kmean Sage2 serves noncausal equal-head inference only")
-    attention_upstream._cuda_inputs(
-        query, key, value, enable_gqa, name=DENSE_NAME, dims={128}, bf16=True
-    )
-    _shape(query, key, value)
+    attention_upstream._options(DENSE_NAME, dropout_p, scale)
+    attention_upstream._cuda_inputs(query, key, value, enable_gqa)
     if any(t.stride(-1) != 1 for t in (query, key, value)):
         raise ValueError("Fixed-Kmean Sage2 requires contiguous channels")
     core = import_module("sageattention.core")
@@ -96,32 +77,8 @@ def forward(
 
 
 DENSE = Local(forward, lambda *_: IMPLEMENTATION)
-
-
-def dense(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
-    return attention_ulysses._call(
-        "_cozy_sage2_fixed_kmean",
-        DENSE,
-        query,
-        key,
-        value,
-        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
-    )
-
-
-def sparse_forward(query: Tensor, key: Tensor, value: Tensor, **options: Any) -> Tensor:
-    # No replacement sparse math: the existing CuTe kernel and model layout stay authoritative.
-    return attention_sol._attention(
-        query,
-        key,
-        value,
-        **options,
-        dense=dense,
-        prefix_dense=dense,
-    )
-
-
+#: Sol's CuTe sparse rows; its dense rows are its row's declared kernel (`attention.Candidate`).
 SOL = Local(
-    sparse_forward,
+    attention_sol._attention,
     lambda q, *_: f"dense={IMPLEMENTATION}; sparse={attention_sol.backend(q.device)}",
 )

@@ -1,0 +1,1 @@
+- Route the remaining offline NVFP4 and ConvRot tensor encoders through TensorFS’s measured Rust primitives. Keep bounded chunks, existing output roles, calibration in Runtime, and the FP8/W4A8 producers.

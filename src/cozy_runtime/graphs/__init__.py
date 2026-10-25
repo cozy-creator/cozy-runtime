@@ -808,7 +808,10 @@ def _watch(root: Any, recorder: _Recorder) -> None:
             "first two calls: declare each that steers its forward in Model.__graph_keys__",
         )
         WARNINGS.append(
-            ("a component's undeclared state changed between calls", {"component": name})
+            (
+                "a component's undeclared state changed between calls",
+                {"component": name, "attributes": ", ".join(sorted(changed))},
+            )
         )
 
 

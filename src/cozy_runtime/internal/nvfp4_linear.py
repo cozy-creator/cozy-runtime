@@ -1,17 +1,19 @@
 """The `nvfp4-w4a4/1` encoded linear: one leaf from sm80 up, three ways to multiply.
 
-* **W4A4, Blackwell (sm100+), more than `DECODE_ROWS` rows.** comfy-kitchen's NVFP4 quantizer and
-  cuBLASLt FP4 GEMM, the pair ComfyUI serves BFL's nvfp4 checkpoints with. Each activation is
-  scaled by its own tensor amax (`amax / (448 * 6)`, the producer's rule for the weight's second
-  level) and quantized per 16-block; the GEMM applies both second-levels as its alpha.
+* **W4A4, a card whose row has FP4 tensor cores (`arch`), more than `DECODE_ROWS` rows.**
+  comfy-kitchen's NVFP4 quantizer and cuBLASLt FP4 GEMM, the pair ComfyUI serves BFL's nvfp4
+  checkpoints with. Each activation is scaled by its own tensor amax (`amax / (448 * 6)`, the
+  producer's rule for the weight's second level) and quantized per 16-block; the GEMM applies
+  both second-levels as its alpha.
 * **W4A16, everything else on CUDA.** At decode-sized M a split-K Triton GEMV decodes the stored
   nibbles and E4M3 block scales in registers onto the bf16/fp16 tensor cores, reading 0.56 bytes
   per weight where bf16 reads 2, which is what an LM's token loop is bound by. Larger M decodes the
   weight once into a transient and takes the bf16 GEMM.
 * **Eager decode** where neither exists (CPU, no Triton, fp16, the executor start's build still
-  running; the kitchen build still running at large M on Blackwell takes W4A16 instead), so no
-  run waits for a compile. The Triton kernels build when the executor starts (`KERNELS`). A W4A4
-  call that raises is served by W4A16, and the run says so (`int8_linear.failed`).
+  running; the kitchen build still running at large M on an FP4 card takes W4A16 instead), so no
+  run waits for a compile. The Triton kernels build when the executor starts (`KERNELS`). Each
+  path serves once its probe agrees with the exact law on the card (`kernel_ready.serve`). A
+  W4A4 call that raises is served by W4A16, and the run says so (`int8_linear.failed`).
 
 `torch` is the torch module: this module imports no torch.
 """
@@ -30,8 +32,14 @@ from cozy_runtime.author.kernels import (
     TritonKernels,
     readable,
 )
-from cozy_runtime.internal import int8_linear, kernel_ready
-from cozy_runtime.internal.encoding.formats import NVFP4_BLOCK, Tensor, nvfp4_values
+from cozy_runtime.internal import arch, int8_linear, kernel_ready, prebuilt, svdq_linear, verify
+from cozy_runtime.internal.encoding.formats import (
+    NVFP4_BLOCK,
+    Tensor,
+    from_blocked,
+    nvfp4_values,
+    to_blocked,
+)
 
 if TYPE_CHECKING:
     from torch import device as Device
@@ -46,8 +54,8 @@ DECODE_ROWS = 16
 GEMV_N, GEMV_W = 64, 32
 #: The kernels a leaf serves besides comfy-kitchen's W4A4 (`gemm.selected`).
 DECODE, EAGER = "cozy-nvfp4-decode", "torch-decode"
-
-_MAJOR: dict[int, int] = {}
+#: comfy-kitchen's W4A4 by its `kernel_ready` name's head.
+KITCHEN = "comfy-kitchen nvfp4 W4A4"
 
 
 try:
@@ -272,23 +280,36 @@ def _entries() -> list[TritonEntry]:
 
 #: Built on every executor's GPUs when it starts (`author.kernels`): a request never compiles.
 KERNELS = TritonKernels("cozy-nvfp4", _entries())
-#: `triton_kernels.ready`, bound by `triton_kernels` itself when it is imported, which the
-#: executor does past its device boundary: this module imports neither Triton nor torch, so
-#: `encoding` imports in a session without a GPU (test_device_session).
-READY: list[Callable[..., Launch | None]] = []
 
 
-def _launcher(device: Device) -> Launch | None:
-    """This GPU's launcher once the executor start's build serves (`kernel_ready`), else None:
-    the caller then decodes eagerly."""
-    name = f"{KERNELS.name} cuda:{device.index or 0}"
-    return kernel_ready.ready(name, partial(READY[0], KERNELS, device=device)) if READY else None
+def _launcher(torch: ModuleType, device: Device, capturing: bool) -> Launch | None:
+    """This GPU's launcher once the executor start's build loads and passes `probe` here
+    (`kernel_ready.serve`), else None: the caller then decodes eagerly."""
+    if TRITON_ABSENT or not kernel_ready.TRITON:
+        return None
+    opener = partial(kernel_ready.TRITON[0], KERNELS, partial(probe, torch, device), device=device)
+    return kernel_ready.serve(f"{KERNELS.name} cuda:{device.index or 0}", opener, capturing)
 
 
-def _major(torch: ModuleType, index: int) -> int:
-    if index not in _MAJOR:
-        _MAJOR[index] = int(torch.cuda.get_device_capability(index)[0])
-    return _MAJOR[index]
+def kitchen(torch: ModuleType, index: int, capturing: bool) -> ModuleType | None:
+    """comfy-kitchen's backend once its W4A4 passes its probe on this card (`kernel_ready.serve`):
+    asked only where the card's row has FP4 tensor cores."""
+    name = f"{KITCHEN} cuda:{index}"
+    return kernel_ready.serve(name, partial(_kitchen, torch, index), capturing)
+
+
+def _kitchen(torch: ModuleType, index: int, wait: bool) -> ModuleType | None:
+    found = int8_linear.kitchen_module(torch, index, wait)
+    if found is None:
+        return None
+    module, artifact = found
+    sm, check = int8_linear.capability(torch, index), partial(_probe_kitchen, torch, index)
+    return kernel_ready.verified(module, "comfy-kitchen-nvfp4", artifact, sm, check)
+
+
+def fp4(torch: ModuleType, index: int) -> bool:
+    """Whether cuda:`index`'s row has FP4 tensor cores: only there does a W4A4 product serve."""
+    return arch.row(int8_linear.capability(torch, index)).fp4
 
 
 def matmul(
@@ -309,21 +330,14 @@ def matmul(
     rows = int(flat.shape[0])
     if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16):
         index = x.device.index or 0
+        capturing = torch.cuda.is_current_stream_capturing()
         module = (
-            int8_linear.kitchen(torch, index)
-            if rows > DECODE_ROWS and _major(torch, index) >= 10
-            else None
+            kitchen(torch, index, capturing) if rows > DECODE_ROWS and fp4(torch, index) else None
         )
         if module is not None:
-            amax = torch.linalg.vector_norm(flat, float("inf")).float()  # one pass, exact
-            tensor_scale = (amax / LEVELS_MAX).clamp(min=SCALE_FLOOR).reshape(1)
             try:
                 with readable(weight, blocked_scale, scale_2) as (w, scales, second):
-                    # hi_first=False: element 2k in the LOW nibble, the stored weight's order.
-                    # Kitchen's default packs the other way; a K-wise dot only needs both agree.
-                    payload, block = module.quantize_nvfp4(
-                        flat, tensor_scale, 0.0, rows % NVFP4_BLOCK != 0, False
-                    )
+                    payload, block, tensor_scale = _quantized(torch, module, flat)
                     out = module.scaled_mm_nvfp4(
                         payload, w, tensor_scale, second, block, scales, out_dtype=out_dtype
                     )
@@ -331,77 +345,148 @@ def matmul(
             except Exception as exc:  # W4A16 serves this call
                 int8_linear.failed("comfy-kitchen nvfp4", index, exc)
         launch = (
-            _launcher(x.device)
+            _launcher(torch, x.device, capturing)
             if x.dtype == torch.bfloat16 and out_dtype == torch.bfloat16
             else None
         )
         if launch is not None:
             with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
-                scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
                 if rows <= DECODE_ROWS and weight.data_ptr() % 16 == 0:
                     # Bandwidth-bound: split over K while a few programs per row block would
                     # leave SMs idle (a 3090: 213-335 GB/s for a program per 32 rows, 520-795 so).
                     flat = flat if flat.data_ptr() % 16 == 0 else flat.clone()
                     split = 4 if rows_out <= 8192 else 2 if rows_out <= 16384 else 1
-                    span = -(-cols // (split * 8 * GEMV_W)) * 8 * GEMV_W
-                    out = torch.empty(rows, rows_out, dtype=out_dtype, device=x.device)
-                    part = (
-                        torch.empty(split, rows, rows_out, dtype=torch.float32, device=x.device)
-                        if split > 1
-                        else out
-                    )
-                    launch(
-                        _gemv,
-                        (-(-rows_out // GEMV_N), split, 1),
-                        flat,
-                        weight.view(torch.int32),
-                        scales,
-                        scale_2,
-                        part,
-                        rows,
-                        rows_out,
-                        cols,
-                        tiles,
-                        span,
-                        GEMV_N,
-                        GEMV_W,
-                        int(split > 1),
-                    )
-                    if split > 1:
-                        launch(
-                            _gather,
-                            (-(-(rows * rows_out) // 1024), 1, 1),
-                            part,
-                            scale_2,
-                            out,
-                            rows * rows_out,
-                            split,
-                            1024,
-                        )
+                    out = _rows(torch, launch, flat, weight, blocked_scale, scale_2, split)
                     return out.reshape(*x.shape[:-1], rows_out)
-                decoded = torch.empty(rows_out, cols, dtype=x.dtype, device=x.device)
-                launch(
-                    _dequant,
-                    (-(-rows_out // 64), -(-cols // 128), 1),
-                    weight,
-                    scales,
-                    scale_2,
-                    decoded,
-                    rows_out,
-                    cols,
-                    tiles,
-                    64,
-                    128,
-                )
+                decoded = _decoded(torch, launch, weight, blocked_scale, scale_2)
             out = torch.nn.functional.linear(flat, decoded).to(out_dtype)
             return out.reshape(*x.shape[:-1], rows_out)
     decoded = nvfp4_values(torch, weight, linear_scale(), scale_2).to(x.dtype)
     return torch.nn.functional.linear(x, decoded).to(out_dtype)
 
 
+def _quantized(torch: ModuleType, module: ModuleType, flat: Tensor) -> tuple[Tensor, ...]:
+    """comfy-kitchen's NVFP4 operand of `flat` under its own tensor amax: packed codes, block
+    scales in cuBLASLt's tiles, the second level."""
+    amax = torch.linalg.vector_norm(flat, float("inf")).float()  # one pass, exact
+    tensor_scale = (amax / LEVELS_MAX).clamp(min=SCALE_FLOOR).reshape(1)
+    # hi_first=False: element 2k in the LOW nibble, the stored weight's order. Kitchen's default
+    # packs the other way; a K-wise dot only needs both agree.
+    rows = int(flat.shape[0])
+    payload, block = module.quantize_nvfp4(flat, tensor_scale, 0.0, rows % NVFP4_BLOCK != 0, False)
+    return payload, block, tensor_scale
+
+
+def _rows(
+    torch: ModuleType,
+    launch: Launch,
+    flat: Tensor,
+    weight: Tensor,
+    blocked_scale: Tensor,
+    scale_2: Tensor,
+    split: int,
+) -> Tensor:
+    """`flat @ W.T` (bf16, up to `DECODE_ROWS` rows) on the GEMV, K split over `split` spans."""
+    rows, cols, rows_out = int(flat.shape[0]), int(flat.shape[1]), int(weight.shape[0])
+    scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
+    span = -(-cols // (split * 8 * GEMV_W)) * 8 * GEMV_W
+    out = torch.empty(rows, rows_out, dtype=torch.bfloat16, device=flat.device)
+    part = (
+        torch.empty(split, rows, rows_out, dtype=torch.float32, device=flat.device)
+        if split > 1
+        else out
+    )
+    launch(
+        _gemv, (-(-rows_out // GEMV_N), split, 1),
+        flat, weight.view(torch.int32), scales, scale_2, part, rows, rows_out, cols, tiles, span,
+        GEMV_N, GEMV_W, int(split > 1),
+    )  # fmt: skip
+    if split > 1:
+        launch(
+            _gather, (-(-(rows * rows_out) // 1024), 1, 1),
+            part, scale_2, out, rows * rows_out, split, 1024,
+        )  # fmt: skip
+    return out
+
+
+def _decoded(
+    torch: ModuleType, launch: Launch, weight: Tensor, blocked_scale: Tensor, scale_2: Tensor
+) -> Tensor:
+    """The stored weight decoded to bf16 `[N, K]` in one launch."""
+    rows_out, cols = int(weight.shape[0]), 2 * int(weight.shape[1])
+    scales, tiles = blocked_scale.view(torch.uint8), int(blocked_scale.shape[1]) // 4
+    decoded = torch.empty(rows_out, cols, dtype=torch.bfloat16, device=weight.device)
+    launch(
+        _dequant, (-(-rows_out // 64), -(-cols // 128), 1),
+        weight, scales, scale_2, decoded, rows_out, cols, tiles, 64, 128,
+    )  # fmt: skip
+    return decoded
+
+
+def _probe_weight(
+    torch: ModuleType, generator: object, device: object, rows_out: int, cols: int
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """A random stored weight: packed codes, its E4M3 block scales row-major and in cuBLASLt's
+    tiles, an f32 second level."""
+    weight = torch.randint(0, 256, (rows_out, cols // 2), generator=generator, device=device,
+                           dtype=torch.uint8)  # fmt: skip
+    linear = torch.rand(rows_out, cols // NVFP4_BLOCK, generator=generator, device=device)
+    linear = (linear * 4 + 0.25).to(torch.float8_e4m3fn)
+    padded = -(-(cols // NVFP4_BLOCK) // 4) * 4
+    blocked = to_blocked(torch, linear.view(torch.uint8)).view(-1, padded)
+    return weight, linear, blocked.view(torch.float8_e4m3fn), torch.full((1,), 0.02, device=device)
+
+
+def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
+    """The decode kernels against the exact law in float64: the GEMV at 1, 3 and `DECODE_ROWS`
+    rows over each K split, and the decoded weight, with N not a multiple of a tile."""
+    generator = torch.Generator(device=device).manual_seed(20261025)
+    rows_out, cols = 200, 1024
+    weight, linear, blocked, second = _probe_weight(torch, generator, device, rows_out, cols)
+    exact = nvfp4_values(torch, weight, linear, second).double()
+    errors: dict[str, float] = {}
+    for m in (1, 3, DECODE_ROWS):
+        x = torch.randn(m, cols, generator=generator, device=device).to(torch.bfloat16)
+        want = x.double() @ exact.t()
+        for split in (1, 2, 4):
+            got = _rows(torch, launch, x, weight, blocked, second, split)
+            errors[f"gemv M={m} split={split}"] = verify.error(torch, got, want)
+    errors["dequant"] = verify.error(torch, _decoded(torch, launch, weight, blocked, second), exact)
+    return verify.within(errors, prebuilt.BUDGET)
+
+
+def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.Verdict:
+    """comfy-kitchen's W4A4 on this card: its GEMM against the exact (float64) product of the
+    operands it was handed, and its quantizer, which rounds its own way, within `verify.SLACK` of
+    the exact law's loss (`svdq_linear.fake`). bf16 and fp16, rows not a multiple of 16."""
+    device = torch.device("cuda", index)
+    generator = torch.Generator(device=device).manual_seed(20261025)
+    rows_out, cols = 264, 1024
+    weight, linear, blocked, second = _probe_weight(torch, generator, device, rows_out, cols)
+    exact = nvfp4_values(torch, weight, linear, second).double()
+    gemm: dict[str, float] = {}
+    quantizer: dict[str, tuple[float, float]] = {}
+    for name, dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
+        for m in (40, 300):
+            x = torch.randn(m, cols, generator=generator, device=device).to(dtype)
+            payload, block, tensor_scale = _quantized(torch, module, x)
+            got = module.scaled_mm_nvfp4(
+                payload, weight, tensor_scale, second, block, blocked, out_dtype=dtype
+            )[:m]
+            scales = from_blocked(torch, block.view(torch.uint8), int(payload.shape[0]), cols // 16)
+            operand = nvfp4_values(torch, payload, scales.view(torch.float8_e4m3fn), tensor_scale)
+            operand = operand[:m].double()
+            case, law = f"{name} M={m}", svdq_linear.fake(torch, x.float(), tensor_scale)
+            gemm[case] = verify.error(torch, got, operand @ exact.t())
+            quantizer[case] = (verify.error(torch, operand, x), verify.error(torch, law, x))
+    product, rounding = verify.within(gemm, prebuilt.BUDGET), verify.against_law(quantizer)
+    detail = f"GEMM {product.detail}; quantizer {rounding.detail}"
+    return verify.Verdict(product.ok and rounding.ok, detail)
+
+
 def serving(index: int) -> str:
     """The kernel this card's nvfp4 leaves serve a product of more than `DECODE_ROWS` rows with
     now (fewer rows take the GEMV): a run's `gemm.selected`, read once a run."""
-    if _MAJOR.get(index, 0) >= 10 and int8_linear.kitchen_serves(index):
+    if kernel_ready.ready(f"{KITCHEN} cuda:{index}") is not None:
         return int8_linear.ARTIFACT
     return DECODE if kernel_ready.ready(f"{KERNELS.name} cuda:{index}") is not None else EAGER

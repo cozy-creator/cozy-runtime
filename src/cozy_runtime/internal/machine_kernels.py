@@ -53,9 +53,7 @@ def boot(row: arch.Row) -> list[attention.Candidate]:
         for names in cells.get(row.family, {}).values():
             for candidate in (attention.BY_NAME[n] for n in names):
                 if not attention._off_row(candidate, row):
-                    found.append(candidate)
-                    if candidate.dense:
-                        found.append(attention.BY_NAME[candidate.dense])
+                    found += [candidate, *(attention.BY_NAME[n] for n in candidate.dense)]
                     break
     return found
 

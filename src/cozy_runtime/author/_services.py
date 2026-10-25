@@ -1238,6 +1238,8 @@ class Telemetry(_Bound):
         attempt._step_device = clock.mark() if clock is not None else None
         if attempt._stall_watch is None:
             attempt._stall_watch = _stalls.watch(lambda: not attempt.closed)
+            if attempt._stall_watch is not None:
+                self._ctx._pause_stall_watch = attempt._stall_watch.pause
 
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()

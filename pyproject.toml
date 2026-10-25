@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.15.4,<0.16",
+    "tensorfs>=0.15.6,<0.16",
     "cryptography>=45",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -119,7 +119,7 @@ media = [
 ]
 # CUDA executors use TensorFS's prebuilt local Rust residency bridge and ordinary Torch
 # tensor views. CPU/MPS use Torch storage; serving never compiles native code.
-model-execution = ["tensorfs>=0.15.4,<0.16"]
+model-execution = ["tensorfs>=0.15.6,<0.16"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [

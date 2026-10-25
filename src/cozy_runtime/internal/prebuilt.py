@@ -515,7 +515,7 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
         name = "bf16" if dtype == torch.bfloat16 else "fp16"
         for m in (3, rows):
             x = randn(m, width).to(dtype)
-            want = _law(torch, f, x.double(), data, scale, bias)
+            want = law(torch, f, x.double(), data, scale, bias)
             got = (ops.fp8_linear if f.fp8 else ops.int8_linear)(x, data, scale, bias, dtype)
             errors[f"{name} linear M={m}"] = verify.error(torch, got, want)
         q, scales = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(x)
@@ -534,7 +534,7 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     got = (ops.fp8_gemm if f.fp8 else ops.int8_gemm)(*folded, data, scale, None, torch.bfloat16)
     produced = _prologue(torch, x.double(), modulation.double(), shift.double(), 1e-6)
     errors["prologue rms+modulation+gelu_tanh"] = verify.error(
-        torch, got, _law(torch, f, produced, data, scale, None)
+        torch, got, law(torch, f, produced, data, scale, None)
     )
     return verify.within(errors, BUDGET)
 
@@ -574,7 +574,7 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
             label = f"{name} {'bf16' if dtype == torch.bfloat16 else 'fp16'}"
             for m in (3, rows):
                 x = randn(m, width).to(dtype)
-                want = _law(torch, INT8, x.double(), data, grid.scale, bias)
+                want = law(torch, INT8, x.double(), data, grid.scale, bias)
                 errors[f"{label} linear M={m}"] = verify.error(
                     torch, ops.w4a8_linear(x, grid, bias, dtype), want
                 )
@@ -592,7 +592,7 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
     got = ops.w4a8_gemm(*folded, w, None, torch.bfloat16)
     produced = _prologue(torch, x.double(), modulation.double(), shift.double(), 1e-6)
     errors["prologue rms+modulation+gelu_tanh"] = verify.error(
-        torch, got, _law(torch, INT8, produced, unpack(torch, w), w.scale, None)
+        torch, got, law(torch, INT8, produced, unpack(torch, w), w.scale, None)
     )
     return verify.within(errors, BUDGET)
 
@@ -603,7 +603,7 @@ def _fp8_law(torch: ModuleType, x: Tensor) -> tuple[Tensor, Tensor]:
     return (x.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn), scale
 
 
-def _law(
+def law(
     torch: ModuleType, f: _Format, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None
 ) -> Tensor:
     """The quantized product in float64: what the kernels compute, up to their output's rounding."""
@@ -670,8 +670,11 @@ def _strides(t: Tensor) -> tuple[int, int, int]:
     return int(t.stride(0)), int(t.stride(1)), int(t.stride(2))
 
 
-def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None, str]:
-    """FlashAttention-3 from the wheel on cuda:`index` once it passes its probe, or None and why."""
+def fa3(
+    torch: ModuleType, index: int, sm: int, cases: Sequence[tuple[int, str, int, int, int, bool]]
+) -> tuple[FlashAttention3 | None, str]:
+    """FlashAttention-3 from the wheel on cuda:`index` once it passes its probe on its row's
+    `cases` (`attention.Candidate.cases`), or None and why."""
     if ABSENT or NO_FA3:
         return None, ABSENT or NO_FA3
     if sm != 90:
@@ -681,8 +684,7 @@ def fa3(torch: ModuleType, index: int, sm: int) -> tuple[FlashAttention3 | None,
     def call(q: Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
         return kernel.flash_attn_func(q, k, v, causal=causal)[0]
 
-    pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16")]
-    probe = partial(attention_probe, torch, index, call, True, pairs, True)
+    probe = partial(attention_probe, torch, index, call, True, cases)
     verdict = verify.verified("prebuilt-fa3", artifact("_fa3"), sm, probe)
     return (kernel if verdict.ok else None), verdict.detail
 
@@ -692,26 +694,24 @@ def attention_probe(
     index: int,
     call: Callable[[Tensor, Tensor, Tensor, bool], Tensor],
     exact: bool,
-    pairs: Sequence[tuple[int, str]],
-    causal: bool,
+    cases: Sequence[tuple[int, str, int, int, int, bool]],
 ) -> verify.Verdict:
     """An attention kernel `call(q, k, v, causal) -> out` on `(b, s, h, d)` against attention in
-    float64: each (head dim, dtype) it serves, with a query longer than its keys, and causal at
-    equal lengths (flash-attention aligns the mask bottom-right) where `causal`."""
+    float64, on each `(head dim, dtype, batch, query length, key length, causal)` its row admits
+    (`attention.Candidate.cases`); causal aligns the mask bottom-right, as flash-attention does."""
     device = torch.device("cuda", index)
     generator = torch.Generator(device=device).manual_seed(20261017)
     errors: dict[str, float] = {}
-    for head_dim, name in pairs:
-        for masked, lengths in ((False, (300, 257)), *(((True, (257, 257)),) if causal else ())):
-            q, k, v = (
-                torch.randn(1, s, 2, head_dim, generator=generator, device=device)
-                for s in (lengths[0], lengths[1], lengths[1])
-            )
-            want = torch.nn.functional.scaled_dot_product_attention(
-                *(t.transpose(1, 2).double() for t in (q, k, v)), is_causal=masked
-            ).transpose(1, 2)
-            dtype = getattr(torch, name)
-            got = call(q.to(dtype), k.to(dtype), v.to(dtype), masked)
-            case = f"d={head_dim} {name}{' causal' if masked else ''}"
-            errors[case] = verify.error(torch, got, want)
+    for head_dim, name, batch, queries, keys, causal in cases:
+        q, k, v = (
+            torch.randn(batch, s, 2, head_dim, generator=generator, device=device)
+            for s in (queries, keys, keys)
+        )
+        want = torch.nn.functional.scaled_dot_product_attention(
+            *(t.transpose(1, 2).double() for t in (q, k, v)), is_causal=causal
+        ).transpose(1, 2)
+        dtype = getattr(torch, name)
+        got = call(q.to(dtype), k.to(dtype), v.to(dtype), causal)
+        case = f"d={head_dim} {name} b={batch} {queries}x{keys}{' causal' if causal else ''}"
+        errors[case] = verify.error(torch, got, want)
     return verify.within(errors, ATTENTION_BUDGET[exact])

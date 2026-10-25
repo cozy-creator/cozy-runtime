@@ -10,7 +10,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, nullcontext, suppress
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
@@ -128,11 +128,13 @@ class PreparedRepeat:
         resident_only: bool = False,
         load: Any = None,
     ) -> PreparedRepeat:
-        """Capture a fixed body, optionally fed by one native raw LoadSlot.
+        """Capture a fixed body, optionally fed by one native LoadSlot.
 
         A load slot is initialized capture storage, not a cold-model compiler. Capture seals
-        its unpublished Fill; one later submission reads its actual stored bytes before the
-        native graph starts. Loaded submissions are one-shot and require wait/request join
+        its unpublished Fill; one later submission reads its actual stored bytes and, for an
+        encoded slot, decodes them through TensorFS before the native graph starts. A native
+        worker checks read/decode completion; this is not an event-only handoff. Loaded
+        submissions are one-shot and require wait/request join
         before output access. Pure resident repeats retain their existing reuse contract.
 
         Placed component roots are resolved to owned weight bindings. `resident_only=True`
@@ -320,6 +322,7 @@ class PreparedRepeat:
         from torch.utils._pytree import tree_leaves
 
         from cozy_runtime._kernels import _execution
+        from cozy_runtime.author._context import CURRENT
         from cozy_runtime.internal.residency import Binding
 
         tensors = tuple(state)
@@ -328,56 +331,11 @@ class PreparedRepeat:
         held: dict[int, Any] = {id(t): t for t in tensors}
         landed = LANDED[0]
 
-        # Temporary diagnostic: resolve the driver API before capture, never in a callback.
-        import ctypes
-        import json
-        import threading
-
-        driver = ctypes.CDLL("libcuda.so.1")
-        capture_status = driver.cuStreamIsCapturing
-        capture_status.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
-        capture_status.restype = ctypes.c_int
-        status_cell = ctypes.c_int()
-        status_pointer = ctypes.pointer(status_cell)
-        diagnostics: list[dict[str, Any]] = []
-
-        def status() -> tuple[int, int | None]:
-            code = capture_status(ctypes.c_void_p(stream.cuda_stream), status_pointer)
-            return code, status_cell.value if code == 0 else None
-
-        def probe(stage: str) -> None:
-            from cozy_runtime.internal import kernel_ready
-
-            free, total = torch.cuda.mem_get_info(device)
-            with kernel_ready._LOCK:
-                opening = [
-                    name for name, slot in kernel_ready._SLOTS.items() if slot.state == "opening"
-                ][:8]
-            diagnostics.append(
-                {
-                    "stage": stage,
-                    "free": free,
-                    "total": total,
-                    "allocated": torch.cuda.memory_allocated(device),
-                    "reserved": torch.cuda.memory_reserved(device),
-                    "opening": opening,
-                    "workers": [t.name for t in threading.enumerate() if "kernel-ready" in t.name][
-                        :8
-                    ],
-                }
-            )
-
-        def annotate(error: BaseException) -> None:
-            error.add_note(
-                "[DEBUG-xs103-capture] " + json.dumps(diagnostics, separators=(",", ":"))
-            )
-
         class CaptureOwners(TorchDispatchMode):  # type: ignore[misc]  # Torch is optional in checks.
             def __init__(self, retain: bool) -> None:
                 super().__init__()
                 self.retain = retain
                 self.produced: dict[int, Any] = {}
-                self.previous: str | None = None
 
             def __torch_dispatch__(
                 self, func: Any, types: Any, args: Any = (), kwargs: Any = None
@@ -396,32 +354,7 @@ class PreparedRepeat:
                         and (prior is None or prior() is not tensor)
                     ):
                         held[id(tensor)] = tensor
-                try:
-                    before = status() if self.retain else None
-                    if before is not None and before != (0, 1):
-                        raise RuntimeError(f"capture was not active before {func}: {before}")
-                    result = func(*args, **(kwargs or {}))
-                    after = status() if self.retain else None
-                    if after is not None and after != (0, 1):
-                        raise RuntimeError(f"capture was not active after {func}: {after}")
-                except BaseException as error:
-                    shapes = [
-                        (tuple(t.shape), str(t.dtype), str(t.device))
-                        for t in tree_leaves((args, kwargs or {}))
-                        if isinstance(t, torch.Tensor)
-                    ][:8]
-                    diagnostics.append(
-                        {
-                            "capture": self.retain,
-                            "operator": str(func),
-                            "previous": self.previous,
-                            "shapes": shapes,
-                            "error": str(error)[:600],
-                        }
-                    )
-                    annotate(error)
-                    raise
-                self.previous = str(func)
+                result = func(*args, **(kwargs or {}))
                 for tensor in tree_leaves(result):
                     if isinstance(tensor, torch.Tensor):
                         self.produced[id(tensor)] = weakref.ref(tensor)
@@ -438,23 +371,24 @@ class PreparedRepeat:
             graph = torch.cuda.CUDAGraph(keep_graph=True)
             native = None
             try:
-                probe("before-warmup")
                 with torch.cuda.stream(stream), CaptureOwners(False):
                     step(index)  # instantiate library workspaces before capture
                     for target, original in zip(tensors, saved, strict=True):
                         target.copy_(original)
                 stream.synchronize()
-                probe("after-warmup-before-capture")
-                try:
-                    with (
-                        varena.capture(device),
-                        CaptureOwners(True),
-                        torch.cuda.graph(graph, stream=stream, capture_error_mode="global"),
-                    ):
+                context = CURRENT.get()
+                pause = context._pause_stall_watch if context is not None else None
+                with (
+                    pause() if pause is not None else nullcontext(),
+                    varena.capture(device),
+                    torch.cuda.stream(stream),
+                    CaptureOwners(True),
+                ):
+                    graph.capture_begin(capture_error_mode="global")
+                    try:
                         step(index)
-                except BaseException as error:
-                    annotate(error)
-                    raise
+                    finally:
+                        graph.capture_end()
                 stream.synchronize()
                 for target, original in zip(tensors, saved, strict=True):
                     target.copy_(original)
@@ -665,7 +599,7 @@ class Execution:
         return facts
 
     def _failed_load(self, error: Exception) -> None:
-        """A failed read may still prove cleanup; an exception alone is never that proof."""
+        """A failed read/decode may prove cleanup; an exception alone is never that proof."""
         if self._load_job is None:
             return
         self._failure = error
