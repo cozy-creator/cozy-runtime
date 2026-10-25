@@ -1016,7 +1016,9 @@ class Placement:
         """The choice in this attempt's context, including entirely remote components."""
         return {
             name: (bakes._choice.get() or bakes._last)
-            if (bakes := self.bakes.get(name)) is not None
+            if (bakes := self.bakes.get(name)) is not None and bakes.bakes
+            else ("bake", "eager")
+            if bakes is not None
             else (self._lora_mode.get(), "eager")
             for name in components
         }
