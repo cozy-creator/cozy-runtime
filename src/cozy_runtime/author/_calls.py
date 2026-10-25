@@ -41,6 +41,7 @@ from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import WARNINGS, Model
 from cozy_runtime.author._model_defaults import model_components, model_defaults
+from cozy_runtime.author._observations import Scalar
 from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
 from cozy_runtime.author._weights import Weights
 
@@ -378,7 +379,7 @@ class _Broker:
             )
             if ignored:
                 # A field the installed callee does not declare is a warning, never a refusal.
-                row = (
+                row: tuple[str, dict[str, Scalar]] = (
                     "a package call named fields its callee does not declare; they were dropped",
                     {"callee": f"{module}:{export}", "fields": ", ".join(ignored)},
                 )
