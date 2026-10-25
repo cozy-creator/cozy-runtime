@@ -33,6 +33,7 @@ from types import MappingProxyType
 from typing import (
     Any,
     Concatenate,
+    Literal,
     ParamSpec,
     Protocol,
     Self,
@@ -290,13 +291,16 @@ class _Scope(Protocol):
     def __exit__(self, *exc: object) -> None: ...
 
 
+LoRAServing = tuple[Literal["bake", "per_step"], Literal["eager", "fused"] | None]
+
+
 class Residency(Protocol):
     """What a Runtime mechanism handed a placed component reaches, installed on a constructed
-    generation. Memory itself is varena's: it sees each forward through its own hooks.
+    generation. Runtime's local residency scopes bind weights around each forward.
 
     Declared here because the contract has one home; implemented nowhere in this package,
     because it needs a device and this package is torch-free by construction. cozy-runtime
-    supplies the body on varena's memory (`internal/weights.py`'s `Placement`).
+    supplies the body in `internal/weights.py`'s `Placement`.
     """
 
     def note(self, key: str, value: str) -> None:
@@ -304,7 +308,13 @@ class Residency(Protocol):
         ...
 
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
-        """Retain a region's virtual addresses; prepare() leases backing only during use."""
+        """Retain ordinary weight storage after prepare(), until the binding closes."""
+        ...
+
+    def represent(
+        self, component: str, dtype: Any, *, resident_only: bool = False
+    ) -> Callable[[], None]:
+        """Validate a final representation and return its pre-capture metadata transition."""
         ...
 
     def graph_accounted(self) -> bool:
@@ -315,16 +325,14 @@ class Residency(Protocol):
         """Shared capture stream and library workspace, serialized across component graphs."""
         ...
 
-    def region(self, owner: str, kind: str, sets: Any) -> Any:
-        """A long-lived intermediate's region (KV, latents, derived weights) serving `sets`."""
+    def region(
+        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None
+    ) -> Any:
+        """An explicitly owned cache, released only while it has no active user."""
         ...
 
     def graph_pool(self, component: str) -> Any:
-        """`component`'s graph region of the device's one capture pool."""
-        ...
-
-    def graph_segments(self, component: str) -> tuple[str, ...]:
-        """Declared model-block paths that bound graph regions independently of residency."""
+        """`component`'s ordinary Torch graph pool, owned with its cached recordings."""
         ...
 
     def graph_pass(self, component: str, entry: str) -> Any:
@@ -345,6 +353,14 @@ class Residency(Protocol):
 
     def graph_resident(self, binding: Any) -> bool:
         """Every page a retained region covers is on the device now."""
+        ...
+
+    def lora_choices(self, components: tuple[str, ...]) -> dict[str, LoRAServing]:
+        """The attempt's selected serving recipe, carried with each mirrored scope."""
+        ...
+
+    def mirrored_lora(self, choices: Mapping[str, LoRAServing]) -> AbstractContextManager[None]:
+        """Apply the leader's recipes in the follower's call context."""
         ...
 
     #: How many attempts (requests) it has opened.
@@ -1087,7 +1103,7 @@ def _declared_state(cls: type) -> tuple[str, ...]:
 @final
 class _ComponentScope:
     """A method's declared components, nested or on any of the call's threads (cr-202), each
-    marking its own context (`Model._cozy_active`). Varena sees each forward itself, and the
+    marking its own context (`Model._cozy_active`). Residency hooks see each forward, and the
     scope's components are held bound for its plan step (`Residency.using`, which covers a
     component with no blocks that another's forward reads, cr-207). Calls still take scopes one
     at a time (`SCOPES`): the sites they read change between turns (cr-202 U4 lifts it).

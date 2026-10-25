@@ -407,7 +407,17 @@ def _command(
         for key, (_model, root) in prepared.items()
         if key[0] in active and key[1] in active[key[0]][1]
     }
-    scopes = [wire.Scope(key, method, components) for key, (method, components) in active.items()]
+    scopes = [
+        wire.Scope(
+            key,
+            method,
+            components,
+            models[key]._cozy_residency.lora_choices(components)
+            if models[key]._cozy_residency is not None
+            else {},
+        )
+        for key, (method, components) in active.items()
+    ]
     payloads = (
         wire.Broadcast(references)
         if broadcast

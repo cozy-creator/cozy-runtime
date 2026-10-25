@@ -19,13 +19,16 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, final
+from typing import TYPE_CHECKING, Any, Literal, final, overload
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
+    from cozy_runtime.author._prepared import Execution, PreparedWork
     from cozy_runtime.author._recipes import DeclaredRecipe
     from cozy_runtime.author._weights import Weights
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
@@ -150,6 +153,10 @@ class Context:
         default=None, repr=False
     )
     _recipes: tuple[DeclaredRecipe, ...] = field(default=(), repr=False)
+    _submit_prepared: Callable[[PreparedWork], Execution] | None = field(default=None, repr=False)
+    _pause_stall_watch: Callable[[], AbstractContextManager[None]] | None = field(
+        default=None, repr=False
+    )
 
     def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
@@ -172,8 +179,8 @@ class Context:
         return self._tensorfs_output(slot, derivation)
 
     def adopt_model(self, output: Output) -> ModelArtifact:
-        """Commit `output` (a committed one replays), upload it to the run's destination when
-        it names one, and keep it as this attempt's model."""
+        """Commit `output` and keep it as this attempt's model. A committed output replays;
+        TensorD uploads it when the run names a destination."""
         self.raise_if_cancelled()
         if self._tensorfs_adopt is None:
             raise CapabilityError(
@@ -202,12 +209,31 @@ class Context:
         """THE cancellation question. A passed deadline IS cancellation, not a second flag."""
         return self._cancel() or time.monotonic() >= self.deadline
 
-    def plan(self, *steps: str | Collection[str]) -> None:
+    @overload
+    def plan(self, prepared: PreparedWork, /) -> Execution: ...
+
+    @overload
+    def plan(self, *steps: str | Collection[str]) -> None: ...
+
+    def plan(self, *steps: str | Collection[str] | PreparedWork) -> Execution | None:
         """The models this call runs, in order, so GPU memory evicts and restores by them: each
         step a component name, or a set of names used together (`{"unet", "controlnet"}`).
-        Declare it before the first model runs; calling again replaces it. No sizes or times."""
+        Declare it before the first model runs; calling again replaces it. No sizes or times.
+
+        A single PreparedWork instead submits already prepared resident GPU work and returns
+        its Execution observer. It does not reinterpret ordinary component hints as code.
+        """
+        from cozy_runtime.author._prepared import PreparedWork
+
+        if len(steps) == 1 and isinstance(steps[0], PreparedWork):
+            if self._submit_prepared is not None:
+                return self._submit_prepared(steps[0])
+            return steps[0].submit(self)
+        if any(isinstance(step, PreparedWork) for step in steps):
+            raise TypeError("prepared work must be the only ctx.plan argument")
         if self._plan is not None:
-            self._plan(steps)
+            self._plan(steps)  # type: ignore[arg-type]
+        return None
 
     def raise_if_cancelled(self) -> None:
         """THE cancellation spelling."""

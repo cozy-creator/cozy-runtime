@@ -2,9 +2,9 @@
 
 Runtime imports the package's Torch stack and constructs its models in this process.
 TensorD makes model data available, prepares shared CPU buffers through TensorFS and
-coordinates machine budgets. Runtime uses its local TensorFS plane/device APIs to allocate,
-copy, map and unmap GPU weight memory, and can attach allocations TensorD keeps through
-exported handles. TensorFS therefore runs in both processes; it is not a separate daemon.
+coordinates machine budgets. Runtime allocates ordinary Torch tensors and lends their storage
+through TensorFS's read interface. Each executor owns its allocations; TensorFS runs in both
+processes as a library.
 
 The executor lives for its (environment, lane) and holds its loaded constructions.
 TensorD supervises its disposable lifetime and owns durable execution records; source and
@@ -66,7 +66,6 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import tensorfs
 from msgspec import UNSET, UnsetType
-from tensorfs.varena import VarenaError
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -233,8 +232,8 @@ else:
 if TYPE_CHECKING:
     from types import ModuleType
 
-    from tensorfs.varena.torch import Memory
-    from tensorfs.varena.torch import Request as MemoryRequest
+    from cozy_runtime.internal.residency import Memory, QueuedPrefetch
+    from cozy_runtime.internal.residency import Request as MemoryRequest
 
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -399,10 +398,10 @@ def _replay_code(command: Invoke, request: str) -> str:
 
 
 def _show_checkpoint(
-    exchange: Exchange, slot: str, repo_id: str, revision: str, tag: str, variant: str
+    exchange: Exchange, slot: str, repo_id: str, revision: str
 ) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
-    item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision, tag=tag, variant=variant)
+    item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision)
     answer = exchange(item, Answer)
     if not answer.ok:
         raise RuntimeFailure(
@@ -635,9 +634,11 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt()
 
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+    def plan(
+        self, steps: Sequence[str | Collection[str]], request: MemoryRequest | None = None
+    ) -> None:
         for row in self.rows.values():
-            row.plan(steps)
+            row.plan(steps, request=request)
 
     def release(self) -> None:
         for row in self.rows.values():
@@ -661,12 +662,6 @@ class _CompositeResidency:
             }
             for part in ("notes", "graphs")
         }
-
-
-def _leases(command: Start) -> int | None:
-    """TensorD's lease namespace when it leases this executor's pages (memory protocol 2), else
-    None: off Linux, with no manager, or an older TensorD, varena runs each GPU standalone."""
-    return command.leases if command.memory_protocol == 2 else None
 
 
 def _construction_record(facts: Mapping[str, Any]) -> dict[str, Any]:
@@ -797,21 +792,17 @@ class Executor:
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
         #: HOST ONLY: every loaded construction and the active one. One memory decides where
-        #: all their weights live (`tensorfs.varena.torch`), and the execution layer runs
+        #: all their weights live (`internal.residency`), and the execution layer runs
         #: torch under it (`internal.execution`, imported with the device).
         self.constructions: dict[str, Executor] = {}
         self.memory: Memory | None = None
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: Why a GPU runs standalone ("" it does not): TensorD leases nothing here (its memory
-        #: protocol), or it asked and no manager answers (`Memory.standalone`)
-        self.standalone = ""
         #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
         self.cuts: dict[str, object] = {}
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
-        self.leases: int | None = None
         #: The machine's sealed TensorFS cache directory.
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -922,6 +913,8 @@ class Executor:
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
         self.prepared: dict[str, PreparedRequest] = {}
+        # A cancel may arrive on the seam reader while preflight is still running.
+        self._prepared_lock = threading.Lock()
         self.attempts = 0
 
     # ------------------------------------------------------------------ prepare
@@ -981,9 +974,10 @@ class Executor:
             "pgid": _group(),
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
-            # 2: each GPU's weight pages leased from TensorD's manager (`Start.leases`); a
-            # Start of any other runs standalone.
-            "memory_protocol": 2,
+            "memory_protocol": 0,  # all weight and activation storage is process-local
+            "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
+            # Correlated PrepareRequest replies and cancellation-safe publication.
+            "request_lookahead": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -1024,35 +1018,30 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        from cozy_runtime.internal.residency import ResidencyError
+
         try:
-            self._open_memory(torch)  # before torch's context, so varena measures its own
-        except VarenaError as exc:  # its torch allocator will not load, or TensorD refused it
-            return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
-        accel.initialize(torch, self.device_kind)
-        if self.world > 1 and self.device_kind == "cuda":
-            torch.cuda.set_device(self.rank)
+            accel.initialize(torch, self.device_kind)
+            if self.world > 1 and self.device_kind == "cuda":
+                torch.cuda.set_device(self.rank)
+            self._open_memory(torch)
+        except ResidencyError as exc:
+            return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
         place(self._device())
         return None
 
     def _open_memory(self, torch: Any) -> None:
-        """This process's memory (`tensorfs.varena.torch`), on its grant from TensorD, and the
-        execution layer that runs torch under it."""
-        from tensorfs.varena.torch import Memory
-
+        """This executor's local residency and its pure-site execution helpers."""
         from cozy_runtime.internal import execution
+        from cozy_runtime.internal.residency import Memory
 
         host = self.host
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        # TensorD's lease namespace, when it leases this GPU's weight pages. A follower that
-        # dials before rank 0's progress frame registers it is held until TensorD has.
-        leases = host.leases if device.type == "cuda" else None
-        host.memory, host.execution = Memory.open(device, leases=leases), execution
-        if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
-            host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
+        host.memory, host.execution = Memory.open(device), execution
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         _split.install(execution)
@@ -1282,6 +1271,7 @@ class Executor:
         # A spread call rank 0 waits on over the group: a header always answers it.
         answered = False
         try:
+            scoped = {scope.model: scope for scope in wire.RunCommand.read(command).scopes}
             spool = Path(command["spool"])
             held = attention.observed(
                 {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
@@ -1313,6 +1303,13 @@ class Executor:
                         # priced, so it may always make room: demand-pull when measured.
                         residency.open_attempt()
                         self._group_attempts[key] = spool
+                    if residency is not None:
+                        choices = scoped[key].lora
+                        if set(choices) != set(components):
+                            raise GroupRefusal(
+                                "mirrored LoRA choices do not cover the scope's components"
+                            )
+                        stack.enter_context(residency.mirrored_lora(choices))
                     stack.enter_context(models[key]._cozy_scope(scope["method"], components))
                     active[key] = components
                 if name[0] not in active or name[1] not in active[name[0]]:
@@ -1368,7 +1365,7 @@ class Executor:
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
             ranked = self.host._rank_request
-            working = accel.arena_peak(self.host.memory, ranked.id) if ranked is not None else 0
+            working = accel.allocator_peak(self.host.memory, ranked.id) if ranked is not None else 0
         except Exception as exc:
             ending = mirror.ending(exc)
             # where it was raised, innermost first: a GPU's own traceback stays on that GPU
@@ -1596,16 +1593,6 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        # An older TensorD's GPU ledgers follow its Start (a memfd and an eventfd each): unused
-        # here, they close. Skew degrades: whatever leases nothing runs standalone.
-        for fd in self.channel.recv_fds(2 * command.ledgers):
-            os.close(fd)
-        self.leases = _leases(command)
-        if command.devices and self.leases is None and not self.standalone:
-            self.standalone = (
-                f"TensorD's memory protocol {command.memory_protocol} leases nothing here: "
-                "each GPU runs standalone"
-            )
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:
@@ -1914,7 +1901,7 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
-            **({"memory_standalone": self.standalone} if self.standalone else {}),
+            "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
         }
 
     def _model_classes(self) -> list[type[Model[Any]]]:
@@ -3121,7 +3108,11 @@ class Executor:
         """A request cancelled before its invoke (waiting for admission): what its prepare
         retained goes, so the executor returns to the pool holding nothing of it."""
         for construction in (self, *self.constructions.values()):
-            construction.prepared.pop(request_id, None)
+            with construction._prepared_lock:
+                construction.prepared.pop(request_id, None)
+        if self.host.memory is not None:
+            # Never hold the prepared-record lock while touching a native read owner.
+            self.host.memory.cancel_queued(request_id)
 
     def serve_request(self, command: PrepareRequest) -> dict[str, Any]:
         target = self._target(command, attempt=False)
@@ -3143,7 +3134,8 @@ class Executor:
                 self.in_flight.ready()
             if refused is not None:
                 return refused
-            prepared = target.prepared.pop(command.request_id, None)
+            with target._prepared_lock:
+                prepared = target.prepared.pop(command.request_id, None)
             if prepared is None:  # trimmed by a prepare meanwhile
                 return target._unadmitted(command) or {}
             reply = target.invoke(command, prepared, slot)
@@ -3180,6 +3172,15 @@ class Executor:
         executor exactly as it found it — it is a PRE-ENTRY refusal in the strongest sense,
         arriving before the attempt is even accepted.
         """
+        canceled = {
+            "ok": False,
+            "code": "cancelled",
+            "terminal": "canceled",
+            "origin": "request",
+            "detail": "request preparation was canceled before entry",
+        }
+        if self.host.mux.cancelled(command.request_id):
+            return canceled
         if not self.ready:
             return {
                 "ok": False,
@@ -3232,11 +3233,25 @@ class Executor:
                 "origin": outcome.origin,
                 "fields": list(outcome.fields),
             }
-        self.prepared[command.request_id] = replace(prepared, stages=waits.stages)
-        # A prepared request the worker never dispatched (a refusal after the plan, a
-        # cancel while it queued) would otherwise be retained for the generation's life.
-        for stale in list(self.prepared)[: -PREPARED_HELD or None]:
-            self.prepared.pop(stale, None)
+        with self._prepared_lock:
+            # Mux records the cancel before calling _discard under this same lock. A
+            # cancel before this check refuses publication; one after it removes the row.
+            if self.host.mux.cancelled(command.request_id):
+                return canceled
+            if not self.ready or self.poisoned:
+                return {
+                    "ok": False,
+                    "code": "poisoned_generation" if self.poisoned else "executor_not_ready",
+                    "detail": self.poisoned or "executor stopped during request preparation",
+                }
+            self.prepared[command.request_id] = replace(
+                prepared,
+                stages=waits.stages,
+                prefetch_key=(command.attention_kernel, command.bits),
+            )
+            # A prepared request never dispatched must not survive for the generation.
+            for stale in list(self.prepared)[: -PREPARED_HELD or None]:
+                self.prepared.pop(stale, None)
         return {
             "ok": True,
             "features": dict(prepared.features.values),
@@ -3261,7 +3276,9 @@ class Executor:
                 "code": "unknown_entrypoint",
                 "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        if command.request_id not in self.prepared:
+        with self._prepared_lock:
+            missing = command.request_id not in self.prepared
+        if missing:
             return {
                 "ok": False,
                 "code": "prepared_request_absent",
@@ -3379,8 +3396,6 @@ class Executor:
                 code=_replay_code(command, prepared.overlay.digest),
                 bounds=command.weights,
                 show=functools.partial(_show_checkpoint, exchange),
-                destination=command.destination,
-                connection=connection,
             )
             if command.weights
             else None
@@ -3394,7 +3409,7 @@ class Executor:
             with (
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
-                self._request(command.request_id) as own_memory,
+                self._request(command.request_id, prepared) as own_memory,
                 self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
@@ -3406,6 +3421,8 @@ class Executor:
                 attention_ulysses.observing() as served_impls,
             ):
                 served_attention = self._attention_selection(served_attention)
+                if prepared.phases:
+                    self._plan_request(command.request_id, prepared.phases)
                 envelope, outcome, record = run_prepared(
                     prepared,
                     Invocation(
@@ -3556,10 +3573,11 @@ class Executor:
             self.residency.release()  # the last step's holds
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
-        # On CUDA the request's own arena high-water (varena's); MPS keeps no mark: its figures now.
-        arena = own_memory[0].torch_peak if own_memory else 0
+        # Stock Torch's peak is absolute and process-wide. Overlapping attempts share it;
+        # never add the request-start allocation again or present it as exclusive ownership.
+        arena = (own_memory[0].torch_peak or 0) if own_memory else 0
         live = accel.allocated(torch, self.device_kind, own) if torch is not None else 0
-        peak_vram = allocated_at_start + arena if self.device_kind == "cuda" else live
+        peak_vram = max(arena, live) if self.device_kind == "cuda" else live
         peak_reserved = accel.reserved(torch, self.device_kind, own) if torch is not None else 0
         residency_document = self.residency.document() if self.residency else {}
         working_peak = max(peak_vram - allocated_at_start, 0)
@@ -4153,7 +4171,7 @@ class Executor:
         if request is not None:
             request.plan(list(steps))
         if self.residency is not None:  # a step's components keep their holds (`using`)
-            self.residency.plan(steps)
+            self.residency.plan(steps, request=request)
         if self.group is not None and self.rank == 0:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
@@ -4489,11 +4507,61 @@ class Executor:
         placed = self._rank_device(self.torch)
         return Device(placed.type, placed.index)
 
+    def _queued_prefetch(
+        self, current: str, active: PreparedRequest
+    ) -> QueuedPrefetch | None:
+        """Snapshot one exact same-construction preparation; no device work under its lock."""
+        from cozy_runtime.internal.residency import QueuedPrefetch
+
+        if self.world != 1 or self.host.in_flight.count != 1 or self.residency is None:
+            return None
+        placements = (
+            tuple(self.residency.rows.values())
+            if isinstance(self.residency, _CompositeResidency)
+            else (self.residency,)
+        )
+        if len(placements) != 1:
+            return None  # Component names must identify one actual model slot.
+        with self._prepared_lock:
+            pending = [
+                (request_id, prepared)
+                for request_id, prepared in self.prepared.items()
+                if request_id != current and not self.host.mux.cancelled(request_id)
+            ]
+            if len(pending) != 1:
+                return None
+            request_id, prepared = pending[0]
+            if (
+                not prepared.phases
+                or prepared.lora != active.lora
+                or prepared.prefetch_key != active.prefetch_key
+            ):
+                return None
+            models = placements[0].models
+            names = prepared.phases[0]
+            if any(name not in models for name in names):
+                return None
+            targets = tuple(models[name] for name in names)
+
+        def valid() -> bool:
+            with self._prepared_lock:
+                return (
+                    self.prepared.get(request_id) is prepared
+                    and not self.host.mux.cancelled(request_id)
+                    and not self.host.mux.cancelled(current)
+                    and self.host.in_flight.count == 1
+                    and self.ready
+                    and not self.poisoned
+                )
+
+        return QueuedPrefetch(request_id, targets, valid)
+
     @contextlib.contextmanager
-    def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:
-        """The attempt as varena's request (varena-slim §3), its ops under the execution
-        layer's catch and its plan `ctx.plan`'s: everything it allocated is freed at its end,
-        failed or not, and its record (this GPU's) lands in the list."""
+    def _request(
+        self, request_id: str, prepared: PreparedRequest | None = None
+    ) -> Iterator[list[GpuMemory]]:
+        """The request's residency scopes and pure cuts. Tensor ownership determines lifetime;
+        its recorded allocator figures are process-wide, not exact per-request allocations."""
         host, rows = self.host, list[GpuMemory]()
         if host.memory is None or host.execution is None:
             yield rows
@@ -4501,15 +4569,17 @@ class Executor:
         request: MemoryRequest | None = None
         cuda = host.memory.cuda
         device = host.memory.device.index if cuda else None
-        peak = 0
+        peak: int | None = None
         try:
             with host.memory.request(request_id) as request, host.execution.serving(request):
                 host.requests[request_id] = request
+                if prepared is not None:
+                    request.queued = functools.partial(self._queued_prefetch, request_id, prepared)
                 try:
                     yield rows
                 finally:
                     del host.requests[request_id]
-                    peak = accel.arena_peak(host.memory, request_id)  # read while it is open
+                    peak = accel.allocator_peak(host.memory, request_id)  # read while open
                     host.cuts[request_id] = msgspec.to_builtins(host.execution.cut_rows(request))
         finally:
             if request is not None:
@@ -4536,10 +4606,22 @@ class Executor:
             if group is not None:
                 group.broadcast(executor_commands.encode(command))
             if self.memory is not None:
+                if command.level == "ram":
+                    # Map is ordered after every preceding invocation. Join its remaining
+                    # consumer streams before retiring owners and returning allocator storage.
+                    accel.synchronize(self.torch, self.device_kind)
                 for member in child.model_executors or [child]:
                     if member.backend is not None:
+                        if command.level == "ram" and member.residency is not None:
+                            member.residency.release()
                         for model in member.backend.models.values():
+                            if command.level == "ram":
+                                for _, release in graphs.DECODERS:
+                                    release(model.module)
+                                graphs.retire(self.torch, model.module)
                             self.memory.load(model.module, command.level)
+                if command.level == "ram":
+                    self.memory.trim()
             for reply in group.collect("map") if group is not None else ():
                 if not reply.get("ok"):
                     raise GroupRefusal(
@@ -4555,7 +4637,8 @@ class Executor:
         child = self.constructions.get(self.active)
         if child is None or child.residency is None:
             return {}
-        return child.residency.document()
+        document: dict[str, Any] = child.residency.document()
+        return document
 
     def process_incarnations(self) -> list[dict[str, Any]]:
         """The actual rank births, including a follower that vanished before this probe."""
