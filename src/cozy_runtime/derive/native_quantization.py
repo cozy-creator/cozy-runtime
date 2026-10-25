@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from concurrent.futures import CancelledError, Future, TimeoutError
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -107,7 +108,15 @@ class _Work:
         if context is not None:
             context.raise_if_cancelled()
         control = tensorfs.ConversionControl()
-        return _Execution(_pool().submit(self.convert, control), control, context)
+        future = _pool().submit(self.convert, control)
+        try:
+            return _Execution(future, control, context)
+        except BaseException:
+            control.cancel()
+            future.cancel()
+            with suppress(Exception):
+                future.result()  # A signal cannot orphan native work owning the Output.
+            raise
 
 
 def quantize(
