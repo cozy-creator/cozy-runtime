@@ -417,9 +417,24 @@ class Model:
                 return None
             groups = self.groups()
             missing = sum(b.allocation_bytes for b in groups if b.data is None and not b.cached())
+            if self.memory.device.type == "mps" and missing:
+                missing += min(
+                    max(
+                        (
+                            part.nbytes
+                            for b in groups
+                            if b.data is None
+                            for p in b.parts.values()
+                            for part in p.values()
+                        ),
+                        default=0,
+                    ),
+                    _HOST_STAGING,
+                )
             if free_only and missing > self.memory.room().free:
-                if self.memory.cuda:
-                    torch.cuda.empty_cache()
+                from cozy_runtime.internal.accel import release_cached
+
+                release_cached(torch, self.memory.device.type)
                 if missing > self.memory.room().free:
                     return None
             entered: list[_Block] = []
@@ -1124,7 +1139,13 @@ class Memory:
                 self.reclaim(need)
         try:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        except torch.OutOfMemoryError:
+        except RuntimeError as error:
+            # MPS reports allocator refusal as RuntimeError. Classify only this failed
+            # allocation; reads, transforms and model execution are outside the retry.
+            if not isinstance(error, torch.OutOfMemoryError) and not (
+                self.device.type == "mps" and fault(error) is Fault.OOM
+            ):
+                raise
             if not reclaim or self.capturing() or not self.reclaim():
                 raise
             # Only the failed allocation is retried. No read, fill transform or forward ran.
