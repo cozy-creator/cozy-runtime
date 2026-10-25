@@ -914,6 +914,8 @@ class Executor:
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
         self.prepared: dict[str, PreparedRequest] = {}
+        # A cancel may arrive on the seam reader while preflight is still running.
+        self._prepared_lock = threading.Lock()
         self.attempts = 0
 
     # ------------------------------------------------------------------ prepare
@@ -971,6 +973,8 @@ class Executor:
             "pgid": _group(),
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
+            # Correlated PrepareRequest replies and cancellation-safe publication.
+            "request_lookahead": True,
             # 2: each GPU's weight pages leased from TensorD's manager (`Start.leases`); a
             # Start of any other runs standalone.
             "memory_protocol": 2,
@@ -3075,7 +3079,8 @@ class Executor:
         """A request cancelled before its invoke (waiting for admission): what its prepare
         retained goes, so the executor returns to the pool holding nothing of it."""
         for construction in (self, *self.constructions.values()):
-            construction.prepared.pop(request_id, None)
+            with construction._prepared_lock:
+                construction.prepared.pop(request_id, None)
 
     def serve_request(self, command: PrepareRequest) -> dict[str, Any]:
         target = self._target(command, attempt=False)
@@ -3097,7 +3102,8 @@ class Executor:
                 self.in_flight.ready()
             if refused is not None:
                 return refused
-            prepared = target.prepared.pop(command.request_id, None)
+            with target._prepared_lock:
+                prepared = target.prepared.pop(command.request_id, None)
             if prepared is None:  # trimmed by a prepare meanwhile
                 return target._unadmitted(command) or {}
             reply = target.invoke(command, prepared, slot)
@@ -3134,6 +3140,15 @@ class Executor:
         executor exactly as it found it — it is a PRE-ENTRY refusal in the strongest sense,
         arriving before the attempt is even accepted.
         """
+        canceled = {
+            "ok": False,
+            "code": "cancelled",
+            "terminal": "canceled",
+            "origin": "request",
+            "detail": "request preparation was canceled before entry",
+        }
+        if self.host.mux.cancelled(command.request_id):
+            return canceled
         if not self.ready:
             return {
                 "ok": False,
@@ -3186,11 +3201,21 @@ class Executor:
                 "origin": outcome.origin,
                 "fields": list(outcome.fields),
             }
-        self.prepared[command.request_id] = replace(prepared, stages=waits.stages)
-        # A prepared request the worker never dispatched (a refusal after the plan, a
-        # cancel while it queued) would otherwise be retained for the generation's life.
-        for stale in list(self.prepared)[: -PREPARED_HELD or None]:
-            self.prepared.pop(stale, None)
+        with self._prepared_lock:
+            # Mux records the cancel before calling _discard under this same lock. A
+            # cancel before this check refuses publication; one after it removes the row.
+            if self.host.mux.cancelled(command.request_id):
+                return canceled
+            if not self.ready or self.poisoned:
+                return {
+                    "ok": False,
+                    "code": "poisoned_generation" if self.poisoned else "executor_not_ready",
+                    "detail": self.poisoned or "executor stopped during request preparation",
+                }
+            self.prepared[command.request_id] = replace(prepared, stages=waits.stages)
+            # A prepared request never dispatched must not survive for the generation.
+            for stale in list(self.prepared)[: -PREPARED_HELD or None]:
+                self.prepared.pop(stale, None)
         return {
             "ok": True,
             "features": dict(prepared.features.values),
@@ -3215,7 +3240,9 @@ class Executor:
                 "code": "unknown_entrypoint",
                 "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        if command.request_id not in self.prepared:
+        with self._prepared_lock:
+            missing = command.request_id not in self.prepared
+        if missing:
             return {
                 "ok": False,
                 "code": "prepared_request_absent",
