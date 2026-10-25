@@ -3,9 +3,8 @@
 A checkpoint opens by its header ref (`sha256:<hex>`) from the shared store (the executor's
 `TENSORFS_HOME`). A derived checkpoint is written with TensorFS's `Writer` straight into the
 store, only its new chunks written. Its replay key names the work (who asked, what code and
-request, which output, from what): a finished derivation is the `local/derived` release of
-that key, so the same work in any process replays it, and an interrupted one resumes its
-keyed writer.
+request, which output, from what): each replay key has one local repository, so the same work
+in any process reopens its latest commit and an interrupted one resumes its keyed writer.
 """
 
 from __future__ import annotations
@@ -15,12 +14,11 @@ import hashlib
 import io
 import mmap
 import os
-import tempfile
 import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, TYPE_CHECKING
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -29,12 +27,13 @@ from tensorfs import raw
 
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
+from cozy_runtime.author._errors import CapabilityError
+
+if TYPE_CHECKING:
+    from tensorfs.api import QuantizeTensor
 
 #: The store's location when the machine names none (TensorFS's default, owner D3).
 DEFAULT_HOME = "~/.cache/tensorfs"
-#: The local repo of finished derivations, one release per replay key.
-DERIVED = "local/derived"
 #: A fresh output component's class: unknown (an empty library), as TensorFS spells it.
 UNKNOWN_CLASS = ("", "", "")
 
@@ -115,35 +114,6 @@ def open_checkpoint(store: Path, ref: str, connection: Connection | None = None)
     return tensorfs.open(ref, cache_dir=store, endpoint=options.endpoint, token=options.token)
 
 
-def upload(
-    store: Path, ck: Checkpoint, repo_id: str, tag: str, connection: Connection | None = None
-) -> str:
-    """Commit `ck` to `repo_id`, move its private `tag` there and return the commit (its tree
-    id). A failed upload leaves the committed local checkpoint available."""
-    options = connection or Connection()
-    try:
-        with _thin(store, ck) as folder:
-            return tensorfs.upload_folder(
-                repo_id=repo_id, folder_path=folder, revision=tag, cache_dir=store,
-                endpoint=options.endpoint, token=options.token,
-            )  # fmt: skip
-    except tensorfs.Error as exc:
-        raise RuntimeFailure(f"uploading to {repo_id}: {exc}"[:900], code="upload_failed") from exc
-
-
-@contextlib.contextmanager
-def _thin(store: Path, ck: Checkpoint) -> Iterator[Path]:
-    """`ck`'s tree as a folder for `upload_folder`: its header and repo files only. The chunks
-    stay in the store, which the upload reads them from."""
-    assert ck.tree is not None
-    with tempfile.TemporaryDirectory(prefix="tensorfs-upload-") as directory:
-        yield Path(
-            tensorfs.materialize(
-                ck.tree, components=[], local_dir=directory, cache_dir=store, local_files_only=True
-            )
-        )
-
-
 def read_into(
     ck: Checkpoint, component: str, key: str, role: str, offset: int, into: Buffer
 ) -> None:
@@ -207,19 +177,17 @@ def replay_key(actor: str, code: str, slot: str, work: Mapping[str, object]) -> 
     return "sha256:" + hashlib.sha256(f"{actor}\0{code}\0{slot}\0{body}".encode()).hexdigest()
 
 
-def variant(slot: str) -> str:
-    """Output `slot`'s variant path: a variant is its exact path (TensorFS 0.13.9)."""
-    return f"model.{slot}.cozytensors"
+def repository(transaction: str) -> str:
+    """One immutable derivation's local commit history, keyed by its existing replay identity."""
+    return "local/derived-" + transaction.removeprefix("sha256:")
 
 
 def finished(store: Path, transaction: str, slot: str) -> Checkpoint | None:
-    """Output `slot`'s variant that a finished derivation of `transaction` committed, if `store`
-    has one."""
+    """The finished commit for this replay key and output lane, if the store has one."""
     try:
         return tensorfs.open(
-            DERIVED,
-            revision=tag(transaction),
-            variant=variant(slot),
+            repository(transaction),
+            lane=slot,
             cache_dir=store,
             local_files_only=True,
         )
@@ -227,13 +195,8 @@ def finished(store: Path, transaction: str, slot: str) -> Checkpoint | None:
         return None
 
 
-def tag(transaction: str) -> str:
-    """The private tag an output's commits move, named by its replay key: never digest-shaped."""
-    return "replay-" + transaction.removeprefix("sha256:")
-
-
 class Output:
-    """One derived checkpoint, output `slot` and the variant of that name (a quantizer's `int8`
+    """One derived checkpoint, output `slot` and the lane of that name (a quantizer's `int8`
     output is the `int8` lane), written into `store` under its replay key `transaction`. A
     finished one replays (`done`): every tensor is there and `commit` answers it. An interrupted
     one resumes: what an earlier attempt wrote `has`. At most `max_new_bytes` are written."""
@@ -259,9 +222,8 @@ class Output:
             if self.done is not None
             else tensorfs.Writer(
                 base=derivation.base,
-                repo_id=DERIVED,
-                revision=tag(transaction),
-                variant=variant(slot),
+                repo_id=repository(transaction),
+                lane=slot,
                 resume=transaction.removeprefix("sha256:"),
                 cache_dir=store,
             )
@@ -369,6 +331,57 @@ class Output:
                 key, dtype=dtype, shape=list(shape), scheme=scheme, parts=views, params=dict(params)
             )
 
+    def prepare_quantization(
+        self,
+        source: Checkpoint,
+        tensors: Sequence[QuantizeTensor],
+        *,
+        max_relative_frobenius: float | None,
+    ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
+        """Reserve this output's grant once, then return one owning native Writer call.
+
+        The derivation supplies the full immutable native selection; only missing entries
+        consume this attempt's logical new-byte grant. The caller must join before close.
+        """
+        if self.done is not None:
+            return lambda _: {
+                "encoded_keys": 0,
+                "reused_keys": len(tensors),
+                "source_bytes_read": 0,
+                "new_bytes_written": 0,
+                "saturated_elements": 0,
+                "worst_relative_frobenius": None,
+            }, 0
+        writer = self._writer
+        if writer is None:
+            raise CapabilityError("the output is closed", code="weights_writer_closed")
+        pending = [row for row in tensors if not self.has(row["component"], row["key"])]
+        required = 0
+        for row in pending:
+            rows, columns = row["shape"]
+            match row["encoding"]["scheme"]:
+                case "int8.convrot":
+                    required += rows * columns + rows * 4
+                case "nvfp4":
+                    required += rows * columns // 2 + rows * columns // 16 + 4
+                case _:
+                    raise CapabilityError("unsupported native quantizer", code="quantization_plan")
+        self._spend(required)
+        for component in dict.fromkeys(row["component"] for row in tensors):
+            self.component(component)
+
+        def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
+            return writer.quantize(
+                source,
+                tensors,
+                max_buffer_bytes=8 << 20,
+                max_new_bytes=required,
+                control=control,
+                max_relative_frobenius=max_relative_frobenius,
+            )
+
+        return convert, len(pending)
+
     def copy(
         self,
         component: str,
@@ -386,7 +399,7 @@ class Output:
         )
 
     def commit(self) -> Checkpoint:
-        """The finished checkpoint, kept as `local/derived` at its replay key: once committed,
+        """The finished checkpoint, kept in its replay key's local repository: once committed,
         every later commit of the same work answers this one."""
         if self.done is None:
             if self._writer is None:
@@ -396,9 +409,7 @@ class Output:
                 keys.setdefault(component, []).append(key)
             for component, ordered in keys.items():
                 self.component(component).order(ordered)
-            self._writer.commit()
-            self.done = finished(self.store, self.transaction, self.slot)
-            assert self.done is not None
+            self.done = self._writer.commit()
             self.close()
         return self.done
 
@@ -413,7 +424,7 @@ class Output:
 
 class Outputs:
     """One attempt's weights outputs in `store`. Each opens under its replay key; adopting one
-    commits it and shows it to the run (`show(slot, repo_id, commit, tag, variant)`)."""
+    commits it and shows it to the run (`show(slot, repo_id, commit)`). TensorD owns uploads."""
 
     def __init__(
         self,
@@ -423,16 +434,10 @@ class Outputs:
         actor: str,
         code: str,
         bounds: Mapping[str, int],
-        show: Callable[[str, str, str, str, str], None],
-        destination: str = "",
-        connection: Connection | None = None,
+        show: Callable[[str, str, str], None],
     ) -> None:
         self.store, self.request_id, self.actor, self.code = store, request_id, actor, code
         self.bounds, self.show = dict(bounds), show
-        #: `org/name@tag`: the repo the output uploads to and the tag it moves there (its own
-        #: replay tag when the destination names none)
-        self.destination, _, self.destination_tag = destination.partition("@")
-        self.connection = connection
 
     def open(self, slot: str, derivation: Derivation) -> Output:
         bound = self.bounds.get(slot)
@@ -442,13 +447,9 @@ class Outputs:
         return Output(self.store, slot, key, derivation, bound)
 
     def adopt(self, output: Output) -> ModelArtifact:
-        ck, moved = output.commit(), tag(output.transaction)
+        ck = output.commit()
         assert ck.tree is not None
-        self.show(output.slot, DERIVED, ck.tree, moved, ck.variant or "")
-        if self.destination:
-            named = self.destination_tag or moved
-            commit = upload(self.store, ck, self.destination, named, self.connection)
-            self.show(output.slot, self.destination, commit, named, ck.variant or "")
+        self.show(output.slot, repository(output.transaction), ck.tree)
         return ModelArtifact(self.request_id, output.slot, ck.id, output.transaction)
 
 

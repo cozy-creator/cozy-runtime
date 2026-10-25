@@ -24,7 +24,7 @@ from cozy_runtime.author import (
 )
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
-from . import svdq
+from . import native_quantization, svdq
 from .quantization import (
     _ENCODINGS,
     ArtifactQuantizationPlan,
@@ -229,20 +229,39 @@ def _quantize(
             request = ArtifactQuantizationRequest(
                 max_relative_frobenius=plan.max_relative_frobenius
             )
-            for component in artifact.components:
-                stats = quantize_component_into(
-                    opened, out, ctx, request, tel, encoding=plan.encoding, plan=artifact,
-                    component=component, logical_dtype=logical, calibration=calibration,
-                )  # fmt: skip
+            if calibration is None and native_quantization.supported(
+                opened, artifact, plan.encoding
+            ):
+                stats = native_quantization.quantize(
+                    opened,
+                    out,
+                    artifact,
+                    plan.encoding,
+                    logical,
+                    ctx=ctx,
+                    tel=tel,
+                    max_relative_frobenius=plan.max_relative_frobenius,
+                )
                 read += stats.source_bytes_read
                 written += stats.new_bytes_written
                 saturated += stats.saturated_elements
                 reused += stats.reused_keys
-                worst = (
-                    max(worst, stats.worst_relative_frobenius)
-                    if worst is not None and stats.worst_relative_frobenius is not None
-                    else None
-                )
+                worst = stats.worst_relative_frobenius
+            else:
+                for component in artifact.components:
+                    stats = quantize_component_into(
+                        opened, out, ctx, request, tel, encoding=plan.encoding, plan=artifact,
+                        component=component, logical_dtype=logical, calibration=calibration,
+                    )  # fmt: skip
+                    read += stats.source_bytes_read
+                    written += stats.new_bytes_written
+                    saturated += stats.saturated_elements
+                    reused += stats.reused_keys
+                    worst = (
+                        max(worst, stats.worst_relative_frobenius)
+                        if worst is not None and stats.worst_relative_frobenius is not None
+                        else None
+                    )
         result_artifact = ctx.adopt_model(out)
         transaction = out.transaction
     return QuantizeResult(
