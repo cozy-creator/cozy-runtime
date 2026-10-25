@@ -100,7 +100,7 @@ def provenance(
     return {
         "native_quantization": {
             "source": source.id,
-            "calibration": None if calibration is None else calibration.id,
+            **({"calibration": calibration.id} if calibration is not None else {}),
             "selection": rows,
             "implementation": tensorfs.raw.quantization_implementation(),
         }
