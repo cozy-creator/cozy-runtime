@@ -10,8 +10,11 @@ the first sight of a length (a model's intake statement, or the first dense step
 compile, and conditioning and the dense steps cover it. A sparse step never waits for it: while
 the object builds, the step runs the dense reference (`dense_building`), and the object serves
 from the step boundary after it is ready (`kernel_ready`); the run's kernel rows say from which
-step. Upstream's preprocess autotuning is pinned to one configuration, because its candidates
-differ bitwise and a timing race must not choose the output.
+step. Upstream's preprocess kernels, which take the length and head count as constants, build
+the same way per (length, heads) (`preprocess`, a `triton_kernels.warm_job`); the step runs the
+dense reference until they are built, and for good when their build failed. Their autotuning is
+pinned to one configuration, because its candidates differ bitwise and a timing race must not
+choose the output.
 """
 
 from __future__ import annotations
@@ -60,15 +63,6 @@ _DENSE: Callable[..., Tensor] | None = None
 _DENSE_IDENTITY = ""
 #: The BF16 kernel the model's exact paths take when the dense one quantizes; else `_DENSE`.
 _EXACT: Callable[..., Tensor] | None = None
-NAMES = frozenset(
-    {
-        "sol-attn",
-        "sol-attn-sage2-fixed-kmean",
-        "kitchen-sol",
-        "kitchen-sol-fp4-lowmem",
-        "kitchen-sol-fp4-fixed-means",
-    }
-)
 _COUNTS: ContextVar[dict[str, int] | None] = ContextVar("cozy_sol_counts", default=None)
 _RANK_COUNTS: ContextVar[dict[int, dict[str, int]] | None] = ContextVar(
     "cozy_sol_rank_counts", default=None
@@ -162,15 +156,8 @@ def rebind(held: Binding) -> None:
     _DENSE, _DENSE_IDENTITY, _EXACT = held
 
 
-def dense_identity(kernel: str = "sol-attn") -> str:
-    if kernel == "kitchen-sol-fp4-fixed-means":
-        return "sageattention3-fp4-fixed-means; sparse-prefix=kitchen-int8"
-    if kernel == "sol-attn-sage2-fixed-kmean":
-        return "sageattention-fixed-kmean"
-    if kernel == "kitchen-sol-fp4-lowmem":
-        return "sageattention3-fp4-global-lowmem; sparse-prefix=kitchen-int8"
-    if kernel == "kitchen-sol":
-        return "kitchen-int8"
+def dense_identity() -> str:
+    """The dense reference bound for a sparse kernel whose site's walk supplies one."""
     return _DENSE_IDENTITY
 
 
@@ -599,39 +586,62 @@ def _open(
     return None if data is None else load(data)
 
 
-def _preprocessed(tokens: int, query: Tensor) -> bool:
-    """Whether upstream's preprocess kernels are built for this length and head count here
-    (`_warm`, off the request): they take both as constants. A warm that failed lets the step
-    build them itself, as upstream does."""
+def _preprocessed(tokens: int, query: Tensor) -> str:
+    """Whether upstream's preprocess kernels for this length and head count serve here: "" once
+    they do, else what a sparse step serves instead (`dense_building` while they build,
+    `dense_step` when their build failed)."""
     heads, index = query.shape[2], query.device.index or 0
     name = f"{KERNEL} preprocess {tokens}x{heads} cuda:{index}"
-    opener = functools.partial(_warm, index, tokens, heads)
-    return kernel_ready.ready(name, opener) is not None or kernel_ready.failed(name) is not None
+    if kernel_ready.ready(name, functools.partial(_warm, index, tokens, heads)) is not None:
+        return ""
+    return "dense_step" if kernel_ready.failed(name) is not None else "dense_building"
 
 
-def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool:
-    """`_preprocessed`'s opener: upstream's exact-threshold preprocess (`preprocess.prepare`) built
-    for `tokens` and `heads` on GPU `index`, launching nothing. Its operands are small ones in
-    the live ones' class: what compiles is the descriptors' block shapes, the constants and the
-    lengths' residues, never the sizes."""
+def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool | None:
+    """`_preprocessed`'s opener: `preprocess` built by the machine's compile manager for this
+    card, then loaded here (its build waited for when `wait`, else None while it runs)."""
+    store = kernel_cache.configured()
+    if store is None:
+        raise kernel_compile.CompileFailed("absent", "no machine kernel store to compile into")
+    major, minor = _arch(index)
+    found = import_module("cozy_runtime.internal.triton_kernels").warm_job(
+        f"{KERNEL}-preprocess",
+        f"{__name__}:preprocess",
+        [tokens, heads],
+        major * 10 + minor,
+        {"library": sol_library()},
+    )
+    state = (kernel_compile.wait if wait else kernel_compile.submit)(store, found)
+    if state.state in ("compiling", "pending"):
+        return None
+    if state.state != "ready":
+        raise kernel_compile.CompileFailed(state.state, state.line())
+    with import_module("torch").cuda.device(index):
+        preprocess(tokens, heads)
+    return True
+
+
+def preprocess(tokens: int, heads: int) -> None:
+    """Upstream's exact-threshold preprocess (`preprocess.prepare`) for `tokens` and `heads` on
+    the current card, launching nothing: in the compile manager's builder it compiles (`_warm`),
+    in an executor it loads what that built. Its operands are host stand-ins in the live ones'
+    class: what compiles is the descriptors' block shapes, the constants and the lengths'
+    residues, never the sizes."""
     torch = import_module("torch")
     upstream = import_module("sol_attn.preprocess")
     descriptor = import_module("triton.tools.tensor_descriptor").TensorDescriptor
     _pin_preprocess()
     blocks, bf16, f32 = -(-tokens // _BLOCK), torch.bfloat16, torch.float32
-    with torch.cuda.device(index):
-        rows = torch.empty(1, _BLOCK + tokens % 16, heads, 128, dtype=bf16, device="cuda")
-        tiles = descriptor.from_tensor(rows, [1, _BLOCK, 1, 128])
-        shape = (tokens, heads, blocks, 128, _BLOCK, 128)
-        upstream._reduce_kc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
-        upstream._reduce_vc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
-        upstream._pool_query_kernel.warmup(tiles, bf16, *shape, grid=(1,), num_warps=4,
-                                           num_stages=1)  # fmt: skip
-        upstream._exact_fused_threshold_kernel.warmup(
-            bf16, f32, bf16, f32, _SCALE, heads, blocks, 128, 64, 128, 1.0,
-            grid=(1,), num_warps=4, num_stages=1,
-        )  # fmt: skip
-    return True
+    rows = torch.empty(1, _BLOCK + tokens % 16, heads, 128, dtype=bf16)
+    tiles = descriptor.from_tensor(rows, [1, _BLOCK, 1, 128])
+    shape = (tokens, heads, blocks, 128, _BLOCK, 128)
+    upstream._reduce_kc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
+    upstream._reduce_vc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
+    upstream._pool_query_kernel.warmup(tiles, bf16, *shape, grid=(1,), num_warps=4, num_stages=1)
+    upstream._exact_fused_threshold_kernel.warmup(
+        bf16, f32, bf16, f32, _SCALE, heads, blocks, 128, 64, 128, 1.0,
+        grid=(1,), num_warps=4, num_stages=1,
+    )  # fmt: skip
 
 
 def _pin_preprocess() -> None:
@@ -718,7 +728,9 @@ def _attention(
     dense: Callable[..., Tensor] = _dense,
     prefix_dense: Callable[..., Tensor] | None = None,
 ) -> Tensor:
-    """Shared input and model-policy boundary for the opt-in sparse implementations."""
+    """Shared input and model-policy boundary for the opt-in sparse implementations. What a
+    sparse kernel admits (one BF16 document, head dimension 128, equal Q/K/V, no mask or
+    causality) is its row's (`attention.Candidate`), asserted before this runs."""
     import torch
 
     if torch.compiler.is_compiling():
@@ -728,19 +740,13 @@ def _attention(
         raise ValueError(
             "Sol requires model-owned attention layout and a registered attention site"
         )
-    if attn_mask is not None or is_causal or dropout_p != 0 or enable_gqa:
-        raise ValueError("Sol supports unmasked noncausal inference without dropout or GQA")
+    if dropout_p != 0:
+        raise ValueError("Sol is an inference kernel and does not support dropout")
     tensors = (query, key, value)
-    if any(not isinstance(t, torch.Tensor) or t.ndim != 4 for t in tensors):
-        raise ValueError("Sol requires batch/sequence/head/dimension tensors")
-    if query.shape != key.shape or query.shape != value.shape:
-        raise ValueError("Sol requires equal Q/K/V geometry")
-    if query.shape[0] != 1 or query.shape[-1] != 128 or not query.shape[2]:
-        raise ValueError("Sol requires one document with head dimension 128")
-    if any(
-        t.dtype != torch.bfloat16 or t.device != query.device or t.requires_grad for t in tensors
+    if query.shape != value.shape or any(
+        t.device != query.device or t.requires_grad for t in tensors
     ):
-        raise ValueError("Sol requires BF16 inference inputs on one device")
+        raise ValueError("Sol requires inference inputs of one geometry on one device")
     if sparse is None and _card(query.device) is None:
         raise ValueError(f"Sol has no route on {query.device}")
     if scale is not None and not math.isfinite(scale):
@@ -812,10 +818,10 @@ def _execute(
     if not dense_path and sparse is None:
         # The first sight of this length starts its kernels opening off the request (a CuTe
         # route's object, upstream's preprocess), and the dense steps run while they build.
-        built = card is None or _preprocessed(layout.live_tokens, query)
+        unbuilt = "" if card is None else _preprocessed(layout.live_tokens, query)
         ready, waiting = (FA4, "") if fa4 else _ready(layout.live_tokens, query.device, layout.step)
-        if ready is not None and not built:
-            ready, waiting = None, "dense_building"
+        if ready is not None and unbuilt:
+            ready, waiting = None, unbuilt
         if layout.step >= layout.dense_until_step:
             loaded, instead = ready, waiting
     if dense_path or layout.step < layout.dense_until_step or (sparse is None and loaded is None):

@@ -10,7 +10,7 @@ dependencies, and the executor imports torch only after its environment seal.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Collection
+from collections.abc import Callable
 from importlib import import_module
 from typing import TYPE_CHECKING, Protocol, Unpack
 
@@ -42,18 +42,11 @@ def bind_fa3(module: FlashAttn3, variant: str) -> None:
     _FA3, _FA3_VARIANT = module, variant
 
 
-def _options(
-    name: str,
-    attn_mask: Tensor | None,
-    dropout_p: float,
-    scale: float | None,
-    *,
-    masks: bool = False,
-) -> None:
+def _options(name: str, dropout_p: float, scale: float | None) -> None:
+    """What every inference kernel refuses; what each one admits is its row's
+    (`attention.Candidate`), asserted on every call before its forward."""
     if dropout_p != 0.0:
         raise ValueError(f"{name} is an inference kernel and does not support dropout")
-    if attn_mask is not None and not masks:
-        raise ValueError(f"{name} does not support an attention mask")
     if scale is not None and not math.isfinite(scale):
         raise ValueError("attention scale must be finite")
 
@@ -196,7 +189,7 @@ def fa3(
     enable_gqa: bool = False,
 ) -> Tensor:
     """FlashAttention-3 BF16/FP16 forward, one KV split, as Diffusers' FA3 entry calls it."""
-    _options("flash-attn3", attn_mask, dropout_p, scale)
+    _options("flash-attn3", dropout_p, scale)
     _heads(query, key, enable_gqa)
     return _first(
         _fa3().flash_attn_func(
@@ -219,7 +212,7 @@ def fa3_fp8(
     """FA3's e4m3 forward from the same snapshot: per-(batch, head) amax quantisation per
     call, the descales handed to the kernel, BF16/FP16 output from the kernel itself. Every
     scale reduces within one head, so it is head-local under Ulysses."""
-    _options("flash-attn3-fp8", attn_mask, dropout_p, scale)
+    _options("flash-attn3-fp8", dropout_p, scale)
     q8, k8, v8, descales = _e4m3(query, key, value)
     return _first(
         _fa3().flash_attn_func(
@@ -232,9 +225,7 @@ def _e4m3(
     query: Tensor, key: Tensor, value: Tensor
 ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
     """Per-(batch, head) e4m3 Q/K/V and the `*_descale` keywords FA3 and FA4 take. Their
-    descales are per KV head, so a grouped query (one scale per Q head) is refused."""
-    if query.shape[2] != key.shape[2]:
-        raise ValueError("FP8 FlashAttention needs equal Q/KV head counts")
+    descales are per KV head, so their rows admit no grouped query."""
     (q8, q), (k8, k), (v8, v) = (attention_fp8.quantise(t) for t in (query, key, value))
     return q8, k8, v8, {"q_descale": q, "k_descale": k, "v_descale": v}
 
@@ -252,7 +243,7 @@ def fa4(
 ) -> Tensor:
     """FlashAttention-4's CuTe-DSL forward (`flash_attn.cute`); it compiles for the card on
     first use, which preparation's probe absorbs."""
-    _options("flash-attn4", attn_mask, dropout_p, scale)
+    _options("flash-attn4", dropout_p, scale)
     _heads(query, key, enable_gqa)
     cute = import_module("flash_attn.cute")
     return _first(cute.flash_attn_func(query, key, value, softmax_scale=scale, causal=is_causal))
@@ -294,13 +285,7 @@ def fa4_fp8(
     channel outlier spreads over the head before its per-head scale is taken: on H3's real
     Q/K/V (B200, h3-b200-attention) 0.029 -> 0.026 rel L2 at block 25 and 0.26-0.41 -> 0.09-0.10
     at block 49, for 1-2 ms of a 205 ms call."""
-    import torch
-
-    _options("flash-attn4-fp8", attn_mask, dropout_p, scale)
-    if query.dtype != torch.bfloat16:
-        raise ValueError("flash-attn4-fp8 returns BF16 and requires BF16 inputs")
-    if query.shape[-1] & (query.shape[-1] - 1):
-        raise ValueError("flash-attn4-fp8 rotates Q/K by a Hadamard: head dimension 2^n")
+    _options("flash-attn4-fp8", dropout_p, scale)
     q8, k8, v8, descales = _e4m3(_hadamard(query), _hadamard(key), value)
     interface = import_module("flash_attn.cute.interface")
     return _first(
@@ -339,7 +324,7 @@ def _sage(modes: dict[str, tuple[str, str, str]]) -> Local:
         scale: float | None = None,
         enable_gqa: bool = False,
     ) -> Tensor:
-        _options("sageattention", attn_mask, dropout_p, scale)
+        _options("sageattention", dropout_p, scale)
         _heads(query, key, enable_gqa)
         entry, granularity, accumulation = mode(query)
         return getattr(import_module("sageattention"), entry)(
@@ -371,16 +356,7 @@ def _sage_row(row: arch.Row) -> str:
     return ""
 
 
-def _cuda_inputs(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    enable_gqa: bool,
-    *,
-    name: str,
-    dims: Collection[int] = range(1, 257),
-    bf16: bool = False,
-) -> None:
+def _cuda_inputs(query: Tensor, key: Tensor, value: Tensor, enable_gqa: bool) -> None:
     import torch
 
     if any(not isinstance(x, torch.Tensor) for x in (query, key, value)):
@@ -391,8 +367,6 @@ def _cuda_inputs(
         raise ValueError("attention Q/K/V must be BF16 or FP16")
     if key.dtype != query.dtype or value.dtype != query.dtype:
         raise ValueError("attention Q/K/V must have identical input dtypes")
-    if bf16 and query.dtype != torch.bfloat16:
-        raise ValueError(f"{name} preserves BF16 Q/K and requires BF16 inputs")
     batch, _sequence, heads, dim = query.shape
     if min(query.shape) <= 0 or min(key.shape) <= 0 or min(value.shape) <= 0:
         raise ValueError("attention tensor dimensions must be positive")
@@ -404,8 +378,6 @@ def _cuda_inputs(
     ):
         raise ValueError("attention needs matching K/V and compatible batch/head dimensions")
     _heads(query, key, enable_gqa)
-    if dim not in dims:
-        raise ValueError(f"{name} does not serve head dimension {dim}")
     if query.device.type != "cuda" or key.device != query.device or value.device != query.device:
         raise ValueError("attention Q/K/V must be on the same CUDA device")
     if getattr(torch.version, "hip", None):
@@ -427,10 +399,8 @@ def kitchen_int8(
 ) -> Tensor:
     """Comfy Kitchen INT8 Q/K/V with unsigned INT8 P and FP32 softmax; masks preserved.
     Rotation, key shift and scales are per batch/head, so it is head-local under Ulysses."""
-    if is_causal:
-        raise ValueError("kitchen-int8 serves noncausal attention only")
-    _options("kitchen-int8", attn_mask, dropout_p, scale, masks=True)
-    _cuda_inputs(query, key, value, enable_gqa, name="kitchen-int8")
+    _options("kitchen-int8", dropout_p, scale)
+    _cuda_inputs(query, key, value, enable_gqa)
     kitchen = import_module("comfy_kitchen")
     tensors = [x if x.stride(-1) == 1 else x.contiguous() for x in (query, key, value)]
     output = kitchen.int8_attention(
@@ -455,18 +425,8 @@ def flashinfer_mixed(
     descale multiplies that head's output (attention is linear in V): head-local, and no host
     synchronisation. The kernel is compiled from the installed source (CuTe JIT) and handed
     in, so the library never fetches its prebuilt artifacts at first use."""
-    if is_causal:
-        raise ValueError("flashinfer-bf16-fp8 serves noncausal attention only")
-    _options("flashinfer-bf16-fp8", attn_mask, dropout_p, scale)
-    _cuda_inputs(
-        query,
-        key,
-        value,
-        enable_gqa,
-        name="flashinfer-bf16-fp8",
-        dims=(128,),
-        bf16=True,
-    )
+    _options("flashinfer-bf16-fp8", dropout_p, scale)
+    _cuda_inputs(query, key, value, enable_gqa)
     import torch
 
     batch, q_length, q_heads, dim = query.shape
@@ -557,20 +517,8 @@ def sage3_fp4_fixed_means(
     enable_gqa: bool = False,
 ) -> Tensor:
     """Opt-in fixed means/centering, preserving Sage3's BF16 matmul correction."""
-    _options("sageattention3-fp4-fixed-means", attn_mask, dropout_p, scale)
-    _cuda_inputs(
-        query,
-        key,
-        value,
-        enable_gqa,
-        name="sageattention3-fp4-fixed-means",
-        dims=(128,),
-        bf16=True,
-    )
-    if is_causal or enable_gqa or query.shape != key.shape:
-        raise ValueError("fixed Sage3 means require noncausal equal Q/K/V geometry")
-    if scale is not None and not math.isclose(scale, 128**-0.5, rel_tol=1e-6):
-        raise ValueError("fixed Sage3 means require the head128 softmax scale")
+    _options("sageattention3-fp4-fixed-means", dropout_p, scale)
+    _cuda_inputs(query, key, value, enable_gqa)
     result = import_module("cozy_runtime.internal.attention_sage3_fixed").forward(query, key, value)
     return _output(result, query)
 
@@ -616,12 +564,8 @@ def _sage3_fp4(
 ) -> Tensor:
     import torch
 
-    _options("sageattention3-fp4", attn_mask, dropout_p, scale)
-    _cuda_inputs(query, key, value, enable_gqa, name="sageattention3-fp4", dims=(64, 128))
-    if query.shape[2] != key.shape[2]:
-        raise ValueError("sageattention3-fp4 needs equal Q/KV head counts")
-    if scale is not None and not math.isclose(scale, query.shape[-1] ** -0.5, rel_tol=1e-6):
-        raise ValueError("sageattention3-fp4 fixes the softmax scale at D^-1/2")
+    _options("sageattention3-fp4", dropout_p, scale)
+    _cuda_inputs(query, key, value, enable_gqa)
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
     if release_intermediates:
         if per_block_mean:

@@ -1,7 +1,9 @@
-"""Head-local Kitchen Sol recipes under the model's dense/sparse policy."""
+"""Head-local Kitchen Sol recipes under the model's dense/sparse policy: Kitchen's sparse rows,
+and its row's declared dense kernels for the dense ones (`attention.Candidate.dense`)."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from importlib import import_module
 from typing import TYPE_CHECKING, Unpack
 
@@ -10,10 +12,8 @@ if TYPE_CHECKING:
 
     from torch import Tensor
 
-from cozy_runtime.internal import attention_sol, attention_ulysses, attention_upstream
-from cozy_runtime.internal.attention_ulysses import Local, Options
-
-NAMES = frozenset({"kitchen-sol", "kitchen-sol-fp4-lowmem", "kitchen-sol-fp4-fixed-means"})
+from cozy_runtime.internal import attention_sol
+from cozy_runtime.internal.attention_ulysses import Local
 
 
 def sparse(
@@ -31,91 +31,35 @@ def sparse(
     )
 
 
-def dense_kitchen(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
-    return attention_ulysses._call(
-        "_cozy_kitchen_int8",
-        attention_upstream.KITCHEN,
-        query,
-        key,
-        value,
-        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
-    )
-
-
-def dense_fp4_lowmem(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
-    return attention_ulysses._call(
-        "_cozy_sage3_fp4_global_lowmem",
-        attention_upstream.SAGE3_GLOBAL_LOWMEM,
-        query,
-        key,
-        value,
-        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
-    )
-
-
-def dense_fp4_fixed_means(
-    *, query: Tensor, key: Tensor, value: Tensor, scale: float | None
-) -> Tensor:
-    return attention_ulysses._call(
-        "_cozy_sage3_fp4_fixed_means",
-        attention_upstream.SAGE3_FIXED_MEANS,
-        query,
-        key,
-        value,
-        Options(attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False),
-    )
-
-
-def forward(query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]) -> Tensor:
-    return attention_sol._attention(
-        query,
-        key,
-        value,
-        **options,
-        sparse=sparse,
-        dense=dense_kitchen,
-    )
-
-
-def forward_fp4_lowmem(
-    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
+def forward(
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    *,
+    dense: Callable[..., Tensor],
+    prefix_dense: Callable[..., Tensor],
+    **options: Unpack[PartialOptions],
 ) -> Tensor:
     return attention_sol._attention(
-        query,
-        key,
-        value,
-        **options,
-        sparse=sparse,
-        dense=dense_fp4_lowmem,
-        prefix_dense=dense_kitchen,
+        query, key, value, **options, sparse=sparse, dense=dense, prefix_dense=prefix_dense
     )
 
 
-def forward_fp4_fixed_means(
-    query: Tensor, key: Tensor, value: Tensor, **options: Unpack[PartialOptions]
-) -> Tensor:
-    return attention_sol._attention(
-        query,
-        key,
-        value,
-        **options,
-        sparse=sparse,
-        dense=dense_fp4_fixed_means,
-        prefix_dense=dense_kitchen,
-    )
+def _named(implementation: str) -> Callable[..., str]:
+    return lambda *_: implementation
 
 
-KITCHEN_SOL = Local(forward, lambda *_: "comfy_kitchen.sol_attn(int8, tau=1, current-call stats)")
+KITCHEN_SOL = Local(forward, _named("comfy_kitchen.sol_attn(int8, tau=1, current-call stats)"))
 KITCHEN_SOL_FP4_LOWMEM = Local(
-    forward_fp4_lowmem,
-    lambda *_: (
+    forward,
+    _named(
         "dense=sageattn3.nvfp4_global_head_mean(short_owned_lifetimes); "
         "sparse=comfy_kitchen.sol_attn(int8)"
     ),
 )
 KITCHEN_SOL_FP4_FIXED_MEANS = Local(
-    forward_fp4_fixed_means,
-    lambda *_: (
+    forward,
+    _named(
         "dense=sageattn3.nvfp4_fixed_means(upstream_bf16_correction); "
         "sparse=comfy_kitchen.sol_attn(int8)"
     ),
