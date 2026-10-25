@@ -20,7 +20,8 @@ from typing import Annotated
 
 import msgspec
 
-from cozy_runtime.author import App, AssetBound, Invocation, Outputs, Tree, attempt
+from cozy_runtime.author import App, AssetBound, Outputs, Tree
+from cozy_runtime.author.fakes import invoke_with_fakes
 
 
 class Request(msgspec.Struct):
@@ -71,15 +72,13 @@ def verify(directory: Path) -> dict[str, object]:
         tree, sizes = recorder.retain_trace_file(raw, out.save_tree)
         return Result(tree)
 
-    result, outcome, _ = attempt(
+    result, outcome, _ = invoke_with_fakes(
         app.get("retain"),
         {},
-        Invocation(
-            "large-trace-storage",
-            directory / "spool",
-            time.monotonic() + 900,
-            max_output_bytes=2 << 30,
-        ),
+        request_id="large-trace-storage",
+        spool=directory / "spool",
+        seconds=900,
+        max_output_bytes=2 << 30,
     )
     assert outcome.terminal == "succeeded", outcome
     assert result is not None

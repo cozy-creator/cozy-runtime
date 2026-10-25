@@ -11,12 +11,10 @@ handle hydrated through the real `bind`, so one attempt's result feeds the next 
 the executor feeds it. `file_input()` does the same for a file on disk, and
 `granted_input()` is the verified grant `invoke_with_fakes(assets=...)` takes for one.
 
-`Settings` and `Secrets` need no fake wrapper: they carry exactly the validated value, so
-`Settings(MyConfig(...))` IS the fake — a wrapper adding nothing is a surface to maintain.
-
-`invoke_with_fakes()` runs a registered handler through the REAL kernel with fakes standing
-in for the runtime's side of the contract: same decode, same overlay, same preflight, same
-injection, same return validation, same output transaction.
+`invoke_with_fakes()` builds an `Invocation` and runs a registered handler through the one
+production driver, `prepare` then `run_prepared`: same decode, same overlay, same preflight,
+same injection, same return validation, same output transaction, same terminal outcome. It
+supplies only what the executor supplies, so a handler that passes here is not refused there.
 
 `StagedBackend`/`ResidentBackend` are the weightless fill doubles a `Model` constructs
 against with no store and no device.
@@ -34,16 +32,15 @@ from typing import Any
 
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._assets import Asset, GrantedInput, bind, file_state
-from cozy_runtime.author._context import AdapterRef, Context, Device
+from cozy_runtime.author._context import Context, Device
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
-from cozy_runtime.author._defaults import Clamp, DefaultSet
-from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._errors import CapabilityError, Outcome
 from cozy_runtime.author._invoke import (
     Invocation,
     InvocationResult,
-    invoke,
     prepare,
     prepare_duration,
+    run_prepared,
 )
 from cozy_runtime.author._loader import Census, TensorLike, TensorSpec
 from cozy_runtime.author._markers import Preparation
@@ -266,47 +263,24 @@ def invoke_with_fakes(
     request_id: str = "fake-attempt",
     spool: Path | None = None,
     models: Mapping[str, Model[Any]] | None = None,
-    settings: object = None,
-    secrets: object = None,
-    default_sets: Sequence[DefaultSet] = (),
-    clamps: Sequence[Clamp] = (),
-    adapters: tuple[AdapterRef, ...] = (),
     seconds: float = 300.0,
     cancelled: bool = False,
-    egress_broker: Callable[..., Any] | None = None,
     assets: Mapping[str, GrantedInput] | None = None,
     max_output_bytes: int = MAX_OUTPUT_BYTES,
-) -> InvocationResult:
-    """Run a handler through the REAL kernel with no GPU, no hub and no RecordOwner."""
-    spool = spool or _spool(request_id)
-    spool.mkdir(parents=True, exist_ok=True)
-    return invoke(
-        prepare(
-            registration,
-            wire,
-            default_sets=default_sets,
-            clamps=clamps,
-            settings=settings,
-            input_metadata=assets or {},
-        ),
-        Invocation(
-            request_id=request_id,
-            spool=spool,
-            deadline=time.monotonic() + seconds,
-            cancel=lambda: cancelled,
-            models=models or {},
-            default_sets=default_sets,
-            clamps=clamps,
-            settings=settings,
-            secrets=secrets,
-            adapters=adapters,
-            egress_broker=egress_broker,
-            assets=assets or {},
-            max_output_bytes=max_output_bytes,
-        ),
-        # No worker stands behind a fake, so every registered frame is encoded at the save.
-        Attempt(request_id, spool, max_output_bytes, settle_at_save=True),
+) -> tuple[InvocationResult | None, Outcome, Attempt]:
+    """Run a handler as the executor does, with no GPU, no hub and no worker. A request
+    `prepare` refuses raises; the attempt's own failure is its outcome."""
+    inv = Invocation(
+        request_id=request_id,
+        spool=spool or _spool(request_id),
+        deadline=time.monotonic() + seconds,
+        cancel=lambda: cancelled,
+        models=models or {},
+        assets=assets or {},
+        max_output_bytes=max_output_bytes,
+        settle_at_save=True,
     )
+    return run_prepared(prepare(registration, wire, input_metadata=inv.assets), inv)
 
 
 # --------------------------------------------------------------------------- fill
