@@ -8,6 +8,11 @@ continuation; the host submits one graph for any number of steps.
 
 The public entry point is `from cozy_runtime.compute import PreparedRepeat`.
 The first supported operation is `PreparedRepeat.capture(step, state=..., steps=..., owners=...)`.
+Optional `prefix=` and `suffix=` callbacks record one-time tensor work before and after the loop.
+All phases retain their graph and storage owners; the suffix runs only if the loop completed and
+cancellation had not won at its GPU entry boundary. A suffix already admitted is joined to completion.
+This resident composition keeps its combined weight dependencies pinned; it does not stream weights
+between phases or make graphs survive physical eviction.
 `ctx.plan(prepared)` submits it and returns an `Execution`; existing string/component plans remain
 hints. The callback receives a CUDA int64 index tensor and changes declared state in place. Its
 timestep, guidance and noise tables are ordinary immutable GPU tensors captured by the callback.
@@ -99,10 +104,19 @@ Each definition can be submitted repeatedly after its prior execution finishes. 
 tokens reject stale cancel/wait/close operations. Every execution owns distinct output buffers;
 readout completes before a later execution can overwrite state. The GPU index and
 control state reset before each graph launch. State tensors remain in place: callers may restore
-or replace their contents between runs, but must not resize, change storage, mutate immutable
+or replace their contents and input values between runs. `valid()` checks whether owners, layouts,
+fill identities and kernel implementations still match; submission checks again. Unexpected errors
+propagate from that query. During execution, callers must not resize tensors, change storage, mutate
 inputs or access outputs until completion. Concurrent submissions are refused. Close cancels and
 joins before destruction. Device-completion failure retains owners until process death. Forked
 processes cannot use inherited native handles.
+
+Real RTX4070 Laptop8GiB runs17944–17955 passed the twelve resident-phase gates on Runtime8c057,
+Creator/TensorFS51a: phase parity, changed-input reuse, checked stored loading, zero-launch source
+failure, phase-copy refusals and rollback, cancellation and alias release. Reuse17948 submitted the
+same definition twice within one invocation; production cross-request caching remains separate.
+Final-iteration cancel17954 skipped its suffix; tail17955 joined an already-admitted suffix.
+These results do not qualify the later public `valid()` query or a full production model program.
 
 Concurrent result observers and definition retirement share one readout/claim-release boundary.
 Close sends cancellation before waiting for the observer lock, so a blocking result waiter cannot
