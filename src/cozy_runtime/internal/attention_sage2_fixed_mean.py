@@ -1,5 +1,5 @@
 """Fixed token reduction for Sage K means (Sage2's K, Sage3's Q and K): one compile per card,
-whatever the length, so `warm` builds every variant off the request (`kernel_ready`)."""
+whatever the length (`ENTRIES`), on the machine's compile manager (`triton_kernels`)."""
 
 from __future__ import annotations
 
@@ -11,15 +11,15 @@ if TYPE_CHECKING:
 import triton
 import triton.language as tl
 
+from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+
 TOKEN_TILE, CHANNEL_TILE = 256, 32
-#: The largest power-of-two tile count `warm` builds `finish_mean` for: 2048 x 256 tokens.
+#: The largest power-of-two tile count `finish_mean` is built for: 2048 x 256 tokens.
 REDUCE_MAX = 2048
+DIM = 128
 
 
-@triton.jit(  # type: ignore[untyped-decorator]
-    do_not_specialize=["stride_t", "stride_h", "tokens", "tiles"],
-    do_not_specialize_on_alignment=["stride_t", "stride_h"],
-)
+@triton.jit  # type: ignore[untyped-decorator]
 def partial_mean(  # type: ignore[no-untyped-def]
     X,
     P,
@@ -44,7 +44,7 @@ def partial_mean(  # type: ignore[no-untyped-def]
     tl.store(P + (head * tiles + tile) * D + channel, sums, mask=channel < D)
 
 
-@triton.jit(do_not_specialize=["tiles"])  # type: ignore[untyped-decorator]
+@triton.jit  # type: ignore[untyped-decorator]
 def finish_mean(  # type: ignore[no-untyped-def]
     P,
     M,
@@ -67,7 +67,43 @@ def finish_mean(  # type: ignore[no-untyped-def]
     tl.store(M + head * D + channel, mean.to(tl.bfloat16), mask=channel < D)
 
 
-def fixed_mean(x: Tensor, denominator: int) -> Tensor:
+#: Every specialization `fixed_mean` launches: one `partial_mean`, `finish_mean` per
+#: power-of-two tile count. Sizes, strides and the divisor are runtime values and the input may
+#: be any view (only the outputs are assumed aligned); nothing is fused, so each product and sum
+#: rounds as written.
+ENTRIES = (
+    TritonEntry(
+        partial_mean,
+        {"X": "*bf16", "P": "*fp32", "stride_t": "i32", "stride_h": "i32", "tokens": "i32",
+         "tiles": "i32", "D": "constexpr", "BT": "constexpr", "BC": "constexpr"},
+        {"D": DIM, "BT": TOKEN_TILE, "BC": CHANNEL_TILE},
+        ("P",),
+        num_warps=8,
+        fp_fusion=False,
+    ),
+    *(
+        TritonEntry(
+            finish_mean,
+            {"P": "*fp32", "M": "*bf16", "tiles": "i32", "inverse": "fp32", "D": "constexpr",
+             "REDUCE": "constexpr", "BC": "constexpr"},
+            {"D": DIM, "REDUCE": 1 << shift, "BC": CHANNEL_TILE},
+            ("P", "M"),
+            num_warps=8,
+            fp_fusion=False,
+        )
+        for shift in range(REDUCE_MAX.bit_length())
+    ),
+)  # fmt: skip
+KERNELS = TritonKernels("cozy-sage2-fixed-kmean", ENTRIES)
+#: Device index -> its loaded launcher (`serve`).
+_LAUNCH: dict[int, Launch] = {}
+
+
+def serve(index: int, launch: Launch) -> None:
+    _LAUNCH[index] = launch
+
+
+def fixed_mean(launch: Launch, x: Tensor, denominator: int) -> Tensor:
     """BF16 [heads, D] sums of B1/NHD `x` over its tokens, in fixed tiles, over `denominator`.
     `1 / denominator` is f32 as a constant fold rounds it."""
     import torch
@@ -77,44 +113,19 @@ def fixed_mean(x: Tensor, denominator: int) -> Tensor:
     partial = torch.empty((heads, tiles, dim), device=x.device, dtype=torch.float32)
     result = torch.empty((heads, dim), device=x.device, dtype=torch.bfloat16)
     channels = triton.cdiv(dim, CHANNEL_TILE)
-    partial_mean[(heads, channels, tiles)](
+    launch(
+        partial_mean, (heads, channels, tiles),
         x, partial, x.stride(1), x.stride(2), tokens, tiles, dim, TOKEN_TILE, CHANNEL_TILE,
-        num_warps=8, enable_fp_fusion=False,
     )  # fmt: skip
-    finish_mean[(heads, channels)](
+    launch(
+        finish_mean, (heads, channels, 1),
         partial, result, tiles, 1.0 / denominator, dim, triton.next_power_of_2(tiles),
-        CHANNEL_TILE, num_warps=8, enable_fp_fusion=False,
+        CHANNEL_TILE,
     )  # fmt: skip
     return result
 
 
-def warm(index: int, dim: int = 128) -> None:
-    """Build both kernels on GPU `index` for every length up to `REDUCE_MAX` tiles, launching
-    nothing."""
-    import torch
-
-    with torch.cuda.device(index):
-        partial_mean.warmup(
-            torch.bfloat16, torch.float32, 1, 1, 1, 1, dim, TOKEN_TILE, CHANNEL_TILE,
-            grid=(1,), num_warps=8, enable_fp_fusion=False,
-        )  # fmt: skip
-        reduce = 1
-        while reduce <= REDUCE_MAX:
-            finish_mean.warmup(
-                torch.float32, torch.bfloat16, 1, 1.0, dim, reduce, CHANNEL_TILE,
-                grid=(1,), num_warps=8, enable_fp_fusion=False,
-            )  # fmt: skip
-            reduce *= 2
-
-
 def mean(k: Tensor) -> Tensor:
-    import torch
-
-    if k.ndim != 4 or k.shape[0] != 1 or k.shape[-1] != 128:
-        raise ValueError("Fixed K mean requires B1/NHD/D128")
-    if k.dtype != torch.bfloat16 or k.device.type != "cuda" or k.stride(-1) != 1:
-        raise ValueError("Fixed K mean requires CUDA BF16 K with contiguous channels")
+    """Sage2's fixed K mean, on the launcher its kernel opened (`serve`)."""
     _, tokens, heads, dim = k.shape
-    if min(tokens, heads) <= 0:
-        raise ValueError("Nonempty K required")
-    return fixed_mean(k, tokens).view(1, 1, heads, dim)
+    return fixed_mean(_LAUNCH[k.device.index or 0], k, tokens).view(1, 1, heads, dim)

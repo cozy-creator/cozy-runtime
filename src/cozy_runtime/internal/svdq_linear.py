@@ -11,21 +11,22 @@ Two Triton kernels, built when the executor starts (`KERNELS`):
 - `_quantize` reads `x` once: it writes the nvfp4 operand and the down-projection `x · downᵀ`;
 - `_gemm` multiplies on the FP4 tensor cores (`tl.dot_scaled`); its epilogue adds the
   up-projection, both second levels, `c` and the bias.
-Until the build lands, and off Blackwell, `eager` serves the same law with torch ops.
+They serve once they load and pass `probe` on a card whose row has FP4 tensor cores (`arch`,
+`kernel_ready.serve`); until then, and elsewhere, `eager` serves the same law with torch ops.
 
 `torch` is the torch module: this module imports no torch.
 """
 
 from __future__ import annotations
 
-import time
-from collections.abc import Callable, Mapping
+import math
+from collections.abc import Mapping
+from functools import partial
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-from cozy_runtime.author._model import Building
-from cozy_runtime.author.kernels import KernelsUnavailable, Launch, TritonEntry, TritonKernels
-from cozy_runtime.internal import int8_linear
+from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.internal import arch, int8_linear, kernel_ready, verify
 from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, Tensor
 
 if TYPE_CHECKING:
@@ -45,6 +46,9 @@ TILE_M, TILE_N, TILE_K, GROUP_M, GEMM_WARPS, GEMM_STAGES = 128, 128, 256, 8, 8, 
 K_ALIGN = TILE_K
 #: What a run's `gemm.selected` names.
 TRITON, EAGER = "cozy-svdq-nvfp4", "torch-eager"
+#: The probe's budget for the down-projection and the output, against the law's exact products:
+#: their bf16 or fp16 rounding.
+BUDGET = 5e-3
 
 try:
     import triton
@@ -242,14 +246,6 @@ def _entries() -> list[TritonEntry]:
 
 #: Built on every executor's GPUs when it starts (`author.kernels`): a request never compiles.
 KERNELS = TritonKernels("cozy-svdq-nvfp4", _entries())
-#: How often a call asks whether the start's build has landed: resolution, never a verdict.
-POLL_SECONDS = 1.0
-_LAUNCH: dict[int, tuple[float, Launch | None]] = {}
-#: `triton_kernels.ready`, bound by `triton_kernels` itself when it is imported (past the
-#: executor's device boundary): this module imports neither Triton's runtime nor torch.
-READY: list[Callable[..., Launch | None]] = []
-#: Whether each GPU has FP4 tensor cores (Blackwell): only there do the kernels serve.
-_FP4: dict[int, bool] = {}
 #: E2M1's values per device, made outside any graph capture (a host copy would end one).
 _TABLES: dict[object, Tensor] = {}
 
@@ -288,47 +284,37 @@ def merged(
     return {"lowrank_down": both, "lowrank_up": wide}
 
 
-def _launcher(torch: ModuleType, device: Device) -> Launch | None:
-    """This GPU's launcher once the start's build has landed and agrees with the law here
-    (`verify`), else None (asked again after `POLL_SECONDS`): the caller then runs `eager`."""
+def _launcher(torch: ModuleType, device: Device, capturing: bool) -> Launch | None:
+    """This GPU's launcher once the start's build loads and passes `probe` here, on a card whose
+    row has FP4 tensor cores (`kernel_ready.serve`); else None: the caller then runs `eager`."""
     index = device.index or 0
-    if index not in _FP4:
-        _FP4[index] = int(torch.cuda.get_device_capability(index)[0]) >= 10
-    if not _FP4[index] or TRITON_ABSENT:
+    if TRITON_ABSENT or not kernel_ready.TRITON:
         return None
-    asked, launch = _LAUNCH.get(index, (float("-inf"), None))
-    now = time.monotonic()
-    if launch is None and now - asked >= POLL_SECONDS:
-        try:
-            launch = READY[0](KERNELS, device=device) if READY else None
-            if launch is not None:
-                verify(torch, device, launch)
-        except KernelsUnavailable as exc:  # absent, failed or corrupt for good: the run says so
-            int8_linear.failed(TRITON, index, exc)
-            _FP4[index] = False
-            launch = None
-        except Exception as exc:  # broken kernels never serve: the law does, and the run says so
-            int8_linear.failed(TRITON, index, exc)
-            _FP4[index] = False
-            launch = None
-        _LAUNCH[index] = (now, launch)
-    return launch
+    if not arch.row(int8_linear.capability(torch, index)).fp4:
+        return None
+    opener = partial(_opened, torch, device)
+    return kernel_ready.serve(f"{KERNELS.name} cuda:{index}", opener, capturing)
 
 
-def verify(torch: ModuleType, device: Device, launch: Launch) -> None:
+def _opened(torch: ModuleType, device: Device, wait: bool) -> Launch | None:
+    try:
+        return kernel_ready.TRITON[0](KERNELS, partial(probe, torch, device), wait, device=device)
+    except Exception as exc:  # it never serves here: the law does, and the run says so
+        int8_linear.failed(TRITON, device.index or 0, exc)
+        raise
+
+
+def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
     """Both kernels against the law on ragged rows and columns, each dtype and built rank, with
     and without `c` and the bias: the operand and its scales bit for bit; the down-projection and
-    the output against the law's exact (f64) products, within their bf16 or fp16 rounding. Raises
-    on a miss."""
+    the output against the law's exact (f64) products, within their bf16 or fp16 rounding."""
     generator = torch.Generator(device=device).manual_seed(0)
     rows, n, k = 200, 144, 256
 
     def draw(*shape: int) -> Tensor:
         return torch.randn(*shape, generator=generator, device=device)
 
-    def far(got: Tensor, want: Tensor) -> float:
-        return float((got.double() - want).norm() / want.norm())
-
+    errors: dict[str, float] = {}
     for r in RANKS:
         roles = {
             "weight": torch.randint(0, 256, (n, k // 2), generator=generator, device=device).to(
@@ -347,16 +333,15 @@ def verify(torch: ModuleType, device: Device, launch: Launch) -> None:
                 roles = {**roles, "channel_scale": draw(n).abs() + 0.5}
             else:
                 roles = {role: t for role, t in roles.items() if role != "channel_scale"}
+            case = f"rank {r} {'bf16' if extras else 'fp16'}"
             q, sx, low, g = _quantized(torch, launch, x, roles)
             codes, scales = quantize(torch, _smoothed(torch, x, roles), g)
-            if not (
-                torch.equal(q, codes[:, 0::2] | (codes[:, 1::2] << 4))
-                and torch.equal(sx.view(torch.uint8), scales.view(torch.uint8))
-            ):
-                raise RuntimeError(f"the svdq quantize kernel is not the law (rank {r}, {half})")
+            exact = torch.equal(q, codes[:, 0::2] | (codes[:, 1::2] << 4)) and torch.equal(
+                sx.view(torch.uint8), scales.view(torch.uint8)
+            )
+            errors[f"{case} quantize (bitwise)"] = 0.0 if exact else math.inf
             down = x.double() @ roles["lowrank_down"].to(half).double().t()
-            if not far(low, down) < 5e-3:
-                raise RuntimeError(f"the svdq down-projection is {far(low, down):.3g} off ({half})")
+            errors[f"{case} down-projection"] = verify.error(torch, low, down)
             packed = roles["weight"]
             nibbles = torch.stack((packed & 0x0F, packed >> 4), dim=-1).view(n, k)
             weight = _values(torch, nibbles, roles["scale"], roles["scale_2"]).double()
@@ -367,13 +352,13 @@ def verify(torch: ModuleType, device: Device, launch: Launch) -> None:
             if bias is not None:
                 want = want + bias.double()
             got = _multiplied(torch, launch, q, sx, low, g, roles, bias, half)
-            if not far(got, want) < 5e-3:
-                raise RuntimeError(f"the svdq GEMM is {far(got, want):.3g} from the law ({half})")
+            errors[f"{case} gemm"] = verify.error(torch, got, want)
+    return verify.within(errors, BUDGET)
 
 
 def serving(index: int) -> str:
     """The kernel this card's svdq leaves serve now: a run's `gemm.selected`."""
-    return TRITON if _LAUNCH.get(index, (0.0, None))[1] is not None else EAGER
+    return TRITON if kernel_ready.ready(f"{KERNELS.name} cuda:{index}") is not None else EAGER
 
 
 def activation_scale(torch: ModuleType, flat: Tensor, roles: Mapping[str, Tensor]) -> Tensor:
@@ -469,13 +454,7 @@ def linear(
     `input_scale`. The kernels serve a half `x` written in its own dtype; the law the rest."""
     launch = None
     if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and out_dtype == x.dtype:
-        launch = _launcher(torch, x.device)
-        if (
-            launch is None
-            and _FP4.get(x.device.index or 0)
-            and torch.cuda.is_current_stream_capturing()
-        ):
-            raise Building(TRITON)  # recording the law now would keep it: record once they land
+        launch = _launcher(torch, x.device, torch.cuda.is_current_stream_capturing())
     if launch is None:
         return eager(torch, x, roles, bias, out_dtype)
     try:

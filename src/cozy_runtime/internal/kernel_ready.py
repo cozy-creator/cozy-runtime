@@ -12,19 +12,27 @@ A kernel a background opener produced serves from the next boundary (`boundary`)
 stage of a request, the start of one, a follower's next call; with no request in flight, the
 next ask. A call never sees its kernels change, and the run records each kernel that began
 serving and where. `epoch` counts the changes (`LANDED`), for what keys on the kernels serving.
+
+Every opener ends in `verified`: the kernel serves once its probe agrees with the exact law on
+this card (`verify`). A call asks through `serve`, which keeps a CUDA graph's recording whole.
 """
 
 from __future__ import annotations
 
+import sys
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import cast
+from dataclasses import dataclass
+from functools import partial
+from typing import TYPE_CHECKING, cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._errors import is_capacity
-from cozy_runtime.author._model import LANDED
-from cozy_runtime.internal import kernel_compile
+from cozy_runtime.author._model import LANDED, Building
+from cozy_runtime.internal import kernel_compile, verify
+
+if TYPE_CHECKING:
+    from cozy_runtime.author.kernels import Launch
 
 #: `opener(wait)`: the kernel ready to dispatch. With `wait` it may wait for its build; without,
 #: None while the build runs. It raises when the kernel cannot serve here.
@@ -42,6 +50,14 @@ _SLOTS: dict[str, _Slot] = {}
 _LOCK = threading.Lock()
 #: A background opener's thread name, before its kernel's.
 THREAD = "kernel-ready: "
+#: `triton_kernels.opened(kernels, probe, wait, *, device)`: a Runtime Triton set's opener,
+#: bound by `triton_kernels` when the executor imports it past its device boundary (the
+#: families that open one import no torch).
+TRITON: list[Callable[..., Launch | None]] = []
+
+
+class Refused(RuntimeError):
+    """A kernel whose probe disagreed with the exact law on this card: it never serves here."""
 
 
 def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
@@ -71,6 +87,31 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
     opening.name = f"{THREAD}{name}"
     opening.start()
     return None
+
+
+def serve[T](name: str, opener: Opener[T], capturing: bool) -> T | None:
+    """`ready`, for a call. While its CUDA graph records (`capturing`) an open would end the
+    recording: a kernel not ready yet raises `Building`, so the graph records once it lands, and
+    one failed for good is None, so the graph records the fallback."""
+    if not capturing:
+        return ready(name, opener)
+    value = cast("T | None", ready(name))
+    if value is None and failed(name) is None:
+        raise Building(name)
+    return value
+
+
+def verified[T](
+    value: T, kernel: str, artifact: str, sm: int, probe: Callable[[T], verify.Verdict]
+) -> T:
+    """An opener's last step: `value` once `kernel` (`artifact`'s bytes) passes its probe on this
+    card (`verify.verified`), said once; raises `Refused` with why it did not."""
+    verdict = verify.verified(kernel, artifact, sm, partial(probe, value))
+    said = "verified" if verdict.ok else "refused"
+    print(f"[kernels] {kernel} {said} on sm{sm}: {verdict.detail}"[:400], file=sys.stderr)
+    if not verdict.ok:
+        raise Refused(verdict.detail)
+    return value
 
 
 def wait[T](name: str, opener: Opener[T]) -> T:

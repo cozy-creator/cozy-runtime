@@ -18,6 +18,7 @@ step, and refuses an unsupported or failed kernel (owner ruling 2026-10-10).
 
 from __future__ import annotations
 
+import math
 import shutil
 import site
 import sys
@@ -36,7 +37,7 @@ import msgspec
 from cozy_runtime.author._attention import _PRODUCERS, AttentionProducer
 from cozy_runtime.author._attention_scope import _EXPECTED
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.author.kernels import quantize_once
+from cozy_runtime.author.kernels import KernelsUnavailable, Launch, quantize_once
 from cozy_runtime.internal import (
     arch,
     attention_kitchen_sol,
@@ -82,9 +83,15 @@ class Lacking(AttentionRefusal):
         self.kernels = kernels
 
 
+#: One self-check case: (head dimension, dtype, batch, query length, key length, causal).
+type Case = tuple[int, str, int, int, int, bool]
+
+
 @dataclass(frozen=True, slots=True)
 class Candidate:
-    """One attention kernel the runtime knows how to reach, and what it needs to run."""
+    """One attention kernel the runtime knows how to reach: the cards it runs on, what it admits
+    and how it is built. The row is the only statement of what a kernel admits: site selection
+    (`admits`), its self-check (`cases`) and each of its calls (`refusal`) read it."""
 
     name: str
     backend: str
@@ -94,23 +101,82 @@ class Candidate:
     #: the row's formats it also needs (fp8, fp4)
     formats: frozenset[str] = frozenset()
     dtypes: frozenset[str] = frozenset()  # Empty admits all dtypes.
-    max_head_dim: int = 0  # Zero is unbounded.
+    #: the head dimensions it serves; empty is every one up to `max_head_dim` (zero: unbounded)
+    head_dims: frozenset[int] = frozenset()
+    max_head_dim: int = 0
+    #: the exact (head dimension, dtype) pairs its build serves; empty is every pair above
+    shapes: frozenset[tuple[int, str]] = frozenset()
+    #: what a call may carry besides one shape of Q/K/V: a mask, causal attention, fewer K/V
+    #: heads than Q heads, a query length other than the keys', several batch rows, and a
+    #: softmax scale other than D^-1/2
+    masks: bool = False
+    causal: bool = True
+    gqa: bool = True
+    cross: bool = True
+    batches: bool = True
+    scales: bool = True
     #: the `kernel_sources` recipe compiled for this card; empty is part of torch
     artifact: str = ""
     #: the module the kernel is imported from; empty is torch itself
     import_name: str = ""
-    head_dims: frozenset[int] = frozenset()
-    #: the exact (head dimension, dtype) pairs its build serves; empty is every pair above
-    shapes: frozenset[tuple[int, str]] = frozenset()
     #: a package's producer, served through its base backend (`known`)
     producer: AttentionProducer | None = None
     #: keeps the operands' own precision; False quantizes them (8 or 4 bits)
     exact: bool = True
-    #: the dense kernel a sparse one computes its dense rows with, built beside it
-    dense: str = ""
-    #: the Runtime module whose `warm(index)` builds its Triton kernels for every length, so no
-    #: request compiles one (`kernel_ready`)
-    warm: str = ""
+    #: a sparse kernel: the model's layout routes each call's rows (`attention_sol`)
+    sparse: bool = False
+    #: the dense kernels a sparse one computes rows with, opened beside it: its dense steps',
+    #: then its protected prefix's; none: the one its site's walk binds (`_sol_dense`)
+    dense: tuple[str, ...] = ()
+    #: the Runtime module whose `KERNELS` (a `TritonKernels` set) it launches: it serves once
+    #: they are built here (`triton_kernels`)
+    kernels: str = ""
+
+    def admits(self, dtype: str, head_dim: int) -> bool:
+        """Whether a site of DTYPE activations at HEAD_DIM (0: unknown) is one it serves."""
+        if self.shapes and (head_dim, dtype) not in self.shapes:
+            return False
+        if self.head_dims and head_dim not in self.head_dims:
+            return False
+        if self.dtypes and dtype not in self.dtypes:
+            return False
+        return not (self.max_head_dim and (head_dim == 0 or head_dim > self.max_head_dim))
+
+    def cases(self) -> list[Case]:
+        """Its self-check (`_launch`): each (head dimension, dtype) it admits of its own head
+        dimensions, else 64 and 128, with a query longer than its keys and two batch rows where
+        it serves them, and causal at equal lengths where it serves that."""
+        dims = sorted(self.head_dims | {d for d, _ in self.shapes}) or (64, 128)
+        names = sorted(self.dtypes) or ("bfloat16", "float16")
+        batch, query = 2 if self.batches else 1, 300 if self.cross else 257
+        return [
+            case
+            for d in dims
+            for n in names
+            if self.admits(n, d)
+            for case in ((d, n, batch, query, 257, False), (d, n, batch, 257, 257, True))
+            if self.causal or not case[5]
+        ]
+
+    def refusal(self, query: Any, key: Any, options: Mapping[str, Any]) -> str:
+        """Why it does not serve this call, or empty: its row, asserted on every call."""
+        dtype, dim = str(query.dtype).removeprefix("torch."), int(query.shape[-1])
+        scale = options.get("scale")
+        limits = (
+            (not self.admits(dtype, dim), f"{dtype} activations at head dimension {dim}"),
+            (options.get("attn_mask") is not None and not self.masks, "an attention mask"),
+            (bool(options.get("is_causal")) and not self.causal, "causal attention"),
+            (query.shape[2] != key.shape[2] and not self.gqa, "fewer K/V heads than Q heads"),
+            (query.shape[1] != key.shape[1] and not self.cross, "a query length other than K's"),
+            (query.shape[0] != 1 and not self.batches, "more than one batch row"),
+            (
+                scale is not None
+                and not self.scales
+                and not math.isclose(scale, dim**-0.5, rel_tol=1e-6),
+                "a softmax scale other than D^-1/2",
+            ),
+        )
+        return next((f"{self.name} does not serve {what}" for off, what in limits if off), "")
 
 
 _GPU = frozenset({arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05})
@@ -121,19 +187,26 @@ _D64_128 = frozenset({64, 128})
 #: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
 _FA3 = frozenset((d, dtype) for d in (64, 128) for dtype in ("bfloat16", "float16"))
 _PY, _KITCHEN, _SAGE3 = kernel_sources.PYTHON, "comfy-kitchen", "sageattn3"
-_FP8_WARM = "cozy_runtime.internal.attention_fp8"
+_E4M3 = "cozy_runtime.internal.attention_fp8"
+#: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
+_SOL: dict[str, Any] = dict(
+    sparse=True, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False, gqa=False,
+    cross=False, batches=False,
+)  # fmt: skip
 
 KERNELS: tuple[Candidate, ...] = (
-    Candidate("sdpa", "_cozy_sdpa", upstream.SDPA),
-    Candidate("cudnn", "_cozy_cudnn", upstream.CUDNN, _GPU, dtypes=_HALF, max_head_dim=128),
+    Candidate("sdpa", "_cozy_sdpa", upstream.SDPA, masks=True),
+    Candidate(
+        "cudnn", "_cozy_cudnn", upstream.CUDNN, _GPU, dtypes=_HALF, max_head_dim=128, masks=True,
+    ),
     Candidate(
         "flash-attn3", "_cozy_flash_attn3", upstream.FA3, _WGMMA, dtypes=_HALF, max_head_dim=256,
         shapes=_FA3, artifact="flash-attn3-full", import_name="flash_attn_interface",
     ),
     Candidate(
         "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, exact=False,
-        dtypes=_HALF, max_head_dim=128, artifact="flash-attn3-full",
-        import_name="flash_attn_interface", warm=_FP8_WARM,
+        dtypes=_HALF, max_head_dim=128, gqa=False, artifact="flash-attn3-full",
+        import_name="flash_attn_interface", kernels=_E4M3,
     ),
     Candidate(
         "flash-attn4", "_cozy_flash_attn4", upstream.FA4, _WGMMA | _TCGEN05, dtypes=_HALF,
@@ -141,8 +214,8 @@ KERNELS: tuple[Candidate, ...] = (
     ),
     Candidate(
         "flash-attn4-fp8", "_cozy_flash_attn4_fp8", upstream.FA4_FP8, _TCGEN05, exact=False,
-        dtypes=_BF16, max_head_dim=128, artifact=_PY, import_name="flash_attn.cute",
-        warm=_FP8_WARM,
+        dtypes=_BF16, head_dims=_D64_128, max_head_dim=128, gqa=False, artifact=_PY,
+        import_name="flash_attn.cute", kernels=_E4M3,
     ),
     Candidate(
         "sageattention", "_cozy_sage_int8_fp8", upstream.SAGE, _MMA | _WGMMA, _FP8, exact=False,
@@ -155,59 +228,60 @@ KERNELS: tuple[Candidate, ...] = (
     ),
     Candidate(
         "kitchen-int8", "_cozy_kitchen_int8", upstream.KITCHEN, _GPU, exact=False, dtypes=_HALF,
-        max_head_dim=256, artifact=_KITCHEN, import_name="comfy_kitchen",
+        max_head_dim=256, masks=True, causal=False, artifact=_KITCHEN,
+        import_name="comfy_kitchen",
     ),
     Candidate(
         "flashinfer-bf16-fp8", "_cozy_flashinfer_bf16_fp8", upstream.FLASHINFER, _TCGEN05,
-        exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128, artifact=_PY,
-        import_name="flashinfer", warm=_FP8_WARM,
+        exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
+        artifact=_PY, import_name="flashinfer", kernels=_E4M3,
     ),
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, exact=False,
-        dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, artifact=_SAGE3, import_name=_SAGE3,
+        dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, gqa=False, scales=False,
+        artifact=_SAGE3, import_name=_SAGE3,
     ),
     Candidate(
         "sageattention3-fp4-global-lowmem", "_cozy_sage3_fp4_global_lowmem",
         upstream.SAGE3_GLOBAL_LOWMEM, _MMA, _FP4, exact=False, dtypes=_HALF, max_head_dim=128,
-        head_dims=_D64_128, artifact=_SAGE3, import_name=_SAGE3,
+        head_dims=_D64_128, gqa=False, scales=False, artifact=_SAGE3, import_name=_SAGE3,
     ),
     Candidate(
         "sageattention3-fp4-fixed-means", "_cozy_sage3_fp4_fixed_means",
         upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, exact=False, dtypes=_BF16, max_head_dim=128,
-        head_dims=_D128, artifact=_SAGE3, import_name=_SAGE3,
-        warm="cozy_runtime.internal.attention_sage3_fixed",
+        head_dims=_D128, causal=False, gqa=False, cross=False, batches=False, scales=False,
+        artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
     ),
     Candidate(
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
-        _WGMMA, exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128,
-        artifact="sageattention", import_name="sageattention",
-        warm="cozy_runtime.internal.attention_sage2_fixed_mean",
+        _WGMMA, exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
+        gqa=False, batches=False, artifact="sageattention", import_name="sageattention",
+        kernels="cozy_runtime.internal.attention_sage2_fixed_mean",
     ),
     Candidate(
-        "sol-attn", "_cozy_sol_bf16", attention_sol.SOL, _GPU, _FP8, dtypes=_BF16,
-        max_head_dim=128, head_dims=_D128, artifact=_PY, import_name="sol_attn",
+        "sol-attn", "_cozy_sol_bf16", attention_sol.SOL, _GPU, _FP8, artifact=_PY,
+        import_name="sol_attn", **_SOL,
     ),
     Candidate(
         attention_sage2_fixed.SOL_NAME, "_cozy_sol_sage2_fixed_kmean", attention_sage2_fixed.SOL,
-        _WGMMA, dtypes=_BF16, max_head_dim=128, head_dims=_D128, artifact=_PY,
-        import_name="sol_attn", dense=attention_sage2_fixed.DENSE_NAME,
+        _WGMMA, artifact=_PY, import_name="sol_attn", dense=(attention_sage2_fixed.DENSE_NAME,),
+        **_SOL,
     ),
     Candidate(
         "kitchen-sol", "_cozy_kitchen_sol_int8", attention_kitchen_sol.KITCHEN_SOL, _GPU,
-        dtypes=_BF16, max_head_dim=128, head_dims=_D128, artifact=_KITCHEN,
-        import_name="comfy_kitchen",
+        artifact=_KITCHEN, import_name="comfy_kitchen", dense=("kitchen-int8",), **_SOL,
     ),
     Candidate(
         "kitchen-sol-fp4-lowmem", "_cozy_kitchen_sol_fp4_lowmem",
-        attention_kitchen_sol.KITCHEN_SOL_FP4_LOWMEM, _MMA, _FP4, dtypes=_BF16, max_head_dim=128,
-        head_dims=_D128, artifact=_KITCHEN, import_name="comfy_kitchen",
-        dense="sageattention3-fp4-global-lowmem",
+        attention_kitchen_sol.KITCHEN_SOL_FP4_LOWMEM, _MMA, _FP4, artifact=_KITCHEN,
+        import_name="comfy_kitchen", dense=("sageattention3-fp4-global-lowmem", "kitchen-int8"),
+        **_SOL,
     ),
     Candidate(
         "kitchen-sol-fp4-fixed-means", "_cozy_kitchen_sol_fp4_fixed_means",
-        attention_kitchen_sol.KITCHEN_SOL_FP4_FIXED_MEANS, _MMA, _FP4, dtypes=_BF16,
-        max_head_dim=128, head_dims=_D128, artifact=_KITCHEN, import_name="comfy_kitchen",
-        dense="sageattention3-fp4-fixed-means",
+        attention_kitchen_sol.KITCHEN_SOL_FP4_FIXED_MEANS, _MMA, _FP4, artifact=_KITCHEN,
+        import_name="comfy_kitchen", dense=("sageattention3-fp4-fixed-means", "kitchen-int8"),
+        **_SOL,
     ),
 )  # fmt: skip
 BY_NAME: dict[str, Candidate] = {c.name: c for c in KERNELS}
@@ -249,11 +323,11 @@ def _produced(producer: AttentionProducer) -> Candidate:
     if held is not None and held[0] is producer:
         return held[1]
     base = BY_NAME.get(producer.base)
-    if base is None or base.name not in attention_sol.NAMES:
+    if base is None or not base.sparse:
         raise AttentionRefusal(
             "attention_kernel_unknown",
             f"{producer.name} is served through {producer.base!r}, which is not one of this "
-            f"Runtime's sparse backends {sorted(attention_sol.NAMES.intersection(BY_NAME))}",
+            f"Runtime's sparse backends {sorted(n for n, c in BY_NAME.items() if c.sparse)}",
         )
     candidate = replace(
         base,
@@ -272,21 +346,28 @@ def known() -> dict[str, Candidate]:
     return {**BY_NAME, **{name: _produced(p) for name, p in _PRODUCERS.items()}}
 
 
-def sparse(candidate: Candidate) -> bool:
-    """A Sol-family kernel: the model's layout decides each call's dense or sparse route."""
-    return candidate.name in attention_sol.NAMES or candidate.producer is not None
-
-
 def sparse_names(names: Iterable[str]) -> list[str]:
     found = known()
-    return sorted(name for name in set(names) if name in found and sparse(found[name]))
+    return sorted(name for name in set(names) if name in found and found[name].sparse)
+
+
+def _walked(candidate: Candidate) -> bool:
+    """A sparse kernel whose dense reference its site's walk binds (`_sol_dense`)."""
+    return candidate.sparse and not candidate.dense
+
+
+def _sol_objects(candidate: Candidate) -> bool:
+    """A sparse kernel whose sparse steps run Sol's compiled CuTe objects (`attention_sol`)."""
+    return candidate.sparse and candidate.import_name == "sol_attn"
 
 
 def dense_identity(name: str) -> str:
-    """The dense reference a sparse kernel recomputes rows with: a producer's base's."""
-    candidate = known().get(name)
-    producer = candidate.producer if candidate is not None else None
-    return attention_sol.dense_identity(producer.base if producer is not None else name)
+    """The dense reference a sparse kernel recomputes rows with: its row's declared kernels,
+    else the one its site's walk bound."""
+    dense = known()[name].dense
+    if not dense:
+        return attention_sol.dense_identity()
+    return dense[0] + (f"; sparse-prefix={dense[-1]}" if dense[-1] != dense[0] else "")
 
 
 def device_row(device: DeviceFacts | None) -> arch.Row:
@@ -379,7 +460,46 @@ def _registry() -> Any:
 
 def _member(candidate: Candidate) -> Any:
     """The Diffusers member serving this candidate, registered on first use."""
-    return attention_ulysses.member(candidate.backend, candidate.local)
+    return attention_ulysses.member(candidate.backend, _local(candidate))
+
+
+#: backend -> the kernel its Diffusers member calls (`_local`)
+_LOCALS: dict[str, Local] = {}
+
+
+def _local(candidate: Candidate) -> Local:
+    """CANDIDATE's forward as every call reaches it: its row asserted first (`refusal`), a
+    sparse one's dense rows through its declared kernels' own."""
+    found = _LOCALS.get(candidate.backend)
+    if found is not None:
+        return found
+    forward = candidate.local.forward
+    if candidate.dense:
+        rows = [_dense_rows(BY_NAME[name]) for name in candidate.dense]
+        forward = partial(forward, dense=rows[0], prefix_dense=rows[-1])
+
+    def guarded(query: Tensor, key: Tensor, value: Tensor, **options: Any) -> Tensor:
+        refused = candidate.refusal(query, key, options)
+        if refused:
+            raise ValueError(refused)
+        out: Tensor = forward(query, key, value, **options)
+        return out
+
+    found = _LOCALS[candidate.backend] = replace(candidate.local, forward=guarded)
+    return found
+
+
+def _dense_rows(candidate: Candidate) -> Any:
+    """A sparse kernel's dense rows on CANDIDATE: `(query=, key=, value=, scale=)`."""
+    local = _local(candidate)
+
+    def rows(*, query: Tensor, key: Tensor, value: Tensor, scale: float | None) -> Tensor:
+        options = attention_ulysses.Options(
+            attn_mask=None, dropout_p=0.0, is_causal=False, scale=scale, enable_gqa=False
+        )
+        return attention_ulysses._call(candidate.backend, local, query, key, value, options)
+
+    return rows
 
 
 #: kernel -> its artifact's latest state on this rank: what a run's evidence reports.
@@ -505,20 +625,17 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
     whose probe raises, is not served. Torch's own backends need none; Sol runs only inside its
     model's layout."""
     candidate = ready.candidate
-    if not candidate.artifact or ready.name in attention_sol.NAMES or device.kind != "cuda":
-        return
-    pairs = [(d, n) for d in (64, 128) for n in ("bfloat16", "float16") if _admits(candidate, n, d)]
-    if not pairs:
+    cases = candidate.cases()
+    if not candidate.artifact or candidate.sparse or device.kind != "cuda" or not cases:
         return
     import torch
     from diffusers.models.attention_dispatch import dispatch_attention_fn
 
     def call(q: Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
-        out: object = dispatch_attention_fn(q, k, v, backend=ready.member)
+        out: object = dispatch_attention_fn(q, k, v, backend=ready.member, is_causal=causal)
         return out[0] if isinstance(out, tuple) else out
 
-    probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, pairs,
-                    False)  # fmt: skip
+    probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, cases)
     key = (ready.artifact or {}).get("key", "") or _environment_key(candidate)
     verdict = verify.verified(f"attention-{candidate.name}", key, device.sm, probe)
     if not verdict.ok:
@@ -535,7 +652,7 @@ def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
         return None
     import torch
 
-    kernel, why = prebuilt.fa3(torch, device.index, device.sm)
+    kernel, why = prebuilt.fa3(torch, device.index, device.sm, candidate.cases())
     if kernel is None:
         if not prebuilt.ABSENT:
             _STATES[f"{candidate.name} prebuilt"] = kernel_compile.State(
@@ -635,39 +752,35 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
         return prebuilt_ready
     artifact: dict[str, str] | None
     if candidate.dense:
-        dense = BY_NAME[candidate.dense]
-        artifacts = _compile_dependencies((candidate, dense), device, wait)
-        dense_artifact = (_waited if wait else _opened)(dense, device).artifact or {}
-        artifact = {
-            **(artifacts[candidate.name] or {}),
-            **{f"dense_{key}": value for key, value in dense_artifact.items()},
-        }
+        dense = [BY_NAME[name] for name in dict.fromkeys(candidate.dense)]
+        artifacts = _compile_dependencies((candidate, *dense), device, wait)
+        artifact = dict(artifacts[candidate.name] or {})
+        for role, beside in zip(("dense", "prefix"), dense, strict=False):
+            opened = (_waited if wait else _opened)(beside, device).artifact or {}
+            artifact.update({f"{role}_{key}": value for key, value in opened.items()})
     else:
         artifact = _compiled(candidate, device, wait) if candidate.artifact else None
     if candidate.import_name:
         module = _import(candidate)
-        if candidate.name in attention_kitchen_sol.NAMES:
+        if candidate.sparse and candidate.import_name == "comfy_kitchen":
             import torch
 
-            target = torch.device("cuda", device.index)
-            if not module.sol_attn_is_available(target):
+            if not module.sol_attn_is_available(torch.device("cuda", device.index)):
                 raise AttentionRefusal(
                     "attention_kernel_absent",
                     f"{candidate.name}: compiled Kitchen Sol is unavailable",
-                )
-            if not module.int8_attention_is_available(target):
-                raise AttentionRefusal(
-                    "attention_kernel_absent",
-                    f"{candidate.name}: Kitchen dense INT8 is unavailable",
                 )
         if candidate.local in (upstream.FA3, upstream.FA3_FP8):
             upstream.bind_fa3(
                 cast("upstream.FlashAttn3", module), (artifact or {}).get("key", "environment")
             )
-    if candidate.warm and device.kind == "cuda":
-        import_module(candidate.warm).warm(device.index)
-    if candidate.name in {"sol-attn", attention_sage2_fixed.SOL_NAME}:
-        _sol_route(device)
+    if candidate.kernels and device.kind == "cuda":
+        own = import_module(candidate.kernels)
+        launch = _launcher(own, candidate.name, device, wait)
+        if launch is not None:
+            own.serve(device.index, launch)
+    if _sol_objects(candidate):
+        _sol_route(device, wait)
         if device.kind == "cuda":
             attention_sol.submit_card(device.index)
     ready = Ready(candidate, _member(candidate), artifact)
@@ -681,11 +794,29 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
     return ready
 
 
+def _launcher(module: ModuleType, name: str, device: DeviceFacts, wait: bool) -> Launch | None:
+    """The Runtime's own Triton kernels `module.KERNELS`, which kernel NAME launches, built by
+    the machine's compile manager and loaded onto this card (`triton_kernels.ready`); a build
+    still running refuses as compiling, a failed one as absent. A module with an eager floor
+    serves without kernels this machine cannot build (None)."""
+    built = import_module("cozy_runtime.internal.triton_kernels")
+    try:
+        launch: Launch | None = built.ready(module.KERNELS, wait, device=f"cuda:{device.index}")
+    except KernelsUnavailable as exc:
+        if exc.code == "kernels_absent" and getattr(module, "EAGER_FLOOR", False):
+            return None
+        raise AttentionRefusal("attention_kernel_absent", f"{name}: {exc}") from exc
+    if launch is None:
+        raise AttentionRefusal(
+            "attention_kernel_compiling", f"{name}: {module.KERNELS.name} compiling"
+        )
+    return launch
+
+
 def _expected(live_tokens: int, module: Any) -> None:
     """A model's early length statement reaches Sol when a Sol site serves `module`."""
-    if not {"sol-attn", attention_sage2_fixed.SOL_NAME}.intersection(
-        observed({"": module}).totals()
-    ):
+    found = known()
+    if not any(_sol_objects(found[n]) for n in observed({"": module}).totals() if n in found):
         return
     import torch
 
@@ -730,16 +861,17 @@ def failures(
     return [{"kernel": kernel, "reason": reason} for kernel, reason in sorted(rows)]
 
 
-def _sol_route(device: DeviceFacts) -> None:
-    """Sol serves only its CuTe routes and FA4's (`attention_sol.route`), never Triton."""
+def _sol_route(device: DeviceFacts, wait: bool) -> None:
+    """Sol serves only its CuTe routes and FA4's (`attention_sol.route`), never Triton's: FA4's
+    once its merge is built (`attention_sol_fa4.KERNELS`) and its forwards compiled."""
     if device.kind == "cuda":
         route = attention_sol.backend(device.index)
         if route == "fa4_block_sparse":
             _import(known()["flash-attn4"])
-            if not tools.triton():
-                raise AttentionRefusal("attention_kernel_absent", "sol-attn FA4: cc not found")
+            fa4 = import_module("cozy_runtime.internal.attention_sol_fa4")
+            launch = _launcher(fa4, "sol-attn FA4", device, wait)
             try:
-                import_module("cozy_runtime.internal.attention_sol_fa4").warm(device.index)
+                fa4.warm(device.index, cast("Launch", launch))
             except Exception as exc:
                 raise AttentionRefusal(
                     "attention_kernel_launch_failed",
@@ -773,9 +905,10 @@ def _sol_dense(
         candidate = found.get(name)
         if (
             candidate is None
-            or sparse(candidate)
+            or candidate.sparse
             or _off_row(candidate, row)
-            or not _admits(candidate, "bfloat16", 128)
+            or not candidate.admits("bfloat16", 128)
+            or not candidate.cross
             or (dense is not None and not candidate.exact)
             or name in refused
         ):
@@ -1057,16 +1190,6 @@ def _projections(module: object) -> tuple[object, ...]:
     return ()
 
 
-def _admits(candidate: Candidate, dtype: str, head_dim: int) -> bool:
-    if candidate.shapes and (head_dim, dtype) not in candidate.shapes:
-        return False
-    if candidate.head_dims and head_dim not in candidate.head_dims:
-        return False
-    if candidate.dtypes and dtype not in candidate.dtypes:
-        return False
-    return not (candidate.max_head_dim and (head_dim == 0 or head_dim > candidate.max_head_dim))
-
-
 def _context_parallel(member: Any) -> bool:
     """Does diffusers' registry mark this backend as one it can shard? Read at the pin and
     never restated on a row: the backend's own registration is the authority, and a static
@@ -1271,7 +1394,7 @@ def _unfit(
     off = "" if row is None else _off_row(candidate, row)
     if off:
         return off
-    if not _admits(candidate, dtype, head_dim):
+    if not candidate.admits(dtype, head_dim):
         return (
             f"{candidate.name} does not serve {dtype or 'unknown'} activations at head "
             f"dimension {head_dim or 'unknown'}"
@@ -1377,21 +1500,24 @@ def install(
     matched = False
     sol_order: list[str] | None = None
     fallbacks: list[execution_evidence.AttentionFallback] = []
-    for component, path, module, processor in _attention_records(roots):
-        dtype, head_dim = _dtype(module), _head_dim(module)
+    for record in _attention_records(roots):
+        component, path, module, processor = record
         forced = bool(name and _matches(component, scope))
         matched |= forced
-        if not hasattr(processor, "_attention_backend"):
+        entry: Ready | None
+        if forced and name != EXACT:
+            reason = _pin_reason(resolved.get(name), f"{name} is not open here", record, degree)
+            if reason:
+                raise AttentionRefusal(
+                    "attention_kernel_unsupported",
+                    f"{reason}. A pinned kernel is never quietly replaced",
+                )
+            entry, order = resolved[name], [name]
+        elif not hasattr(processor, "_attention_backend"):
             if forced:
                 reason = _unmanaged_reason(component, path, processor)
                 raise AttentionRefusal("attention_kernel_unsupported", reason)
             continue
-        entry: Ready | None
-        if forced and name != EXACT:
-            entry = resolved.get(name)
-            if entry is not None and _unfit(entry.candidate, None, module, dtype, head_dim, degree):
-                entry = None
-            order = [name]
         elif choice is not None:
             order = [taken.get((component, path), "")]
             if not order[0]:
@@ -1403,9 +1529,7 @@ def install(
         else:
             at = 16 if forced else level(bits, component, path)
             order = (
-                ["sdpa"]
-                if isinstance(processor, ClassicSdpa)
-                else walk(row, at, sparse_site(module))
+                _walk_order(row, at, module, processor)
                 if row is not None
                 else [entry.name for entry in ready]
             )
@@ -1413,9 +1537,11 @@ def install(
                 order, row, device, component, module, degree, resolved, refused, fallbacks
             )
         if entry is None:
-            wanted = name if forced else order[0] if choice is not None else ""
             detail = _site_refusal(
-                wanted or "no available attention kernel", component, dtype, head_dim
+                order[0] if choice is not None else "no available attention kernel",
+                component,
+                _dtype(module),
+                _head_dim(module),
             )
             if degree > 1:
                 detail = AttentionRefusal(
@@ -1423,8 +1549,8 @@ def install(
                     f"{detail}; sequence-parallel degree {degree} requires context parallelism",
                 )
             raise detail
-        if entry.name == "sol-attn" and sol_order is None:
-            sol_order = order[order.index("sol-attn") + 1 :]
+        if _walked(entry.candidate) and sol_order is None:
+            sol_order = order[order.index(entry.name) + 1 :]
         assignments.append((component, path, module, processor, entry))
         hosts.setdefault(component, {})
         hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
@@ -1458,6 +1584,24 @@ def install(
     )
 
 
+def _walk_order(row: arch.Row, at: int, module: Any, processor: Any) -> list[str]:
+    """A site's kernels at level AT: a classic site keeps SDPA, every other one walks."""
+    return ["sdpa"] if isinstance(processor, ClassicSdpa) else walk(row, at, sparse_site(module))
+
+
+def _pin_reason(entry: Ready | None, why: str, record: _Record, degree: int) -> str:
+    """Why a site in a named pin's scope does not take its kernel ENTRY, or empty: its
+    processor has no per-site selection, the kernel does not serve here (`why`, ENTRY None), or
+    its row refuses this site or degree. Every pin reads it: at load a reason refuses the pin
+    (`install`), at a request the site keeps its prepared kernel and says why (`plan`)."""
+    component, path, module, processor = record
+    if not hasattr(processor, "_attention_backend"):
+        return _unmanaged_reason(component, path, processor)
+    if entry is None:
+        return why
+    return _unfit(entry.candidate, None, module, _dtype(module), _head_dim(module), degree)
+
+
 def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
     """Install metadata hooks atomically, preserving hooks owned by preparation."""
     # Validate all producer topology/hooks before any metadata or processor mutation.
@@ -1469,7 +1613,7 @@ def _install_sites(records: Sequence[tuple[Ready, str, str, Any]]) -> None:
     processors: list[tuple[Any, Any]] = []
     try:
         for entry, component, path, module in records:
-            if not sparse(entry.candidate):
+            if not entry.candidate.sparse:
                 continue
             local = component.rsplit("/", 1)[-1]
             if getattr(module, "_cozy_sol_site", None) is None:
@@ -1536,7 +1680,8 @@ def chosen(roots: Mapping[str, object]) -> Choice:
         (component, path, _served(processor, names))
         for component, path, _module, processor in _site_records(roots)
     )
-    if not any(kernel == "sol-attn" for *_, kernel in sites):
+    found = known()
+    if not any(kernel in found and _walked(found[kernel]) for *_, kernel in sites):
         return Choice(sites=sites)
     dense, _, exact = attention_sol.binding()[1].partition(_EXACT_AT)
     return Choice(sites=sites, dense=dense, exact=exact)
@@ -1578,7 +1723,11 @@ class Snapshot:
 def snapshot(roots: Mapping[str, object]) -> Snapshot:
     names = _names()
     held = [processor for _, _, processor in _sites(roots)]
-    sol = any(_served(processor, names) == "sol-attn" for processor in held)
+    found = known()
+    sol = any(
+        (kernel := _served(processor, names)) in found and _walked(found[kernel])
+        for processor in held
+    )
     return Snapshot(
         tuple((processor, processor._attention_backend) for processor in held),
         attention_sol.binding() if sol else None,
@@ -1595,7 +1744,7 @@ def override(
     temporary_sites = [
         (component.rsplit("/", 1)[-1], path, module)
         for component, path, module, _, entry in changed
-        if sparse(entry.candidate) and getattr(module, "_cozy_sol_site", None) is None
+        if entry.candidate.sparse and getattr(module, "_cozy_sol_site", None) is None
     ]
     temporary_processors = [
         (module, module.processor) for _, _, module, _, entry in changed if entry.candidate.producer
@@ -1741,12 +1890,13 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
             if exc.code in ("attention_kernel_unknown", "attention_kernel_needs_executor"):
                 raise
             why = str(exc)
-    if entry is not None and entry.name == "sol-attn" and not attention_sol.dense_identity():
+    if entry is not None and _walked(entry.candidate) and not attention_sol.dense_identity():
         _bind_sol_dense(_sol_dense((), device, {}, {}))
     sites: list[_Site] = []
     fallbacks: list[execution_evidence.AttentionFallback] = []
-    for component, path, module, processor in records:
-        reason = why or _site_reason(candidate, component, path, module, processor)
+    for record in records:
+        component, path, module, processor = record
+        reason = _pin_reason(entry, why, record, degree)
         if reason or entry is None:
             row = execution_evidence.AttentionFallback(
                 component=component,
@@ -1778,25 +1928,14 @@ def exact(
     for component, path, module, processor in records:
         if not hasattr(processor, "_attention_backend"):
             continue
-        order = (
-            ["sdpa"] if isinstance(processor, ClassicSdpa) else walk(row, 16, sparse_site(module))
-        )
+        order = _walk_order(row, 16, module, processor)
         entry = _first(order, row, device, component, module, degree, resolved, refused, fallbacks)
         if entry is not None:
-            if entry.name == "sol-attn" and sol is None:
-                sol = order[order.index("sol-attn") + 1 :]
+            if _walked(entry.candidate) and sol is None:
+                sol = order[order.index(entry.name) + 1 :]
             sites.append((component, path, module, processor, entry))
     dense = None if sol is None else _sol_dense(sol, device, resolved, refused)
     return Swap(tuple(sites), pin, tuple(fallbacks), dense)
-
-
-def _site_reason(
-    candidate: Candidate, component: str, path: str, module: Any, processor: Any
-) -> str:
-    """Why CANDIDATE cannot run this site, or empty."""
-    if not hasattr(processor, "_attention_backend"):
-        return _unmanaged_reason(component, path, processor)
-    return _unfit(candidate, None, module, _dtype(module), _head_dim(module), 1)
 
 
 def select(

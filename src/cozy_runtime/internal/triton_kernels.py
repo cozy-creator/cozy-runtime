@@ -7,7 +7,8 @@ kernel store), then Triton's launcher module, in the compile manager's niced bac
 cache filled. The key is Triton's own hash of every entry (sources and the functions they call,
 signature, architecture, options, Triton) plus the launcher module's key and the cache
 location; a driver update rebuilds nothing. `load` waits for a live build by its measured
-progress, then serves it or raises `KernelsUnavailable`: a request never compiles.
+progress, then serves it or raises `KernelsUnavailable`: a request never compiles. The Runtime's
+own sets open through `opened` (`kernel_ready.TRITON`): loaded, then verified on the card.
 
 Executor-only: torch and Triton are imported at the top, guarded; their absence is
 `kernels_absent`.
@@ -34,7 +35,7 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
-from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, svdq_linear, tools
+from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_ready, tools, verify
 
 try:
     import torch
@@ -50,6 +51,7 @@ try:
     from triton.knobs import CompileTimes
     from triton.runtime.build import _get_cache_manager
     from triton.runtime.cache import get_cache_key, get_cache_manager
+    from triton.runtime.driver import driver as triton_driver
     from triton.runtime.jit import JITFunction
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal
     TRITON_ABSENT = f"torch and triton do not import ({_absent})"
@@ -84,7 +86,7 @@ _BACKENDS: dict[int, BaseBackend] = {}
 def _cache_key(entry: TritonEntry, arch: int) -> str:
     """Triton's own cache hash for (sources, signature, architecture, options, Triton)."""
     backend = _backend(arch)
-    options = backend.parse_options({"num_warps": entry.num_warps, "num_stages": entry.num_stages})
+    options = backend.parse_options(entry.options)
     key = get_cache_key(_source(entry), backend, options, get_cache_invalidating_env_vars())
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
@@ -112,6 +114,7 @@ class _Kernel(Struct, frozen=True):
     aligned: tuple[str, ...]
     num_warps: int
     num_stages: int
+    fp_fusion: bool
 
     @classmethod
     def of(cls, entry: TritonEntry) -> _Kernel:
@@ -125,12 +128,19 @@ class _Kernel(Struct, frozen=True):
             entry.aligned,
             entry.num_warps,
             entry.num_stages,
+            entry.fp_fusion,
         )
 
     def entry(self) -> TritonEntry:
         kernel = getattr(import_module(self.module), self.name)
         return TritonEntry(
-            kernel, self.signature, self.constexprs, self.aligned, self.num_warps, self.num_stages
+            kernel,
+            self.signature,
+            self.constexprs,
+            self.aligned,
+            self.num_warps,
+            self.num_stages,
+            self.fp_fusion,
         )
 
 
@@ -165,9 +175,7 @@ def build(
     todo = [msgspec.convert(row, _Kernel).entry() for row in spec["kernels"]]
     for done, entry in enumerate(todo, 1):
         compiled = triton.compile(
-            _source(entry),
-            target=GPUTarget("cuda", arch, WARP_SIZE),
-            options={"num_warps": entry.num_warps, "num_stages": entry.num_stages},
+            _source(entry), target=GPUTarget("cuda", arch, WARP_SIZE), options=entry.options
         )
         if compiled.hash != entries[entry.key]:
             raise kernel_compile.CompileFailed(
@@ -177,6 +185,52 @@ def build(
         report(done / (len(todo) + 1))
     _cuda_driver.CudaUtils()
     return {"entries": len(todo)}
+
+
+class _Card:
+    """The compile manager's stand-in for a card: Triton's active driver while a builder runs
+    `.warmup` calls, so they compile for `arch` with no GPU (and no context) in the builder."""
+
+    def __init__(self, arch: int) -> None:
+        self.target = GPUTarget("cuda", arch, WARP_SIZE)
+
+    def get_current_device(self) -> int:
+        return 0
+
+    def get_current_stream(self, device: int) -> int:
+        return 0
+
+    def get_current_target(self) -> GPUTarget:
+        return self.target
+
+
+def warm_job(
+    kernel: str, function: str, args: list[object], arch: int, inputs: dict[str, object]
+) -> kernel_compile.Job:
+    """Upstream Triton kernels a Runtime `module:function(*args)` builds by `.warmup`, for
+    `arch`, into this process's Triton cache, keyed by `inputs` (their sources) and the
+    arguments: the out-of-process build of kernels Runtime does not declare (`build_warm`).
+    Once it is ready, the same call in an executor loads what it built and compiles nothing."""
+    _require_triton()
+    key = {**inputs, "arch": arch, "args": args, "triton": triton.__version__,
+           "cache": triton.knobs.cache.dir}  # fmt: skip
+    spec = {"arch": arch, "function": function, "args": args}
+    return kernel_compile.Job(
+        "triton-warm", kernel_cache.Key.of(kernel, key), spec, {"CUDA_VISIBLE_DEVICES": ""}
+    )
+
+
+@request_path.forbid("kernel build: triton warm")
+def build_warm(
+    spec: dict[str, Any], staging: Path, report: Callable[[float], None]
+) -> dict[str, object]:
+    """The compile manager's builder for a `warm_job`: its function's `.warmup` calls compile
+    for the job's card through `_Card`. `staging` stays empty, as `build`'s does."""
+    _require_triton()
+    triton_driver.set_active(_Card(int(spec["arch"])))
+    module, name = str(spec["function"]).split(":")
+    getattr(import_module(module), name)(*spec["args"])
+    return {"function": spec["function"]}
 
 
 def _store() -> kernel_cache.Store:
@@ -210,9 +264,13 @@ class _Launcher:
     weight the plane has not mapped."""
 
     def __init__(
-        self, arch: int, compiled: dict[str, CompiledKernel], names: dict[str, tuple[str, ...]]
+        self,
+        arch: int,
+        compiled: dict[str, CompiledKernel],
+        names: dict[str, tuple[str, ...]],
+        key: str,
     ) -> None:
-        self.arch, self.compiled, self.names = arch, compiled, names
+        self.arch, self.compiled, self.names, self.key = arch, compiled, names, key
 
     def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
         params = kernel.arg_names
@@ -273,7 +331,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
             ) from exc
         compiled[entry.key] = kernel
         names[entry.kernel.__name__] = tuple(sorted(entry.constexprs))
-    launcher = _LOADED[(kernels.name, index)] = _Launcher(arch, compiled, names)
+    launcher = _LOADED[(kernels.name, index)] = _Launcher(arch, compiled, names, found.key.digest)
     return launcher
 
 
@@ -298,8 +356,23 @@ def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Laun
     return launch
 
 
-nvfp4_linear.READY[:] = [ready]
-svdq_linear.READY[:] = [ready]
+def opened(
+    kernels: TritonKernels,
+    probe: Callable[[Launch], verify.Verdict],
+    wait: bool = False,
+    *,
+    device: object,
+) -> Launch | None:
+    """A Runtime set's opener: `ready`, then `probe` of its launcher against the exact law on
+    this card (`kernel_ready.verified`, keyed by the build), else `kernel_ready.Refused`."""
+    launch = ready(kernels, wait, device=device)
+    if launch is None:
+        return None
+    loaded = _LOADED[(kernels.name, torch.device(device).index or 0)]
+    return kernel_ready.verified(launch, kernels.name, loaded.key, loaded.arch, probe)
+
+
+kernel_ready.TRITON[:] = [opened]
 
 
 def _compiled(*, src: ASTSource, times: CompileTimes, cache_hit: bool, **_: object) -> None:

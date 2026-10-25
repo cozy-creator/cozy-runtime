@@ -14,7 +14,7 @@ import msgspec
 import torch
 
 from cozy_runtime import __version__
-from cozy_runtime.internal import arch, int8_linear, prebuilt
+from cozy_runtime.internal import arch, attention, int8_linear, prebuilt
 from cozy_runtime.internal.encoding import launch_providers, measure_device
 from cozy_runtime.internal.probe import UnmeasuredEvidence, conform
 
@@ -39,7 +39,8 @@ def main() -> int:
             or "absent"
         )
         if arch.row(device.sm).family == arch.WGMMA:
-            fa3, why = prebuilt.fa3(torch, 0, device.sm)
+            cases = attention.BY_NAME["flash-attn3"].cases()
+            fa3, why = prebuilt.fa3(torch, 0, device.sm, cases)
             kernels["fa3"] = "serves" if fa3 is not None else why
             if fa3 is None:
                 failed.append("prebuilt-fa3")
