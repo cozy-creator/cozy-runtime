@@ -1179,6 +1179,12 @@ class Memory:
             self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
             self._phase_names, self._phase_request = names, request_id
             incoming = [m for m in self.models.values() if m.name in names]
+            # An unrelated registered model must not enlarge this phase's streaming
+            # headroom. Native admission still permits an unexpectedly larger group.
+            self.window_bytes = max(
+                (b.allocation_bytes for m in incoming for b in m.groups()), default=0
+            )
+            self.native.set_streaming_limit(self.window_bytes)
             missing = 0
             for member in incoming:
                 member.prefix = None
@@ -1213,6 +1219,7 @@ class Memory:
                 request.phase_changes.append(
                     {
                         "models": sorted(names),
+                        "window_bytes": self.window_bytes,
                         "missing_bytes": missing,
                         "torch_unused_bytes": unused,
                         "torch_returned_bytes": returned,
