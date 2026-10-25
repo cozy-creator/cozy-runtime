@@ -108,6 +108,9 @@ struct Continuation {
     _module: Py<PyAny>,
 }
 
+// Keep the fixed, bounded ABI status by value. In particular, cancel/drop must not allocate
+// a boxed Rust error whose ownership is unrelated to the capability's native-only contract.
+#[allow(clippy::result_large_err)]
 impl Continuation {
     fn checked(&self) -> Result<std::sync::MutexGuard<'_, Progress>, Status> {
         if self.owner.pid != std::process::id() {

@@ -404,6 +404,7 @@ class PreparedRepeat:
                 try:
                     self._native.close_owner()
                     self._closed = True
+                    self._load = None
                     for model in reversed(claimed):
                         model._release()
                     self._release_owned_bindings()
