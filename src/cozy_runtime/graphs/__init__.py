@@ -181,7 +181,7 @@ class _Recording:
                 if static is not None and not _same(static, value):
                     static.copy_(value)
                     copied += static.nbytes
-            with self.owner.recovery_blocked():
+            with self.owner.recovery_blocked(replay=True):
                 self.graph.replay()
             work.done += 1
             for backend, implementation in self.served:
@@ -1110,7 +1110,7 @@ def _record(
                 for target, value in zip(statics, inputs, strict=True):
                     if target is not None:
                         target.copy_(value)
-                with owner.recovery_blocked():
+                with owner.recovery_blocked(replay=True):
                     graph.replay()  # served only when it reproduces the eager run bit for bit
                 pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
                 if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
