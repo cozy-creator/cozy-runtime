@@ -99,11 +99,13 @@ class Domain:
             return "library workspace configuration changed while graphs retain its pointers"
         return unsupported(self.torch)
 
-    def recovery_blocked(self) -> AbstractContextManager[Any]:
-        """Block native reclaim on every thread while this device captures or replays."""
+    def recovery_blocked(self, *, replay: bool = False) -> AbstractContextManager[Any]:
+        """Block reclaim; actual capture also excludes native producers."""
         from tensorfs import varena
 
-        return varena.capture(self.device)
+        # Older native cohorts retain their conservative capture guard.
+        guard = getattr(varena, "replay", varena.capture) if replay else varena.capture
+        return guard(self.device)
 
     def initialize(self) -> None:
         """Preparation, including the never-replayed owner, uses the admitted budget."""
