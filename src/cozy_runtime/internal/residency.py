@@ -1338,8 +1338,9 @@ class Memory:
         read_bytes = read_ns = 0
         use = None
         try:
-            if self._prefetch is not None:
-                self._settle_prefetch(cancel=self._prefetch.block is not block)
+            with self.lock:
+                if self._prefetch is not None:
+                    self._settle_prefetch(cancel=self._prefetch.block is not block)
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:
@@ -1529,8 +1530,9 @@ class Memory:
             if model.local.depth == 0:
                 try:
                     try:
-                        if self._prefetch is not None and self._prefetch.block.model is model:
-                            self._settle_prefetch(cancel=True)
+                        with self.lock:
+                            if self._prefetch is not None and self._prefetch.block.model is model:
+                                self._settle_prefetch(cancel=True)
                     finally:
                         if model.common is not None:
                             self._exit(model.common)
@@ -1559,8 +1561,9 @@ class Memory:
             yield request
         finally:
             try:
-                if self._prefetch is not None and self._prefetch.request is request:
-                    self._settle_prefetch(cancel=True)
+                with self.lock:
+                    if self._prefetch is not None and self._prefetch.request is request:
+                        self._settle_prefetch(cancel=True)
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
