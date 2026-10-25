@@ -51,7 +51,8 @@ class KernelsUnavailable(RuntimeError):
 class TritonEntry:
     """One compiled specialization of a module-level `@triton.jit` kernel: Triton's signature
     (`{"x_ptr": "*bf16", "n": "i32", "BLOCK": "constexpr"}`), the constexpr values, the pointer
-    and integer arguments it may assume 16-aligned, its warps and its pipeline stages."""
+    and integer arguments it may assume 16-aligned, its warps, its pipeline stages, and whether
+    the compiler may fuse a multiply and an add (`fp_fusion`; False keeps each one rounded)."""
 
     kernel: Any
     signature: Mapping[str, str]
@@ -59,6 +60,16 @@ class TritonEntry:
     aligned: tuple[str, ...] = ()
     num_warps: int = 4
     num_stages: int = 3
+    fp_fusion: bool = True
+
+    @property
+    def options(self) -> dict[str, object]:
+        """Its compile options, as Triton takes them."""
+        return {
+            "num_warps": self.num_warps,
+            "num_stages": self.num_stages,
+            "enable_fp_fusion": self.fp_fusion,
+        }
 
     @property
     def key(self) -> str:
