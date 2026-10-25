@@ -17,7 +17,7 @@ environment or config read, any device/allocator surface. Those are fenced (§7)
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypeVar, overload
 
@@ -63,6 +63,7 @@ class Registration:
     weights_outputs: tuple[WeightsOutput, ...] = ()
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
+    phases: tuple[tuple[str, ...], ...] = ()
     internal: bool = False
     """Managed children from this installed package revision only; never a root request."""
     accelerator: bool = True
@@ -114,6 +115,7 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
+        phases: Sequence[str | Collection[str]] = (),
         demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
@@ -137,6 +139,7 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
+        phases: Sequence[str | Collection[str]] = (),
         demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
@@ -160,6 +163,7 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
+        phases: Sequence[str | Collection[str]] = (),
         demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
@@ -189,7 +193,18 @@ class App:
         uses, so a machine fetches those first; absent means all. `on_demand=("upsampler",)`
         names the model arguments a request may leave unused: each is built, and its weights
         fetched, when the function first reads it. `model_classes` names a model argument's class
-        in place of its annotation (the Runtime's own generic functions)."""
+        in place of its annotation (the Runtime's own generic functions). `phases=` declares
+        immutable component groups in execution order, available to queued preparation before
+        handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
+        # Immutable CPU metadata; no handler or device work runs during registration.
+        if isinstance(phases, str):
+            raise RegistrationError("phases must be a sequence of component groups")
+        declared_phases: list[tuple[str, ...]] = []
+        for phase in phases:
+            names = (phase,) if isinstance(phase, str) else tuple(phase)
+            if not names or any(not isinstance(name, str) or not name for name in names):
+                raise RegistrationError("each phase must name nonempty component strings")
+            declared_phases.append(tuple(sorted(set(names))))
         policy = memo_policy(memoize)
         if type(internal) is not bool:
             raise RegistrationError("internal must be a boolean")
@@ -246,6 +261,7 @@ class App:
                 weights_outputs=weights,
                 demand_bound=demand,
                 preflight=preflight,
+                phases=tuple(declared_phases),
                 hidden=hidden,
                 internal=internal,
                 accelerator=accelerator is not False,

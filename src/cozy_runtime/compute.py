@@ -596,6 +596,12 @@ class PreparedRepeat:
                     job = self._load.submit_native(capsule)
                     self._load_used = True
                 self._active = Execution(self, context, epoch, outputs, readout, claimed, job)
+                if context is not None and self._load is None:
+                    from cozy_runtime.internal.residency import _REQUEST
+
+                    request = _REQUEST.get()
+                    if request is not None:
+                        request.prefetch_queued()
                 return self._active
             except BaseException as error:
                 if isinstance(error, Exception) and getattr(error, "eligibility_refusal", False):
