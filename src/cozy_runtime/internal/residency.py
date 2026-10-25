@@ -17,6 +17,7 @@ from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import pairwise
 from typing import Any, Protocol
 
 import tensorfs
@@ -264,6 +265,7 @@ class _Block:
     final_storage: int | None = None
     final_fills: int = 0
     final_hits: int = 0
+    next: _Block | None = None
 
     @property
     def nbytes(self) -> int:
@@ -311,6 +313,15 @@ class _Block:
             yield from (tensor for parts in self.data.values() for tensor in parts.values())
         if self.assigned is not None:
             yield from (tensor for _, tensor in self.assigned)
+
+
+@dataclass(slots=True)
+class _Prefetch:
+    block: _Block
+    region: Any
+    read: Any
+    identity: str
+    request: Request | None
 
 
 class Model:
@@ -715,6 +726,8 @@ class Memory:
         self.native: Any = None
         self.granularity = 512
         self.window_bytes = 0
+        self.prefetch_supported = False
+        self._prefetch: _Prefetch | None = None
         if self.cuda:
             try:
                 from tensorfs import varena
@@ -723,6 +736,9 @@ class Memory:
                     varena.set_activation_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
+                self.prefetch_supported = bool(
+                    getattr(varena, "supports_prefetch", lambda: False)()
+                )
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
                     raise
@@ -864,6 +880,9 @@ class Memory:
             else:
                 model.common = block
         if self.native is not None:
+            groups = model.groups()
+            for current, following in pairwise(groups):
+                current.next = following
             for block in model.groups():
                 _layout(block)
             model.layout_identity = hashlib.sha256(
@@ -925,6 +944,8 @@ class Memory:
                 or (block.model.users and block.model.thread != threading.get_ident())
             ):
                 return 0
+            if self._prefetch is not None and self._prefetch.block is block:
+                self._settle_prefetch(cancel=True)
             present = block.data is not None
             block.data = block.assigned = block.ready = None
             block.native_storage = None
@@ -1065,7 +1086,7 @@ class Memory:
             # Only the failed allocation is retried. No read, fill transform or forward ran.
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
-    def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
+    def _native_region(self, block: _Block, *, final: bool = False) -> Any:
         model = block.model
         field = "final_region" if final else "region"
         region = getattr(block, field)
@@ -1094,6 +1115,11 @@ class Memory:
                 min(model.prefix, block.index) if model.prefix is not None else block.index
             )
             block.preferred = False
+        return region
+
+    def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
+        model = block.model
+        region = self._native_region(block, final=final)
         needed = int(region.allocated_bytes)
         if not region.resident and (not reclaim or self.budget_bytes is not None):
             if reclaim and needed > self.room().free:
@@ -1116,6 +1142,110 @@ class Memory:
             if not self.reclaim(needed, current={model.name}):
                 raise
             return region.prepare()
+
+    def _prefetch_next(self, current: _Block) -> None:
+        """Admit at most one next raw block, without eviction or Python fill callbacks."""
+        block = current.next
+        request = _REQUEST.get()
+        if (
+            not self.prefetch_supported
+            or block is None
+            or current.retained
+            or self.capturing()
+            or (request is not None and request.idle)
+            or block.model.fill is not None
+            or block.aliases is None
+            or block.finals
+            or not block.storage_bytes
+        ):
+            return
+        with self.lock:
+            if (
+                self._prefetch is not None
+                or block.loading
+                or block.count
+                or block.retained
+                or block.cached()
+            ):
+                return
+            # Capacity is checked before native admission and includes already resident
+            # weights/activation reservations. The native call also refuses window trimming,
+            # OOM recovery and abandoned-writer joins; it never requests a context join.
+            if block.allocation_bytes > self.room().free:
+                if request is not None:
+                    request.prefetch_skipped += 1
+                return
+            region = self._native_region(block)
+            offset = 0
+            parts = []
+            for key, roles in block.parts.items():
+                for part in roles.values():
+                    name = f"{block.model.component}/{key}#{part.role or 'value'}"
+                    parts.append((name, offset, part.nbytes))
+                    offset += (part.nbytes + 255) // 256 * 256
+            try:
+                read = region.prepare_read(block.model.source.ck, parts, reclaim=False)
+            except torch.OutOfMemoryError:
+                if request is not None:
+                    request.prefetch_skipped += 1
+                return
+            identity = block.model.identity
+            assert identity is not None  # eligibility excludes mutable/undeclared fills
+            self._prefetch = _Prefetch(block, region, read, identity, request)
+            try:
+                read.start()
+            except BaseException:
+                self._settle_prefetch(cancel=True)
+                raise
+            if request is not None:
+                request.prefetch_started += 1
+
+    def _settle_prefetch(self, *, cancel: bool = False) -> None:
+        """Checked completion owns the source and Fill independently of Python model views."""
+        with self.lock:
+            pending = self._prefetch
+            if pending is None:
+                return
+            block, read, request = pending.block, pending.read, pending.request
+            cancel = cancel or pending.identity != block.model.wanted_identity()
+            if cancel:
+                read.cancel()
+            began = time.perf_counter_ns()
+            complete = False
+            try:
+                from cozy_runtime.author._context import CURRENT
+
+                context = CURRENT.get()
+                try:
+                    if context is not None and not cancel:
+                        # This is a host transition between blocks, never the GPU loop.
+                        while not read.poll()["done"]:
+                            context.raise_if_cancelled()
+                            time.sleep(0.001)
+                    row = read.wait()
+                except BaseException:
+                    read.cancel()
+                    read.wait()  # do not release the task before checked producer drain
+                    raise
+                complete = not row["canceled"]
+                if request is not None:
+                    request.prefetch_canceled += int(not complete)
+                    request.prefetch_wait_ns += time.perf_counter_ns() - began
+                    if complete:
+                        request.prefetch_completed += 1
+                        request.read(block, 0, int(row.get("bytes", 0)), speculative=True)
+            except tensorfs.Error as error:
+                if fault(error) is not Fault.OTHER:
+                    raise
+                # A speculative local-only source may be absent. Demand uses the normal
+                # reader/fetch path after the native adapter has checked its producer drain.
+                if request is not None:
+                    request.prefetch_failed += 1
+            finally:
+                if not complete and block.region is pending.region:
+                    block.region = None
+                    block.preferred = False
+                self._prefetch = None
 
     def _final_views(self, block: _Block, reclaim: bool) -> None:
         if not block.finals:
@@ -1156,6 +1286,8 @@ class Memory:
         read_bytes = read_ns = 0
         use = None
         try:
+            if self._prefetch is not None:
+                self._settle_prefetch(cancel=self._prefetch.block is not block)
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:
@@ -1344,8 +1476,12 @@ class Memory:
             model.local.depth -= 1
             if model.local.depth == 0:
                 try:
-                    if model.common is not None:
-                        self._exit(model.common)
+                    try:
+                        if self._prefetch is not None and self._prefetch.block.model is model:
+                            self._settle_prefetch(cancel=True)
+                    finally:
+                        if model.common is not None:
+                            self._exit(model.common)
                 finally:
                     request = getattr(model.local, "request", None)
                     if request is not None:
@@ -1370,12 +1506,16 @@ class Memory:
         try:
             yield request
         finally:
-            request.sample()
-            request.ended = request.stats()
-            with self.lock:
-                self.requests.discard(request)
+            try:
+                if self._prefetch is not None and self._prefetch.request is request:
+                    self._settle_prefetch(cancel=True)
+                request.sample()
+                request.ended = request.stats()
                 self.last = request.ended
-            _REQUEST.reset(token)
+            finally:
+                with self.lock:
+                    self.requests.discard(request)
+                _REQUEST.reset(token)
 
     def stats(self) -> dict[str, Any] | None:
         return self.last
@@ -1403,6 +1543,8 @@ class Request:
         self.overlap = False
         self.moved = self.read_ns = 0
         self.final_fills = self.final_hits = 0
+        self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
+        self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.sample()
@@ -1469,7 +1611,7 @@ class Request:
             torch.cuda.reset_peak_memory_stats(self.memory.device)
         return peak
 
-    def read(self, block: _Block, ns: int, nbytes: int) -> None:
+    def read(self, block: _Block, ns: int, nbytes: int, *, speculative: bool = False) -> None:
         self.moved += nbytes
         self.read_ns += ns
         self.trace.append(
@@ -1479,7 +1621,7 @@ class Request:
                 "block": block.index,
                 "bytes": nbytes,
                 "origin": "store",
-                "speculative": False,
+                "speculative": speculative,
             }
         )
         self.sample()
@@ -1526,7 +1668,16 @@ class Request:
                         if b.final_region is not None and b.final_region.resident
                     ),
                     "fallback_blocks": sum(b.aliases is None for b in groups),
-                    "native_prefetch": False,
+                    "native_prefetch": self.memory.prefetch_supported,
+                },
+                prefetch={
+                    "started": self.prefetch_started,
+                    "completed": self.prefetch_completed,
+                    "canceled": self.prefetch_canceled,
+                    "skipped_capacity": self.prefetch_skipped,
+                    "failed": self.prefetch_failed,
+                    "wait_ns": self.prefetch_wait_ns,
+                    "scope": "one next exact raw block; no native transform callbacks",
                 },
             )
         elif self.memory.device.type == "mps":
@@ -1737,6 +1888,11 @@ def _hooks(model: Model) -> None:
             model._claim()
             try:
                 memory._enter(b)
+                try:
+                    memory._prefetch_next(b)
+                except BaseException:
+                    memory._exit(b)
+                    raise
             except BaseException:
                 model._release()
                 raise
