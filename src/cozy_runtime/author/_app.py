@@ -82,7 +82,7 @@ class Registration:
     def surface(self) -> Surface:
         """The derived surface — schemas, capabilities, models, and preflight identity."""
         if self._surface is None:
-            self._surface = analyze(
+            surface = analyze(
                 self.fn,
                 name=self.name,
                 publishes=self.publishes,
@@ -101,7 +101,8 @@ class Registration:
                 model_classes=self.model_classes,
             )
             if self.prepare is not None:
-                self.prepare_params = preparation_params(self.prepare, self._surface)
+                self.prepare_params = preparation_params(self.prepare, surface)
+            self._surface = surface
         return self._surface
 
 

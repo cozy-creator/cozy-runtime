@@ -554,6 +554,9 @@ def prepare_program(
     if prepared.asset_bounds:
         raise CapabilityError("GPU program warming takes no hydrated assets", code="prepare_assets")
     record = Attempt(inv.request_id, inv.spool, 0, sink=inv.progress)
+    record.components_active = lambda: any(
+        model._cozy_active is not None for model in inv.models.values()
+    )
     record.rows.extend(prepared.overlay.rows)
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
     ctx._plan = inv.plan
