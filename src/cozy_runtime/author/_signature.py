@@ -80,6 +80,8 @@ class PreflightSpec:
 def preparation_params(fn: Callable[..., object], surface: Surface) -> tuple[Param, ...]:
     """A GPU preparation callback receives only a checked subset of the real invocation."""
     where = f"{fn.__module__}:{fn.__qualname__}"
+    if surface.invocable:
+        raise ConformanceError("prepare needs an App entrypoint", code="prepare_signature")
     signature, hints = inspect.signature(fn), _hints(fn)
     if inspect.iscoroutinefunction(fn) or hints.get("return") is not bool:
         raise ConformanceError(

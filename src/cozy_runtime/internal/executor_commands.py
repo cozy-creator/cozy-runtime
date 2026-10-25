@@ -96,6 +96,9 @@ class Map(Command, frozen=True, kw_only=True, tag="map"):
 
     construction: str
     level: Literal["gpu", "ram"] = "gpu"
+    request_id: str = ""
+    entrypoint: str = ""
+    payload: Json | None = None
 
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):

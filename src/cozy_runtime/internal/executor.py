@@ -108,6 +108,7 @@ from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
     prepare,
+    prepare_program,
     run_prepared,
 )
 from cozy_runtime.author._model import (
@@ -397,9 +398,7 @@ def _replay_code(command: Invoke, request: str) -> str:
     return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
 
 
-def _show_checkpoint(
-    exchange: Exchange, slot: str, repo_id: str, revision: str
-) -> None:
+def _show_checkpoint(exchange: Exchange, slot: str, repo_id: str, revision: str) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
     item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision)
     answer = exchange(item, Answer)
@@ -978,6 +977,7 @@ class Executor:
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
+            "program_preparation": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -3129,7 +3129,7 @@ class Executor:
         with self.in_flight.attempt(alone, command.request_id) as slot, request_path.serving():
             # Admitted only now: an attempt before it may have poisoned the generation. Its
             # record is taken once nothing can refuse it, so a refused call may come again.
-            refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
+            refused = target._unadmitted(command) or self._grant(target, first=slot.first)
             if not alone:
                 self.in_flight.ready()
             if refused is not None:
@@ -3144,7 +3144,7 @@ class Executor:
         reply["poisoned"] = self.poisoned
         return reply
 
-    def _grant(self, target: Executor, command: Invoke, *, first: bool) -> Frame | None:
+    def _grant(self, target: Executor, *, first: bool) -> Frame | None:
         """The kernels that became ready, installed while no call is in a scope (a group none
         of whose GPUs may serve otherwise refuses); the first attempt in also opens the
         residency's attempt."""
@@ -4507,9 +4507,7 @@ class Executor:
         placed = self._rank_device(self.torch)
         return Device(placed.type, placed.index)
 
-    def _queued_prefetch(
-        self, current: str, active: PreparedRequest
-    ) -> QueuedPrefetch | None:
+    def _queued_prefetch(self, current: str, active: PreparedRequest) -> QueuedPrefetch | None:
         """Snapshot one exact same-construction preparation; no device work under its lock."""
         from cozy_runtime.internal.residency import QueuedPrefetch
 
@@ -4591,6 +4589,102 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
+    def _prepare_program(self, command: Map) -> dict[str, Any]:
+        """A GPU warm command, alone under the existing process order and GPU permit.
+
+        Normal preflight and the declared factory run on the actual loaded models. This
+        neither enters the generation handler nor grants output or inference submission.
+        The returned readiness is a point-in-time fact, not a residency reservation.
+        """
+        record: AuthorAttempt | None = None
+        entered = False
+        reply: dict[str, Any]
+        try:
+            if command.level != "gpu" or not command.request_id:
+                raise InvalidRequest("program warming needs a GPU request", code="prepare_request")
+            if self.world != 1 or self.device_kind != "cuda":
+                raise CapabilityError(
+                    "program warming requires one CUDA device", code="prepare_device"
+                )
+            if not self.ready or self.poisoned:
+                raise CapabilityError("construction is not ready", code="executor_not_ready")
+            if command.entrypoint not in self.surface_names:
+                raise InvalidRequest("unknown warm entrypoint", code="unknown_entrypoint")
+            if not isinstance(command.payload, Mapping):
+                raise InvalidRequest(
+                    "warm payload must be a request object", code="prepare_payload"
+                )
+            registration = self.discovered.app.get(command.entrypoint)
+            if registration.prepare is None:
+                raise CapabilityError(
+                    "entrypoint declares no preparation factory", code="prepare_absent"
+                )
+            prepared = prepare(registration, command.payload)
+            if prepared.asset_bounds:
+                raise CapabilityError(
+                    "program warming takes no input assets", code="prepare_assets"
+                )
+            if self.host.mux.cancelled(command.request_id):
+                raise InvalidRequest("warm preparation was canceled", code="cancelled")
+            entered = True
+            refused = self._grant(self, first=True)
+            if refused is not None:
+                reply = refused
+            else:
+                with self._request(command.request_id):
+                    if prepared.phases:
+                        self._plan_request(command.request_id, prepared.phases)
+                    ready, record = prepare_program(
+                        registration,
+                        prepared,
+                        Invocation(
+                            request_id=command.request_id,
+                            spool=self.root / "preparation",
+                            deadline=float("inf"),
+                            device=self._device(),
+                            cancel=functools.partial(self.host.mux.cancelled, command.request_id),
+                            models=self.models,
+                            progress=self._progress_sink(command.request_id),
+                            plan=functools.partial(self._plan_request, command.request_id),
+                        ),
+                    )
+                reply = {"ok": True, "prepared": ready, **prepared.digests()}
+        except Exception as exc:
+            outcome = classify(exc)
+            unwind(exc)
+            reply = {
+                "ok": False,
+                "code": outcome.code,
+                "detail": ends(outcome.message, 1024),
+                "terminal": outcome.terminal,
+                "origin": outcome.origin,
+                "traceback": outcome.traceback,
+            }
+            if outcome.code == DEVICE_FAULT:
+                self.poisoned = (
+                    self.poisoned or f"preparation device fault: {outcome.message}"[:300]
+                )
+        finally:
+            self.host.cuts.pop(command.request_id, None)
+        quiet = not entered
+        if entered:
+            try:
+                # Capture warmups and fills may use side streams. The whole device joins
+                # before the permit can be reused, including clean eligibility refusals.
+                accel.synchronize(self.torch, self.device_kind)
+                if self.residency is not None:
+                    self.residency.release()
+                quiet = self._quiescent()
+            except Exception as exc:
+                self.poisoned = self.poisoned or f"preparation did not settle: {exc}"[:300]
+            if not quiet:
+                self.poisoned = self.poisoned or "preparation completion was not proven"
+        self.host.poisoned = self.host.poisoned or self.poisoned
+        if record is not None:
+            reply["observations"] = record.ring.rows()
+            reply["adjustments"] = [adjustment_row(row) for row in record.rows]
+        return {**reply, "quiescent": quiet, "poisoned": self.poisoned}
+
     def map(self, command: Map) -> dict[str, Any]:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
         of a group."""
@@ -4601,6 +4695,8 @@ class Executor:
             return self._refusal(
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
+        if command.payload is not None:
+            return child._prepare_program(command)
         group = self.group if self.rank == 0 else None
         try:
             if group is not None:
@@ -5113,7 +5209,9 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
     not take, ends the process, as either did when commands ran on the main thread; so does a
     `shutdown` that waited here for the calls before it, once answered."""
     try:
-        call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
+        call = (
+            str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS | {"map"} else ""
+        )
         _CALL.set(call)  # its wait for its turn is told as its own
         with turn:
             reply = _reply(executor, frame)
@@ -5122,7 +5220,7 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(code)
-            if frame.get("cmd") == "invoke":
+            if frame.get("cmd") in {"invoke", "map"} and call:
                 executor.mux.forget(call)
             _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)
     except BaseException as exc:
