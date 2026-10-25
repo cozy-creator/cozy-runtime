@@ -27,7 +27,8 @@ class Command(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True, tag
 
 
 class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
-    """Ordinary endpoint settings and an already supplied bearer credential."""
+    """Ordinary endpoint settings and an already supplied token: at the run's Hub, its signer's run
+    capability, presented as a bearer token."""
 
     endpoint: str
     token: str | None = None
@@ -40,8 +41,8 @@ class TensorFSOptions(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=T
 
 
 class Supplied(msgspec.Struct, frozen=True, kw_only=True):
-    """A signer's bearer for one endpoint, read off the seam in order (`Mux`): a `bearer` frame
-    (TensorD's newer one, unanswered) or what a Load or Invoke carries."""
+    """A signer's run capability for one endpoint, read off the seam in order (`Mux`): a
+    `capability` frame (TensorD's newer one, unanswered) or what a Load or Invoke carries."""
 
     actor: str = ""
     tensorfs: TensorFSOptions | None = None

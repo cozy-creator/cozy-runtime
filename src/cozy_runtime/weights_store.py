@@ -45,9 +45,9 @@ type PartData = tuple[str, str, Sequence[int], Data]
 
 
 class Bearers:
-    """Each signer's newest bearer for each endpoint, as TensorD gives them (a Load's or Invoke's
-    own, or a `bearer` frame): a bearer only ever goes to the endpoint it was given for. Of two,
-    the one that expires later stands; an unknown expiry (0) always replaces."""
+    """Each signer's newest run capability for each endpoint, as TensorD gives them (a Load's or
+    Invoke's own, or a `capability` frame): it only ever goes to the endpoint it was given for.
+    Of two, the one that expires later stands; an unknown expiry (0) always replaces."""
 
     def __init__(self) -> None:
         self._latest: dict[tuple[str, str], tuple[str, int]] = {}
@@ -71,9 +71,10 @@ class Bearers:
 
 @dataclass(frozen=True, slots=True)
 class Bearer:
-    """One call's TensorFS `token=` provider: its signer's newest bearer for its endpoint, asked
-    for every request's header, so a call that outlives its bearer keeps working once TensorD
-    sends a newer one. A 401 for a bearer replaced while it was in flight is asked once more."""
+    """One call's TensorFS `token=` provider: its signer's newest run capability for its endpoint,
+    presented as a bearer token and asked for every request's header, so a call that outlives one
+    keeps working once TensorD sends a newer one. A 401 for one replaced while it was in flight is
+    asked once more."""
 
     bearers: Bearers
     actor: str
@@ -103,7 +104,7 @@ class Bearer:
 
 @dataclass(frozen=True, slots=True)
 class Connection:
-    """The request's TensorFS endpoint and its bearer, when it was supplied one."""
+    """The request's TensorFS endpoint and its run capability, when it was supplied one."""
 
     endpoint: str | None = None
     token: str | Bearer | None = field(default=None, repr=False)
