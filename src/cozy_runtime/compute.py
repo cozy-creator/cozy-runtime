@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import time
 import weakref
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext, suppress
 from typing import TYPE_CHECKING, Any, NoReturn
 
@@ -144,6 +144,7 @@ class PreparedRepeat:
         load: Any = None,
         prefix: Callable[[], object] | None = None,
         suffix: Callable[[], object] | None = None,
+        dtypes: Mapping[object, Any] | None = None,
     ) -> PreparedRepeat:
         """Capture a fixed body, optionally fed by one native LoadSlot.
 
@@ -161,6 +162,12 @@ class PreparedRepeat:
         be submitted again with new input/state values at the same layouts and identities.
         All three phases share the declared mutable state and retained resident owners;
         this does not release phase weights or implement streaming between phases.
+
+        `dtypes` selects an explicit final float dtype for named placed component roots.
+        Stored bytes keep their original dtype; conversion fills managed final buffers once.
+        A changed representation retires older idle graphs before preparation. The selected
+        representation may remain cached after a preparation refusal; rollback covers the
+        declared mutable state, not cache contents. Resident-only capture refuses a change.
 
         Placed component roots are resolved to owned weight bindings. `resident_only=True`
         refuses missing weights before running the body; it never fills them for capture.
@@ -226,6 +233,30 @@ class PreparedRepeat:
         ):
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("prepare a repeat outside graph capture")
+            changes: list[Callable[[], None]] = []
+            for root, dtype in (dtypes or {}).items():
+                if not isinstance(root, torch.nn.Module) or not any(root is o for o in owners):
+                    raise CapabilityError(
+                        "prepared dtype keys must be component roots named in owners",
+                        code="prepared_graph_ineligible",
+                    )
+                placed = PLACED.get(root)
+                if placed is None:
+                    raise CapabilityError(
+                        "prepared dtype overrides require placed component roots",
+                        code="prepared_graph_ineligible",
+                    )
+                try:
+                    changes.append(
+                        placed[0].represent(placed[1], dtype, resident_only=resident_only)
+                    )
+                except StaleBinding as error:
+                    raise CapabilityError(str(error), code="prepared_graph_ineligible") from error
+            for change in changes:
+                try:
+                    change()
+                except StaleBinding as error:
+                    raise CapabilityError(str(error), code="prepared_graph_ineligible") from error
             resolved: list[object] = []
             bindings: dict[int, Any] = {}
             models: dict[int, Any] = {}

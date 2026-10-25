@@ -67,6 +67,7 @@ from cozy_runtime.internal.residency import (
     Region,
     Request,
     ResidencyError,
+    StaleBinding,
     TensorLayout,
     Weights,
     blocks_of,
@@ -648,6 +649,49 @@ class _Routes:
         return {f"{name.removesuffix('.weight')}.{buffer}": t for buffer, t in made.items()}
 
 
+class _PlainDtype:
+    """An immutable cast of ordinary stored values into managed final buffers."""
+
+    def __init__(self, base: _Routes, dtype: str) -> None:
+        if any(route != "verbatim" for route in base.routes.values()):
+            raise StaleBinding("prepared dtype overrides require plain stored weights")
+        self.base = base
+        layouts: dict[str, Mapping[str, TensorLayout]] = {}
+        for key in base.rows:
+            original = base.layout(key)
+            if original is None or any(value.source != "value" for value in original.values()):
+                raise StaleBinding("prepared dtype overrides require ordinary value layouts")
+            if any(
+                value.dtype.startswith("F") and value.dtype not in {"F16", "F32"}
+                for value in original.values()
+            ):
+                raise StaleBinding("prepared dtype overrides support F16, BF16 and F32 sources")
+            layouts[key] = MappingProxyType(
+                {
+                    name: TensorLayout(
+                        dtype if value.dtype in {"F16", "BF16", "F32"} else value.dtype,
+                        value.shape,
+                        value.strides,
+                        value.source,
+                    )
+                    for name, value in original.items()
+                }
+            )
+        self.layouts = MappingProxyType(layouts)
+        unchanged = all(dict(row) == dict(base.layout(key) or {}) for key, row in layouts.items())
+        self.identity = base.identity if unchanged else repr((base.identity, "plain-cast/1", dtype))
+
+    def layout(self, key: str) -> Mapping[str, TensorLayout]:
+        return self.layouts[key]
+
+    def write(
+        self, key: str, parts: Mapping[str, Tensor], destinations: Mapping[str, Tensor]
+    ) -> None:
+        # The original source remains in its stored dtype. copy_ casts directly into the
+        # final region; no unowned full-weight temporary or rounded-source round trip.
+        self.base.write(key, parts, destinations)
+
+
 def _float32(torch: ModuleType, root: Module) -> None:
     """A CPU computes 16-bit floats some two hundred times slower than float32 (torch's own CPU
     kernels: a 1024² matmul takes 2.0 s in bf16 and 9.5 ms in f32 on AVX2), so a CPU executor's
@@ -1038,6 +1082,19 @@ class Placement:
     def retain(self, component: str, paths: tuple[str, ...]) -> Any:
         """The region's address ownership, independent of its physical replay lease."""
         return self.models[component].retain(paths)
+
+    def represent(
+        self, component: str, dtype: Any, *, resident_only: bool = False
+    ) -> Callable[[], None]:
+        """Preflight every requested cast before capture applies any representation change."""
+        if dtype not in (self.torch.float16, self.torch.bfloat16, self.torch.float32):
+            raise StaleBinding("prepared weight dtype must be float16, bfloat16 or float32")
+        model = self.models[component]
+        base = model.declared_finals
+        if not isinstance(base, _Routes):
+            raise StaleBinding("prepared dtype overrides require the ordinary weight routes")
+        layout = _PlainDtype(base, TENSORFS_NAMES[canonical_dtype(dtype)])
+        return self.memory._configure_binding(model, layout, resident_only=resident_only)
 
     def graph_accounted(self) -> bool:
         return bool(self.memory.cuda)

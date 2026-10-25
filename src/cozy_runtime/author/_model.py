@@ -311,6 +311,12 @@ class Residency(Protocol):
         """Retain ordinary weight storage after prepare(), until the binding closes."""
         ...
 
+    def represent(
+        self, component: str, dtype: Any, *, resident_only: bool = False
+    ) -> Callable[[], None]:
+        """Validate a final representation and return its pre-capture metadata transition."""
+        ...
+
     def graph_accounted(self) -> bool:
         """Whether per-process driver/context bytes can be included in graph admission."""
         ...

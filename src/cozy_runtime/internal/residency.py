@@ -333,6 +333,7 @@ class Model:
         self.component = declared.weights.component
         self.name = f"{self.source.release}/{self.source.ck.id}/{self.component}"
         self.fill, self.bind, self.finals = declared.fill, declared.bind, declared.finals
+        self.declared_finals = declared.finals
         self.binding_identity = None if self.finals is None else self.finals.identity
         self.layout_identity = ""
         self.identity = self.wanted_identity()
@@ -948,6 +949,220 @@ class Memory:
         _hooks(model)
         self.models[module] = model
         return model
+
+    def _configure_binding(
+        self, model: Model, layout: BindingLayout, *, resident_only: bool = False
+    ) -> Callable[[], None]:
+        """Preflight a plain final-layout change; return its checked metadata transition.
+
+        Every allocation here is metadata, never GPU weight storage. The existing fill path
+        materializes the chosen representation after its new binding is retained.
+        """
+        if (
+            not self.cuda
+            or self.native is None
+            or self.device.index
+            not in (
+                None,
+                torch.cuda.current_device(),
+            )
+        ):
+            raise StaleBinding("prepared dtype overrides require the same native CUDA device")
+        if self.capturing():
+            raise StaleBinding("change weight representations before graph capture")
+        with self.lock:
+            generation = model.generation
+            targets: dict[str, str] = {}
+            target_shapes: dict[str, tuple[int, ...]] = {}
+            for block in model.groups():
+                for key in block.parts:
+                    declared = layout.layout(key)
+                    if declared is None:
+                        raise StaleBinding(
+                            "prepared dtype overrides require explicit final layouts"
+                        )
+                    for name, part in declared.items():
+                        if name in targets and (
+                            targets[name] != part.dtype or target_shapes[name] != part.shape
+                        ):
+                            raise StaleBinding("a tied weight has conflicting final dtypes")
+                        targets[name] = part.dtype
+                        target_shapes[name] = part.shape
+
+            def matches() -> bool:
+                return (
+                    not model.closed
+                    and model.binding_identity == layout.identity
+                    and all(
+                        (value := site.table[site.name]) is not None
+                        and tuple(value.shape) == target_shapes[name]
+                        and value.dtype == getattr(torch, _DTYPES[dtype])
+                        for name, dtype in targets.items()
+                        for site in model.sites.get(name, ())
+                    )
+                )
+
+            if matches():
+                return lambda: None
+            if resident_only:
+                raise StaleBinding(
+                    "resident-only capture cannot create a new weight representation"
+                )
+            if (
+                model.closed
+                or model.retiring
+                or model.users
+                or any(b.loading for b in model.groups())
+            ):
+                raise StaleBinding("weight representation is in use or being changed")
+            stored_sites = {
+                (id(site.table), site.name)
+                for name in targets
+                for site in model.sites.get(name, ())
+            }
+            for sites in model.sites.values():
+                for site in sites:
+                    value = site.table[site.name]
+                    if (
+                        (id(site.table), site.name) not in stored_sites
+                        and value is not None
+                        and value.is_floating_point()
+                    ):
+                        raise StaleBinding(
+                            "prepared dtype overrides require declared floating buffers"
+                        )
+            layouts: list[tuple[_Block, _Block]] = []
+            replacements: dict[int, tuple[list[_Site], Tensor]] = {}
+            for block in model.groups():
+                staged = _Block(model, block.path, block.index, block.parts)
+                _layout(staged, binding=layout, target_dtypes=targets)
+                layouts.append((block, staged))
+                for key in block.parts:
+                    for name, part in (layout.layout(key) or {}).items():
+                        sites = model.sites[name]
+                        if id(sites) not in replacements:
+                            held = _placeholder(
+                                model,
+                                block,
+                                sites,
+                                getattr(torch, _DTYPES[part.dtype]),
+                                staged.raw_views,
+                            )
+                            replacements[id(sites)] = sites, held
+            layout_identity = hashlib.sha256(
+                repr([(b.path, b.aliases, b.finals) for _, b in layouts]).encode()
+            ).hexdigest()
+            window = max([self.window_bytes, *(b.allocation_bytes for _, b in layouts)])
+
+        def apply() -> None:
+            if self.capturing():
+                raise StaleBinding("change weight representations before graph capture")
+            with self.lock:
+                if matches():
+                    return
+                if (
+                    model.closed
+                    or model.retiring
+                    or model.users
+                    or model.generation != generation
+                    or any(b.loading for b in model.groups())
+                ):
+                    raise StaleBinding("model changed after weight representation preflight")
+                model.retiring = True
+            try:
+                # Closing graphs can join CUDA or invoke Python owner destructors. Never
+                # hold the residency metadata lock across those operations.
+                if model.retire_graphs is not None:
+                    model.retire_graphs()
+                for hold in list(model.holds):
+                    hold.shed()
+                with self.lock:
+                    if self._prefetch is not None and self._prefetch.block.model is model:
+                        self._settle_prefetch(cancel=True)
+                    if model.users or any(
+                        b.count or b.retained or b.loading for b in model.groups()
+                    ):
+                        raise StaleBinding(
+                            "retire every weight user before changing representation"
+                        )
+                    # Check again before changing any site. External mutation is not a cast.
+                    for sites, held in replacements.values():
+                        if any(
+                            (current := site.table[site.name]) is None
+                            or tuple(current.shape) != tuple(held.shape)
+                            for site in sites
+                        ):
+                            raise StaleBinding(
+                                "weight geometry changed during representation retirement"
+                            )
+                    fill = "stored" if model.fill is None else model.fill.identity
+                    identity = (
+                        None if fill is None else repr((fill, layout.identity, layout_identity))
+                    )
+                    # This can refuse before metadata publication. A larger temporary
+                    # streaming margin is conservative if a subsequent cache drop fails.
+                    self.native.set_streaming_limit(window)
+                    self.window_bytes = window
+                    old_model = (
+                        model.finals,
+                        model.binding_identity,
+                        model.layout_identity,
+                        model.identity,
+                        model.generation,
+                        model.prefix,
+                    )
+                    old_sites = [
+                        (site, site.table[site.name])
+                        for sites, _ in replacements.values()
+                        for site in sites
+                    ]
+                    old_layouts = [
+                        (block, block.aliases, block.finals, block.raw_views)
+                        for block, _ in layouts
+                    ]
+                    # Reserve no bytes here. Old escaped aliases own their old reservations;
+                    # a later fill gets fresh final backing, never their rounded contents.
+                    for block, _ in layouts:
+                        self._discard(block, forget=True)
+                    try:
+                        for sites, held in replacements.values():
+                            for site in sites:
+                                site.table[site.name] = held
+                        for block, staged in layouts:
+                            block.aliases, block.finals = staged.aliases, staged.finals
+                            block.raw_views = staged.raw_views
+                        model.finals = layout
+                        model.binding_identity = layout.identity
+                        model.layout_identity = layout_identity
+                        model.identity = identity
+                        model.generation += 1
+                        model.prefix = None
+                    except BaseException:
+                        for site, value in old_sites:
+                            site.table[site.name] = value
+                        for block, aliases, finals, raw_views in old_layouts:
+                            block.aliases, block.finals, block.raw_views = (
+                                aliases,
+                                finals,
+                                raw_views,
+                            )
+                        (
+                            model.finals,
+                            model.binding_identity,
+                            model.layout_identity,
+                            model.identity,
+                            model.generation,
+                            model.prefix,
+                        ) = old_model
+                        raise
+                    finally:
+                        # Next use recomputes headroom even if only cache retirement succeeded.
+                        self._phase_names = frozenset()
+            finally:
+                with self.lock:
+                    model.retiring = False
+
+        return apply
 
     def _declare(self, model: Model) -> None:
         if model.finals is not None and model.finals.identity != model.binding_identity:
@@ -1997,17 +2212,23 @@ def _strides(shape: Sequence[int]) -> tuple[int, ...]:
     return tuple(reversed(out))
 
 
-def _layout(block: _Block) -> None:
-    """Validate final geometry once, before placeholders or any GPU bytes exist."""
+def _layout(
+    block: _Block,
+    *,
+    binding: BindingLayout | None = None,
+    target_dtypes: Mapping[str, str] | None = None,
+) -> None:
+    """Validate final geometry before its placeholders or backing are published."""
     model = block.model
-    if model.finals is None and model.bind is not None:
+    binding = model.finals if binding is None else binding
+    if binding is None and model.bind is not None:
         return  # An arbitrary binder has not declared immutable final bytes.
     aliases: dict[str, dict[str, str]] = {}
     finals: dict[str, dict[str, _Part]] = {}
     codes = {kind: code for code, kind in _DTYPES.items() if code != "F4"}
     for key, parts in block.parts.items():
-        if model.finals is not None:
-            declared = model.finals.layout(key)
+        if binding is not None:
+            declared = binding.layout(key)
             if declared is None:
                 return  # The provider explicitly declines final-buffer caching here.
         else:
@@ -2032,7 +2253,10 @@ def _layout(block: _Block) -> None:
             target = model.sites[name][0].table[model.sites[name][0].name]
             if (
                 tuple(target.shape) != shape
-                or codes.get(str(target.dtype).removeprefix("torch.")) != layout.dtype
+                or (target_dtypes or {}).get(
+                    name, codes.get(str(target.dtype).removeprefix("torch."))
+                )
+                != layout.dtype
             ):
                 raise ResidencyError(f"{name}: final layout disagrees with target shape or dtype")
             if layout.dtype not in _DTYPES or layout.dtype == "F4":
@@ -2065,6 +2289,29 @@ def _layout(block: _Block) -> None:
                 offset += (part.nbytes + 255) // 256 * 256
 
 
+def _placeholder(
+    model: Model,
+    block: _Block,
+    sites: list[_Site],
+    dtype: Any,
+    raw_views: Mapping[tuple[int, str], tuple[int, _Part]],
+) -> Tensor:
+    meta = sites[0].table[sites[0].name]
+    held = Placeholder(meta.shape, dtype, model.memory.device)
+    if sites[0].parameter:
+        held = nn.Parameter(held, requires_grad=False)
+
+    def read(
+        b: _Block = block,
+        site: _Site = sites[0],
+        raw_view: tuple[int, _Part] | None = raw_views.get((id(sites[0].table), sites[0].name)),
+    ) -> Tensor:
+        return model.memory._read(b, site, raw_view)
+
+    held._varena_read = read
+    return held
+
+
 def _placeholders(model: Model) -> None:
     done: set[int] = set()
     for name, sites in model.sites.items():
@@ -2078,20 +2325,7 @@ def _placeholders(model: Model) -> None:
             block = model.blocks.get(path) or model.common
         if block is None:
             raise ResidencyError(f"{model.name}: no stored group for {name}")
-        held = Placeholder(meta.shape, meta.dtype, model.memory.device)
-        if sites[0].parameter:
-            held = nn.Parameter(held, requires_grad=False)
-
-        def read(
-            b: _Block = block,
-            site: _Site = sites[0],
-            raw_view: tuple[int, _Part] | None = block.raw_views.get(
-                (id(sites[0].table), sites[0].name)
-            ),
-        ) -> Tensor:
-            return model.memory._read(b, site, raw_view)
-
-        held._varena_read = read
+        held = _placeholder(model, block, sites, meta.dtype, block.raw_views)
         for site in sites:
             site.table[site.name] = held
 
