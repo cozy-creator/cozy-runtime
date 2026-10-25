@@ -738,7 +738,8 @@ class Memory:
                 self.native = varena.Arena(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = bool(
-                    getattr(varena, "supports_prefetch", lambda: False)()
+                    callable(getattr(varena, "replay", None))
+                    and getattr(varena, "supports_prefetch", lambda: False)()
                 )
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
