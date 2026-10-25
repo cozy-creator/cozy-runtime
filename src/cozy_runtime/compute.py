@@ -445,16 +445,16 @@ class PreparedRepeat:
                         target.copy_(original)
                 stream.synchronize()
                 probe("after-warmup-before-capture")
-                with varena.capture(device), torch.cuda.stream(stream), CaptureOwners(True):
-                    graph.capture_begin(capture_error_mode="global")
-                    try:
+                try:
+                    with (
+                        varena.capture(device),
+                        CaptureOwners(True),
+                        torch.cuda.graph(graph, stream=stream, capture_error_mode="global"),
+                    ):
                         step(index)
-                    finally:
-                        try:
-                            graph.capture_end()
-                        except BaseException as error:
-                            annotate(error)
-                            raise
+                except BaseException as error:
+                    annotate(error)
+                    raise
                 stream.synchronize()
                 for target, original in zip(tensors, saved, strict=True):
                     target.copy_(original)
