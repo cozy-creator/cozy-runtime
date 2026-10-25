@@ -62,6 +62,8 @@ class Probe(Command, frozen=True, kw_only=True, tag="probe"):
 
 
 class Join(Command, frozen=True, kw_only=True, tag="join"):
+    """A follower's first half: rank 0's store reached, then it says it is ready (`Form`)."""
+
     port: int
     backend: str = "nccl"
     #: A socket follows: a byte on it aborts this follower's collectives (`RankGroup.interrupt`).
@@ -70,6 +72,11 @@ class Join(Command, frozen=True, kw_only=True, tag="join"):
     again: bool = False
     #: The NCCL route rank 0 chose from the group's measured links; set before joining.
     nccl: dict[str, str] = {}
+
+
+class Form(Command, frozen=True, kw_only=True, tag="form"):
+    """Every follower said it is ready: all GPUs enter group init together."""
+
     #: Every GPU then times NCCL against its copy engines (`copy_engine.calibrate`).
     calibrate: bool = False
 
@@ -89,6 +96,9 @@ class Map(Command, frozen=True, kw_only=True, tag="map"):
 
     construction: str
     level: Literal["gpu", "ram"] = "gpu"
+    request_id: str = ""
+    entrypoint: str = ""
+    payload: Json | None = None
 
 
 class Unload(Command, frozen=True, kw_only=True, tag="unload"):
@@ -119,6 +129,8 @@ class Attention(Command, frozen=True, kw_only=True, tag="attention"):
     adopt: Choice | UnsetType = UNSET
     #: rank 0 asks while it serves a request: this GPU opens no kernel on its own thread
     serving: bool = False
+    #: the kernels the group serves from here (`kernel_ready.agreed`)
+    kernels: tuple[str, ...] = ()
 
 
 class Kernels(Command, frozen=True, kw_only=True, tag="kernels"):
@@ -340,6 +352,7 @@ type KnownCommand = (
     | Shutdown
     | Probe
     | Join
+    | Form
     | Fork
     | Map
     | Unload

@@ -17,7 +17,7 @@ import msgspec
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._errors import MEMORY_EXHAUSTED, Cancelled, classify
 from cozy_runtime.author._model import remote_scope
-from cozy_runtime.internal import attention_sol, execution_evidence
+from cozy_runtime.internal import attention_sol, execution_evidence, kernel_ready
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import ENDED, SHORT, RankGroup, SpreadLog
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -97,7 +97,9 @@ def mirror_component(
                         ended.append((0, code or ENDED, f"{type(exc).__name__}: {exc}"))
                         group.interrupt()  # the followers wait on GPU 0 in a collective
                     try:
-                        frames = list(zip(group.followers, group.collect("run"), strict=True))
+                        frames = list(
+                            zip(group.followers, group.collect("run", shown=False), strict=True)
+                        )
                     except GroupRefusal as lost:
                         if failure is None:
                             raise
@@ -283,7 +285,7 @@ def install_spread(
             calls["0"] = calls.get("0", 0) + 1
             for rank, index, args, _payloads in sent:
                 result = wire.recv_tensor(rank, group.pg, device)
-                reply = _accept(name, group, rank, group.reply_one(rank, "run"))
+                reply = _accept(name, group, rank, group.reply_one(rank, "run", shown=False))
                 if result is None:
                     declined[str(rank)] = (reply.declined or "declined")[:300]
                     log["declined"][str(rank)] = declined[str(rank)]
@@ -437,6 +439,7 @@ def _command(
         args=[wire.marshal(a, payloads, path=f"args[{i}]") for i, a in enumerate(args)],
         kwargs={k: wire.marshal(v, payloads, path=k) for k, v in kwargs.items()},
         broadcast=broadcast,
+        kernels=kernel_ready.agreed(),
     )
     return command, payloads
 
@@ -458,6 +461,8 @@ def _accept(
             code=reply.code or "group_broken",
         )
     group.working_peaks[rank] = max(group.working_peaks.get(rank, 0), reply.working_peak_bytes)
+    kernel_ready.report(rank, reply.kernels)
+    group.began.extend((rank, kernel) for kernel in reply.began)
     if reply.evidence is not None:
         execution_evidence.widen(group.rank_records, rank, reply.evidence)
     return reply

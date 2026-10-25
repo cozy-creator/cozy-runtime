@@ -108,6 +108,7 @@ from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
     prepare,
+    prepare_program,
     run_prepared,
 )
 from cozy_runtime.author._model import (
@@ -164,6 +165,7 @@ from cozy_runtime.internal.executor_commands import (
     Binding,
     CallInterface,
     Fork,
+    Form,
     GroupHardware,
     Hello,
     Invoke,
@@ -201,7 +203,8 @@ from cozy_runtime.internal.parallel.group import (
     RankGroup,
     RankSpec,
     abort_process_group,
-    join_rank,
+    form_rank,
+    ready_rank,
 )
 from cozy_runtime.internal.parallel.mirror import mirror_component
 from cozy_runtime.internal.parallel.plan import (
@@ -395,9 +398,7 @@ def _replay_code(command: Invoke, request: str) -> str:
     return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
 
 
-def _show_checkpoint(
-    exchange: Exchange, slot: str, repo_id: str, revision: str
-) -> None:
+def _show_checkpoint(exchange: Exchange, slot: str, repo_id: str, revision: str) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
     item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision)
     answer = exchange(item, Answer)
@@ -832,8 +833,14 @@ class Executor:
         #: world spawns and drives the followers; a follower's channel is rank 0's seam.
         self.rank = int(rank)
         self.world = int(world)
+        if self.world > 1:
+            kernel_ready.group(self.rank, self.world)
         self.group: RankGroup | None = None
+        #: the kernels that began serving as this attempt was admitted (`_grant`)
+        self._granted: list[str] = []
         self.pg: Any = None
+        #: between `join` and `form`: this follower's rank spec and the store it reached
+        self._forming: tuple[RankSpec, Any] | None = None
         #: HOST ONLY: the group's handle as every installed component reads it (`CpComms`)
         self.comms: cp.CpComms | None = None
         #: rank 0 only: the measured links and route this group formed over
@@ -918,6 +925,8 @@ class Executor:
                 return self.hello()
             case Join():
                 return self.join(command)
+            case Form():
+                return self.form(command)
             case Attention():
                 return self.select_attention(command)
             case Kernels():
@@ -968,6 +977,7 @@ class Executor:
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
+            "program_preparation": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -1109,9 +1119,11 @@ class Executor:
         return torch.device("cpu")
 
     def join(self, command: Join) -> dict[str, Any]:
-        """A FOLLOWER joins rank 0's store and forms its half of the process group."""
+        """A FOLLOWER's first half of the group: rank 0's store reached and its device current.
+        Its answer is the readiness every GPU gives before any enters group init (`form`)."""
         if self.rank == 0:
             return {"ok": False, "code": "not_a_follower", "detail": f"{_gpu(0)} forms the group"}
+        self._forming = None
         if command.abort:
             watcher = socket.socket(fileno=self.channel.recv_descriptor())
             threading.Thread(
@@ -1145,25 +1157,44 @@ class Executor:
                 self.poisoned = f"join refused: {refused['code']}"
                 return refused
         try:
-            self.pg = join_rank(torch, spec, _SEALED)
+            self._forming = (spec, ready_rank(torch, spec, _SEALED))
         except Exception as exc:
-            self.poisoned = f"join failed: {type(exc).__name__}"
+            return self._unformed(exc, "join")
+        return {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
+
+    def form(self, command: Form) -> dict[str, Any]:
+        """A FOLLOWER's second half: every GPU said it is ready, so it enters group init."""
+        forming, self._forming = self._forming, None
+        if forming is None:
             return {
                 "ok": False,
                 "code": "group_unformed",
-                "detail": f"{_gpu(self.rank)} could not join the group: "
-                f"{type(exc).__name__}: {exc}"[:900],
-                "traceback": prepare_diagnostics.exception_trace(exc),
+                "detail": f"{_gpu(self.rank)} was not joined",
             }
+        spec, store = forming
+        try:
+            self.pg = form_rank(self.torch, spec, store)
+        except Exception as exc:
+            return self._unformed(exc, "form")
         if self.comms is not None:
             self.comms.pg = self.pg
         reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
         if command.calibrate:
             exchange, reply["calibration"] = copy_engine.calibrate(
-                torch, self.pg, self.rank, self.world
+                self.torch, self.pg, self.rank, self.world
             )
             copy_engine.install(exchange, self.pg)
         return reply
+
+    def _unformed(self, exc: Exception, step: str) -> dict[str, Any]:
+        self.poisoned = f"{step} failed: {type(exc).__name__}"
+        detail = f"{_gpu(self.rank)} could not {step} the group: {type(exc).__name__}: {exc}"
+        return {
+            "ok": False,
+            "code": "group_unformed",
+            "detail": detail[:900],
+            "traceback": prepare_diagnostics.exception_trace(exc),
+        }
 
     def _calibrated(self, pg: Any) -> None:
         """Rank 0's half of the formation's calibration: NCCL against the copy engines."""
@@ -1176,8 +1207,12 @@ class Executor:
         """A follower's collectives end when rank 0 says so (`RankGroup.interrupt`): its main
         thread may be inside one, where no command reaches it."""
         with watcher:
-            while watcher.recv(1):
-                abort_process_group()
+            try:
+                while watcher.recv(1):
+                    abort_process_group()
+                    self._interrupted.set()
+            finally:
+                # Ended (rank 0 closed it, or the abort raised): a join waiting on it goes on.
                 self._interrupted.set()
 
     def _group_reform(self) -> None:
@@ -1631,6 +1666,7 @@ class Executor:
         try:
             if degree > 1 and self.rank == 0:
                 self.world = degree
+                kernel_ready.group(0, degree)
                 if self.group is None:
                     self.group = RankGroup(
                         degree=degree,
@@ -1640,6 +1676,7 @@ class Executor:
                         forward=self.channel.send,
                         devices=_sealed_entries(),
                         launch=self._follower,
+                        waiting=functools.partial(_waiting, self.channel),
                     )
                 if not self.group.followers:
                     self.group.spawn()
@@ -1713,7 +1750,11 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only:
-                    measured = links.measured(links.directory(_SEALED), _sealed_entries()[:degree])
+                    measured = links.measured(
+                        links.directory(_SEALED),
+                        _sealed_entries()[:degree],
+                        functools.partial(_waiting, self.channel),
+                    )
                     stage("group_links")
                     self.transport = links.Transport(
                         degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured
@@ -2668,6 +2709,7 @@ class Executor:
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
             for follower, reply in zip(self.group.followers, replies, strict=True):
+                kernel_ready.report(follower.rank, reply.get("kernels") or {})
                 if not reply.get("ok"):
                     code = str(reply.get("code") or "group_unformed")
                     return self._group_refusal(
@@ -3087,7 +3129,7 @@ class Executor:
         with self.in_flight.attempt(alone, command.request_id) as slot, request_path.serving():
             # Admitted only now: an attempt before it may have poisoned the generation. Its
             # record is taken once nothing can refuse it, so a refused call may come again.
-            refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
+            refused = target._unadmitted(command) or self._grant(target, first=slot.first)
             if not alone:
                 self.in_flight.ready()
             if refused is not None:
@@ -3102,12 +3144,12 @@ class Executor:
         reply["poisoned"] = self.poisoned
         return reply
 
-    def _grant(self, target: Executor, command: Invoke, *, first: bool) -> Frame | None:
+    def _grant(self, target: Executor, *, first: bool) -> Frame | None:
         """The kernels that became ready, installed while no call is in a scope (a group none
         of whose GPUs may serve otherwise refuses); the first attempt in also opens the
         residency's attempt."""
         turn = object()
-        kernel_ready.boundary()
+        target._granted = kernel_ready.boundary()
         with SCOPES.held(turn):
             target._upgrade_attention(turn)
             refused = target._install_ready_kernels()
@@ -3301,11 +3343,21 @@ class Executor:
         # (`_upgrade_attention`): each selection the run served and from which step.
         segments: list[dict[str, Any]] = []
         later: list[attention.Applied] = []
-        #: each kernel that became ready mid-run, and the step from which it served
-        swapped: list[tuple[str, dict[str, str | int]]] = []
+        #: each kernel that became ready mid-run, and the step from which it served; in a
+        #: group, on which GPU
+        here: dict[str, str | int] = {} if self.group is None else {"gpu": self.group.gpu(0)}
+        point = [{"stage": "", "step": 0, **here}]  # the last boundary
+        swapped = [(name, point[0]) for name in self._granted]
         steps: dict[str, int] = {}
         stage = [""]  # the last stage this attempt itself reported
         handler = threading.get_ident()
+
+        def followed() -> None:
+            """What each follower began serving since the last boundary, at it."""
+            if self.group is not None:
+                began, self.group.began = self.group.began, []
+                gpu = self.group.gpu
+                swapped.extend((kernel, {**point[0], "gpu": gpu(rank)}) for rank, kernel in began)
 
         def boundary(frame: Any) -> None:
             progress(frame)
@@ -3313,9 +3365,10 @@ class Executor:
                 stage[0] = frame.stage
             if not isinstance(frame, ProgressFrame) or threading.get_ident() != handler:
                 return
+            followed()
             if frame.position is not None:
                 steps[frame.stage] = frame.position
-            at: dict[str, str | int] = {"stage": frame.stage, "step": steps.get(frame.stage, 0)}
+            at = point[0] = {"stage": frame.stage, "step": steps.get(frame.stage, 0), **here}
             swapped.extend((name, at) for name in kernel_ready.boundary())
             if pin or served_attention is None:
                 return  # an override holds its kernel for every step
@@ -3443,6 +3496,7 @@ class Executor:
                 took = {"ms": round(ms, 1), "times": times}
                 record.emit("confession", "request_path.blocking", work, **took)
                 record.emit("log", "kernel work blocked the request", "warn", work=work, **took)
+            followed()
             for name, where in swapped:
                 record.emit("confession", "kernel.ready", name, **where)
             members = self.model_executors or [self]
@@ -3919,10 +3973,13 @@ class Executor:
                             model_key=self._group_model_key,
                             adopt=mine,
                             serving=request_path.in_flight(),
+                            kernels=kernel_ready.agreed(),
                         )
                     )
                 )
                 replies = self.group.collect("attention")
+                for follower, reply in zip(self.group.followers, replies, strict=True):
+                    self.group.began.extend((follower.rank, k) for k in reply.get("began") or ())
             except GroupRefusal as exc:
                 return self._group_refusal(exc)
             lacking = {
@@ -3992,8 +4049,9 @@ class Executor:
         """A FOLLOWER restores its prepared selection and, given rank 0's `pin` for the next
         attempt (empty is the prepared one), holds it and answers what its sites now hold."""
         if command.adopt is not UNSET:
+            began = kernel_ready.boundary(command.kernels)
             with request_path.serving() if command.serving else contextlib.nullcontext():
-                return self._adopt_attention(command, command.adopt)
+                return {**self._adopt_attention(command, command.adopt), "began": began}
         self._attention_hold.close()
         self._producer_hold = None
         if command.pin is UNSET:
@@ -4449,9 +4507,7 @@ class Executor:
         placed = self._rank_device(self.torch)
         return Device(placed.type, placed.index)
 
-    def _queued_prefetch(
-        self, current: str, active: PreparedRequest
-    ) -> QueuedPrefetch | None:
+    def _queued_prefetch(self, current: str, active: PreparedRequest) -> QueuedPrefetch | None:
         """Snapshot one exact same-construction preparation; no device work under its lock."""
         from cozy_runtime.internal.residency import QueuedPrefetch
 
@@ -4533,6 +4589,102 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
+    def _prepare_program(self, command: Map) -> dict[str, Any]:
+        """A GPU warm command, alone under the existing process order and GPU permit.
+
+        Normal preflight and the declared factory run on the actual loaded models. This
+        neither enters the generation handler nor grants output or inference submission.
+        The returned readiness is a point-in-time fact, not a residency reservation.
+        """
+        record: AuthorAttempt | None = None
+        entered = False
+        reply: dict[str, Any]
+        try:
+            if command.level != "gpu" or not command.request_id:
+                raise InvalidRequest("program warming needs a GPU request", code="prepare_request")
+            if self.world != 1 or self.device_kind != "cuda":
+                raise CapabilityError(
+                    "program warming requires one CUDA device", code="prepare_device"
+                )
+            if not self.ready or self.poisoned:
+                raise CapabilityError("construction is not ready", code="executor_not_ready")
+            if command.entrypoint not in self.surface_names:
+                raise InvalidRequest("unknown warm entrypoint", code="unknown_entrypoint")
+            if not isinstance(command.payload, Mapping):
+                raise InvalidRequest(
+                    "warm payload must be a request object", code="prepare_payload"
+                )
+            registration = self.discovered.app.get(command.entrypoint)
+            if registration.prepare is None:
+                raise CapabilityError(
+                    "entrypoint declares no preparation factory", code="prepare_absent"
+                )
+            prepared = prepare(registration, command.payload)
+            if prepared.asset_bounds:
+                raise CapabilityError(
+                    "program warming takes no input assets", code="prepare_assets"
+                )
+            if self.host.mux.cancelled(command.request_id):
+                raise InvalidRequest("warm preparation was canceled", code="cancelled")
+            entered = True
+            refused = self._grant(self, first=True)
+            if refused is not None:
+                reply = refused
+            else:
+                with self._request(command.request_id):
+                    if prepared.phases:
+                        self._plan_request(command.request_id, prepared.phases)
+                    ready, record = prepare_program(
+                        registration,
+                        prepared,
+                        Invocation(
+                            request_id=command.request_id,
+                            spool=self.root / "preparation",
+                            deadline=float("inf"),
+                            device=self._device(),
+                            cancel=functools.partial(self.host.mux.cancelled, command.request_id),
+                            models=self.models,
+                            progress=self._progress_sink(command.request_id),
+                            plan=functools.partial(self._plan_request, command.request_id),
+                        ),
+                    )
+                reply = {"ok": True, "prepared": ready, **prepared.digests()}
+        except Exception as exc:
+            outcome = classify(exc)
+            unwind(exc)
+            reply = {
+                "ok": False,
+                "code": outcome.code,
+                "detail": ends(outcome.message, 1024),
+                "terminal": outcome.terminal,
+                "origin": outcome.origin,
+                "traceback": outcome.traceback,
+            }
+            if outcome.code == DEVICE_FAULT:
+                self.poisoned = (
+                    self.poisoned or f"preparation device fault: {outcome.message}"[:300]
+                )
+        finally:
+            self.host.cuts.pop(command.request_id, None)
+        quiet = not entered
+        if entered:
+            try:
+                # Capture warmups and fills may use side streams. The whole device joins
+                # before the permit can be reused, including clean eligibility refusals.
+                accel.synchronize(self.torch, self.device_kind)
+                if self.residency is not None:
+                    self.residency.release()
+                quiet = self._quiescent()
+            except Exception as exc:
+                self.poisoned = self.poisoned or f"preparation did not settle: {exc}"[:300]
+            if not quiet:
+                self.poisoned = self.poisoned or "preparation completion was not proven"
+        self.host.poisoned = self.host.poisoned or self.poisoned
+        if record is not None:
+            reply["observations"] = record.ring.rows()
+            reply["adjustments"] = [adjustment_row(row) for row in record.rows]
+        return {**reply, "quiescent": quiet, "poisoned": self.poisoned}
+
     def map(self, command: Map) -> dict[str, Any]:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
         of a group."""
@@ -4543,6 +4695,8 @@ class Executor:
             return self._refusal(
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
+        if command.payload is not None:
+            return child._prepare_program(command)
         group = self.group if self.rank == 0 else None
         try:
             if group is not None:
@@ -4773,6 +4927,7 @@ _FOLLOWER_COMMANDS = frozenset(
         "hello",
         "start",
         "join",
+        "form",
         "load",
         "activate",
         "unload",
@@ -4800,18 +4955,24 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
             "detail": f"{_gpu(executor.rank)} answers {sorted(_FOLLOWER_COMMANDS)}, not {name!r}",
         }
     if name == "run":
-        # A follower's call serves rank 0's request: what landed before it serves in it.
+        # A follower's call serves rank 0's request, with the kernels the group serves from it.
         with request_path.serving():
-            kernel_ready.boundary()
-            return executor.run(frame)
+            began = kernel_ready.boundary(frame.get("kernels") or ())
+            reply = executor.run(frame)
+        return {**reply, "kernels": kernel_ready.pending(), "began": began}
     if name not in executor_commands.NAMES:
         return {"ok": False, "code": "unknown_command", "detail": name}
     command = executor_commands.decode(frame)
-    return None if isinstance(command, Shutdown) else executor.handle(command)
+    if isinstance(command, Shutdown):
+        return None
+    reply = executor.handle(command)
+    if name == "load" and executor.rank:  # what it opened loading: the group may serve it at once
+        reply["kernels"] = kernel_ready.pending()
+    return reply
 
 
 #: The commands whose refusals carry the raising traceback to the worker.
-_TRACED_COMMANDS = frozenset({"start", "load", "join"})
+_TRACED_COMMANDS = frozenset({"start", "load", "join", "form"})
 
 #: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
 #: forming, named with the follower's own detail.
@@ -5048,7 +5209,9 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
     not take, ends the process, as either did when commands ran on the main thread; so does a
     `shutdown` that waited here for the calls before it, once answered."""
     try:
-        call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
+        call = (
+            str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS | {"map"} else ""
+        )
         _CALL.set(call)  # its wait for its turn is told as its own
         with turn:
             reply = _reply(executor, frame)
@@ -5057,7 +5220,7 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(code)
-            if frame.get("cmd") == "invoke":
+            if frame.get("cmd") in {"invoke", "map"} and call:
                 executor.mux.forget(call)
             _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)
     except BaseException as exc:

@@ -159,6 +159,7 @@ from cozy_runtime.author._recipes import (
 )
 from cozy_runtime.author._services import (
     AdjustmentRow,
+    AdjustmentRows,
     Adjustments,
     Egress,
     EgressResponse,
@@ -196,6 +197,7 @@ __all__ = [
     "AdapterCompatibility",
     "AdapterRef",
     "AdjustmentRow",
+    "AdjustmentRows",
     "Adjustments",
     "App",
     "Artifact",

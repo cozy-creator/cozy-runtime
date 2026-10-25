@@ -15,13 +15,20 @@ serving and where. `epoch` counts the changes (`LANDED`), for what keys on the k
 
 Every opener ends in `verified`: the kernel serves once its probe agrees with the exact law on
 this card (`verify`). A call asks through `serve`, which keeps a CUDA graph's recording whole.
+
+In a group every GPU switches at the same boundary, or none does. Each follower states its
+kernels in its load's and every call's reply (`pending`, `report`); at its boundary rank 0 serves
+what landed on some GPU and opens or failed on none, and sends that with its next call to each
+follower, which serves it from that call on. A GPU that never asked for an agreed kernel opens it
+at its first ask: it is built on this machine, since another GPU serves it.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, cast
@@ -48,6 +55,13 @@ class _Slot:
 
 _SLOTS: dict[str, _Slot] = {}
 _LOCK = threading.Lock()
+#: In a group: this GPU's index as its slots name it (`cuda:1`), shared as `cuda:*`, and the
+#: group's size. Alone: None.
+_GROUP: list[tuple[re.Pattern[str], int] | None] = [None]
+#: In a group, the kernels every GPU serves: rank 0's decisions so far, as the group names them.
+_AGREED: set[str] = set()
+#: Rank 0 of a group: each follower's kernels not serving yet, as its latest reply stated them.
+_REPORTS: dict[int, dict[str, str]] = {}
 #: A background opener's thread name, before its kernel's.
 THREAD = "kernel-ready: "
 #: `triton_kernels.opened(kernels, probe, wait, *, device)`: a Runtime Triton set's opener,
@@ -62,12 +76,17 @@ class Refused(RuntimeError):
 
 def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
     """`name`'s kernel once it serves here, else None: opening (started now by `opener` if it
-    was not), or failed. Never blocks a request."""
+    was not), or failed. Never blocks a request, except to open a kernel its group serves."""
     quiet = not request_path.in_flight()
+    grouped = _GROUP[0] is not None
+    if grouped and opener is not None and _AGREED and _shared(name) in _AGREED:
+        held = _SLOTS.get(name)
+        if held is None or held.state != "ready":
+            return wait(name, opener)
     with _LOCK:
         slot = _SLOTS.get(name)
         if slot is not None or opener is None:
-            if slot is not None and slot.state == "landed" and quiet:
+            if slot is not None and slot.state == "landed" and quiet and not grouped:
                 slot.state = "ready"
                 LANDED[0] += 1
             return cast("T", slot.value) if slot is not None and slot.state == "ready" else None
@@ -81,8 +100,8 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
                 raise  # the memory manager's to answer
             return None
         if value is not None:
-            _landed(slot, value, "ready")
-            return value
+            _landed(slot, value, "landed" if grouped else "ready")
+            return None if grouped else value
     opening = threading.Thread(target=_background, args=(name, slot, opener), daemon=True)
     opening.name = f"{THREAD}{name}"
     opening.start()
@@ -193,15 +212,66 @@ def failures(prefix: str) -> dict[str, Exception]:
         return {n: s.error for n, s in _SLOTS.items() if n.startswith(prefix) and s.error}
 
 
-def boundary() -> list[str]:
+def boundary(agreed: Iterable[str] | None = None) -> list[str]:
     """A boundary of a request: every kernel that landed since serves from here on. Their
-    names."""
+    names. In a group, only the kernels the group serves: rank 0 decides (`agreed` None), a
+    follower takes rank 0's decision."""
     with _LOCK:
-        landed = [name for name, slot in _SLOTS.items() if slot.state == "landed"]
+        if _GROUP[0] is not None:
+            _AGREED.update(_decided() if agreed is None else agreed)
+        landed = [
+            name
+            for name, slot in _SLOTS.items()
+            if slot.state == "landed" and (_GROUP[0] is None or _shared(name) in _AGREED)
+        ]
         for name in landed:
             _SLOTS[name].state = "ready"
         LANDED[0] += bool(landed)
     return landed
+
+
+def group(index: int, world: int) -> None:
+    """This process is GPU `index` of a group of `world`: its kernels change only as the group's
+    do (`boundary`)."""
+    _GROUP[0] = (re.compile(rf"\bcuda:{index}\b"), world)
+
+
+def agreed() -> tuple[str, ...]:
+    """What rank 0 decided the group serves, for its next call to each follower."""
+    with _LOCK:
+        return tuple(sorted(_AGREED))
+
+
+def pending() -> dict[str, str]:
+    """This GPU's kernels not serving yet, as the group names them: opening, landed or failed."""
+    with _LOCK:
+        return _pending()
+
+
+def _pending() -> dict[str, str]:
+    return {_shared(name): slot.state for name, slot in _SLOTS.items() if slot.state != "ready"}
+
+
+def report(rank: int, kernels: Mapping[str, str]) -> None:
+    """Rank 0: follower `rank`'s `pending`, from its latest reply."""
+    with _LOCK:
+        _REPORTS[rank] = dict(kernels)
+
+
+def _decided() -> set[str]:
+    """Rank 0's decision: a kernel landed on some GPU that none still opens or failed. Nothing
+    until every follower has stated its kernels once."""
+    assert _GROUP[0] is not None
+    if len(_REPORTS) < _GROUP[0][1] - 1:
+        return set()
+    states = [_pending(), *_REPORTS.values()]
+    landed = {name for state in states for name, at in state.items() if at == "landed"}
+    return landed - {name for state in states for name, at in state.items() if at != "landed"}
+
+
+def _shared(name: str) -> str:
+    """`name` as every GPU of the group names it: its device index is `cuda:*`."""
+    return name if _GROUP[0] is None else _GROUP[0][0].sub("cuda:*", name)
 
 
 def epoch() -> int:
