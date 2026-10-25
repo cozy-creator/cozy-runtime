@@ -1273,9 +1273,20 @@ class Memory:
                     row = read.wait()
                 except BaseException:
                     read.cancel()
-                    drained = read.wait()  # retain the task through checked producer drain
-                    if request is not None:
-                        request.prefetch_canceled += int(drained["canceled"])
+                    try:
+                        drained = read.wait()  # retain through checked producer drain
+                    except (
+                        tensorfs.Error,
+                        torch.OutOfMemoryError,
+                        torch.AcceleratorError,
+                    ) as error:
+                        if fault(error) not in (Fault.OTHER, Fault.OOM):
+                            raise  # uncertain/sticky completion takes precedence over cancellation
+                        # Ordinary native errors already prove a checked drain. Preserve the
+                        # original exception (notably Context cancellation) at this boundary.
+                    else:
+                        if request is not None:
+                            request.prefetch_canceled += int(drained["canceled"])
                     raise
                 complete = not row["canceled"]
                 if request is not None:
