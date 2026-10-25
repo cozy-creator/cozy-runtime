@@ -1175,7 +1175,6 @@ class Memory:
                 if request is not None:
                     request.prefetch_skipped += 1
                 return
-            region = self._native_region(block)
             offset = 0
             parts = []
             for key, roles in block.parts.items():
@@ -1184,10 +1183,17 @@ class Memory:
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
             try:
+                region = self._native_region(block)
                 read = region.prepare_read(block.model.source.ck, parts, reclaim=False)
             except torch.OutOfMemoryError:
                 if request is not None:
                     request.prefetch_skipped += 1
+                return
+            except tensorfs.Error as error:
+                if fault(error) is not Fault.OTHER:
+                    raise
+                if request is not None:
+                    request.prefetch_failed += 1
                 return
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
@@ -1219,18 +1225,20 @@ class Memory:
                 try:
                     if context is not None and not cancel:
                         # This is a host transition between blocks, never the GPU loop.
+                        context.raise_if_cancelled()
                         while not read.poll()["done"]:
                             context.raise_if_cancelled()
                             time.sleep(0.001)
                     row = read.wait()
                 except BaseException:
                     read.cancel()
-                    read.wait()  # do not release the task before checked producer drain
+                    drained = read.wait()  # retain the task through checked producer drain
+                    if request is not None:
+                        request.prefetch_canceled += int(drained["canceled"])
                     raise
                 complete = not row["canceled"]
                 if request is not None:
                     request.prefetch_canceled += int(not complete)
-                    request.prefetch_wait_ns += time.perf_counter_ns() - began
                     if complete:
                         request.prefetch_completed += 1
                         request.read(block, 0, int(row.get("bytes", 0)), speculative=True)
@@ -1242,6 +1250,8 @@ class Memory:
                 if request is not None:
                     request.prefetch_failed += 1
             finally:
+                if request is not None:
+                    request.prefetch_wait_ns += time.perf_counter_ns() - began
                 if not complete and block.region is pending.region:
                     block.region = None
                     block.preferred = False
