@@ -66,6 +66,8 @@ class TensorLike(Protocol):
     @property
     def dtype(self) -> object: ...
 
+    def detach(self) -> TensorLike: ...
+
 
 @runtime_checkable
 class ModuleLike(Protocol):
@@ -695,7 +697,8 @@ class _Residency(Protocol):
 class _ScopeHost(Protocol):
     """What a cache needs from the model generation that declared it."""
 
-    _cozy_residency: _Residency | None
+    @property
+    def _cozy_residency(self) -> _Residency | None: ...
 
     def _cozy_require_scope(self, what: str) -> None: ...
 
@@ -1048,7 +1051,9 @@ def census(obj: object) -> Census:
         components.append(name)
         seen: set[int] = set()
         named_buffers = getattr(member, "named_buffers", None)
-        buffers = {id(b) for _, b in named_buffers(remove_duplicate=False)} if named_buffers else set()
+        buffers = (
+            {id(b) for _, b in named_buffers(remove_duplicate=False)} if named_buffers else set()
+        )
         for key, held in member.state_dict(keep_vars=True).items():
             if id(held) in seen:
                 continue
