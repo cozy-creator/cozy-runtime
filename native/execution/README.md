@@ -90,7 +90,7 @@ it after a complete body. Progress uses a control-stream kernel reading device a
 owned snapshot, followed by ordered D2H and an event; CPU never races a device write to the same
 host flag. Observers can stop polling without stopping the GPU. Cancellation latency depends on
 the longest body/kernel and scheduling of the control kernel; it is not GPU preemption.
-All three control kernels are loaded during preparation with `cudaFuncGetAttributes`. The real
+Control kernels are loaded during preparation with `cudaFuncGetAttributes`. The real
 gate caught a lazy-loading serialization: without this preparation cancellation was submitted
 promptly but ran only after the loop ended. Stream priority alone did not fix it.
 
@@ -103,7 +103,8 @@ native weight backing. This is one tested device/cohort, not a general cancellat
 Each definition can be submitted repeatedly after its prior execution finishes. Native epoch
 tokens reject stale cancel/wait/close operations. Every execution owns distinct output buffers;
 readout completes before a later execution can overwrite state. The GPU index and
-control state reset before each graph launch. State tensors remain in place: callers may restore
+private control state resets before each graph launch; the index resets only inside the admitted
+program body. State tensors remain in place: callers may restore
 or replace their contents and input values between runs. `valid()` checks whether owners, layouts,
 fill identities and kernel implementations still match; submission checks again. Unexpected errors
 propagate from that query. During execution, callers must not resize tensors, change storage, mutate
@@ -137,7 +138,7 @@ is introduced: resident bindings own weights and the future native-fill descript
 source/recipe/target identity.
 
 This is a resident execution primitive, not a full H3 pipeline or an oversubscribed native plan.
-Streaming, event-based refill, broader queue policy and the CPU output handoff remain separate work.
+General streamed binding and broader queue policy remain separate work.
 
 ## One queued raw weight block
 
@@ -169,10 +170,11 @@ Exact fixture/artifact hashes and ordinary CLI receipts are retained in
 Python captures the known fixed body and seals the slot before any read producer starts. The first
 `ctx.plan(prepared)` submission reserves a native epoch, records caller readiness on the caller's
 OS thread and passes a checked continuation capsule to TensorFS's existing native worker. That
-worker reads the actual raw stored parts, commits after checked producer completion, retains the
-Pin and calls the native repeat. No Python callback, observer or decoder drives this transition.
-This first load submission is one-shot; native decode and arbitrary cold-model capture are not
-supported by this interface. Setup allocation, zero initialization and capture are preparation
+worker reads the actual stored parts and uses TensorFS's shared decoder for encoded slots.
+Default `load_ordering="checked"` commits after checked producer completion, retains the Pin
+and calls the native repeat. No Python callback or observer drives this transition.
+Loaded submissions are one-shot; arbitrary cold-model capture is not supported by this interface.
+Setup allocation, zero initialization and capture are preparation
 costs, not hidden parts of the measured stored-byte read.
 
 The two extensions remain separate. `include/cozy_execution_v1.h` is the private C-layout contract:
@@ -189,8 +191,8 @@ composed submission does not promise immediate ordering of later caller-stream w
 its explicitly owned stream and the caller-ready event that was already recorded; a worker never
 reinterprets the caller's per-thread default stream. Pure resident submission ordering is unchanged.
 
-`Execution.facts()` includes native load bytes and completion timestamps. Failed or canceled
-reads never launch the graph. A checked ordinary failure remains visible to observers but permits
+`Execution.facts()` includes native load bytes and completion timestamps. In checked mode, failed
+reads/decodes and cancellation before native start never launch the graph. A checked ordinary failure remains visible to observers but permits
 close to release graph owners; `completion_proven` comes from the native job, never from an error
 class. Sticky or unproven completion retains actual source, Fill/Pin, graph and module owners.
 The existing request scope still owns the complete submission on success, cancellation and unwind.
@@ -198,3 +200,28 @@ The existing request scope still owns the complete submission on success, cancel
 Source/build work is not GPU qualification. The corresponding real Creator release-gate cell must
 prove nonzero stored reads feed the known body while Python is parked, active cancellation while
 the native worker waits, zero launches on prelaunch failure/cancel, and final ownership cleanup.
+
+### Event-ordered input
+
+`load_ordering="events"` requires both native capabilities before capture. `"auto"` selects events
+only when both are present, otherwise it selects checked ordering before submission. Facts expose
+both `load_ordering_requested` and selected `load_ordering`; a fallback is never event-mode proof.
+The optional, size-validated `start_after` ABI tail preserves the original checked ABI prefix.
+
+The one-placement source callback runs only after every host read, copy and padding span has been
+successfully enqueued. It records owned native-stream dependencies and submits the graph without
+waiting for copies on the host. Encoded slots enqueue the existing prepared decoder first. Its
+existing device error flag gates the complete program: public index reset, prefix, loop and suffix.
+The loading worker still checks completion and ownership, but its return does not drive GPU
+continuation. The Fill remains unpublished and physically pinned through composed completion.
+
+Input/preflight/read failure before enqueue commitment means zero graph submissions and no state
+mutation. Encoded value rejection can submit one graph but executes none of its authored body;
+`body_entry_checked`, `body_entered` and `input_invalid` distinguish this from graph submission.
+Cancellation after enqueue commitment is cooperative execution cancellation. Late device or
+ownership failure may occur after body entry: discard the result, retain uncertain owners and
+retire the executor. Such a failure never establishes a retroactive zero-execution claim.
+
+Event mode is source/build work until its matching raw, encoded, failed-input, cancellation and
+alias-lifetime release cells pass on real CUDA. Host issue/completion timestamps alone do not
+prove the absence of a GPU bubble; device ordering and the complete result remain separate gates.
