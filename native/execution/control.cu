@@ -21,13 +21,16 @@ template<class Body> static int on_device(int device, Body body) {
     return result == cudaSuccess ? restored : result;
 }
 
-struct Control { unsigned completed; unsigned cancel; };
-struct Snapshot { unsigned completed; unsigned cancel; };
+struct Control { unsigned completed; unsigned cancel; unsigned suffix_completed; };
+struct Snapshot { unsigned completed; unsigned cancel; unsigned suffix_completed; };
 struct Repeat {
     int device = 0;
     unsigned steps = 0;
     unsigned nodes = 0;
     unsigned validated_nodes = 0;
+    unsigned prefix_nodes = 0;
+    unsigned suffix_nodes = 0;
+    bool has_suffix = false;
     char inspection[256]{};
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t executable = nullptr;
@@ -56,9 +59,21 @@ __global__ void advance(Control *state, int64_t *index, unsigned steps,
 
 __global__ void cancel_repeat(Control *state) { atomicExch(&state->cancel, 1u); }
 
+// Gate entry after a prefix, and gate the suffix after the whole loop. No host decides
+// whether another phase runs, and a cancel before the suffix boundary skips it.
+__global__ void select_phase(Control *state, unsigned steps,
+                             cudaGraphConditionalHandle condition, bool finishing) {
+    const unsigned canceled = atomicAdd(&state->cancel, 0u);
+    const unsigned completed = atomicAdd(&state->completed, 0u);
+    cudaGraphSetConditional(condition, !canceled && (!finishing || completed == steps));
+}
+
+__global__ void finish_suffix(Control *state) { atomicExch(&state->suffix_completed, 1u); }
+
 __global__ void snapshot(Control *state, Snapshot *out) {
     out->completed = atomicAdd(&state->completed, 0u);
     out->cancel = atomicAdd(&state->cancel, 0u);
+    out->suffix_completed = atomicAdd(&state->suffix_completed, 0u);
 }
 
 // Preserve only the first refusal, without pointers or another lifetime/ownership mechanism.
@@ -165,19 +180,31 @@ static cudaError_t cleanup(Repeat *run) {
     return cudaSuccess;
 }
 
-static int create(uintptr_t source, uintptr_t index, int device, unsigned steps, Repeat **out) {
+static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
+                  uintptr_t prefix, uintptr_t suffix, Repeat **out) {
     *out = nullptr;
     if (!source || !index || !steps) return cudaErrorInvalidValue;
     cudaError_t error;
     auto run = new (std::nothrow) Repeat;
     if (!run) return cudaErrorMemoryAllocation;
     run->device = device; run->steps = steps; run->index = reinterpret_cast<int64_t *>(index);
+    run->has_suffix = suffix != 0;
     // Return ownership even on failure so Rust can retain the source after uncertain cleanup.
     *out = run;
     auto checked = [&](cudaError_t result) { return result; };
 #define CHECK(call) do { error = checked(call); if (error != cudaSuccess) return error; } while (0)
     CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device, run, "source"));
     if (!run->nodes) return -101;
+    unsigned total = run->nodes;
+    if (prefix) {
+        CHECK(inspect(reinterpret_cast<cudaGraph_t>(prefix), total, device, run, "prefix"));
+        run->prefix_nodes = total - run->nodes;
+    }
+    if (suffix) {
+        const unsigned before = total;
+        CHECK(inspect(reinterpret_cast<cudaGraph_t>(suffix), total, device, run, "suffix"));
+        run->suffix_nodes = total - before;
+    }
     CHECK(cudaStreamCreateWithFlags(&run->work, cudaStreamNonBlocking));
     int lowest_priority, highest_priority;
     CHECK(cudaDeviceGetStreamPriorityRange(&lowest_priority, &highest_priority));
@@ -191,6 +218,8 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(advance)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(cancel_repeat)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(snapshot)));
+    if (prefix || suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_phase)));
+    if (suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(finish_suffix)));
     CHECK(cudaMalloc(&run->control, sizeof(Control)));
     CHECK(cudaMalloc(&run->device_snapshot, sizeof(Snapshot)));
     CHECK(cudaMallocHost(&run->host_snapshot, sizeof(Snapshot)));
@@ -202,8 +231,23 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     conditional.conditional.handle = condition;
     conditional.conditional.type = cudaGraphCondTypeWhile;
     conditional.conditional.size = 1;
+    cudaGraphNode_t predecessor = nullptr;
+    if (prefix) {
+        cudaGraphNode_t compute;
+        CHECK(cudaGraphAddChildGraphNode(&compute, run->graph, nullptr, 0, reinterpret_cast<cudaGraph_t>(prefix)));
+        cudaGraph_t cloned;
+        CHECK(cudaGraphChildGraphNodeGetGraph(compute, &cloned));
+        CHECK(inspect(cloned, run->validated_nodes, device, run, "assembled_prefix"));
+        bool finishing = false;
+        void *args[] = {&run->control, &run->steps, &condition, &finishing};
+        cudaKernelNodeParams gate{};
+        gate.func = reinterpret_cast<void *>(select_phase);
+        gate.gridDim = dim3(1); gate.blockDim = dim3(1); gate.kernelParams = args;
+        CHECK(cudaGraphAddKernelNode(&predecessor, run->graph, &compute, 1, &gate));
+    }
     cudaGraphNode_t loop;
-    CHECK(cudaGraphAddNode(&loop, run->graph, nullptr, nullptr, 0, &conditional));
+    CHECK(cudaGraphAddNode(&loop, run->graph, predecessor ? &predecessor : nullptr, nullptr,
+                          predecessor ? 1 : 0, &conditional));
     auto body = conditional.conditional.phGraph_out[0];
     cudaGraphNode_t compute;
     CHECK(cudaGraphAddChildGraphNode(&compute, body, nullptr, 0, reinterpret_cast<cudaGraph_t>(source)));
@@ -215,6 +259,33 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(cudaGraphAddKernelNode(&boundary, body, &compute, 1, &kernel));
     // Inspect the actual assembled body, including the cloned source child definition.
     CHECK(inspect(body, run->validated_nodes, device, run, "assembled"));
+    if (suffix) {
+        cudaGraphConditionalHandle finish;
+        CHECK(cudaGraphConditionalHandleCreate(&finish, run->graph, 0, cudaGraphCondAssignDefault));
+        bool finishing = true;
+        void *args[] = {&run->control, &run->steps, &finish, &finishing};
+        cudaKernelNodeParams gate{};
+        gate.func = reinterpret_cast<void *>(select_phase);
+        gate.gridDim = dim3(1); gate.blockDim = dim3(1); gate.kernelParams = args;
+        cudaGraphNode_t decide;
+        CHECK(cudaGraphAddKernelNode(&decide, run->graph, &loop, 1, &gate));
+        cudaGraphNodeParams conditional{};
+        conditional.type = cudaGraphNodeTypeConditional;
+        conditional.conditional.handle = finish;
+        conditional.conditional.type = cudaGraphCondTypeIf;
+        conditional.conditional.size = 1;
+        cudaGraphNode_t tail;
+        CHECK(cudaGraphAddNode(&tail, run->graph, &decide, nullptr, 1, &conditional));
+        auto final = conditional.conditional.phGraph_out[0];
+        cudaGraphNode_t compute, complete;
+        CHECK(cudaGraphAddChildGraphNode(&compute, final, nullptr, 0, reinterpret_cast<cudaGraph_t>(suffix)));
+        void *done_args[] = {&run->control};
+        cudaKernelNodeParams done{};
+        done.func = reinterpret_cast<void *>(finish_suffix);
+        done.gridDim = dim3(1); done.blockDim = dim3(1); done.kernelParams = done_args;
+        CHECK(cudaGraphAddKernelNode(&complete, final, &compute, 1, &done));
+        CHECK(inspect(final, run->validated_nodes, device, run, "assembled_suffix"));
+    }
     CHECK(cudaGraphInstantiate(&run->executable, run->graph, 0));
     CHECK(cudaGraphUpload(run->executable, run->work));
     CHECK(cudaStreamSynchronize(run->work));
@@ -223,9 +294,9 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
 }
 
 extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
-                                  unsigned steps, Repeat **out) {
+                                  unsigned steps, uintptr_t prefix, uintptr_t suffix, Repeat **out) {
     *out = nullptr;
-    return on_device(device, [&] { return create(source, index, device, steps, out); });
+    return on_device(device, [&] { return create(source, index, device, steps, prefix, suffix, out); });
 }
 
 static int arm(Repeat *run, uintptr_t producer) {
@@ -300,7 +371,8 @@ static int poll(Repeat *run, unsigned *completed, unsigned *canceled, int *done)
         run->pending_sample = true;
     }
     *completed = run->observed.completed;
-    *canceled = run->observed.cancel && run->observed.completed < run->steps;
+    *canceled = run->observed.cancel && (run->observed.completed < run->steps
+                 || (run->has_suffix && !run->observed.suffix_completed));
     return cudaSuccess;
 }
 
@@ -317,12 +389,16 @@ static int wait(Repeat *run, unsigned *completed, unsigned *canceled) {
     Control state;
     error = cudaMemcpy(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost);
     if (error != cudaSuccess) return error;
-    *completed = state.completed; *canceled = state.cancel && state.completed < run->steps;
+    *completed = state.completed;
+    *canceled = state.cancel && (state.completed < run->steps
+                 || (run->has_suffix && !state.suffix_completed));
     return cudaSuccess;
 }
 
 extern "C" unsigned cozy_repeat_nodes(Repeat *run) { return run->nodes; }
 extern "C" unsigned cozy_repeat_validated_nodes(Repeat *run) { return run->validated_nodes; }
+extern "C" unsigned cozy_repeat_prefix_nodes(Repeat *run) { return run->prefix_nodes; }
+extern "C" unsigned cozy_repeat_suffix_nodes(Repeat *run) { return run->suffix_nodes; }
 
 static int destroy(Repeat *run) {
     if (!run) return cudaSuccess;

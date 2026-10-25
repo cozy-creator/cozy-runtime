@@ -127,6 +127,8 @@ class PreparedRepeat:
         owners: Sequence[object] = (),
         resident_only: bool = False,
         load: Any = None,
+        prefix: Callable[[], object] | None = None,
+        suffix: Callable[[], object] | None = None,
     ) -> PreparedRepeat:
         """Capture a fixed body, optionally fed by one native LoadSlot.
 
@@ -136,6 +138,14 @@ class PreparedRepeat:
         worker checks read/decode completion; this is not an event-only handoff. Loaded
         submissions are one-shot and require wait/request join
         before output access. Pure resident repeats retain their existing reuse contract.
+
+        Optional prefix/suffix tensor work runs once before/after the repeat. The suffix
+        runs only after every iteration completed without cancellation at its GPU boundary.
+        A phase already admitted on the GPU completes before its owners can be released;
+        cancellation does not preempt a running prefix or suffix. Resident definitions can
+        be submitted again with new input/state values at the same layouts and identities.
+        All three phases share the declared mutable state and retained resident owners;
+        this does not release phase weights or implement streaming between phases.
 
         Placed component roots are resolved to owned weight bindings. `resident_only=True`
         refuses missing weights before running the body; it never fills them for capture.
@@ -157,6 +167,14 @@ class PreparedRepeat:
                 "this Runtime wheel has no prebuilt GPU execution module",
                 code="prepared_graph_ineligible",
             ) from error
+
+        if (prefix is not None or suffix is not None) and not getattr(
+            _execution.ResidentRepeat, "supports_phases", False
+        ):
+            raise CapabilityError(
+                "this Runtime execution module has no resident phase composition",
+                code="prepared_graph_ineligible",
+            )
 
         if isinstance(steps, bool) or not isinstance(steps, int) or not 0 < steps <= 2**32 - 1:
             raise ValueError("repeat steps must be a positive uint32")
@@ -266,7 +284,14 @@ class PreparedRepeat:
                 with torch.no_grad():
                     try:
                         snapshots = [graphs._State(torch, module) for module in models.values()]
-                        plan = cls._capture_ready(step, state=tensors, steps=steps, owners=resolved)
+                        plan = cls._capture_ready(
+                            step,
+                            state=tensors,
+                            steps=steps,
+                            owners=resolved,
+                            prefix=prefix,
+                            suffix=suffix,
+                        )
                     finally:
                         changed = [
                             change for snapshot in snapshots if (change := snapshot.restore())
@@ -315,6 +340,8 @@ class PreparedRepeat:
         state: Sequence[Any],
         steps: int,
         owners: Sequence[object] = (),
+        prefix: Callable[[], object] | None = None,
+        suffix: Callable[[], object] | None = None,
     ) -> PreparedRepeat:
         import torch
         from tensorfs import varena
@@ -369,10 +396,18 @@ class PreparedRepeat:
             saved = tuple(t.clone() for t in tensors)
             stream.wait_stream(current)
             graph = torch.cuda.CUDAGraph(keep_graph=True)
+            before = torch.cuda.CUDAGraph(keep_graph=True) if prefix is not None else None
+            after = torch.cuda.CUDAGraph(keep_graph=True) if suffix is not None else None
+            phases = [(graph, lambda: step(index))]
+            if before is not None:
+                phases.insert(0, (before, prefix))
+            if after is not None:
+                phases.append((after, suffix))
             native = None
             try:
                 with torch.cuda.stream(stream), CaptureOwners(False):
-                    step(index)  # instantiate library workspaces before capture
+                    for _, operation in phases:
+                        operation()  # instantiate each phase's library workspaces before capture
                     for target, original in zip(tensors, saved, strict=True):
                         target.copy_(original)
                 stream.synchronize()
@@ -384,30 +419,38 @@ class PreparedRepeat:
                     torch.cuda.stream(stream),
                     CaptureOwners(True),
                 ):
-                    graph.capture_begin(capture_error_mode="global")
-                    try:
-                        step(index)
-                    finally:
-                        graph.capture_end()
+                    for recording, operation in phases:
+                        recording.capture_begin(capture_error_mode="global")
+                        try:
+                            operation()
+                        finally:
+                            recording.capture_end()
                 stream.synchronize()
                 for target, original in zip(tensors, saved, strict=True):
                     target.copy_(original)
                 current.synchronize()
                 # CUDAGraph owns capture allocations; its live template is cloned into a child
                 # of the native conditional body. Its executable is never borrowed or replayed.
+                phase_args = {}
+                if before is not None or after is not None:
+                    phase_args = {
+                        "prefix_graph": before.raw_cuda_graph() if before is not None else 0,
+                        "suffix_graph": after.raw_cuda_graph() if after is not None else 0,
+                    }
                 native = _execution.ResidentRepeat(
                     graph.raw_cuda_graph(),
                     index.data_ptr(),
                     device,
                     steps,
                     [
-                        graph,
+                        *(recording for recording, _ in phases),
                         stream,
                         index,
                         *held.values(),
                         *(tensor.untyped_storage() for tensor in held.values()),
                         *owners,
                     ],
+                    **phase_args,
                 )
             except _execution.NativeExecutionError as error:
                 _native_error(error)
@@ -419,7 +462,8 @@ class PreparedRepeat:
                     target.copy_(original)
                 current.synchronize()
                 if native is None:
-                    graph.reset()
+                    for recording, _ in phases:
+                        recording.reset()
                     held.clear()
             if landed != LANDED[0]:
                 native.close_owner()

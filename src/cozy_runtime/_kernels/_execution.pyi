@@ -2,7 +2,18 @@ class NativeExecutionError(RuntimeError):
     error_code: int
 
 class ResidentRepeat:
-    def __init__(self, source_graph: int, index: int, device: int, steps: int, owners: list[object]) -> None: ...
+    supports_phases: bool
+    def __init__(
+        self,
+        source_graph: int,
+        index: int,
+        device: int,
+        steps: int,
+        owners: list[object],
+        *,
+        prefix_graph: int = 0,
+        suffix_graph: int = 0,
+    ) -> None: ...
     @property
     def body_nodes(self) -> int: ...
     def facts(self) -> dict[str, object]: ...

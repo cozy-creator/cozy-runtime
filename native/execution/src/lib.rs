@@ -16,6 +16,8 @@ unsafe extern "C" {
         index: usize,
         device: i32,
         steps: u32,
+        prefix: usize,
+        suffix: usize,
         out: *mut *mut c_void,
     ) -> i32;
     fn cozy_repeat_launch(run: *mut c_void, producer: usize) -> i32;
@@ -32,6 +34,8 @@ unsafe extern "C" {
     fn cozy_repeat_wait(run: *mut c_void, completed: *mut u32, canceled: *mut u32) -> i32;
     fn cozy_repeat_nodes(run: *mut c_void) -> u32;
     fn cozy_repeat_validated_nodes(run: *mut c_void) -> u32;
+    fn cozy_repeat_prefix_nodes(run: *mut c_void) -> u32;
+    fn cozy_repeat_suffix_nodes(run: *mut c_void) -> u32;
     fn cozy_repeat_inspection(run: *mut c_void) -> *const c_char;
     fn cozy_repeat_destroy(run: *mut c_void) -> i32;
 }
@@ -84,6 +88,10 @@ struct RepeatOwner {
     pid: u32,
     nodes: u32,
     validated_nodes: u32,
+    prefix_nodes: u32,
+    suffix_nodes: u32,
+    has_prefix: bool,
+    has_suffix: bool,
     device: i32,
     steps: u32,
 }
@@ -187,7 +195,13 @@ impl RepeatOwner {
 
 #[pymethods]
 impl ResidentRepeat {
+    #[classattr]
+    fn supports_phases() -> bool {
+        true
+    }
+
     #[new]
+    #[pyo3(signature = (source_graph, index, device, steps, owners, *, prefix_graph=0, suffix_graph=0))]
     fn new(
         py: Python<'_>,
         source_graph: usize,
@@ -195,6 +209,8 @@ impl ResidentRepeat {
         device: i32,
         steps: u32,
         owners: Vec<Py<PyAny>>,
+        prefix_graph: usize,
+        suffix_graph: usize,
     ) -> PyResult<Self> {
         if source_graph == 0 || index == 0 || steps == 0 {
             return Err(PyRuntimeError::new_err(
@@ -203,9 +219,19 @@ impl ResidentRepeat {
         }
         let (pointer, code) = py.detach(|| {
             let mut pointer = std::ptr::null_mut();
-            // SAFETY: private bridge passes a live Torch-owned graph definition and int64 device tensor.
-            let code =
-                unsafe { cozy_repeat_create(source_graph, index, device, steps, &mut pointer) };
+            // SAFETY: private bridge retains every supplied Torch-owned graph definition
+            // and the int64 device tensor; zero denotes an absent optional phase.
+            let code = unsafe {
+                cozy_repeat_create(
+                    source_graph,
+                    index,
+                    device,
+                    steps,
+                    prefix_graph,
+                    suffix_graph,
+                    &mut pointer,
+                )
+            };
             (pointer as usize, code)
         });
         if code != 0 {
@@ -234,6 +260,10 @@ impl ResidentRepeat {
         let nodes = unsafe { cozy_repeat_nodes(pointer as *mut c_void) };
         // SAFETY: successful preparation inspected this same live native body recursively.
         let validated_nodes = unsafe { cozy_repeat_validated_nodes(pointer as *mut c_void) };
+        // SAFETY: the same successfully constructed owner inspected these optional phases.
+        let prefix_nodes = unsafe { cozy_repeat_prefix_nodes(pointer as *mut c_void) };
+        // SAFETY: the same successfully constructed owner inspected these optional phases.
+        let suffix_nodes = unsafe { cozy_repeat_suffix_nodes(pointer as *mut c_void) };
         Ok(Self {
             inner: Arc::new(RepeatOwner {
                 state: Mutex::new(State {
@@ -249,6 +279,10 @@ impl ResidentRepeat {
                 pid: std::process::id(),
                 nodes,
                 validated_nodes,
+                prefix_nodes,
+                suffix_nodes,
+                has_prefix: prefix_graph != 0,
+                has_suffix: suffix_graph != 0,
                 device,
                 steps,
             }),
@@ -274,6 +308,10 @@ impl ResidentRepeat {
         result.set_item("execution_mode", "cuda_conditional_while")?;
         result.set_item("body_nodes", self.nodes)?;
         result.set_item("validated_nodes", self.validated_nodes)?;
+        result.set_item("prefix_nodes", self.prefix_nodes)?;
+        result.set_item("suffix_nodes", self.suffix_nodes)?;
+        result.set_item("has_prefix", self.has_prefix)?;
+        result.set_item("has_suffix", self.has_suffix)?;
         result.set_item("device", self.device)?;
         result.set_item("steps_per_launch", self.steps)?;
         result.set_item("host_graph_launches", launches)?;
