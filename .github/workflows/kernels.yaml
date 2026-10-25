@@ -34,6 +34,8 @@ on:
     branches: [master]
     paths:
       - kernels/**
+      - native/execution/**
+      - scripts/build-execution-native.sh
       - src/cozy_runtime/_kernels/__init__.py
       - checks/kernel_modules.py
       - .github/workflows/kernels.yaml
@@ -66,7 +68,7 @@ jobs:
       - id: key
         run: |
           grep -v '^#' kernels/toolchain.env >> "$GITHUB_ENV"
-          echo "key=kernels-r1-linux-$ARCH-${{ hashFiles('kernels/**', 'src/cozy_runtime/_kernels/__init__.py', 'checks/kernel_modules.py') }}" >> "$GITHUB_OUTPUT"
+          echo "key=kernels-r2-linux-$ARCH-${{ hashFiles('kernels/**', 'native/execution/**', 'scripts/build-execution-native.sh', 'src/cozy_runtime/_kernels/__init__.py', 'checks/kernel_modules.py') }}" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache/restore@v4
         with:
@@ -93,6 +95,10 @@ jobs:
               time cmake -S kernels -B /tmp/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPython_EXECUTABLE="$(command -v python)"
               time cmake --build /tmp/build --parallel "$JOBS"
               cmake --install /tmp/build --prefix modules
+              # The execution owner is Rust/ABI3, with CUDA control kernels compiled ahead of time.
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.91.1
+              export PATH="$HOME/.cargo/bin:$PATH" COZY_CUDA_TOOLKIT=/usr/local/cuda-13.0 CARGO_BUILD_JOBS="$JOBS"
+              bash scripts/build-execution-native.sh modules
               # CPU torch, which each module must load before: none may export what it binds.
               python -m pip install -q --root-user-action ignore "torch==$TORCH" --index-url https://download.pytorch.org/whl/cpu
               python checks/kernel_modules.py modules --python python \
@@ -187,7 +193,7 @@ jobs:
           "built in $(((Get-Date) - $began).TotalMinutes) min"
           & $py -m pip install -q "torch==$env:TORCH" --index-url https://download.pytorch.org/whl/cpu
           # MSVC builds neither CUTLASS's TMA GEMMs nor FA3 (cr-201).
-          & $py checks/kernel_modules.py modules --without tma --without _fa3 --python $py `
+          & $py checks/kernel_modules.py modules --without tma --without _fa3 --without _execution --python $py `
             --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
             --platform-floor platform-gpu.rs --torch-python $py
           exit $LASTEXITCODE
