@@ -95,6 +95,8 @@ class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):
     spare: bool | msgspec.UnsetType = msgspec.UNSET
     #: the tensors cross by `Broadcast`, after this command, rather than the spool
     broadcast: bool = False
+    #: the kernels the group serves from this call on (`kernel_ready.agreed`)
+    kernels: tuple[str, ...] = ()
 
     @classmethod
     def read(cls, command: Mapping[str, object]) -> RunCommand:
@@ -372,6 +374,9 @@ class RunReply(msgspec.Struct, frozen=True):
     result: Json = None
     #: why a spread call was declined; "" when it ran
     declined: str = ""
+    #: its kernels not serving yet (`kernel_ready.pending`), and those it began serving
+    kernels: dict[str, str] = {}
+    began: list[str] = []
 
 
 def run_call(

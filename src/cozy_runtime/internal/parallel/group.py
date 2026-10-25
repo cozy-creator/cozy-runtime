@@ -309,6 +309,9 @@ class RankGroup:
         self.rank_records: dict[int, execution_evidence.GpuEvidence] = {}
         #: per spread method this attempt
         self.spread_log: dict[str, SpreadLog] = {}
+        #: each kernel a follower began serving at a command (`kernel_ready.boundary`), and its
+        #: rank, until the attempt's record takes them
+        self.began: list[tuple[int, str]] = []
         self._readers: list[threading.Thread] = []
         #: Followers with a command in flight. A follower answers one command at a time, so
         #: every caller that sends one holds its rank until the reply is read: calls made

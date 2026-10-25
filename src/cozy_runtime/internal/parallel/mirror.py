@@ -17,7 +17,7 @@ import msgspec
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
 from cozy_runtime.author._errors import MEMORY_EXHAUSTED, Cancelled, classify
 from cozy_runtime.author._model import remote_scope
-from cozy_runtime.internal import attention_sol, execution_evidence
+from cozy_runtime.internal import attention_sol, execution_evidence, kernel_ready
 from cozy_runtime.internal.parallel import cp, wire
 from cozy_runtime.internal.parallel.group import ENDED, SHORT, RankGroup, SpreadLog
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -429,6 +429,7 @@ def _command(
         args=[wire.marshal(a, payloads, path=f"args[{i}]") for i, a in enumerate(args)],
         kwargs={k: wire.marshal(v, payloads, path=k) for k, v in kwargs.items()},
         broadcast=broadcast,
+        kernels=kernel_ready.agreed(),
     )
     return command, payloads
 
@@ -450,6 +451,8 @@ def _accept(
             code=reply.code or "group_broken",
         )
     group.working_peaks[rank] = max(group.working_peaks.get(rank, 0), reply.working_peak_bytes)
+    kernel_ready.report(rank, reply.kernels)
+    group.began.extend((rank, kernel) for kernel in reply.began)
     if reply.evidence is not None:
         execution_evidence.widen(group.rank_records, rank, reply.evidence)
     return reply
