@@ -1,36 +1,8 @@
-"""The numeric core of the 8- and 4-bit quant kinds: E2M1/E4M3/int8 arithmetic in numpy.
+"""Compatibility encoders and independent decoders for derived weight formats.
 
-Every encoder here is INTEGER-DETERMINISTIC — table lookups, comparisons and float32
-arithmetic with no reduction order that a device can reorder — so two runs on two hosts
-produce the same bytes. That is not a nicety: #501c banked that fp8 is bit-identical
-within a host but not across hosts once a GPU is in the loop, and a quant artifact whose
-digest depends on which card produced it cannot be pinned by a recipe.
-
-The element tables are TABLES, not formulas, and they are written to match the border's
-reference decoders exactly (`tensorfs crates/tensorfs-core/src/bin/tfs/conform.rs`:
-`f32_from_e4m3fn`, `f32_from_e2m1`). Producer and reader agree by construction rather than
-by both being "an implementation of the spec".
-
-THE SCALE-SELECTION RULE (#513/#517's defect class)
----------------------------------------------------
-#517 root-caused 1.02 dB of a block-scaled format's gap to a scale rule that was POSITIONAL
-rather than chosen: its own largest element clamped in every dense block. The trap is one
-line wide in nvfp4, because the two-level scheme divides by a per-block E4M3 scale that a
-round-to-nearest cast can round DOWN, at which point the block's max lands above E2M1's 6.0
-and saturates.
-
-So the rule here is CHOSEN ERROR-MINIMIZING, never positional:
-
-  * the anchor is the smallest E4M3 scale that cannot clip — the first value at or above
-    the block's exact requirement, re-checked in the same float32 arithmetic the encoder
-    actually uses and bumped where double-to-single narrowing left it short, so the
-    no-clip guarantee of that anchor is arithmetic rather than algebraic;
-  * the candidate set is the anchor, its neighbour UP, and its rounded-DOWN (clipping)
-    neighbour — admissible per the #543d family ruling and selected by measured error;
-  * every candidate is quantized THROUGH the stored representation and the smaller
-    sum-of-squares wins, ties to the smaller scale. Positional selection is what #517
-    convicted; this compares. Saturation is a REPORTED per-tensor stat, never a
-    constraint.
+TensorFS owns the versioned NVFP4 and ConvRot numerical producers and acceptance statistics.
+Their adapters preserve bounded row chunks and the existing Encoded/Companion result contract.
+FP8/W4A8 producers and independent decode helpers remain here.
 """
 
 from __future__ import annotations
@@ -38,6 +10,8 @@ from __future__ import annotations
 from typing import NamedTuple
 
 import numpy as np
+import tensorfs
+from tensorfs import raw
 
 from cozy_runtime.author import UnsupportedInput
 
@@ -60,29 +34,10 @@ def _e4m3_magnitudes() -> np.ndarray:
     return mags
 
 
-#: E4M3 (`f8_e4m3fn`) magnitudes by byte, and E2M1's sixteen-value nibble table.
+#: E4M3 (`f8_e4m3fn`) magnitudes by byte.
 E4M3_MAG = _e4m3_magnitudes()
 E4M3_MAG32 = E4M3_MAG.astype(np.float32)
 E4M3_MAX = float(E4M3_MAG[-1])  # 448.0
-
-E2M1_MAG = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float64)
-E2M1_MAG32 = E2M1_MAG.astype(np.float32)
-E2M1_MAX = 6.0
-#: nibble -> value, sign in bit 3. The border reads element 2k from the LOW nibble.
-E2M1_DECODE32 = np.concatenate([E2M1_MAG32, -E2M1_MAG32]).astype(np.float32)
-
-
-def _nearest_even(mags: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """Index of the nearest table magnitude, ties to the EVEN index.
-
-    Even index is even mantissa-LSB for both tables (E2M1: 0, 1.0, 2.0, 4.0 have man 0;
-    E4M3: byte parity IS the mantissa LSB), so this is round-to-nearest-even in the
-    representation, not merely in the index.
-    """
-    mids = (mags[:-1] + mags[1:]) / 2.0
-    idx = np.searchsorted(mids, x, side="right")
-    tie = (idx > 0) & (x == mids[np.maximum(idx - 1, 0)])
-    return np.where(tie & (idx % 2 == 1), idx - 1, idx).astype(np.uint8)
 
 
 def e4m3_encode(values: np.ndarray) -> np.ndarray:
@@ -124,31 +79,12 @@ def e4m3_decode(raw: np.ndarray) -> np.ndarray:
     return out
 
 
-def e2m1_encode(values: np.ndarray) -> np.ndarray:
-    """float32 -> E2M1 nibbles (0..15), RNE, saturating at +/-6."""
-    v = np.nan_to_num(
-        np.asarray(values, dtype=np.float32), nan=0.0, posinf=E2M1_MAX, neginf=-E2M1_MAX
-    )
-    mag = np.minimum(np.abs(v).astype(np.float64), E2M1_MAX)
-    idx = _nearest_even(E2M1_MAG, mag)
-    out: np.ndarray = (idx | np.where(np.signbit(v), 0x08, 0x00).astype(np.uint8)).astype(np.uint8)
-    return out
-
-
 def pack_nibbles(nibbles: np.ndarray) -> np.ndarray:
     """[r, c] nibbles -> [r, c/2] bytes, element 2k in the LOW nibble (the border's
     packing; `nvfp4:nibbles-swapped` is one of its own WRONG conformance arms)."""
     rows, cols = nibbles.shape
     pairs = nibbles.reshape(rows, cols // 2, 2)
     out: np.ndarray = (pairs[:, :, 0] | (pairs[:, :, 1] << 4)).astype(np.uint8)
-    return out
-
-
-def unpack_nibbles(packed: np.ndarray, cols: int) -> np.ndarray:
-    rows = packed.shape[0]
-    out = np.empty((rows, cols), dtype=np.uint8)
-    out[:, 0::2] = packed & 0x0F
-    out[:, 1::2] = packed >> 4
     return out
 
 
@@ -201,6 +137,12 @@ class _Accum:
         self.sse += float(np.sum(np.square(diff, out=diff)))
         self.energy += float(np.sum(np.square(wide, out=wide)))
 
+    def merge(self, measured: raw.QuantizationStats) -> None:
+        self.sse += measured["sse"]
+        self.energy += measured["energy"]
+        self.max_abs = max(self.max_abs, measured["max_abs_error"])
+        self.sat += measured["saturated"]
+
 
 def _require_2d(key: str, values: np.ndarray, block: int) -> tuple[int, int]:
     if values.ndim != 2:
@@ -218,99 +160,101 @@ def _require_2d(key: str, values: np.ndarray, block: int) -> tuple[int, int]:
     return rows, cols
 
 
+def _measured(
+    key: str,
+    values: np.ndarray,
+    scheme: str,
+    strategy: str,
+    params: dict[str, object],
+    tensor_amax: float | None = None,
+) -> tuple[tensorfs.Encoded, raw.QuantizationStats]:
+    """One bounded immutable F32 input; only the native encoding refusal changes family."""
+    values = np.ascontiguousarray(values, dtype="<f4")
+    try:
+        return raw.quantize_measured(
+            scheme,
+            values.tobytes(),
+            dtype="F32",
+            shape=values.shape,
+            strategy=strategy,
+            params=params,
+            tensor_amax=tensor_amax,
+        )
+    except tensorfs.DecodeError as error:
+        raise UnsupportedInput(f"{key!r}: {error}") from error
+
+
 # ----------------------------------------------------------------------------- nvfp4
 
 NVFP4_BLOCK = 16
 
 
 def encode_nvfp4(key: str, values: np.ndarray, amax: float | None = None) -> Encoded:
-    """The two-level NVFP4 scheme, in the border's `nvfp4-w4a4/1` base-variant layout.
-
-    REFERENCE. The scheme is NVIDIA's NVFP4 as exported by TensorRT Model Optimizer and
-    decoded by this platform's own border: `value[i,j] = e2m1(nibble) *
-    e4m3(weight_scale[i, j/16]) * weight_scale_2`, with `weight` packed u8 [out, in/2],
-    `weight_scale` e4m3 [out, in/16] and `weight_scale_2` an f32 SCALAR. That decode line
-    is the contract this producer is written against (registry.rs `nvfp4-w4a4/1`,
-    conform.rs `nvfp4_inner`) — a second-hand description of the format is not, which
-    matters because two of the border's three conformance arms for this encoding are
-    plausible misreadings (`nibbles-swapped`, `global-scale-ignored`).
-
-    The second-level scalar is `amax / (448 * 6)`: it maps the tensor's largest element to
-    the largest product the two levels can express, so the block requiring the most range
-    lands at E4M3's own maximum and no block requirement is unrepresentable. Per block the
-    exact requirement is `block_amax / (6 * s2)` and the scale is chosen by min-SSE
-    through the stored representation over the family rule's candidate set — the
-    rounded-down (CLIPPING) neighbour included, per #543d (see the module docstring).
-    """
+    """TensorFS's explicit min-SSE NVFP4 producer, exposed through the existing U8 carrier."""
     rows, cols = _require_2d(key, values, NVFP4_BLOCK)
-    nb = cols // NVFP4_BLOCK
-    if amax is None:  # a whole tensor; a row chunk is handed its tensor's amax
-        amax = float(np.max(np.abs(values))) if values.size else 0.0
-    if not np.isfinite(amax):
-        raise UnsupportedInput(f"{key!r} contains a non-finite weight — refuse, never encode")
-    # An all-zero tensor has no scale to derive; 1.0 reproduces it exactly and keeps the
-    # scalar a real number rather than a zero that makes every later division undefined.
-    s2 = np.float32(amax / (E4M3_MAX * E2M1_MAX)) if amax > 0 else np.float32(1.0)
-
-    payload = np.empty((rows, cols // 2), dtype=np.uint8)
-    scales = np.empty((rows, nb), dtype=np.uint8)
+    if not rows:
+        # Historical empty results carry only metadata; no tensor arithmetic or native work.
+        maximum = 0.0 if amax is None else amax
+        if not np.isfinite(maximum):
+            raise UnsupportedInput(f"{key!r} contains a non-finite weight — refuse, never encode")
+        empty_scale = np.float32(maximum / (E4M3_MAX * 6.0)) if maximum > 0 else np.float32(1.0)
+        return Encoded(
+            "U8",
+            [0, cols // 2],
+            b"",
+            [
+                Companion(".weight_scale", "F8_E4M3", [0, cols // NVFP4_BLOCK], b""),
+                Companion(".weight_scale_2", "F32", [], empty_scale.tobytes()),
+            ],
+            0,
+            0.0,
+            0.0,
+            0.0,
+        )
+    if not cols:
+        raise UnsupportedInput(f"{key!r}: NVFP4 requires nonempty weight columns")
+    if amax is None:
+        amax = 0.0
+        for sl in row_chunks(rows, cols):
+            maximum = float(np.max(np.abs(values[sl])))
+            if not np.isfinite(maximum):
+                raise UnsupportedInput(
+                    f"{key!r} contains a non-finite weight — refuse, never encode"
+                )
+            amax = max(amax, maximum)
+    payload: list[bytes] = []
+    scales: list[bytes] = []
+    second: bytes | None = None
     acc = _Accum()
     for sl in row_chunks(rows, cols):
-        blk = np.ascontiguousarray(values[sl], dtype=np.float32).reshape(-1, nb, NVFP4_BLOCK)
-        bamax = np.max(np.abs(blk), axis=-1)
-        need = (bamax / np.float32(E2M1_MAX * s2)).astype(np.float64)
-        # Saturation-free by construction: the smallest E4M3 value at or above `need`.
-        idx = np.clip(np.searchsorted(E4M3_MAG, need, side="left"), 0, 126).astype(np.int64)
-        # ...then by ARITHMETIC: re-check in the same float32 the encoder will use, and
-        # bump anything the double-to-single narrowing left one ulp short. Two rounds is
-        # a bound, not a hope — one bump moves the scale a full E4M3 step.
-        for _ in range(3):
-            eff = (E4M3_MAG32[idx] * s2).astype(np.float32)
-            short = (bamax > eff * np.float32(E2M1_MAX)) & (idx < 126)
-            if not bool(short.any()):
-                break
-            idx = np.where(short, idx + 1, idx)
-
-        best_sse: np.ndarray | None = None
-        best: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
-        # THE FAMILY RULE (#543d, realigning this kind to #517): clipping candidates are
-        # ADMISSIBLE. The rounded-DOWN neighbour clips the block's own largest element,
-        # and in fp4 that trade WINS 0.33 dB weight-SNR on the banked audit — an E4M3
-        # scale step is ~6% while the resolution gain applies to all 16 elements.
-        # Iteration order is smallest scale first, so the strict `<` keeps the smaller
-        # scale on ties; saturation is a REPORTED stat below, never a constraint.
-        for cand in (np.maximum(idx - 1, 0), idx, np.minimum(idx + 1, 126)):
-            eff = (E4M3_MAG32[cand] * s2).astype(np.float32)[..., None]
-            safe = np.where(eff > 0, eff, np.float32(1.0))
-            nib = e2m1_encode(np.where(eff > 0, blk / safe, np.float32(0.0)))
-            recon = (E2M1_DECODE32[nib] * eff).astype(np.float32)
-            sse = np.sum((recon - blk).astype(np.float64) ** 2, axis=-1)
-            if best_sse is None:
-                best_sse, best = sse, (cand, nib, recon)
-            else:
-                assert best is not None
-                take = sse < best_sse  # strict: a tie keeps the SMALLER scale
-                best_sse = np.where(take, sse, best_sse)
-                best = (
-                    np.where(take, cand, best[0]),
-                    np.where(take[..., None], nib, best[1]),
-                    np.where(take[..., None], recon, best[2]),
-                )
-        assert best is not None
-        chosen, nib, recon = best
-        limit = (E4M3_MAG32[chosen] * s2).astype(np.float32)[..., None] * np.float32(E2M1_MAX)
-        acc.sat += int(np.count_nonzero(np.abs(blk) > limit))
-        acc.add(blk.reshape(-1, cols), recon.reshape(-1, cols))
-        payload[sl] = pack_nibbles(nib.reshape(-1, cols))
-        scales[sl] = chosen.astype(np.uint8)
-
+        encoded, measured = _measured(
+            key,
+            values[sl],
+            "nvfp4",
+            "nvfp4-min-sse/1",
+            {
+                "block_size": NVFP4_BLOCK,
+                "global_scale": "multiply",
+                "nibble_order": "low_first",
+                "scale_layout": "row_major",
+            },
+            amax,
+        )
+        payload.append(encoded.parts["weight"].tobytes())
+        scales.append(encoded.parts["scale"].tobytes())
+        current = encoded.parts["scale_2"].tobytes()
+        if second is not None and second != current:
+            raise RuntimeError("native NVFP4 chunks changed their shared global scale")
+        second = current
+        acc.merge(measured)
+    assert second is not None
     return Encoded(
-        payload_dtype="U8",
+        payload_dtype="U8",  # Native F4(R,C) is the same physical U8(R,C/2) byte carrier.
         payload_shape=[rows, cols // 2],
-        payload=payload.tobytes(),
+        payload=b"".join(payload),
         companions=[
-            Companion(".weight_scale", "F8_E4M3", [rows, nb], scales.tobytes()),
-            Companion(".weight_scale_2", "F32", [], np.float32(s2).tobytes()),
+            Companion(".weight_scale", "F8_E4M3", [rows, cols // NVFP4_BLOCK], b"".join(scales)),
+            Companion(".weight_scale_2", "F32", [], second),
         ],
         saturated=acc.sat,
         sse=acc.sse,
@@ -387,31 +331,40 @@ def decode_int8_convrot256(payload: np.ndarray, scale: np.ndarray) -> np.ndarray
 
 
 def encode_int8_convrot256(key: str, values: np.ndarray) -> Encoded:
-    """`int8-convrot256/1`: each row rotated by the orthonormal Hadamard per 256 input
-    channels (ComfyUI's ConvRot), then symmetric per-output-row int8: `scale = rowmax|Wh|/127`
-    (f32, floor 1e-12) and RNE `clip(rint(Wh / scale), ±127)`. The rotation spreads a row's
-    outliers across its group, which is what keeps the per-token int8 activations that pair
-    with it accurate; the leaf rotates each activation by the same H."""
+    """TensorFS's versioned H256/16 rowwise ConvRot producer and measured acceptance facts."""
     rows, cols = _require_2d(key, values, CONVROT_GROUP)
-    payload = np.empty((rows, cols), dtype=np.int8)
-    row_scale = np.empty((rows,), dtype=np.float32)
+    if not rows:
+        return Encoded(
+            "I8",
+            [0, cols],
+            b"",
+            [Companion(".weight_scale", "F32", [0], b"")],
+            0,
+            0.0,
+            0.0,
+            0.0,
+        )
+    if not cols:
+        raise UnsupportedInput(f"{key!r}: ConvRot requires nonempty weight columns")
+    payload: list[bytes] = []
+    scales: list[bytes] = []
     acc = _Accum()
     for sl in row_chunks(rows, cols, CACHE_ELEMENTS):
-        v = np.ascontiguousarray(values[sl], dtype=np.float32)
-        rotated = hadamard256(v.astype(np.float64)) / 16.0
-        amax = np.abs(rotated).max(axis=-1)
-        scale = np.maximum(amax / INT8_MAX, 1e-12).astype(np.float32)
-        q = np.rint(rotated / scale.astype(np.float64)[:, None])
-        acc.sat += int(np.count_nonzero(np.abs(q) > INT8_MAX))
-        q = np.clip(q, -INT8_MAX, INT8_MAX).astype(np.int8)
-        acc.add(v, decode_int8_convrot256(q, scale))
-        payload[sl] = q
-        row_scale[sl] = scale
+        encoded, measured = _measured(
+            key,
+            values[sl],
+            "int8.convrot",
+            "int8-convrot256/1",
+            {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
+        )
+        payload.append(encoded.parts["weight"].tobytes())
+        scales.append(encoded.parts["scale"].tobytes())
+        acc.merge(measured)
     return Encoded(
         payload_dtype="I8",
         payload_shape=[rows, cols],
-        payload=payload.tobytes(),
-        companions=[Companion(".weight_scale", "F32", [rows], row_scale.tobytes())],
+        payload=b"".join(payload),
+        companions=[Companion(".weight_scale", "F32", [rows], b"".join(scales))],
         saturated=acc.sat,
         sse=acc.sse,
         energy=acc.energy,
