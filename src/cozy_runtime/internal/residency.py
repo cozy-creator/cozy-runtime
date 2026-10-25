@@ -1144,7 +1144,7 @@ class Memory:
                     self.phase_supported
                     and wanted > free
                     and not self.capturing()
-                    and not (request is not None and request.idle)
+                    and not (request is not None and (request.idle or request.overlap))
                 ):
                     # Activation growth can consume phase-entry headroom. Shed other idle
                     # backing before permanently shortening this phase's resident prefix.
