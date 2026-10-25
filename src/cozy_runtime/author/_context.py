@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Any, Literal, final, overload
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
     from cozy_runtime.author._prepared import Execution, PreparedWork
@@ -152,6 +154,9 @@ class Context:
     )
     _recipes: tuple[DeclaredRecipe, ...] = field(default=(), repr=False)
     _submit_prepared: Callable[[PreparedWork], Execution] | None = field(default=None, repr=False)
+    _pause_stall_watch: Callable[[], AbstractContextManager[None]] | None = field(
+        default=None, repr=False
+    )
 
     def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored

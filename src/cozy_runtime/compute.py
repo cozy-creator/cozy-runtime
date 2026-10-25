@@ -10,7 +10,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Sequence
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack, nullcontext, suppress
 from typing import TYPE_CHECKING, Any, NoReturn
 
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
@@ -320,6 +320,7 @@ class PreparedRepeat:
         from torch.utils._pytree import tree_leaves
 
         from cozy_runtime._kernels import _execution
+        from cozy_runtime.author._context import CURRENT
         from cozy_runtime.internal.residency import Binding
 
         tensors = tuple(state)
@@ -373,7 +374,14 @@ class PreparedRepeat:
                     for target, original in zip(tensors, saved, strict=True):
                         target.copy_(original)
                 stream.synchronize()
-                with varena.capture(device), torch.cuda.stream(stream), CaptureOwners(True):
+                context = CURRENT.get()
+                pause = context._pause_stall_watch if context is not None else None
+                with (
+                    pause() if pause is not None else nullcontext(),
+                    varena.capture(device),
+                    torch.cuda.stream(stream),
+                    CaptureOwners(True),
+                ):
                     graph.capture_begin(capture_error_mode="global")
                     try:
                         step(index)

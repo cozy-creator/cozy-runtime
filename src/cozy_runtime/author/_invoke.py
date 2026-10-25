@@ -528,6 +528,8 @@ def run_prepared(
         unwind(exc)
         return None, outcome, record
     finally:
+        if record._stall_watch is not None:
+            record._stall_watch.stop()
         record.closed = True
 
 
