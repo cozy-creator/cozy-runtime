@@ -314,6 +314,10 @@ class PreparedRequest:
     lora: str = "bake"
     #: what preparing it waited for (its attention kernel's compile): its attempt's first stages
     stages: Mapping[str, Track] = field(default_factory=dict)
+    #: Static component order is available before handler entry and queued GPU admission.
+    phases: tuple[tuple[str, ...], ...] = ()
+    #: Device-selection hints used only to decline incompatible queued speculation.
+    prefetch_key: tuple[str, int] = ("", 0)
 
     def digests(self) -> dict[str, str]:
         """What a worker can hold, record and price against — never the payload."""
@@ -344,6 +348,7 @@ def prepare(
         facts_digest=facts_digest,
         asset_bounds=asset_bounds,
         lora=lora,
+        phases=registration.phases,
     )
 
 

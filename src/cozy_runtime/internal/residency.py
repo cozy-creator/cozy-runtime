@@ -36,6 +36,7 @@ __all__ = [
     "Level",
     "Memory",
     "Model",
+    "QueuedPrefetch",
     "Region",
     "Request",
     "ResidencyError",
@@ -318,6 +319,15 @@ class _Block:
             yield from (tensor for _, tensor in self.assigned)
 
 
+@dataclass(frozen=True, slots=True)
+class QueuedPrefetch:
+    """One exact prepared-record snapshot, never permission to invoke that request."""
+
+    request_id: str
+    models: tuple[Model, ...]
+    valid: Callable[[], bool]
+
+
 @dataclass(slots=True)
 class _Prefetch:
     block: _Block
@@ -325,6 +335,7 @@ class _Prefetch:
     read: Any
     identity: str
     request: Request | None
+    queued: QueuedPrefetch | None = None
 
 
 class Model:
@@ -1520,13 +1531,54 @@ class Memory:
             return region.prepare()
 
     def _prefetch_next(self, current: _Block) -> None:
-        """Admit at most one next raw block, without eviction or Python fill callbacks."""
-        block = current.next
-        request = _REQUEST.get()
+        """Demand's own next block takes priority over queued-request speculation."""
+        if current.next is None or current.retained:
+            return
+        with self.lock:
+            if self._prefetch is not None and self._prefetch.queued is not None:
+                self._settle_prefetch(cancel=True)
+        self._prefetch_block(current.next, _REQUEST.get())
+
+    def _prefetch_queued(self, request: Request) -> None:
+        """One raw block after a resident program has allocated all of its working storage."""
+        if (
+            request.queued is None
+            or request.idle
+            or request.overlap
+            or not self.prefetch_supported
+            or self.capturing()
+        ):
+            return
+        queued = request.queued()
+        if queued is None or not queued.valid():
+            return
+        with self.lock:
+            if self._prefetch is not None or len(self.requests) != 1:
+                return
+            for model in queued.models:
+                if model.memory is not self or model.closed or model.retiring:
+                    return
+                for block in model.groups():
+                    if not block.cached():
+                        # One offer, one block; no scan that admits a second reader after refusal.
+                        self._prefetch_block(block, request, queued=queued)
+                        return
+
+    def cancel_queued(self, request_id: str) -> None:
+        """Invalidate only the named native reader; its current owner drains it later."""
+        pending = self._prefetch
+        if pending is not None and pending.queued is not None:
+            if pending.queued.request_id == request_id:
+                # A strong local reference survives concurrent settlement. Native cancel does
+                # not join; no Memory or prepared-record lock is needed on the Mux thread.
+                pending.read.cancel()
+
+    def _prefetch_block(
+        self, block: _Block, request: Request | None, *, queued: QueuedPrefetch | None = None
+    ) -> None:
+        """Admit one immutable raw read, without eviction or Python fill callbacks."""
         if (
             not self.prefetch_supported
-            or block is None
-            or current.retained
             or self.capturing()
             or (request is not None and request.idle)
             or block.model.fill is not None
@@ -1547,9 +1599,14 @@ class Memory:
             # Capacity is checked before native admission and includes already resident
             # weights/activation reservations. The native call also refuses window trimming,
             # OOM recovery and abandoned-writer joins; it never requests a context join.
-            if block.allocation_bytes > self.room().free:
+            needed = block.allocation_bytes + (self.window_bytes if queued is not None else 0)
+            if needed > self.room().free:
                 if request is not None:
                     request.prefetch_skipped += 1
+                    if queued is not None:
+                        request.queued_prefetch.append(
+                            {"request": queued.request_id, "state": "capacity_skip", "bytes": needed}
+                        )
                 return
             offset = 0
             parts = []
@@ -1565,7 +1622,8 @@ class Memory:
                 # block under that same soft preference without growing a cut prefix.
                 preferred = bool(region.preferred)
                 provisional = (
-                    self.phase_supported
+                    queued is None
+                    and self.phase_supported
                     and not preferred
                     and block.model.prefix is None
                     and block.allocation_bytes + self.window_bytes <= self.room().free
@@ -1591,16 +1649,46 @@ class Memory:
                 if request is not None:
                     request.prefetch_failed += 1
                 return
+            except (RuntimeError, ValueError) as error:
+                if queued is None or fault(error) not in (Fault.OTHER, Fault.OOM):
+                    raise
+                if request is not None:
+                    request.prefetch_failed += 1
+                return
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
-            self._prefetch = _Prefetch(block, region, read, identity, request)
+            self._prefetch = _Prefetch(block, region, read, identity, request, queued)
             try:
+                # Publication precedes the last validity check, so a concurrent discard either
+                # cancels this exact read or is observed here before any I/O starts.
+                if queued is not None and not queued.valid():
+                    self._settle_prefetch(cancel=True)
+                    return
                 read.start()
-            except BaseException:
-                self._settle_prefetch(cancel=True)
+            except BaseException as error:
+                self._settle_prefetch(cancel=True)  # a failed start still owns its admitted Fill
+                if (
+                    queued is not None
+                    and isinstance(error, (tensorfs.Error, RuntimeError, ValueError))
+                    and fault(error) in (Fault.OTHER, Fault.OOM)
+                ):
+                    if request is not None:
+                        request.prefetch_failed += 1
+                    return
                 raise
             if request is not None:
                 request.prefetch_started += 1
+                if queued is not None:
+                    request.queued_prefetch.append(
+                        {
+                            "request": queued.request_id,
+                            "state": "started",
+                            "set": block.model.name,
+                            "block": block.index,
+                            "bytes": block.allocation_bytes,
+                            "at_ns": time.time_ns(),
+                        }
+                    )
 
     def _settle_prefetch(self, *, cancel: bool = False) -> None:
         """Checked completion owns the source and Fill independently of Python model views."""
@@ -1609,7 +1697,11 @@ class Memory:
             if pending is None:
                 return
             block, read, request = pending.block, pending.read, pending.request
-            cancel = cancel or pending.identity != block.model.wanted_identity()
+            cancel = (
+                cancel
+                or pending.identity != block.model.wanted_identity()
+                or (pending.queued is not None and not pending.queued.valid())
+            )
             if cancel:
                 read.cancel()
             began = time.perf_counter_ns()
@@ -1645,6 +1737,18 @@ class Memory:
                     raise
                 complete = not row["canceled"]
                 if request is not None:
+                    if pending.queued is not None:
+                        request.queued_prefetch.append(
+                            {
+                                "request": pending.queued.request_id,
+                                "state": "ready" if complete else "canceled",
+                                "set": block.model.name,
+                                "block": block.index,
+                                "bytes": int(row.get("bytes", 0)),
+                                "at_ns": time.time_ns(),
+                                "native": dict(row),
+                            }
+                        )
                     request.prefetch_canceled += int(not complete)
                     if complete:
                         request.prefetch_completed += 1
@@ -1991,6 +2095,8 @@ class Memory:
             try:
                 with self.lock:
                     if self._prefetch is not None and self._prefetch.request is request:
+                        # Cancel/drain unfinished speculation. An already completed read
+                        # keeps valid immutable bytes as ordinary unpinned cache for B.
                         self._settle_prefetch(cancel=True)
                 request.sample()
                 request.ended = request.stats()
@@ -2032,7 +2138,13 @@ class Request:
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
+        self.queued: Callable[[], QueuedPrefetch | None] | None = None
+        self.queued_prefetch: list[dict[str, Any]] = []
         self.sample()
+
+    def prefetch_queued(self) -> None:
+        """Called only by a resident submission after its state/scratch/readout allocation."""
+        self.memory._prefetch_queued(self)
 
     def sample(self) -> None:
         self.peak = max(self.peak, self.memory._figures()[2])
@@ -2176,7 +2288,8 @@ class Request:
                     "skipped_capacity": self.prefetch_skipped,
                     "failed": self.prefetch_failed,
                     "wait_ns": self.prefetch_wait_ns,
-                    "scope": "one next exact raw block; no native transform callbacks",
+                    "scope": "one exact raw block; current demand precedes queued speculation",
+                    "queued": list(self.queued_prefetch),
                 },
             )
         elif self.memory.device.type == "mps":
