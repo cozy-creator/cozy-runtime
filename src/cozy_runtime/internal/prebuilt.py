@@ -515,7 +515,7 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
         name = "bf16" if dtype == torch.bfloat16 else "fp16"
         for m in (3, rows):
             x = randn(m, width).to(dtype)
-            want = _law(torch, f, x.double(), data, scale, bias)
+            want = law(torch, f, x.double(), data, scale, bias)
             got = (ops.fp8_linear if f.fp8 else ops.int8_linear)(x, data, scale, bias, dtype)
             errors[f"{name} linear M={m}"] = verify.error(torch, got, want)
         q, scales = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(x)
@@ -534,7 +534,7 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     got = (ops.fp8_gemm if f.fp8 else ops.int8_gemm)(*folded, data, scale, None, torch.bfloat16)
     produced = _prologue(torch, x.double(), modulation.double(), shift.double(), 1e-6)
     errors["prologue rms+modulation+gelu_tanh"] = verify.error(
-        torch, got, _law(torch, f, produced, data, scale, None)
+        torch, got, law(torch, f, produced, data, scale, None)
     )
     return verify.within(errors, BUDGET)
 
@@ -574,7 +574,7 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
             label = f"{name} {'bf16' if dtype == torch.bfloat16 else 'fp16'}"
             for m in (3, rows):
                 x = randn(m, width).to(dtype)
-                want = _law(torch, INT8, x.double(), data, grid.scale, bias)
+                want = law(torch, INT8, x.double(), data, grid.scale, bias)
                 errors[f"{label} linear M={m}"] = verify.error(
                     torch, ops.w4a8_linear(x, grid, bias, dtype), want
                 )
@@ -592,7 +592,7 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
     got = ops.w4a8_gemm(*folded, w, None, torch.bfloat16)
     produced = _prologue(torch, x.double(), modulation.double(), shift.double(), 1e-6)
     errors["prologue rms+modulation+gelu_tanh"] = verify.error(
-        torch, got, _law(torch, INT8, produced, unpack(torch, w), w.scale, None)
+        torch, got, law(torch, INT8, produced, unpack(torch, w), w.scale, None)
     )
     return verify.within(errors, BUDGET)
 
@@ -603,7 +603,7 @@ def _fp8_law(torch: ModuleType, x: Tensor) -> tuple[Tensor, Tensor]:
     return (x.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(torch.float8_e4m3fn), scale
 
 
-def _law(
+def law(
     torch: ModuleType, f: _Format, x: Tensor, data: Tensor, scale: Tensor, bias: Tensor | None
 ) -> Tensor:
     """The quantized product in float64: what the kernels compute, up to their output's rounding."""

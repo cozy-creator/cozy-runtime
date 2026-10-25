@@ -11,14 +11,11 @@ codes are unpacked by torch ops and the int8 lane's GEMM serves, and every run s
 
 from __future__ import annotations
 
-import sys
 from functools import partial
 from types import ModuleType
-from typing import cast
 
-from cozy_runtime.author._model import Building
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
-from cozy_runtime.internal import int8_linear, kernel_ready, prebuilt, verify
+from cozy_runtime.internal import int8_linear, kernel_ready, prebuilt
 from cozy_runtime.internal.encoding.formats import Tensor
 
 OP = "cozy-w4a8"
@@ -28,32 +25,18 @@ OPERAND = INT8_CONVROT
 
 def native(torch: ModuleType, index: int) -> prebuilt.Prebuilt | None:
     """The 8-bit library on this card once its w4a8 GEMM verifies here, off any request thread
-    (`kernel_ready`); None until then, and for good where the GEMM fails its probe (said once)."""
-    name = f"{OP} cuda:{index}"
+    (`kernel_ready.serve`); None until then, and for good where the GEMM fails its probe."""
     if int8_linear.native(torch, index) is None:
         return None
-    if torch.cuda.is_current_stream_capturing():
-        ops = kernel_ready.ready(name)
-        if ops is None and kernel_ready.failed(name) is None:
-            raise Building(
-                OP
-            )  # its probe would end the graph being recorded: record once it serves
-        return cast("prebuilt.Prebuilt | None", ops)
-    return kernel_ready.ready(name, partial(_verified, torch, index))
+    capturing = torch.cuda.is_current_stream_capturing()
+    return kernel_ready.serve(f"{OP} cuda:{index}", partial(_verified, torch, index), capturing)
 
 
 def _verified(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
-    ops = int8_linear.library(index)
-    major, minor = torch.cuda.get_device_capability(index)
-    verdict = verify.verified(
-        "prebuilt-w4a8", prebuilt.artifact(), major * 10 + minor,
-        partial(prebuilt.probe_w4a8, torch, ops),
-    )  # fmt: skip
-    if not verdict.ok:
-        print(f"[w4a8] no w4a8 GEMM on cuda:{index}: {verdict.detail}", file=sys.stderr)
-        raise RuntimeError(verdict.detail)
-    print(f"[w4a8] verified on sm{major}{minor}: {verdict.detail}", file=sys.stderr)
-    return ops
+    sm, probe = int8_linear.capability(torch, index), partial(prebuilt.probe_w4a8, torch)
+    return kernel_ready.verified(
+        int8_linear.library(index), "prebuilt-w4a8", prebuilt.artifact(), sm, probe
+    )
 
 
 def why(index: int) -> str:

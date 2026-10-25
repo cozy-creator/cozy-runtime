@@ -7,7 +7,8 @@ kernel store), then Triton's launcher module, in the compile manager's niced bac
 cache filled. The key is Triton's own hash of every entry (sources and the functions they call,
 signature, architecture, options, Triton) plus the launcher module's key and the cache
 location; a driver update rebuilds nothing. `load` waits for a live build by its measured
-progress, then serves it or raises `KernelsUnavailable`: a request never compiles.
+progress, then serves it or raises `KernelsUnavailable`: a request never compiles. The Runtime's
+own sets open through `opened` (`kernel_ready.TRITON`): loaded, then verified on the card.
 
 Executor-only: torch and Triton are imported at the top, guarded; their absence is
 `kernels_absent`.
@@ -34,7 +35,7 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
-from cozy_runtime.internal import kernel_cache, kernel_compile, nvfp4_linear, svdq_linear, tools
+from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_ready, tools, verify
 
 try:
     import torch
@@ -263,9 +264,13 @@ class _Launcher:
     weight the plane has not mapped."""
 
     def __init__(
-        self, arch: int, compiled: dict[str, CompiledKernel], names: dict[str, tuple[str, ...]]
+        self,
+        arch: int,
+        compiled: dict[str, CompiledKernel],
+        names: dict[str, tuple[str, ...]],
+        key: str,
     ) -> None:
-        self.arch, self.compiled, self.names = arch, compiled, names
+        self.arch, self.compiled, self.names, self.key = arch, compiled, names, key
 
     def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
         params = kernel.arg_names
@@ -326,7 +331,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
             ) from exc
         compiled[entry.key] = kernel
         names[entry.kernel.__name__] = tuple(sorted(entry.constexprs))
-    launcher = _LOADED[(kernels.name, index)] = _Launcher(arch, compiled, names)
+    launcher = _LOADED[(kernels.name, index)] = _Launcher(arch, compiled, names, found.key.digest)
     return launcher
 
 
@@ -351,8 +356,23 @@ def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Laun
     return launch
 
 
-nvfp4_linear.READY[:] = [ready]
-svdq_linear.READY[:] = [ready]
+def opened(
+    kernels: TritonKernels,
+    probe: Callable[[Launch], verify.Verdict],
+    wait: bool = False,
+    *,
+    device: object,
+) -> Launch | None:
+    """A Runtime set's opener: `ready`, then `probe` of its launcher against the exact law on
+    this card (`kernel_ready.verified`, keyed by the build), else `kernel_ready.Refused`."""
+    launch = ready(kernels, wait, device=device)
+    if launch is None:
+        return None
+    loaded = _LOADED[(kernels.name, torch.device(device).index or 0)]
+    return kernel_ready.verified(launch, kernels.name, loaded.key, loaded.arch, probe)
+
+
+kernel_ready.TRITON[:] = [opened]
 
 
 def _compiled(*, src: ASTSource, times: CompileTimes, cache_hit: bool, **_: object) -> None:
