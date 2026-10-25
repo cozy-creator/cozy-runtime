@@ -176,6 +176,7 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
         _selection,
         "cozy_runtime.derive.facade",
         "cozy_runtime.derive.quantization",
+        "cozy_runtime.derive.native_quantization",
         "cozy_runtime.derive.microscale",
         "cozy_runtime.derive.safetensors_io",
         "cozy_runtime.weights_store",

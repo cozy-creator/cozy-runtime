@@ -1,6 +1,6 @@
 name: dev-build
 # Builds runtime-publish.yaml's release files for any ref, off the dev box:
-#   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure]
+#   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure|execution]
 # The artifact is cozy-runtime-<sha>[-aarch64]. The files carry the ref's pyproject version; the
 # commit is stamped in cozy_runtime._build_provenance.
 on:
@@ -11,7 +11,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: sdist, pure wheel and the runner arch's Linux wheel with its kernels; pure: sdist and pure wheel"
+        description: "wheels: release files; pure: sdist and pure wheel; execution: Linux x86_64 execution module only"
         type: string
         default: wheels
       runner:
@@ -39,7 +39,7 @@ jobs:
 
   dev:
     needs: modules
-    if: ${{ !cancelled() && needs.modules.result != 'failure' }}
+    if: ${{ inputs.build != 'execution' && !cancelled() && needs.modules.result != 'failure' }}
     runs-on: ${{ inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
@@ -93,5 +93,102 @@ jobs:
         with:
           name: cozy-runtime-${{ steps.pin.outputs.sha }}${{ runner.arch == 'ARM64' && '-aarch64' || '' }}
           path: source/dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  execution:
+    if: ${{ inputs.build == 'execution' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: pin
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          grep -v '^#' kernels/toolchain.env >> "$GITHUB_ENV"
+      - name: Build and check only the native execution owner
+        run: |
+          set -o pipefail
+          docker run --rm -i -v "$PWD:/src" -w /src \
+            --env-file <(grep -v '^#' kernels/toolchain.env) \
+            -e HOST_OWNER="$(id -u):$(id -g)" \
+            "quay.io/pypa/manylinux_2_28_x86_64:$MANYLINUX" bash -seuo pipefail <<'BUILD' 2>&1 | tee execution-build.log
+          dnf install -y -q dnf-plugins-core
+          dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+          dnf install -y -q "cuda-nvcc-13-0-$CUDA_NVCC" "cuda-cudart-devel-13-0-$CUDA_CUDART" \
+            "cuda-cuobjdump-13-0-$CUDA_CUOBJDUMP"
+          export PATH=/opt/python/cp312-cp312/bin:/usr/local/cuda-13.0/bin:$PATH
+          export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.91.1
+          export PATH="$HOME/.cargo/bin:$PATH" COZY_CUDA_TOOLKIT=/usr/local/cuda-13.0
+          export CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/execution-target PYO3_PYTHON=/opt/python/cp312-cp312/bin/python
+          cargo fetch --locked --manifest-path native/execution/Cargo.toml
+          CARGO_NET_OFFLINE=true bash scripts/build-execution-native.sh modules
+          python -m pip install -q --root-user-action ignore "torch==$TORCH" --index-url https://download.pytorch.org/whl/cpu
+          python checks/kernel_modules.py modules --without _gemm --without _norm --without _fa3 --torch-python python
+          for py in /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python /opt/python/cp314-cp314/bin/python; do
+            "$py" -I - <<'SMOKE'
+          import importlib.util
+          from pathlib import Path
+          path = Path("modules/cozy_runtime/_kernels/_execution.abi3.so")
+          spec = importlib.util.spec_from_file_location("_execution", path)
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          assert callable(module.ResidentRepeat)
+          try:
+              module.ResidentRepeat(0, 0, 0, 0, [])
+          except RuntimeError as error:
+              assert "nonempty owned graph" in str(error), str(error)
+          else:
+              raise AssertionError("invalid empty definition was accepted")
+          print("execution module import and pre-CUDA argument refusal passed")
+          SMOKE
+          done
+          readelf --version-info modules/cozy_runtime/_kernels/_execution.abi3.so > modules/elf-versions.txt
+          python - <<'MANIFEST'
+          import hashlib, json, os, re, subprocess
+          from pathlib import Path
+          module = Path("modules/cozy_runtime/_kernels/_execution.abi3.so")
+          versions = Path("modules/elf-versions.txt").read_text()
+          floor = max((tuple(map(int, m.split("."))) for m in re.findall(r"GLIBC_([0-9.]+)", versions)), default=(0,))
+          assert floor <= (2, 28), floor
+          paths = sorted(p for p in Path("native/execution").rglob("*") if p.is_file() and "target" not in p.parts)
+          paths += [Path("scripts/build-execution-native.sh"), Path("kernels/toolchain.env"), Path("checks/kernel_modules.py"), Path("src/cozy_runtime/_kernels/__init__.py"), Path(".github/workflows/dev-build.yaml")]
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          receipt = {
+              "source_commit": subprocess.check_output(["git", "-c", "safe.directory=/src", "rev-parse", "HEAD"], text=True).strip(),
+              "native_input_sha256": {str(p): digest(p) for p in paths},
+              "module": str(module), "module_sha256": digest(module),
+              "glibc_floor": ".".join(map(str, floor)),
+              "toolchain": {k: os.environ[k] for k in ("MANYLINUX", "CUDA_NVCC", "CUDA_CUDART", "CUDA_CUOBJDUMP", "TORCH")},
+              "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
+              "nvcc": subprocess.check_output(["nvcc", "--version"], text=True).strip(),
+              "cc": subprocess.check_output([os.environ["CC"], "--version"], text=True).splitlines()[0],
+              "checks": ["existing module catalog/cubin/export/dependency checker", "module-before-CPU-Torch import", "CPython3.12/3.13/3.14 import and pre-CUDA invalid-definition refusal", "GLIBC<=2.28"],
+              "scope": "Native build/import/ELF only; no CUDA device execution or wheel publication",
+          }
+          Path("modules/execution-manifest.json").write_text(json.dumps(receipt, indent=2) + "\n")
+          Path("modules/execution.sha256").write_text(digest(module) + "  cozy_runtime/_kernels/_execution.abi3.so\n")
+          MANIFEST
+          chown -R "$HOST_OWNER" modules
+          BUILD
+          exit "${PIPESTATUS[0]}"
+      - name: Preserve frozen native inputs
+        run: git diff --exit-code -- native/execution scripts/build-execution-native.sh kernels/toolchain.env
+      - uses: astral-sh/setup-uv@v7
+      - name: Stable execution ABI only
+        run: |
+          set -o pipefail
+          uvx abi3audit==0.0.26 --strict --report --assume-minimum-abi3 3.12 \
+            modules/cozy_runtime/_kernels/_execution.abi3.so 2>&1 | tee execution-abi3.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: execution-${{ steps.pin.outputs.sha }}
+          path: |
+            modules/
+            execution-build.log
+            execution-abi3.log
           if-no-files-found: error
           retention-days: 7

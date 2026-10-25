@@ -1,0 +1,200 @@
+"""One scoped native Writer conversion; model policy stays in the derivation."""
+
+from __future__ import annotations
+
+import time
+from collections.abc import Callable
+from concurrent.futures import CancelledError, Future, TimeoutError
+from contextlib import suppress
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+import msgspec
+import tensorfs
+
+from cozy_runtime.author import Context, Telemetry, UnsupportedInput
+from cozy_runtime.author._loader import TENSORFS_NAMES
+from cozy_runtime.author._prepared import Progress
+from cozy_runtime.weights_store import Checkpoint, Output
+
+from .quantization import (
+    _ENCODINGS,
+    PER_ROW,
+    ArtifactQuantizationPlan,
+    QuantizationStats,
+    QuantizationTensor,
+    _pool,
+)
+
+if TYPE_CHECKING:
+    from tensorfs.api import QuantizeTensor
+
+_STRATEGIES = {"int8.convrot": "int8-convrot256/1", "nvfp4": "nvfp4-min-sse/1"}
+
+
+def supported(source: Checkpoint, selection: ArtifactQuantizationPlan, encoding: str) -> bool:
+    """One native selection of plain or rowwise floats; TensorFS validates stored parts."""
+    for row in selection.tensors:
+        info = source.components[row.component].tensors[row.key]
+        if (
+            (row.encoding or encoding) not in _STRATEGIES
+            or info.dtype not in {"F16", "BF16", "F32"}
+            or len(info.shape) != 2
+        ):
+            return False
+        if info.encoding is not None and (
+            info.encoding.scheme not in PER_ROW or dict(info.encoding.params)
+        ):
+            return False
+    return bool(selection.tensors)
+
+
+class _Execution:
+    def __init__(
+        self,
+        future: Future[dict[str, object]],
+        control: tensorfs.ConversionControl,
+        context: Context | None,
+    ) -> None:
+        self.future, self.control, self.context = future, control, context
+
+    def poll(self) -> Progress:
+        _, completed, _ = self.control.progress()
+        return Progress(completed, self.control.canceled, self.future.done())
+
+    def cancel(self) -> None:
+        self.control.cancel()
+        self.future.cancel()  # A queued operation has not touched its Writer yet.
+
+    def _join(self) -> tuple[object, ...]:
+        try:
+            return (self.future.result(),)
+        except CancelledError:
+            if self.control.canceled:
+                return ()
+            raise
+        except tensorfs.NetworkError as error:
+            if (
+                self.control.canceled
+                and error.detail == "the conversion was stopped before publication"
+            ):
+                return ()
+            raise
+        except tensorfs.DecodeError as error:
+            # This prefix is the native Writer's explicit quality-refusal contract;
+            # unrelated format, storage and device failures retain their own families.
+            if error.detail.startswith("quantization_tripwire:"):
+                raise UnsupportedInput(error.detail, code="quantization_tripwire") from error
+            raise
+
+    def wait(self) -> tuple[object, ...]:
+        while not self.future.done():
+            if self.context is not None and self.context.cancelled:
+                self.cancel()
+            try:
+                self.future.result(timeout=0.05)
+            except TimeoutError:
+                continue
+            except Exception:
+                break  # The checked join below preserves/classifies the actual result.
+        result = self._join()
+        if self.context is not None:
+            self.context.raise_if_cancelled()
+        return result
+
+    def close(self, original: BaseException | None = None) -> None:
+        secondary: BaseException | None = None
+        try:
+            if not self.future.done():
+                self.cancel()
+        except BaseException as error:
+            secondary = error
+        try:
+            self._join()  # A failed cancel still must join the actual Writer owner.
+        except BaseException as error:
+            if not self.future.done():
+                raise  # An interrupted join did not prove completion.
+            secondary = secondary or error
+        if secondary is not None:
+            if original is None:
+                raise secondary
+            if secondary is not original:
+                original.add_note(
+                    f"Native conversion completed with a secondary failure: {secondary}"
+                )
+
+
+@dataclass(frozen=True)
+class _Work:
+    convert: Callable[[tensorfs.ConversionControl], dict[str, object]]
+
+    def submit(self, context: Context | None = None) -> _Execution:
+        if context is not None:
+            context.raise_if_cancelled()
+        control = tensorfs.ConversionControl()
+        future = _pool().submit(self.convert, control)
+        try:
+            return _Execution(future, control, context)
+        except BaseException:
+            control.cancel()
+            future.cancel()
+            with suppress(Exception):
+                future.result()  # A signal cannot orphan native work owning the Output.
+            raise
+
+
+def quantize(
+    source: Checkpoint,
+    output: Output,
+    selection: ArtifactQuantizationPlan,
+    encoding: str,
+    logical_dtype: Callable[[QuantizationTensor], str],
+    *,
+    ctx: Context,
+    tel: Telemetry,
+    max_relative_frobenius: float | None,
+) -> QuantizationStats:
+    rows: list[QuantizeTensor] = []
+    for row in selection.tensors:
+        scheme = row.encoding or encoding
+        rows.append(
+            {
+                "component": row.component,
+                "key": row.key,
+                "source_dtype": source.components[row.component].tensors[row.key].dtype,
+                "shape": list(row.shape),
+                "dtype": TENSORFS_NAMES[logical_dtype(row)],
+                "encoding": {"scheme": scheme, "params": dict(_ENCODINGS[scheme].params)},
+                "strategy": _STRATEGIES[scheme],
+            }
+        )
+    convert, pending = output.prepare_quantization(
+        source, rows, max_relative_frobenius=max_relative_frobenius
+    )
+    # This helper joins before returning, like the existing bounded encoding loop.
+    # It must not consume Context.plan's one whole GPU program slot: an author may
+    # convert several outputs and then submit that program in the same request.
+    execution = _Work(convert).submit(ctx)
+    observed = -1
+    failure: BaseException | None = None
+    try:
+        while True:
+            ctx.raise_if_cancelled()
+            progress = execution.poll()
+            if progress.completed_steps != observed:
+                observed = progress.completed_steps
+                tel.progress(observed / max(1, pending), stage="native quantization")
+            if progress.done:
+                break
+            time.sleep(0.05)  # Observation never advances native reads/encoding/publication.
+        (result,) = execution.wait()
+        stats = msgspec.convert(result, type=QuantizationStats)
+        tel.progress(1.0, stage="native quantization")
+        tel.metric("native_quantized_tensors", float(stats.encoded_keys))
+        return stats
+    except BaseException as error:
+        failure = error
+        raise
+    finally:
+        # ctx.output can exit before the outer request scope. Join before it closes Output.
+        execution.close(failure)

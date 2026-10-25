@@ -186,10 +186,13 @@ def describe() -> int:
 
 
 def _regular(directory: int, name: str) -> int:
-    """The spool file `name`, opened as a path: a regular file, never a link or elsewhere."""
+    """The readable spool file `name`: a regular file, never a link or elsewhere."""
     if not name or name != os.path.basename(name) or name in (".", ".."):
         raise ValueError("SDK output has no single owned spool name")
-    handle = os.open(name, os.O_PATH | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=directory)
+    # Nonblocking open lets fstat reject a FIFO without waiting for a writer.
+    handle = os.open(
+        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory
+    )
     try:
         if not stat.S_ISREG(os.fstat(handle).st_mode):
             raise ValueError("SDK output is not a regular file")
@@ -202,7 +205,7 @@ def _regular(directory: int, name: str) -> int:
 def _read_regular(directory: int, name: str) -> bytes:
     handle = _regular(directory, name)
     try:
-        with open(f"/proc/self/fd/{handle}", "rb") as stream:
+        with os.fdopen(handle, "rb", closefd=False) as stream:
             return stream.read()
     finally:
         os.close(handle)
