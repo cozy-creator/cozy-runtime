@@ -250,6 +250,9 @@ class PreparedRepeat:
         bindings = tuple(
             (weakref.ref(owner), owner.identity) for owner in owners if isinstance(owner, Binding)
         )
+        # The local mode class has a __class__ closure cycle. Native ownership has taken its
+        # own references; do not leave GPU tensors retained until an unrelated Python GC pass.
+        held.clear()
         return cls(native, tensors, device, steps, dependencies, bindings)
 
     def _valid_definition(self) -> bool:
