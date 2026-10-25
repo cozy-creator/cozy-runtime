@@ -94,10 +94,26 @@ class _Execution:
             self.context.raise_if_cancelled()
         return result
 
-    def close(self) -> None:
-        if not self.future.done():
-            self.cancel()
-        self._join()  # Joining is mandatory even while an outer exception unwinds.
+    def close(self, original: BaseException | None = None) -> None:
+        secondary: BaseException | None = None
+        try:
+            if not self.future.done():
+                self.cancel()
+        except BaseException as error:
+            secondary = error
+        try:
+            self._join()  # A failed cancel still must join the actual Writer owner.
+        except BaseException as error:
+            if not self.future.done():
+                raise  # An interrupted join did not prove completion.
+            secondary = secondary or error
+        if secondary is not None:
+            if original is None:
+                raise secondary
+            if secondary is not original:
+                original.add_note(
+                    f"Native conversion completed with a secondary failure: {secondary}"
+                )
 
 
 @dataclass(frozen=True)
@@ -152,6 +168,7 @@ def quantize(
     # convert several outputs and then submit that program in the same request.
     execution = _Work(convert).submit(ctx)
     observed = -1
+    failure: BaseException | None = None
     try:
         while True:
             ctx.raise_if_cancelled()
@@ -167,6 +184,9 @@ def quantize(
         tel.progress(1.0, stage="native quantization")
         tel.metric("native_quantized_tensors", float(stats.encoded_keys))
         return stats
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         # ctx.output can exit before the outer request scope. Join before it closes Output.
-        execution.close()
+        execution.close(failure)
