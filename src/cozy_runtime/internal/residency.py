@@ -48,6 +48,7 @@ __all__ = [
 
 progress = 0
 _RESERVE = 512 << 20
+_HOST_STAGING = 64 << 20
 _DTYPES = {
     name: kind
     for name, kind in (
@@ -416,9 +417,24 @@ class Model:
                 return None
             groups = self.groups()
             missing = sum(b.allocation_bytes for b in groups if b.data is None and not b.cached())
+            if self.memory.device.type == "mps" and missing:
+                missing += min(
+                    max(
+                        (
+                            part.nbytes
+                            for b in groups
+                            if b.data is None
+                            for p in b.parts.values()
+                            for part in p.values()
+                        ),
+                        default=0,
+                    ),
+                    _HOST_STAGING,
+                )
             if free_only and missing > self.memory.room().free:
-                if self.memory.cuda:
-                    torch.cuda.empty_cache()
+                from cozy_runtime.internal.accel import release_cached
+
+                release_cached(torch, self.memory.device.type)
                 if missing > self.memory.room().free:
                     return None
             entered: list[_Block] = []
@@ -832,6 +848,13 @@ class Memory:
                 # Account native backing beside Torch reservations, including graph pools.
                 # Unused private-pool bytes are not headroom for an eager allocation.
                 free = min(free, max(self.budget_bytes - reserved, 0))
+        elif self.device.type == "mps":
+            from cozy_runtime.internal.accel import allocation
+
+            figures = allocation(torch, "mps")
+            free, reserved = figures["driver_free_bytes"], figures["reserved_bytes"]
+            if self.budget_bytes is not None:
+                free = min(free, max(self.budget_bytes - reserved, 0))
         else:
             from cozy_runtime.internal.accel import host_memory
 
@@ -1003,6 +1026,8 @@ class Memory:
 
     def reclaim(self, need: int = 0, *, current: Collection[str] = ()) -> int:
         """Discard idle local owners at a preparation boundary; never inside an allocator."""
+        from cozy_runtime.internal.accel import release_cached
+
         if self.capturing():
             return 0
         before_allocated, before_reserved, _ = self._figures()
@@ -1021,8 +1046,8 @@ class Memory:
                 if self.native is not None:
                     self.native.reclaim(max(need - available, 0))
                     available = self.room(current).free
-                if self.cuda and available < need:
-                    torch.cuda.empty_cache()
+                if available < need:
+                    release_cached(torch, self.device.type)
                 dropped = 0
                 available = self.room(current).free
             return available >= need
@@ -1072,10 +1097,10 @@ class Memory:
                     break
                 if region.discard():
                     enough(flush=True)
-        if self.cuda and not need:
+        if not need:
             if self.native is not None:
                 self.native.reclaim(int(self.native.stats()["resident_bytes"]))
-            torch.cuda.empty_cache()
+            release_cached(torch, self.device.type)
         allocated, reserved, _ = self._figures()
         free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
         return max(before_allocated - allocated, before_reserved - reserved, free - before_free, 0)
@@ -1106,9 +1131,21 @@ class Memory:
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
         self.apply_budget()
+        if self.device.type == "mps" and reclaim:
+            # TensorFS reads into bounded host staging; account for that transient beside
+            # the retained MPS part before asking Torch for its destination allocation.
+            need = nbytes + min(nbytes, _HOST_STAGING)
+            if need > self.room().free:
+                self.reclaim(need)
         try:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        except torch.OutOfMemoryError:
+        except RuntimeError as error:
+            # MPS reports allocator refusal as RuntimeError. Classify only this failed
+            # allocation; reads, transforms and model execution are outside the retry.
+            if not isinstance(error, torch.OutOfMemoryError) and not (
+                self.device.type == "mps" and fault(error) is Fault.OOM
+            ):
+                raise
             if not reclaim or self.capturing() or not self.reclaim():
                 raise
             # Only the failed allocation is retried. No read, fill transform or forward ran.
@@ -1492,7 +1529,7 @@ class Memory:
                     if use is None or use.needs_fill:
                         began = time.perf_counter_ns()
                         try:
-                            tensors.read_into(key, raw, role=part.role or None)
+                            self._read_into(tensors, key, raw, part.role or None)
                         except tensorfs.Error:
                             # A failed destination completion must retain its native owner.
                             # Preserve the existing sticky CUDA failure classification.
@@ -1536,6 +1573,22 @@ class Memory:
                 request.read(block, read_ns, read_bytes)
             with self.lock:
                 block.loading = False
+
+    def _read_into(self, tensors: Any, key: str, raw: Tensor, role: str | None) -> None:
+        if self.device.type != "mps":
+            tensors.read_into(key, raw, role=role)
+            return
+        length = raw.numel()  # Stored carriers are contiguous U8, including packed parts.
+        if not length:
+            return
+        host = torch.empty(min(length, _HOST_STAGING), dtype=torch.uint8, device="cpu")
+        for offset in range(0, length, host.numel()):
+            stop = min(offset + host.numel(), length)
+            view = host[: stop - offset]
+            tensors.read_into(key, view, role=role, offset=offset)
+            # TensorFS owns only the CPU read. Torch owns MPS transfer and completion;
+            # a blocking copy lets the next window reuse this same host allocation safely.
+            raw[offset:stop].copy_(view, non_blocking=False)
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
         global progress
