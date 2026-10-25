@@ -651,7 +651,7 @@ def _built(device: int, wait: bool) -> bool | None:
     if not tools.triton():
         raise RuntimeError("cc not found")
     if _BUILD is None:
-        log = tempfile.TemporaryFile()  # noqa: SIM115 - read and closed when the child ends
+        log: IO[bytes] = tempfile.TemporaryFile()  # noqa: SIM115 - closed when the child ends
         boot = json.dumps({"path": sys.path, "device": device})
         command = [sys.executable, "-I", "-c", _CHECK, boot]
         _BUILD = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log), log

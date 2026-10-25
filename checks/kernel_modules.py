@@ -5,8 +5,9 @@ cozy-runtime wheels promise. `<modules>/cozy_runtime/_kernels` holds exactly the
 PTX (cuobjdump). Each needs only the OS's C runtime (readelf, dumpbin): no torch, no CUDA library,
 no version-specific libpython (Windows' stable-ABI `python3.dll` is the one Python it may name).
 Each loads on every Python given, and a call on a machine without a GPU returns CUDA's error
-rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`, the Rust source
-TensorD checks at startup). Each exports `PyInit_*` alone (nm, dumpbin): an exported libstdc++
+rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`, the
+Rust source TensorD checks at startup). Rust execution may use the OS libgcc unwinder.
+Each exports `PyInit_*` alone (nm, dumpbin): an exported libstdc++
 symbol binds process-wide and crashed torch imported after it. With `--torch-python`, each module
 loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
 """
@@ -23,7 +24,7 @@ from typing import Any
 
 #: What a module may need: glibc's own libraries; Windows' kernel, C runtime and stable ABI.
 SYSTEM = re.compile(
-    r"(libc|libm|libdl|libpthread|librt|ld-linux[\w.-]*)\.so(\.\d+)*"
+    r"(libc|libm|libdl|libpthread|librt|libgcc_s|ld-linux[\w.-]*)\.so(\.\d+)*"
     r"|(?i:(kernel32|python3|ucrtbase|vcruntime140(_1)?|api-ms-win-[\w-]+)\.dll)"
 )
 #: The `platform` crate's `gpu::DRIVER_FLOOR`: Windows', then everything else's.
