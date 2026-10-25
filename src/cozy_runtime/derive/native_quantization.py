@@ -19,6 +19,7 @@ from cozy_runtime.weights_store import Checkpoint, Output
 
 from .quantization import (
     _ENCODINGS,
+    PER_ROW,
     ArtifactQuantizationPlan,
     QuantizationStats,
     QuantizationTensor,
@@ -32,13 +33,20 @@ _STRATEGIES = {"int8.convrot": "int8-convrot256/1", "nvfp4": "nvfp4-min-sse/1"}
 
 
 def supported(source: Checkpoint, selection: ArtifactQuantizationPlan, encoding: str) -> bool:
-    """The first checkpoint route is explicit: all selected inputs must be plain floats."""
-    return bool(selection.tensors) and all(
-        (row.encoding or encoding) in _STRATEGIES
-        and source.components[row.component].tensors[row.key].encoding is None
-        and source.components[row.component].tensors[row.key].dtype in {"F16", "BF16", "F32"}
-        for row in selection.tensors
-    )
+    """One native selection of plain or rowwise floats; TensorFS validates stored parts."""
+    for row in selection.tensors:
+        info = source.components[row.component].tensors[row.key]
+        if (
+            (row.encoding or encoding) not in _STRATEGIES
+            or info.dtype not in {"F16", "BF16", "F32"}
+            or len(info.shape) != 2
+        ):
+            return False
+        if info.encoding is not None and (
+            info.encoding.scheme not in PER_ROW or dict(info.encoding.params)
+        ):
+            return False
+    return bool(selection.tensors)
 
 
 class _Execution:
