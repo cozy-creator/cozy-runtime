@@ -328,21 +328,48 @@ class PreparedRepeat:
         held: dict[int, Any] = {id(t): t for t in tensors}
         landed = LANDED[0]
 
+        # Temporary diagnostic: resolve the driver API before capture, never in a callback.
+        import ctypes
+        import json
+        import threading
+
+        driver = ctypes.CDLL("libcuda.so.1")
+        capture_status = driver.cuStreamIsCapturing
+        capture_status.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+        capture_status.restype = ctypes.c_int
+        status_cell = ctypes.c_int()
+        status_pointer = ctypes.pointer(status_cell)
+        diagnostics: list[dict[str, Any]] = []
+
+        def status() -> tuple[int, int | None]:
+            code = capture_status(ctypes.c_void_p(stream.cuda_stream), status_pointer)
+            return code, status_cell.value if code == 0 else None
+
         def probe(stage: str) -> None:
-            import sys
+            from cozy_runtime.internal import kernel_ready
 
             free, total = torch.cuda.mem_get_info(device)
-            print(
-                "[DEBUG-xs103-capture]",
-                stage,
+            with kernel_ready._LOCK:
+                opening = [
+                    name for name, slot in kernel_ready._SLOTS.items() if slot.state == "opening"
+                ][:8]
+            diagnostics.append(
                 {
+                    "stage": stage,
                     "free": free,
                     "total": total,
                     "allocated": torch.cuda.memory_allocated(device),
                     "reserved": torch.cuda.memory_reserved(device),
-                },
-                file=sys.stderr,
-                flush=True,
+                    "opening": opening,
+                    "workers": [t.name for t in threading.enumerate() if "kernel-ready" in t.name][
+                        :8
+                    ],
+                }
+            )
+
+        def annotate(error: BaseException) -> None:
+            error.add_note(
+                "[DEBUG-xs103-capture] " + json.dumps(diagnostics, separators=(",", ":"))
             )
 
         class CaptureOwners(TorchDispatchMode):  # type: ignore[misc]  # Torch is optional in checks.
@@ -370,29 +397,29 @@ class PreparedRepeat:
                     ):
                         held[id(tensor)] = tensor
                 try:
+                    before = status() if self.retain else None
+                    if before is not None and before != (0, 1):
+                        raise RuntimeError(f"capture was not active before {func}: {before}")
                     result = func(*args, **(kwargs or {}))
-                    if self.retain and not torch.cuda.is_current_stream_capturing():
-                        raise RuntimeError(f"capture became inactive after {func}")
+                    after = status() if self.retain else None
+                    if after is not None and after != (0, 1):
+                        raise RuntimeError(f"capture was not active after {func}: {after}")
                 except BaseException as error:
-                    import sys
-
                     shapes = [
                         (tuple(t.shape), str(t.dtype), str(t.device))
                         for t in tree_leaves((args, kwargs or {}))
                         if isinstance(t, torch.Tensor)
                     ][:8]
-                    print(
-                        "[DEBUG-xs103-capture] operator failure",
+                    diagnostics.append(
                         {
                             "capture": self.retain,
                             "operator": str(func),
                             "previous": self.previous,
                             "shapes": shapes,
-                            "error": repr(error),
-                        },
-                        file=sys.stderr,
-                        flush=True,
+                            "error": str(error)[:600],
+                        }
                     )
+                    annotate(error)
                     raise
                 self.previous = str(func)
                 for tensor in tree_leaves(result):
@@ -423,7 +450,11 @@ class PreparedRepeat:
                     try:
                         step(index)
                     finally:
-                        graph.capture_end()
+                        try:
+                            graph.capture_end()
+                        except BaseException as error:
+                            annotate(error)
+                            raise
                 stream.synchronize()
                 for target, original in zip(tensors, saved, strict=True):
                     target.copy_(original)
