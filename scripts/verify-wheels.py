@@ -46,7 +46,7 @@ def main() -> None:
         ),
     }
     if arch == "x86_64" and any(w.name.endswith(f"-{WINDOWS}.whl") for w in wheels):
-        kernels[WINDOWS] = ("_gemm.pyd", "_norm.pyd")
+        kernels[WINDOWS] = ("_gemm.pyd", "_norm.pyd", "_execution.pyd")
     assert {w.name for w in wheels} == {f"cozy_runtime-{version}-{tag}.whl" for tag in kernels}, (
         "missing or unexpected platform wheels"
     )

@@ -153,7 +153,7 @@ jobs:
         shell: bash
         run: |
           cl=$(cl 2>&1 | grep -o 'Version [0-9.]*' | cut -d' ' -f2)
-          echo "key=kernels-r1-win_amd64-msvc$cl-${{ hashFiles('kernels/**', 'src/cozy_runtime/_kernels/__init__.py', 'checks/kernel_modules.py') }}" >> "$GITHUB_OUTPUT"
+          echo "key=kernels-r2-win_amd64-msvc$cl-${{ hashFiles('kernels/**', 'native/execution/**', 'scripts/build-execution-native.ps1', 'scripts/cuda-windows-toolkit.ps1', 'src/cozy_runtime/_kernels/__init__.py', 'checks/kernel_modules.py') }}" >> "$GITHUB_OUTPUT"
       - id: cache
         uses: actions/cache/restore@v4
         with:
@@ -162,20 +162,9 @@ jobs:
       - name: CUDA from NVIDIA's redistributables, each archive held to its digest
         if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
-        run: |
-          $manifest = Invoke-RestMethod "$env:REDIST/redistrib_$env:CUDA_REDIST.json"
-          $root = "$env:RUNNER_TEMP\cuda"
-          New-Item -ItemType Directory -Force $root | Out-Null
-          foreach ($name in "cuda_nvcc", "cuda_crt", "libnvvm", "cuda_cudart", "cuda_cccl", "cuda_cuobjdump") {
-            $entry = $manifest.$name."windows-x86_64"
-            Invoke-WebRequest "$env:REDIST/$($entry.relative_path)" -OutFile "$name.zip"
-            if ((Get-FileHash "$name.zip" -Algorithm SHA256).Hash -ne $entry.sha256.ToUpper()) { throw "$name digest" }
-            Expand-Archive "$name.zip" "$env:RUNNER_TEMP\x\$name"
-            Copy-Item "$env:RUNNER_TEMP\x\$name\*\*" $root -Recurse -Force
-          }
-          "$root\bin" >> $env:GITHUB_PATH
-          "CUDAToolkit_ROOT=$root" >> $env:GITHUB_ENV
-          "CUDA_PATH=$root" >> $env:GITHUB_ENV
+        run: ./scripts/cuda-windows-toolkit.ps1
+      - if: steps.cache.outputs.cache-hit != 'true'
+        uses: dtolnay/rust-toolchain@1.91.1
       - name: Build and check the modules
         if: steps.cache.outputs.cache-hit != 'true'
         shell: pwsh
@@ -190,10 +179,13 @@ jobs:
           cmake --build "$env:RUNNER_TEMP\build" --parallel 1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --install "$env:RUNNER_TEMP\build" --prefix modules
+          $env:PYO3_PYTHON = $py
+          ./scripts/build-execution-native.ps1 -Destination modules
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           "built in $(((Get-Date) - $began).TotalMinutes) min"
           & $py -m pip install -q "torch==$env:TORCH" --index-url https://download.pytorch.org/whl/cpu
           # MSVC builds neither CUTLASS's TMA GEMMs nor FA3 (cr-201).
-          & $py checks/kernel_modules.py modules --without tma --without _fa3 --without _execution --python $py `
+          & $py checks/kernel_modules.py modules --without tma --without _fa3 --python $py `
             --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
             --platform-floor platform-gpu.rs --torch-python $py
           exit $LASTEXITCODE

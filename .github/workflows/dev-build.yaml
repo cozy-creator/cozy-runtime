@@ -11,7 +11,7 @@ on:
         type: string
         default: master
       build:
-        description: "wheels: release files; pure: sdist and pure wheel; execution: Linux x86_64 execution module only"
+        description: "wheels: release files; pure: sdist and pure wheel; execution: Linux execution module; execution-windows: Windows execution module"
         type: string
         default: wheels
       runner:
@@ -39,7 +39,7 @@ jobs:
 
   dev:
     needs: modules
-    if: ${{ inputs.build != 'execution' && !cancelled() && needs.modules.result != 'failure' }}
+    if: ${{ !startsWith(inputs.build, 'execution') && !cancelled() && needs.modules.result != 'failure' }}
     runs-on: ${{ inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
@@ -191,4 +191,90 @@ jobs:
             execution-build.log
             execution-abi3.log
           if-no-files-found: error
+          retention-days: 7
+
+  execution-windows:
+    if: ${{ inputs.build == 'execution-windows' }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - id: pin
+        run: |
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          Get-Content kernels/toolchain.env | Where-Object { $_ -and -not $_.StartsWith('#') } >> $env:GITHUB_ENV
+      - {uses: actions/setup-python@v5, id: py313, with: {python-version: '3.13'}}
+      - {uses: actions/setup-python@v5, id: py314, with: {python-version: '3.14'}}
+      - {uses: actions/setup-python@v5, id: py312, with: {python-version: '3.12'}}
+      - uses: ilammy/msvc-dev-cmd@v1.13.0
+        with:
+          toolset: ${{ env.MSVC_TOOLSET }}
+      - uses: dtolnay/rust-toolchain@1.91.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native/execution
+      - uses: astral-sh/setup-uv@v7
+      - name: Pinned CUDA redistributables
+        run: ./scripts/cuda-windows-toolkit.ps1
+      - name: Build the native execution owner
+        env:
+          PYO3_PYTHON: ${{ steps.py312.outputs.python-path }}
+        run: |
+          ./scripts/build-execution-native.ps1 -Destination modules
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Verify PE imports, exports, cubins and stable Python ABI
+        run: |
+          $py = '${{ steps.py312.outputs.python-path }}'
+          uv pip install --python $py "torch==$env:TORCH" --index-url https://download.pytorch.org/whl/cpu
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & $py checks/kernel_modules.py modules --without _gemm --without _norm --without _fa3 `
+            --python $py --python '${{ steps.py313.outputs.python-path }}' `
+            --python '${{ steps.py314.outputs.python-path }}' --torch-python $py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          uvx abi3audit==0.0.26 --strict --report --assume-minimum-abi3 3.12 modules/cozy_runtime/_kernels/_execution.pyd
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Record actual module and argument-refusal proof
+        run: |
+          @'
+          import hashlib, importlib.util, json, os, subprocess, sys
+          from pathlib import Path
+          module = Path('modules/cozy_runtime/_kernels/_execution.pyd')
+          spec = importlib.util.spec_from_file_location('_execution', module)
+          loaded = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(loaded)
+          assert callable(loaded.ResidentRepeat)
+          try:
+              loaded.ResidentRepeat(0, 0, 0, 0, [])
+          except RuntimeError as error:
+              assert 'nonempty owned graph' in str(error), str(error)
+          else:
+              raise AssertionError('empty graph definition accepted')
+          paths = sorted(p for p in Path('native/execution').rglob('*') if p.is_file() and 'target' not in p.parts)
+          paths += [Path('scripts/build-execution-native.ps1'), Path('scripts/cuda-windows-toolkit.ps1'), Path('kernels/toolchain.env'), Path('checks/kernel_modules.py')]
+          digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+          record = {
+              'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'native_input_sha256': {str(p): digest(p) for p in paths},
+              'module': str(module), 'module_sha256': digest(module),
+              'module_bytes': module.stat().st_size, 'platform': sys.platform,
+              'rustc': subprocess.check_output(['rustc', '--version'], text=True).strip(),
+              'nvcc': subprocess.check_output(['nvcc', '--version'], text=True).strip(),
+              'checks': ['PE dependency/export/cubin catalog', 'CPython3.12/3.13/3.14 imports', 'module-before-Torch import', 'stable ABI audit', 'pre-CUDA invalid-definition refusal'],
+              'scope': 'Windows native build and actual process import only; no GPU execution or local CLI qualification',
+          }
+          Path('modules/execution-manifest.json').write_text(json.dumps(record, indent=2) + '\n')
+          '@ | & '${{ steps.py312.outputs.python-path }}' -
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git diff --exit-code -- native/execution scripts/build-execution-native.ps1 kernels/toolchain.env
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: execution-windows-${{ steps.pin.outputs.sha }}
+          path: modules/
+          if-no-files-found: warn
           retention-days: 7

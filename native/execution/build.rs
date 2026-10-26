@@ -32,6 +32,12 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         root.join("lib64").display()
     );
+    if cfg!(windows) {
+        println!(
+            "cargo:rustc-link-search=native={}",
+            root.join("lib").join("x64").display()
+        );
+    }
     println!("cargo:rustc-link-lib=static=cudart_static");
     if !cfg!(windows) {
         let output = std::process::Command::new("c++")
