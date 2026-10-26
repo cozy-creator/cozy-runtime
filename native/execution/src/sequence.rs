@@ -30,10 +30,21 @@ struct Api {
     wait: Option<Observe>,
 }
 
+#[repr(C)]
+struct ReusableApi {
+    base: Api,
+    start_after: Option<unsafe extern "C" fn(*mut c_void, *const usize, u32, u64) -> Status>,
+    rearm: Option<Operation>,
+    finish: Option<Operation>,
+}
+
 struct Input {
     api: Api,
     owner: Option<Py<PyAny>>,
     quiescent: AtomicBool,
+    rearm: Option<Operation>,
+    finish: Option<Operation>,
+    finished: AtomicBool,
 }
 // SAFETY: v1 requires retained same-process, native-only thread-safe operations.
 unsafe impl Send for Input {}
@@ -76,6 +87,19 @@ impl Input {
             return Err(invalid());
         }
         let owner = value.clone().unbind();
+        let (rearm, finish) = if api.flags & 16 != 0 {
+            if size < std::mem::size_of::<ReusableApi>() as u32 {
+                return Err(invalid());
+            }
+            // SAFETY: capability flag and size cover the optional same-process v1 tail.
+            let extended = unsafe { &*pointer.cast::<ReusableApi>() };
+            (
+                Some(extended.rearm.ok_or_else(invalid)?),
+                Some(extended.finish.ok_or_else(invalid)?),
+            )
+        } else {
+            (None, None)
+        };
         // SAFETY: one matching provider-owned retain; keep the actual capsule/code alive.
         let status = unsafe { api.retain.expect("validated retain")(api.context) };
         if status.kind != OK {
@@ -86,6 +110,9 @@ impl Input {
             api,
             owner: Some(owner),
             quiescent: AtomicBool::new(false),
+            rearm,
+            finish,
+            finished: AtomicBool::new(false),
         })
     }
 
@@ -109,12 +136,45 @@ impl Input {
         }
         (status, progress)
     }
+
+    fn rearm(&self) -> Status {
+        let Some(rearm) = self.rearm else {
+            return Status::invalid("stage has no reusable continuation capability");
+        };
+        if !self.quiescent.load(Ordering::Acquire) || self.finished.load(Ordering::Acquire) {
+            return Status::invalid("rearm requires an unfinished checked stage");
+        }
+        self.quiescent.store(false, Ordering::Release);
+        // SAFETY: optional tail validated at import; provider checks prior success and
+        // preserves sticky cancellation while reserving its next native epoch.
+        unsafe { rearm(self.api.context) }
+    }
+
+    fn finish(&self) -> Status {
+        if self.finished.load(Ordering::Acquire) {
+            return Status::ok();
+        }
+        if !self.quiescent.load(Ordering::Acquire) {
+            return Status::unproven();
+        }
+        let status = match self.finish {
+            // SAFETY: successful drain precedes release of this reusable reservation.
+            Some(finish) => unsafe { finish(self.api.context) },
+            None => Status::ok(),
+        };
+        if status.kind == OK {
+            self.finished.store(true, Ordering::Release);
+        }
+        status
+    }
 }
 
 impl Drop for Input {
     fn drop(&mut self) {
         let owner = self.owner.take();
-        if self.api.pid != u64::from(std::process::id()) || !self.quiescent.load(Ordering::Acquire)
+        if self.api.pid != u64::from(std::process::id())
+            || !self.quiescent.load(Ordering::Acquire)
+            || self.finish.is_some() && !self.finished.load(Ordering::Acquire)
         {
             // No checked drain: retain the actual provider context, capsule and its code.
             std::mem::forget(owner);
@@ -137,6 +197,7 @@ struct Snapshot {
     done: bool,
     completion_proven: bool,
     failure: Option<(usize, Status)>,
+    completed_passes: u32,
 }
 
 struct Shared {
@@ -148,6 +209,7 @@ struct Shared {
     cancel_failed: AtomicBool,
     pid: u32,
     _module: Py<PyAny>,
+    repeat: Option<(usize, usize, u32)>,
 }
 
 fn unsafe_status(status: Status) -> bool {
@@ -253,11 +315,14 @@ impl Shared {
                 Status::new(UNPROVEN, 999, "native stage cancellation failed"),
             ));
         }
-        let complete = self
-            .stages
-            .iter()
-            .all(|stage| stage.quiescent.load(Ordering::Acquire))
-            && !failure.is_some_and(|(_, status)| unsafe_status(status));
+        for (index, stage) in self.stages.iter().enumerate() {
+            if stage.quiescent.load(Ordering::Acquire) && stage.finish().kind != OK {
+                failure = Some((index, Status::unproven()));
+            }
+        }
+        let complete = self.stages.iter().all(|stage| {
+            stage.quiescent.load(Ordering::Acquire) && stage.finished.load(Ordering::Acquire)
+        }) && !failure.is_some_and(|(_, status)| unsafe_status(status));
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         state.active = None;
         state.canceled |= self.canceled.load(Ordering::Acquire);
@@ -273,44 +338,84 @@ impl Shared {
     }
 
     fn advance(&self) -> Result<(), (usize, Status)> {
-        for (index, stage) in self.stages.iter().enumerate() {
+        let (begin, end, passes) = self.repeat.unwrap_or((0, self.stages.len(), 1));
+        for index in 0..begin {
+            self.advance_stage(index, false)?;
+        }
+        for pass in 0..passes {
+            let before = self
+                .state
+                .lock()
+                .map_err(|_| (begin, Status::unproven()))?
+                .completed_stages;
+            for index in begin..end {
+                self.advance_stage(index, pass != 0)?;
+            }
+            // A cancellation arriving after the final stage completed must not erase
+            // that whole pass from progress (the GPU sampler may already advance its step).
+            let mut state = self.state.lock().map_err(|_| (begin, Status::unproven()))?;
+            if state.completed_stages - before == end - begin {
+                state.completed_passes += 1;
+            }
+            drop(state);
             if self.canceled.load(Ordering::Acquire) {
                 return Ok(());
             }
-            self.state
-                .lock()
-                .map_err(|_| (index, Status::unproven()))?
-                .active = Some(index);
-            // No sequence lock spans provider calls: cancellation remains independent even
-            // when a source-stage start runs its existing blocking refill worker inline.
-            let status = stage.start();
-            if !matches!(status.kind, OK | CANCELED) {
-                return Err((index, status));
-            }
-            let (status, progress) = stage.observe(true);
-            if !stage.quiescent.load(Ordering::Acquire) || progress.phase != DONE {
-                return Err((
-                    index,
-                    if unsafe_status(status) {
-                        status
-                    } else {
-                        Status::unproven()
-                    },
-                ));
-            }
-            if !matches!(status.kind, OK | CANCELED) {
-                return Err((index, status));
-            }
-            let mut state = self.state.lock().map_err(|_| (index, Status::unproven()))?;
-            state.completed_steps += u64::from(progress.completed_steps);
-            state.active = None;
-            if status.kind == CANCELED || progress.canceled != 0 {
-                state.canceled = true;
+        }
+        for index in end..self.stages.len() {
+            self.advance_stage(index, false)?;
+        }
+        Ok(())
+    }
+
+    fn advance_stage(&self, index: usize, rearm: bool) -> Result<(), (usize, Status)> {
+        let stage = &self.stages[index];
+        if self.canceled.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if rearm {
+            let status = stage.rearm();
+            if status.kind == CANCELED {
                 self.canceled.store(true, Ordering::Release);
                 return Ok(());
             }
-            state.completed_stages += 1;
+            if status.kind != OK {
+                return Err((index, status));
+            }
         }
+        self.state
+            .lock()
+            .map_err(|_| (index, Status::unproven()))?
+            .active = Some(index);
+        // No sequence lock spans provider calls: cancellation remains independent even
+        // when a source-stage start runs its existing blocking refill worker inline.
+        let status = stage.start();
+        if !matches!(status.kind, OK | CANCELED) {
+            return Err((index, status));
+        }
+        let (status, progress) = stage.observe(true);
+        if !stage.quiescent.load(Ordering::Acquire) || progress.phase != DONE {
+            return Err((
+                index,
+                if unsafe_status(status) {
+                    status
+                } else {
+                    Status::unproven()
+                },
+            ));
+        }
+        if !matches!(status.kind, OK | CANCELED) {
+            return Err((index, status));
+        }
+        let mut state = self.state.lock().map_err(|_| (index, Status::unproven()))?;
+        state.completed_steps += u64::from(progress.completed_steps);
+        state.active = None;
+        if status.kind == CANCELED || progress.canceled != 0 {
+            state.canceled = true;
+            self.canceled.store(true, Ordering::Release);
+            return Ok(());
+        }
+        state.completed_stages += 1;
         Ok(())
     }
 
@@ -330,7 +435,10 @@ impl Shared {
                         .map_err(|_| Status::unproven());
                 }
                 let mut after = self.state.lock().map_err(|_| Status::unproven())?.clone();
-                if after.active == Some(active) && !after.done {
+                if after.active == Some(active)
+                    && after.completed_stages == before.completed_stages
+                    && !after.done
+                {
                     after.completed_steps += u64::from(progress.completed_steps);
                     after.canceled |= progress.canceled != 0;
                 }
@@ -357,11 +465,29 @@ pub(super) struct NativeSequence {
 #[pymethods]
 impl NativeSequence {
     #[new]
-    fn new(py: Python<'_>, stages: Vec<Py<PyAny>>, device: i32) -> PyResult<Self> {
+    #[pyo3(signature = (stages, device, repeat = None))]
+    fn new(
+        py: Python<'_>,
+        stages: Vec<Py<PyAny>>,
+        device: i32,
+        repeat: Option<(usize, usize, u32)>,
+    ) -> PyResult<Self> {
         if stages.is_empty() || stages.len() > 65536 {
             return Err(PyRuntimeError::new_err(
                 "native sequence needs 1..65536 prepared stages",
             ));
+        }
+        if let Some((begin, end, count)) = repeat {
+            if begin >= end
+                || end > stages.len()
+                || count == 0
+                || (end - begin) as u64 * u64::from(count) + (stages.len() - (end - begin)) as u64
+                    > u64::from(u32::MAX)
+            {
+                return Err(PyRuntimeError::new_err(
+                    "invalid bounded native repeat range",
+                ));
+            }
         }
         let module = py
             .import("cozy_runtime._kernels._execution")?
@@ -374,7 +500,13 @@ impl NativeSequence {
                 Ok(input)
                     if !inputs
                         .iter()
-                        .any(|prior| prior.api.context == input.api.context) =>
+                        .any(|prior| prior.api.context == input.api.context)
+                        && !repeat.is_some_and(|(begin, end, count)| {
+                            count > 1
+                                && inputs.len() >= begin
+                                && inputs.len() < end
+                                && input.rearm.is_none()
+                        }) =>
                 {
                     inputs.push(input)
                 }
@@ -384,7 +516,7 @@ impl NativeSequence {
                         Ok(input) => {
                             inputs.push(input);
                             PyRuntimeError::new_err(
-                                "native sequence stages must be distinct one-shot capabilities",
+                                "native sequence requires distinct capabilities and reusable repeated stages",
                             )
                         }
                     };
@@ -394,6 +526,7 @@ impl NativeSequence {
                         }
                         for input in &inputs {
                             input.observe(true);
+                            input.finish();
                         }
                     });
                     return Err(error);
@@ -410,6 +543,7 @@ impl NativeSequence {
                 cancel_failed: AtomicBool::new(false),
                 pid: std::process::id(),
                 _module: module,
+                repeat,
             }),
         })
     }
@@ -461,6 +595,8 @@ impl NativeSequence {
         let facts = PyDict::new(py);
         facts.set_item("stages", self.shared.stages.len())?;
         facts.set_item("completed_stages", state.completed_stages)?;
+        facts.set_item("completed_passes", state.completed_passes)?;
+        facts.set_item("repeat_range", self.shared.repeat)?;
         facts.set_item("active_stage", state.active)?;
         facts.set_item("completed_steps", state.completed_steps)?;
         facts.set_item("canceled", state.canceled)?;
@@ -502,3 +638,5 @@ impl Drop for NativeSequence {
 
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(std::mem::size_of::<Api>() == 88);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ReusableApi>() == 112);

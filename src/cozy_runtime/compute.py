@@ -1024,7 +1024,11 @@ class PreparedSequence:
     """
 
     def __init__(
-        self, stages: Sequence[PreparedRepeat], *, outputs: Sequence[Any] | None = None
+        self,
+        stages: Sequence[PreparedRepeat],
+        *,
+        outputs: Sequence[Any] | None = None,
+        repeat: tuple[int, int, int] | None = None,
     ) -> None:
         import torch
 
@@ -1047,6 +1051,23 @@ class PreparedSequence:
             raise TypeError("sequence stages must be PreparedRepeat definitions")
         if len({id(stage) for stage in self.stages}) != len(self.stages):
             raise ValueError("sequence definitions must be distinct; repeat inside a stage")
+        if repeat is not None:
+            if (
+                not isinstance(repeat, tuple)
+                or len(repeat) != 3
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in repeat)
+            ):
+                raise ValueError("repeat must be (first_stage, exclusive_end, positive_passes)")
+            begin, end, passes = repeat
+            if not 0 <= begin < end <= len(self.stages) or not 0 < passes <= 2**32 - 1:
+                raise ValueError("invalid bounded repeat range")
+            if (end - begin) * passes + len(self.stages) - (end - begin) > 2**32 - 1:
+                raise ValueError("repeated stage count exceeds uint32")
+            if passes > 1 and not getattr(native.ResidentRepeat, "supports_reusable_input", False):
+                raise CapabilityError(
+                    "native stage rearm is unavailable", code="prepared_graph_ineligible"
+                )
+        self._repeat = repeat
         self.device = self.stages[0].device
         if any(stage.device != self.device for stage in self.stages):
             raise ValueError("a native sequence belongs to one CUDA device")
@@ -1057,6 +1078,9 @@ class PreparedSequence:
         ):
             raise ValueError("sequence outputs must be declared persistent stage state")
         self.steps = sum(stage.steps for stage in self.stages)
+        if repeat is not None:
+            begin, end, passes = repeat
+            self.steps += (passes - 1) * sum(stage.steps for stage in self.stages[begin:end])
         self._submission = threading.RLock()
         self._active: _SequenceExecution | None = None
         self._native: Any = None
@@ -1067,7 +1091,7 @@ class PreparedSequence:
         self._load = None
         self._owned_bindings: tuple[Any, ...] = ()
         with self._locked_stages():
-            for stage in self.stages:
+            for stage_index, stage in enumerate(self.stages):
                 stage._validate()
                 if stage._sequence_owner is not None and stage._sequence_owner() is not None:
                     raise RuntimeError("a prepared stage already belongs to another sequence")
@@ -1080,10 +1104,26 @@ class PreparedSequence:
                         "this input loader cannot defer its native stage",
                         code="prepared_load_unavailable",
                     )
+                if (
+                    self._repeated(stage_index)
+                    and stage._load is not None
+                    and not getattr(stage._load, "supports_reusable_input", False)
+                ):
+                    raise CapabilityError(
+                        "this input loader cannot rearm a native stage",
+                        code="prepared_load_unavailable",
+                    )
             owner = weakref.ref(self)
             for stage in self.stages:
                 stage._sequence_owner = owner
             self._closed = False
+
+    def _repeated(self, index: int) -> bool:
+        return (
+            self._repeat is not None
+            and self._repeat[2] > 1
+            and self._repeat[0] <= index < self._repeat[1]
+        )
 
     def _locked_stages(self) -> ExitStack:
         locks = ExitStack()
@@ -1150,14 +1190,21 @@ class PreparedSequence:
                         if binding.model not in claimed:
                             binding.model._claim()
                             claimed.append(binding.model)
-                    capsule, _ = stage._native.continuation(producer)
+                    if self._repeated(stage_index):
+                        capsule, _ = stage._native.continuation(producer, reusable=True)
+                    else:
+                        capsule, _ = stage._native.continuation(producer)
                     if stage._load is not None:
                         capsule, observation = stage._load.continuation(
                             capsule, event_ordered=stage._load_ordering == "events"
                         )
                         reads.append((stage_index, observation, stage._owned_bindings))
                     capsules.append(capsule)
-                native = _execution.NativeSequence(capsules, self.device)
+                native = (
+                    _execution.NativeSequence(capsules, self.device)
+                    if self._repeat is None
+                    else _execution.NativeSequence(capsules, self.device, self._repeat)
+                )
                 execution = _SequenceExecution(
                     self, context, outputs, readout, claimed, native, reads
                 )
