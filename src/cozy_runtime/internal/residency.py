@@ -557,6 +557,8 @@ class Binding:
         self.lock = threading.RLock()
         self.last: Any = None
         self._load_slot: Any = None
+        self._stage_source: Any = None
+        self._stage_regions: tuple[tuple[_Block, Any], ...] = ()
         self._load_data: dict[_Block, dict[str, dict[str, Tensor]]] | None = None
         self._load_storage: dict[_Block, int] = {}
         self._load_source: Weights | None = None
@@ -571,10 +573,11 @@ class Binding:
             and self.fill is not None
             and self.fill == self.model.wanted_identity()
             and self.generation == self.model.generation
+            and all(block.region is region for block, region in self._stage_regions)
             and (self._load_source is None or self.model.source is self._load_source)
             and all(
-                (value := site.table[site.name]) is not None
-                and tuple(value.stride()) == stride for site, stride in self._load_target_strides
+                (value := site.table[site.name]) is not None and tuple(value.stride()) == stride
+                for site, stride in self._load_target_strides
             )
             and all(
                 (value := site.table[site.name]) is not None
@@ -591,7 +594,7 @@ class Binding:
     def resident(self) -> bool:
         return self.valid() and all(b.data is not None or b.cached() for b in self.groups)
 
-    def prepare_load(self) -> Any:
+    def prepare_load(self, *, stage: bool = False) -> Any:
         """Create capture-private views for immutable raw blocks, without reading weights.
 
         Ordinary block data is never changed here. The native slot atomically retains ready
@@ -608,6 +611,7 @@ class Binding:
                     or self.used
                     or self.held
                     or self._load_slot is not None
+                    or self._stage_source is not None
                     or not memory.cuda
                     or memory.capturing()
                     or memory.native is None
@@ -632,7 +636,8 @@ class Binding:
                     raise StaleBinding("native component loading needs idle immutable raw layouts")
                 if any(
                     getattr(module, "_compiled_call_impl", None) is not None
-                    or hasattr(module, "_orig_mod") for module in model.module.modules()
+                    or hasattr(module, "_orig_mod")
+                    for module in model.module.modules()
                 ):
                     raise StaleBinding("compiled modules require resident weight preparation")
                 self._load_source = model.source
@@ -679,7 +684,20 @@ class Binding:
                         raise torch.OutOfMemoryError(
                             "native component inputs exceed local capacity"
                         )
-                slot = varena.LoadSlot.from_regions(model.source.ck, groups)
+                if stage and not getattr(varena.LoadSlot, "supports_ready_stage", False):
+                    raise StaleBinding("TensorFS lacks ready-input model stage preparation")
+                slot = (
+                    varena.LoadSlot.from_regions(model.source.ck, groups, keep_ready=True)
+                    if stage
+                    else varena.LoadSlot.from_regions(model.source.ck, groups)
+                )
+                if (
+                    stage
+                    and slot is not None
+                    and not callable(getattr(slot._native, "detach_source", None))
+                ):
+                    slot.close()
+                    raise StaleBinding("TensorFS lacks detached model-stage input ownership")
                 # Native now owns ready inputs, or ordinary resident capture revalidates.
                 ready_uses.clear()
                 if slot is None:
@@ -716,6 +734,50 @@ class Binding:
             finally:
                 model._release()
 
+    def detach_stage(self) -> Any:
+        """Keep immutable source/VA identity after checked capture; release physical pins.
+
+        The native source owns the Region reservations. It reacquires ready pins or missing
+        fills on each sequence pass, without calling Python or replacing parameter addresses.
+        """
+        with self.lock:
+            slot = self._load_slot
+            if (
+                slot is None
+                or self._load_data is None
+                or not self.used
+                or self._stage_source is not None
+                or not self.valid()
+            ):
+                raise StaleBinding("detachment requires a valid completed raw capture")
+            if self.last is not None:
+                try:
+                    self.last.synchronize()
+                except BaseException as incomplete:
+                    self._unproven(incomplete)
+            with self.model.memory.lock:
+                if any(block.count or block.loading for block in self.groups):
+                    raise StaleBinding("model stage capture is still using its input views")
+                regions = tuple((block, block.region) for block in self.groups)
+                if any(region is None for _, region in regions):
+                    raise StaleBinding("model stage lost its managed input reservation")
+                for block, _ in self.held:
+                    block.retained -= 1
+                    self.model.memory._idle(block)
+                self.held.clear()
+                self._load_data = None
+                self._load_storage.clear()
+            # Drop every private Python tensor owner before native's actual live-Pin check.
+            # An escaped external view makes this refuse; no refcount guess or gc sweep.
+            slot._tensor = None
+            slot._tensors = None
+            source = slot._native.detach_source()
+            self._stage_regions = regions
+            self._stage_source = source
+            self._load_slot = None
+            slot.close()
+            return source
+
     def immutable_inputs(self) -> tuple[Tensor, ...]:
         """The native-loaded source ranges, including the all-ready resident fallback."""
         if self._load_source is None:
@@ -741,6 +803,8 @@ class Binding:
                     and self.model.wanted_identity() is None
                     and self.generation == self.model.generation
                 )
+                if self._stage_source is not None:
+                    raise StaleBinding("detached model stages prepare only through native input")
                 if not self.valid() and not ephemeral:
                     raise StaleBinding("graph weight storage or fill changed")
                 request = _REQUEST.get()
@@ -886,6 +950,8 @@ class Binding:
             self._load_storage.clear()
             self._load_source = None
             self._load_target_strides.clear()
+            self._stage_source = None
+            self._stage_regions = ()
 
 
 class Region:
