@@ -45,6 +45,8 @@ def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
 def _native_error(error: Exception) -> NoReturn:
     import torch
 
+    if getattr(error, "load_unavailable", False):
+        raise CapabilityError(str(error), code="prepared_load_unavailable") from error
     if getattr(error, "eligibility_refusal", False):
         raise CapabilityError(str(error), code="prepared_graph_ineligible") from error
 
@@ -67,6 +69,8 @@ class PreparedRepeat:
     Capture retains external ATen dependencies, the graph pool, and explicit owners.
     Placed component roots or explicit weight bindings name the complete dependency set.
     """
+
+    supports_component_load = True
 
     def __init__(
         self,
@@ -145,6 +149,7 @@ class PreparedRepeat:
         owners: Sequence[object] = (),
         resident_only: bool = False,
         load: Any = None,
+        load_component: Any = None,
         load_ordering: Literal["checked", "events", "auto"] = "checked",
         prefix: Callable[[], object] | None = None,
         suffix: Callable[[], object] | None = None,
@@ -177,6 +182,20 @@ class PreparedRepeat:
         representation may remain cached after a preparation refusal; rollback covers the
         declared mutable state, not cache contents. Resident-only capture refuses a change.
 
+        `load_component` names one placed component root or explicit binding already listed
+        in owners. Immutable
+        raw block layouts use its existing regions: ready bytes are retained and only misses
+        are loaded by the native submission. Capture uses private initialized aliases, never
+        ordinary published weights. This requires a complete resident phase; unsupported
+        transforms or capacity refuse before submission. These inputs are read-only during
+        authored computation because their regions cache source bytes. State-storage aliases
+        and ATen-declared writes are refused before execution; custom/native kernels must
+        honor that same contract. Opting in also requires data-independent preparation:
+        every execution must read these dynamic inputs, without caching tensors derived from
+        zero initialization in Python during warmup. Raw layout eligibility does not prove
+        this property for arbitrary modules; unknown/stateful modules need resident preparation.
+        Generic streaming is not implied.
+
         Placed component roots are resolved to owned weight bindings. `resident_only=True`
         refuses missing weights before running the body; it never fills them for capture.
         Missing residency, unsupported hooks or changed model state raises CapabilityError
@@ -186,7 +205,7 @@ class PreparedRepeat:
         import torch
 
         from cozy_runtime import graphs
-        from cozy_runtime.internal.residency import Binding, StaleBinding
+        from cozy_runtime.internal.residency import Binding, ResidencyError, StaleBinding
 
         try:
             import cozy_runtime._kernels._execution as _execution
@@ -219,18 +238,38 @@ class PreparedRepeat:
                 "prepared mutable state must be allocated outside inference_mode",
                 code="prepared_graph_ineligible",
             )
-        if load is not None:
+        if load_component is not None:
+            if load is not None or resident_only or not any(load_component is o for o in owners):
+                raise ValueError(
+                    "load_component needs one named owner, no load slot and nonresident preparation"
+                )
+            if not isinstance(load_component, Binding) and (
+                not isinstance(load_component, torch.nn.Module)
+                or PLACED.get(load_component) is None
+            ):
+                raise CapabilityError(
+                    "native component loading requires a placed root",
+                    code="prepared_graph_ineligible",
+                )
+        if load is not None or load_component is not None:
             from tensorfs import varena
 
             slot_type = getattr(varena, "LoadSlot", None)
             if (
                 slot_type is None
-                or not isinstance(load, slot_type)
+                or (load is not None and not isinstance(load, slot_type))
                 or not callable(getattr(_execution.ResidentRepeat, "continuation", None))
             ):
                 raise CapabilityError(
                     "native loading requires a TensorFS LoadSlot",
                     code="prepared_load_unavailable",
+                )
+            if load_component is not None and not getattr(
+                slot_type, "supports_region_input", False
+            ):
+                raise CapabilityError(
+                    "this TensorFS has no native component input preparation",
+                    code="prepared_graph_ineligible",
                 )
             event_capable = bool(getattr(slot_type, "supports_event_input", False)) and bool(
                 getattr(_execution.ResidentRepeat, "supports_event_input", False)
@@ -245,7 +284,8 @@ class PreparedRepeat:
             selected_ordering = (
                 "events" if load_ordering != "checked" and event_capable else "checked"
             )
-            owners = (*owners, load)
+            if load is not None:
+                owners = (*owners, load)
         elif load_ordering != "checked":
             raise ValueError("load_ordering requires a native LoadSlot")
         with (
@@ -321,7 +361,23 @@ class PreparedRepeat:
                         models[id(model.module)] = model.module
                         if why := graphs._hooked(model.module):
                             raise CapabilityError(why, code="prepared_graph_ineligible")
-                        if resident_only:
+                        if owner is load_component:
+                            try:
+                                load = binding.prepare_load()
+                            except ResidencyError as error:
+                                # StaleBinding and a concurrent-use/_claim refusal are both
+                                # pre-submission: fall back to an eager resident load.
+                                raise CapabilityError(
+                                    str(error), code="prepared_graph_ineligible"
+                                ) from error
+                            except RuntimeError as error:
+                                # Native region refusals (busy, capture-active, ineligible
+                                # descriptor, or not-local inputs) map to a fallback code; OOM,
+                                # device faults and poisoning keep their fatal classification.
+                                _native_error(error)
+                            if load is not None:
+                                resolved.append(load)
+                        if resident_only or (owner is load_component and load is None):
                             memory = model.memory
                             if id(memory) not in idle:
                                 preparing.enter_context(
@@ -428,6 +484,41 @@ class PreparedRepeat:
         assert device is not None
         held: dict[int, Any] = {id(t): t for t in tensors}
         landed = LANDED[0]
+        immutable: tuple[Any, ...] = tuple(
+            tensor
+            for owner in owners
+            for tensor in (
+                owner.immutable_inputs()
+                if isinstance(owner, Binding)
+                else getattr(owner, "immutable_inputs", ())
+                if isinstance(owner, varena.LoadSlot)
+                else ()
+            )
+        )
+        ranges = tuple(
+            dict.fromkeys(
+                (tensor.device, int(storage.data_ptr()), int(storage.data_ptr()) + storage.nbytes())
+                for tensor in immutable
+                if (storage := tensor.untyped_storage()).nbytes()
+            )
+        )
+
+        def overlaps_input(tensor: Any) -> bool:
+            if not isinstance(tensor, torch.Tensor):
+                return False
+            storage = tensor.untyped_storage()
+            first, size = int(storage.data_ptr()), int(storage.nbytes())
+            return bool(size) and any(
+                tensor.device == device and first < end and begin < first + size
+                for device, begin, end in ranges
+            )
+
+        if any(overlaps_input(tensor) for tensor in tensors):
+            raise CapabilityError(
+                "mutable state overlaps immutable loaded input storage",
+                code="prepared_graph_ineligible",
+            )
+        held.update((id(tensor), tensor) for tensor in immutable)
 
         class CaptureOwners(TorchDispatchMode):  # type: ignore[misc]  # Torch is optional in checks.
             def __init__(self, retain: bool) -> None:
@@ -444,6 +535,20 @@ class PreparedRepeat:
                     raise RuntimeError(
                         "GPU-driven repeats require explicit noise/RNG tensor inputs"
                     )
+                if ranges:
+                    for position, argument in enumerate(func._schema.arguments):
+                        if argument.alias_info is None or not argument.alias_info.is_write:
+                            continue
+                        value = (
+                            args[position]
+                            if position < len(args)
+                            else (kwargs or {}).get(argument.name)
+                        )
+                        if any(overlaps_input(tensor) for tensor in tree_leaves(value)):
+                            raise CapabilityError(
+                                "authored computation writes immutable loaded input storage",
+                                code="prepared_graph_ineligible",
+                            )
                 for tensor in tree_leaves((args, kwargs or {})):
                     prior = self.produced.get(id(tensor))
                     if (
@@ -729,6 +834,10 @@ class Execution:
         self._observation = threading.RLock()
         self._models = models
         self._load_job = load_job
+        from cozy_runtime.internal.residency import _REQUEST
+
+        self._load_request = _REQUEST.get()
+        self._load_recorded = False
         self._failure: Exception | None = None
 
     def facts(self) -> dict[str, object]:
@@ -738,12 +847,27 @@ class Execution:
             facts["native_load"] = dict(self._load_job.facts())
         return facts
 
+    def _record_load(self, facts: Mapping[str, Any]) -> None:
+        if self._load_recorded or not facts.get("done", False):
+            return
+        self._load_recorded = True
+        if self._load_request is None or not facts.get("read_done", False):
+            return
+        for binding in self.plan._owned_bindings:
+            if binding._load_slot is self.plan._load:
+                for block, nbytes in zip(binding.groups, facts["input_read_bytes"], strict=True):
+                    if nbytes:
+                        # The native worker did this I/O. Record bytes once after completion;
+                        # its separate native clocks are not Python read-wait measurements.
+                        self._load_request.read(block, 0, int(nbytes))
+
     def _failed_load(self, error: Exception) -> None:
         """A failed read/decode may prove cleanup; an exception alone is never that proof."""
         if self._load_job is None:
             return
         self._failure = error
         facts = self._load_job.facts()
+        self._record_load(facts)
         if facts.get("completion_proven", False):
             # No readout of failed/partial input. Public observers retain the original error;
             # close may now retire the graph and its bindings after this native certificate.
@@ -756,6 +880,8 @@ class Execution:
         import torch
 
         if self._finished is None:
+            if self._load_job is not None:
+                self._record_load(self._load_job.facts())
             with torch.cuda.device(self.plan.device), torch.no_grad():
                 for output, state in zip(self._outputs, self.plan.state, strict=True):
                     output.copy_(state)
