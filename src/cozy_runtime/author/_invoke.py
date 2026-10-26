@@ -180,7 +180,13 @@ class _PreparedScope:
             complete = False
             if execution is not None and fault(error) not in (Fault.STICKY, Fault.DEVICE):
                 with suppress(BaseException):
-                    complete = execution.poll().done
+                    # A terminal failed operation may keep raising from poll()/wait().
+                    # Ask its owner for the independent checked-completion certificate.
+                    proven = getattr(execution, "completion_proven", None)
+                    if callable(proven):
+                        complete = proven() is True
+                    if not complete:
+                        complete = execution.poll().done
             if (
                 execution is not None
                 and not complete

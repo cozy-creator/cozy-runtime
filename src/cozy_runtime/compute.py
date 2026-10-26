@@ -847,6 +847,21 @@ class Execution:
             facts["native_load"] = dict(self._load_job.facts())
         return facts
 
+    def completion_proven(self) -> bool:
+        """Whether native work and readout/drain completed, independently of its result.
+
+        A failed load sets _finished only after TensorFS certifies checked cleanup
+        and this execution releases every model claim.
+        poll() and wait() must still report that load's original error.
+        """
+        with self._observation:
+            return self._finished is not None
+
+    def _release_models(self) -> None:
+        while self._models:
+            self._models[-1]._release()
+            self._models.pop()
+
     def _record_load(self, facts: Mapping[str, Any]) -> None:
         if self._load_recorded or not facts.get("done", False):
             return
@@ -871,10 +886,8 @@ class Execution:
         if facts.get("completion_proven", False):
             # No readout of failed/partial input. Public observers retain the original error;
             # close may now retire the graph and its bindings after this native certificate.
+            self._release_models()
             self._finished = Progress(0, bool(facts.get("canceled", False)), True)
-            models, self._models = self._models, []
-            for model in reversed(models):
-                model._release()
 
     def _finish(self, completed: int, canceled: bool) -> Progress:
         import torch
@@ -887,10 +900,8 @@ class Execution:
                     output.copy_(state)
                 self._readout.record(torch.cuda.current_stream(self.plan.device))
                 self._readout.synchronize()
+            self._release_models()
             self._finished = Progress(completed, canceled, True)
-            models, self._models = self._models, []
-            for model in reversed(models):
-                model._release()
         return self._finished
 
     def poll(self) -> Progress:
