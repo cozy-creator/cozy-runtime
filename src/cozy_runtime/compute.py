@@ -1382,6 +1382,9 @@ class PreparedSequence:
                 self._native, self._active = native, execution
                 for stage in self.stages:
                     stage._active = execution
+                # Every observer/capsule is strongly owned before optional Weak lookahead
+                # links are installed. Admission allocates no source bytes and launches no work.
+                execution._prepare_lookahead()
                 # All Python/native owners exist before the sole native worker can start.
                 native.start()
                 if context is not None and not reads:
@@ -1478,10 +1481,91 @@ class _SequenceExecution(Execution):
     def __init__(self, plan, context, outputs, readout, models, native, reads):
         super().__init__(plan, context, 0, outputs, readout, models, native)
         self._stage_reads = reads
+        self._prefetch_cleanup = ExitStack()
+        self._prefetch_admission: list[dict[str, object]] = []
+
+    def _prepare_lookahead(self) -> None:
+        request = self._load_request
+        candidates: dict[Any, list[tuple[Any, ...]]] = {}
+        for current, following in zip(self._stage_reads, self._stage_reads[1:], strict=False):
+            index, job, bindings = current
+            next_index, next_job, next_bindings = following
+            if next_index != index + 1:
+                continue  # no resident gaps or repeat wraparound in the first slice
+            repeat = self.plan._repeat
+            if repeat is not None and repeat[2] > 1 and next_index == repeat[1]:
+                continue  # the suffix is next only on the final pass
+            if (
+                not bindings
+                or not next_bindings
+                or not getattr(job, "supports_native_lookahead", False)
+                or not getattr(next_job, "supports_native_lookahead", False)
+                or not callable(getattr(job, "link_next", None))
+            ):
+                continue
+            memories = {binding.model.memory for binding in (*bindings, *next_bindings)}
+            if len(memories) != 1:
+                continue
+            memory = next(iter(memories))
+            regions = {
+                id(region): region
+                for binding in (*bindings, *next_bindings)
+                for _, region in binding._stage_regions
+            }
+            current_bytes = sum(
+                int(region.allocated_bytes)
+                for binding in bindings
+                for _, region in binding._stage_regions
+            )
+            next_bytes = sum(
+                int(region.allocated_bytes)
+                for binding in next_bindings
+                for _, region in binding._stage_regions
+            )
+            # Native reports the same actual reservations. Refuse skew or hidden inputs;
+            # do not use Python logical tensor sizes as allocation admission.
+            if (
+                not regions
+                or int(job.reservation_bytes) != current_bytes
+                or int(next_job.reservation_bytes) != next_bytes
+            ):
+                continue
+            required = sum(int(region.allocated_bytes) for region in regions.values())
+            missing = sum(
+                int(region.allocated_bytes) for region in regions.values() if not region.resident
+            )
+            candidates.setdefault(memory, []).append(
+                (index, next_index, job, next_job, required, missing, next_bytes)
+            )
+        for memory, pairs in candidates.items():
+            required = max(pair[4] for pair in pairs)
+            missing = max(pair[5] for pair in pairs)
+            restore = memory._stage_prefetch_window(required, missing, request, self)
+            if restore is None:
+                self._prefetch_admission.append({"state": "capacity_skip", "pair_bytes": required})
+                continue
+            self._prefetch_cleanup.callback(restore)
+            for index, next_index, job, next_job, pair_bytes, _, next_bytes in pairs:
+                linked = bool(job.link_next(next_job, max_prefetch_bytes=next_bytes))
+                self._prefetch_admission.append(
+                    {
+                        "from_stage": index,
+                        "to_stage": next_index,
+                        "pair_bytes": pair_bytes,
+                        "state": "linked" if linked else "native_refusal",
+                    }
+                )
+
+    def _release_models(self) -> None:
+        # Base execution calls this only after checked native completion/readout. If the
+        # drain is unproven, owners and this window lease remain retained for retirement.
+        self._prefetch_cleanup.close()
+        super()._release_models()
 
     def facts(self) -> dict[str, object]:
         facts = self.plan.facts()
         facts["sequence"] = dict(self._load_job.facts())
+        facts["stage_prefetch_admission"] = list(self._prefetch_admission)
         facts["stage_inputs"] = [
             {"stage": index, **dict(job.facts())} for index, job, _ in self._stage_reads
         ]
@@ -1495,7 +1579,17 @@ class _SequenceExecution(Execution):
             if self._load_request is not None and loaded.get("read_done", False):
                 blocks = [block for binding in bindings for block in binding.groups]
                 if blocks:
-                    for block, nbytes in zip(blocks, loaded["input_read_bytes"], strict=True):
-                        if nbytes:
-                            self._load_request.read(block, 0, int(nbytes))
+                    prefetched = loaded.get("prefetch_input_read_bytes", [0] * len(blocks))
+                    for block, nbytes, speculative in zip(
+                        blocks, loaded["input_read_bytes"], prefetched, strict=True
+                    ):
+                        nbytes, speculative = int(nbytes), int(speculative)
+                        if not 0 <= speculative <= nbytes:
+                            raise RuntimeError(
+                                "native prefetch byte accounting exceeds total input reads"
+                            )
+                        if nbytes > speculative:
+                            self._load_request.read(block, 0, nbytes - speculative)
+                        if speculative:
+                            self._load_request.read(block, 0, speculative, speculative=True)
         self._load_recorded = True
