@@ -80,31 +80,37 @@ def capture(
     stream.wait_stream(current)
     stream.wait_stream(work)
     failure: BaseException | None = None
-    with (
-        owner.recovery_blocked(),
-        torch.utils._python_dispatch._disable_current_modes(),
-        torch.cuda.stream(stream),
-    ):
-        try:
-            graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
-        except Exception as exc:
-            failure = exc
-        else:
+    from cozy_runtime.internal import kernel_ready
+
+    try:
+        with (
+            kernel_ready.recording(),
+            owner.recovery_blocked(),
+            torch.utils._python_dispatch._disable_current_modes(),
+            torch.cuda.stream(stream),
+        ):
             try:
-                owner.fork.record(stream)
-                work.wait_event(owner.fork)
-                with torch.cuda.stream(work):
-                    try:
-                        step()
-                    finally:
-                        owner.join.record(work)
-                        stream.wait_event(owner.join)
+                graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
             except Exception as exc:
                 failure = exc
-            try:
-                graph.capture_end()
-            except Exception as exc:
-                failure = failure or exc
+            else:
+                try:
+                    owner.fork.record(stream)
+                    work.wait_event(owner.fork)
+                    with torch.cuda.stream(work):
+                        try:
+                            step()
+                        finally:
+                            owner.join.record(work)
+                            stream.wait_event(owner.join)
+                except Exception as exc:
+                    failure = exc
+                try:
+                    graph.capture_end()
+                except Exception as exc:
+                    failure = failure or exc
+    except Building as exc:
+        failure = exc
     current.wait_stream(stream)
     current.wait_stream(work)
     if failure is not None:
@@ -1006,6 +1012,8 @@ def _capture_pending(pending: _Pending) -> bool:
             owner.prime_blas()  # before the idle request: Torch owns the shared workspaces
             with idle:
                 done = _record(torch, module, pending, recorder, placed, submit)
+        except Building:
+            return False  # a cold probe postpones capture without consuming the signature
         except Exception as exc:  # the signature runs as written; the period goes on
             if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
                 raise

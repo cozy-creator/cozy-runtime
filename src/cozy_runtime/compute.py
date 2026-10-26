@@ -14,7 +14,7 @@ from contextlib import ExitStack, nullcontext, suppress
 from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
-from cozy_runtime.author._model import LANDED, PLACED
+from cozy_runtime.author._model import LANDED, PLACED, Building
 from cozy_runtime.author._prepared import Progress
 
 if TYPE_CHECKING:
@@ -481,6 +481,7 @@ class PreparedRepeat:
 
         from cozy_runtime._kernels import _execution
         from cozy_runtime.author._context import CURRENT
+        from cozy_runtime.internal import kernel_ready
         from cozy_runtime.internal.residency import Binding
 
         tensors = tuple(state)
@@ -618,6 +619,7 @@ class PreparedRepeat:
                 pause = context._pause_stall_watch if context is not None else None
                 with (
                     pause() if pause is not None else nullcontext(),
+                    kernel_ready.recording(),
                     varena.capture(device),
                     torch.cuda.stream(stream),
                     CaptureOwners(True),
@@ -665,6 +667,11 @@ class PreparedRepeat:
                     ],
                     **phase_args,
                 )
+            except Building as error:
+                raise CapabilityError(
+                    f"capture waits for kernel readiness: {error}",
+                    code="prepared_graph_ineligible",
+                ) from error
             except _execution.NativeExecutionError as error:
                 _native_error(error)
             finally:
@@ -1154,6 +1161,7 @@ class PreparedSequence:
 
     def submit(self, context: Context | None = None) -> Execution:
         import torch
+
         from cozy_runtime._kernels import _execution
 
         if not callable(getattr(_execution, "NativeSequence", None)):

@@ -28,7 +28,8 @@ from __future__ import annotations
 import re
 import sys
 import threading
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, cast
@@ -54,7 +55,11 @@ class _Slot:
 
 
 _SLOTS: dict[str, _Slot] = {}
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
+# Explicit wait may overlap a background opener for the same slot. Track actual opener
+# lifetimes as well as slot state; a second publisher must not hide a still-running probe.
+_OPENERS = 0
+_RECORDING = threading.local()
 #: In a group: this GPU's index as its slots name it (`cuda:1`), shared as `cuda:*`, and the
 #: group's size. Alone: None.
 _GROUP: list[tuple[re.Pattern[str], int] | None] = [None]
@@ -74,6 +79,39 @@ class Refused(RuntimeError):
     """A kernel whose probe disagreed with the exact law on this card: it never serves here."""
 
 
+@contextmanager
+def recording() -> Iterator[None]:
+    """Refuse cold GPU probes before capture and exclude new openers until capture ends.
+
+    Do not wait for compilation/probing on a request. The existing slot lock is reentrant
+    so capture may query already-ready kernels through serve(); it cannot open a new one.
+    """
+    with _LOCK:
+        opening = next((name for name, slot in _SLOTS.items() if slot.state == "opening"), None)
+        if opening is not None or _OPENERS:
+            raise Building(opening or "another kernel probe is still opening")
+        depth = getattr(_RECORDING, "depth", 0)
+        _RECORDING.depth = depth + 1
+        try:
+            yield
+        finally:
+            _RECORDING.depth = depth
+
+
+@contextmanager
+def _opening(name: str) -> Iterator[None]:
+    global _OPENERS
+    with _LOCK:
+        if getattr(_RECORDING, "depth", 0):
+            raise Building(name)
+        _OPENERS += 1
+    try:
+        yield
+    finally:
+        with _LOCK:
+            _OPENERS -= 1
+
+
 def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
     """`name`'s kernel once it serves here, else None: opening (started now by `opener` if it
     was not), or failed. Never blocks a request, except to open a kernel its group serves."""
@@ -90,10 +128,13 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
                 slot.state = "ready"
                 LANDED[0] += 1
             return cast("T", slot.value) if slot is not None and slot.state == "ready" else None
+        if getattr(_RECORDING, "depth", 0):
+            raise Building(name)
         slot = _SLOTS[name] = _Slot("opening")
     if quiet:
         try:
-            value = opener(False)
+            with _opening(name):
+                value = opener(False)
         except Exception as exc:
             _ended(name, slot, exc)
             if is_capacity(exc):
@@ -140,6 +181,8 @@ def wait[T](name: str, opener: Opener[T]) -> T:
     with _LOCK:
         slot = _SLOTS.get(name)
         mine = slot is None
+        if getattr(_RECORDING, "depth", 0) and (slot is None or slot.state != "ready"):
+            raise Building(name)
         if slot is None:
             slot = _SLOTS[name] = _Slot("opening")
         elif slot.state == "landed":
@@ -150,7 +193,8 @@ def wait[T](name: str, opener: Opener[T]) -> T:
     if slot.state == "ready":
         return cast("T", slot.value)
     try:
-        value = opener(True)
+        with _opening(name):
+            value = opener(True)
         if value is None:
             raise RuntimeError("its opener waited and returned nothing")
     except Exception:
@@ -165,7 +209,8 @@ def wait[T](name: str, opener: Opener[T]) -> T:
 def _background(name: str, slot: _Slot, opener: Opener[object]) -> None:
     kernel_compile.told.set(False)  # no one waits for it
     try:
-        value = opener(True)
+        with _opening(name):
+            value = opener(True)
         if value is None:
             raise RuntimeError("its opener waited and returned nothing")
     except Exception as exc:
