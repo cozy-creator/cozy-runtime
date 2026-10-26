@@ -111,6 +111,12 @@ inputs or access outputs until completion. Concurrent submissions are refused. C
 joins before destruction. Device-completion failure retains owners until process death. Forked
 processes cannot use inherited native handles.
 
+Preparation joins warmup and its state restoration, then returns inactive Torch cache before
+capture asks for a private graph pool, as the `torch.cuda.graph` context does. This does not
+discard live tensors, native weight pins or existing graph pools, and never retries submitted
+work. `facts().capture_cache` records the observed Torch allocated/reserved bytes at that
+boundary and the reserved-byte reduction. Those figures are not transfer or GPU-stall timings.
+
 Real RTX4070 Laptop8GiB runs17944–17955 passed the twelve resident-phase gates on Runtime8c057,
 Creator/TensorFS51a: phase parity, changed-input reuse, checked stored loading, zero-launch source
 failure, phase-copy refusals and rollback, cancellation and alias release. Reuse17948 submitted the

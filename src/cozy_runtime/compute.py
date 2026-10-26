@@ -87,6 +87,7 @@ class PreparedRepeat:
         self._binding_cleanup = ExitStack()
         self._load: Any = None
         self._load_used = False
+        self._capture_cache: dict[str, int] = {}
         self._landed = landed
 
     @staticmethod
@@ -439,7 +440,8 @@ class PreparedRepeat:
             current = torch.cuda.current_stream(device)
             stream = torch.cuda.Stream(device=device)
             index = torch.zeros(1, dtype=torch.int64, device=device)
-            held[id(index)] = index  # Native control writes it even when the authored body does not.
+            # Native control writes this storage even when the authored body does not.
+            held[id(index)] = index
             saved = tuple(t.clone() for t in tensors)
             stream.wait_stream(current)
             graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -458,6 +460,20 @@ class PreparedRepeat:
                     for target, original in zip(tensors, saved, strict=True):
                         target.copy_(original)
                 stream.synchronize()
+                # Like torch.cuda.graph's preparation, return inactive eager segments
+                # before the graph asks for its own pool. Warmup and its state restore
+                # are joined; live tensors, weight pins and existing graph pools remain
+                # owned. This is a prelaunch boundary, never allocation recovery.
+                reserved_before = int(torch.cuda.memory_reserved(device))
+                allocated_before = int(torch.cuda.memory_allocated(device))
+                torch.cuda.empty_cache()
+                reserved_after = int(torch.cuda.memory_reserved(device))
+                capture_cache = {
+                    "torch_allocated_before_bytes": allocated_before,
+                    "torch_reserved_before_bytes": reserved_before,
+                    "torch_reserved_after_bytes": reserved_after,
+                    "torch_returned_bytes": max(reserved_before - reserved_after, 0),
+                }
                 context = CURRENT.get()
                 pause = context._pause_stall_watch if context is not None else None
                 with (
@@ -526,7 +542,9 @@ class PreparedRepeat:
         # The local mode class has a __class__ closure cycle. Native ownership has taken its
         # own references; do not leave GPU tensors retained until an unrelated Python GC pass.
         held.clear()
-        return cls(native, tensors, device, steps, dependencies, bindings, landed)
+        result = cls(native, tensors, device, steps, dependencies, bindings, landed)
+        result._capture_cache = capture_cache
+        return result
 
     def _retire_if_idle(self) -> None:
         with self._submission:
@@ -581,7 +599,7 @@ class PreparedRepeat:
 
     def facts(self) -> dict[str, object]:
         """Facts from the actual native graph owner; a PreparedWork protocol is not evidence."""
-        return dict(self._native.facts())
+        return {**self._native.facts(), "capture_cache": dict(self._capture_cache)}
 
     def submit(self, context: Context | None = None) -> Execution:
         import torch
