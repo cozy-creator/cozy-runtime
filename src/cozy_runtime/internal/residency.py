@@ -1514,7 +1514,9 @@ class Memory:
                         "torch_returned_bytes": returned,
                         "native_reclaimed_bytes": reclaimed,
                         # Cumulative snapshot; an older native wheel has no reason counters.
-                        "native_reclaimed_by_reason": self.native.stats().get("reclaimed_by_reason"),
+                        "native_reclaimed_by_reason": self.native.stats().get(
+                            "reclaimed_by_reason"
+                        ),
                     }
                 )
 
@@ -1636,7 +1638,11 @@ class Memory:
                     request.prefetch_skipped += 1
                     if queued is not None:
                         request.queued_prefetch.append(
-                            {"request": queued.request_id, "state": "capacity_skip", "bytes": needed}
+                            {
+                                "request": queued.request_id,
+                                "state": "capacity_skip",
+                                "bytes": needed,
+                            }
                         )
                 return
             offset = 0
