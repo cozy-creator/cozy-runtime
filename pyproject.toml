@@ -61,7 +61,7 @@ packages = ["src/cozy_runtime"]
 [tool.uv]
 package = true
 # Lock against the immutable candidate before the matched release gate promotes it.
-find-links = ["https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/tensorfs-v0.17.0"]
+find-links = ["https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/tensorfs-v0.17.1"]
 
 [tool.mypy]
 python_version = "3.12"
