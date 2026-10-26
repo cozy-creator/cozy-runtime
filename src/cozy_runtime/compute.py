@@ -25,6 +25,8 @@ def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
     """Built-in forward SDPA is tagged seeded even when its dropout is a fixed zero."""
     schema = func._schema
     if schema.overload_name or schema.name not in (
+        # The tagged selector chooses a backend; zero-dropout dispatch is deterministic.
+        "aten::_fused_sdp_choice",
         "aten::scaled_dot_product_attention",
         "aten::_scaled_dot_product_attention_math",
         "aten::_scaled_dot_product_flash_attention",
