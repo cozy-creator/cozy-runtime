@@ -529,6 +529,38 @@ def initialize(torch: Any, kind: str) -> None:
         torch.cuda.init()
 
 
+def constrain_device_memory(torch: Any, kind: str, limit_bytes: int | None) -> None:
+    """(dev) Make this process's CUDA device behave like a smaller card.
+
+    Caps the native caching allocator to `limit_bytes` with
+    `set_per_process_memory_fraction`, so an allocation past the cap OOMs exactly as a smaller
+    card would. Varena's recovery hook (installed in `initialize`) reclaims inactive weights
+    to stay under it, so weights page under the cap and only a genuinely oversized model
+    fails — the honest constrained-VRAM simulation the varena release gate needs. Varena's
+    activation admission limit is bound to match too (best effort). A no-op when the limit is
+    unset or non-positive, or off CUDA. Apply once, after the device is current and the
+    allocator is installed, before any weights reserve memory."""
+    if kind != "cuda" or not limit_bytes or limit_bytes <= 0:
+        return
+    device = torch.cuda.current_device()
+    total = int(torch.cuda.get_device_properties(device).total_memory)
+    if total <= 0:
+        return
+    fraction = min(max(limit_bytes / total, 0.0), 1.0)
+    torch.cuda.set_per_process_memory_fraction(fraction, device)
+    try:
+        from tensorfs import varena
+
+        varena.set_activation_limit(device, int(min(limit_bytes, total)))
+    except Exception as exc:  # the fraction is the hard cap; this admission bound is best-effort
+        print(
+            f"[executor] varena activation limit not applied ({exc}); "
+            "the per-process fraction still caps allocation",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
 def first_launches(torch: ModuleType, kind: str) -> None:
     """Create the GPU libraries' handles, workspaces and first kernels while the device has
     room. cuBLAS and cuDNN take device memory for themselves at a first launch, and inside a

@@ -778,6 +778,9 @@ class Executor:
         self.channel = channel
         self.root = root
         self.host: Executor = host or self
+        #: HOST ONLY: (dev) per-GPU VRAM cap in bytes from `Start.gpu_memory_limit`, applied at
+        #: the device-init boundary so this process behaves like a smaller card; None lifts it.
+        self.gpu_memory_limit: int | None = None
         #: HOST ONLY: each signer's newest bearer for each endpoint, which the seam keeps
         #: current as it reads (`Mux`) and every TensorFS request asks (`weights_store.Bearer`)
         self.bearers: weights_store.Bearers = (
@@ -1029,6 +1032,9 @@ class Executor:
             accel.initialize(torch, self.device_kind)
             if self.world > 1 and self.device_kind == "cuda":
                 torch.cuda.set_device(self.rank)
+            # (dev) a configured gpu_memory_limit makes this device behave like a smaller card:
+            # cap the allocator here, before any weights reserve memory.
+            accel.constrain_device_memory(torch, self.device_kind, self.host.gpu_memory_limit)
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
@@ -1598,6 +1604,9 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
+        # (dev) carry the per-GPU VRAM cap to the device-init boundary; applied in
+        # `_initialize_device` so this process behaves like a smaller card.
+        self.host.gpu_memory_limit = command.gpu_memory_limit
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:
