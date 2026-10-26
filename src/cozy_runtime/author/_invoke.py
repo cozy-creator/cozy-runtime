@@ -99,18 +99,19 @@ if TYPE_CHECKING:
 
 
 class _PreparedScope:
-    """One request-owned prepared submission; no implementation or device knowledge here.
+    """Own every accepted submission in request order, independently of its implementation.
 
-    Register the pending owner before submit, but never hold the admission lock across a
-    provider callback. Closure can therefore wait for an in-flight submission without blocking
-    cancellation of already-created work. The first API admits one whole prepared plan.
+    Ordinary staged calls wait for their predecessor before entering the next provider.
+    PreparedSequence instead submits one native plan; its Rust worker advances those stages.
+    No admission lock spans provider callbacks, result waits or cancellation.
     """
 
     def __init__(self, context: Context) -> None:
         self.context = context
         self.lock = threading.Lock()
         self.accepting = True
-        self.pending: Future[Execution] | None = None
+        self.pending: list[Future[Execution]] = []
+        self.submitting: set[int] = set()
         self.original: BaseException | None = None
         self.failure: BaseException | None = None
 
@@ -121,14 +122,31 @@ class _PreparedScope:
                 raise CapabilityError(
                     "this request no longer accepts prepared work", code="prepared_request_closed"
                 )
-            if self.pending is not None:
+            thread = threading.get_ident()
+            if thread in self.submitting:
                 raise CapabilityError(
-                    "submit one complete prepared plan per request",
-                    code="prepared_request_submitted",
+                    "a prepared provider cannot recursively submit another stage",
+                    code="prepared_request_recursive",
                 )
-            self.pending = pending
+            previous = self.pending[-1] if self.pending else None
+            self.pending.append(pending)
+            self.submitting.add(thread)
         execution: Execution | None = None
         try:
+            if previous is not None:
+                predecessor = previous.result()
+                predecessor.wait()  # a prior failure prevents every following provider call
+                if predecessor.poll().canceled:
+                    raise RuntimeFailure(
+                        "the preceding prepared stage was canceled", code="prepared_stage_canceled"
+                    )
+            self.context.raise_if_cancelled()
+            with self.lock:
+                if not self.accepting:
+                    raise CapabilityError(
+                        "this request no longer accepts prepared work",
+                        code="prepared_request_closed",
+                    )
             execution = work.submit(self.context)
             pending.set_result(execution)
         except BaseException as error:
@@ -139,23 +157,36 @@ class _PreparedScope:
                     # Publication itself was interrupted: closure still owns the returned work.
                     pending.set_result(execution)
             raise
+        finally:
+            with self.lock:
+                self.submitting.discard(thread)
         return execution
 
-    def stop(self) -> Future[Execution] | None:
+    def stop(self) -> tuple[Future[Execution], ...]:
         with self.lock:
             self.accepting = False
-            return self.pending
+            return tuple(self.pending)
 
     def join(self) -> None:
-        pending = self.stop()
-        if pending is not None:
+        for pending in self.stop():
             pending.result().wait()
             self.context.raise_if_cancelled()
 
+    @staticmethod
+    def _fatal(error: BaseException) -> bool:
+        return fault(error) in (Fault.STICKY, Fault.DEVICE) or (
+            isinstance(error, RuntimeFailure) and error.code == "device_fault"
+        )
+
     def settle(self) -> None:
-        pending = self.stop()
-        if pending is None:
-            return
+        for pending in self.stop():
+            error = self._settle_one(pending)
+            if error is not None and (self.failure is None or self._fatal(error)):
+                self.failure = error
+        with self.lock:
+            self.pending.clear()
+
+    def _settle_one(self, pending: Future[Execution]) -> BaseException | None:
         execution: Execution | None = None
         try:
             execution = pending.result()
@@ -192,15 +223,13 @@ class _PreparedScope:
                 and not complete
                 and fault(error) not in (Fault.STICKY, Fault.DEVICE)
             ):
-                self.failure = RuntimeFailure(
+                failure = RuntimeFailure(
                     "prepared-work completion is unproven; retire executor", code="device_fault"
                 )
-                self.failure.__cause__ = error
-            else:
-                self.failure = error
-        finally:
-            with self.lock:
-                self.pending = None
+                failure.__cause__ = error
+                return failure
+            return error
+        return None
 
     def __exit__(
         self,

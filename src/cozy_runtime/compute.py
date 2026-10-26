@@ -93,6 +93,7 @@ class PreparedRepeat:
         self._load_used = False
         self._capture_cache: dict[str, int] = {}
         self._load_ordering_requested = "checked"
+        self._sequence_owner: Any = None
         self._load_ordering = "checked"
         self._landed = landed
 
@@ -676,6 +677,10 @@ class PreparedRepeat:
         return result
 
     def _retire_if_idle(self) -> None:
+        sequence = self._sequence_owner() if self._sequence_owner is not None else None
+        if sequence is not None and not sequence._closing:
+            sequence._retire_if_idle()
+            return
         with self._submission:
             if self._closed:
                 return
@@ -696,6 +701,10 @@ class PreparedRepeat:
         self._binding_cleanup.close()
 
     def close(self) -> None:
+        sequence = self._sequence_owner() if self._sequence_owner is not None else None
+        if sequence is not None and not sequence._closing:
+            sequence.close()
+            return
         with self._submission:
             if self._closed:
                 return
@@ -738,6 +747,8 @@ class PreparedRepeat:
     def submit(self, context: Context | None = None) -> Execution:
         import torch
 
+        if self._sequence_owner is not None and self._sequence_owner() is not None:
+            raise RuntimeError("this prepared stage belongs to a PreparedSequence")
         if torch.cuda.is_current_stream_capturing():
             raise CapabilityError(
                 "prepared submission during CUDA capture is not supported",
@@ -820,7 +831,7 @@ class Execution:
 
     def __init__(
         self,
-        plan: PreparedRepeat,
+        plan: PreparedRepeat | PreparedSequence,
         context: Context | None,
         epoch: int,
         outputs: tuple[Any, ...],
@@ -877,7 +888,7 @@ class Execution:
                         self._load_request.read(block, 0, int(nbytes))
 
     def _failed_load(self, error: Exception) -> None:
-        """A failed read/decode may prove cleanup; an exception alone is never that proof."""
+        """A native input/sequence job may prove cleanup; an exception is not that proof."""
         if self._load_job is None:
             return
         self._failure = error
@@ -975,3 +986,245 @@ class Execution:
             # Share the definition owner's join/readout path. In particular, don't race
             # another observer into two readouts or release the same model claim twice.
             self.plan.close()
+
+
+class PreparedSequence:
+    """Own ordered prepared stages; one submission advances them entirely in native code.
+
+    Stages are distinct definitions on one CUDA device. Their boundary state is ordinary
+    persistent GPU storage: a later stage may read a previous stage's state at the same
+    address. Output values are copied only after the whole native sequence finishes.
+    Preparation is still explicit Python work. The native worker may perform host-required
+    I/O and checked CUDA waits; sequential execution is not a single GPU graph launch.
+
+    Constructing this object transfers definition ownership: close/idle retirement of any
+    stage closes the whole sequence. Use PreparedRepeat's explicit prefix/body/suffix
+    capture instead when a package author chooses one shape-compatible composite graph.
+    Neither choice is a consumer/request setting or an automatic fusion decision.
+    """
+
+    def __init__(
+        self, stages: Sequence[PreparedRepeat], *, outputs: Sequence[Any] | None = None
+    ) -> None:
+        import torch
+
+        self.stages = tuple(stages)
+        if not self.stages or len(self.stages) > 65536:
+            raise ValueError("a prepared sequence needs 1..65536 stages")
+        if any(not isinstance(stage, PreparedRepeat) for stage in self.stages):
+            raise TypeError("sequence stages must be PreparedRepeat definitions")
+        if len({id(stage) for stage in self.stages}) != len(self.stages):
+            raise ValueError("sequence definitions must be distinct; repeat inside a stage")
+        self.device = self.stages[0].device
+        if any(stage.device != self.device for stage in self.stages):
+            raise ValueError("a native sequence belongs to one CUDA device")
+        self.state = tuple(self.stages[-1].state if outputs is None else outputs)
+        declared = {id(tensor) for stage in self.stages for tensor in stage.state}
+        if not self.state or any(
+            not isinstance(t, torch.Tensor) or id(t) not in declared for t in self.state
+        ):
+            raise ValueError("sequence outputs must be declared persistent stage state")
+        self.steps = sum(stage.steps for stage in self.stages)
+        self._submission = threading.RLock()
+        self._active: _SequenceExecution | None = None
+        self._native: Any = None
+        self._closed = False
+        self._closing = False
+        self._load = None
+        self._owned_bindings: tuple[Any, ...] = ()
+        with self._locked_stages():
+            for stage in self.stages:
+                stage._validate()
+                if stage._sequence_owner is not None and stage._sequence_owner() is not None:
+                    raise RuntimeError("a prepared stage already belongs to another sequence")
+                if stage._active is not None and not stage._active.poll().done:
+                    raise RuntimeError("a running definition cannot enter a new sequence")
+                if stage._load is not None and not callable(
+                    getattr(stage._load, "continuation", None)
+                ):
+                    raise CapabilityError(
+                        "this input loader cannot defer its native stage",
+                        code="prepared_load_unavailable",
+                    )
+            for stage in self.stages:
+                stage._sequence_owner = weakref.ref(self)
+
+    def _locked_stages(self) -> ExitStack:
+        locks = ExitStack()
+        try:
+            for stage in sorted(self.stages, key=id):
+                locks.enter_context(stage._submission)
+            return locks
+        except BaseException:
+            locks.close()
+            raise
+
+    def valid(self) -> bool:
+        with self._submission, self._locked_stages():
+            return not self._closed and all(stage.valid() for stage in self.stages)
+
+    def facts(self) -> dict[str, object]:
+        stages = [stage.facts() for stage in self.stages]
+        return {
+            "sequence": {} if self._native is None else self._native.facts(),
+            "stages": stages,
+            "host_graph_launches": sum(int(stage["host_graph_launches"]) for stage in stages),
+            "native_stage_advancement": True,
+        }
+
+    def submit(self, context: Context | None = None) -> Execution:
+        import torch
+        from cozy_runtime._kernels import _execution
+
+        if not callable(getattr(_execution, "NativeSequence", None)):
+            raise CapabilityError(
+                "native sequence module is unavailable", code="prepared_graph_ineligible"
+            )
+        if torch.cuda.is_current_stream_capturing():
+            raise CapabilityError(
+                "sequence submission during capture is unsupported", code="prepared_capture_active"
+            )
+        if context is not None:
+            context.raise_if_cancelled()
+            if context.device.type != "cuda" or context.device.index not in (None, self.device):
+                raise ValueError("prepared sequence does not belong to this request's CUDA device")
+        with self._submission, self._locked_stages():
+            if self._closed:
+                raise RuntimeError("prepared sequence is closed")
+            for stage in self.stages:
+                stage._validate()
+                if stage._active is not None and not stage._active.poll().done:
+                    raise RuntimeError("a sequence stage is already running")
+            with torch.cuda.device(self.device):
+                outputs = tuple(torch.empty_like(value) for value in self.state)
+                readout = torch.cuda.Event()
+                producer = torch.cuda.current_stream(self.device).cuda_stream
+            claimed: list[Any] = []
+            capsules: list[Any] = []
+            reads: list[tuple[Any, tuple[Any, ...]]] = []
+            native = None
+            execution = None
+            try:
+                for stage in self.stages:
+                    for binding in stage._owned_bindings:
+                        if binding.model not in claimed:
+                            binding.model._claim()
+                            claimed.append(binding.model)
+                    capsule, _ = stage._native.continuation(producer)
+                    if stage._load is not None:
+                        capsule, observation = stage._load.continuation(
+                            capsule, event_ordered=stage._load_ordering == "events"
+                        )
+                        reads.append((observation, stage._owned_bindings))
+                    capsules.append(capsule)
+                native = _execution.NativeSequence(capsules, self.device)
+                execution = _SequenceExecution(
+                    self, context, outputs, readout, claimed, native, reads
+                )
+                self._native, self._active = native, execution
+                for stage in self.stages:
+                    stage._active = execution
+                # All Python/native owners exist before the sole native worker can start.
+                native.start()
+                return execution
+            except BaseException as error:
+                if native is not None:
+                    try:
+                        native.close_owner()
+                    except Exception as cleanup:
+                        raise RuntimeFailure(
+                            "native sequence submission completion is unproven; retire executor",
+                            code="device_fault",
+                        ) from cleanup
+                else:
+                    # No sequence worker exists. Each capsule's provider owns abandonment of
+                    # its still-armed epoch; closing definitions checks all caller streams.
+                    self._closing = True
+                    try:
+                        for stage in self.stages:
+                            stage.close()
+                        self._closed = True
+                    except Exception as cleanup:
+                        raise RuntimeFailure(
+                            "native sequence preparation cleanup is unproven; retire executor",
+                            code="device_fault",
+                        ) from cleanup
+                    finally:
+                        self._closing = False
+                if execution is not None:
+                    execution._release_models()
+                else:
+                    while claimed:
+                        claimed[-1]._release()
+                        claimed.pop()
+                if isinstance(error, Exception):
+                    _native_error(error)
+                raise
+
+    def _retire_if_idle(self) -> None:
+        with self._submission:
+            if (
+                self._active is not None
+                and self._active._finished is None
+                and not self._active.poll().done
+            ):
+                raise RuntimeError("cannot retire a sequence while GPU execution is active")
+            self.close()
+
+    def close(self) -> None:
+        with self._submission, self._locked_stages():
+            if self._closed:
+                return
+            error = None
+            if self._active is not None:
+                if self._active._finished is None:
+                    self._active.cancel()
+                try:
+                    self._active._join()
+                except Exception as failure:
+                    if self._active._finished is None:
+                        raise
+                    error = failure
+            if self._native is not None:
+                try:
+                    self._native.close_owner()
+                except Exception as failure:
+                    _native_error(failure)
+            self._closing = True
+            try:
+                for stage in self.stages:
+                    stage.close()
+                self._closed = True
+            finally:
+                self._closing = False
+            if error is not None:
+                _native_error(error)
+
+    def __del__(self) -> None:
+        with suppress(BaseException):
+            self.close()
+
+
+class _SequenceExecution(Execution):
+    def __init__(self, plan, context, outputs, readout, models, native, reads):
+        super().__init__(plan, context, 0, outputs, readout, models, native)
+        self._stage_reads = reads
+
+    def facts(self) -> dict[str, object]:
+        facts = self.plan.facts()
+        facts["sequence"] = dict(self._load_job.facts())
+        facts["stage_inputs"] = [dict(job.facts()) for job, _ in self._stage_reads]
+        return facts
+
+    def _record_load(self, facts: Mapping[str, Any]) -> None:
+        if self._load_recorded or not facts.get("done", False):
+            return
+        for job, bindings in self._stage_reads:
+            loaded = job.facts()
+            if self._load_request is not None and loaded.get("read_done", False):
+                blocks = [block for binding in bindings for block in binding.groups]
+                if blocks:
+                    for block, nbytes in zip(blocks, loaded["input_read_bytes"], strict=True):
+                        if nbytes:
+                            self._load_request.read(block, 0, int(nbytes))
+        self._load_recorded = True

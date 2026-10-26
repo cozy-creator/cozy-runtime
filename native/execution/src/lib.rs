@@ -7,6 +7,7 @@ use std::{
 };
 
 mod continuation;
+mod sequence;
 
 pyo3::create_exception!(_execution, NativeExecutionError, PyRuntimeError);
 
@@ -492,5 +493,6 @@ fn _execution(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.py().get_type::<NativeExecutionError>(),
     )?;
     module.add_class::<ResidentRepeat>()?;
+    module.add_class::<sequence::NativeSequence>()?;
     Ok(())
 }

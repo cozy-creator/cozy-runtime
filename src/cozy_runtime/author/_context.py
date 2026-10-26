@@ -221,7 +221,10 @@ class Context:
         Declare it before the first model runs; calling again replaces it. No sizes or times.
 
         A single PreparedWork instead submits already prepared resident GPU work and returns
-        its Execution observer. It does not reinterpret ordinary component hints as code.
+        its Execution observer. Further submissions are ordered after earlier completion;
+        a prior failure prevents later work. PreparedSequence submits a whole ordered native
+        plan at once, without Python calls between its stages. Ordinary component hints are
+        not reinterpreted as executable code.
         """
         from cozy_runtime.author._prepared import PreparedWork
 
