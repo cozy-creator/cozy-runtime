@@ -1630,8 +1630,14 @@ class _SequenceCapture:
             self._domain = domain.Domain(torch, None)
             if self._domain.device != device:
                 raise ValueError("sequence capture must use the current request device")
-            self._domain.initialize()
-            self._domain.prime_blas()
+            try:
+                self._domain.initialize()
+                self._domain.prime_blas()
+            except Building as error:
+                raise CapabilityError(
+                    f"capture waits for kernel readiness: {error}",
+                    code="prepared_graph_ineligible",
+                ) from error
             self._pool = domain.Pool(torch.cuda.graph_pool_handle())
         elif self._domain.device != device:
             raise ValueError("sequence captures cannot span devices")
