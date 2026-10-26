@@ -11,6 +11,7 @@ import time
 import weakref
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack, nullcontext, suppress
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Literal, NoReturn
 
 from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
@@ -19,6 +20,8 @@ from cozy_runtime.author._prepared import Progress
 
 if TYPE_CHECKING:
     from cozy_runtime.author._context import Context
+
+_CAPTURE_GROUP: ContextVar[Any] = ContextVar("cozy_sequence_capture_group", default=None)
 
 
 def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
@@ -320,6 +323,9 @@ class PreparedRepeat:
         if isinstance(steps, bool) or not isinstance(steps, int) or not 0 < steps <= 2**32 - 1:
             raise ValueError("repeat steps must be a positive uint32")
         tensors = tuple(state)
+        group = _CAPTURE_GROUP.get()
+        if group is not None:
+            group._prepare(tensors)
         if not tensors or any(not isinstance(t, torch.Tensor) or not t.is_cuda for t in tensors):
             raise ValueError("prepared repeat state must contain CUDA tensors")
         device = tensors[0].device.index
@@ -639,6 +645,8 @@ class PreparedRepeat:
         tensors = tuple(state)
         device = tensors[0].device.index
         assert device is not None
+        group = _CAPTURE_GROUP.get()
+        generated: dict[int, tuple[Any, Any, Any, int, int]] = {}
         held: dict[int, Any] = {id(t): t for t in tensors}
         landed = LANDED[0]
         immutable: tuple[Any, ...] = tuple(
@@ -738,18 +746,46 @@ class PreparedRepeat:
                         and isinstance(tensor, torch.Tensor)
                         and (prior is None or prior() is not tensor)
                     ):
+                        if group is not None:
+                            group._external(tensor)
                         held[id(tensor)] = tensor
+                input_storage = (
+                    {
+                        (tensor.device, tensor.untyped_storage().data_ptr())
+                        for tensor in tree_leaves((args, kwargs or {}))
+                        if isinstance(tensor, torch.Tensor)
+                    }
+                    if group is not None and self.retain
+                    else set()
+                )
                 result = func(*args, **(kwargs or {}))
                 for tensor in tree_leaves(result):
                     if isinstance(tensor, torch.Tensor):
                         self.produced[id(tensor)] = weakref.ref(tensor)
+                        if group is not None and self.retain:
+                            storage = tensor.untyped_storage()
+                            pointer, size = int(storage.data_ptr()), int(storage.nbytes())
+                            aliases_generated = any(
+                                tensor.device == device and pointer < end and start < pointer + size
+                                for _, _, device, start, end in generated.values()
+                            )
+                            if size and (
+                                (tensor.device, pointer) not in input_storage or aliases_generated
+                            ):
+                                generated[id(tensor)] = (
+                                    weakref.ref(tensor),
+                                    weakref.ref(storage),
+                                    tensor.device,
+                                    pointer,
+                                    pointer + size,
+                                )
                 return result
 
         with torch.cuda.device(device), torch.no_grad():
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError("prepare a repeat outside graph capture")
             current = torch.cuda.current_stream(device)
-            stream = torch.cuda.Stream(device=device)
+            stream = torch.cuda.Stream(device=device) if group is None else group._domain.stream
             index = torch.zeros(1, dtype=torch.int64, device=device)
             # Native control writes this storage even when the authored body does not.
             held[id(index)] = index
@@ -795,11 +831,35 @@ class PreparedRepeat:
                     CaptureOwners(True),
                 ):
                     for recording, operation in phases:
-                        recording.capture_begin(capture_error_mode="global")
-                        try:
-                            operation()
-                        finally:
-                            recording.capture_end()
+                        if group is None:
+                            recording.capture_begin(capture_error_mode="global")
+                            try:
+                                operation()
+                            finally:
+                                recording.capture_end()
+                        else:
+                            # Same owned library/control streams as the established Domain.
+                            # Capture begins on control so Torch cannot reset the live cuBLAS
+                            # library workspace when recording the next stage.
+                            control = group._domain.control
+                            control.wait_stream(stream)
+                            with torch.cuda.stream(control):
+                                recording.capture_begin(
+                                    pool=group._pool.handle, capture_error_mode="global"
+                                )
+                                try:
+                                    group._domain.fork.record(control)
+                                    stream.wait_event(group._domain.fork)
+                                    with torch.cuda.stream(stream):
+                                        try:
+                                            operation()
+                                        finally:
+                                            group._domain.join.record(stream)
+                                            control.wait_event(group._domain.join)
+                                finally:
+                                    recording.capture_end()
+                            control.synchronize()
+                            group._domain.graphs.add(recording)
                 stream.synchronize()
                 for target, original in zip(tensors, saved, strict=True):
                     target.copy_(original)
@@ -822,6 +882,25 @@ class PreparedRepeat:
                         key: tensor for key, tensor in held.items() if not overlaps_input(tensor)
                     }
                     retained_owners = ()
+                if group is not None:
+                    areas = tuple(
+                        (device, start, end) for _, _, device, start, end in generated.values()
+                    )
+                    held = {
+                        key: tensor
+                        for key, tensor in held.items()
+                        if not overlaps_input(tensor, areas)
+                    }
+                    if any(
+                        tensor() is not None or storage() is not None
+                        for tensor, storage, _, _, _ in generated.values()
+                    ):
+                        raise CapabilityError(
+                            "a captured temporary escaped its sequence stage; "
+                            "use an external boundary tensor",
+                            code="prepared_graph_ineligible",
+                        )
+                    group._areas.extend(areas)
                 native = _execution.ResidentRepeat(
                     graph.raw_cuda_graph(),
                     index.data_ptr(),
@@ -834,6 +913,7 @@ class PreparedRepeat:
                         *held.values(),
                         *(tensor.untyped_storage() for tensor in held.values()),
                         *retained_owners,
+                        *(() if group is None else (group._domain, group._pool)),
                     ],
                     **phase_args,
                 )
@@ -1200,6 +1280,16 @@ class PreparedSequence:
     Neither choice is a consumer/request setting or an automatic fusion decision.
     """
 
+    @classmethod
+    def record(cls) -> _SequenceCapture:
+        """Capture an ordered program in one private scratch pool, then finish ownership.
+
+        Use `with PreparedSequence.record() as recording`, its capture/capture_stage
+        methods, and recording.finish(outputs=..., repeat=...). Every GPU boundary must be
+        allocated outside capture. Intermediate definitions cannot launch independently.
+        """
+        return _SequenceCapture()
+
     def __init__(
         self,
         stages: Sequence[PreparedRepeat],
@@ -1261,6 +1351,7 @@ class PreparedSequence:
         self._submission = threading.RLock()
         self._active: _SequenceExecution | None = None
         self._native: Any = None
+        self._capture_domain: Any = None
         # A rejected constructor owns no definitions. In particular its destructor must
         # not close a stage already transferred to another live sequence.
         self._closed = True
@@ -1473,11 +1564,157 @@ class PreparedSequence:
             try:
                 for stage in self.stages:
                     stage.close()
+                if self._capture_domain is not None:
+                    self._capture_domain.finish()
+                    self._capture_domain = None
                 self._closed = True
             finally:
                 self._closing = False
             if error is not None:
                 _native_error(error)
+
+    def __del__(self) -> None:
+        with suppress(BaseException):
+            self.close()
+
+
+class _SequenceCapture:
+    """Preparation-only ownership; uses the existing sequence for every execution."""
+
+    def __init__(self) -> None:
+        self.stages: list[PreparedRepeat] = []
+        self._domain: Any = None
+        self._pool: Any = None
+        self._areas: list[tuple[Any, int, int]] = []
+        self._submission = threading.RLock()
+        self._closing = False
+        self._entered = self._finished = self._closed = self._capturing = False
+
+    def __enter__(self) -> _SequenceCapture:
+        if self._entered or self._closed:
+            raise RuntimeError("sequence recording is one-shot")
+        self._entered = True
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        if not self._finished:
+            self.close()
+
+    def _external(self, tensor: Any) -> None:
+        storage = tensor.untyped_storage()
+        pointer, size = int(storage.data_ptr()), int(storage.nbytes())
+        if size and any(
+            tensor.device == device and pointer < end and start < pointer + size
+            for device, start, end in self._areas
+        ):
+            raise CapabilityError(
+                "sequence boundaries must not alias captured temporary storage",
+                code="prepared_graph_ineligible",
+            )
+
+    def _prepare(self, state: tuple[Any, ...]) -> None:
+        import torch
+
+        from cozy_runtime.graphs import domain
+
+        if not self._entered or self._closed or self._finished or not state:
+            raise RuntimeError("capture inside an open sequence recording")
+        for tensor in state:
+            if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                raise ValueError("sequence state must contain CUDA tensors")
+            self._external(tensor)
+        device = state[0].device.index
+        if device is None or any(t.device.index != device for t in state):
+            raise ValueError("sequence capture belongs to one device")
+        if self._domain is None:
+            self._domain = domain.Domain(torch, None)
+            if self._domain.device != device:
+                raise ValueError("sequence capture must use the current request device")
+            try:
+                self._domain.initialize()
+                self._domain.prime_blas()
+            except Building as error:
+                raise CapabilityError(
+                    f"capture waits for kernel readiness: {error}",
+                    code="prepared_graph_ineligible",
+                ) from error
+            self._pool = domain.Pool(torch.cuda.graph_pool_handle())
+        elif self._domain.device != device:
+            raise ValueError("sequence captures cannot span devices")
+        if why := self._domain.refusal():
+            raise CapabilityError(why, code="prepared_graph_ineligible")
+
+    def _capture(self, method: Any, step: Any, **parameters: Any) -> PreparedRepeat:
+        with self._submission:
+            if _CAPTURE_GROUP.get() is not None:
+                raise RuntimeError("nested sequence capture is unsupported")
+            if self._capturing:
+                raise RuntimeError("nested sequence preparation is unsupported")
+            self._capturing = True
+            token = _CAPTURE_GROUP.set(self)
+            try:
+                plan = method(step, **parameters)
+                if self._closed or self._domain is None or self._domain.closed:
+                    plan.close()
+                    raise RuntimeError("sequence recording retired during preparation")
+                with plan._submission:
+                    plan._sequence_owner = weakref.ref(self)
+                    self.stages.append(plan)
+                return plan
+            finally:
+                _CAPTURE_GROUP.reset(token)
+                self._capturing = False
+
+    def capture(self, step: Any, **parameters: Any) -> PreparedRepeat:
+        return self._capture(PreparedRepeat.capture, step, **parameters)
+
+    def capture_stage(self, step: Any, **parameters: Any) -> PreparedRepeat:
+        return self._capture(PreparedRepeat.capture_stage, step, **parameters)
+
+    def finish(
+        self, *, outputs: Sequence[Any] | None = None, repeat: tuple[int, int, int] | None = None
+    ) -> PreparedSequence:
+        with self._submission, ExitStack() as locks:
+            if not self._entered or self._closed or self._finished:
+                raise RuntimeError("sequence recording is not open")
+            for stage in sorted(self.stages, key=id):
+                locks.enter_context(stage._submission)
+            owner = weakref.ref(self)
+            for stage in self.stages:
+                if stage._sequence_owner is None or stage._sequence_owner() is not self:
+                    raise RuntimeError("sequence recording lost a captured definition")
+                stage._sequence_owner = None
+            try:
+                sequence = PreparedSequence(self.stages, outputs=outputs, repeat=repeat)
+            except BaseException:
+                for stage in self.stages:
+                    stage._sequence_owner = owner
+                raise
+            sequence._capture_domain = self._domain
+            self._domain = None
+            self._finished = True
+            return sequence
+
+    def _retire_if_idle(self) -> None:
+        if self._capturing:
+            raise RuntimeError("cannot retire a sequence during stage preparation")
+        self.close()
+
+    def close(self) -> None:
+        with self._submission:
+            if self._closed or self._finished:
+                return
+            if self._capturing:
+                raise RuntimeError("cannot close a sequence during stage preparation")
+            self._closing = True
+            try:
+                for stage in self.stages:
+                    stage.close()
+                if self._domain is not None:
+                    self._domain.finish()
+                self._closed = True
+            finally:
+                self._closing = False
 
     def __del__(self) -> None:
         with suppress(BaseException):
