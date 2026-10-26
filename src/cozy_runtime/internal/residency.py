@@ -1260,6 +1260,12 @@ class Memory:
         before_allocated, before_reserved, _ = self._figures()
         before_free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
         available = self.room(current).free if need else 0
+        if need and available < need:
+            # Return actual unused activation storage before sacrificing reusable weights.
+            # Private graph pools and live tensors may remain; measure instead of crediting
+            # reserved-minus-allocated bytes as available memory.
+            release_cached(torch, self.device.type)
+            available = self.room(current).free
         dropped = 0
 
         def enough(released: int = 0, *, flush: bool = False) -> bool:
@@ -1270,13 +1276,14 @@ class Memory:
             if flush or dropped >= max(need - available, 1):
                 # Dropped owner bytes only trigger a batch flush. Aliases, allocator
                 # fragmentation and graph pools can keep them resident; measure again.
-                if self.native is not None:
-                    self.native.reclaim(max(need - available, 0))
-                    available = self.room(current).free
+                available = self.room(current).free
                 if available < need:
                     release_cached(torch, self.device.type)
+                    available = self.room(current).free
+                if self.native is not None and available < need:
+                    self.native.reclaim(need - available)
+                    available = self.room(current).free
                 dropped = 0
-                available = self.room(current).free
             return available >= need
 
         with self.lock:
