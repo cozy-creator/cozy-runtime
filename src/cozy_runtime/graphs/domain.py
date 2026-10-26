@@ -113,24 +113,29 @@ class Domain:
             raise Unavailable(why)
         if self.stream is not None:
             return
-        try:
-            self.stream = self._stream()
-            self.control = self._stream()
-            self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
-            self.fork.record(self.control)
-            self.join.record(self.stream)
-            self.done.record(self.stream)
-            self.owner = self.torch.cuda.CUDAGraph()
-            # No library work or allocation inside this owner graph. Recording an event makes
-            # its capture stream explicit; reset later clears only this stream.
-            with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
-                self.owner.capture_begin(capture_error_mode="thread_local")
+        from cozy_runtime.internal import kernel_ready
+
+        # Refuse before allocating the owner graph/streams; the same device's background
+        # kernel probes must not invalidate this small lifetime-owner capture either.
+        with kernel_ready.recording():
+            try:
+                self.stream = self._stream()
+                self.control = self._stream()
+                self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
+                self.fork.record(self.control)
                 self.join.record(self.stream)
-                self.owner.capture_end()
-            self.config = self.configuration()
-        except BaseException:
-            self.finish()
-            raise
+                self.done.record(self.stream)
+                self.owner = self.torch.cuda.CUDAGraph()
+                # No library work or allocation inside this owner graph. Recording an event makes
+                # its capture stream explicit; reset later clears only this stream.
+                with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
+                    self.owner.capture_begin(capture_error_mode="thread_local")
+                    self.join.record(self.stream)
+                    self.owner.capture_end()
+                self.config = self.configuration()
+            except BaseException:
+                self.finish()
+                raise
 
     @contextmanager
     def using(self) -> Iterator[None]:
