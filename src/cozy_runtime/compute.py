@@ -1576,7 +1576,11 @@ class _SequenceExecution(Execution):
             return
         for _, job, bindings in self._stage_reads:
             loaded = job.facts()
-            if self._load_request is not None and loaded.get("read_done", False):
+            if self._load_request is not None and (
+                loaded.get("read_done", False) or getattr(job, "supports_native_lookahead", False)
+            ):
+                # Lookahead jobs expose complete padded ledgers after aggregate done,
+                # including prefetched bytes when demand was canceled before starting.
                 blocks = [block for binding in bindings for block in binding.groups]
                 if blocks:
                     prefetched = loaded.get("prefetch_input_read_bytes", [0] * len(blocks))
