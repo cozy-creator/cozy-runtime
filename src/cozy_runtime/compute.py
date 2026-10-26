@@ -1278,6 +1278,10 @@ class PreparedSequence:
     stage closes the whole sequence. Use PreparedRepeat's explicit prefix/body/suffix
     capture instead when a package author chooses one shape-compatible composite graph.
     Neither choice is a consumer/request setting or an automatic fusion decision.
+
+    `prefetch=False` is author execution-plan policy: omit speculative next-stage reads
+    when other work has priority. Native demand execution and existing cached weights keep
+    the same semantics. True permits bounded lookahead only when actual capacity admits it.
     """
 
     @classmethod
@@ -1296,6 +1300,7 @@ class PreparedSequence:
         *,
         outputs: Sequence[Any] | None = None,
         repeat: tuple[int, int, int] | None = None,
+        prefetch: bool = True,
     ) -> None:
         import torch
 
@@ -1311,6 +1316,9 @@ class PreparedSequence:
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
             )
+        if type(prefetch) is not bool:
+            raise TypeError("sequence prefetch policy must be a boolean")
+        self.prefetch = prefetch
         self.stages = tuple(stages)
         if not self.stages or len(self.stages) > 65536:
             raise ValueError("a prepared sequence needs 1..65536 stages")
@@ -1729,6 +1737,9 @@ class _SequenceExecution(Execution):
         self._prefetch_admission: list[dict[str, object]] = []
 
     def _prepare_lookahead(self) -> None:
+        if not self.plan.prefetch:
+            self._prefetch_admission.append({"state": "disabled_by_author"})
+            return
         request = self._load_request
         candidates: dict[Any, list[tuple[Any, ...]]] = {}
         for current, following in zip(self._stage_reads, self._stage_reads[1:], strict=False):
