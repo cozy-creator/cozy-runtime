@@ -120,6 +120,7 @@ from cozy_runtime.author._model import (
     component_use,
 )
 from cozy_runtime.author._observations import DEVICE, Attribution
+from cozy_runtime.author._prepared_use import PreparedUse, prepared_use
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
@@ -866,7 +867,8 @@ class Executor:
         self.residency: Any = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
-        self._prepared_uses: dict[str, object] = {}
+        # Accepted with this member (or its deferred container), never a per-alias cache.
+        self._prepared_use: PreparedUse | None = None
         self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
         self.group_sharded: set[tuple[str, str]] = set()
         #: component -> the follower rank that keeps it resident for the whole group
@@ -2025,7 +2027,8 @@ class Executor:
             return self._refusal("construction_key_absent", "a load names its construction")
         loaded = self.constructions.get(key)
         if loaded is not None:
-            loaded._bind_parameters(command)
+            if refused := loaded._bind_parameters(command):
+                return refused
             return self._load_reply(key, loaded, reused=True)
         child = self._construction_child(key)
         try:
@@ -2043,17 +2046,40 @@ class Executor:
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
 
-    def _bind_parameters(self, command: Load) -> None:
-        """A reload names the construction under every parameter its bindings now spell
-        (h3a-018): an added entrypoint over loaded bytes binds the same model object."""
+    def _bind_parameters(self, command: Load) -> dict[str, Any] | None:
+        """A reuse binds aliases to the same path-ordered members and immutable uses."""
         members = self.model_executors or [self]
-        for row, member in zip(command.rows(), members, strict=False):
+        rows = tuple(sorted(command.rows(), key=lambda row: row.binding.model_binding_path))
+        if len(rows) != len(members):
+            return self._refusal("model_binding_set_invalid", "a reuse must bind every member")
+        paths = [row.binding.model_binding_path for row in rows]
+        if len(paths) != len(set(paths)):
+            return self._refusal("model_binding_set_invalid", "model paths must be unique")
+        claimed = {name: member for member in members for name in member.models}
+        pairs = tuple(zip(rows, members, strict=True))
+        for row, member in pairs:
+            try:
+                use = None if row.binding.prepared_use is None else prepared_use(
+                    msgspec.to_builtins(row.binding.prepared_use)
+                )
+            except InvalidRequest as exc:
+                return self._refusal(exc.code, str(exc))
+            if use != member._prepared_use:
+                return self._refusal("prepared_use_binding", "changed use needs a new construction")
+            for name in row.binding.parameter_names():
+                if claimed.setdefault(name, member) is not member:
+                    return self._refusal(
+                        "model_binding_set_invalid", "a reuse aliases different model members"
+                    )
+        # Every row agreed before any alias is published: later refusal is atomic.
+        for row, member in pairs:
             model = next(iter(member.models.values()), None)
             if model is None:
                 continue
             for name in row.binding.parameter_names():
                 member.models.setdefault(name, model)
                 self.models.setdefault(name, model)
+        return None
 
     def _register(self, key: str, child: Executor, reply: dict[str, Any]) -> None:
         child.load_reply = reply
@@ -2173,6 +2199,7 @@ class Executor:
             }
             for member in (*members, child):
                 member.models.clear()
+                member._prepared_use = None
                 member.prepared.clear()
                 member.model_executors = []
                 member.backend = member.residency = member.registry = None
@@ -2294,6 +2321,14 @@ class Executor:
         if self._group_parent is None and self._deferred(single.binding):
             return self._prepare_many(command, (single,))
         binding = single.binding
+        try:
+            use = None if binding.prepared_use is None else prepared_use(
+                msgspec.to_builtins(binding.prepared_use)
+            )
+        except InvalidRequest as exc:
+            return self._refusal(exc.code, str(exc))
+        if use is not None and not binding.model_class:
+            return self._refusal("prepared_use_binding", "prepared use requires a model")
         self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
@@ -2365,11 +2400,6 @@ class Executor:
             self._discover_provisioned(binding)
         stage("package_import")
 
-        from cozy_runtime.author._prepared_use import prepared_use
-
-        use = None if binding.prepared_use is None else prepared_use(
-            msgspec.to_builtins(binding.prepared_use)
-        )
         registration = None
         if use is not None:
             entrypoint = binding.model_binding_path.partition(".models.")[0]
@@ -2378,7 +2408,6 @@ class Executor:
                 return self._refusal(
                     "prepared_use_binding", "the model declares no prepared-use field"
                 )
-            self._prepared_uses[binding.model_parameter_name] = use
 
         # The header ref identifies stored weights and metadata. Runtime opens it through
         # TensorFS in the shared store, then plans reads from its components.
@@ -2689,8 +2718,9 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
         self.backend = backend
         self.registry = registry
-        # ONE generation under EVERY parameter name the placement's bindings spell (h3a-018).
-        self.models = {name: model for name in binding.parameter_names()}
+        # Keep aliases accepted while an on-demand member was still a proxy (h3a-018).
+        aliases = dict.fromkeys((*binding.parameter_names(), *self.models))
+        self.models = dict.fromkeys(aliases, model)
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY: from here on a declared scope is a
         # shared `use` of its components, and each block binds its weights while it runs.
         self.residency = Placement(host.memory, backend)
@@ -2843,6 +2873,7 @@ class Executor:
             "delivery": plan.wire_document(),
             "attention": applied.document() if applied is not None else None,
         }
+        self._prepared_use = use
         return {
             "ok": True,
             "ready": True,
@@ -2868,11 +2899,12 @@ class Executor:
         rows = tuple(sorted(rows, key=lambda row: row.binding.model_binding_path))
         paths = [row.binding.model_binding_path for row in rows]
         parameters = [row.binding.model_parameter_name for row in rows]
+        aliases = [name for row in rows for name in row.binding.parameter_names()]
         if (
             not all(paths)
             or len(paths) != len(set(paths))
             or not all(parameters)
-            or len(parameters) != len(set(parameters))
+            or len(aliases) != len(set(aliases))
         ):
             return {
                 "ok": False,
@@ -2880,18 +2912,21 @@ class Executor:
                 "detail": "model paths and parameters must be named and unique",
             }
 
+        try:
+            uses = tuple(
+                None if row.binding.prepared_use is None else prepared_use(
+                    msgspec.to_builtins(row.binding.prepared_use)
+                )
+                for row in rows
+            )
+        except InvalidRequest as exc:
+            return self._refusal(exc.code, str(exc))
         children: list[tuple[str, Executor, dict[str, Any]]] = []
         for row in rows:
             binding = row.binding
             parameter = binding.model_parameter_name
             child = self._construction_child(self.construction)
             child._group_parent = self
-            if binding.prepared_use is not None:
-                from cozy_runtime.author._prepared_use import prepared_use
-
-                child._prepared_uses[parameter] = prepared_use(
-                    msgspec.to_builtins(binding.prepared_use)
-                )
             # The command with one model in place of its set: everything the machine said
             # about the load holds for each model.
             load = msgspec.structs.replace(
@@ -3048,6 +3083,10 @@ class Executor:
             "delivery": delivery,
             "models": {parameter: facts for parameter, facts in facts_rows},
         }
+        # Deferred members are accepted bindings even before their first materialization.
+        for (_, member, reply), use in zip(children, uses, strict=True):
+            if not reply:
+                member._prepared_use = use
         self.ready = True
         return {
             "ok": True,
@@ -4636,29 +4675,36 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
-    def _check_prepared_use(self, registration: Any, payload: object) -> None:
-        """The loaded construction serves exactly the use selected by the package planner."""
-        from cozy_runtime.author._prepared_use import prepared_use
-
-        bound = {
-            name: use
-            for member in self.model_executors or [self]
-            for name, use in member._prepared_uses.items()
-        }
+    def _check_prepared_use(self, registration: Registration, payload: object) -> None:
+        """Check current callable slots against the actual member, not historical aliases."""
         declarations = registration.model_prepared_use
-        if set(bound) != set(declarations):
-            raise InvalidRequest(
-                "prepared-use declaration differs from the loaded construction",
-                code="prepared_use_binding",
-            )
-        for name, field in declarations.items():
-            if not isinstance(payload, Mapping) or field not in payload:
-                raise InvalidRequest("prepared-use field is absent", code="prepared_use_invalid")
-            if prepared_use(payload[field]) != bound[name]:
+        slots = {slot.parameter for slot in registration.surface.slots if not slot.weights}
+        checked: set[str] = set()
+        for member in self.model_executors or [self]:
+            names = slots.intersection(member.models)
+            if not names:
+                continue
+            declared = names.intersection(declarations)
+            use = member._prepared_use
+            if declared != (names if use is not None else set()):
                 raise InvalidRequest(
-                    "changed prepared use needs a new construction",
+                    "prepared-use declaration differs from the loaded construction",
                     code="prepared_use_binding",
                 )
+            for name in declared:
+                field = declarations[name]
+                if not isinstance(payload, Mapping) or field not in payload:
+                    raise InvalidRequest(
+                        "prepared-use field is absent", code="prepared_use_invalid"
+                    )
+                if prepared_use(payload[field]) != use:
+                    raise InvalidRequest(
+                        "changed prepared use needs a new construction",
+                        code="prepared_use_binding",
+                    )
+            checked.update(declared)
+        if checked != set(declarations):
+            raise InvalidRequest("a prepared model slot is absent", code="prepared_use_binding")
 
     def _prepare_program(self, command: Map) -> dict[str, Any]:
         """A GPU warm command, alone under the existing process order and GPU permit.

@@ -32,9 +32,18 @@ def prepared_use(value: object) -> PreparedUse:
         row = msgspec.convert(value, type=PreparedUse, strict=True)
     except (TypeError, msgspec.ValidationError) as exc:
         raise InvalidRequest(str(exc), code="prepared_use_invalid") from exc
+    try:
+        invalid_key = any(
+            not key or len(key.encode("utf-8")) > 1024 or "." not in key
+            for key in row.tensors
+        )
+    except UnicodeEncodeError as exc:
+        raise InvalidRequest(
+            "prepared tensor keys must be valid UTF-8", code="prepared_use_invalid"
+        ) from exc
     if (
         len(row.tensors) > 4096
-        or any(not key or len(key) > 1024 or "." not in key for key in row.tensors)
+        or invalid_key
         or len(set(row.tensors)) != len(row.tensors)
     ):
         raise InvalidRequest(
