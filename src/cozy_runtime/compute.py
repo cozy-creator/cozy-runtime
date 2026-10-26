@@ -501,7 +501,6 @@ class PreparedRepeat:
                         if why := graphs._hooked(owner):
                             raise CapabilityError(why, code="prepared_graph_ineligible")
                         models[id(owner)] = owner
-            bypass = graphs.BYPASS.set(True)
             snapshots: list[Any] = []
             immutable_buffers = (
                 frozenset().union(
@@ -527,17 +526,17 @@ class PreparedRepeat:
                 if _detach_stage
                 else ()
             )
-            capture_blocks = (
-                _CAPTURE_BLOCKS.set(
-                    frozenset(
-                        id(block) for binding in bindings.values() for block in binding.groups
-                    )
-                )
+            declared_blocks = (
+                frozenset(id(block) for binding in bindings.values() for block in binding.groups)
                 if _detach_stage
                 else None
             )
+            capture_blocks = None
             plan = None
+            bypass = graphs.BYPASS.set(True)
             try:
+                if declared_blocks is not None:
+                    capture_blocks = _CAPTURE_BLOCKS.set(declared_blocks)
                 with torch.no_grad():
                     try:
                         snapshots = [
