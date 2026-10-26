@@ -164,7 +164,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         return run(0)
     scope = Scope(site)
     _local.scopes.append(scope)
-    available = request.room()
+    available: sizing.Room
     retries = 0
 
     def room() -> sizing.Room:
@@ -210,6 +210,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
 
     try:
         if _capturing():
+            available = request.room()
             return whole(sizing.choose(finest, need, available)[0])
         try:
             result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
