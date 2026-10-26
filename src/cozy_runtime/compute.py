@@ -6,6 +6,7 @@ control flow. Randomness must be explicit tensor inputs. Serving never compiles 
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import weakref
@@ -1528,7 +1529,7 @@ class PreparedSequence:
                                         # Model source/fill/generation identity belongs to this
                                         # submission. Actual readiness is inspected natively
                                         # at phase entry, never guessed from this snapshot.
-                                        key = repr(
+                                        identity = repr(
                                             tuple(
                                                 sorted(
                                                     (
@@ -1540,6 +1541,14 @@ class PreparedSequence:
                                                 )
                                             )
                                         )
+                                        # Only the compact digest crosses the capability and
+                                        # progress boundaries; complete immutable identities
+                                        # can contain large per-weight route tables.
+                                        digest = hashlib.sha256(identity.encode()).hexdigest()
+                                        label = "+".join(
+                                            sorted(model.component for model in selected)
+                                        )[:128]
+                                        key = f"{label}:{digest}"
                                         definition = key, regions
                                         phase_definitions[(memory, names)] = definition
                             if exclusive and memory.native is not None:
