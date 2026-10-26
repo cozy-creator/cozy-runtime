@@ -145,6 +145,7 @@ struct Shared {
     changed: Condvar,
     started: AtomicBool,
     canceled: AtomicBool,
+    cancel_failed: AtomicBool,
     pid: u32,
     _module: Py<PyAny>,
 }
@@ -182,7 +183,9 @@ impl Shared {
     fn cancel(&self) {
         self.canceled.store(true, Ordering::Release);
         for stage in &self.stages {
-            stage.cancel();
+            if !matches!(stage.cancel().kind, OK | CANCELED) {
+                self.cancel_failed.store(true, Ordering::Release);
+            }
         }
     }
 
@@ -243,6 +246,12 @@ impl Shared {
                     failure = Some((index, status));
                 }
             }
+        }
+        if self.cancel_failed.load(Ordering::Acquire) {
+            failure = Some((
+                0,
+                Status::new(UNPROVEN, 999, "native stage cancellation failed"),
+            ));
         }
         let complete = self
             .stages
@@ -398,6 +407,7 @@ impl NativeSequence {
                 changed: Condvar::new(),
                 started: AtomicBool::new(false),
                 canceled: AtomicBool::new(false),
+                cancel_failed: AtomicBool::new(false),
                 pid: std::process::id(),
                 _module: module,
             }),
@@ -408,9 +418,12 @@ impl NativeSequence {
         self.shared.begin()
     }
 
-    fn cancel(&self) -> PyResult<()> {
+    fn cancel(&self, py: Python<'_>) -> PyResult<()> {
         self.shared.check_process()?;
         self.shared.cancel();
+        if self.shared.cancel_failed.load(Ordering::Acquire) {
+            return Err(raise(py, Status::unproven(), 0));
+        }
         Ok(())
     }
 
@@ -467,7 +480,7 @@ impl NativeSequence {
         let state = py
             .detach(|| self.shared.wait())
             .map_err(|status| raise(py, status, 0))?;
-        if !state.completion_proven {
+        if !state.completion_proven || self.shared.cancel_failed.load(Ordering::Acquire) {
             return Err(raise(py, Status::unproven(), state.active.unwrap_or(0)));
         }
         Ok(())
