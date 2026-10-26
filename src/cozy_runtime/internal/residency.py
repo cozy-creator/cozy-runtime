@@ -1867,7 +1867,8 @@ class Memory:
         """Admit bounded next-source speculation after actual graph/readout allocations.
 
         The streaming limit bounds idle nonpreferred cache, not active physical residency.
-        Existing useful cache may remain beyond the current/next source pair. This never reclaims. Driver free and the request budget already exclude Torch
+        Existing useful cache may remain beyond the current/next source pair. This never
+        reclaims. Driver free and the request budget already exclude Torch
         reservations (including graph scratch and boundary slots) and native residency.
         The speculative native allocation independently rechecks pressure at read time.
         """
