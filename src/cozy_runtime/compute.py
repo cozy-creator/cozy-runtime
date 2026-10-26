@@ -463,6 +463,7 @@ class PreparedRepeat:
             current = torch.cuda.current_stream(device)
             stream = torch.cuda.Stream(device=device)
             index = torch.zeros(1, dtype=torch.int64, device=device)
+            held[id(index)] = index  # Native control writes it even when the authored body does not.
             saved = tuple(t.clone() for t in tensors)
             stream.wait_stream(current)
             graph = torch.cuda.CUDAGraph(keep_graph=True)
