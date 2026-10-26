@@ -28,6 +28,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
+from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 from cozy_runtime.internal.hostfacts import available_memory, physical_memory
 
@@ -497,11 +498,10 @@ def drain(torch: Any, kind: str) -> None:
         torch.cuda.current_stream().synchronize()
 
 
-#: torch's caching allocator, set in code before the first allocation: a segment grows by
-#: mapping only the pages a request adds and gives freed pages back the same way, so torch
-#: fragments less beside the plane's maps. The machine erases every `PYTORCH_` variable from
-#: an executor's environment: nothing outside the Runtime changes this.
-ALLOCATOR = "expandable_segments:True"
+#: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
+#: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
+#: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
+ALLOCATOR = "backend:native,expandable_segments:False"
 
 
 def initialize(torch: Any, kind: str) -> None:
@@ -515,7 +515,17 @@ def initialize(torch: Any, kind: str) -> None:
     if kind == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("this Mac's torch has no usable MPS device")
     if kind == "cuda":
+        from cozy_runtime.internal.residency import ResidencyError
+
         torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
+        try:
+            from tensorfs import varena
+
+            varena.install_allocator()
+        except (ImportError, AttributeError, RuntimeError) as exc:
+            if fault(exc) is not Fault.OTHER:
+                raise
+            raise ResidencyError(f"native CUDA allocation recovery is unavailable: {exc}") from exc
         torch.cuda.init()
 
 
@@ -557,8 +567,8 @@ def oom_error(torch: Any, kind: str) -> type[BaseException]:
 
 def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) -> dict[str, int]:
     """The allocator's live numbers plus the driver's own view — the only number that sees
-    other processes. On CUDA the allocator is varena's (`memory`), whose figures these are:
-    torch's own statistics raise under it. On unified memory the device is this process's
+    other processes. CUDA figures include native weight backing beside stock Torch. On unified
+    memory the device is this process's
     budget (`unified_budget`) and the driver's figure counts this process's Metal buffers only.
     A CPU's device memory is the host's RAM, and no allocator of ours holds any of it."""
     if kind == "cpu":
@@ -578,43 +588,48 @@ def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) ->
             "driver_total_bytes": total,
         }
     free, total = torch.cuda.mem_get_info(device)
-    held = varena_torch(memory)
+    weights = _weight_bytes(memory)
     return {
-        "allocated_bytes": int(held["allocated"]),
-        "reserved_bytes": int(held["mapped"]),
+        "allocated_bytes": int(torch.cuda.memory_allocated(device)) + weights,
+        "reserved_bytes": int(torch.cuda.memory_reserved(device)) + weights,
         "driver_free_bytes": int(free),
         "driver_total_bytes": int(total),
     }
 
 
-def varena_torch(memory: Any) -> dict[str, Any]:
-    """varena's figures for torch's blocks on a CUDA `memory`: allocated, mapped and peak bytes,
-    and per open request its (allocated, peak). None without one (no torch block is varena's)."""
-    if memory is None or not memory.cuda:
-        return {"allocated": 0, "mapped": 0, "peak": 0, "requests": {}}
-    return dict(memory.torch_stats())
+def _weight_bytes(memory: Any) -> int:
+    native = getattr(memory, "native", None)
+    return int(native.stats()["resident_bytes"]) if native is not None else 0
 
 
 def allocated(torch: Any, kind: str, memory: Any = None) -> int:
-    """The allocator's live bytes ALONE. Separate from `allocation` on purpose: the
-    residency plane reads this on every stage and every eviction, and the driver query
-    `allocation` also makes is far too expensive to ride along on that path."""
+    """Process-local live allocations, without querying the driver."""
     if kind == "mps":
         return int(torch.mps.current_allocated_memory())
-    return int(varena_torch(memory)["allocated"])
+    if kind == "cpu":
+        return 0
+    return int(torch.cuda.memory_allocated(getattr(memory, "device", None))) + _weight_bytes(memory)
 
 
 def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
-    """The allocator's reserved bytes ALONE: live tensors plus what it holds mapped for them."""
+    """Process-local allocator storage, including unused cached blocks."""
     if kind == "mps":
         return int(torch.mps.driver_allocated_memory())
-    return int(varena_torch(memory)["mapped"])
+    if kind == "cpu":
+        return 0
+    return int(torch.cuda.memory_reserved(getattr(memory, "device", None))) + _weight_bytes(memory)
 
 
-def arena_peak(memory: Any, request: str) -> int:
-    """Open request `request`'s torch high-water in its arena (varena keeps it per request,
-    so concurrent requests never share a mark); 0 off CUDA."""
-    return int(varena_torch(memory)["requests"].get(request, (0, 0))[1])
+def allocator_peak(memory: Any, request: str | None = None) -> int:
+    """Absolute process high-water, including samples carried across pure-cut resets.
+
+    A request names the observation window, not exclusive ownership; overlapping calls share it.
+    """
+    if memory is None or not memory.cuda:
+        return 0
+    figures = memory.torch_stats()
+    carried = figures["requests"].get(request, (0, 0))[1] if request is not None else 0
+    return max(int(figures["peak"]), int(carried))
 
 
 #: This process's own cache releases that returned something, by the function that asked:
@@ -623,16 +638,15 @@ RELEASED: dict[str, list[int]] = {}
 
 
 def release_cached(torch: Any, kind: str) -> None:
-    """Return MPS's caching allocator's UNUSED segments to the driver. Frees nothing the
-    process still holds; it is what makes an eviction visible to other processes. CUDA's
-    allocator is varena's, which returns what it doesn't hold itself."""
-    if kind == "mps":
-        before = reserved(torch, kind)
-        torch.mps.empty_cache()
-        if (freed := before - reserved(torch, kind)) > 0:
-            row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
-            row[0] += 1
-            row[1] += freed
+    """Return unused allocator blocks to the driver; live tensors remain owned."""
+    if kind not in ("cuda", "mps"):
+        return
+    before = reserved(torch, kind)
+    (torch.cuda if kind == "cuda" else torch.mps).empty_cache()
+    if (freed := before - reserved(torch, kind)) > 0:
+        row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
+        row[0] += 1
+        row[1] += freed
 
 
 def completion_event(torch: Any, kind: str) -> Any:
@@ -654,7 +668,10 @@ def streams_idle(torch: Any, kind: str) -> bool:
     if kind == "cpu":
         return True
     if kind == "mps":
-        return bool(completion_event(torch, kind).query())
+        # Recording a new event after a drain adds work, so its immediate query can fail.
+        # These completion boundaries need the MPS queue fence, not a fresh poll marker.
+        synchronize(torch, kind)
+        return True
     return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
 
 

@@ -12,13 +12,14 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import io
+import math
 import mmap
 import os
 import threading
 from collections.abc import Buffer, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, TYPE_CHECKING, cast
 
 import tensorfs
 from tensorfs import Checkpoint as Checkpoint
@@ -28,6 +29,9 @@ from tensorfs import raw
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._errors import CapabilityError
+
+if TYPE_CHECKING:
+    from tensorfs.api import NormalizeBf16Tensor, QuantizeTensor
 
 #: The store's location when the machine names none (TensorFS's default, owner D3).
 DEFAULT_HOME = "~/.cache/tensorfs"
@@ -328,6 +332,190 @@ class Output:
             writer.put_encoded(
                 key, dtype=dtype, shape=list(shape), scheme=scheme, parts=views, params=dict(params)
             )
+
+    def prepare_bf16(
+        self,
+        source: Checkpoint,
+        tensors: Sequence[NormalizeBf16Tensor],
+        *,
+        max_buffer_bytes: int = 8 << 20,
+    ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
+        """Reserve missing BF16 bytes, then return one owning native normalization call.
+
+        Supply the full immutable normalization selection, even when every key is already
+        journaled. Only native success validates resume and admits completed-output reuse.
+        """
+        if not tensors:
+            raise CapabilityError("normalization needs a selected tensor", code="quantization_plan")
+        identity = hashlib.sha256(
+            canonical_json.encode(
+                {
+                    "operation": "bf16-normalize/1",
+                    "source": source.id,
+                    "selection": list(tensors),
+                    "implementation": raw.normalization_implementation(),
+                }
+            )
+        ).hexdigest()
+        if self.done is not None:
+            if self.done.metadata.get("native_bf16_normalization") != identity:
+                raise CapabilityError(
+                    "finished output has different BF16 normalization work; derive a new output",
+                    code="normalization_identity",
+                )
+            return lambda _: {
+                "identity": identity,
+                "converted_keys": 0,
+                "reused_keys": len(tensors),
+                "source_bytes_read": 0,
+                "logical_source_bytes_read": 0,
+                "new_bytes_written": 0,
+                "required_buffer_bytes": 0,
+                "worst_relative_frobenius": None,
+                "tensors": [],
+            }, 0
+        writer = self._writer
+        if writer is None:
+            raise CapabilityError("the output is closed", code="weights_writer_closed")
+        for row in tensors:
+            if any(type(dimension) is not int or dimension < 0 for dimension in row["shape"]):
+                raise CapabilityError("normalization shape is invalid", code="quantization_plan")
+        pending = [row for row in tensors if not writer.has(row["component"], row["key"])]
+        required = sum(math.prod(row["shape"]) * 2 for row in pending)
+        self._spend(required)
+        for component in dict.fromkeys(row["component"] for row in tensors):
+            self.component(component)
+
+        def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
+            result = writer.normalize_bf16(
+                source,
+                tensors,
+                max_buffer_bytes=max_buffer_bytes,
+                max_new_bytes=required,
+                control=control,
+            )
+            # A successful full-selection call (including all-reused) revalidated the
+            # native journal and every selected entry before this completed acceptance.
+            writer.metadata["native_bf16_normalization"] = identity
+            return result
+
+        return convert, len(pending)
+
+    def prepare_quantization(
+        self,
+        source: Checkpoint,
+        tensors: Sequence[QuantizeTensor],
+        *,
+        max_relative_frobenius: float | None,
+        calibration: Checkpoint | None = None,
+        max_buffer_bytes: int = 8 << 20,
+        component: str | None = None,
+    ) -> tuple[Callable[[tensorfs.ConversionControl], dict[str, object]], int]:
+        """Reserve this output's grant once, then return one owning native Writer call.
+
+        The derivation supplies the full immutable native selection; only missing entries
+        consume this attempt's logical new-byte grant. The caller must join before close.
+        """
+        selected = [row for row in tensors if component is None or row["component"] == component]
+        if component is not None and not selected:
+            raise CapabilityError("unknown quantization component", code="quantization_plan")
+        if any(row.get("fit") is not None for row in tensors) and calibration is None:
+            raise CapabilityError(
+                "calibrated conversion needs a checkpoint", code="quantization_plan"
+            )
+
+        implementation = raw.quantization_implementation()
+
+        def accepted_identity(scope: str | None) -> str:
+            return hashlib.sha256(
+                canonical_json.encode(
+                    {
+                        "source": source.id,
+                        "calibration": None if calibration is None else calibration.id,
+                        "selection": list(tensors),
+                        "implementation": implementation,
+                        "max_relative_frobenius": max_relative_frobenius,
+                        # Finished reuse is scoped; the native journal binds the full plan.
+                        "component": scope,
+                    }
+                )
+            ).hexdigest()
+
+        identity = accepted_identity(component)
+        if self.done is not None:
+            if identity not in self.done.metadata.get("native_quantization", []):
+                raise CapabilityError(
+                    "finished output has a different calibration or native producer; "
+                    "derive a new output",
+                    code="quantization_identity",
+                )
+            return lambda _: {
+                "encoded_keys": 0,
+                "reused_keys": len(selected),
+                "source_bytes_read": 0,
+                "new_bytes_written": 0,
+                "saturated_elements": 0,
+                "worst_relative_frobenius": None,
+            }, 0
+        writer = self._writer
+        if writer is None:
+            raise CapabilityError("the output is closed", code="weights_writer_closed")
+        pending = [row for row in selected if not self.has(row["component"], row["key"])]
+        required = 0
+        for row in pending:
+            rows, columns = row["shape"]
+            match row["encoding"]["scheme"]:
+                case "int8.convrot":
+                    required += rows * columns + rows * 4
+                case "nvfp4":
+                    required += rows * columns // 2 + rows * columns // 16 + 4
+                case "fp8.rowwise":
+                    required += rows * (columns + 4)
+                case "w4a8.convrot":
+                    required += rows * (columns // 2 + columns // 16 + 4) + 64
+                case "svdq.nvfp4":
+                    required += (
+                        rows * columns // 2
+                        + rows * columns // 16
+                        + 8
+                        + columns * 4
+                        + (rows + columns) * 32 * 2
+                    )
+                case _:
+                    raise CapabilityError("unsupported native quantizer", code="quantization_plan")
+        self._spend(required)
+        for name in dict.fromkeys(row["component"] for row in selected):
+            self.component(name)
+
+        def convert(control: tensorfs.ConversionControl) -> dict[str, object]:
+            result = writer.quantize(
+                source,
+                tensors,
+                max_buffer_bytes=max_buffer_bytes,
+                max_new_bytes=required,
+                calibration=calibration,
+                component=component,
+                control=control,
+                max_relative_frobenius=max_relative_frobenius,
+            )
+            # Native success matched the journal's full immutable plan, including quality.
+            # First binding also refuses selected entries written without that identity.
+            # Recover scopes completed before an interruption: has() names journal entries,
+            # never inherited base tensors, and is only the completeness check here.
+            complete: dict[str | None, bool] = {None: True}
+            for row in tensors:
+                present = writer.has(row["component"], row["key"])
+                complete[None] &= present
+                name = row["component"]
+                complete[name] = complete.get(name, True) and present
+            identities = cast("list[str]", writer.metadata.setdefault("native_quantization", []))
+            for scope, completed in complete.items():
+                if completed and (accepted := accepted_identity(scope)) not in identities:
+                    identities.append(accepted)
+            identities.sort()
+            return result
+
+        return convert, len(pending)
 
     def copy(
         self,

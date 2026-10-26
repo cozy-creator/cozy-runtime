@@ -1,0 +1,1 @@
+- Pause the request host-stall sampler while recording a prepared CUDA graph, and drain its in-flight query before capture and request teardown. Graph recording no longer races the observer’s default-stream query.

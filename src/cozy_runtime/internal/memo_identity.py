@@ -84,9 +84,10 @@ def distribution_identity(
             archive, vcs = source.archive_info, source.vcs_info
             if source.dir_info is not None or (vcs is None and archive is None):
                 return None
-            # uv may record a local immutable wheel with archive_info={}.
-            # Its version and wheel tags still supply the declared native build
-            # contract; include archive hashes when the installer retains them.
+            # A local development wheel may reuse its version. Without immutable
+            # archive provenance it cannot authorize a completed memo replay.
+            if archive is not None and not (archive.hashes or archive.hash):
+                return None
             if archive is not None and archive.hashes:
                 provenance["archive_hashes"] = archive.hashes
             elif archive is not None and archive.hash:

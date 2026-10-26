@@ -351,6 +351,8 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
         doc["weights"] = True
     if parameter in declared.model_on_demand:
         doc["on_demand"] = True
+    if use := declared.model_prepared_use.get(parameter):
+        doc["prepared_use"] = use
     return doc
 
 

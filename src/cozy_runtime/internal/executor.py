@@ -2,9 +2,9 @@
 
 Runtime imports the package's Torch stack and constructs its models in this process.
 TensorD makes model data available, prepares shared CPU buffers through TensorFS and
-coordinates machine budgets. Runtime uses its local TensorFS plane/device APIs to allocate,
-copy, map and unmap GPU weight memory, and can attach allocations TensorD keeps through
-exported handles. TensorFS therefore runs in both processes; it is not a separate daemon.
+coordinates machine budgets. Runtime allocates ordinary Torch tensors and lends their storage
+through TensorFS's read interface. Each executor owns its allocations; TensorFS runs in both
+processes as a library.
 
 The executor lives for its (environment, lane) and holds its loaded constructions.
 TensorD supervises its disposable lifetime and owns durable execution records; source and
@@ -66,7 +66,6 @@ from typing import TYPE_CHECKING, Any
 import msgspec
 import tensorfs
 from msgspec import UNSET, UnsetType
-from tensorfs.varena import VarenaError
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
@@ -109,6 +108,7 @@ from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
     prepare,
+    prepare_program,
     run_prepared,
 )
 from cozy_runtime.author._model import (
@@ -120,6 +120,7 @@ from cozy_runtime.author._model import (
     component_use,
 )
 from cozy_runtime.author._observations import DEVICE, Attribution
+from cozy_runtime.author._prepared_use import PreparedUse, prepared_use
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
@@ -233,8 +234,8 @@ else:
 if TYPE_CHECKING:
     from types import ModuleType
 
-    from tensorfs.varena.torch import Memory
-    from tensorfs.varena.torch import Request as MemoryRequest
+    from cozy_runtime.internal.residency import Memory, QueuedPrefetch
+    from cozy_runtime.internal.residency import Request as MemoryRequest
 
 #: The native inline-result door: a small typed result rides
 #: the terminal envelope and skips the file-store round trip. Larger than this REFUSES at
@@ -635,9 +636,11 @@ class _CompositeResidency:
         for row in self.rows.values():
             row.open_attempt()
 
-    def plan(self, steps: Sequence[str | Collection[str]]) -> None:
+    def plan(
+        self, steps: Sequence[str | Collection[str]], request: MemoryRequest | None = None
+    ) -> None:
         for row in self.rows.values():
-            row.plan(steps)
+            row.plan(steps, request=request)
 
     def release(self) -> None:
         for row in self.rows.values():
@@ -661,12 +664,6 @@ class _CompositeResidency:
             }
             for part in ("notes", "graphs")
         }
-
-
-def _leases(command: Start) -> int | None:
-    """TensorD's lease namespace when it leases this executor's pages (memory protocol 2), else
-    None: off Linux, with no manager, or an older TensorD, varena runs each GPU standalone."""
-    return command.leases if command.memory_protocol == 2 else None
 
 
 def _construction_record(facts: Mapping[str, Any]) -> dict[str, Any]:
@@ -797,21 +794,17 @@ class Executor:
         #: the construction key this generation was loaded under; "" on the host
         self.construction = construction
         #: HOST ONLY: every loaded construction and the active one. One memory decides where
-        #: all their weights live (`tensorfs.varena.torch`), and the execution layer runs
+        #: all their weights live (`internal.residency`), and the execution layer runs
         #: torch under it (`internal.execution`, imported with the device).
         self.constructions: dict[str, Executor] = {}
         self.memory: Memory | None = None
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: Why a GPU runs standalone ("" it does not): TensorD leases nothing here (its memory
-        #: protocol), or it asked and no manager answers (`Memory.standalone`)
-        self.standalone = ""
         #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
         self.cuts: dict[str, object] = {}
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
-        self.leases: int | None = None
         #: The machine's sealed TensorFS cache directory.
         self.store: Path | None = None
         #: HOST ONLY: the constructed slots built on first use (`on_demand=`), by the same path
@@ -876,6 +869,8 @@ class Executor:
         self.residency: Any = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
+        # Accepted with this member (or its deferred container), never a per-alias cache.
+        self._prepared_use: PreparedUse | None = None
         self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
         self.group_sharded: set[tuple[str, str]] = set()
         #: component -> the follower rank that keeps it resident for the whole group
@@ -922,6 +917,8 @@ class Executor:
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
         self.prepared: dict[str, PreparedRequest] = {}
+        # A cancel may arrive on the seam reader while preflight is still running.
+        self._prepared_lock = threading.Lock()
         self.attempts = 0
 
     # ------------------------------------------------------------------ prepare
@@ -981,9 +978,11 @@ class Executor:
             "pgid": _group(),
             "runtime_version": RUNTIME_VERSION,
             "tensorfs_version": _distribution_version("tensorfs"),
-            # 2: each GPU's weight pages leased from TensorD's manager (`Start.leases`); a
-            # Start of any other runs standalone.
-            "memory_protocol": 2,
+            "memory_protocol": 0,  # all weight and activation storage is process-local
+            "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
+            # Correlated PrepareRequest replies and cancellation-safe publication.
+            "request_lookahead": True,
+            "program_preparation": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -1024,35 +1023,30 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        from cozy_runtime.internal.residency import ResidencyError
+
         try:
-            self._open_memory(torch)  # before torch's context, so varena measures its own
-        except VarenaError as exc:  # its torch allocator will not load, or TensorD refused it
-            return {"ok": False, "code": "weight_plane_unavailable", "detail": str(exc)}
-        accel.initialize(torch, self.device_kind)
-        if self.world > 1 and self.device_kind == "cuda":
-            torch.cuda.set_device(self.rank)
+            accel.initialize(torch, self.device_kind)
+            if self.world > 1 and self.device_kind == "cuda":
+                torch.cuda.set_device(self.rank)
+            self._open_memory(torch)
+        except ResidencyError as exc:
+            return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
         place(self._device())
         return None
 
     def _open_memory(self, torch: Any) -> None:
-        """This process's memory (`tensorfs.varena.torch`), on its grant from TensorD, and the
-        execution layer that runs torch under it."""
-        from tensorfs.varena.torch import Memory
-
+        """This executor's local residency and its pure-site execution helpers."""
         from cozy_runtime.internal import execution
+        from cozy_runtime.internal.residency import Memory
 
         host = self.host
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        # TensorD's lease namespace, when it leases this GPU's weight pages. A follower that
-        # dials before rank 0's progress frame registers it is held until TensorD has.
-        leases = host.leases if device.type == "cuda" else None
-        host.memory, host.execution = Memory.open(device, leases=leases), execution
-        if host.memory.standalone:  # TensorD asked to lease and no manager can: the start says why
-            host.standalone = f"{_gpu(self.rank)} runs standalone: {host.memory.standalone}"
+        host.memory, host.execution = Memory.open(device), execution
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         _split.install(execution)
@@ -1282,6 +1276,7 @@ class Executor:
         # A spread call rank 0 waits on over the group: a header always answers it.
         answered = False
         try:
+            scoped = {scope.model: scope for scope in wire.RunCommand.read(command).scopes}
             spool = Path(command["spool"])
             held = attention.observed(
                 {f"{m}/{c}": root for (m, c), (_, root) in self.group_components.items()}
@@ -1313,6 +1308,13 @@ class Executor:
                         # priced, so it may always make room: demand-pull when measured.
                         residency.open_attempt()
                         self._group_attempts[key] = spool
+                    if residency is not None:
+                        choices = scoped[key].lora
+                        if set(choices) != set(components):
+                            raise GroupRefusal(
+                                "mirrored LoRA choices do not cover the scope's components"
+                            )
+                        stack.enter_context(residency.mirrored_lora(choices))
                     stack.enter_context(models[key]._cozy_scope(scope["method"], components))
                     active[key] = components
                 if name[0] not in active or name[1] not in active[name[0]]:
@@ -1368,7 +1370,7 @@ class Executor:
                 accel.synchronize(self.torch, self.device_kind)
             self._attempt_spool = spool
             ranked = self.host._rank_request
-            working = accel.arena_peak(self.host.memory, ranked.id) if ranked is not None else 0
+            working = accel.allocator_peak(self.host.memory, ranked.id) if ranked is not None else 0
         except Exception as exc:
             ending = mirror.ending(exc)
             # where it was raised, innermost first: a GPU's own traceback stays on that GPU
@@ -1596,16 +1598,6 @@ class Executor:
         and reads as unstarted. The ordinary start that follows only initializes devices,
         warms the package and forms the group.
         """
-        # An older TensorD's GPU ledgers follow its Start (a memfd and an eventfd each): unused
-        # here, they close. Skew degrades: whatever leases nothing runs standalone.
-        for fd in self.channel.recv_fds(2 * command.ledgers):
-            os.close(fd)
-        self.leases = _leases(command)
-        if command.devices and self.leases is None and not self.standalone:
-            self.standalone = (
-                f"TensorD's memory protocol {command.memory_protocol} leases nothing here: "
-                "each GPU runs standalone"
-            )
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         if command.memo is not None:
@@ -1914,7 +1906,7 @@ class Executor:
             "warmup_error": warmup_error,
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
-            **({"memory_standalone": self.standalone} if self.standalone else {}),
+            "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
         }
 
     def _model_classes(self) -> list[type[Model[Any]]]:
@@ -2037,7 +2029,8 @@ class Executor:
             return self._refusal("construction_key_absent", "a load names its construction")
         loaded = self.constructions.get(key)
         if loaded is not None:
-            loaded._bind_parameters(command)
+            if refused := loaded._bind_parameters(command):
+                return refused
             return self._load_reply(key, loaded, reused=True)
         child = self._construction_child(key)
         try:
@@ -2055,17 +2048,40 @@ class Executor:
         self._register(key, child, reply)
         return self._load_reply(key, child, reused=False)
 
-    def _bind_parameters(self, command: Load) -> None:
-        """A reload names the construction under every parameter its bindings now spell
-        (h3a-018): an added entrypoint over loaded bytes binds the same model object."""
+    def _bind_parameters(self, command: Load) -> dict[str, Any] | None:
+        """A reuse binds aliases to the same path-ordered members and immutable uses."""
         members = self.model_executors or [self]
-        for row, member in zip(command.rows(), members, strict=False):
+        rows = tuple(sorted(command.rows(), key=lambda row: row.binding.model_binding_path))
+        if len(rows) != len(members):
+            return self._refusal("model_binding_set_invalid", "a reuse must bind every member")
+        paths = [row.binding.model_binding_path for row in rows]
+        if len(paths) != len(set(paths)):
+            return self._refusal("model_binding_set_invalid", "model paths must be unique")
+        claimed = {name: member for member in members for name in member.models}
+        pairs = tuple(zip(rows, members, strict=True))
+        for row, member in pairs:
+            try:
+                use = None if row.binding.prepared_use is None else prepared_use(
+                    msgspec.to_builtins(row.binding.prepared_use)
+                )
+            except InvalidRequest as exc:
+                return self._refusal(exc.code, str(exc))
+            if use != member._prepared_use:
+                return self._refusal("prepared_use_binding", "changed use needs a new construction")
+            for name in row.binding.parameter_names():
+                if claimed.setdefault(name, member) is not member:
+                    return self._refusal(
+                        "model_binding_set_invalid", "a reuse aliases different model members"
+                    )
+        # Every row agreed before any alias is published: later refusal is atomic.
+        for row, member in pairs:
             model = next(iter(member.models.values()), None)
             if model is None:
                 continue
             for name in row.binding.parameter_names():
                 member.models.setdefault(name, model)
                 self.models.setdefault(name, model)
+        return None
 
     def _register(self, key: str, child: Executor, reply: dict[str, Any]) -> None:
         child.load_reply = reply
@@ -2185,6 +2201,7 @@ class Executor:
             }
             for member in (*members, child):
                 member.models.clear()
+                member._prepared_use = None
                 member.prepared.clear()
                 member.model_executors = []
                 member.backend = member.residency = member.registry = None
@@ -2306,6 +2323,14 @@ class Executor:
         if self._group_parent is None and self._deferred(single.binding):
             return self._prepare_many(command, (single,))
         binding = single.binding
+        try:
+            use = None if binding.prepared_use is None else prepared_use(
+                msgspec.to_builtins(binding.prepared_use)
+            )
+        except InvalidRequest as exc:
+            return self._refusal(exc.code, str(exc))
+        if use is not None and not binding.model_class:
+            return self._refusal("prepared_use_binding", "prepared use requires a model")
         self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
@@ -2376,6 +2401,15 @@ class Executor:
         if self.discovered is None:
             self._discover_provisioned(binding)
         stage("package_import")
+
+        registration = None
+        if use is not None:
+            entrypoint = binding.model_binding_path.partition(".models.")[0]
+            registration = self.discovered.app.get(entrypoint)
+            if binding.model_parameter_name not in registration.model_prepared_use:
+                return self._refusal(
+                    "prepared_use_binding", "the model declares no prepared-use field"
+                )
 
         # The header ref identifies stored weights and metadata. Runtime opens it through
         # TensorFS in the shared store, then plans reads from its components.
@@ -2495,6 +2529,21 @@ class Executor:
         # the plan already chosen and the package already imported; a plan whose route the
         # package cannot consent to is not a candidate, so it is never built.
         consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
+        prepared_ineligible = ""
+        if use is not None:
+            assert registration is not None
+            if self.world != 1 or len(registration.surface.slots) != 1:
+                prepared_ineligible = (
+                    "multi-rank or multi-slot preparation remains on its existing route"
+                )
+            elif binding.adapters or any(
+                model_config.ADAPTERS in held.assets
+                for checkpoint in checkpoints.values() for held in checkpoint.ck.components.values()
+            ):
+                prepared_ineligible = (
+                    "adapter preparation has no fixed complete-footprint allowance"
+                )
+        prepared_memory = host.memory
         try:
             plan = resolve(
                 variant=reference,
@@ -2506,6 +2555,15 @@ class Executor:
                 placement=binding.placement or "all_resident",
                 encoded_leaves=consent,
                 dtype_name=dtype_name,
+                prepared_use=use,
+                prepared_free_bytes=(
+                    prepared_memory.room().free
+                    if use is not None and prepared_memory is not None else 0
+                ),
+                prepared_granularity=(
+                    prepared_memory.granularity if prepared_memory is not None else 0
+                ),
+                prepared_ineligible=prepared_ineligible,
             )
         except PlanRefusal as exc:
             return {
@@ -2662,8 +2720,9 @@ class Executor:
             return {"ok": False, "code": exc.code, "detail": str(exc)[:900]}
         self.backend = backend
         self.registry = registry
-        # ONE generation under EVERY parameter name the placement's bindings spell (h3a-018).
-        self.models = {name: model for name in binding.parameter_names()}
+        # Keep aliases accepted while an on-demand member was still a proxy (h3a-018).
+        aliases = dict.fromkeys((*binding.parameter_names(), *self.models))
+        self.models = dict.fromkeys(aliases, model)
         # THE COMPONENT-USE CONTRACT'S RUNTIME BODY: from here on a declared scope is a
         # shared `use` of its components, and each block binds its weights while it runs.
         self.residency = Placement(host.memory, backend)
@@ -2816,6 +2875,7 @@ class Executor:
             "delivery": plan.wire_document(),
             "attention": applied.document() if applied is not None else None,
         }
+        self._prepared_use = use
         return {
             "ok": True,
             "ready": True,
@@ -2841,11 +2901,12 @@ class Executor:
         rows = tuple(sorted(rows, key=lambda row: row.binding.model_binding_path))
         paths = [row.binding.model_binding_path for row in rows]
         parameters = [row.binding.model_parameter_name for row in rows]
+        aliases = [name for row in rows for name in row.binding.parameter_names()]
         if (
             not all(paths)
             or len(paths) != len(set(paths))
             or not all(parameters)
-            or len(parameters) != len(set(parameters))
+            or len(aliases) != len(set(aliases))
         ):
             return {
                 "ok": False,
@@ -2853,6 +2914,15 @@ class Executor:
                 "detail": "model paths and parameters must be named and unique",
             }
 
+        try:
+            uses = tuple(
+                None if row.binding.prepared_use is None else prepared_use(
+                    msgspec.to_builtins(row.binding.prepared_use)
+                )
+                for row in rows
+            )
+        except InvalidRequest as exc:
+            return self._refusal(exc.code, str(exc))
         children: list[tuple[str, Executor, dict[str, Any]]] = []
         for row in rows:
             binding = row.binding
@@ -3015,6 +3085,10 @@ class Executor:
             "delivery": delivery,
             "models": {parameter: facts for parameter, facts in facts_rows},
         }
+        # Deferred members are accepted bindings even before their first materialization.
+        for (_, member, reply), use in zip(children, uses, strict=True):
+            if not reply:
+                member._prepared_use = use
         self.ready = True
         return {
             "ok": True,
@@ -3121,7 +3195,11 @@ class Executor:
         """A request cancelled before its invoke (waiting for admission): what its prepare
         retained goes, so the executor returns to the pool holding nothing of it."""
         for construction in (self, *self.constructions.values()):
-            construction.prepared.pop(request_id, None)
+            with construction._prepared_lock:
+                construction.prepared.pop(request_id, None)
+        if self.host.memory is not None:
+            # Never hold the prepared-record lock while touching a native read owner.
+            self.host.memory.cancel_queued(request_id)
 
     def serve_request(self, command: PrepareRequest) -> dict[str, Any]:
         target = self._target(command, attempt=False)
@@ -3138,12 +3216,13 @@ class Executor:
         with self.in_flight.attempt(alone, command.request_id) as slot, request_path.serving():
             # Admitted only now: an attempt before it may have poisoned the generation. Its
             # record is taken once nothing can refuse it, so a refused call may come again.
-            refused = target._unadmitted(command) or self._grant(target, command, first=slot.first)
+            refused = target._unadmitted(command) or self._grant(target, first=slot.first)
             if not alone:
                 self.in_flight.ready()
             if refused is not None:
                 return refused
-            prepared = target.prepared.pop(command.request_id, None)
+            with target._prepared_lock:
+                prepared = target.prepared.pop(command.request_id, None)
             if prepared is None:  # trimmed by a prepare meanwhile
                 return target._unadmitted(command) or {}
             reply = target.invoke(command, prepared, slot)
@@ -3152,7 +3231,7 @@ class Executor:
         reply["poisoned"] = self.poisoned
         return reply
 
-    def _grant(self, target: Executor, command: Invoke, *, first: bool) -> Frame | None:
+    def _grant(self, target: Executor, *, first: bool) -> Frame | None:
         """The kernels that became ready, installed while no call is in a scope (a group none
         of whose GPUs may serve otherwise refuses); the first attempt in also opens the
         residency's attempt."""
@@ -3180,6 +3259,15 @@ class Executor:
         executor exactly as it found it — it is a PRE-ENTRY refusal in the strongest sense,
         arriving before the attempt is even accepted.
         """
+        canceled = {
+            "ok": False,
+            "code": "cancelled",
+            "terminal": "canceled",
+            "origin": "request",
+            "detail": "request preparation was canceled before entry",
+        }
+        if self.host.mux.cancelled(command.request_id):
+            return canceled
         if not self.ready:
             return {
                 "ok": False,
@@ -3221,6 +3309,7 @@ class Executor:
             finally:
                 kernel_compile.held.reset(held)
         try:
+            self._check_prepared_use(registration, command.payload)
             prepared = prepare(registration, command.payload, input_metadata=command.input_metadata)
         except Exception as exc:
             outcome = classify(exc)
@@ -3232,11 +3321,25 @@ class Executor:
                 "origin": outcome.origin,
                 "fields": list(outcome.fields),
             }
-        self.prepared[command.request_id] = replace(prepared, stages=waits.stages)
-        # A prepared request the worker never dispatched (a refusal after the plan, a
-        # cancel while it queued) would otherwise be retained for the generation's life.
-        for stale in list(self.prepared)[: -PREPARED_HELD or None]:
-            self.prepared.pop(stale, None)
+        with self._prepared_lock:
+            # Mux records the cancel before calling _discard under this same lock. A
+            # cancel before this check refuses publication; one after it removes the row.
+            if self.host.mux.cancelled(command.request_id):
+                return canceled
+            if not self.ready or self.poisoned:
+                return {
+                    "ok": False,
+                    "code": "poisoned_generation" if self.poisoned else "executor_not_ready",
+                    "detail": self.poisoned or "executor stopped during request preparation",
+                }
+            self.prepared[command.request_id] = replace(
+                prepared,
+                stages=waits.stages,
+                prefetch_key=(command.attention_kernel, command.bits),
+            )
+            # A prepared request never dispatched must not survive for the generation.
+            for stale in list(self.prepared)[: -PREPARED_HELD or None]:
+                self.prepared.pop(stale, None)
         return {
             "ok": True,
             "features": dict(prepared.features.values),
@@ -3261,7 +3364,9 @@ class Executor:
                 "code": "unknown_entrypoint",
                 "detail": f"{command.entrypoint!r} is not an entrypoint of this release",
             }
-        if command.request_id not in self.prepared:
+        with self._prepared_lock:
+            missing = command.request_id not in self.prepared
+        if missing:
             return {
                 "ok": False,
                 "code": "prepared_request_absent",
@@ -3392,7 +3497,7 @@ class Executor:
             with (
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
-                self._request(command.request_id) as own_memory,
+                self._request(command.request_id, prepared) as own_memory,
                 self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
@@ -3404,6 +3509,8 @@ class Executor:
                 attention_ulysses.observing() as served_impls,
             ):
                 served_attention = self._attention_selection(served_attention)
+                if prepared.phases:
+                    self._plan_request(command.request_id, prepared.phases)
                 envelope, outcome, record = run_prepared(
                     prepared,
                     Invocation(
@@ -3554,10 +3661,11 @@ class Executor:
             self.residency.release()  # the last step's holds
         d2h_ms = (time.perf_counter() - d2h_started) * 1000
         released_us = execution_evidence.now_us()
-        # On CUDA the request's own arena high-water (varena's); MPS keeps no mark: its figures now.
-        arena = own_memory[0].torch_peak if own_memory else 0
+        # Stock Torch's peak is absolute and process-wide. Overlapping attempts share it;
+        # never add the request-start allocation again or present it as exclusive ownership.
+        arena = (own_memory[0].torch_peak or 0) if own_memory else 0
         live = accel.allocated(torch, self.device_kind, own) if torch is not None else 0
-        peak_vram = allocated_at_start + arena if self.device_kind == "cuda" else live
+        peak_vram = max(arena, live) if self.device_kind == "cuda" else live
         peak_reserved = accel.reserved(torch, self.device_kind, own) if torch is not None else 0
         residency_document = self.residency.document() if self.residency else {}
         working_peak = max(peak_vram - allocated_at_start, 0)
@@ -4151,7 +4259,7 @@ class Executor:
         if request is not None:
             request.plan(list(steps))
         if self.residency is not None:  # a step's components keep their holds (`using`)
-            self.residency.plan(steps)
+            self.residency.plan(steps, request=request)
         if self.group is not None and self.rank == 0:
             normalized = tuple(
                 (step,) if isinstance(step, str) else tuple(sorted(step)) for step in steps
@@ -4487,11 +4595,59 @@ class Executor:
         placed = self._rank_device(self.torch)
         return Device(placed.type, placed.index)
 
+    def _queued_prefetch(self, current: str, active: PreparedRequest) -> QueuedPrefetch | None:
+        """Snapshot one exact same-construction preparation; no device work under its lock."""
+        from cozy_runtime.internal.residency import QueuedPrefetch
+
+        if self.world != 1 or self.host.in_flight.count != 1 or self.residency is None:
+            return None
+        placements = (
+            tuple(self.residency.rows.values())
+            if isinstance(self.residency, _CompositeResidency)
+            else (self.residency,)
+        )
+        if len(placements) != 1:
+            return None  # Component names must identify one actual model slot.
+        with self._prepared_lock:
+            pending = [
+                (request_id, prepared)
+                for request_id, prepared in self.prepared.items()
+                if request_id != current and not self.host.mux.cancelled(request_id)
+            ]
+            if len(pending) != 1:
+                return None
+            request_id, prepared = pending[0]
+            if (
+                not prepared.phases
+                or prepared.lora != active.lora
+                or prepared.prefetch_key != active.prefetch_key
+            ):
+                return None
+            models = placements[0].models
+            names = prepared.phases[0]
+            if any(name not in models for name in names):
+                return None
+            targets = tuple(models[name] for name in names)
+
+        def valid() -> bool:
+            with self._prepared_lock:
+                return (
+                    self.prepared.get(request_id) is prepared
+                    and not self.host.mux.cancelled(request_id)
+                    and not self.host.mux.cancelled(current)
+                    and self.host.in_flight.count == 1
+                    and self.ready
+                    and not self.poisoned
+                )
+
+        return QueuedPrefetch(request_id, targets, valid)
+
     @contextlib.contextmanager
-    def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:
-        """The attempt as varena's request (varena-slim §3), its ops under the execution
-        layer's catch and its plan `ctx.plan`'s: everything it allocated is freed at its end,
-        failed or not, and its record (this GPU's) lands in the list."""
+    def _request(
+        self, request_id: str, prepared: PreparedRequest | None = None
+    ) -> Iterator[list[GpuMemory]]:
+        """The request's residency scopes and pure cuts. Tensor ownership determines lifetime;
+        its recorded allocator figures are process-wide, not exact per-request allocations."""
         host, rows = self.host, list[GpuMemory]()
         if host.memory is None or host.execution is None:
             yield rows
@@ -4499,15 +4655,17 @@ class Executor:
         request: MemoryRequest | None = None
         cuda = host.memory.cuda
         device = host.memory.device.index if cuda else None
-        peak = 0
+        peak: int | None = None
         try:
             with host.memory.request(request_id) as request, host.execution.serving(request):
                 host.requests[request_id] = request
+                if prepared is not None:
+                    request.queued = functools.partial(self._queued_prefetch, request_id, prepared)
                 try:
                     yield rows
                 finally:
                     del host.requests[request_id]
-                    peak = accel.arena_peak(host.memory, request_id)  # read while it is open
+                    peak = accel.allocator_peak(host.memory, request_id)  # read while open
                     host.cuts[request_id] = msgspec.to_builtins(host.execution.cut_rows(request))
         finally:
             if request is not None:
@@ -4519,6 +4677,134 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
+    def _check_prepared_use(self, registration: Registration, payload: object) -> None:
+        """Check current callable slots against the actual member, not historical aliases."""
+        declarations = registration.model_prepared_use
+        slots = {slot.parameter for slot in registration.surface.slots if not slot.weights}
+        checked: set[str] = set()
+        for member in self.model_executors or [self]:
+            names = slots.intersection(member.models)
+            if not names:
+                continue
+            declared = names.intersection(declarations)
+            use = member._prepared_use
+            if declared != (names if use is not None else set()):
+                raise InvalidRequest(
+                    "prepared-use declaration differs from the loaded construction",
+                    code="prepared_use_binding",
+                )
+            for name in declared:
+                field = declarations[name]
+                if not isinstance(payload, Mapping) or field not in payload:
+                    raise InvalidRequest(
+                        "prepared-use field is absent", code="prepared_use_invalid"
+                    )
+                if prepared_use(payload[field]) != use:
+                    raise InvalidRequest(
+                        "changed prepared use needs a new construction",
+                        code="prepared_use_binding",
+                    )
+            checked.update(declared)
+        if checked != set(declarations):
+            raise InvalidRequest("a prepared model slot is absent", code="prepared_use_binding")
+
+    def _prepare_program(self, command: Map) -> dict[str, Any]:
+        """A GPU warm command, alone under the existing process order and GPU permit.
+
+        Normal preflight and the declared factory run on the actual loaded models. This
+        neither enters the generation handler nor grants output or inference submission.
+        The returned readiness is a point-in-time fact, not a residency reservation.
+        """
+        record: AuthorAttempt | None = None
+        entered = False
+        reply: dict[str, Any]
+        try:
+            if command.level != "gpu" or not command.request_id:
+                raise InvalidRequest("program warming needs a GPU request", code="prepare_request")
+            if self.world != 1 or self.device_kind != "cuda":
+                raise CapabilityError(
+                    "program warming requires one CUDA device", code="prepare_device"
+                )
+            if not self.ready or self.poisoned:
+                raise CapabilityError("construction is not ready", code="executor_not_ready")
+            if command.entrypoint not in self.surface_names:
+                raise InvalidRequest("unknown warm entrypoint", code="unknown_entrypoint")
+            if not isinstance(command.payload, Mapping):
+                raise InvalidRequest(
+                    "warm payload must be a request object", code="prepare_payload"
+                )
+            registration = self.discovered.app.get(command.entrypoint)
+            if registration.prepare is None:
+                raise CapabilityError(
+                    "entrypoint declares no preparation factory", code="prepare_absent"
+                )
+            self._check_prepared_use(registration, command.payload)
+            prepared = prepare(registration, command.payload)
+            if prepared.asset_bounds:
+                raise CapabilityError(
+                    "program warming takes no input assets", code="prepare_assets"
+                )
+            if self.host.mux.cancelled(command.request_id):
+                raise InvalidRequest("warm preparation was canceled", code="cancelled")
+            entered = True
+            refused = self._grant(self, first=True)
+            if refused is not None:
+                reply = refused
+            else:
+                with self._request(command.request_id):
+                    if prepared.phases:
+                        self._plan_request(command.request_id, prepared.phases)
+                    ready, record = prepare_program(
+                        registration,
+                        prepared,
+                        Invocation(
+                            request_id=command.request_id,
+                            spool=self.root / "preparation",
+                            deadline=float("inf"),
+                            device=self._device(),
+                            cancel=functools.partial(self.host.mux.cancelled, command.request_id),
+                            models=self.models,
+                            progress=self._progress_sink(command.request_id),
+                            plan=functools.partial(self._plan_request, command.request_id),
+                        ),
+                    )
+                reply = {"ok": True, "prepared": ready, **prepared.digests()}
+        except Exception as exc:
+            outcome = classify(exc)
+            unwind(exc)
+            reply = {
+                "ok": False,
+                "code": outcome.code,
+                "detail": ends(outcome.message, 1024),
+                "terminal": outcome.terminal,
+                "origin": outcome.origin,
+                "traceback": outcome.traceback,
+            }
+            if outcome.code == DEVICE_FAULT:
+                self.poisoned = (
+                    self.poisoned or f"preparation device fault: {outcome.message}"[:300]
+                )
+        finally:
+            self.host.cuts.pop(command.request_id, None)
+        quiet = not entered
+        if entered:
+            try:
+                # Capture warmups and fills may use side streams. The whole device joins
+                # before the permit can be reused, including clean eligibility refusals.
+                accel.synchronize(self.torch, self.device_kind)
+                if self.residency is not None:
+                    self.residency.release()
+                quiet = self._quiescent()
+            except Exception as exc:
+                self.poisoned = self.poisoned or f"preparation did not settle: {exc}"[:300]
+            if not quiet:
+                self.poisoned = self.poisoned or "preparation completion was not proven"
+        self.host.poisoned = self.host.poisoned or self.poisoned
+        if record is not None:
+            reply["observations"] = record.ring.rows()
+            reply["adjustments"] = [adjustment_row(row) for row in record.rows]
+        return {**reply, "quiescent": quiet, "poisoned": self.poisoned}
+
     def map(self, command: Map) -> dict[str, Any]:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
         of a group."""
@@ -4529,15 +4815,29 @@ class Executor:
             return self._refusal(
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
+        if command.payload is not None:
+            return child._prepare_program(command)
         group = self.group if self.rank == 0 else None
         try:
             if group is not None:
                 group.broadcast(executor_commands.encode(command))
             if self.memory is not None:
+                if command.level == "ram":
+                    # Map is ordered after every preceding invocation. Join its remaining
+                    # consumer streams before retiring owners and returning allocator storage.
+                    accel.synchronize(self.torch, self.device_kind)
                 for member in child.model_executors or [child]:
                     if member.backend is not None:
+                        if command.level == "ram" and member.residency is not None:
+                            member.residency.release()
                         for model in member.backend.models.values():
+                            if command.level == "ram":
+                                for _, release in graphs.DECODERS:
+                                    release(model.module)
+                                graphs.retire(self.torch, model.module)
                             self.memory.load(model.module, command.level)
+                if command.level == "ram":
+                    self.memory.trim()
             for reply in group.collect("map") if group is not None else ():
                 if not reply.get("ok"):
                     raise GroupRefusal(
@@ -4553,7 +4853,8 @@ class Executor:
         child = self.constructions.get(self.active)
         if child is None or child.residency is None:
             return {}
-        return child.residency.document()
+        document: dict[str, Any] = child.residency.document()
+        return document
 
     def process_incarnations(self) -> list[dict[str, Any]]:
         """The actual rank births, including a follower that vanished before this probe."""
@@ -5028,7 +5329,9 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
     not take, ends the process, as either did when commands ran on the main thread; so does a
     `shutdown` that waited here for the calls before it, once answered."""
     try:
-        call = str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS else ""
+        call = (
+            str(frame.get("request_id", "")) if frame.get("cmd") in _CALL_COMMANDS | {"map"} else ""
+        )
         _CALL.set(call)  # its wait for its turn is told as its own
         with turn:
             reply = _reply(executor, frame)
@@ -5037,7 +5340,7 @@ def _serve(executor: Executor, frame: Frame, turn: contextlib.AbstractContextMan
                 sys.stdout.flush()
                 sys.stderr.flush()
                 os._exit(code)
-            if frame.get("cmd") == "invoke":
+            if frame.get("cmd") in {"invoke", "map"} and call:
                 executor.mux.forget(call)
             _send_reply(executor.channel, {**reply, "request_id": call} if call else reply)
     except BaseException as exc:
