@@ -455,11 +455,17 @@ pub(super) fn export(
         .into_any()
         .unbind();
     // If completion becomes unproven and the core is retained, retain its code module too.
-    owner
-        .owners
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?
-        .push(module.clone_ref(py));
+    {
+        let mut held = owner
+            .owners
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?;
+        // Reused sequence definitions arm once per request. Keep one permanent code
+        // owner, not another module reference for every successful submission.
+        if !held.iter().any(|value| value.as_ptr() == module.as_ptr()) {
+            held.push(module.clone_ref(py));
+        }
+    }
     let epoch = py
         .detach(|| {
             let mut core = owner.state.lock().map_err(|_| 999)?;
