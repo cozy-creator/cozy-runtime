@@ -3,6 +3,7 @@ class NativeExecutionError(RuntimeError):
 
 class ResidentRepeat:
     supports_phases: bool
+    supports_event_input: bool
     def __init__(
         self,
         source_graph: int,

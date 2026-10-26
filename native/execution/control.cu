@@ -1,5 +1,6 @@
 // Original CUDA graph control, built ahead of time. No Python or host nodes in a loop body.
 #include <cuda_runtime.h>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <new>
@@ -21,8 +22,11 @@ template<class Body> static int on_device(int device, Body body) {
     return result == cudaSuccess ? restored : result;
 }
 
-struct Control { unsigned completed; unsigned cancel; unsigned suffix_completed; };
-struct Snapshot { unsigned completed; unsigned cancel; unsigned suffix_completed; };
+struct Control {
+    unsigned completed, cancel, suffix_completed, body_entered, input_invalid;
+    unsigned long long input_error;
+};
+struct Snapshot { unsigned completed, cancel, suffix_completed, body_entered, input_invalid; };
 struct Repeat {
     int device = 0;
     unsigned steps = 0;
@@ -40,6 +44,7 @@ struct Repeat {
     cudaEvent_t producer_ready = nullptr;
     cudaEvent_t initialized = nullptr;
     cudaEvent_t sampled = nullptr;
+    std::array<cudaEvent_t, 4> input_ready{};
     Control *control = nullptr;
     Snapshot *device_snapshot = nullptr;
     Snapshot *host_snapshot = nullptr;
@@ -47,7 +52,22 @@ struct Repeat {
     Snapshot observed{};
     bool launched = false;
     bool pending_sample = false;
+    bool input_checked = false;
 };
+
+__global__ void set_input(Control *state, unsigned long long error) { state->input_error = error; }
+
+__global__ void select_input(Control *state, cudaGraphConditionalHandle condition) {
+    const auto error = reinterpret_cast<const int *>(state->input_error);
+    const unsigned invalid = error && *error != 0;
+    atomicExch(&state->input_invalid, invalid);
+    cudaGraphSetConditional(condition, !invalid && !atomicAdd(&state->cancel, 0u));
+}
+
+__global__ void begin_body(Control *state, int64_t *index) {
+    *index = 0;
+    atomicExch(&state->body_entered, 1u);
+}
 
 __global__ void advance(Control *state, int64_t *index, unsigned steps,
                         cudaGraphConditionalHandle condition) {
@@ -74,6 +94,8 @@ __global__ void snapshot(Control *state, Snapshot *out) {
     out->completed = atomicAdd(&state->completed, 0u);
     out->cancel = atomicAdd(&state->cancel, 0u);
     out->suffix_completed = atomicAdd(&state->suffix_completed, 0u);
+    out->body_entered = atomicAdd(&state->body_entered, 0u);
+    out->input_invalid = atomicAdd(&state->input_invalid, 0u);
 }
 
 // Preserve only the first refusal, without pointers or another lifetime/ownership mechanism.
@@ -173,6 +195,10 @@ static cudaError_t cleanup(Repeat *run) {
     run->initialized = nullptr;
     if (run->sampled && (error = cudaEventDestroy(run->sampled)) != cudaSuccess) return error;
     run->sampled = nullptr;
+    for (auto &event : run->input_ready) {
+        if (event && (error = cudaEventDestroy(event)) != cudaSuccess) return error;
+        event = nullptr;
+    }
     if (run->work && (error = cudaStreamDestroy(run->work)) != cudaSuccess) return error;
     run->work = nullptr;
     if (run->control_stream && (error = cudaStreamDestroy(run->control_stream)) != cudaSuccess) return error;
@@ -213,17 +239,44 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(cudaEventCreateWithFlags(&run->producer_ready, cudaEventDisableTiming));
     CHECK(cudaEventCreateWithFlags(&run->initialized, cudaEventDisableTiming));
     CHECK(cudaEventCreateWithFlags(&run->sampled, cudaEventDisableTiming));
+    for (auto &event : run->input_ready)
+        CHECK(cudaEventCreateWithFlags(&event, cudaEventDisableTiming));
     // A first control-kernel launch must never trigger lazy loading while the repeat runs.
     cudaFuncAttributes attributes;
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(advance)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(cancel_repeat)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(snapshot)));
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(set_input)));
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_input)));
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(begin_body)));
     if (prefix || suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_phase)));
     if (suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(finish_suffix)));
     CHECK(cudaMalloc(&run->control, sizeof(Control)));
     CHECK(cudaMalloc(&run->device_snapshot, sizeof(Snapshot)));
     CHECK(cudaMallocHost(&run->host_snapshot, sizeof(Snapshot)));
     CHECK(cudaGraphCreate(&run->graph, 0));
+    cudaGraphConditionalHandle accepted;
+    CHECK(cudaGraphConditionalHandleCreate(&accepted, run->graph, 0, cudaGraphCondAssignDefault));
+    void *input_args[] = {&run->control, &accepted};
+    cudaKernelNodeParams input_gate{};
+    input_gate.func = reinterpret_cast<void *>(select_input);
+    input_gate.gridDim = dim3(1); input_gate.blockDim = dim3(1); input_gate.kernelParams = input_args;
+    cudaGraphNode_t input_node;
+    CHECK(cudaGraphAddKernelNode(&input_node, run->graph, nullptr, 0, &input_gate));
+    cudaGraphNodeParams input_if{};
+    input_if.type = cudaGraphNodeTypeConditional;
+    input_if.conditional.handle = accepted;
+    input_if.conditional.type = cudaGraphCondTypeIf;
+    input_if.conditional.size = 1;
+    cudaGraphNode_t accepted_node;
+    CHECK(cudaGraphAddNode(&accepted_node, run->graph, &input_node, nullptr, 1, &input_if));
+    auto program = input_if.conditional.phGraph_out[0];
+    void *begin_args[] = {&run->control, &run->index};
+    cudaKernelNodeParams begin{};
+    begin.func = reinterpret_cast<void *>(begin_body);
+    begin.gridDim = dim3(1); begin.blockDim = dim3(1); begin.kernelParams = begin_args;
+    cudaGraphNode_t predecessor;
+    CHECK(cudaGraphAddKernelNode(&predecessor, program, nullptr, 0, &begin));
     cudaGraphConditionalHandle condition;
     CHECK(cudaGraphConditionalHandleCreate(&condition, run->graph, 1, cudaGraphCondAssignDefault));
     cudaGraphNodeParams conditional{};
@@ -231,10 +284,9 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     conditional.conditional.handle = condition;
     conditional.conditional.type = cudaGraphCondTypeWhile;
     conditional.conditional.size = 1;
-    cudaGraphNode_t predecessor = nullptr;
     if (prefix) {
         cudaGraphNode_t compute;
-        CHECK(cudaGraphAddChildGraphNode(&compute, run->graph, nullptr, 0, reinterpret_cast<cudaGraph_t>(prefix)));
+        CHECK(cudaGraphAddChildGraphNode(&compute, program, &predecessor, 1, reinterpret_cast<cudaGraph_t>(prefix)));
         cudaGraph_t cloned;
         CHECK(cudaGraphChildGraphNodeGetGraph(compute, &cloned));
         CHECK(inspect(cloned, run->validated_nodes, device, run, "assembled_prefix"));
@@ -243,11 +295,10 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
         cudaKernelNodeParams gate{};
         gate.func = reinterpret_cast<void *>(select_phase);
         gate.gridDim = dim3(1); gate.blockDim = dim3(1); gate.kernelParams = args;
-        CHECK(cudaGraphAddKernelNode(&predecessor, run->graph, &compute, 1, &gate));
+        CHECK(cudaGraphAddKernelNode(&predecessor, program, &compute, 1, &gate));
     }
     cudaGraphNode_t loop;
-    CHECK(cudaGraphAddNode(&loop, run->graph, predecessor ? &predecessor : nullptr, nullptr,
-                          predecessor ? 1 : 0, &conditional));
+    CHECK(cudaGraphAddNode(&loop, program, &predecessor, nullptr, 1, &conditional));
     auto body = conditional.conditional.phGraph_out[0];
     cudaGraphNode_t compute;
     CHECK(cudaGraphAddChildGraphNode(&compute, body, nullptr, 0, reinterpret_cast<cudaGraph_t>(source)));
@@ -268,14 +319,14 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
         gate.func = reinterpret_cast<void *>(select_phase);
         gate.gridDim = dim3(1); gate.blockDim = dim3(1); gate.kernelParams = args;
         cudaGraphNode_t decide;
-        CHECK(cudaGraphAddKernelNode(&decide, run->graph, &loop, 1, &gate));
+        CHECK(cudaGraphAddKernelNode(&decide, program, &loop, 1, &gate));
         cudaGraphNodeParams conditional{};
         conditional.type = cudaGraphNodeTypeConditional;
         conditional.conditional.handle = finish;
         conditional.conditional.type = cudaGraphCondTypeIf;
         conditional.conditional.size = 1;
         cudaGraphNode_t tail;
-        CHECK(cudaGraphAddNode(&tail, run->graph, &decide, nullptr, 1, &conditional));
+        CHECK(cudaGraphAddNode(&tail, program, &decide, nullptr, 1, &conditional));
         auto final = conditional.conditional.phGraph_out[0];
         cudaGraphNode_t compute, complete;
         CHECK(cudaGraphAddChildGraphNode(&compute, final, nullptr, 0, reinterpret_cast<cudaGraph_t>(suffix)));
@@ -310,22 +361,39 @@ static int arm(Repeat *run, uintptr_t producer) {
         error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
     }
     // Record on the caller's OS thread: a per-thread default stream cannot be moved to a worker.
+    run->input_checked = false;
     return cudaEventRecord(run->producer_ready, reinterpret_cast<cudaStream_t>(producer));
 }
 
-static int launch_armed(Repeat *run) {
+static int launch_armed(Repeat *run, const uintptr_t *streams = nullptr,
+                        unsigned count = 0, unsigned long long input_error = 0) {
+    if (count > run->input_ready.size() || (count && !streams) || (input_error && !count))
+        return cudaErrorInvalidValue;
+    for (unsigned i = 0; i < count; ++i) {
+        if (!streams[i] || streams[i] == reinterpret_cast<uintptr_t>(cudaStreamLegacy)
+            || streams[i] == reinterpret_cast<uintptr_t>(cudaStreamPerThread)) return cudaErrorInvalidValue;
+        auto error = cudaEventRecord(run->input_ready[i], reinterpret_cast<cudaStream_t>(streams[i]));
+        if (error != cudaSuccess) return error;
+    }
     // The caller-ready event was already recorded before the native read worker was started.
     cudaError_t error = cudaStreamWaitEvent(run->work, run->producer_ready, 0);
     if (error != cudaSuccess) return error;
     error = cudaMemsetAsync(run->control, 0, sizeof(Control), run->work);
     if (error != cudaSuccess) return error;
-    error = cudaMemsetAsync(run->index, 0, sizeof(int64_t), run->work);
-    if (error != cudaSuccess) return error;
+    if (input_error) {
+        set_input<<<1, 1, 0, run->work>>>(run->control, input_error);
+        error = cudaGetLastError();
+        if (error != cudaSuccess) return error;
+    }
     error = cudaEventRecord(run->initialized, run->work);
     if (error != cudaSuccess) return error;
     error = cudaStreamWaitEvent(run->control_stream, run->initialized, 0);
     if (error != cudaSuccess) return error;
-    run->observed = {}; run->pending_sample = false;
+    for (unsigned i = 0; i < count; ++i) {
+        error = cudaStreamWaitEvent(run->work, run->input_ready[i], 0);
+        if (error != cudaSuccess) return error;
+    }
+    run->observed = {}; run->pending_sample = false; run->input_checked = false;
     run->launched = true;
     error = cudaGraphLaunch(run->executable, run->work);
     if (error != cudaSuccess) return error;
@@ -389,6 +457,9 @@ static int wait(Repeat *run, unsigned *completed, unsigned *canceled) {
     Control state;
     error = cudaMemcpy(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost);
     if (error != cudaSuccess) return error;
+    run->observed = {state.completed, state.cancel, state.suffix_completed,
+                     state.body_entered, state.input_invalid};
+    run->input_checked = true;
     *completed = state.completed;
     *canceled = state.cancel && (state.completed < run->steps
                  || (run->has_suffix && !state.suffix_completed));
@@ -420,6 +491,16 @@ extern "C" int cozy_repeat_arm(Repeat *run, uintptr_t producer) {
 }
 extern "C" int cozy_repeat_launch_armed(Repeat *run) {
     return on_device(run->device, [&] { return launch_armed(run); });
+}
+extern "C" int cozy_repeat_launch_after(Repeat *run, const uintptr_t *streams,
+                                        unsigned count, unsigned long long input_error) {
+    return on_device(run->device, [&] { return launch_armed(run, streams, count, input_error); });
+}
+// Host-only facts: zero is not a checked negative observation until input_checked is true.
+extern "C" void cozy_repeat_input_status(Repeat *run, unsigned *entered, unsigned *invalid, int *checked) {
+    *entered = run->observed.body_entered;
+    *invalid = run->observed.input_invalid;
+    *checked = run->input_checked;
 }
 extern "C" int cozy_repeat_ready(Repeat *run, int *done) {
     return on_device(run->device, [&] { return ready(run, done); });

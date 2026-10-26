@@ -23,6 +23,18 @@ unsafe extern "C" {
     fn cozy_repeat_launch(run: *mut c_void, producer: usize) -> i32;
     fn cozy_repeat_arm(run: *mut c_void, producer: usize) -> i32;
     fn cozy_repeat_launch_armed(run: *mut c_void) -> i32;
+    fn cozy_repeat_launch_after(
+        run: *mut c_void,
+        streams: *const usize,
+        count: u32,
+        error: u64,
+    ) -> i32;
+    fn cozy_repeat_input_status(
+        run: *mut c_void,
+        entered: *mut u32,
+        invalid: *mut u32,
+        checked: *mut i32,
+    );
     fn cozy_repeat_ready(run: *mut c_void, done: *mut i32) -> i32;
     fn cozy_repeat_poll(
         run: *mut c_void,
@@ -200,6 +212,11 @@ impl ResidentRepeat {
         true
     }
 
+    #[classattr]
+    fn supports_event_input() -> bool {
+        true
+    }
+
     #[new]
     #[pyo3(signature = (source_graph, index, device, steps, owners, *, prefix_graph=0, suffix_graph=0))]
     fn new(
@@ -296,12 +313,24 @@ impl ResidentRepeat {
 
     fn facts<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         self.check_process()?;
-        let (launches, closed) = {
+        let (launches, closed, input) = {
             let state = self
                 .state
                 .lock()
                 .map_err(|_| PyRuntimeError::new_err("native owner poisoned"))?;
-            (state.launches, state.pointer == 0)
+            let mut input = (0, 0, 0);
+            if state.pointer != 0 {
+                // SAFETY: this is a host-only snapshot under the handle's lifetime lock.
+                unsafe {
+                    cozy_repeat_input_status(
+                        state.pointer as *mut c_void,
+                        &mut input.0,
+                        &mut input.1,
+                        &mut input.2,
+                    );
+                }
+            }
+            (state.launches, state.pointer == 0, input)
         };
         // These facts originate in the actual constructed native handle, never a protocol match.
         let result = PyDict::new(py);
@@ -317,6 +346,10 @@ impl ResidentRepeat {
         result.set_item("host_graph_launches", launches)?;
         result.set_item("control_kernels_preloaded", true)?;
         result.set_item("continuation_abi", 1)?;
+        result.set_item("event_input_supported", true)?;
+        result.set_item("body_entry_checked", input.2 != 0)?;
+        result.set_item("body_entered", (input.2 != 0).then_some(input.0 != 0))?;
+        result.set_item("input_invalid", (input.2 != 0).then_some(input.1 != 0))?;
         result.set_item("closed", closed)?;
         Ok(result)
     }

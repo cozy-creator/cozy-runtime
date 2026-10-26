@@ -399,7 +399,9 @@ def _replay_code(command: Invoke, request: str) -> str:
     return f"{command.operation}\0{hashlib.sha256(canonical.write(asked)).hexdigest()}"
 
 
-def _show_checkpoint(exchange: Exchange, slot: str, repo_id: str, revision: str) -> None:
+def _show_checkpoint(
+    exchange: Exchange, slot: str, repo_id: str, revision: str
+) -> None:
     """A weights output's checkpoint as the run's checkpoint item (`CheckpointItem`)."""
     item = CheckpointItem(output=slot, repo_id=repo_id, revision=revision)
     answer = exchange(item, Answer)

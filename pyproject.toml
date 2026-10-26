@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.33.0"
+version = "0.33.2"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -60,8 +60,6 @@ packages = ["src/cozy_runtime"]
 
 [tool.uv]
 package = true
-# TensorFS 0.16.0 before the gate promotes it to PyPI: its GitHub prerelease (CI v2 pre-release).
-find-links = ["https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/tensorfs-v0.16.0"]
 
 [tool.mypy]
 python_version = "3.12"

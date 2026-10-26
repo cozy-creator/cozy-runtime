@@ -9,6 +9,7 @@
 #define COZY_EXECUTION_CALLER_READY 2ull
 #define COZY_EXECUTION_RETAINED_OWNERS 4ull
 #define COZY_EXECUTION_REQUIRED_FLAGS 7ull
+#define COZY_EXECUTION_EVENT_INPUT 8ull
 
 /* Every function returns a value; no exception/unwind crosses this C ABI. */
 #define COZY_EXECUTION_OK 0u
@@ -42,6 +43,8 @@ typedef struct CozyExecutionProgressV1 {
 typedef CozyExecutionStatusV1 (*CozyExecutionOpV1)(void *context);
 typedef CozyExecutionStatusV1 (*CozyExecutionObserveV1)(
     void *context, CozyExecutionProgressV1 *out);
+typedef CozyExecutionStatusV1 (*CozyExecutionStartAfterV1)(
+    void *context, const uintptr_t *streams, uint32_t count, uint64_t error_device_ptr);
 
 typedef struct CozyExecutionContinuationV1 {
     uint32_t abi_version;
@@ -57,6 +60,8 @@ typedef struct CozyExecutionContinuationV1 {
     CozyExecutionObserveV1 poll;
     CozyExecutionOpV1 cancel;
     CozyExecutionObserveV1 wait;
+    /* Optional tail: require EVENT_INPUT and a struct_size covering this pointer. */
+    CozyExecutionStartAfterV1 start_after;
 } CozyExecutionContinuationV1;
 
 /* Import checks capsule name, ABI, full struct size, required flags, pid and device.
@@ -72,4 +77,12 @@ typedef struct CozyExecutionContinuationV1 {
    checked cleanup succeeds or process exit. No Rust types or Python callbacks are in this ABI.
    Caller-ready is recorded before export on the submitting OS thread. start uses an
    explicitly owned native CUDA stream; callers must wait for composed completion. */
+/* start_after copies 1..4 native producer stream handles during the call and records
+   owned events after all source work was enqueued. No PTDS/legacy stream handles.
+   The caller retains the destination, producer resources and optional i32 device
+   error word through checked composed completion. Zero means no decoder error word.
+   An encoded error may submit a graph but skips its complete authored body, including
+   index reset and prefix. Late device/ownership failures do NOT prove zero execution:
+   discard outputs, retain uncertain owners and retire. cancel before enqueue commitment
+   prevents submission; cancellation after commitment is cooperative execution cancel. */
 #endif
