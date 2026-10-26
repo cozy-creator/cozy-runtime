@@ -143,6 +143,62 @@ class PreparedRepeat:
             return self._invalid_reason() is None
 
     @classmethod
+    def capture_stage(
+        cls,
+        step: Callable[[Any], object],
+        *,
+        state: Sequence[Any],
+        owner: object,
+        load_ordering: Literal["checked", "events", "auto"] = "events",
+    ) -> PreparedRepeat:
+        """Record one immutable raw model block/phase at its existing managed addresses.
+
+        `owner` is a placed component root or a retained subset binding. The callback runs
+        only during preparation and writes explicit GPU boundary state. Use PreparedSequence
+        to advance these stages or repeat a block range without Python callbacks. A shared
+        GPU timestep belongs in declared state and advances in the authored sampler stage.
+
+        Source/fill/generation and parameter geometry remain checked on every submission;
+        model claims cover the entire native sequence. Capture-private weight views are
+        released after checked preparation, and native detachment refuses escaped aliases.
+        Encoded/decoded weights and undeclared/stateful module behavior are ineligible.
+        """
+        import torch
+
+        tensors = tuple(state)
+        if any(not isinstance(tensor, torch.Tensor) for tensor in tensors):
+            raise ValueError("model stage state must contain CUDA tensors")
+        original = tuple(tensor.detach() for tensor in tensors)
+        layouts = tuple(cls._layout(tensor) for tensor in tensors)
+
+        def record(index: Any) -> object:
+            try:
+                return step(index)
+            finally:
+                changed = [
+                    i for i, tensor in enumerate(tensors) if cls._layout(tensor) != layouts[i]
+                ]
+                for i in changed:
+                    # Restore metadata before capture cleanup copies saved values; never
+                    # write mutable-state restoration into an aliased immutable weight.
+                    tensors[i].data = original[i]
+                if changed:
+                    raise CapabilityError(
+                        "model stage changed boundary tensor metadata",
+                        code="prepared_graph_ineligible",
+                    )
+
+        return cls.capture(
+            record,
+            state=tensors,
+            steps=1,
+            owners=(owner,),
+            load_component=owner,
+            load_ordering=load_ordering,
+            _detach_stage=True,
+        )
+
+    @classmethod
     def capture(
         cls,
         step: Callable[[Any], object],
@@ -157,6 +213,7 @@ class PreparedRepeat:
         prefix: Callable[[], object] | None = None,
         suffix: Callable[[], object] | None = None,
         dtypes: Mapping[object, Any] | None = None,
+        _detach_stage: bool = False,
     ) -> PreparedRepeat:
         """Capture a fixed body, optionally fed by one native LoadSlot.
 
@@ -241,6 +298,8 @@ class PreparedRepeat:
                 "prepared mutable state must be allocated outside inference_mode",
                 code="prepared_graph_ineligible",
             )
+        if _detach_stage and (load_component is None or len(owners) != 1):
+            raise ValueError("a detached model stage requires exactly one named raw binding")
         if load_component is not None:
             if load is not None or resident_only or not any(load_component is o for o in owners):
                 raise ValueError(
@@ -366,7 +425,7 @@ class PreparedRepeat:
                             raise CapabilityError(why, code="prepared_graph_ineligible")
                         if owner is load_component:
                             try:
-                                load = binding.prepare_load()
+                                load = binding.prepare_load(stage=_detach_stage)
                             except ResidencyError as error:
                                 # StaleBinding and a concurrent-use/_claim refusal are both
                                 # pre-submission: fall back to an eager resident load.
@@ -378,6 +437,11 @@ class PreparedRepeat:
                                 # descriptor, or not-local inputs) map to a fallback code; OOM,
                                 # device faults and poisoning keep their fatal classification.
                                 _native_error(error)
+                            if _detach_stage and load is None:
+                                raise CapabilityError(
+                                    "this TensorFS cannot detach an already-resident model stage",
+                                    code="prepared_graph_ineligible",
+                                )
                             if load is not None:
                                 resolved.append(load)
                         if resident_only or (owner is load_component and load is None):
@@ -419,6 +483,7 @@ class PreparedRepeat:
                             owners=resolved,
                             prefix=prefix,
                             suffix=suffix,
+                            _release_loaded_inputs=_detach_stage,
                         )
                     finally:
                         changed = [
@@ -444,6 +509,18 @@ class PreparedRepeat:
                 except BaseException:
                     plan.close()
                     raise
+                if _detach_stage:
+                    try:
+                        # Parameter slots and capture streams are restored before dropping
+                        # any capture-only weight view. Native detachment checks real Pins.
+                        preparing.close()
+                        snapshots.clear()
+                        load = next(iter(bindings.values())).detach_stage()
+                    except BaseException as error:
+                        plan.close()
+                        if isinstance(error, Exception):
+                            _native_error(error)
+                        raise
                 plan._load = load
                 plan._load_ordering_requested = load_ordering
                 plan._load_ordering = selected_ordering
@@ -523,8 +600,14 @@ class PreparedRepeat:
                 code="prepared_graph_ineligible",
             )
         held.update((id(tensor), tensor) for tensor in immutable)
+        slots = [owner for owner in owners if isinstance(owner, varena.LoadSlot)]
+        detached_bindings = [owner for owner in owners if isinstance(owner, Binding)]
         if _release_loaded_inputs and (
-            not immutable or len(owners) != 1 or not isinstance(owners[0], varena.LoadSlot)
+            not immutable
+            or len(slots) != 1
+            or len(owners) != len(slots) + len(detached_bindings)
+            or len(detached_bindings) > 1
+            or any(binding._load_slot is not slots[0] for binding in detached_bindings)
         ):
             raise CapabilityError(
                 "detached stage capture requires one existing-region raw input slot",
@@ -1154,6 +1237,7 @@ class PreparedSequence:
 
     def submit(self, context: Context | None = None) -> Execution:
         import torch
+
         from cozy_runtime._kernels import _execution
 
         if not callable(getattr(_execution, "NativeSequence", None)):
