@@ -916,9 +916,10 @@ class PreparedRepeat:
                 self._native.close_owner()
             except Exception as error:
                 _native_error(error)
-            self._closed = True
             self._release_owned_bindings()
             self._load = None
+            # A closed definition certifies both graph retirement and binding cleanup.
+            self._closed = True
             if settled_error is not None:
                 _native_error(settled_error)
 
@@ -1463,7 +1464,13 @@ class PreparedSequence:
             self._closing = True
             try:
                 for stage in self.stages:
-                    stage.close()
+                    try:
+                        stage.close()
+                    except Exception as failure:
+                        if not stage._closed:
+                            raise  # Unknown drain/cleanup: preserve remaining actual owners.
+                        if error is None:
+                            error = failure
                 self._closed = True
             finally:
                 self._closing = False
