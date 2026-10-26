@@ -22,6 +22,7 @@ from typing import Any
 import msgspec
 
 from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+from cozy_runtime.author._model import LoRAServing
 from cozy_runtime.internal import execution_evidence
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.parallel.plan import GroupRefusal
@@ -70,6 +71,8 @@ class Scope(msgspec.Struct, frozen=True):
     model: str
     method: str
     components: tuple[str, ...]
+    #: Component -> the leader's attempt-fixed mode and bake implementation.
+    lora: dict[str, LoRAServing]
 
 
 class RunCommand(msgspec.Struct, frozen=True, tag_field="cmd", tag="run"):

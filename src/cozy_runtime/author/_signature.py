@@ -77,6 +77,54 @@ class PreflightSpec:
     argument_order: tuple[str, ...] = ()
 
 
+def preparation_params(fn: Callable[..., object], surface: Surface) -> tuple[Param, ...]:
+    """A GPU preparation callback receives only a checked subset of the real invocation."""
+    where = f"{fn.__module__}:{fn.__qualname__}"
+    if surface.invocable:
+        raise ConformanceError("prepare needs an App entrypoint", code="prepare_signature")
+    signature, hints = inspect.signature(fn), _hints(fn)
+    if inspect.iscoroutinefunction(fn) or hints.get("return") is not bool:
+        raise ConformanceError(
+            f"{where}: prepare must be synchronous and return bool", code="prepare_signature"
+        )
+    declared = {param.name: param for param in surface.params}
+    parameters: list[Param] = []
+    for parameter in signature.parameters.values():
+        if (
+            parameter.kind
+            not in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+            or parameter.default is not inspect.Parameter.empty
+        ):
+            raise ConformanceError(
+                f"{where}: prepare parameters are named injections", code="prepare_signature"
+            )
+        if parameter.name not in hints:
+            raise ConformanceError(
+                f"{where}: prepare parameters require types", code="prepare_signature"
+            )
+        param = _classify(parameter.name, hints[parameter.name], where)
+        if param != declared.get(parameter.name):
+            raise ConformanceError(
+                f"{where}: {parameter.name} differs from its entrypoint injection",
+                code="prepare_signature",
+            )
+        if param.role not in {"context", "payload", "preflight", "model"} and not (
+            param.role == "service" and param.capability in {"telemetry", "adjust"}
+        ):
+            raise ConformanceError(
+                f"{where}: prepare cannot request {parameter.name}", code="prepare_capability"
+            )
+        if param.name in surface.model_on_demand:
+            raise ConformanceError(
+                f"{where}: prepare requires already constructed models", code="prepare_capability"
+            )
+        parameters.append(param)
+    return tuple(parameters)
+
+
 _COLLECTION_MARKERS = (AssetLimits, *PREPARATIONS)
 
 
@@ -333,6 +381,7 @@ class Declaration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Model argument -> the components this callable runs; an absent argument runs all."""
+    model_prepared_use: Mapping[str, str] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
     """Model arguments built, and their weights fetched, on first use (`on_demand=`)."""
     parameters: tuple[str, ...] | None = None
@@ -511,6 +560,7 @@ def analyze(
     model_defaults: Mapping[str, str] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
+    model_prepared_use: Mapping[str, str] | None = None,
     model_classes: Mapping[str, type[Model[Any]]] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
@@ -696,6 +746,7 @@ def analyze(
         model_defaults=model_defaults or {},
         model_components=model_components or {},
         model_on_demand=model_on_demand,
+        model_prepared_use=model_prepared_use or {},
         parameters=tuple(callers) if invocable else None,
         parameter_defaults={
             name: signature.parameters[name].default

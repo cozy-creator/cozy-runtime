@@ -11,22 +11,18 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-import os
 import tempfile
 import threading
-import time
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from pathlib import Path
-from typing import IO, NamedTuple
+from typing import IO, TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
 import numpy as np
 
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput, _numeric
-from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
@@ -43,6 +39,9 @@ from .microscale import (
     encode_nvfp4,
     encode_w4a8,
 )
+
+if TYPE_CHECKING:
+    from tensorfs.api import NormalizeBf16Tensor
 
 
 class _Encoding(NamedTuple):
@@ -61,7 +60,7 @@ class _Encoding(NamedTuple):
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
     whole: frozenset[str] = frozenset()
     pack: int = 1
-    #: Encoded whole from a `svdq.Calibration` of the model's own activations (`svdq.fit`).
+    #: Native Writer fitting consumes a completed model Calibration checkpoint.
     calibrated: bool = False
 
     def tensor_scaled(self) -> bool:
@@ -155,7 +154,7 @@ def _uncalibrated(key: str) -> Encoded:
     )
 
 
-#: RNE fp32->bf16 keeps every element within amax * 2^-8 (8-bit significand, half-ulp).
+#: Public lane-declaration bound; BF16 conversion and validation remain native.
 BF16_ROUND_TRIP_BOUND = 2.0**-8
 _SOURCE_READ_CHUNK = 8 << 20
 _WIDTH = {"bf16": 2, "f16": 2, "f32": 4}
@@ -216,6 +215,8 @@ class ArtifactQuantizationPlan(msgspec.Struct, forbid_unknown_fields=True):
 
 class ArtifactQuantizationRequest(msgspec.Struct, forbid_unknown_fields=True):
     max_relative_frobenius: float | None = None
+    # Explicit initial native calibrated-fit allowance; callers can select a smaller grant.
+    fit_workspace_bytes: int = 512 << 20
 
 
 class QuantizationStats(msgspec.Struct):
@@ -225,6 +226,7 @@ class QuantizationStats(msgspec.Struct):
     new_bytes_written: int
     saturated_elements: int
     worst_relative_frobenius: float | None
+    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
 
 
 class Bf16Tensor(msgspec.Struct):
@@ -250,6 +252,22 @@ class Bf16Stats(msgspec.Struct):
     source_bytes_read: int
     new_bytes_written: int
     worst_relative_frobenius: float | None
+    #: Actual stored payload/scale bytes read by native normalization; legacy read stays logical.
+    stored_source_bytes_read: int = 0
+    required_buffer_bytes: int = 0
+
+
+class _Bf16Result(msgspec.Struct):
+    """Native normalization facts; selected-count compatibility is applied at the boundary."""
+
+    converted_keys: int
+    reused_keys: int
+    source_bytes_read: int
+    logical_source_bytes_read: int
+    new_bytes_written: int
+    required_buffer_bytes: int
+    worst_relative_frobenius: float | None
+    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
 
 
 def bf16_source_dtypes(sources: Sequence[str]) -> tuple[str, ...]:
@@ -327,57 +345,50 @@ def write_bf16(
     plan: Bf16Plan,
     excluded: set[tuple[str, str]] | None = None,
 ) -> Bf16Stats:
-    """Stream the selected float cut through one bounded RNE conversion, stats recorded: each
-    tensor's round trip is held to `BF16_ROUND_TRIP_BOUND` of its amax and logged."""
+    """Normalize the complete selected cut in TensorFS under one scoped native lifetime.
+
+    Reused keys remain in the declaration so Writer validates its normalization journal
+    before trusting them. Source decoding, BF16 RNE, tripwires and staging are native.
+    """
+    from .native_quantization import _run_native
+
     omitted = excluded or set()
-    selected = [t for t in plan.tensors if (t.component, t.key) not in omitted]
-    read = written = reused = 0
-    worst: float | None = 0.0
-    for done, tensor in enumerate(selected, 1):
-        ctx.raise_if_cancelled()
-        if output.has(tensor.component, tensor.key):
-            reused += 1
-            worst = None
-            tel.progress(done / len(selected), stage="bf16")
-            continue
-        amax = max_error = sse = energy = 0.0
-        with tempfile.TemporaryFile() as spill:
-            for values in _read_chunks(
-                source, tensor.component, tensor.key, tensor.source_dtype, tensor.shape
-            ):
-                raw = st.from_f32(values, "BF16")
-                error = np.abs(values - st.to_f32(raw, "BF16", list(values.shape)))
-                if values.size:
-                    amax = _numeric.worst(amax, float(np.max(np.abs(values))))
-                    max_error = _numeric.worst(max_error, float(np.max(error)))
-                sse += float(np.sum(error.astype(np.float64) ** 2))
-                energy += float(np.sum(values.astype(np.float64) ** 2))
-                read += values.size * _WIDTH[tensor.source_dtype]
-                spill.write(raw)
-            bound = amax * BF16_ROUND_TRIP_BOUND
-            if not _numeric.within(max_error, bound):
-                raise UnsupportedInput(
-                    f"{tensor.component}.{tensor.key}: bf16 round-trip error {max_error:.4g} "
-                    f"exceeds the representational bound {bound:.4g}",
-                    code="quantization_tripwire",
-                )
-            relative = math.sqrt(sse / energy) if energy else 0.0
-            worst = _numeric.worst(worst, relative) if worst is not None else None
-            written += spill.tell()
-            spill.seek(0)
-            output.put(tensor.component, tensor.key, "BF16", tensor.shape, spill)
+    selected = [tensor for tensor in plan.tensors if (tensor.component, tensor.key) not in omitted]
+    if not selected:
+        return Bf16Stats(0, 0, 0, 0, 0.0)
+    ctx.raise_if_cancelled()
+    rows: list[NormalizeBf16Tensor] = [
+        {
+            "component": tensor.component,
+            "key": tensor.key,
+            "source_dtype": TENSORFS_NAMES[tensor.source_dtype],
+            "shape": list(tensor.shape),
+        }
+        for tensor in selected
+    ]
+    convert, pending = output.prepare_bf16(source, rows, max_buffer_bytes=_SOURCE_READ_CHUNK)
+    result = msgspec.convert(
+        _run_native(convert, pending, ctx, tel, stage="bf16"), type=_Bf16Result
+    )
+    for done, tensor in enumerate(result.tensors, result.reused_keys + 1):
         tel.log(
             "normalized tensor",
             level="info",
-            component=tensor.component,
-            key=tensor.key,
-            source_dtype=tensor.source_dtype,
-            relative_frobenius=relative,
+            component=tensor["component"],
+            key=tensor["key"],
+            relative_frobenius=tensor["relative_frobenius"],
             done=done,
             total=len(selected),
         )
-        tel.progress(done / len(selected), stage="bf16")
-    return Bf16Stats(len(selected), reused, read, written, worst)
+    return Bf16Stats(
+        converted_keys=len(selected),
+        reused_keys=result.reused_keys,
+        source_bytes_read=result.logical_source_bytes_read,
+        new_bytes_written=result.new_bytes_written,
+        worst_relative_frobenius=result.worst_relative_frobenius,
+        stored_source_bytes_read=result.source_bytes_read,
+        required_buffer_bytes=result.required_buffer_bytes,
+    )
 
 
 def quantize_component_into(
@@ -403,6 +414,8 @@ def quantize_component_into(
     if component not in plan.components:
         raise UnsupportedInput(f"quantization plan has no component {component!r}")
     tensors = [t for t in plan.tensors if t.component == component]
+    if not tensors:
+        return QuantizationStats(0, 0, 0, 0, 0, 0.0)
     pending = [t for t in tensors if not output.has(t.component, t.key)]
     source_bytes = new_bytes = saturated = 0
     worst = 0.0
@@ -411,20 +424,27 @@ def quantize_component_into(
     def scheme(tensor: QuantizationTensor) -> str:
         return tensor.encoding or encoding
 
-    fitted = None
-    if any(_ENCODINGS[scheme(t)].calibrated for t in pending):
-        # Fitted one at a time on this thread: its GPU allocations are the attempt's, which the
-        # memory manager answers by making room (varena serves torch). Each tensor is a step of the
-        # run's record, with the host code any slow one waited in (`author._stalls`).
-        fitted = tel.step_callback(len(pending), stage=f"fitting {component}")
-        stop = threading.Event()
-        results: Generator[_Encoded, None, None] = (
-            _encode_tensor(source, scheme(t), t, stop, calibration) for t in pending
+    from . import native_quantization
+
+    if native_quantization.supported(source, plan, encoding):
+        return native_quantization.quantize(
+            source,
+            output,
+            plan,
+            encoding,
+            logical_dtype,
+            ctx=ctx,
+            tel=tel,
+            max_relative_frobenius=payload.max_relative_frobenius,
+            calibration=calibration,
+            fit_workspace_bytes=payload.fit_workspace_bytes,
+            component=component,
         )
-    else:
-        results = _in_order(
-            pending, lambda tensor, stop: _encode_tensor(source, scheme(tensor), tensor, stop)
-        )
+    if any(_ENCODINGS[scheme(t)].calibrated for t in plan.tensors):
+        raise UnsupportedInput("calibrated selection is unsupported by the native Writer")
+    results = _in_order(
+        pending, lambda tensor, stop: _encode_tensor(source, scheme(tensor), tensor, stop)
+    )
     with contextlib.closing(results):
         for done, tensor in enumerate(pending, 1 + reused):
             ctx.raise_if_cancelled()
@@ -469,10 +489,8 @@ def quantize_component_into(
             source_bytes += result.read
             saturated += result.saturated
             tel.log("quantized tensor", level="info", encoding=name, component=component,
-                    key=tensor.key, done=done, total=total, **(result.fit or {}))  # fmt: skip
+                    key=tensor.key, done=done, total=total)  # fmt: skip
             tel.progress(done / total, stage=f"{encoding}-{component}")
-            if fitted is not None:
-                fitted(done - 1 - reused)
     return QuantizationStats(
         encoded_keys=len(pending),
         reused_keys=reused,
@@ -494,8 +512,6 @@ class _Encoded(NamedTuple):
     energy: float
     saturated: int
     read: int
-    #: A calibrated scheme's fit, logged per tensor: its alpha and output errors (`svdq.Fitted`).
-    fit: dict[str, float] | None = None
 
 
 def _encode_tensor(
@@ -503,7 +519,6 @@ def _encode_tensor(
     encoding: str,
     tensor: QuantizationTensor,
     stop: threading.Event,
-    calibration: svdq.Calibration | None = None,
 ) -> _Encoded:
     encoder = _ENCODINGS[encoding]
     expected = encoder.companions(*tensor.shape)
@@ -511,7 +526,7 @@ def _encode_tensor(
         _read_chunks, source, tensor.component, tensor.key, tensor.logical_dtype, tensor.shape
     )
     if encoder.calibrated:
-        return _fit_tensor(read_chunks, tensor, calibration)
+        raise UnsupportedInput("calibrated fitting must use the native Writer")
     amax = max_error = sse = energy = 0.0
     if encoder.tensor_scaled():
         for values in read_chunks():
@@ -521,7 +536,7 @@ def _encode_tensor(
                 amax = _numeric.worst(amax, float(np.max(np.abs(values))))
     read = rows = saturated = 0
     scales: list[list[bytes]] = [[] for _ in expected]
-    spill = tempfile.TemporaryFile()
+    spill = tempfile.TemporaryFile()  # noqa: SIM115 - ownership returns to the caller
     try:
         for values in read_chunks():
             if stop.is_set():
@@ -560,70 +575,6 @@ def _encode_tensor(
     except BaseException:
         spill.close()
         raise
-
-
-def _fit_tensor(
-    read_chunks: Callable[[], Iterator[np.ndarray]],
-    tensor: QuantizationTensor,
-    calibration: svdq.Calibration | None,
-) -> _Encoded:
-    """A calibrated scheme's whole tensor, fitted to its linear's recorded inputs."""
-    if calibration is None:
-        _uncalibrated(f"{tensor.component}.{tensor.key}")
-    assert calibration is not None
-    started = time.perf_counter()
-    values = np.concatenate(list(read_chunks()))
-    torch = calibration.torch
-    cuda = placed_device().type == "cuda"
-    if cuda:
-        torch.cuda.reset_peak_memory_stats()
-    read = time.perf_counter()
-    fitted = svdq.fit(
-        torch, tensor.key, values, calibration.stats(tensor.component, tensor.key),
-        "cuda" if cuda else "cpu",
-    )  # fmt: skip
-    measured = {
-        "read_s": read - started,
-        "fit_s": time.perf_counter() - read,
-        "encode_s": fitted.encode_s,
-        **_host_mb(),
-    }
-    if cuda:  # what this fit held, then given back: the model's pages need the room more
-        measured["peak_mb"] = torch.cuda.max_memory_allocated() / 2**20
-        measured["reserved_mb"] = torch.cuda.memory_reserved() / 2**20
-        torch.cuda.empty_cache()
-    spill = tempfile.TemporaryFile()  # noqa: SIM115 - the caller closes it, as _encode_tensor's
-    spill.write(fitted.payload)
-    return _Encoded(
-        spill,
-        fitted.companions,
-        fitted.amax,  # the bound holds the residual's round trip, in the smoothed domain
-        fitted.max_abs_err,
-        fitted.sse,
-        fitted.energy,
-        fitted.saturated,
-        values.size * _WIDTH[tensor.logical_dtype],
-        {"alpha": fitted.alpha, "error": fitted.error, "nvfp4_error": fitted.nvfp4_error}
-        | {name: round(value, 2) for name, value in measured.items()},
-    )
-
-
-def _host_mb() -> dict[str, float]:
-    """The host's memory now, from `/proc` (none where there is no `/proc`): this process's
-    resident set, what the kernel says is available, and its page cache."""
-    out: dict[str, float] = {}
-    try:
-        pages = int(Path("/proc/self/statm").read_text().split()[1])
-        out["rss_mb"] = pages * os.sysconf("SC_PAGE_SIZE") / 2**20
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            name, _, value = line.partition(":")
-            if name in ("MemAvailable", "Cached"):
-                out[{"MemAvailable": "avail_mb", "Cached": "cache_mb"}[name]] = (
-                    int(value.split()[0]) / 1024
-                )
-    except (OSError, IndexError, ValueError):
-        pass
-    return out
 
 
 class _Stopped(Exception):
@@ -687,13 +638,17 @@ def _decoded_chunks(
     step = max(1, _SOURCE_READ_CHUNK // max(columns * 4, 1))
     for first in range(0, rows, step):
         values = np.empty((min(step, rows - first), columns), dtype=np.float32)
-        read_values_into(None, source, component, key, first * columns, memoryview(values.reshape(-1)))
+        read_values_into(
+            None, source, component, key, first * columns, memoryview(values.reshape(-1))
+        )
         if not bool(np.isfinite(values).all()):
             raise UnsupportedInput(f"source {component}.{key} contains non-finite weights")
         yield values
 
 
 def _validate_request(payload: ArtifactQuantizationRequest) -> None:
+    if type(payload.fit_workspace_bytes) is not int or payload.fit_workspace_bytes <= 0:
+        raise UnsupportedInput("fit_workspace_bytes must be a positive explicit allowance")
     if payload.max_relative_frobenius is not None and (
         not math.isfinite(payload.max_relative_frobenius) or payload.max_relative_frobenius < 0
     ):

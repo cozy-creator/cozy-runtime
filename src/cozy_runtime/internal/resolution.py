@@ -29,12 +29,14 @@ from typing import Protocol
 
 import msgspec
 
-from cozy_runtime.internal import canonical
+from cozy_runtime.author._prepared_use import PreparedUse
+from cozy_runtime.internal import arch, canonical
 from cozy_runtime.internal.delivery import DELIVERY_RUNGS, ROUTE_KERNEL
 from cozy_runtime.internal.encoding import (
     DeviceFacts,
     Encoded,
     EncodingRefusal,
+    LeafProvider,
     Provider,
     Refusal,
     RuntimeIdentity,
@@ -44,6 +46,8 @@ from cozy_runtime.internal.encoding import (
     device_line,
     implementation_digest,
 )
+from cozy_runtime.internal.encoding.adapters import _nvfp4_kernel
+from cozy_runtime.internal.nvfp4_linear import DECODE_ROWS
 
 #: The route a tensor PREFERS under each policy (the package's consent decides the policy);
 #: the first route in the list that this tensor actually has wins.
@@ -216,6 +220,9 @@ class ResolvedModelPlan:
     construction: ConstructionFacts
     encoded_leaves: str
     walk: tuple[Step, ...] = ()
+    prepared_use: PreparedUse | None = None
+    prepared_use_reason: str = ""
+    prepared_footprint_bytes: int = 0
 
     # ------------------------------------------------------------------ derived facts
 
@@ -303,6 +310,11 @@ class ResolvedModelPlan:
             "runtime": self.runtime.document(),
             "placement": self.placement,
             "construction": self.construction.document(),
+            **(
+                {"prepared_use": msgspec.to_builtins(self.prepared_use)}
+                if self.prepared_use
+                else {}
+            ),
         }
 
     def digest(self) -> str:
@@ -344,6 +356,17 @@ class ResolvedModelPlan:
             "stored_bytes": self.stored_bytes(),
             "tensors": [row.document() for row in self.tensors],
             "walk": msgspec.to_builtins(self.walk),
+            **(
+                {
+                    "prepared_use": {
+                        "request": msgspec.to_builtins(self.prepared_use),
+                        "reason": self.prepared_use_reason,
+                        "required_bytes": self.prepared_footprint_bytes,
+                    }
+                }
+                if self.prepared_use
+                else {}
+            ),
         }
 
     def summary(self) -> str:
@@ -368,6 +391,8 @@ class PlanRow(Protocol):
     def shape(self) -> tuple[int, ...]: ...
     @property
     def encoded(self) -> Encoded: ...
+    @property
+    def nbytes(self) -> int: ...
 
 
 def resolve(
@@ -381,6 +406,10 @@ def resolve(
     placement: str = "all_resident",
     encoded_leaves: str = "refuse",
     dtype_name: Callable[[str], str],
+    prepared_use: PreparedUse | None = None,
+    prepared_free_bytes: int = 0,
+    prepared_granularity: int = 0,
+    prepared_ineligible: str = "",
 ) -> ResolvedModelPlan:
     """The variant's header rows -> ONE plan, by rule.
 
@@ -410,6 +439,15 @@ def resolve(
     # THE CONSENT GATE (#549.1): a route that REPLACES the module that computes needs the
     # package to say so, because code that reads `.weight` finds nothing there.
     policy = "encoded_gemm" if encoded_leaves == "accept" else "decode_floor"
+    retained, why, footprint = _prepared_choices(
+        found,
+        device,
+        prepared_use,
+        policy,
+        prepared_free_bytes,
+        prepared_granularity,
+        prepared_ineligible,
+    )
     plan = _build(
         variant=variant,
         policy=policy,
@@ -420,6 +458,13 @@ def resolve(
         placement=placement,
         encoded_leaves=encoded_leaves,
         dtype_name=dtype_name,
+        retained=retained,
+    )
+    plan = dataclasses.replace(
+        plan,
+        prepared_use=prepared_use,
+        prepared_use_reason=why,
+        prepared_footprint_bytes=footprint,
     )
     step = Step(
         variant.name,
@@ -430,6 +475,92 @@ def resolve(
         routes=plan.route_census(),
     )
     return dataclasses.replace(plan, walk=(step,))
+
+
+def _prepared_choices(
+    found: Sequence[tuple[PlanRow, TensorCandidates]],
+    device: DeviceFacts,
+    use: PreparedUse | None,
+    policy: str,
+    free: int,
+    granularity: int,
+    ineligible: str,
+) -> tuple[frozenset[str], str, int]:
+    """Price a fixed retained-float use before any leaf or destination exists.
+
+    There is no block census yet. Deliberately overprice: a separate native allocation for
+    every raw row and every logical row, all packed inputs live beside all final weights,
+    plus the program's workspace. Unknown transforms cannot use this estimate.
+    """
+    empty: frozenset[str] = frozenset()
+    if use is None:
+        return empty, "", 0
+    if use.target == "stored":
+        return empty, "the program keeps the existing stored route", 0
+    if ineligible:
+        return empty, ineligible, 0
+    if device.kind != "cuda" or arch.row(device.sm).fp4:
+        return empty, "the existing device/native-FP4 route is preserved", 0
+    if use.activation_rows <= DECODE_ROWS or use.repetitions <= 1 or not use.tensors:
+        return empty, "use is unknown, mixed, small-M or not repeated", 0
+    if use.compute_dtype != "BF16" or policy != "encoded_gemm":
+        return empty, "retention preserves the existing BF16 logical dtype and leaf consent", 0
+    if not _nvfp4_kernel(device.sm, "BF16"):
+        return empty, "the resident-input native BF16 decoder is unavailable", 0
+    rows = {row.key: (row, candidates) for row, candidates in found}
+    if any(key not in rows for key in use.tensors):
+        raise PlanRefusal("prepared_use_invalid", "prepared use names an absent tensor")
+    for key in use.tensors:
+        row, candidates = rows[key]
+        decoded = candidates.by_route.get("decoded_float")
+        if (
+            row.encoded.scheme != "nvfp4"
+            or row.dtype != "bf16"
+            or "encoded_gemm" not in candidates.by_route
+            or decoded is None
+            or decoded.provider.name != "cozy.nvfp4.cores/1"
+        ):
+            return empty, "a requested tensor lacks the unchanged BF16 native decode route", 0
+    if not use.workspace_bytes or granularity <= 0:
+        return empty, "the full workspace/alignment allowance is unknown", 0
+
+    def align(size: int) -> int:
+        return (size + granularity - 1) // granularity * granularity
+
+    weights, scratch = 0, 0
+    for row, candidates in found:
+        chosen = (
+            candidates.by_route["decoded_float"]
+            if row.key in use.tensors
+            else _prefer(candidates.by_route, policy)
+        )
+        provider = chosen.provider
+        if isinstance(provider, LeafProvider):
+            parts = {part.role: part for part in row.encoded.parts}
+            # Existing leaf declarations price padded roles and their fill scratch. Keep
+            # the logical tensor as an additional conservative bound on dtype conversion.
+            weights += align(max(row.nbytes, provider.resident_bytes(parts)))
+            scratch += align(provider.fill_scratch_bytes(parts))
+        elif provider.route == "verbatim" or row.key in use.tensors:
+            weights += align(row.nbytes)
+        else:
+            return empty, "another decoder's complete preparation footprint is unknown", 0
+    raw = sum(
+        align(sum((part.nbytes + 255) // 256 * 256 for part in row.encoded.parts))
+        for row, _ in found
+    )
+    required = weights + raw + scratch + use.workspace_bytes
+    if weights > use.max_resident_bytes or required > free:
+        return (
+            empty,
+            "complete retained weights, packed fill and workspace exceed the grant or free room",
+            required,
+        )
+    return (
+        frozenset(use.tensors),
+        "fixed repeated large-M use retains its BF16 final buffers",
+        required,
+    )
 
 
 def _refusal(variant: Variant, device: DeviceFacts, step: Step) -> str:
@@ -451,11 +582,16 @@ def _build(
     placement: str,
     encoded_leaves: str,
     dtype_name: Callable[[str], str],
+    retained: frozenset[str] = frozenset(),
 ) -> ResolvedModelPlan:
     """One policy -> its plan. Pure: no I/O, no device, no allocation."""
     tensors: list[TensorResolution] = []
     for row, found in resolved:
-        selection = _prefer(found.by_route, policy)
+        selection = (
+            found.by_route["decoded_float"]
+            if row.key in retained
+            else _prefer(found.by_route, policy)
+        )
         numel = 1
         for extent in row.shape:
             numel *= extent
@@ -472,7 +608,8 @@ def _build(
                 output_dtype=dtype_name(row.dtype),
                 numel=numel,
                 stored_bytes=row.encoded.stored_nbytes,
-                reason=_reason(selection, found, policy),
+                reason=("prepared repeated large-M BF16 use; " if row.key in retained else "")
+                + _reason(selection, found, policy),
                 refused=found.refused[0]
                 if found.refused
                 and encoded_leaves == "accept"
