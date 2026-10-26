@@ -469,19 +469,31 @@ def split[T](
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
-    Its op's bytes are measured at its first two calls, at the finest window and the next
-    (the request's section peaks), then fitted: an op quadratic in its window scales as one."""
+    Its op's bytes are measured at its first two successful window sizes, then fitted: an
+    op quadratic in its window scales as one. The first measurement groups at most 128
+    minimum windows; allocation refusals use the ordinary descent to smaller windows.
+    Like every split call, the declared operation must be safe to retry without side effects."""
     deepest = levels(-(-total // max(finest, 1)))
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
 
-    def at(level: int) -> T:
-        return run(window(level))
-
     with _MEASURED_LOCK:
-        points = list(_MEASURED.get(key, ()))
+        points = sorted(_MEASURED.get(key, ()))
     request = catch.CURRENT.get()
+    measured: tuple[int, int] | None = None
+
+    def at(level: int) -> T:
+        nonlocal measured
+        if len(points) == 2 or request is None or deepest == 0:
+            return run(window(level))
+        request.reset_peak()
+        start = request.reset_peak()  # Restart after each refused attempt, not before descent.
+        result = run(window(level))
+        grew = max(request.reset_peak() - start - out_bytes, 0)
+        measured = (window(level), grew)
+        return result
+
     if len(points) == 2:
         fit = sizing.fitted(points[0], points[1])
 
@@ -489,9 +501,12 @@ def split[T](
             return sizing.peak(granularity, out_bytes, (fit(window(level)),))
 
         return catch.cut(f"split:{key}", deepest, need, at)
-    # Unmeasured: the next window to measure (the finest, then the next larger), sized as so.
-    target = next(
-        (lv for lv in range(deepest, -1, -1) if all(window(lv) > w for w, _ in points)), 0
+    # A whole long sequence at one token per launch is expensive even when it fits.
+    # Start bounded, then measure the next larger window. OOM still descends to the floor.
+    target = (
+        next((lv for lv in range(deepest, -1, -1) if window(lv) > points[-1][0]), 0)
+        if points
+        else min(deepest, max(deepest - 7, 1))
     )
 
     def measuring(level: int, granularity: int) -> int:
@@ -499,12 +514,11 @@ def split[T](
 
     if request is None or deepest == 0:
         return catch.cut(f"split:{key}", deepest, measuring, at)
-    request.reset_peak()
-    start = request.reset_peak()  # what is live now: the restarted high-water
     result = catch.cut(f"split:{key}", deepest, measuring, at)
-    grew = max(request.reset_peak() - start - out_bytes, 0)
+    assert measured is not None
     with _MEASURED_LOCK:
         known = _MEASURED.setdefault(key, [])
-        if len(known) < 2 and all(window(target) > w for w, _ in known):
-            known.append((window(target), grew))
+        if len(known) < 2 and all(measured[0] != w for w, _ in known):
+            known.append(measured)
+            known.sort()
     return result
