@@ -5,28 +5,28 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-const OK: u32 = 0;
-const CANCELED: u32 = 1;
-const INVALID: u32 = 2;
-const CAPACITY: u32 = 3;
-const CUDA: u32 = 4;
-const INTERNAL: u32 = 5;
-const UNPROVEN: u32 = 6;
-const ARMED: u32 = 0;
-const RUNNING: u32 = 1;
-const DONE: u32 = 2;
-const FAILED: u32 = 3;
+pub(super) const OK: u32 = 0;
+pub(super) const CANCELED: u32 = 1;
+pub(super) const INVALID: u32 = 2;
+pub(super) const CAPACITY: u32 = 3;
+pub(super) const CUDA: u32 = 4;
+pub(super) const INTERNAL: u32 = 5;
+pub(super) const UNPROVEN: u32 = 6;
+pub(super) const ARMED: u32 = 0;
+pub(super) const RUNNING: u32 = 1;
+pub(super) const DONE: u32 = 2;
+pub(super) const FAILED: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Status {
-    kind: u32,
-    code: i32,
-    detail_len: u32,
-    detail: [u8; 244],
+pub(super) struct Status {
+    pub(super) kind: u32,
+    pub(super) code: i32,
+    pub(super) detail_len: u32,
+    pub(super) detail: [u8; 244],
 }
 impl Status {
-    fn new(kind: u32, code: i32, message: &str) -> Self {
+    pub(super) fn new(kind: u32, code: i32, message: &str) -> Self {
         let mut detail = [0; 244];
         let mut length = message.len().min(detail.len());
         while !message.is_char_boundary(length) {
@@ -40,13 +40,13 @@ impl Status {
             detail,
         }
     }
-    fn ok() -> Self {
+    pub(super) fn ok() -> Self {
         Self::new(OK, 0, "")
     }
-    fn invalid(message: &str) -> Self {
+    pub(super) fn invalid(message: &str) -> Self {
         Self::new(INVALID, 0, message)
     }
-    fn cuda(code: i32) -> Self {
+    pub(super) fn cuda(code: i32) -> Self {
         if code < 0 {
             return Self::invalid("native continuation is ineligible or closed");
         }
@@ -56,19 +56,19 @@ impl Status {
             &format!("native continuation: CUDA error {code}"),
         )
     }
-    fn unproven() -> Self {
+    pub(super) fn unproven() -> Self {
         Self::new(UNPROVEN, 999, "native continuation completion is unproven")
     }
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
-struct Progress {
-    phase: u32,
-    completed_steps: u32,
-    canceled: u32,
-    done: u32,
-    epoch: u64,
+#[derive(Clone, Copy, Default)]
+pub(super) struct Progress {
+    pub(super) phase: u32,
+    pub(super) completed_steps: u32,
+    pub(super) canceled: u32,
+    pub(super) done: u32,
+    pub(super) epoch: u64,
 }
 
 type Operation = unsafe extern "C" fn(*mut c_void) -> Status;
@@ -455,11 +455,17 @@ pub(super) fn export(
         .into_any()
         .unbind();
     // If completion becomes unproven and the core is retained, retain its code module too.
-    owner
-        .owners
-        .lock()
-        .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?
-        .push(module.clone_ref(py));
+    {
+        let mut held = owner
+            .owners
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?;
+        // Reused sequence definitions arm once per request. Keep one permanent code
+        // owner, not another module reference for every successful submission.
+        if !held.iter().any(|value| value.as_ptr() == module.as_ptr()) {
+            held.push(module.clone_ref(py));
+        }
+    }
     let epoch = py
         .detach(|| {
             let mut core = owner.state.lock().map_err(|_| 999)?;

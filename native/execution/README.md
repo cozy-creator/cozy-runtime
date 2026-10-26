@@ -59,14 +59,40 @@ allocations are reset on failure. An author can continue eagerly after such a pr
 but must not catch a submission/execution error and replay the request. Hidden Python side effects
 outside the declared tensor state and component remain outside the deterministic-body contract.
 
-Within a normal invocation, `Context.plan` registers one pending prepared-work owner before
-calling the provider. The request admits one complete prepared submission, rejects late or
-additional submissions, joins before success serialization, and cancels/joins unfinished work on
-unwind. Admission locks never span provider callbacks or blocking device work. Reusable graph
+Within a normal invocation, `Context.plan` registers every pending prepared-work owner before
+calling its provider. Submissions are ordered after their predecessors finish; a prior failure
+or cancellation prevents later provider calls. Late and recursive submissions are refused.
+The request joins before success serialization and cancels/joins every accepted owner on unwind,
+including submissions still waiting for a predecessor. Admission locks never span provider
+callbacks or blocking device work. Reusable graph
 definitions are not automatically closed by request completion. Low-level `submit()` outside an
 invocation remains caller-owned. Native launch orders the caller's stream after its completion
 event; other streams and host readers must await results or establish their own dependency.
 Submission during CUDA capture is refused before allocation/launch.
+
+`PreparedSequence((first, second, ...))` instead prepares one ordered native submission from
+distinct stage definitions. Stages communicate through persistent GPU boundary tensors allocated
+outside capture: the second graph reads the first graph's actual output address. The Rust worker
+advances existing same-process continuation capabilities without Python callbacks or per-stage
+Python output copies. The default returned state is the final stage's state, read only after
+the entire sequence completes. Explicit selected outputs are also end-of-sequence values, not
+snapshots of intermediate stages.
+
+The package author chooses this sequential mechanism or the existing explicit prefix/body/suffix
+composite when its shapes permit that optimization. There is no consumer setting or automatic
+fusion. Sequential stages still need native host launches/waits; this is not CPU-free disk I/O.
+Deferred source capabilities use the same worker to refill their own retained virtual addresses
+and run their graph. Native physical pins guard each actual use. The internal raw-stage helper
+removes only captured immutable weight owners, then refuses detachment if a real foreign Pin
+survived; it is not a production model adapter or a complete generation/LoRA validator.
+
+A sequence takes ownership of its stage definitions. Failed constructor validation does not
+consume them. Standalone stage submission is refused while attached; closing or idle-retiring
+one stage closes the sequence. Every accepted capability remains owned through cancellation,
+including unstarted stages. An uncertain completion retains the actual source/graph chain.
+All-resident sequences use existing bounded next-job prefetch; streamed sequences do not yet
+speculate into their future weight/workspace window. The initial native sequence is one pass:
+an oversized denoiser still needs native repeated block ranges and explicit outer timestep state.
 
 The complete source graph is walked recursively. Only kernel, empty, memcpy, memset and ordinary
 child graph nodes are accepted. Copy and memset nodes must address device memory on the selected

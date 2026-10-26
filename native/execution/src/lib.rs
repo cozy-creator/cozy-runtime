@@ -7,6 +7,7 @@ use std::{
 };
 
 mod continuation;
+mod sequence;
 
 pyo3::create_exception!(_execution, NativeExecutionError, PyRuntimeError);
 
@@ -333,6 +334,11 @@ impl ResidentRepeat {
             (state.launches, state.pointer == 0, input)
         };
         // These facts originate in the actual constructed native handle, never a protocol match.
+        let retained_owners = self
+            .owners
+            .lock()
+            .map_err(|_| PyRuntimeError::new_err("prepared owners poisoned"))?
+            .len();
         let result = PyDict::new(py);
         result.set_item("execution_mode", "cuda_conditional_while")?;
         result.set_item("body_nodes", self.nodes)?;
@@ -344,6 +350,7 @@ impl ResidentRepeat {
         result.set_item("device", self.device)?;
         result.set_item("steps_per_launch", self.steps)?;
         result.set_item("host_graph_launches", launches)?;
+        result.set_item("retained_owner_count", retained_owners)?;
         result.set_item("control_kernels_preloaded", true)?;
         result.set_item("continuation_abi", 1)?;
         result.set_item("event_input_supported", true)?;
@@ -492,5 +499,6 @@ fn _execution(module: &Bound<'_, PyModule>) -> PyResult<()> {
         module.py().get_type::<NativeExecutionError>(),
     )?;
     module.add_class::<ResidentRepeat>()?;
+    module.add_class::<sequence::NativeSequence>()?;
     Ok(())
 }
