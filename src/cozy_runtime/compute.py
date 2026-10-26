@@ -884,7 +884,7 @@ class PreparedRepeat:
                     retained_owners = ()
                 if group is not None:
                     areas = tuple(
-                        (device, start, end) for _, device, start, end in generated.values()
+                        (device, start, end) for _, _, device, start, end in generated.values()
                     )
                     held = {
                         key: tensor
