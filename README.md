@@ -400,7 +400,16 @@ A package whose signature names a video or audio input must install
 static reader has no environment to check). Media inputs are handles read through the
 attempt's one budget; see [Media inputs](docs/assets.md).
 
-Image inputs can opt into preparation on a field or an `Assets` argument:
+Image generation uses the shared `ImageRequest` output-canvas limit: aspect ratios must be
+between **1:16 and 16:1**, inclusive. Explicit ratios outside this range are rejected during
+request decoding, before admission or model work. A canvas inferred from a reference is checked
+when `target()` resolves it, and `Sizes.fit()` keeps grid rounding within the same envelope.
+Models can impose narrower bounds. This output-generation rule does not crop or reject source
+assets merely because they have unusual dimensions; an explicit valid output ratio can use
+such a reference. Packages that preserve a reference canvas directly must still resolve it
+through `ImageRequest.target()` before choosing output dimensions.
+
+Image inputs can separately opt into preparation on a field or an `Assets` argument:
 
 ```python
 from typing import Annotated
