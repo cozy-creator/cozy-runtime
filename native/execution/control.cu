@@ -7,6 +7,7 @@
 #include <vector>
 #ifdef COZY_REPEAT_DIAGNOSTICS
 #include <atomic>
+#include <cstdlib>
 static std::atomic<unsigned long long> diagnostic_next{0};
 #endif
 
@@ -36,6 +37,7 @@ struct Repeat {
     unsigned long long diagnostic_id = diagnostic_next.fetch_add(1, std::memory_order_relaxed);
     unsigned diagnostic_types[6]{};
     unsigned diagnostic_depth = 0;
+    cudaGraphExec_t diagnostic_source = nullptr;
 #endif
     int device = 0;
     unsigned steps = 0;
@@ -232,6 +234,10 @@ static cudaError_t cleanup(Repeat *run) {
     cudaError_t error;
     if (run->work && (error = cudaStreamSynchronize(run->work)) != cudaSuccess) return error;
     if (run->control_stream && (error = cudaStreamSynchronize(run->control_stream)) != cudaSuccess) return error;
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    if (run->diagnostic_source && (error = cudaGraphExecDestroy(run->diagnostic_source)) != cudaSuccess) return error;
+    run->diagnostic_source = nullptr;
+#endif
     if (run->executable && (error = cudaGraphExecDestroy(run->executable)) != cudaSuccess) return error;
     run->executable = nullptr;
     if (run->graph && (error = cudaGraphDestroy(run->graph)) != cudaSuccess) return error;
@@ -277,6 +283,16 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     DIAGNOSTIC_CALL("exit", #call, error); if (error != cudaSuccess) return error; } while (0)
     CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device, run, "source"));
     if (!run->nodes) return -101;
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    const char *source_only = std::getenv("COZY_REPEAT_DIAG_SOURCE_INSTANTIATE");
+    if (source_only && source_only[0] == '1' && source_only[1] == '\0') {
+        // Diagnostic only: never launch this executable. Instantiation may change driver
+        // lazy-loading state, so a changed outcome is not proof of a production fix.
+        CHECK(cudaGraphInstantiate(&run->diagnostic_source, reinterpret_cast<cudaGraph_t>(source), 0));
+        CHECK(cudaGraphExecDestroy(run->diagnostic_source));
+        run->diagnostic_source = nullptr;
+    }
+#endif
     unsigned total = run->nodes;
     if (prefix) {
         CHECK(inspect(reinterpret_cast<cudaGraph_t>(prefix), total, device, run, "prefix"));
