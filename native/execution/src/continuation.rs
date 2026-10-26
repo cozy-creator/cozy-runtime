@@ -90,6 +90,8 @@ struct Api {
     cancel: Operation,
     wait: Observe,
     start_after: StartAfter,
+    rearm: Operation,
+    finish: Operation,
 }
 // SAFETY: context is an opaque Arc<Continuation>; only its owning DSO dereferences it.
 unsafe impl Send for Api {}
@@ -107,6 +109,8 @@ struct Continuation {
     cancel_requested: AtomicBool,
     cancel_issued: AtomicBool,
     input_invalid: AtomicBool,
+    reusable: bool,
+    reusable_closed: AtomicBool,
     // A worker may outlive every public Python definition. Keep its provider module loaded.
     _module: Py<PyAny>,
 }
@@ -188,6 +192,82 @@ impl Continuation {
         progress.phase = RUNNING;
         // A cancellation during initialization remains in cancel_requested. poll/wait emits
         // its GPU control write only after initialization, never before the memset resets it.
+        Ok(())
+    }
+    // A streamed owner records caller readiness once at submission. The native worker
+    // can rearm only after the preceding consumer is checked complete. It never moves
+    // a PTDS handle to another OS thread or rerecords the caller event there.
+    fn rearm(&self) -> Result<(), Status> {
+        if !self.reusable || self.reusable_closed.load(Ordering::Acquire) {
+            return Err(Status::invalid("continuation is one-shot or finished"));
+        }
+        let mut progress = self.checked()?;
+        if progress.phase != DONE
+            || progress.done == 0
+            || self.input_invalid.load(Ordering::Acquire)
+        {
+            return Err(Status::invalid(
+                "rearm requires checked successful segment completion",
+            ));
+        }
+        if progress.canceled != 0 || self.cancel_requested.load(Ordering::Acquire) {
+            return Err(Status::new(CANCELED, 0, "streamed execution canceled"));
+        }
+        let mut core = self.owner.state.lock().map_err(|_| Status::unproven())?;
+        if core.pointer == 0
+            || core.failed
+            || !core.streamed
+            || core.pending.is_some()
+            || core.epoch != progress.epoch
+        {
+            return Err(Status::invalid(
+                "streamed definition is closed, active or stale",
+            ));
+        }
+        let epoch = core.epoch.checked_add(1).ok_or_else(Status::unproven)?;
+        core.epoch = epoch;
+        core.pending = Some(epoch);
+        *progress = Progress {
+            phase: ARMED,
+            completed_steps: 0,
+            canceled: 0,
+            done: 0,
+            epoch,
+        };
+        self.cancel_issued.store(false, Ordering::Release);
+        self.input_invalid.store(false, Ordering::Release);
+        self.gate.store(0, Ordering::Release);
+        // cancel is sticky across every rearm. Recheck after publishing the gate: a
+        // cancel racing before this store is restored; a later cancel sees the new gate.
+        if self.cancel_requested.load(Ordering::Acquire) {
+            let _ = self
+                .gate
+                .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+        }
+        Ok(())
+    }
+    fn finish(&self) -> Result<(), Status> {
+        if !self.reusable {
+            return Err(Status::invalid("continuation is one-shot"));
+        }
+        let progress = self.checked()?;
+        if progress.phase != DONE || progress.done == 0 {
+            return Err(Status::invalid(
+                "finish requires checked segment completion",
+            ));
+        }
+        let mut core = self.owner.state.lock().map_err(|_| Status::unproven())?;
+        if self.reusable_closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if core.failed {
+            return Err(Status::unproven());
+        }
+        if core.epoch != progress.epoch || core.pending.is_some() || !core.streamed {
+            return Err(Status::invalid("cannot release another execution epoch"));
+        }
+        self.reusable_closed.store(true, Ordering::Release);
+        core.streamed = false;
         Ok(())
     }
     fn cancel(&self) -> Result<(), Status> {
@@ -316,6 +396,10 @@ impl Drop for Continuation {
             .is_err()
         {
             std::mem::forget(self.owner.clone());
+        } else if self.reusable && !self.reusable_closed.load(Ordering::Acquire) {
+            if self.finish().is_err() {
+                std::mem::forget(self.owner.clone());
+            }
         }
     }
 }
@@ -443,10 +527,19 @@ unsafe extern "C" fn wait(context: *mut c_void, out: *mut Progress) -> Status {
     })
 }
 
+unsafe extern "C" fn rearm(context: *mut c_void) -> Status {
+    boundary(context, |owner| owner.rearm())
+}
+
+unsafe extern "C" fn finish(context: *mut c_void) -> Status {
+    boundary(context, |owner| owner.finish())
+}
+
 pub(super) fn export(
     py: Python<'_>,
     owner: Arc<RepeatOwner>,
     producer: usize,
+    reusable: bool,
 ) -> PyResult<(Py<PyAny>, u64)> {
     owner.check_process()?;
     // Take the module owner before arming; no Python allocation failure may strand an epoch.
@@ -475,7 +568,7 @@ pub(super) fn export(
             if core.failed {
                 return Err(999);
             }
-            if core.pending.is_some() {
+            if core.pending.is_some() || core.streamed {
                 return Err(-4);
             }
             let epoch = core.epoch.checked_add(1).ok_or(999)?;
@@ -489,6 +582,7 @@ pub(super) fn export(
             }
             core.epoch = epoch;
             core.pending = Some(epoch);
+            core.streamed = reusable;
             Ok(epoch)
         })
         .map_err(|code| cuda_error(py, "arm native load continuation", code))?;
@@ -505,13 +599,15 @@ pub(super) fn export(
         cancel_requested: AtomicBool::new(false),
         cancel_issued: AtomicBool::new(false),
         input_invalid: AtomicBool::new(false),
+        reusable,
+        reusable_closed: AtomicBool::new(false),
         _module: module,
     });
     let context = Arc::as_ptr(&owner) as *mut c_void;
     let api = Api {
         abi_version: 1,
         struct_size: std::mem::size_of::<Api>() as u32,
-        flags: 15,
+        flags: if reusable { 31 } else { 15 },
         device: owner.owner.device,
         reserved: 0,
         pid: u64::from(owner.owner.pid),
@@ -523,6 +619,8 @@ pub(super) fn export(
         cancel,
         wait,
         start_after,
+        rearm,
+        finish,
     };
     let capsule = PyCapsule::new_with_value(
         py,
@@ -536,4 +634,4 @@ const _: () = assert!(std::mem::size_of::<Status>() == 256);
 const _: () = assert!(std::mem::size_of::<Progress>() == 24);
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Api>() == 96);
+const _: () = assert!(std::mem::size_of::<Api>() == 112);
