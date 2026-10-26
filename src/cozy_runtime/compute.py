@@ -922,11 +922,15 @@ class Execution:
                         if self._load_job is None
                         else self._load_job.wait()
                     )
-                    return self._finish(completed, canceled)
-                return Progress(completed, canceled, False)
             except Exception as error:
                 self._failed_load(error)
                 _native_error(error)
+            # The input certificate covers producer/graph completion, not this readout.
+            # Never reinterpret a copy, synchronization or model-release failure as a
+            # clean input failure merely because the load worker finished successfully.
+            if done:
+                return self._finish(completed, canceled)
+            return Progress(completed, canceled, False)
 
     def cancel(self) -> None:
         try:
