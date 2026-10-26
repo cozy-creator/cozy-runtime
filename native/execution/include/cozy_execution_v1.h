@@ -10,6 +10,7 @@
 #define COZY_EXECUTION_RETAINED_OWNERS 4ull
 #define COZY_EXECUTION_REQUIRED_FLAGS 7ull
 #define COZY_EXECUTION_EVENT_INPUT 8ull
+#define COZY_EXECUTION_REUSABLE_INPUT 16ull
 
 /* Every function returns a value; no exception/unwind crosses this C ABI. */
 #define COZY_EXECUTION_OK 0u
@@ -62,6 +63,10 @@ typedef struct CozyExecutionContinuationV1 {
     CozyExecutionObserveV1 wait;
     /* Optional tail: require EVENT_INPUT and a struct_size covering this pointer. */
     CozyExecutionStartAfterV1 start_after;
+    /* Optional REUSABLE_INPUT tail. Checked DONE -> ARMED; cancellation stays sticky. */
+    CozyExecutionOpV1 rearm;
+    /* Checked DONE -> terminal; releases definition reservation deterministically. */
+    CozyExecutionOpV1 finish;
 } CozyExecutionContinuationV1;
 
 /* Import checks capsule name, ABI, full struct size, required flags, pid and device.
@@ -85,4 +90,8 @@ typedef struct CozyExecutionContinuationV1 {
    index reset and prefix. Late device/ownership failures do NOT prove zero execution:
    discard outputs, retain uncertain owners and retire. cancel before enqueue commitment
    prevents submission; cancellation after commitment is cooperative execution cancel. */
+/* REUSABLE_INPUT exclusively reserves the graph definition until this capability is
+   released. Rearm requires checked completion and preserves the first caller-ready
+   event. It never drops storage pins. Native banks may change bytes only after their
+   previous consumer completed. A non-reusable continuation retains one-shot behavior. */
 #endif

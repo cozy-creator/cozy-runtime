@@ -93,6 +93,7 @@ struct State {
     launches: u64,
     pending: Option<u64>,
     destroy_failed: bool,
+    streamed: bool, // Exclusive reusable continuation owns this definition between segments.
 }
 
 struct RepeatOwner {
@@ -155,7 +156,7 @@ impl RepeatOwner {
             if state.failed {
                 return Err(999);
             }
-            if state.pending.is_some() {
+            if state.pending.is_some() || state.streamed {
                 return Err(-4);
             }
             let result = call(&mut state);
@@ -210,6 +211,11 @@ impl RepeatOwner {
 impl ResidentRepeat {
     #[classattr]
     fn supports_phases() -> bool {
+        true
+    }
+
+    #[classattr]
+    fn supports_reusable_input() -> bool {
         true
     }
 
@@ -292,6 +298,7 @@ impl ResidentRepeat {
                     launches: 0,
                     pending: None,
                     destroy_failed: false,
+                    streamed: false,
                 }),
                 owners: Mutex::new(owners),
                 pid: std::process::id(),
@@ -379,8 +386,14 @@ impl ResidentRepeat {
         })
     }
 
-    fn continuation(&self, py: Python<'_>, producer_stream: usize) -> PyResult<(Py<PyAny>, u64)> {
-        continuation::export(py, self.inner.clone(), producer_stream)
+    #[pyo3(signature = (producer_stream, *, reusable = false))]
+    fn continuation(
+        &self,
+        py: Python<'_>,
+        producer_stream: usize,
+        reusable: bool,
+    ) -> PyResult<(Py<PyAny>, u64)> {
+        continuation::export(py, self.inner.clone(), producer_stream, reusable)
     }
 
     fn poll(&self, py: Python<'_>, epoch: u64) -> PyResult<(u32, bool, bool)> {

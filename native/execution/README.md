@@ -91,8 +91,22 @@ consume them. Standalone stage submission is refused while attached; closing or 
 one stage closes the sequence. Every accepted capability remains owned through cancellation,
 including unstarted stages. An uncertain completion retains the actual source/graph chain.
 All-resident sequences use existing bounded next-job prefetch; streamed sequences do not yet
-speculate into their future weight/workspace window. The initial native sequence is one pass:
-an oversized denoiser still needs native repeated block ranges and explicit outer timestep state.
+speculate into their future weight/workspace window.
+
+`PreparedSequence(stages, repeat=(begin, end, passes))` repeats the half-open range natively,
+with the prefix and suffix outside that range executed once. For example,
+`(encode, block_a, block_b, sampler, decode)` with `repeat=(1, 4, 30)` runs thirty complete
+denoising passes before decode. The private graph iteration index still resets for each stage:
+the package must declare a shared GPU timestep tensor, read it from the block graphs and
+advance it once in the sampler. First-step variants can be separate prefix definitions, followed
+by a repeated range of later-step variants. The runtime does not infer either schedule.
+
+Repeated stages require the existing continuation.v1 optional reusable tail (flag16, size112).
+Their definition remains reserved between checked passes; rearm never records a caller/PTDS
+event on the worker. Cancellation remains sticky, failed/invalid/unproven inputs cannot rearm,
+and checked finish releases the reservation. Source identities and model claims remain fixed
+for the complete submitted program. This mechanism still needs actual model adapters, phase
+preferences, shared-pool budgeting and real repeated streaming qualification.
 
 The complete source graph is walked recursively. Only kernel, empty, memcpy, memset and ordinary
 child graph nodes are accepted. Copy and memset nodes must address device memory on the selected
