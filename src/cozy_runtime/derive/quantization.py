@@ -154,6 +154,8 @@ def _uncalibrated(key: str) -> Encoded:
     )
 
 
+#: Public lane-declaration bound; BF16 conversion and validation remain native.
+BF16_ROUND_TRIP_BOUND = 2.0**-8
 _SOURCE_READ_CHUNK = 8 << 20
 _WIDTH = {"bf16": 2, "f16": 2, "f32": 4}
 
