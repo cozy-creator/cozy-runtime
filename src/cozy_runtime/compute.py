@@ -165,7 +165,9 @@ class PreparedRepeat:
         Source/fill/generation and parameter geometry remain checked on every submission;
         model claims cover the entire native sequence. Capture-private weight views are
         released after checked preparation, and native detachment refuses escaped aliases.
-        Encoded/decoded weights and undeclared/stateful module behavior are ineligible.
+        Direct stored native-role buffers are supported when the existing route declares
+        exact source aliases. Decoding, derived/final buffers, packed F4 views and
+        undeclared/stateful module behavior remain ineligible.
         """
         import torch
 
@@ -290,7 +292,12 @@ class PreparedRepeat:
         import torch
 
         from cozy_runtime import graphs
-        from cozy_runtime.internal.residency import Binding, ResidencyError, StaleBinding
+        from cozy_runtime.internal.residency import (
+            _CAPTURE_BLOCKS,
+            Binding,
+            ResidencyError,
+            StaleBinding,
+        )
 
         try:
             import cozy_runtime._kernels._execution as _execution
@@ -496,11 +503,47 @@ class PreparedRepeat:
                         models[id(owner)] = owner
             bypass = graphs.BYPASS.set(True)
             snapshots: list[Any] = []
+            immutable_buffers = (
+                frozenset().union(
+                    *(binding.immutable_buffer_ids() for binding in bindings.values())
+                )
+                if _detach_stage
+                else frozenset()
+            )
+            unbound_buffers = (
+                immutable_buffers
+                - frozenset().union(
+                    *(binding.immutable_buffer_ids(selected=True) for binding in bindings.values())
+                )
+                if _detach_stage
+                else frozenset()
+            )
+            undeclared_inputs = (
+                tuple(
+                    area
+                    for binding in bindings.values()
+                    for area in binding.undeclared_input_ranges()
+                )
+                if _detach_stage
+                else ()
+            )
+            capture_blocks = (
+                _CAPTURE_BLOCKS.set(
+                    frozenset(
+                        id(block) for binding in bindings.values() for block in binding.groups
+                    )
+                )
+                if _detach_stage
+                else None
+            )
             plan = None
             try:
                 with torch.no_grad():
                     try:
-                        snapshots = [graphs._State(torch, module) for module in models.values()]
+                        snapshots = [
+                            graphs._State(torch, module, immutable_buffers=immutable_buffers)
+                            for module in models.values()
+                        ]
                         plan = cls._capture_ready(
                             step,
                             state=tensors,
@@ -509,6 +552,9 @@ class PreparedRepeat:
                             prefix=prefix,
                             suffix=suffix,
                             _release_loaded_inputs=_detach_stage,
+                            _immutable_buffers=immutable_buffers,
+                            _unbound_buffers=unbound_buffers,
+                            _undeclared_inputs=undeclared_inputs,
                         )
                     finally:
                         changed = [
@@ -526,6 +572,8 @@ class PreparedRepeat:
                     plan.close()
                 raise
             finally:
+                if capture_blocks is not None:
+                    _CAPTURE_BLOCKS.reset(capture_blocks)
                 graphs.BYPASS.reset(bypass)
             assert plan is not None
             if load is not None:
@@ -575,6 +623,9 @@ class PreparedRepeat:
         prefix: Callable[[], object] | None = None,
         suffix: Callable[[], object] | None = None,
         _release_loaded_inputs: bool = False,
+        _immutable_buffers: frozenset[int] = frozenset(),
+        _unbound_buffers: frozenset[int] = frozenset(),
+        _undeclared_inputs: tuple[tuple[Any, int, int], ...] = (),
     ) -> PreparedRepeat:
         import torch
         from tensorfs import varena
@@ -609,14 +660,14 @@ class PreparedRepeat:
             )
         )
 
-        def overlaps_input(tensor: Any) -> bool:
+        def overlaps_input(tensor: Any, areas: Any = ranges) -> bool:
             if not isinstance(tensor, torch.Tensor):
                 return False
             storage = tensor.untyped_storage()
             first, size = int(storage.data_ptr()), int(storage.nbytes())
             return bool(size) and any(
                 tensor.device == device and first < end and begin < first + size
-                for device, begin, end in ranges
+                for device, begin, end in areas
             )
 
         if any(overlaps_input(tensor) for tensor in tensors):
@@ -648,13 +699,22 @@ class PreparedRepeat:
             def __torch_dispatch__(
                 self, func: Any, types: Any, args: Any = (), kwargs: Any = None
             ) -> Any:
+                if _unbound_buffers or _undeclared_inputs:
+                    for tensor in tree_leaves((args, kwargs or {})):
+                        if id(tensor) in _unbound_buffers or overlaps_input(
+                            tensor, _undeclared_inputs
+                        ):
+                            raise CapabilityError(
+                                "model stage reads a checkpoint buffer outside its declared paths",
+                                code="prepared_graph_ineligible",
+                            )
                 if torch.Tag.nondeterministic_seeded in func.tags and not _zero_dropout_attention(
                     func, args, kwargs or {}
                 ):
                     raise RuntimeError(
                         "GPU-driven repeats require explicit noise/RNG tensor inputs"
                     )
-                if ranges:
+                if ranges or _immutable_buffers:
                     for position, argument in enumerate(func._schema.arguments):
                         if argument.alias_info is None or not argument.alias_info.is_write:
                             continue
@@ -663,7 +723,10 @@ class PreparedRepeat:
                             if position < len(args)
                             else (kwargs or {}).get(argument.name)
                         )
-                        if any(overlaps_input(tensor) for tensor in tree_leaves(value)):
+                        if any(
+                            id(tensor) in _immutable_buffers or overlaps_input(tensor)
+                            for tensor in tree_leaves(value)
+                        ):
                             raise CapabilityError(
                                 "authored computation writes immutable loaded input storage",
                                 code="prepared_graph_ineligible",

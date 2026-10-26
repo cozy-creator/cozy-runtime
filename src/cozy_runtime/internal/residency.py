@@ -73,6 +73,8 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+# During authored stage preparation, undeclared model reads must not page in sibling blocks.
+_CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -602,6 +604,8 @@ class Binding:
         """
         from tensorfs import varena
 
+        from cozy_runtime.internal.weights import _Routes
+
         memory, model = self.model.memory, self.model
         with self.lock:
             model._claim()
@@ -620,7 +624,10 @@ class Binding:
                     or any(
                         block.aliases is None
                         or block.finals
-                        or any(set(parts) != {"value"} for parts in block.parts.values())
+                        or (
+                            any(set(parts) != {"value"} for parts in block.parts.values())
+                            and (not stage or not isinstance(model.finals, _Routes))
+                        )
                         or not block.storage_bytes
                         or any(
                             part.dtype == "F4"
@@ -733,6 +740,45 @@ class Binding:
                 raise
             finally:
                 model._release()
+
+    def immutable_buffer_ids(self, *, selected: bool = False) -> frozenset[int]:
+        """Declared checkpoint-backed buffers, including idle placeholders in other blocks.
+
+        They are immutable inputs, not mutable module state to clone while capturing one
+        block. Restrict this to named final-layout targets; ordinary nonweight buffers keep
+        the existing state snapshot and restoration behavior.
+        """
+        names: set[str] = set()
+        for block in self.groups if selected else self.model.groups():
+            for key in block.parts:
+                if self.model.finals is not None:
+                    layout = self.model.finals.layout(key)
+                    if layout is not None:
+                        names.update(layout)
+                elif set(block.parts[key]) == {"value"}:
+                    names.add(
+                        self.model.source.bound.get(key, key) if self.model.source.bound else key
+                    )
+        return frozenset(
+            id(site.table[site.name])
+            for name in names
+            for site in self.model.sites.get(name, ())
+            if not site.parameter and site.table[site.name] is not None
+        )
+
+    def undeclared_input_ranges(self) -> tuple[tuple[Any, int, int], ...]:
+        """Existing source/final reservations outside this stage, including escaped views."""
+        return tuple(
+            (
+                self.model.memory.device,
+                int(region.ptr),
+                int(region.ptr) + int(region.allocated_bytes),
+            )
+            for block in self.model.groups()
+            if block not in self.groups
+            for region in (block.region, block.final_region)
+            if region is not None
+        )
 
     def detach_stage(self) -> Any:
         """Keep immutable source/VA identity after checked capture; release physical pins.
@@ -2198,6 +2244,14 @@ class Memory:
             raw[offset:stop].copy_(view, non_blocking=False)
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
+        declared = _CAPTURE_BLOCKS.get()
+        if declared is not None and id(block) not in declared:
+            from cozy_runtime.author._errors import CapabilityError
+
+            raise CapabilityError(
+                "model stage reads a block outside its declared paths",
+                code="prepared_graph_ineligible",
+            )
         global progress
         with self.lock:
             if not block.model.users or block.model.thread != threading.get_ident():
@@ -2263,6 +2317,14 @@ class Memory:
         self, block: _Block, site: _Site, raw_view: tuple[int, _Part] | None = None
     ) -> Tensor:
         global progress
+        declared = _CAPTURE_BLOCKS.get()
+        if declared is not None and id(block) not in declared:
+            from cozy_runtime.author._errors import CapabilityError
+
+            raise CapabilityError(
+                "model stage reads a block outside its declared paths",
+                code="prepared_graph_ineligible",
+            )
         model = block.model
         model._claim()
         try:
