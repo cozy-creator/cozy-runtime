@@ -6,6 +6,7 @@ control flow. Randomness must be explicit tensor inputs. Serving never compiles 
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 import weakref
@@ -1461,12 +1462,24 @@ class PreparedSequence:
             reads: list[tuple[int, Any, tuple[Any, ...]]] = []
             native = None
             execution = None
+            phase_controllers: dict[Any, Any] = {}
+            phase_definitions: dict[tuple[Any, tuple[str, ...]], tuple[str, tuple[Any, ...]]] = {}
+            from tensorfs import varena
+
+            from cozy_runtime.internal.residency import _REQUEST
+
+            request = _REQUEST.get()
+            phase_type = getattr(varena, "PhaseController", None)
             try:
-                for stage_index, stage in enumerate(self.stages):
+                # Every program model is claimed before model-wide phase identities are
+                # snapshotted. Unrelated declared siblings are not decorated or borrowed.
+                for stage in self.stages:
                     for binding in stage._owned_bindings:
                         if binding.model not in claimed:
                             binding.model._claim()
                             claimed.append(binding.model)
+                for stage_index, stage in enumerate(self.stages):
+                    stage._validate()  # claims now fence concurrent model identity changes
                     if self._repeated(stage_index):
                         capsule, _ = stage._native.continuation(producer, reusable=True)
                     else:
@@ -1476,6 +1489,74 @@ class PreparedSequence:
                             capsule, event_ordered=stage._load_ordering == "events"
                         )
                         reads.append((stage_index, observation, stage._owned_bindings))
+                    if callable(phase_type) and request is not None and stage._owned_bindings:
+                        memories = {binding.model.memory for binding in stage._owned_bindings}
+                        if len(memories) == 1:
+                            memory = next(iter(memories))
+                            with memory.lock:
+                                exclusive = (
+                                    request.memory is memory
+                                    and not request.idle
+                                    and not memory._active_beside(request)
+                                )
+                                names = tuple(
+                                    sorted(
+                                        set().union(
+                                            *(
+                                                request.phase(binding.model.name)
+                                                for binding in stage._owned_bindings
+                                            )
+                                        )
+                                    )
+                                )
+                                selected = [
+                                    model
+                                    for model in claimed
+                                    if model.memory is memory and model.name in names
+                                ]
+                                if exclusive and memory.native is not None:
+                                    definition = phase_definitions.get((memory, names))
+                                    if definition is None:
+                                        regions = tuple(
+                                            {
+                                                id(region): region
+                                                for model in selected
+                                                for block in model.groups()
+                                                for region in (block.region, block.final_region)
+                                                if region is not None
+                                            }.values()
+                                        )
+                                        # Model source/fill/generation identity belongs to this
+                                        # submission. Actual readiness is inspected natively
+                                        # at phase entry, never guessed from this snapshot.
+                                        identity = repr(
+                                            tuple(
+                                                sorted(
+                                                    (
+                                                        model.name,
+                                                        model.wanted_identity(),
+                                                        model.generation,
+                                                    )
+                                                    for model in selected
+                                                )
+                                            )
+                                        )
+                                        # Only the compact digest crosses the capability and
+                                        # progress boundaries; complete immutable identities
+                                        # can contain large per-weight route tables.
+                                        digest = hashlib.sha256(identity.encode()).hexdigest()
+                                        label = "+".join(
+                                            sorted(model.component for model in selected)
+                                        )[:128]
+                                        key = f"{label}:{digest}"
+                                        definition = key, regions
+                                        phase_definitions[(memory, names)] = definition
+                            if exclusive and memory.native is not None:
+                                controller = phase_controllers.get(memory)
+                                if controller is None:
+                                    controller = phase_type(memory.native)
+                                    phase_controllers[memory] = controller
+                                capsule = controller.wrap(capsule, *definition)
                     capsules.append(capsule)
                 native = (
                     _execution.NativeSequence(capsules, self.device)
@@ -1483,7 +1564,7 @@ class PreparedSequence:
                     else _execution.NativeSequence(capsules, self.device, self._repeat)
                 )
                 execution = _SequenceExecution(
-                    self, context, outputs, readout, claimed, native, reads
+                    self, context, outputs, readout, claimed, native, reads, phase_controllers
                 )
                 self._native, self._active = native, execution
                 for stage in self.stages:
@@ -1730,9 +1811,10 @@ class _SequenceCapture:
 
 
 class _SequenceExecution(Execution):
-    def __init__(self, plan, context, outputs, readout, models, native, reads):
+    def __init__(self, plan, context, outputs, readout, models, native, reads, phases=None):
         super().__init__(plan, context, 0, outputs, readout, models, native)
         self._stage_reads = reads
+        self._phase_controllers = phases or {}
         self._prefetch_cleanup = ExitStack()
         self._prefetch_admission: list[dict[str, object]] = []
 
@@ -1815,12 +1897,28 @@ class _SequenceExecution(Execution):
         # Base execution calls this only after checked native completion/readout. If the
         # drain is unproven, owners and this window lease remain retained for retirement.
         self._prefetch_cleanup.close()
+        # Native phase entry changed preferences without a Python callback. After every
+        # source/prefetch/consumer is checked, invalidate only our stale eager-policy cache;
+        # the next ordinary phase recomputes it. Preserve another live request's policy.
+        for memory in self._phase_controllers:
+            with memory.lock:
+                request = self._load_request
+                if (
+                    request is not None
+                    and not memory._active_beside(request)
+                    and memory._phase_request == request.id
+                ):
+                    memory._phase_names = frozenset()
+                    memory._phase_request = None
         super()._release_models()
 
     def facts(self) -> dict[str, object]:
         facts = self.plan.facts()
         facts["sequence"] = dict(self._load_job.facts())
         facts["stage_prefetch_admission"] = list(self._prefetch_admission)
+        facts["native_phases"] = [
+            dict(controller.facts()) for controller in self._phase_controllers.values()
+        ]
         facts["stage_inputs"] = [
             {"stage": index, **dict(job.facts())} for index, job, _ in self._stage_reads
         ]
