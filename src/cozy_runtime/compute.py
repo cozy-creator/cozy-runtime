@@ -470,6 +470,7 @@ class PreparedRepeat:
         owners: Sequence[object] = (),
         prefix: Callable[[], object] | None = None,
         suffix: Callable[[], object] | None = None,
+        _release_loaded_inputs: bool = False,
     ) -> PreparedRepeat:
         import torch
         from tensorfs import varena
@@ -520,6 +521,13 @@ class PreparedRepeat:
                 code="prepared_graph_ineligible",
             )
         held.update((id(tensor), tensor) for tensor in immutable)
+        if _release_loaded_inputs and (
+            not immutable or len(owners) != 1 or not isinstance(owners[0], varena.LoadSlot)
+        ):
+            raise CapabilityError(
+                "detached stage capture requires one existing-region raw input slot",
+                code="prepared_graph_ineligible",
+            )
 
         class CaptureOwners(TorchDispatchMode):  # type: ignore[misc]  # Torch is optional in checks.
             def __init__(self, retain: bool) -> None:
@@ -630,6 +638,16 @@ class PreparedRepeat:
                         "prefix_graph": before.raw_cuda_graph() if before is not None else 0,
                         "suffix_graph": after.raw_cuda_graph() if after is not None else 0,
                     }
+                # Internal raw-stage capture retains addresses through its native source
+                # descriptor after this method returns. Remove only immutable input storage
+                # owners here; the caller must then drop every private view and ask native
+                # detachment to refuse any remaining foreign alias before admitting execution.
+                retained_owners = owners
+                if _release_loaded_inputs:
+                    held = {
+                        key: tensor for key, tensor in held.items() if not overlaps_input(tensor)
+                    }
+                    retained_owners = ()
                 native = _execution.ResidentRepeat(
                     graph.raw_cuda_graph(),
                     index.data_ptr(),
@@ -641,7 +659,7 @@ class PreparedRepeat:
                         index,
                         *held.values(),
                         *(tensor.untyped_storage() for tensor in held.values()),
-                        *owners,
+                        *retained_owners,
                     ],
                     **phase_args,
                 )
@@ -747,8 +765,6 @@ class PreparedRepeat:
     def submit(self, context: Context | None = None) -> Execution:
         import torch
 
-        if self._sequence_owner is not None and self._sequence_owner() is not None:
-            raise RuntimeError("this prepared stage belongs to a PreparedSequence")
         if torch.cuda.is_current_stream_capturing():
             raise CapabilityError(
                 "prepared submission during CUDA capture is not supported",
@@ -759,6 +775,8 @@ class PreparedRepeat:
             if context.device.type != "cuda" or context.device.index not in (None, self.device):
                 raise ValueError("prepared work does not belong to this request's CUDA device")
         with self._submission:
+            if self._sequence_owner is not None and self._sequence_owner() is not None:
+                raise RuntimeError("this prepared stage belongs to a PreparedSequence")
             self._validate()
             if self._load is not None and self._load_used:
                 raise RuntimeError("a prepared native load is one-shot; prepare a new slot")
@@ -1008,6 +1026,18 @@ class PreparedSequence:
     ) -> None:
         import torch
 
+        try:
+            import cozy_runtime._kernels._execution as native
+        except ModuleNotFoundError as error:
+            if error.name != "cozy_runtime._kernels._execution":
+                raise
+            raise CapabilityError(
+                "native sequence module is unavailable", code="prepared_graph_ineligible"
+            ) from error
+        if not callable(getattr(native, "NativeSequence", None)):
+            raise CapabilityError(
+                "native sequence module is unavailable", code="prepared_graph_ineligible"
+            )
         self.stages = tuple(stages)
         if not self.stages or len(self.stages) > 65536:
             raise ValueError("a prepared sequence needs 1..65536 stages")
@@ -1028,7 +1058,9 @@ class PreparedSequence:
         self._submission = threading.RLock()
         self._active: _SequenceExecution | None = None
         self._native: Any = None
-        self._closed = False
+        # A rejected constructor owns no definitions. In particular its destructor must
+        # not close a stage already transferred to another live sequence.
+        self._closed = True
         self._closing = False
         self._load = None
         self._owned_bindings: tuple[Any, ...] = ()
@@ -1046,8 +1078,10 @@ class PreparedSequence:
                         "this input loader cannot defer its native stage",
                         code="prepared_load_unavailable",
                     )
+            owner = weakref.ref(self)
             for stage in self.stages:
-                stage._sequence_owner = weakref.ref(self)
+                stage._sequence_owner = owner
+            self._closed = False
 
     def _locked_stages(self) -> ExitStack:
         locks = ExitStack()
@@ -1061,7 +1095,11 @@ class PreparedSequence:
 
     def valid(self) -> bool:
         with self._submission, self._locked_stages():
-            return not self._closed and all(stage.valid() for stage in self.stages)
+            return (
+                not self._closed
+                and (self._active is None or self._active._failure is None)
+                and all(stage.valid() for stage in self.stages)
+            )
 
     def facts(self) -> dict[str, object]:
         stages = [stage.facts() for stage in self.stages]
@@ -1101,11 +1139,11 @@ class PreparedSequence:
                 producer = torch.cuda.current_stream(self.device).cuda_stream
             claimed: list[Any] = []
             capsules: list[Any] = []
-            reads: list[tuple[Any, tuple[Any, ...]]] = []
+            reads: list[tuple[int, Any, tuple[Any, ...]]] = []
             native = None
             execution = None
             try:
-                for stage in self.stages:
+                for stage_index, stage in enumerate(self.stages):
                     for binding in stage._owned_bindings:
                         if binding.model not in claimed:
                             binding.model._claim()
@@ -1115,7 +1153,7 @@ class PreparedSequence:
                         capsule, observation = stage._load.continuation(
                             capsule, event_ordered=stage._load_ordering == "events"
                         )
-                        reads.append((observation, stage._owned_bindings))
+                        reads.append((stage_index, observation, stage._owned_bindings))
                     capsules.append(capsule)
                 native = _execution.NativeSequence(capsules, self.device)
                 execution = _SequenceExecution(
@@ -1126,6 +1164,15 @@ class PreparedSequence:
                     stage._active = execution
                 # All Python/native owners exist before the sole native worker can start.
                 native.start()
+                if context is not None and not reads:
+                    # All resident weights and graph workspace are already retained. Reuse
+                    # the existing bounded next-job preparation policy; streamed plans need
+                    # their future window/workspace accounted before enabling speculation.
+                    from cozy_runtime.internal.residency import _REQUEST
+
+                    request = _REQUEST.get()
+                    if request is not None:
+                        request.prefetch_queued()
                 return execution
             except BaseException as error:
                 if native is not None:
@@ -1172,6 +1219,8 @@ class PreparedSequence:
             self.close()
 
     def close(self) -> None:
+        if self._closed:
+            return
         with self._submission, self._locked_stages():
             if self._closed:
                 return
@@ -1213,13 +1262,15 @@ class _SequenceExecution(Execution):
     def facts(self) -> dict[str, object]:
         facts = self.plan.facts()
         facts["sequence"] = dict(self._load_job.facts())
-        facts["stage_inputs"] = [dict(job.facts()) for job, _ in self._stage_reads]
+        facts["stage_inputs"] = [
+            {"stage": index, **dict(job.facts())} for index, job, _ in self._stage_reads
+        ]
         return facts
 
     def _record_load(self, facts: Mapping[str, Any]) -> None:
         if self._load_recorded or not facts.get("done", False):
             return
-        for job, bindings in self._stage_reads:
+        for _, job, bindings in self._stage_reads:
             loaded = job.facts()
             if self._load_request is not None and loaded.get("read_done", False):
                 blocks = [block for binding in bindings for block in binding.groups]
