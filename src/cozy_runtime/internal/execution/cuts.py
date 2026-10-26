@@ -506,7 +506,7 @@ def split[T](
     target = (
         next((lv for lv in range(deepest, -1, -1) if window(lv) > points[-1][0]), 0)
         if points
-        else max(deepest - 7, 1)
+        else min(deepest, max(deepest - 7, 1))
     )
 
     def measuring(level: int, granularity: int) -> int:
