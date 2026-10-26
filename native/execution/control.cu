@@ -5,6 +5,10 @@
 #include <cstdio>
 #include <new>
 #include <vector>
+#ifdef COZY_REPEAT_DIAGNOSTICS
+#include <atomic>
+static std::atomic<unsigned long long> diagnostic_next{0};
+#endif
 
 template<class Body> static int on_device(int device, Body body) {
     int previous = 0;
@@ -28,6 +32,11 @@ struct Control {
 };
 struct Snapshot { unsigned completed, cancel, suffix_completed, body_entered, input_invalid; };
 struct Repeat {
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    unsigned long long diagnostic_id = diagnostic_next.fetch_add(1, std::memory_order_relaxed);
+    unsigned diagnostic_types[6]{};
+    unsigned diagnostic_depth = 0;
+#endif
     int device = 0;
     unsigned steps = 0;
     unsigned nodes = 0;
@@ -54,6 +63,30 @@ struct Repeat {
     bool pending_sample = false;
     bool input_checked = false;
 };
+
+#ifdef COZY_REPEAT_DIAGNOSTICS
+// Compile-time diagnostic only: bounded constructor records, never tensor data or addresses.
+static void diagnostic_call(const Repeat *run, const char *event, const char *call, int code) {
+    std::fprintf(stderr, "[cozy-repeat-diag-v1] id=%llu event=%s call=%s code=%d device=%d steps=%u\n",
+                 run->diagnostic_id, event, call, code, run->device, run->steps);
+    std::fflush(stderr);
+}
+static void diagnostic_outputs(const Repeat *run, const char *stage, cudaGraph_t *outputs) {
+    std::fprintf(stderr, "[cozy-repeat-diag-v1] id=%llu stage=%s array_present=%d\n",
+                 run->diagnostic_id, stage, outputs != nullptr);
+    std::fflush(stderr);
+    if (outputs) {
+        std::fprintf(stderr, "[cozy-repeat-diag-v1] id=%llu stage=%s child_present=%d\n",
+                     run->diagnostic_id, stage, outputs[0] != nullptr);
+        std::fflush(stderr);
+    }
+}
+#define DIAGNOSTIC_CALL(event, call, code) diagnostic_call(run, event, call, code)
+#define DIAGNOSTIC_OUTPUTS(stage, outputs) diagnostic_outputs(run, stage, outputs)
+#else
+#define DIAGNOSTIC_CALL(event, call, code) ((void)0)
+#define DIAGNOSTIC_OUTPUTS(stage, outputs) ((void)0)
+#endif
 
 __global__ void set_input(Control *state, unsigned long long error) { state->input_error = error; }
 
@@ -116,6 +149,13 @@ static cudaError_t ineligible(Repeat *run, const char *stage, const char *reason
 // cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle.
 static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
                            Repeat *run, const char *stage, unsigned depth = 0) {
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    if (depth == 0) {
+        for (auto &count : run->diagnostic_types) count = 0;
+        run->diagnostic_depth = 0;
+    }
+    if (depth > run->diagnostic_depth) run->diagnostic_depth = depth;
+#endif
     if (depth > 32) return ineligible(run, stage, "depth_limit", -1, depth, 0, total);
     size_t count = 0;
     auto error = cudaGraphGetNodes(graph, nullptr, &count);
@@ -130,6 +170,12 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
         cudaGraphNodeType type;
         error = cudaGraphNodeGetType(node, &type);
         if (error != cudaSuccess) return error;
+#ifdef COZY_REPEAT_DIAGNOSTICS
+        const unsigned bucket = type == cudaGraphNodeTypeKernel ? 0
+            : type == cudaGraphNodeTypeGraph ? 1 : type == cudaGraphNodeTypeMemcpy ? 2
+            : type == cudaGraphNodeTypeMemset ? 3 : type == cudaGraphNodeTypeEmpty ? 4 : 5;
+        ++run->diagnostic_types[bucket];
+#endif
         if (type == cudaGraphNodeTypeGraph) {
             cudaGraph_t child;
             error = cudaGraphChildGraphNodeGetGraph(node, &child);
@@ -169,6 +215,15 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
             return ineligible(run, stage, "node_type", type, depth, count, total);
         }
     }
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    if (depth == 0) {
+        const auto &types = run->diagnostic_types;
+        std::fprintf(stderr, "[cozy-repeat-diag-v1] id=%llu stage=%s local_nodes=%zu total_nodes=%u max_depth=%u kernel=%u child=%u memcpy=%u memset=%u empty=%u other=%u\n",
+                     run->diagnostic_id, stage, count, total, run->diagnostic_depth,
+                     types[0], types[1], types[2], types[3], types[4], types[5]);
+        std::fflush(stderr);
+    }
+#endif
     return cudaSuccess;
 }
 
@@ -218,7 +273,8 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     // Return ownership even on failure so Rust can retain the source after uncertain cleanup.
     *out = run;
     auto checked = [&](cudaError_t result) { return result; };
-#define CHECK(call) do { error = checked(call); if (error != cudaSuccess) return error; } while (0)
+#define CHECK(call) do { DIAGNOSTIC_CALL("enter", #call, 0); error = checked(call); \
+    DIAGNOSTIC_CALL("exit", #call, error); if (error != cudaSuccess) return error; } while (0)
     CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device, run, "source"));
     if (!run->nodes) return -101;
     unsigned total = run->nodes;
@@ -270,6 +326,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     input_if.conditional.size = 1;
     cudaGraphNode_t accepted_node;
     CHECK(cudaGraphAddNode(&accepted_node, run->graph, &input_node, nullptr, 1, &input_if));
+    DIAGNOSTIC_OUTPUTS("input_if", input_if.conditional.phGraph_out);
     auto program = input_if.conditional.phGraph_out[0];
     void *begin_args[] = {&run->control, &run->index};
     cudaKernelNodeParams begin{};
@@ -299,6 +356,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     }
     cudaGraphNode_t loop;
     CHECK(cudaGraphAddNode(&loop, program, &predecessor, nullptr, 1, &conditional));
+    DIAGNOSTIC_OUTPUTS("while", conditional.conditional.phGraph_out);
     auto body = conditional.conditional.phGraph_out[0];
     cudaGraphNode_t compute;
     CHECK(cudaGraphAddChildGraphNode(&compute, body, nullptr, 0, reinterpret_cast<cudaGraph_t>(source)));
@@ -327,6 +385,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
         conditional.conditional.size = 1;
         cudaGraphNode_t tail;
         CHECK(cudaGraphAddNode(&tail, program, &decide, nullptr, 1, &conditional));
+        DIAGNOSTIC_OUTPUTS("suffix_if", conditional.conditional.phGraph_out);
         auto final = conditional.conditional.phGraph_out[0];
         cudaGraphNode_t compute, complete;
         CHECK(cudaGraphAddChildGraphNode(&compute, final, nullptr, 0, reinterpret_cast<cudaGraph_t>(suffix)));
@@ -346,6 +405,11 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
 
 extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
                                   unsigned steps, uintptr_t prefix, uintptr_t suffix, Repeat **out) {
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    std::fprintf(stderr, "[cozy-repeat-diag-v1] event=create_entry device=%d steps=%u source_present=%d index_present=%d prefix_present=%d suffix_present=%d\n",
+                 device, steps, source != 0, index != 0, prefix != 0, suffix != 0);
+    std::fflush(stderr);
+#endif
     *out = nullptr;
     return on_device(device, [&] { return create(source, index, device, steps, prefix, suffix, out); });
 }
