@@ -149,11 +149,15 @@ class PreparedRepeat:
         *,
         state: Sequence[Any],
         owner: object,
+        paths: tuple[str, ...] = ("",),
         load_ordering: Literal["checked", "events", "auto"] = "events",
     ) -> PreparedRepeat:
         """Record one immutable raw model block/phase at its existing managed addresses.
 
-        `owner` is a placed component root or a retained subset binding. The callback runs
+        `owner` is a placed component root or a retained subset binding. For a root,
+        `paths` selects its named block subtrees plus common weights; () selects only common
+        weights. An explicit binding already defines its paths and accepts only the default.
+        The callback runs
         only during preparation and writes explicit GPU boundary state. Use PreparedSequence
         to advance these stages or repeat a block range without Python callbacks. A shared
         GPU timestep belongs in declared state and advances in the authored sampler stage.
@@ -188,15 +192,36 @@ class PreparedRepeat:
                         code="prepared_graph_ineligible",
                     )
 
-        return cls.capture(
-            record,
-            state=tensors,
-            steps=1,
-            owners=(owner,),
-            load_component=owner,
-            load_ordering=load_ordering,
-            _detach_stage=True,
-        )
+        from cozy_runtime.internal.residency import Binding
+
+        if not isinstance(paths, tuple) or any(not isinstance(path, str) for path in paths):
+            raise ValueError("model stage paths must be a tuple of module paths")
+        selected = None
+        if isinstance(owner, Binding):
+            if paths != ("",):
+                raise ValueError("an explicit model binding already selects its stage paths")
+        elif paths != ("",):
+            placed = PLACED.get(owner) if isinstance(owner, torch.nn.Module) else None
+            if placed is None:
+                raise CapabilityError(
+                    "model stage paths require a placed component root",
+                    code="prepared_graph_ineligible",
+                )
+            selected = placed[0].retain(placed[1], paths)
+            owner = selected
+        try:
+            return cls.capture(
+                record,
+                state=tensors,
+                steps=1,
+                owners=(owner,),
+                load_component=owner,
+                load_ordering=load_ordering,
+                _detach_stage=True,
+            )
+        finally:
+            if selected is not None:
+                selected.close()
 
     @classmethod
     def capture(
