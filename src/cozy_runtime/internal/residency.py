@@ -1864,9 +1864,10 @@ class Memory:
     def _stage_prefetch_window(
         self, required: int, missing: int, request: Request | None, owner: object
     ) -> Callable[[], None] | None:
-        """Admit an attempt's two-source window after actual graph/readout allocations.
+        """Admit bounded next-source speculation after actual graph/readout allocations.
 
-        This never reclaims. Driver free and the request budget already exclude Torch
+        The streaming limit bounds idle nonpreferred cache, not active physical residency.
+        Existing useful cache may remain beyond the current/next source pair. This never reclaims. Driver free and the request budget already exclude Torch
         reservations (including graph scratch and boundary slots) and native residency.
         The speculative native allocation independently rechecks pressure at read time.
         """
