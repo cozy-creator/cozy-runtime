@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.16,<0.17",
+    "tensorfs>=0.16,<0.18",
     "cryptography>=45",
     "msgspec>=0.19",
     "numpy>=1.26",
@@ -117,7 +117,7 @@ media = [
 ]
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
-model-execution = ["tensorfs>=0.16,<0.17"]
+model-execution = ["tensorfs>=0.16,<0.18"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
