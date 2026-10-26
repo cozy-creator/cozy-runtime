@@ -871,6 +871,17 @@ class Binding:
             if self._load_slot is not None:
                 self._load_slot.close()
                 self._load_slot = None
+                # Abandoning the slot drops any unpublished fill, leaving its region Cold.
+                # A capture-only alias may have escaped and outlive it, so retire the region
+                # identity of every block that was being filled (not resident), as _ensure
+                # does on a failed fill. Otherwise a later prepare() returns Busy against the
+                # dropped fill and breaks the eager fallback. Resident inputs keep their cache.
+                with self.model.memory.lock:
+                    for block in self.groups:
+                        region = block.region
+                        if region is not None and not region.resident:
+                            block.region = None
+                            block.preferred = block.preference_set = False
             self._load_data = None
             self._load_storage.clear()
             self._load_source = None

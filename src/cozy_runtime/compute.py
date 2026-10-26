@@ -45,6 +45,8 @@ def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
 def _native_error(error: Exception) -> NoReturn:
     import torch
 
+    if getattr(error, "load_unavailable", False):
+        raise CapabilityError(str(error), code="prepared_load_unavailable") from error
     if getattr(error, "eligibility_refusal", False):
         raise CapabilityError(str(error), code="prepared_graph_ineligible") from error
 
@@ -203,7 +205,7 @@ class PreparedRepeat:
         import torch
 
         from cozy_runtime import graphs
-        from cozy_runtime.internal.residency import Binding, StaleBinding
+        from cozy_runtime.internal.residency import Binding, ResidencyError, StaleBinding
 
         try:
             import cozy_runtime._kernels._execution as _execution
@@ -362,10 +364,17 @@ class PreparedRepeat:
                         if owner is load_component:
                             try:
                                 load = binding.prepare_load()
-                            except StaleBinding as error:
+                            except ResidencyError as error:
+                                # StaleBinding and a concurrent-use/_claim refusal are both
+                                # pre-submission: fall back to an eager resident load.
                                 raise CapabilityError(
                                     str(error), code="prepared_graph_ineligible"
                                 ) from error
+                            except RuntimeError as error:
+                                # Native region refusals (busy, capture-active, ineligible
+                                # descriptor, or not-local inputs) map to a fallback code; OOM,
+                                # device faults and poisoning keep their fatal classification.
+                                _native_error(error)
                             if load is not None:
                                 resolved.append(load)
                         if resident_only or (owner is load_component and load is None):
