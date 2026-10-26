@@ -343,16 +343,24 @@ impl Shared {
             self.advance_stage(index, false)?;
         }
         for pass in 0..passes {
+            let before = self
+                .state
+                .lock()
+                .map_err(|_| (begin, Status::unproven()))?
+                .completed_stages;
             for index in begin..end {
                 self.advance_stage(index, pass != 0)?;
             }
+            // A cancellation arriving after the final stage completed must not erase
+            // that whole pass from progress (the GPU sampler may already advance its step).
+            let mut state = self.state.lock().map_err(|_| (begin, Status::unproven()))?;
+            if state.completed_stages - before == end - begin {
+                state.completed_passes += 1;
+            }
+            drop(state);
             if self.canceled.load(Ordering::Acquire) {
                 return Ok(());
             }
-            self.state
-                .lock()
-                .map_err(|_| (begin, Status::unproven()))?
-                .completed_passes += 1;
         }
         for index in end..self.stages.len() {
             self.advance_stage(index, false)?;
