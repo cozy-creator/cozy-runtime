@@ -73,6 +73,8 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+# During authored stage preparation, undeclared model reads must not page in sibling blocks.
+_CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -557,6 +559,8 @@ class Binding:
         self.lock = threading.RLock()
         self.last: Any = None
         self._load_slot: Any = None
+        self._stage_source: Any = None
+        self._stage_regions: tuple[tuple[_Block, Any], ...] = ()
         self._load_data: dict[_Block, dict[str, dict[str, Tensor]]] | None = None
         self._load_storage: dict[_Block, int] = {}
         self._load_source: Weights | None = None
@@ -571,10 +575,11 @@ class Binding:
             and self.fill is not None
             and self.fill == self.model.wanted_identity()
             and self.generation == self.model.generation
+            and all(block.region is region for block, region in self._stage_regions)
             and (self._load_source is None or self.model.source is self._load_source)
             and all(
-                (value := site.table[site.name]) is not None
-                and tuple(value.stride()) == stride for site, stride in self._load_target_strides
+                (value := site.table[site.name]) is not None and tuple(value.stride()) == stride
+                for site, stride in self._load_target_strides
             )
             and all(
                 (value := site.table[site.name]) is not None
@@ -591,13 +596,15 @@ class Binding:
     def resident(self) -> bool:
         return self.valid() and all(b.data is not None or b.cached() for b in self.groups)
 
-    def prepare_load(self) -> Any:
+    def prepare_load(self, *, stage: bool = False) -> Any:
         """Create capture-private views for immutable raw blocks, without reading weights.
 
         Ordinary block data is never changed here. The native slot atomically retains ready
         regions and owns unpublished missing fills; its views are installed only by prepare().
         """
         from tensorfs import varena
+
+        from cozy_runtime.internal.weights import _Routes
 
         memory, model = self.model.memory, self.model
         with self.lock:
@@ -608,6 +615,7 @@ class Binding:
                     or self.used
                     or self.held
                     or self._load_slot is not None
+                    or self._stage_source is not None
                     or not memory.cuda
                     or memory.capturing()
                     or memory.native is None
@@ -616,7 +624,10 @@ class Binding:
                     or any(
                         block.aliases is None
                         or block.finals
-                        or any(set(parts) != {"value"} for parts in block.parts.values())
+                        or (
+                            any(set(parts) != {"value"} for parts in block.parts.values())
+                            and (not stage or not isinstance(model.finals, _Routes))
+                        )
                         or not block.storage_bytes
                         or any(
                             part.dtype == "F4"
@@ -632,7 +643,8 @@ class Binding:
                     raise StaleBinding("native component loading needs idle immutable raw layouts")
                 if any(
                     getattr(module, "_compiled_call_impl", None) is not None
-                    or hasattr(module, "_orig_mod") for module in model.module.modules()
+                    or hasattr(module, "_orig_mod")
+                    for module in model.module.modules()
                 ):
                     raise StaleBinding("compiled modules require resident weight preparation")
                 self._load_source = model.source
@@ -679,7 +691,20 @@ class Binding:
                         raise torch.OutOfMemoryError(
                             "native component inputs exceed local capacity"
                         )
-                slot = varena.LoadSlot.from_regions(model.source.ck, groups)
+                if stage and not getattr(varena.LoadSlot, "supports_ready_stage", False):
+                    raise StaleBinding("TensorFS lacks ready-input model stage preparation")
+                slot = (
+                    varena.LoadSlot.from_regions(model.source.ck, groups, keep_ready=True)
+                    if stage
+                    else varena.LoadSlot.from_regions(model.source.ck, groups)
+                )
+                if (
+                    stage
+                    and slot is not None
+                    and not callable(getattr(slot._native, "detach_source", None))
+                ):
+                    slot.close()
+                    raise StaleBinding("TensorFS lacks detached model-stage input ownership")
                 # Native now owns ready inputs, or ordinary resident capture revalidates.
                 ready_uses.clear()
                 if slot is None:
@@ -716,6 +741,89 @@ class Binding:
             finally:
                 model._release()
 
+    def immutable_buffer_ids(self, *, selected: bool = False) -> frozenset[int]:
+        """Declared checkpoint-backed buffers, including idle placeholders in other blocks.
+
+        They are immutable inputs, not mutable module state to clone while capturing one
+        block. Restrict this to named final-layout targets; ordinary nonweight buffers keep
+        the existing state snapshot and restoration behavior.
+        """
+        names: set[str] = set()
+        for block in self.groups if selected else self.model.groups():
+            for key in block.parts:
+                if self.model.finals is not None:
+                    layout = self.model.finals.layout(key)
+                    if layout is not None:
+                        names.update(layout)
+                elif set(block.parts[key]) == {"value"}:
+                    names.add(
+                        self.model.source.bound.get(key, key) if self.model.source.bound else key
+                    )
+        return frozenset(
+            id(site.table[site.name])
+            for name in names
+            for site in self.model.sites.get(name, ())
+            if not site.parameter and site.table[site.name] is not None
+        )
+
+    def undeclared_input_ranges(self) -> tuple[tuple[Any, int, int], ...]:
+        """Existing source/final reservations outside this stage, including escaped views."""
+        return tuple(
+            (
+                self.model.memory.device,
+                int(region.ptr),
+                int(region.ptr) + int(region.allocated_bytes),
+            )
+            for block in self.model.groups()
+            if block not in self.groups
+            for region in (block.region, block.final_region)
+            if region is not None
+        )
+
+    def detach_stage(self) -> Any:
+        """Keep immutable source/VA identity after checked capture; release physical pins.
+
+        The native source owns the Region reservations. It reacquires ready pins or missing
+        fills on each sequence pass, without calling Python or replacing parameter addresses.
+        """
+        with self.lock:
+            slot = self._load_slot
+            if (
+                slot is None
+                or self._load_data is None
+                or not self.used
+                or self._stage_source is not None
+                or not self.valid()
+            ):
+                raise StaleBinding("detachment requires a valid completed raw capture")
+            if self.last is not None:
+                try:
+                    self.last.synchronize()
+                except BaseException as incomplete:
+                    self._unproven(incomplete)
+            with self.model.memory.lock:
+                if any(block.count or block.loading for block in self.groups):
+                    raise StaleBinding("model stage capture is still using its input views")
+                regions = tuple((block, block.region) for block in self.groups)
+                if any(region is None for _, region in regions):
+                    raise StaleBinding("model stage lost its managed input reservation")
+                for block, _ in self.held:
+                    block.retained -= 1
+                    self.model.memory._idle(block)
+                self.held.clear()
+                self._load_data = None
+                self._load_storage.clear()
+            # Drop every private Python tensor owner before native's actual live-Pin check.
+            # An escaped external view makes this refuse; no refcount guess or gc sweep.
+            slot._tensor = None
+            slot._tensors = None
+            source = slot._native.detach_source()
+            self._stage_regions = regions
+            self._stage_source = source
+            self._load_slot = None
+            slot.close()
+            return source
+
     def immutable_inputs(self) -> tuple[Tensor, ...]:
         """The native-loaded source ranges, including the all-ready resident fallback."""
         if self._load_source is None:
@@ -741,6 +849,8 @@ class Binding:
                     and self.model.wanted_identity() is None
                     and self.generation == self.model.generation
                 )
+                if self._stage_source is not None:
+                    raise StaleBinding("detached model stages prepare only through native input")
                 if not self.valid() and not ephemeral:
                     raise StaleBinding("graph weight storage or fill changed")
                 request = _REQUEST.get()
@@ -886,6 +996,8 @@ class Binding:
             self._load_storage.clear()
             self._load_source = None
             self._load_target_strides.clear()
+            self._stage_source = None
+            self._stage_regions = ()
 
 
 class Region:
@@ -2132,6 +2244,14 @@ class Memory:
             raw[offset:stop].copy_(view, non_blocking=False)
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
+        declared = _CAPTURE_BLOCKS.get()
+        if declared is not None and id(block) not in declared:
+            from cozy_runtime.author._errors import CapabilityError
+
+            raise CapabilityError(
+                "model stage reads a block outside its declared paths",
+                code="prepared_graph_ineligible",
+            )
         global progress
         with self.lock:
             if not block.model.users or block.model.thread != threading.get_ident():
@@ -2197,6 +2317,14 @@ class Memory:
         self, block: _Block, site: _Site, raw_view: tuple[int, _Part] | None = None
     ) -> Tensor:
         global progress
+        declared = _CAPTURE_BLOCKS.get()
+        if declared is not None and id(block) not in declared:
+            from cozy_runtime.author._errors import CapabilityError
+
+            raise CapabilityError(
+                "model stage reads a block outside its declared paths",
+                code="prepared_graph_ineligible",
+            )
         model = block.model
         model._claim()
         try:

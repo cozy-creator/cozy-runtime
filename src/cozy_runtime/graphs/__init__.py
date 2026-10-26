@@ -1187,7 +1187,9 @@ class _State:
     it once, so a change means the forward has state a replay would not keep (run 11226:
     measuring must never change a later request)."""
 
-    def __init__(self, torch: Any, module: Any) -> None:
+    def __init__(
+        self, torch: Any, module: Any, *, immutable_buffers: frozenset[int] = frozenset()
+    ) -> None:
         self.torch = torch
         self.modules = list(module.modules())
         self.plain = [{n: v for n, v in vars(m).items() if type(v) in _PLAIN} for m in self.modules]
@@ -1195,8 +1197,29 @@ class _State:
             (name, tensor, tensor._version, tensor.clone())
             for m in self.modules
             for name, tensor in m._buffers.items()
-            if tensor is not None
+            if tensor is not None and id(tensor) not in immutable_buffers
         ]
+        from cozy_runtime.internal.residency import Placeholder
+
+        self.immutable = []
+        for m in self.modules:
+            for name, tensor in m._buffers.items():
+                if tensor is None or id(tensor) not in immutable_buffers:
+                    continue
+                if isinstance(tensor, Placeholder):
+                    saved = Placeholder(tensor.shape, tensor.dtype, tensor.device)
+                    saved._varena_read = tensor._varena_read
+                else:
+                    saved = tensor.detach()
+                geometry = (
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                    tensor.device,
+                    tensor.storage_offset(),
+                    tensor.data_ptr(),
+                )
+                self.immutable.append((m._buffers, name, tensor, tensor._version, saved, geometry))
         self.rng = torch.random.get_rng_state(), torch.cuda.get_rng_state()
         self.changed: str | None = None
 
@@ -1209,6 +1232,24 @@ class _State:
                     if vars(module).get(name, _EAGER) != value:
                         changed.add(name)
                         vars(module)[name] = value
+            for table, name, tensor, version, saved, geometry in self.immutable:
+                current = (
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                    tensor.dtype,
+                    tensor.device,
+                    tensor.storage_offset(),
+                    tensor.data_ptr(),
+                )
+                if (
+                    table.get(name) is not tensor
+                    or tensor._version != version
+                    or current != geometry
+                ):
+                    changed.add(name)
+                    if current != geometry:
+                        tensor.data = saved
+                    table[name] = tensor
             for name, tensor, version, saved in self.buffers:
                 if tensor._version != version:
                     changed.add(name)
