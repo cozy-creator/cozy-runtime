@@ -13,6 +13,7 @@ import msgspec
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime.author._assets import FileState, GrantedInput, InputMetadata
+from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
 from cozy_runtime.internal.attention import Choice
 from cozy_runtime.internal.canonical import Json
@@ -234,6 +235,7 @@ class Binding(Release, frozen=True, kw_only=True):
     package: str = ""
     model: str = ""
     adapters: tuple[Adapter, ...] = ()
+    prepared_use: PreparedUse | None = None
     #: In a group, each placeable component's GPU (an index within it): 0 keeps it beside the
     #: serial scope, g >= 1 keeps it resident on GPU g, where its calls and remote scopes run.
     homes: dict[str, int] = {}

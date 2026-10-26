@@ -866,6 +866,7 @@ class Executor:
         self.residency: Any = None
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
+        self._prepared_uses: dict[str, object] = {}
         self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
         self.group_sharded: set[tuple[str, str]] = set()
         #: component -> the follower rank that keeps it resident for the whole group
@@ -2364,6 +2365,21 @@ class Executor:
             self._discover_provisioned(binding)
         stage("package_import")
 
+        from cozy_runtime.author._prepared_use import prepared_use
+
+        use = None if binding.prepared_use is None else prepared_use(
+            msgspec.to_builtins(binding.prepared_use)
+        )
+        registration = None
+        if use is not None:
+            entrypoint = binding.model_binding_path.partition(".models.")[0]
+            registration = self.discovered.app.get(entrypoint)
+            if binding.model_parameter_name not in registration.model_prepared_use:
+                return self._refusal(
+                    "prepared_use_binding", "the model declares no prepared-use field"
+                )
+            self._prepared_uses[binding.model_parameter_name] = use
+
         # The header ref identifies stored weights and metadata. Runtime opens it through
         # TensorFS in the shared store, then plans reads from its components.
         # The component SET, in the contract's own declared order. A single-component
@@ -2482,6 +2498,21 @@ class Executor:
         # the plan already chosen and the package already imported; a plan whose route the
         # package cannot consent to is not a candidate, so it is never built.
         consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
+        prepared_ineligible = ""
+        if use is not None:
+            assert registration is not None
+            if self.world != 1 or len(registration.surface.slots) != 1:
+                prepared_ineligible = (
+                    "multi-rank or multi-slot preparation remains on its existing route"
+                )
+            elif binding.adapters or any(
+                model_config.ADAPTERS in held.assets
+                for checkpoint in checkpoints.values() for held in checkpoint.ck.components.values()
+            ):
+                prepared_ineligible = (
+                    "adapter preparation has no fixed complete-footprint allowance"
+                )
+        prepared_memory = host.memory
         try:
             plan = resolve(
                 variant=reference,
@@ -2493,6 +2524,15 @@ class Executor:
                 placement=binding.placement or "all_resident",
                 encoded_leaves=consent,
                 dtype_name=dtype_name,
+                prepared_use=use,
+                prepared_free_bytes=(
+                    prepared_memory.room().free
+                    if use is not None and prepared_memory is not None else 0
+                ),
+                prepared_granularity=(
+                    prepared_memory.granularity if prepared_memory is not None else 0
+                ),
+                prepared_ineligible=prepared_ineligible,
             )
         except PlanRefusal as exc:
             return {
@@ -2846,6 +2886,12 @@ class Executor:
             parameter = binding.model_parameter_name
             child = self._construction_child(self.construction)
             child._group_parent = self
+            if binding.prepared_use is not None:
+                from cozy_runtime.author._prepared_use import prepared_use
+
+                child._prepared_uses[parameter] = prepared_use(
+                    msgspec.to_builtins(binding.prepared_use)
+                )
             # The command with one model in place of its set: everything the machine said
             # about the load holds for each model.
             load = msgspec.structs.replace(
@@ -3222,6 +3268,7 @@ class Executor:
             finally:
                 kernel_compile.held.reset(held)
         try:
+            self._check_prepared_use(registration, command.payload)
             prepared = prepare(registration, command.payload, input_metadata=command.input_metadata)
         except Exception as exc:
             outcome = classify(exc)
@@ -4589,6 +4636,30 @@ class Executor:
         recorded. The proof is the device's own: every stream is complete."""
         return accel.streams_idle(self.torch, self.device_kind)
 
+    def _check_prepared_use(self, registration: Any, payload: object) -> None:
+        """The loaded construction serves exactly the use selected by the package planner."""
+        from cozy_runtime.author._prepared_use import prepared_use
+
+        bound = {
+            name: use
+            for member in self.model_executors or [self]
+            for name, use in member._prepared_uses.items()
+        }
+        declarations = registration.model_prepared_use
+        if set(bound) != set(declarations):
+            raise InvalidRequest(
+                "prepared-use declaration differs from the loaded construction",
+                code="prepared_use_binding",
+            )
+        for name, field in declarations.items():
+            if not isinstance(payload, Mapping) or field not in payload:
+                raise InvalidRequest("prepared-use field is absent", code="prepared_use_invalid")
+            if prepared_use(payload[field]) != bound[name]:
+                raise InvalidRequest(
+                    "changed prepared use needs a new construction",
+                    code="prepared_use_binding",
+                )
+
     def _prepare_program(self, command: Map) -> dict[str, Any]:
         """A GPU warm command, alone under the existing process order and GPU permit.
 
@@ -4619,6 +4690,7 @@ class Executor:
                 raise CapabilityError(
                     "entrypoint declares no preparation factory", code="prepare_absent"
                 )
+            self._check_prepared_use(registration, command.payload)
             prepared = prepare(registration, command.payload)
             if prepared.asset_bounds:
                 raise CapabilityError(

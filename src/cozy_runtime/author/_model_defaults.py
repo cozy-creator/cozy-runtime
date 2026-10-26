@@ -97,6 +97,22 @@ def model_phases(value: object) -> tuple[tuple[str, ...], ...]:
     return tuple(out)
 
 
+
+def model_prepared_use(value: object) -> dict[str, str]:
+    """Model argument -> one typed top-level field of an internal GPU program call."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping) or len(value) > 16 or any(
+        not isinstance(name, str) or not name.isidentifier()
+        or not isinstance(field, str) or not field.isidentifier()
+        for name, field in value.items()
+    ):
+        raise ConformanceError(
+            "prepared_use must map Model arguments to top-level request field names",
+            code="model_prepared_use",
+        )
+    return dict(value)
+
 def model_on_demand(value: object) -> tuple[str, ...]:
     """Copy an `on_demand=` declaration: the Model arguments built on first use."""
     if value is None:

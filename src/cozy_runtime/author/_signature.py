@@ -381,6 +381,7 @@ class Declaration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Model argument -> the components this callable runs; an absent argument runs all."""
+    model_prepared_use: Mapping[str, str] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
     """Model arguments built, and their weights fetched, on first use (`on_demand=`)."""
     parameters: tuple[str, ...] | None = None
@@ -559,6 +560,7 @@ def analyze(
     model_defaults: Mapping[str, str] | None = None,
     model_components: Mapping[str, tuple[str, ...]] | None = None,
     model_on_demand: tuple[str, ...] = (),
+    model_prepared_use: Mapping[str, str] | None = None,
     model_classes: Mapping[str, type[Model[Any]]] | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
@@ -744,6 +746,7 @@ def analyze(
         model_defaults=model_defaults or {},
         model_components=model_components or {},
         model_on_demand=model_on_demand,
+        model_prepared_use=model_prepared_use or {},
         parameters=tuple(callers) if invocable else None,
         parameter_defaults={
             name: signature.parameters[name].default
