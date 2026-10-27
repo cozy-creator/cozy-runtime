@@ -14,6 +14,7 @@ cuBLASLt's by design. `torch` is the torch module: this module imports no torch.
 from __future__ import annotations
 
 import hashlib
+import math
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -493,8 +494,9 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
 
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     """`f`'s kernels on the card against the exact law in float64: the linear's GEMV rows and its
-    tiled GEMM in bf16 and fp16, every GEMM tile the card's table holds, and one quantization
-    with a producer's RMS norm, modulation and tanh GELU."""
+    tiled GEMM in bf16 and fp16, every GEMM tile the card's table holds (int8's exact integer
+    sums: every tile the same bits), and one quantization with a producer's RMS norm, modulation
+    and tanh GELU."""
     device = torch.device("cuda", ops.index)
     generator = torch.Generator(device=device).manual_seed(20261017)
 
@@ -519,6 +521,7 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
             got = (ops.fp8_linear if f.fp8 else ops.int8_linear)(x, data, scale, bias, dtype)
             errors[f"{name} linear M={m}"] = verify.error(torch, got, want)
         q, scales = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(x)
+        first: tuple[int, Tensor] | None = None
         for config in range(8):
             try:
                 got = (ops.fp8_gemm if f.fp8 else ops.int8_gemm)(
@@ -527,6 +530,9 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
             except ValueError:  # a tile this card's table does not hold, or this shape
                 continue
             errors[f"{name} tile {config}"] = verify.error(torch, got, want)
+            first = first or (config, got)
+            if not f.fp8 and not torch.equal(got, first[1]):
+                errors[f"{name} tile {config} bits differ from tile {first[0]}"] = math.inf
     x = randn(64, width).to(torch.bfloat16)
     shift, modulation = randn(2, width, scale=0.1), randn(2, width, scale=0.1)
     shift, modulation = shift.to(torch.bfloat16), modulation.to(torch.bfloat16)
@@ -548,7 +554,8 @@ CODEBOOK = (
 
 def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
     """The w4a8 GEMM against the exact law in float64 (the unpacked levels through the int8
-    law): bf16 and fp16, 3 and 300 rows, every tile, the uniform grid, and a prologue's rows."""
+    law): bf16 and fp16, 3 and 300 rows, every tile (each the same bits), the uniform grid, and a
+    prologue's rows."""
     device = torch.device("cuda", ops.index)
     generator = torch.Generator(device=device).manual_seed(20261022)
 
@@ -579,12 +586,16 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
                     torch, ops.w4a8_linear(x, grid, bias, dtype), want
                 )
             q, scales = ops.int8_quantize(x)
+            first: tuple[int, Tensor] | None = None
             for config in range(8):
                 try:
                     got = ops.w4a8_gemm(q, scales, grid, bias, dtype, config)
                 except ValueError:
                     continue
                 errors[f"{label} tile {config}"] = verify.error(torch, got, want)
+                first = first or (config, got)
+                if not torch.equal(got, first[1]):
+                    errors[f"{label} tile {config} bits differ from tile {first[0]}"] = math.inf
     x = randn(64, width).to(torch.bfloat16)
     shift, modulation = randn(2, width, scale=0.1), randn(2, width, scale=0.1)
     shift, modulation = shift.to(torch.bfloat16), modulation.to(torch.bfloat16)
