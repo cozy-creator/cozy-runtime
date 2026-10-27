@@ -17,7 +17,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import pairwise
 from typing import Any, Protocol
@@ -155,6 +155,9 @@ class Room:
     warm: int
     granularity: int = 512
     floor: int = 0
+    #: Torch's reserved, unallocated bytes: a cut's level counts them (its activations reuse
+    #: them first); its pre-reclaim compares with `free`, which returns them before weights.
+    cached: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2857,7 +2860,12 @@ class Request:
 
     def room(self, step: int | None = None) -> Room:
         current = self.current if step is None or step >= len(self.steps) else self.steps[step]
-        return self.memory.room(current)
+        room = self.memory.room(current)
+        if not self.memory.cuda or not torch.cuda.is_initialized():
+            return room
+        device = self.memory.device
+        cached = int(torch.cuda.memory_reserved(device)) - int(torch.cuda.memory_allocated(device))
+        return replace(room, cached=max(cached, 0))
 
     def reclaim(self, need: int = 0) -> int:
         """A known pure cut may shed the step's speculative whole-model hold.
