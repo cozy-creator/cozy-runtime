@@ -278,6 +278,9 @@ class _Block:
     preferred: bool = False
     preference_set: bool = False
     native_storage: int | None = None
+    #: the Varena Uses behind the raw and final views; `_used` declares their consumer streams
+    native_use: Any = None
+    final_native_use: Any = None
     aliases: dict[str, dict[str, str]] | None = None
     raw_views: dict[tuple[int, str], tuple[int, _Part]] = field(default_factory=dict)
     finals: dict[str, dict[str, _Part]] = field(default_factory=dict)
@@ -1655,10 +1658,10 @@ class Memory:
     def _idle(self, block: _Block) -> None:
         if self.native is not None and not (block.count or block.retained or block.loading):
             # The DLPack storage owner holds the physical pin. A surviving external alias
-            # retains it after these references disappear; native eviction also joins the
-            # CUDA context before unmapping. record_stream is not that ownership fence.
+            # retains it after these references disappear; native eviction waits on the
+            # region's last-consumer events (`_used`). record_stream is not that ownership fence.
             block.data = block.assigned = block.ready = None
-            block.native_storage = None
+            block.native_storage = block.native_use = None
             self._drop_final(block)
 
     def _drop_final(self, block: _Block, *, forget: bool = False) -> None:
@@ -1666,7 +1669,7 @@ class Memory:
             # A failed writer may have exported an alias. The next attempt needs a new
             # reservation; that alias retains its old owner and unspecified partial bytes.
             forget = True
-        block.final_use = block.final_data = block.final_storage = None
+        block.final_use = block.final_data = block.final_storage = block.final_native_use = None
         if forget:
             block.final_region = None
 
@@ -1683,7 +1686,7 @@ class Memory:
                 self._settle_prefetch(cancel=True)
             present = block.data is not None
             block.data = block.assigned = block.ready = None
-            block.native_storage = None
+            block.native_storage = block.native_use = None
             self._drop_final(block, forget=forget)
             if forget:
                 # Never overwrite an old fill beneath an escaped alias. Its pin keeps
@@ -2335,7 +2338,7 @@ class Memory:
         if not block.finals:
             return
         use = self._prepare_native(block, reclaim, final=True) if block.final_bytes else None
-        block.final_use = use
+        block.final_use = block.final_native_use = use
         request = _REQUEST.get()
         if use is not None and use.needs_fill and request is not None and request.idle:
             raise StaleBinding("final weight backing changed before idle graph preparation")
@@ -2398,6 +2401,7 @@ class Memory:
                     # commit() publishes the whole logical region, including alignment
                     # gaps between stored parts. Initialize them before publication.
                     use.tensor.zero_()
+                block.native_use = use
                 block.native_storage = int(use.tensor.untyped_storage().data_ptr())
             page: tuple[object, ...] | None = None
             if block.model.fill is not None and use is not None and use.needs_fill:
@@ -2464,6 +2468,7 @@ class Memory:
             if use is not None and use.needs_fill:
                 block.region = None
                 block.preferred = False
+            block.native_storage = block.native_use = None
             self._drop_final(block)
             raise
         finally:
@@ -2546,6 +2551,11 @@ class Memory:
     def _used(self, block: _Block) -> None:
         if self.cuda:
             stream = self.stream()
+            # Varena records its own last-consumer event on each declared stream when the
+            # storage's final alias goes, so reclaim waits on that region, not the context.
+            for use in (block.native_use, block.final_native_use):
+                if use is not None:
+                    use.consume_on(stream.cuda_stream)
             for tensor in block.tensors():
                 if tensor.untyped_storage().data_ptr() not in (
                     block.native_storage,
@@ -3095,7 +3105,7 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
                 if block.region is not None:
                     block.region.set_preferred(False)
                 block.data = {}
-                block.native_storage = None
+                block.native_storage = block.native_use = None
         # Only ordinary owning views remain. The native region can become evictable
         # once those views (including every escaped storage alias) disappear.
         block.final_use = None
