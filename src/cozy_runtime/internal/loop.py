@@ -9,15 +9,16 @@ continues from the next step; nothing runs twice. After submission nothing falls
 
 A keyed call whose blocks all stay resident records the whole call (`before`, the steps and
 `after`) and keeps it for its call site: later calls run it natively from start to end, until a
-new key replaces it or residency retires it under pressure. `after` runs eagerly once per call
-site to learn its blocks; a whole call that does not fit is not tried again for that layout, and
-the steps alone are recorded. Any other program closes before the loop returns, ahead of an eager
-`after`.
+new key replaces it or residency retires it under pressure. A whole call is recorded only after
+an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
+blocks; one that does not fit is not tried again for that layout, and the steps alone are
+recorded. Any other program closes before the loop returns, ahead of an eager `after`.
 """
 
 from __future__ import annotations
 
 import ctypes
+import gc
 import sys
 import threading
 import time
@@ -157,10 +158,10 @@ class _Program:
 
 @dataclass
 class _Site:
-    """What a call site's earlier calls learned: the blocks `after` runs, and the layouts
-    whose whole call did not fit."""
+    """What a call site's keyed calls learned, per layout: the blocks an eager `after` ran,
+    and the whole calls that did not fit."""
 
-    after: dict[Model, tuple[str, ...]] | None = None
+    after: dict[Hashable, dict[Model, tuple[str, ...]]] = field(default_factory=dict)
     unfit: set[Hashable] = field(default_factory=set)
 
 
@@ -227,7 +228,9 @@ class Loops:
                 return
             assert ctx is not None
             site = (step.__code__, tuple(id(model) for model in scope))
-            ident = None if key is None else (key, _layouts(tensors), len(steps), phases)
+            # What a call site learns (`_Site`) depends on a keyed call's layout, not its key.
+            shape = None if key is None else (_layouts(tensors), len(steps), phases)
+            ident = None if key is None else (key, shape)
             with self._lock:
                 known = self._sites.setdefault(site, _Site())
                 kept = self._kept.get(site)
@@ -243,7 +246,7 @@ class Loops:
                         return
             program = None
             try:
-                program = _record(loop, tensors, work, scope, key, ctx, row, ident, known)
+                program = _record(loop, tensors, work, scope, key, ctx, row, ident, shape, known)
                 if program is None:
                     return
                 for sequence, first, count in program.first:
@@ -256,7 +259,7 @@ class Loops:
                 # Only a program that ends the call is kept. Any other closes before the work
                 # after it (an eager decode) needs its pool and weights.
                 program.close()
-                _once(after, program.tensors)
+                _after(loop, program.tensors, scope, known, shape)
                 _back(work, program.tensors)
                 return
             _back(work, program.tensors)
@@ -349,6 +352,7 @@ def _record(
     ctx: Context,
     row: dict[str, Any],
     ident: Hashable,
+    shape: Hashable,
     known: _Site,
 ) -> _Program | None:
     """`before` and the first step eagerly, then the rest recorded; None when every mode
@@ -358,45 +362,28 @@ def _record(
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-
-    def used(seen: set[Any]) -> dict[Model, tuple[str, ...]]:
-        """Each scope model the call ran, with the block paths it entered ("" is common)."""
-        paths: dict[Model, set[str]] = {}
-        for item in seen:
-            model = item if isinstance(item, Model) else getattr(item, "model", None)
-            if model is not None and any(model is m for m in scope):
-                paths.setdefault(model, set())
-                if not isinstance(item, Model) and item.path:  # common comes with any binding
-                    paths[model].add(item.path)
-        return {model: tuple(sorted(paths[model])) for model in scope if model in paths}
-
     # The caller's stream: residency records its consumers on the current stream, and the
     # recording's own streams end with the program.
     with _entering() as seen:
         _once(loop.before, tensors)
-    pre = used(seen)
+    pre = _used(seen, scope)
     with _entering() as seen:
         loop.eager(steps[:1], tensors, ctx)
-    body = used(seen) or {model: ("",) for model in scope}
+    body = _used(seen, scope) or {model: ("",) for model in scope}
     models = tuple(body)
     resident = all(not _unresident(model, paths) for model, paths in body.items())
-    # A kept program records the whole call: `after` too, when every block `before` and `after`
-    # run stays on the device. The site's first call runs `after` here to learn its blocks and
-    # warm its kernels (the program overwrites that output).
-    post: dict[Model, tuple[str, ...]] = {}
+    # A kept program records the whole call, `after` too, when every block `before` and an
+    # earlier eager `after` of this key and layout ran is still on the device.
+    post = known.after.get(shape, {})
     ends = (
         key is not None
         and loop.after is not None
         and resident
         and loop.phases is None
-        and ident not in known.unfit
+        and shape in known.after
+        and shape not in known.unfit
     )
     if ends:
-        if known.after is None:
-            with _entering() as seen:
-                _once(loop.after, tensors)
-            known.after = used(seen)
-        post = known.after
         outside = next(
             (w for m, paths in (*pre.items(), *post.items()) if (w := _unresident(m, paths))),
             "",
@@ -415,7 +402,7 @@ def _record(
             row["refusals"].append(f"recording: {why}")
             _back(work, tensors)
             loop.eager(steps[1:], work + tensors[len(work) :], ctx)
-            _once(loop.after, work + tensors[len(work) :])
+            _after(loop, work + tensors[len(work) :], scope, known, shape)
             return None
         torch.cuda.empty_cache()
         rest = steps[1:]
@@ -426,6 +413,7 @@ def _record(
         attempts += [("streamed", False)]
         for mode, whole in attempts:
             ctx.raise_if_cancelled()
+            why = None
             try:
                 with recording.capturing():
                     if mode == "resident":
@@ -451,10 +439,14 @@ def _record(
             except BaseException as error:
                 if (why := _refusal(error)) is None:
                     raise
+            if why is not None:
+                # Outside the handler: its traceback no longer holds the attempt's graphs, so
+                # their pool returns before the next attempt.
                 row["refusals"].append(f"{mode}{' whole call' if whole else ''}: {why}")
                 if whole:
-                    known.unfit.add(ident)
+                    known.unfit.add(shape)
                 _drop_stages(recording)
+                gc.collect()
                 torch.cuda.empty_cache()
                 continue
             first = tuple(
@@ -488,11 +480,38 @@ def _record(
         _back(work, tensors)  # the eager rest runs on the caller's tensors
         tensors = work + tensors[len(work) :]
         loop.eager(rest, tensors, ctx)
-        _once(loop.after, tensors)
+        _after(loop, tensors, scope, known, shape)
         return None
     finally:
         if not recording._finished:
             recording.close()
+
+
+def _used(seen: set[Any], scope: tuple[Model, ...]) -> dict[Model, tuple[str, ...]]:
+    """Each scope model a call ran, with the block paths it entered ("" is common)."""
+    paths: dict[Model, set[str]] = {}
+    for item in seen:
+        model = item if isinstance(item, Model) else getattr(item, "model", None)
+        if model is not None and any(model is m for m in scope):
+            paths.setdefault(model, set())
+            if not isinstance(item, Model) and item.path:  # common comes with any binding
+                paths[model].add(item.path)
+    return {model: tuple(sorted(paths[model])) for model in scope if model in paths}
+
+
+def _after(
+    loop: _Loop, tensors: tuple[Any, ...], scope: tuple[Model, ...], known: _Site, shape: Hashable
+) -> None:
+    """`after` eagerly; a keyed call's site learns the blocks it ran for this layout (`shape`,
+    None for a call without a key)."""
+    if loop.after is None:
+        return
+    if shape is None or shape in known.after:
+        _once(loop.after, tensors)
+        return
+    with _entering() as seen:
+        _once(loop.after, tensors)
+    known.after[shape] = _used(seen, scope)
 
 
 def _back(work: tuple[Any, ...], tensors: tuple[Any, ...]) -> None:
