@@ -1137,6 +1137,17 @@ class Reader:
                 self.declared(module, call, author.sequence_parallel)
                 folded = self.fold(module, call.keywords[0].value)
                 degrees = tuple(typing.cast(Sequence[int], folded))
+            elif (
+                call
+                and isinstance(found, Vocab)
+                and found.key in ("author.uncaptured", "author.graph_keys")
+            ):
+                # Graph policy is read from the imported Model at execution, not carried
+                # in its interface. Still apply the public factory's declaration rules.
+                factory = (
+                    author.uncaptured if found.key == "author.uncaptured" else author.graph_keys
+                )
+                self.declared(module, call, factory)
             else:
                 self.refuse(module, decorator, "a Model class decorator outside the closed set")
         loads = spec.loads
