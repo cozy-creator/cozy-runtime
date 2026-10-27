@@ -16,7 +16,7 @@ import functools
 import time
 import zlib
 from collections import Counter
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -782,8 +782,9 @@ class _Bake:
 class _Bakes:
     """A component's LoRA'd linears, baked into their weights' bytes as the pages arrive
     (`Declared.fill`), so a resident page carries its delta and an evicted one bakes again on
-    its refault. `identity` names what a bake writes the same in every process, and each
-    weight's stochastic rounding is seeded from it: a re-bake is the kept page's bytes."""
+    its refault. `identity` and a block's `overlay` name what a bake writes the same in every
+    process, and each weight's stochastic rounding is seeded from them: a re-bake is the kept
+    page's bytes."""
 
     def __init__(
         self, backend: Backend, root: Module, rows: Mapping[str, PlanRow], blocks: set[str]
@@ -799,6 +800,8 @@ class _Bakes:
         )
         self._last: tuple[lora_bake.Strategy, lora_bake.How | None] = ("per_step", None)
         self.baked = 0
+        #: block -> the package hooks its fill bakes (`overlay`)
+        self._hooked: dict[str, tuple[LoRASource, ...]] = {}
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
             encoded = rows[stored].encoded
@@ -858,14 +861,12 @@ class _Bakes:
 
     @property
     def identity(self) -> str | None:
-        """What a bake writes now, the same in every process (`Filling.identity`): the strategy
-        and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each baked
-        weight's stored name and encoding with each delta's content (a stored factor pair of
-        this checkpoint, or the identity a hook's package declares), dtypes and scale. The
-        attempt's serving recipe is fixed by `choose`: a kernel becoming ready affects the next
-        attempt, never a refault halfway through this one. Package hooks still name their
-        currently armed overlay at the pass boundary; those hooked roots are not graphed."""
-        torch = self.torch
+        """What every page's bake shares, the same in every process (`Filling.identity`): the
+        strategy and recipe (`lora_bake.recipe`), torch and the GPU's architecture, and each
+        baked weight's stored name and encoding with its stored factor pairs and scales. What a
+        package hook arms is each page's own (`overlay`). The attempt's serving recipe is fixed
+        by `choose`: a kernel becoming ready affects the next attempt, never a refault halfway
+        through this one."""
         self._last = self._choice.get() or self._last
         baked = self.serving == "bake"
         for bake in self.bakes.values():  # each LoRA'd linear told whether its bytes carry it
@@ -875,7 +876,40 @@ class _Bakes:
                 hook._cozy_baked = baked
             if bake.leaf is not None:
                 bake.leaf.adopt(functools.partial(_deltas, bake) if baked else None)
-        if not baked:
+        return self._described(armed=False)
+
+    def overlay(self, block: str, keys: Collection[str]) -> Hashable:
+        """What a fill of `block` (its stored `keys`) bakes beyond `identity` now: each of its
+        hooks' armed factors, named as `identity` names a delta (None where none is armed).
+        Residency serves a page only to a use that wants the overlay it was filled with, so a
+        block filled outside a LoRA'd forward never stands in for one, nor the reverse."""
+        if self.serving != "bake":
+            return ()
+        hooks = self._hooked.get(block)
+        if hooks is None:
+            hooks = self._hooked[block] = tuple(
+                hook
+                for stored, bake in sorted(self.bakes.items())
+                if stored in keys and bake.leaf is None
+                for hook in bake.hooks
+            )
+        return tuple(self._delta(hook) for hook in hooks)
+
+    def _delta(self, hook: LoRASource) -> object:
+        """One hook's armed delta by its content: its factors' model and path, dtypes and scale.
+        Factors no loaded model holds have no name: a fresh object, equal to no other."""
+        got = hook.lora_factors()
+        if got is None:
+            return None
+        named = self.owner(got[0])
+        if named is None:
+            return object()
+        return (named[0].name, named[1], str(got[1].dtype), str(got[2].dtype), repr(float(got[3])))
+
+    def _described(self, *, armed: bool) -> str | None:
+        """`identity`, or with `armed` each hook's armed delta too: what seeds a bake's rounding."""
+        torch = self.torch
+        if self.serving != "bake":
             return repr((self.serving,))
         held: list[object] = [lora_bake.recipe(self.how == "fused"), torch.__version__]
         held.append(torch.cuda.get_device_capability(self.gpu) if self.gpu is not None else "cpu")
@@ -883,22 +917,20 @@ class _Bakes:
             if bake.leaf is not None:
                 continue
             deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
-            for hook in bake.hooks:
-                got = hook.lora_factors()
-                if got is None:
+            for hook in bake.hooks if armed else ():
+                delta = self._delta(hook)
+                if delta is None:
                     continue
-                named = self.owner(got[0])
-                if named is None:
+                if not isinstance(delta, tuple):
                     return None
-                dtypes = (str(got[1].dtype), str(got[2].dtype))
-                deltas.append((named[0].name, named[1], *dtypes, repr(float(got[3]))))
+                deltas.append(delta)
             held.append((stored, bake.encoding, deltas))
         return repr(held)
 
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
-        identity = self.identity
         if self.serving != "bake":
             return
+        identity = self._described(armed=True)
         for stored, bake in self.bakes.items():
             weight = parts.get(stored)
             if bake.leaf is not None or weight is None:
