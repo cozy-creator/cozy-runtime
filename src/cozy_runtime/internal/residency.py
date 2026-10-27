@@ -53,6 +53,8 @@ __all__ = [
 
 progress = 0
 _RESERVE = 512 << 20
+#: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
+_PARKED = 2
 _HOST_STAGING = 64 << 20
 #: Host RAM the baked-page cache leaves free (`Memory._keep_baked`).
 _BAKED_HEADROOM = 8 << 30
@@ -288,6 +290,8 @@ class _Block:
     next: _Block | None = None
     #: the fill overlay (`Filling.overlay`) its page was written with
     overlay: Hashable = None
+    #: native pages of other overlays, parked for reuse (`_switch_overlay`): (raw, final) regions
+    parked: dict[Hashable, tuple[Any, Any]] = field(default_factory=dict)
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -1584,17 +1588,34 @@ class Memory:
             self._baked_bytes -= self._baked.pop(page).numel()
         self._baked_once = {page for page in self._baked_once if page[0] != model.name}
 
-    def _forget_overlay(self, block: _Block) -> None:
+    def _switch_overlay(self, block: _Block, overlay: Hashable) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
-        a LoRA forward, or the reverse): as for a changed fill, its model's holds go first, then
-        the page, so the next fill writes the wanted overlay."""
+        a LoRA forward, or the reverse). As for a changed fill, its model's holds go first. A
+        native page is parked under its overlay, first for reclaim to take, and the wanted
+        overlay's parked page serves again: alternating overlays refill nothing while both fit.
+        Off native backing the page is dropped and the next fill writes the wanted overlay."""
         for hold in list(block.model.holds):
             hold.shed()
         if block.count or block.retained or block.loading or self.capturing():
             raise StaleBinding("a weight block in use cannot change its fill overlay")
-        self._discard(block, forget=True)
-        if block.paged():
-            raise StaleBinding("a weight block's page under another overlay could not be dropped")
+        if self.native is None:
+            self._discard(block, forget=True)
+            if block.paged():
+                raise StaleBinding("a weight block's page under another overlay was not dropped")
+            return
+        self._discard(block)
+        current = (block.region, block.final_region)
+        if current != (None, None):
+            for region in current:
+                if region is not None:
+                    region.set_preferred(False)
+            block.parked[block.overlay] = current
+        while len(block.parked) > _PARKED:
+            block.parked.pop(next(iter(block.parked)))
+        block.region, block.final_region = block.parked.pop(overlay, (None, None))
+        block.overlay = overlay
+        block.preferred = block.preference_set = False
+        block.generation += 1
 
     def _idle(self, block: _Block) -> None:
         if self.native is not None and not (block.count or block.retained or block.loading):
@@ -1633,6 +1654,7 @@ class Memory:
                 # Never overwrite an old fill beneath an escaped alias. Its pin keeps
                 # the old reservation alive independently of this model's new identity.
                 block.region = None
+                block.parked.clear()
                 block.preferred = False
                 block.preference_set = False
             if present or forget:
@@ -2434,8 +2456,8 @@ class Memory:
         global progress
         model = block.model
         overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
-        if overlay != block.overlay and block.paged():
-            self._forget_overlay(block)
+        if overlay != block.overlay and (block.paged() or block.parked):
+            self._switch_overlay(block, overlay)
         with self.lock:
             if not model.users or model.thread != threading.get_ident():
                 raise ResidencyError("weight preparation requires an active model scope")
