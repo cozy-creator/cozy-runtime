@@ -7,10 +7,12 @@ its step's components is still on the device, else as streamed stages cut at the
 block boundaries, else eagerly. A refusal before submission drops that attempt and the next mode
 continues from the next step; nothing runs twice. After submission nothing falls back.
 
-A keyed call whose components all stay resident records the whole call (`before`, the steps and
+A keyed call whose blocks all stay resident records the whole call (`before`, the steps and
 `after`) and keeps it for its call site: later calls run it natively from start to end, until a
-new key replaces it or residency retires it under pressure. Any other program closes before the
-loop returns, ahead of an eager `after`.
+new key replaces it or residency retires it under pressure. `after` runs eagerly once per call
+site to learn its blocks; a whole call that does not fit is not tried again for that layout, and
+the steps alone are recorded. Any other program closes before the loop returns, ahead of an eager
+`after`.
 """
 
 from __future__ import annotations
@@ -149,12 +151,22 @@ class _Program:
             self.region.close()  # calls close unless a reclaim already did
 
 
+@dataclass
+class _Site:
+    """What a call site's earlier calls learned: the blocks `after` runs, and the layouts
+    whose whole call did not fit."""
+
+    after: dict[Model, tuple[str, ...]] | None = None
+    unfit: set[Hashable] = field(default_factory=set)
+
+
 class Loops:
     """The installed `author._loop.Loops`: one per executor process."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._kept: dict[Hashable, _Program] = {}
+        self._sites: dict[Hashable, _Site] = {}
 
     def run(
         self,
@@ -193,6 +205,7 @@ class Loops:
             site = (step.__code__, tuple(id(model) for model in scope))
             ident = None if key is None else (key, _layouts(tensors), len(steps), phases)
             with self._lock:
+                known = self._sites.setdefault(site, _Site())
                 kept = self._kept.get(site)
                 if kept is not None and (why := _stale(kept, ident)):
                     row["dropped"] = why
@@ -206,7 +219,7 @@ class Loops:
                         return
             program = None
             try:
-                program = _record(loop, tensors, work, scope, key, ctx, row, ident)
+                program = _record(loop, tensors, work, scope, key, ctx, row, ident, known)
                 if program is None:
                     return
                 for sequence, first, count in program.first:
@@ -242,21 +255,13 @@ class Loops:
         row: dict[str, Any],
     ) -> None:
         """A kept program: this call's values into its tensors, then natively `before`, every
-        step and `after` (or, without that program, the first step eagerly and the rest
-        natively), and the state back out."""
+        step and `after`, and the state back out."""
+        assert kept.again is not None  # only whole calls are kept
         row.update(mode=kept.mode, reused=True, stages=kept.stages, blocks=kept.blocks)
         try:
             for slot, value in zip(kept.tensors, tensors, strict=True):
                 slot.copy_(value)
-            if kept.again is not None:
-                _submit(kept, kept.again, loop.steps, loop, ctx, row)
-            else:
-                _once(loop.before, kept.tensors)
-                loop.eager(loop.steps[:1], kept.tensors, ctx)
-                for sequence, first, count in kept.first:
-                    _submit(kept, sequence, range(first, first + count), loop, ctx, row)
-                if not kept.after_native:
-                    _once(loop.after, kept.tensors)
+            _submit(kept, kept.again, loop.steps, loop, ctx, row)
             _back(work, kept.tensors)
         except BaseException:
             kept.close()
@@ -320,6 +325,7 @@ def _record(
     ctx: Context,
     row: dict[str, Any],
     ident: Hashable,
+    known: _Site,
 ) -> _Program | None:
     """`before` and the first step eagerly, then the rest recorded; None when every mode
     refused, after the loop ran eagerly to its end."""
@@ -350,14 +356,23 @@ def _record(
     body = used(seen) or {model: ("",) for model in scope}
     models = tuple(body)
     resident = all(not _unresident(model, paths) for model, paths in body.items())
-    # A kept program records the whole call: `after` too, warmed once here (the program
-    # overwrites that output), when every block `before` and `after` ran stays on the device.
+    # A kept program records the whole call: `after` too, when every block `before` and `after`
+    # run stays on the device. The site's first call runs `after` here to learn its blocks and
+    # warm its kernels (the program overwrites that output).
     post: dict[Model, tuple[str, ...]] = {}
-    ends = key is not None and loop.after is not None and resident and loop.phases is None
+    ends = (
+        key is not None
+        and loop.after is not None
+        and resident
+        and loop.phases is None
+        and ident not in known.unfit
+    )
     if ends:
-        with _entering() as seen:
-            _once(loop.after, tensors)
-        post = used(seen)
+        if known.after is None:
+            with _entering() as seen:
+                _once(loop.after, tensors)
+            known.after = used(seen)
+        post = known.after
         outside = next(
             (w for m, paths in (*pre.items(), *post.items()) if (w := _unresident(m, paths))),
             "",
@@ -382,8 +397,10 @@ def _record(
         rest = steps[1:]
         began = time.perf_counter()
         row["resident_after_first_step"] = resident
-        attempts = ("resident", "streamed") if resident else ("streamed",)
-        for mode in attempts:
+        attempts = [("resident", True)] if ends else []
+        attempts += [("resident", False)] if resident else []
+        attempts += [("streamed", False)]
+        for mode, whole in attempts:
             ctx.raise_if_cancelled()
             try:
                 with recording.capturing():
@@ -396,9 +413,9 @@ def _record(
                             mutable,
                             counter,
                             body,
-                            pre if ends else None,
-                            post if ends else None,
-                            ends,
+                            pre if whole else None,
+                            post if whole else None,
+                            whole,
                         )
                     else:
                         parts, blocks = _record_streamed(
@@ -410,7 +427,9 @@ def _record(
             except BaseException as error:
                 if (why := _refusal(error)) is None:
                     raise
-                row["refusals"].append(f"{mode}: {why}")
+                row["refusals"].append(f"{mode}{' whole call' if whole else ''}: {why}")
+                if whole:
+                    known.unfit.add(ident)
                 _drop_stages(recording)
                 torch.cuda.empty_cache()
                 continue
@@ -429,12 +448,12 @@ def _record(
                 stages=stages,
                 blocks=blocks,
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
-                after_native=mode == "resident" and ends and loop.after is not None,
+                after_native=whole,
             )
             return _Program(
                 first,
                 again,
-                mode == "resident" and ends and loop.after is not None,
+                whole,
                 mode,
                 tensors,
                 counter,
