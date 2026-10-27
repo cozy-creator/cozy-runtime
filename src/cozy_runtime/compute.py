@@ -1129,7 +1129,11 @@ class Execution:
     def _offer_queued(self) -> None:
         # Scratch, outputs and resident weights are already retained. This optional
         # observer work never advances GPU execution or admits a streamed future workspace.
-        if self._queued_eligible and self._queued_offered is None and self._load_request is not None:
+        if (
+            self._queued_eligible
+            and self._queued_offered is None
+            and self._load_request is not None
+        ):
             self._queued_offered = self._load_request.prefetch_queued()
 
     def facts(self) -> dict[str, object]:
