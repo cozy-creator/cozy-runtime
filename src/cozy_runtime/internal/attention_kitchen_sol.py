@@ -38,10 +38,18 @@ def forward(
     *,
     dense: Callable[..., Tensor],
     prefix_dense: Callable[..., Tensor],
+    exact: Callable[..., Tensor] | None = None,
     **options: Unpack[PartialOptions],
 ) -> Tensor:
     return attention_sol._attention(
-        query, key, value, **options, sparse=sparse, dense=dense, prefix_dense=prefix_dense
+        query,
+        key,
+        value,
+        **options,
+        sparse=sparse,
+        dense=dense,
+        prefix_dense=prefix_dense,
+        exact=exact,
     )
 
 

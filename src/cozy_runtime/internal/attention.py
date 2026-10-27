@@ -361,13 +361,19 @@ def _sol_objects(candidate: Candidate) -> bool:
     return candidate.sparse and candidate.import_name == "sol_attn"
 
 
+#: The BF16 kernel a declaring sparse row's exact paths take (H3: the token refiner and the blocks
+#: whose key outliers no quantized scale carries), on every family.
+EXACT_DENSE = "sdpa"
+
+
 def dense_identity(name: str) -> str:
-    """The dense reference a sparse kernel recomputes rows with: its row's declared kernels,
-    else the one its site's walk bound."""
+    """The dense reference a sparse kernel recomputes rows with: its row's declared kernels and
+    the exact one beside them, else the one its site's walk bound."""
     dense = known()[name].dense
     if not dense:
         return attention_sol.dense_identity()
-    return dense[0] + (f"; sparse-prefix={dense[-1]}" if dense[-1] != dense[0] else "")
+    prefix = f"; sparse-prefix={dense[-1]}" if dense[-1] != dense[0] else ""
+    return f"{dense[0]}{prefix}{_EXACT_AT}{EXACT_DENSE}"
 
 
 def device_row(device: DeviceFacts | None) -> arch.Row:
@@ -476,7 +482,8 @@ def _local(candidate: Candidate) -> Local:
     forward = candidate.local.forward
     if candidate.dense:
         rows = [_dense_rows(BY_NAME[name]) for name in candidate.dense]
-        forward = partial(forward, dense=rows[0], prefix_dense=rows[-1])
+        exact = _dense_rows(BY_NAME[EXACT_DENSE])
+        forward = partial(forward, dense=rows[0], prefix_dense=rows[-1], exact=exact)
 
     def guarded(query: Tensor, key: Tensor, value: Tensor, **options: Any) -> Tensor:
         refused = candidate.refusal(query, key, options)

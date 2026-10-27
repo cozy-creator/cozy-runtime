@@ -728,10 +728,12 @@ def _attention(
     sparse: Callable[..., Tensor] | None = None,
     dense: Callable[..., Tensor] = _dense,
     prefix_dense: Callable[..., Tensor] | None = None,
+    exact: Callable[..., Tensor] | None = None,
 ) -> Tensor:
     """Shared input and model-policy boundary for the opt-in sparse implementations. What a
     sparse kernel admits (one BF16 document, head dimension 128, equal Q/K/V, no mask or
-    causality) is its row's (`attention.Candidate`), asserted before this runs."""
+    causality) is its row's (`attention.Candidate`), asserted before this runs. A row that
+    declares its dense kernels gives `exact` too: the BF16 kernel its model's exact paths take."""
     import torch
 
     if torch.compiler.is_compiling():
@@ -762,6 +764,7 @@ def _attention(
         sparse=sparse,
         dense=dense,
         prefix_dense=prefix_dense,
+        exact=exact,
     )
 
 
@@ -794,16 +797,22 @@ def _execute(
     sparse: Callable[..., Tensor] | None = None,
     dense: Callable[..., Tensor] = _dense,
     prefix_dense: Callable[..., Tensor] | None = None,
+    exact: Callable[..., Tensor] | None = None,
 ) -> Any:
-    """Apply the model's explicit policy after hardware/operand validation."""
+    """Apply the model's explicit policy after hardware/operand validation. An exact path's
+    dense rows (its dense steps, its protected prefix, a dense path) take the exact kernel on
+    every route: the walked reference's (`_exact`), or the one a declaring row gives."""
     import torch
 
     def on(paths: tuple[str, ...]) -> bool:
         return any(site.path == p or site.path.startswith(p + ".") for p in paths)
 
     dense_path = on(layout.dense_paths)
-    if dense is _dense and on(layout.exact_paths):
-        dense = _exact
+    if on(layout.exact_paths):
+        if dense is _dense:
+            dense = _exact
+        elif exact is not None:
+            dense = prefix_dense = exact
     if dense_path and query.shape[1] < layout.live_tokens:
         # A refiner has its own shorter document; its explicit dense policy wins.
         output = dense(query=query, key=key, value=value, scale=scale)
