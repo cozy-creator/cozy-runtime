@@ -1072,12 +1072,7 @@ class PreparedRepeat:
                         job = self._load.submit_native(capsule)
                     self._load_used = True
                 self._active = Execution(self, context, epoch, outputs, readout, claimed, job)
-                if context is not None and self._load is None:
-                    from cozy_runtime.internal.residency import _REQUEST
-
-                    request = _REQUEST.get()
-                    if request is not None:
-                        request.prefetch_queued()
+                self._active._offer_queued()
                 return self._active
             except BaseException as error:
                 if isinstance(error, Exception) and getattr(error, "eligibility_refusal", False):
@@ -1128,6 +1123,14 @@ class Execution:
         self._load_request = _REQUEST.get()
         self._load_recorded = False
         self._failure: Exception | None = None
+        self._queued_eligible = context is not None and load_job is None
+        self._queued_offered: str | None = None
+
+    def _offer_queued(self) -> None:
+        # Scratch, outputs and resident weights are already retained. This optional
+        # observer work never advances GPU execution or admits a streamed future workspace.
+        if self._queued_eligible and self._queued_offered is None and self._load_request is not None:
+            self._queued_offered = self._load_request.prefetch_queued()
 
     def facts(self) -> dict[str, object]:
         """Native execution and, when present, its actual owned input read."""
@@ -1219,6 +1222,9 @@ class Execution:
             # clean input failure merely because the load worker finished successfully.
             if done:
                 return self._finish(completed, canceled)
+            # The one queued CPU preflight can finish after submit. Re-offer only while
+            # native work remains active; latching an actual assignment bounds admission.
+            self._offer_queued()
             return Progress(completed, canceled, False)
 
     def cancel(self) -> None:
@@ -1574,15 +1580,7 @@ class PreparedSequence:
                 execution._prepare_lookahead()
                 # All Python/native owners exist before the sole native worker can start.
                 native.start()
-                if context is not None and not reads:
-                    # All resident weights and graph workspace are already retained. Reuse
-                    # the existing bounded next-job preparation policy; streamed plans need
-                    # their future window/workspace accounted before enabling speculation.
-                    from cozy_runtime.internal.residency import _REQUEST
-
-                    request = _REQUEST.get()
-                    if request is not None:
-                        request.prefetch_queued()
+                execution._offer_queued()
                 return execution
             except BaseException as error:
                 if native is not None:
@@ -1814,6 +1812,9 @@ class _SequenceExecution(Execution):
     def __init__(self, plan, context, outputs, readout, models, native, reads, phases=None):
         super().__init__(plan, context, 0, outputs, readout, models, native)
         self._stage_reads = reads
+        # Only all-resident sequences have already retained every future stage workspace.
+        # Source-backed stages keep their existing separate current-stage lookahead policy.
+        self._queued_eligible = context is not None and not reads
         self._phase_controllers = phases or {}
         self._prefetch_cleanup = ExitStack()
         self._prefetch_admission: list[dict[str, object]] = []

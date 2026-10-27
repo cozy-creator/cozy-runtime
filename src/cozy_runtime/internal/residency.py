@@ -1918,8 +1918,13 @@ class Memory:
                 self._settle_prefetch(cancel=True)
         self._prefetch_block(current.next, _REQUEST.get())
 
-    def _prefetch_queued(self, request: Request) -> None:
-        """One raw block after a resident program has allocated all of its working storage."""
+    def _prefetch_queued(self, request: Request) -> str | None:
+        """Offer one raw block; return its queued assignment even when capacity refuses.
+
+        None means no compatible assignment was ready, or current demand owned the slot.
+        A resident execution may try again after CPU preflight finishes, without repeatedly
+        offering the same queued assignment or changing its current memory policy.
+        """
         if (
             request.queued is None
             or request.idle
@@ -1940,7 +1945,8 @@ class Memory:
                     if not block.cached():
                         # One offer, one block; no scan that admits a second reader after refusal.
                         self._prefetch_block(block, request, queued=queued)
-                        return
+                        return queued.request_id
+            return queued.request_id  # Its first phase is already cached; no device work.
 
     def cancel_queued(self, request_id: str) -> None:
         """Invalidate only the named native reader; its current owner drains it later."""
@@ -2540,9 +2546,9 @@ class Request:
         self.queued_prefetch: list[dict[str, Any]] = []
         self.sample()
 
-    def prefetch_queued(self) -> None:
-        """Called only by a resident submission after its state/scratch/readout allocation."""
-        self.memory._prefetch_queued(self)
+    def prefetch_queued(self) -> str | None:
+        """Only fully allocated resident executions may offer optional queued speculation."""
+        return self.memory._prefetch_queued(self)
 
     def sample(self) -> None:
         self.peak = max(self.peak, self.memory._figures()[2])
