@@ -715,6 +715,8 @@ class _Bakes:
         self.serving: lora_bake.Strategy = "per_step"
         self.how: lora_bake.How | None = None
         self.baked = 0
+        #: passes a baked hooked component declared a fill of its own for (`identity`)
+        self.passes = 0
         names = {row.key.partition(".")[2]: stored for stored, row in rows.items()}
         for local, stored in names.items():
             encoded = rows[stored].encoded
@@ -757,7 +759,10 @@ class _Bakes:
         waits for no kernel: while its kernels build the LoRAs serve per step, and pages bake
         once they serve (the identity changes, so varena refills them). Read where varena
         declares a fill, a pass's start: a hooked component's pass is each forward, after its
-        package armed the overlay (`Placement.using`), so what serves is decided there only."""
+        package armed the overlay (`Placement.using`), so what serves is decided there only.
+        TensorFS 0.16 names a page by its set's fill alone, never by the overlay a page was
+        baked with, so a baked hooked component declares a fill of its own for each pass: no
+        page is kept or served across passes, and every refill bakes again (correct, not fast)."""
         gpu = self.gpu if self.strategy == "bake" else None
         self.how = "eager" if gpu is None else lora_bake.serving(gpu)
         self.serving = self.strategy if self.how is not None else "per_step"
@@ -769,7 +774,11 @@ class _Bakes:
                 hook._cozy_baked = baked
             if bake.leaf is not None:
                 bake.leaf.adopt(functools.partial(_deltas, bake) if baked else None)
-        return self._described()
+        described = self._described()
+        if not baked or described is None or not self.hooked:
+            return described
+        self.passes += 1
+        return repr((described, "pass", self.passes))
 
     @property
     def hooked(self) -> bool:
