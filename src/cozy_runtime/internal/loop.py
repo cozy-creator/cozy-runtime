@@ -1,7 +1,8 @@
 """`author.denoise_loop` in the Runtime: eager, one resident captured program, or streamed stages.
 
-The first step always runs eagerly, for real: it warms libraries and kernels on the recording's
-stream and brings the weights in through ordinary residency. Then the loop runs resident when
+The first step always runs eagerly, for real: it warms kernels and brings the weights in through
+ordinary residency, on the caller's stream (only recorded regions run on the recording's streams,
+which end with the program). Then the loop runs resident when
 every block of its components is still on the device, else as streamed stages cut at the
 residency's own block boundaries, else eagerly. A refusal before submission drops that attempt
 and the next mode continues from the next step; nothing runs twice. After submission nothing
@@ -270,13 +271,9 @@ class Loops:
                 _eager(step, steps[:1], tensors, phases, steps, None, ctx)
                 _back(work, tensors)
                 return None
-            stream = recording._domain.stream
-            current = torch.cuda.current_stream(device)
-            stream.wait_stream(current)
-            with torch.cuda.stream(stream):
-                _eager(step, steps[:1], tensors, phases, steps, None, ctx)
-            current.wait_stream(stream)
-            stream.synchronize()
+            # The caller's stream: residency records its consumers on the current stream, and
+            # the recording's own streams end with the program.
+            _eager(step, steps[:1], tensors, phases, steps, None, ctx)
             torch.cuda.empty_cache()
             rest = steps[1:]
             began = time.perf_counter()
@@ -286,7 +283,7 @@ class Loops:
             for attempt in attempts:
                 ctx.raise_if_cancelled()
                 try:
-                    with torch.cuda.stream(stream), recording.capturing():
+                    with recording.capturing():
                         mode, stages, blocks = attempt(
                             recording, step, rest, tensors, mutable, counter, phases, steps, models
                         )
@@ -690,6 +687,7 @@ class _Graph:
         self.index: Any = None
         self._contexts = ExitStack()
         self._mode: Any = None
+        self._caller: Any = None
 
     def _overlaps(self, tensor: Any, areas: Any) -> bool:
         if not isinstance(tensor, torch.Tensor):
@@ -702,9 +700,11 @@ class _Graph:
         )
 
     def begin(self) -> None:
+        """Capture on the recording's library stream; only the recorded region runs there."""
         if torch.cuda.is_current_stream_capturing():
             raise RuntimeError("a loop stage begins outside capture")
         stream, control = self.domain.stream, self.domain.control
+        self._caller = torch.cuda.current_stream(self.device)
         self.index = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.held[id(self.index)] = self.index
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
@@ -714,6 +714,7 @@ class _Graph:
             self._contexts.enter_context(pause() if pause is not None else nullcontext())
             self._contexts.enter_context(kernel_ready.recording())
             self._contexts.enter_context(varena.capture(self.device.index))
+            stream.wait_stream(self._caller)
             control.wait_stream(stream)
             torch.cuda.set_stream(control)
             try:
@@ -723,6 +724,7 @@ class _Graph:
             finally:
                 torch.cuda.set_stream(stream)
         except BaseException:
+            torch.cuda.set_stream(self._caller)
             self._contexts.close()
             self.graph = None
             raise
@@ -747,7 +749,7 @@ class _Graph:
                 try:
                     self.graph.capture_end()
                 finally:
-                    torch.cuda.set_stream(stream)
+                    torch.cuda.set_stream(self._caller)
             finally:
                 self._contexts.close()
         control.synchronize()
