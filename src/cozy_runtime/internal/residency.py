@@ -427,6 +427,25 @@ class Model:
         finally:
             self.memory._close(self, executing=executing)
 
+    @contextmanager
+    def lending(self) -> Iterator[None]:
+        """This thread's open pass lends its common block to a native stage preparation, which
+        needs every input idle, and takes it back after. A failed take-back stays lent."""
+        if (
+            not getattr(self.local, "depth", 0)
+            or self.common is None
+            or getattr(self.local, "lent", False)
+        ):
+            yield
+            return
+        self.memory._exit(self.common)
+        self.local.lent = True
+        try:
+            yield
+        finally:
+            self.memory._enter(self.common)
+            self.local.lent = False
+
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
         try:
@@ -2645,8 +2664,9 @@ class Memory:
                             if self._prefetch is not None and self._prefetch.block.model is model:
                                 self._settle_prefetch(cancel=True)
                     finally:
-                        if model.common is not None:
+                        if model.common is not None and not getattr(model.local, "lent", False):
                             self._exit(model.common)
+                        model.local.lent = False
                 finally:
                     request = getattr(model.local, "request", None)
                     if request is not None:

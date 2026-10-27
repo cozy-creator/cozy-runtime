@@ -392,6 +392,7 @@ class PreparedRepeat:
         with (
             torch.cuda.device(device),
             torch.inference_mode(False),
+            ExitStack() as lent,
             ExitStack() as cleanup,
             ExitStack() as preparing,
         ):
@@ -463,6 +464,9 @@ class PreparedRepeat:
                         if why := graphs._hooked(model.module):
                             raise CapabilityError(why, code="prepared_graph_ineligible")
                         if owner is load_component:
+                            if _detach_stage:
+                                # Lent through detach_stage; taken back as capture returns.
+                                lent.enter_context(model.lending())
                             try:
                                 load = binding.prepare_load(stage=_detach_stage)
                             except ResidencyError as error:
