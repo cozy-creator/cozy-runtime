@@ -937,6 +937,9 @@ class PreparedRepeat:
                     for recording, _ in phases:
                         recording.reset()
                     held.clear()
+                    # A refusal returns its warm-up and capture memory before the caller runs
+                    # eagerly, whose cuts size their windows to the memory that is free.
+                    torch.cuda.empty_cache()
             if landed != LANDED[0]:
                 native.close_owner()
                 held.clear()
@@ -1803,7 +1806,12 @@ class _SequenceCapture:
                 for stage in self.stages:
                     stage.close()
                 if self._domain is not None:
+                    import torch
+
                     self._domain.finish()
+                    # The unfinished recording's pool goes back, not only its graphs.
+                    self._pool = None
+                    torch.cuda.empty_cache()
                 self._closed = True
             finally:
                 self._closing = False
