@@ -93,6 +93,10 @@ def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], pha
 _NONE = object()
 
 
+def _now() -> float:
+    return round(time.time() * 1000, 1)
+
+
 def _refusal(error: BaseException) -> str | None:
     """The reason a preparation error lets the loop continue in another mode, else None."""
     if isinstance(error, CapabilityError):
@@ -181,17 +185,37 @@ class Loops:
         before: Callable[..., object] | None,
         after: Callable[..., object] | None,
     ) -> None:
-        ctx = CURRENT.get()
         row: dict[str, Any] = {
             "steps": len(steps),
             "mode": "eager",
             "native_steps": 0,
             "reused": False,
             "refusals": [],
+            "at_ms": {"entered": _now()},  # unix ms: entered, submitted, finished, returned
         }
         request = _REQUEST.get()
         if request is not None:
             ROWS.setdefault(request.id, []).append(row)
+        try:
+            self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
+        finally:
+            row["at_ms"]["returned"] = _now()
+
+    def _run(
+        self,
+        step: Callable[..., object],
+        steps: range,
+        state: tuple[Any, ...],
+        carried: tuple[Any, ...],
+        inputs: tuple[Any, ...],
+        phases: tuple[Hashable, ...] | None,
+        key: Hashable | None,
+        on_step: Callable[[int], object] | None,
+        before: Callable[..., object] | None,
+        after: Callable[..., object] | None,
+        row: dict[str, Any],
+    ) -> None:
+        ctx = CURRENT.get()
         loop = _Loop(step, steps, phases, on_step, before, after)
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
@@ -599,6 +623,7 @@ def _submit(
     """One native submission covering `indices`; no fallback once it is accepted."""
     with torch.no_grad():
         program.counter.fill_(indices.start)
+    row["at_ms"].setdefault("submitted", _now())
     execution: Any = (
         sequence.submit(ctx) if ctx._submit_prepared is None else ctx._submit_prepared(sequence)
     )
@@ -621,6 +646,7 @@ def _submit(
             break
         time.sleep(0.01)
     execution.wait()
+    row["at_ms"]["finished"] = _now()
     ctx.raise_if_cancelled()
     facts = execution.facts()
     done = int(facts["sequence"]["completed_passes"]) if streamed else int(progress.completed_steps)
