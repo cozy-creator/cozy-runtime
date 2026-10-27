@@ -28,7 +28,7 @@ class Pieces(Protocol):
 
     def split(
         self,
-        name: str,
+        op: Callable[[Any], Any],
         key: str,
         total: int,
         finest: int,
@@ -58,7 +58,7 @@ def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut, working: float = 0.0) ->
         return fn(x)
     shape = tuple(int(n) for n in x.shape)
     return runtime.split(
-        _name(fn),
+        fn,
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
