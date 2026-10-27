@@ -2344,6 +2344,7 @@ class Memory:
                     read = region.prepare_read(
                         block.model.source.ck,
                         parts,
+                        threads=8,
                         reclaim=False,
                         evict_completed=queued is None,
                     )
