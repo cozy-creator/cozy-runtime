@@ -103,6 +103,8 @@ _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", defa
 _CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
 #: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
 CUTTER: ContextVar[Any] = ContextVar("cozy_loop_cutter", default=None)
+#: A native loop's eager call (`internal.loop`): the models whose forwards it ran.
+ENTERED: ContextVar[set[Any] | None] = ContextVar("cozy_loop_entered", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -2648,6 +2650,8 @@ class Memory:
             model._release()
 
     def _open(self, model: Model, key: str, *, executing: bool = False) -> None:
+        if executing and (seen := ENTERED.get()) is not None:
+            seen.add(model)
         model._claim()
         depth = getattr(model.local, "depth", 0)
         model.local.depth = depth + 1

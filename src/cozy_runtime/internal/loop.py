@@ -1,13 +1,16 @@
 """`author.denoise_loop` in the Runtime: eager, one resident captured program, or streamed stages.
 
-The first step always runs eagerly, for real: it warms kernels and brings the weights in through
-ordinary residency, on the caller's stream (only recorded regions run on the recording's streams,
-which end with the program). Then the loop runs resident when
-every block of its components is still on the device, else as streamed stages cut at the
-residency's own block boundaries, else eagerly. A refusal before submission drops that attempt
-and the next mode continues from the next step; nothing runs twice. After submission nothing
-falls back. A keyed program stays for its call site until a new key replaces it or residency
-retires it under pressure; any other program closes before the loop returns.
+`before` and the first step always run eagerly, for real: they warm kernels and bring the weights
+in through ordinary residency, on the caller's stream (only recorded regions run on the
+recording's streams, which end with the program). Then the loop runs resident when every block of
+its step's components is still on the device, else as streamed stages cut at the residency's own
+block boundaries, else eagerly. A refusal before submission drops that attempt and the next mode
+continues from the next step; nothing runs twice. After submission nothing falls back.
+
+A keyed call whose components all stay resident records the whole call (`before`, the steps and
+`after`) and keeps it for its call site: later calls run it natively from start to end, until a
+new key replaces it or residency retires it under pressure. Any other program closes before the
+loop returns, ahead of an eager `after`.
 """
 
 from __future__ import annotations
@@ -39,11 +42,13 @@ from cozy_runtime.compute import (
     _SequenceCapture,
     _zero_dropout_attention,
 )
+from cozy_runtime.graphs import domain
 from cozy_runtime.internal import kernel_ready
 from cozy_runtime.internal.residency import (
     _CAPTURE_BLOCKS,
     _REQUEST,
     CUTTER,
+    ENTERED,
     Binding,
     Model,
     ResidencyError,
@@ -106,13 +111,19 @@ def _refusal(error: BaseException) -> str | None:
 
 @dataclass
 class _Program:
-    """A recorded native loop and the tensors its graphs read."""
+    """A recorded native loop and the tensors its graphs read.
 
-    sequence: PreparedSequence
+    `first` runs the steps after the eager first one (and `after` when it is recorded); `again`,
+    when recorded, runs `before`, every step and `after` for a later call, with no eager step.
+    Several runs of equal phases are several parts, submitted in order.
+    """
+
+    first: tuple[tuple[PreparedSequence, int, int], ...]
+    again: PreparedSequence | None
+    after_native: bool
     mode: str
     tensors: tuple[Any, ...]
     counter: Any
-    count: int
     ident: Hashable
     stages: int
     blocks: int
@@ -120,11 +131,16 @@ class _Program:
     #: a kept program's cache handle: residency releases it under pressure while it is idle
     region: Any = None
 
+    def sequences(self) -> tuple[PreparedSequence, ...]:
+        rest = () if self.again is None else (self.again,)
+        return (*(sequence for sequence, _, _ in self.first), *rest)
+
     def valid(self) -> bool:
-        return self.sequence.valid()
+        return all(sequence.valid() for sequence in self.sequences())
 
     def close(self) -> None:
-        self.sequence.close()
+        for sequence in self.sequences():
+            sequence.close()
 
     def release(self) -> None:
         if self.region is None:
@@ -150,6 +166,8 @@ class Loops:
         phases: tuple[Hashable, ...] | None,
         key: Hashable | None,
         on_step: Callable[[int], object] | None,
+        before: Callable[..., object] | None,
+        after: Callable[..., object] | None,
     ) -> None:
         ctx = CURRENT.get()
         row: dict[str, Any] = {
@@ -162,16 +180,17 @@ class Loops:
         request = _REQUEST.get()
         if request is not None:
             ROWS.setdefault(request.id, []).append(row)
+        loop = _Loop(step, steps, phases, on_step, before, after)
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
-            models, why = _eligible(ctx, steps, tensors)
+            scope, why = _eligible(ctx, steps, tensors)
             if why:
                 row["refusals"].append(why)
-                _eager(step, steps, tensors, phases, steps, on_step, ctx)
+                loop.eager_all(tensors, ctx)
                 return
             assert ctx is not None
-            site = (step.__code__, tuple(id(model) for model in models))
+            site = (step.__code__, tuple(id(model) for model in scope))
             ident = None if key is None else (key, _layouts(tensors), len(steps), phases)
             with self._lock:
                 kept = self._kept.get(site)
@@ -183,132 +202,238 @@ class Loops:
             if kept is not None:
                 with _taken(kept.lock, ctx), _pinned(kept) as pinned:
                     if pinned and kept.valid():
-                        self._reuse(kept, step, steps, tensors, work, phases, on_step, ctx, row)
+                        self._reuse(kept, loop, tensors, work, ctx, row)
                         return
             program = None
             try:
-                program = self._record(
-                    step, steps, tensors, work, phases, models, key, ctx, row, ident
-                )
-                if on_step is not None:
-                    on_step(steps[0])
+                program = _record(loop, tensors, work, scope, key, ctx, row, ident)
                 if program is None:
-                    _eager(step, steps[1:], tensors, phases, steps, on_step, ctx)
                     return
-                _submit(program, steps[1:], on_step, ctx, row)
-                for value, slot in zip(work, program.tensors, strict=False):
-                    if value is not slot:
-                        value.copy_(slot)
+                for sequence, first, count in program.first:
+                    _submit(program, sequence, range(first, first + count), loop, ctx, row)
             except BaseException:
                 if program is not None:
                     program.close()
                 raise
-            if key is None:
+            if key is None or not program.after_native:
+                # Only a program that ends the call is kept. Any other closes before the work
+                # after it (an eager decode) needs its pool and weights.
                 program.close()
-            else:
-                program.region = models[0].memory.region(
-                    "denoise_loop", "program", release=program.close
-                )
-                with self._lock:
-                    previous = self._kept.pop(site, None)
-                    self._kept[site] = program
-                if previous is not None:
-                    _close_idle(previous)
+                _once(after, program.tensors)
+                _back(work, program.tensors)
+                return
+            _back(work, program.tensors)
+            program.region = scope[0].memory.region(
+                "denoise_loop", "program", release=program.close
+            )
+            with self._lock:
+                previous = self._kept.pop(site, None)
+                self._kept[site] = program
+            if previous is not None:
+                _close_idle(previous)
 
     def _reuse(
         self,
         kept: _Program,
-        step: Callable[..., object],
-        steps: range,
+        loop: _Loop,
         tensors: tuple[Any, ...],
         work: tuple[Any, ...],
-        phases: tuple[Hashable, ...] | None,
-        on_step: Callable[[int], object] | None,
         ctx: Context,
         row: dict[str, Any],
     ) -> None:
-        """A kept program: this call's values into its tensors, its first step eagerly, the
-        rest natively, and the state back out."""
+        """A kept program: this call's values into its tensors, then natively `before`, every
+        step and `after` (or, without that program, the first step eagerly and the rest
+        natively), and the state back out."""
         row.update(mode=kept.mode, reused=True, stages=kept.stages, blocks=kept.blocks)
         try:
             for slot, value in zip(kept.tensors, tensors, strict=True):
                 slot.copy_(value)
-            _eager(step, steps[:1], kept.tensors, phases, steps, on_step, ctx)
-            _submit(kept, steps[1:], on_step, ctx, row)
-            for value, slot in zip(work, kept.tensors, strict=False):
-                value.copy_(slot)
+            if kept.again is not None:
+                _submit(kept, kept.again, loop.steps, loop, ctx, row)
+            else:
+                _once(loop.before, kept.tensors)
+                loop.eager(loop.steps[:1], kept.tensors, ctx)
+                for sequence, first, count in kept.first:
+                    _submit(kept, sequence, range(first, first + count), loop, ctx, row)
+                if not kept.after_native:
+                    _once(loop.after, kept.tensors)
+            _back(work, kept.tensors)
         except BaseException:
             kept.close()
             raise
 
-    def _record(
-        self,
-        step: Callable[..., object],
-        steps: range,
-        tensors: tuple[Any, ...],
-        work: tuple[Any, ...],
-        phases: tuple[Hashable, ...] | None,
-        models: tuple[Model, ...],
-        key: Hashable | None,
-        ctx: Context,
-        row: dict[str, Any],
-        ident: Hashable,
-    ) -> _Program | None:
-        """Record the loop after its eager first step; None when every mode refused."""
-        device = tensors[0].device
-        if key is not None:  # the program owns copies; this call's values go in and out
-            tensors = tuple(value.clone() for value in tensors)
-        mutable = tensors[: len(work)]
-        counter = torch.zeros(1, dtype=torch.int64, device=device)
-        recording = PreparedSequence.record()
-        recording.__enter__()
+
+@dataclass(frozen=True)
+class _Loop:
+    """One call's declaration."""
+
+    step: Callable[..., object]
+    steps: range
+    phases: tuple[Hashable, ...] | None
+    on_step: Callable[[int], object] | None
+    before: Callable[..., object] | None
+    after: Callable[..., object] | None
+
+    def phase(self, i: int) -> Any:
+        return _NONE if self.phases is None else self.phases[i - self.steps.start]
+
+    def eager(self, indices: range, tensors: tuple[Any, ...], ctx: Context | None) -> None:
+        if not len(indices):
+            return
+        index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+        for i in indices:
+            if ctx is not None:
+                ctx.raise_if_cancelled()
+            index.fill_(i)
+            _call(self.step, index, tensors, self.phase(i))
+            if self.on_step is not None:
+                self.on_step(i)
+
+    def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
+        _once(self.before, tensors)
+        self.eager(self.steps, tensors, ctx)
+        _once(self.after, tensors)
+
+
+def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
+    if fn is not None:
+        fn(*tensors)
+
+
+@contextmanager
+def _entering() -> Iterator[set[Any]]:
+    """The models whose forwards run inside: residency adds each one it opens."""
+    seen: set[Any] = set()
+    token = ENTERED.set(seen)
+    try:
+        yield seen
+    finally:
+        ENTERED.reset(token)
+
+
+def _record(
+    loop: _Loop,
+    tensors: tuple[Any, ...],
+    work: tuple[Any, ...],
+    scope: tuple[Model, ...],
+    key: Hashable | None,
+    ctx: Context,
+    row: dict[str, Any],
+    ident: Hashable,
+) -> _Program | None:
+    """`before` and the first step eagerly, then the rest recorded; None when every mode
+    refused, after the loop ran eagerly to its end."""
+    steps = loop.steps
+    if key is not None:  # the program owns copies; this call's values go in and out
+        tensors = tuple(value.clone() for value in tensors)
+    mutable = tensors[: len(work)]
+    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+    in_scope = {id(model) for model in scope}
+
+    def entered(seen: set[Any]) -> tuple[Model, ...]:
+        return tuple(model for model in scope if model in seen and id(model) in in_scope)
+
+    # The caller's stream: residency records its consumers on the current stream, and the
+    # recording's own streams end with the program.
+    with _entering() as seen:
+        _once(loop.before, tensors)
+    pre = entered(seen)
+    with _entering() as seen:
+        loop.eager(steps[:1], tensors, ctx)
+    models = entered(seen) or scope
+    resident = all(not _unresident(model) for model in models)
+    # A kept program records the whole call: `after` too, when its components (the scope's
+    # others) stay on the device. Its one eager warm-up output is overwritten by the program.
+    rest_of_scope = tuple(m for m in scope if m not in pre and m not in models)
+    ends = (
+        key is not None
+        and loop.after is not None
+        and resident
+        and loop.phases is None
+        and all(not _unresident(model) for model in (*pre, *rest_of_scope))
+    )
+    post: tuple[Model, ...] = ()
+    if ends:
+        with _entering() as seen:
+            _once(loop.after, tensors)
+        post = entered(seen)
+        ends = all(not _unresident(model) for model in post)
+    recording = PreparedSequence.record()
+    recording.__enter__()
+    try:
         try:
+            recording._prepare((*mutable, counter))
+        except BaseException as error:
+            if (why := _refusal(error)) is None:
+                raise
+            row["refusals"].append(f"recording: {why}")
+            _back(work, tensors)
+            loop.eager(steps[1:], work + tensors[len(work) :], ctx)
+            _once(loop.after, work + tensors[len(work) :])
+            return None
+        torch.cuda.empty_cache()
+        rest = steps[1:]
+        began = time.perf_counter()
+        row["resident_after_first_step"] = resident
+        attempts = ("resident", "streamed") if resident else ("streamed",)
+        for mode in attempts:
+            ctx.raise_if_cancelled()
             try:
-                recording._prepare((*mutable, counter))
+                with recording.capturing():
+                    if mode == "resident":
+                        parts, blocks = _record_resident(
+                            recording, loop, rest, tensors, mutable, counter, models,
+                            pre if ends else None, post if ends else None, key is not None,
+                        )
+                    else:
+                        parts, blocks = _record_streamed(
+                            recording, loop, rest, tensors, mutable, counter, models
+                        )
+                made = recording.finish_parts(
+                    outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
+                )
             except BaseException as error:
                 if (why := _refusal(error)) is None:
                     raise
-                row["refusals"].append(f"recording: {why}")
-                _eager(step, steps[:1], tensors, phases, steps, None, ctx)
-                _back(work, tensors)
-                return None
-            # The caller's stream: residency records its consumers on the current stream, and
-            # the recording's own streams end with the program.
-            _eager(step, steps[:1], tensors, phases, steps, None, ctx)
-            torch.cuda.empty_cache()
-            rest = steps[1:]
-            began = time.perf_counter()
-            resident = all(not _unresident(model) for model in models)
-            row["resident_after_first_step"] = resident
-            attempts = (_record_resident, _record_streamed) if resident else (_record_streamed,)
-            for attempt in attempts:
-                ctx.raise_if_cancelled()
-                try:
-                    with recording.capturing():
-                        mode, stages, blocks = attempt(
-                            recording, step, rest, tensors, mutable, counter, phases, steps, models
-                        )
-                    repeat = None if mode == "resident" else (0, len(recording.stages), len(rest))
-                    sequence = recording.finish(outputs=mutable, repeat=repeat)
-                except BaseException as error:
-                    if (why := _refusal(error)) is None:
-                        raise
-                    row["refusals"].append(f"{attempt.__name__.removeprefix('_record_')}: {why}")
-                    _drop_stages(recording)
-                    torch.cuda.empty_cache()
-                    continue
-                row.update(
-                    mode=mode,
-                    stages=stages,
-                    blocks=blocks,
-                    capture_ms=round((time.perf_counter() - began) * 1000, 3),
-                )
-                return _Program(sequence, mode, tensors, counter, len(rest), ident, stages, blocks)
-            _back(work, tensors)  # the eager rest runs on the caller's tensors
-            return None
-        finally:
-            if not recording._finished:
-                recording.close()
+                row["refusals"].append(f"{mode}: {why}")
+                _drop_stages(recording)
+                torch.cuda.empty_cache()
+                continue
+            first = tuple(
+                (sequence, start, count)
+                for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
+                if start >= 0
+            )
+            again = next(
+                (sequence for sequence, part in zip(made, parts, strict=True) if part[3] < 0),
+                None,
+            )
+            row.update(
+                mode=mode,
+                stages=len(recording.stages),
+                blocks=blocks,
+                capture_ms=round((time.perf_counter() - began) * 1000, 3),
+                after_native=mode == "resident" and ends and loop.after is not None,
+            )
+            return _Program(
+                first,
+                again,
+                mode == "resident" and ends and loop.after is not None,
+                mode,
+                tensors,
+                counter,
+                ident,
+                len(recording.stages),
+                blocks,
+            )
+        _back(work, tensors)  # the eager rest runs on the caller's tensors
+        tensors = work + tensors[len(work) :]
+        loop.eager(rest, tensors, ctx)
+        _once(loop.after, tensors)
+        return None
+    finally:
+        if not recording._finished:
+            recording.close()
 
 
 def _back(work: tuple[Any, ...], tensors: tuple[Any, ...]) -> None:
@@ -344,12 +469,12 @@ def _stale(program: _Program, ident: Hashable) -> str:
     """Why a kept program cannot serve this call ("" when it can)."""
     if ident is None or program.ident != ident:
         return "another key or layout"
-    sequence = program.sequence
-    if sequence._closed:
-        return "released"
-    for stage in sequence.stages:
-        if why := stage._invalid_reason():
-            return why
+    for sequence in program.sequences():
+        if sequence._closed:
+            return "released"
+        for stage in sequence.stages:
+            if why := stage._invalid_reason():
+                return str(why)
     return ""
 
 
@@ -406,27 +531,6 @@ def _eligible(
     return models, ""
 
 
-def _eager(
-    step: Callable[..., object],
-    indices: range,
-    tensors: tuple[Any, ...],
-    phases: tuple[Hashable, ...] | None,
-    steps: range,
-    on_step: Callable[[int], object] | None,
-    ctx: Context | None,
-) -> None:
-    if not len(indices):
-        return
-    index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    for i in indices:
-        if ctx is not None:
-            ctx.raise_if_cancelled()
-        index.fill_(i)
-        _call(step, index, tensors, _NONE if phases is None else phases[i - steps.start])
-        if on_step is not None:
-            on_step(i)
-
-
 def _unresident(model: Model) -> str:
     binding = model.retain(("",))
     try:
@@ -444,24 +548,26 @@ def _drop_stages(recording: _SequenceCapture) -> None:
         with stage._submission:
             stage._sequence_owner = None
         stage.close()
+    # A failed capture leaves its pool's bookkeeping behind; the next attempt takes a new one.
+    recording._pool = domain.Pool(torch.cuda.graph_pool_handle())
 
 
 def _submit(
     program: _Program,
-    rest: range,
-    on_step: Callable[[int], object] | None,
+    sequence: PreparedSequence,
+    indices: range,
+    loop: _Loop,
     ctx: Context,
     row: dict[str, Any],
 ) -> None:
-    """One native submission of the program's steps; no fallback once it is accepted."""
+    """One native submission covering `indices`; no fallback once it is accepted."""
     with torch.no_grad():
-        program.counter.fill_(rest.start)
-    sequence = program.sequence
+        program.counter.fill_(indices.start)
     execution: Any = (
         sequence.submit(ctx) if ctx._submit_prepared is None else ctx._submit_prepared(sequence)
     )
     streamed = program.mode == "streamed"
-    reported = 0
+    on_step, reported = loop.on_step, 0
     while True:
         if ctx.cancelled:
             execution.cancel()
@@ -472,7 +578,7 @@ def _submit(
             else int(progress.completed_steps)
         )
         if on_step is not None:
-            for i in rest[reported:done]:
+            for i in indices[reported:done]:
                 on_step(i)
         reported = max(reported, done)
         if progress.done:
@@ -482,48 +588,60 @@ def _submit(
     ctx.raise_if_cancelled()
     facts = execution.facts()
     done = int(facts["sequence"]["completed_passes"]) if streamed else int(progress.completed_steps)
-    if progress.canceled or done != len(rest):
+    if progress.canceled or done != len(indices):
         raise OutputError(
-            f"the native loop stopped after {done} of {len(rest)} steps", code="incomplete_denoise"
+            f"the native loop stopped after {done} of {len(indices)} steps",
+            code="incomplete_denoise",
         )
     if on_step is not None:
-        for i in rest[reported:]:
+        for i in indices[reported:]:
             on_step(i)
     row["native_steps"] = row.get("native_steps", 0) + done
-    row["host_graph_launches"] = int(facts["host_graph_launches"])
+    row["host_graph_launches"] = row.get("host_graph_launches", 0) + int(
+        facts["host_graph_launches"]
+    )
     reads = [int(stage.get("read_bytes", 0)) for stage in facts.get("stage_inputs", ())]
     if reads:
         row["streamed_bytes"] = row.get("streamed_bytes", 0) + sum(reads)
-    admitted: dict[str, int] = {}
     for pair in facts.get("stage_prefetch_admission", ()):
+        admitted = row.setdefault("prefetch", {})
         admitted[str(pair.get("state"))] = admitted.get(str(pair.get("state")), 0) + 1
-    if admitted:
-        row["prefetch"] = admitted
     if phases := facts.get("native_phases"):
-        row["native_phases"] = len(phases)
+        row["native_phases"] = row.get("native_phases", 0) + len(phases)
 
 
 # ------------------------------------------------------------------ recording
 
 
+#: A recorded part: (first stage, end stage, passes, first step index or -1 for the reuse
+#: program, steps).
+_Part = tuple[int, int, int, int, int]
+
+
 def _record_resident(
     recording: _SequenceCapture,
-    step: Callable[..., object],
+    loop: _Loop,
     rest: range,
     tensors: tuple[Any, ...],
     mutable: tuple[Any, ...],
     counter: Any,
-    phases: tuple[Hashable, ...] | None,
-    steps: range,
     models: tuple[Model, ...],
-) -> tuple[str, int, int]:
-    """One WHILE graph per run of equal phases, every component resident and held."""
-    runs = _runs(rest, phases, steps)
+    pre: tuple[Model, ...] | None,
+    post: tuple[Model, ...] | None,
+    again: bool,
+) -> tuple[list[_Part], int]:
+    """One WHILE graph per run of equal phases, every component resident and held. With
+    `pre`/`post` (the models `before`/`after` run, resident too), `after` is recorded as the
+    last graph's suffix, and `again` also makes the reuse program: `before`, every step and
+    `after` over the same graphs."""
+    runs = _runs(rest, loop.phases, loop.steps)
+    held = list(models) + [m for m in (*(pre or ()), *(post or ())) if m not in models]
+    state = (*mutable, counter)
     bindings: list[Binding] = []
     try:
         with ExitStack() as preparing:
             idle: set[int] = set()
-            for model in models:
+            for model in held:
                 _checked(model)
                 binding = model.retain(("",))
                 bindings.append(binding)
@@ -536,63 +654,83 @@ def _record_resident(
                         code="prepared_graph_ineligible",
                     )
                 preparing.enter_context(binding.prepare())
+            owners = tuple(bindings)
             landed = LANDED[0]
-            plans = []
-            for _, count, phase in runs:
+            graphs_: list[tuple[_Graph, int, int]] = []
+            with _guarded(tuple(held), frozenset()):
+                for first, count, phase in runs:
 
-                def body(phase: Any = phase) -> None:
-                    _call(step, counter, tensors, phase)
-                    counter.add_(1)
+                    def body(phase: Any = phase) -> None:
+                        _call(loop.step, counter, tensors, phase)
+                        counter.add_(1)
 
-                with _guarded(models, frozenset()):
-                    graph = _Graph(recording, (*mutable, counter), count, tuple(bindings))
+                    graph = _Graph(recording, state, count, owners)
                     graph.record(body)
-                plan = graph.plan(landed)
-                _own(plan, tuple(bindings), recording)
-                plans.append(plan)
+                    graphs_.append((graph, first, count))
+                prefix = suffix = None
+                if loop.after is not None and post is not None:
+                    suffix = _Graph(recording, state, 1, owners)
+                    suffix.record(lambda: loop.after(*tensors))  # type: ignore[misc]
+                if again and loop.before is not None and pre is not None:
+                    prefix = _Graph(recording, state, 1, owners)
+                    prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
+            parts: list[_Part] = []
+            for number, (graph, first, count) in enumerate(graphs_):
+                last = number == len(graphs_) - 1
+                plan = graph.plan(landed, suffix=suffix if last else None)
+                _own(plan, owners, recording)
+                parts.append((len(recording.stages) - 1, len(recording.stages), 1, first, count))
+            if again and len(graphs_) == 1:
+                graph, first, count = graphs_[0]
+                plan = graph.plan(landed, count + 1, prefix=prefix, suffix=suffix)
+                _own(plan, owners, recording)
+                parts.append((len(recording.stages) - 1, len(recording.stages), 1, -1, count + 1))
+            for done in (*(g for g, _, _ in graphs_), prefix, suffix):
+                if done is not None:
+                    done.done()
     except BaseException:
         for binding in bindings:
             binding.close()
         raise
     for binding in bindings:  # the last stage closes the bindings every stage reads
-        plans[-1]._binding_cleanup.callback(binding.close)
-    return "resident", len(runs), 0
+        recording.stages[-1]._binding_cleanup.callback(binding.close)
+    return parts, 0
 
 
 def _record_streamed(
     recording: _SequenceCapture,
-    step: Callable[..., object],
+    loop: _Loop,
     rest: range,
     tensors: tuple[Any, ...],
     mutable: tuple[Any, ...],
     counter: Any,
-    phases: tuple[Hashable, ...] | None,
-    steps: range,
     models: tuple[Model, ...],
-) -> tuple[str, int, int]:
-    """One pass cut into stages at the component's block boundaries, repeated natively."""
-    runs = _runs(rest, phases, steps)
-    if len(runs) != 1:
-        raise CapabilityError(
-            "streamed native runs one phase", code="prepared_graph_ineligible"
-        )
+) -> tuple[list[_Part], int]:
+    """Per run of equal phases, one pass cut into stages at the component's block boundaries;
+    its sequence repeats that pass natively."""
     if len(models) != 1:
         raise CapabilityError(
             "streamed native runs one component", code="prepared_graph_ineligible"
         )
-    (_, _, phase), (model,) = runs[0], models
+    (model,) = models
     if not model.blocks:
         raise CapabilityError(
             f"{model.component} has no blocks to stream", code="prepared_graph_ineligible"
         )
+    parts: list[_Part] = []
+    blocks = 0
+    for first, count, phase in _runs(rest, loop.phases, loop.steps):
 
-    def body() -> None:
-        _call(step, counter, tensors, phase)
-        counter.add_(1)
+        def body(phase: Any = phase) -> None:
+            _call(loop.step, counter, tensors, phase)
+            counter.add_(1)
 
-    cutter = _Cutter(recording, model, (*mutable, counter))
-    cutter.record(body)
-    return "streamed", len(recording.stages), cutter.blocks
+        begin = len(recording.stages)
+        cutter = _Cutter(recording, model, (*mutable, counter))
+        cutter.record(body)
+        parts.append((begin, len(recording.stages), count, first, count))
+        blocks = max(blocks, cutter.blocks)
+    return parts, blocks
 
 
 def _runs(
@@ -806,26 +944,47 @@ class _Graph:
             raise
         self.end()
 
-    def plan(self, landed: int) -> PreparedRepeat:
-        """The native owner of this graph, once recording ended."""
+    def external(self) -> dict[int, Any]:
+        """What the recorded operations read from outside this graph and its pass's scratch."""
         areas = tuple(self.scratch) + tuple(
             (device, start, end) for _, _, device, start, end in self.generated.values()
         )
-        held = {
+        return {
             key: tensor
             for key, tensor in self.held.items()
             if not self._overlaps(tensor, areas)
             and not (self.loaded and self._overlaps(tensor, self.ranges))
         }
+
+    def plan(
+        self,
+        landed: int,
+        steps: int | None = None,
+        prefix: _Graph | None = None,
+        suffix: _Graph | None = None,
+    ) -> PreparedRepeat:
+        """A native owner repeating this graph `steps` times (its own count by default), with
+        one-shot `prefix` and `suffix` graphs of the same recording around the repeat."""
+        steps = self.steps if steps is None else steps
+        held: dict[int, Any] = {}
+        for graph in (self, prefix, suffix):
+            if graph is not None:
+                held.update(graph.external())
         owners = () if self.loaded else self.bindings
+        phases = {
+            "prefix_graph": 0 if prefix is None else prefix.graph.raw_cuda_graph(),
+            "suffix_graph": 0 if suffix is None else suffix.graph.raw_cuda_graph(),
+        }
+        extra = [graph.graph for graph in (prefix, suffix) if graph is not None]
         try:
             native = _execution.ResidentRepeat(
                 self.graph.raw_cuda_graph(),
                 self.index.data_ptr(),
                 self.device.index,
-                self.steps,
+                steps,
                 [
                     self.graph,
+                    *extra,
                     self.domain.stream,
                     self.index,
                     *held.values(),
@@ -834,6 +993,7 @@ class _Graph:
                     self.domain,
                     self.recording._pool,
                 ],
+                **phases,
             )
         except _execution.NativeExecutionError as error:
             self.reset()
@@ -849,12 +1009,15 @@ class _Graph:
             )
         dependencies = tuple((weakref.ref(t), PreparedRepeat._layout(t)) for t in held.values())
         identities = tuple((weakref.ref(b), b.identity) for b in self.bindings)
-        self.held.clear()
         plan = PreparedRepeat(
-            native, self.state, self.device.index, self.steps, dependencies, identities, landed
+            native, self.state, self.device.index, steps, dependencies, identities, landed
         )
         plan._capture_cache = {"recorded_ops": self.ops}
         return plan
+
+    def done(self) -> None:
+        """Every native owner is made: drop this graph's Python references to what it read."""
+        self.held.clear()
 
 
 class _Owners(TorchDispatchMode):  # type: ignore[misc]
@@ -1058,6 +1221,7 @@ class _Cutter:
                 load.seal()
             self._preparing.close()  # parameter slots back before any capture-only view drops
             plan = graph.plan(self.landed)
+            graph.done()
             if binding is None:
                 _own(plan, (), self.recording)
                 return

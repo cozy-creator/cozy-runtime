@@ -24,6 +24,8 @@ class Loops(Protocol):
         phases: tuple[Hashable, ...] | None,
         key: Hashable | None,
         on_step: Callable[[int], object] | None,
+        before: Callable[..., object] | None,
+        after: Callable[..., object] | None,
     ) -> None: ...
 
 
@@ -45,6 +47,8 @@ def denoise_loop(
     phases: Sequence[Hashable] | None = None,
     key: Hashable | None = None,
     on_step: Callable[[int], object] | None = None,
+    before: Callable[..., object] | None = None,
+    after: Callable[..., object] | None = None,
 ) -> None:
     """Run `step` once per index in `steps`; `state` and `carried` advance in place.
 
@@ -60,11 +64,16 @@ def denoise_loop(
     - `inputs`: read-only tensors of this call.
     - `phases`: one hashable host-side plan per step; each run of equal phases is one captured
       segment, and the step receives its phase.
-    - `key`: with `inputs`, lets the Runtime keep the program for a later call with an equal key
-      and equal tensor layouts. It names everything the step bakes in that is not a declared
-      tensor (a guidance float, say). The step must then reach every per-call tensor through
-      its arguments; the Runtime keeps its own copies and copies values in and out.
+    - `key`: with `inputs` and an `after`, lets the Runtime keep the whole call for a later
+      call with an equal key and equal tensor layouts. It names everything the step bakes in
+      that is not a declared tensor (a guidance float, say). The step, `before` and `after` must
+      then reach every per-call tensor through their arguments; the Runtime keeps its own
+      copies and copies values in and out.
     - `on_step(index)`: called on the host after each completed step.
+    - `before` and `after`: work that runs once before the first step and after the last,
+      called like the step without its index (`before(*state, *carried, *inputs)`): a text
+      encoder writing carried conditioning, a decoder writing an image held in `state`. The
+      Runtime records them into the program when their components stay on the device too.
 
     Call it inside a `@uses_components` method: the components the step runs are that scope's.
     """
@@ -82,4 +91,4 @@ def denoise_loop(
     runtime = _RUNTIME
     if runtime is None:
         raise RuntimeError("denoise_loop runs inside a Runtime executor")
-    runtime.run(step, steps, state, carried, inputs, phases, key, on_step)
+    runtime.run(step, steps, state, carried, inputs, phases, key, on_step, before, after)

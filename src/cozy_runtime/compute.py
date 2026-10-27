@@ -1782,6 +1782,47 @@ class _SequenceCapture:
             self._finished = True
             return sequence
 
+    def finish_parts(
+        self, *, outputs: Sequence[Any], parts: Sequence[tuple[int, int, int]]
+    ) -> tuple[PreparedSequence, ...]:
+        """The recorded stages as sequences, one per (begin, end, passes) slice, each repeating
+        its slice natively. They share this recording's pool and domain, which end with the
+        last of them."""
+        with self._submission, ExitStack() as locks:
+            if not self._entered or self._closed or self._finished:
+                raise RuntimeError("sequence recording is not open")
+            for stage in sorted(self.stages, key=id):
+                locks.enter_context(stage._submission)
+            owner = weakref.ref(self)
+            for stage in self.stages:
+                if stage._sequence_owner is None or stage._sequence_owner() is not self:
+                    raise RuntimeError("sequence recording lost a captured definition")
+                stage._sequence_owner = None
+            made: list[PreparedSequence] = []
+            try:
+                for begin, end, passes in parts:
+                    made.append(
+                        PreparedSequence(
+                            self.stages[begin:end],
+                            outputs=outputs,
+                            repeat=(0, end - begin, passes) if passes > 1 else None,
+                        )
+                    )
+            except BaseException:
+                for sequence in made:  # transferred stages return to the recording
+                    for stage in sequence.stages:
+                        stage._sequence_owner = None
+                    sequence._closed = True
+                for stage in self.stages:
+                    stage._sequence_owner = owner
+                raise
+            shared = _SharedDomain(self._domain, len(made))
+            for sequence in made:
+                sequence._capture_domain = shared
+            self._domain = None
+            self._finished = True
+            return tuple(made)
+
     @contextmanager
     def capturing(self) -> Iterator[None]:
         """Stages are being recorded: residency cannot retire the recording meanwhile."""
@@ -1815,6 +1856,19 @@ class _SequenceCapture:
     def __del__(self) -> None:
         with suppress(BaseException):
             self.close()
+
+
+class _SharedDomain:
+    """One recording's domain, finished when the last sequence made from it closes."""
+
+    def __init__(self, domain: Any, users: int) -> None:
+        self.domain, self.users = domain, users
+
+    def finish(self) -> None:
+        self.users -= 1
+        if self.users == 0 and self.domain is not None:
+            self.domain.finish()
+            self.domain = None
 
 
 class _SequenceExecution(Execution):
