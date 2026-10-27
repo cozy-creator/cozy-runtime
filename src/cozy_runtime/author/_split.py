@@ -34,6 +34,7 @@ class Pieces(Protocol):
         finest: int,
         out_bytes: int,
         run: Callable[[int], Any],
+        working: float = 0.0,
     ) -> Any: ...
 
     def piece(self) -> None: ...
@@ -47,9 +48,11 @@ def install(runtime: Pieces | None) -> None:
     _RUNTIME = runtime
 
 
-def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
+def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut, working: float = 0.0) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
-    window of `x` to that window of its result. Without a managing memory it runs whole."""
+    window of `x` to that window of its result. Without a managing memory it runs whole.
+    `working`: the bytes a window holds beyond its output, per element of its input (an FFN's
+    intermediates). Declared, it sizes the first call too; else the first calls measure."""
     runtime = _RUNTIME
     if runtime is None or not cuts:
         return fn(x)
@@ -61,6 +64,7 @@ def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
         _finest(shape, cuts),
         int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size()),
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece),
+        working,
     )
 
 

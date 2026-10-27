@@ -1,0 +1,1 @@
+`split(fn, x, *cuts, working=b)`: a package may declare a window's working bytes per input element. A declared op is sized from its first call and never measured at small windows, where a cold MiniMax-H3 step 1 ran its first FFNs launch-bound.

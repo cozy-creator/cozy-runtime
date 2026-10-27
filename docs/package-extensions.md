@@ -72,7 +72,10 @@ output cross-fades (none: the pieces join exactly, as a batch does).
 decoded = split(self.decode_tiles, z, Cut(-2, scale=8, overlap=8), Cut(-1, scale=8, overlap=8))
 ```
 
-The op runs whole when the device can hold it. Its peak bytes per input element are measured
-in the executor; later calls start at the fewest pieces that fit what is free plus the idle
-weights the plane may unmap (which unmap first). A piece that still runs out of memory runs
-again at half the size. A run that split records `<op>.pieces`.
+The op runs whole when the device can hold it. An author who knows the op's intermediates
+declares them: `split(fn, x, *cuts, working=b)`, `b` bytes per input element beyond the output
+(an FFN window: its projection, activation and down-projection rows over its input rows).
+Otherwise its peak bytes per input element are measured in the executor over its first two
+calls, the first at small windows. Calls start at the fewest pieces that fit what is free plus
+the idle weights the plane may unmap (which unmap first). A piece that still runs out of memory
+runs again at half the size. A run that split records `<op>.pieces`.
