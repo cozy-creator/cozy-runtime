@@ -175,7 +175,8 @@ class Loops:
             ident = None if key is None else (key, _layouts(tensors), len(steps), phases)
             with self._lock:
                 kept = self._kept.get(site)
-                if kept is not None and (ident is None or kept.ident != ident or not kept.valid()):
+                if kept is not None and (why := _stale(kept, ident)):
+                    row["dropped"] = why
                     del self._kept[site]
                     _close_idle(kept)
                     kept = None
@@ -337,6 +338,19 @@ def _taken(lock: threading.Lock, ctx: Context) -> Iterator[None]:
         yield
     finally:
         lock.release()
+
+
+def _stale(program: _Program, ident: Hashable) -> str:
+    """Why a kept program cannot serve this call ("" when it can)."""
+    if ident is None or program.ident != ident:
+        return "another key or layout"
+    sequence = program.sequence
+    if sequence._closed:
+        return "released"
+    for stage in sequence.stages:
+        if why := stage._invalid_reason():
+            return why
+    return ""
 
 
 def _close_idle(program: _Program) -> None:
