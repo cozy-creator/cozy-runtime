@@ -1,0 +1,1 @@
+The 8-bit GEMM self-check now requires every int8 and w4a8 tile (the unpack tile included) to return the same bits on the card, since their integer sums are exact. A tile that differs refuses the op with `bits differ from tile N`, where the 1e-2 error budget alone let it pass. FP8 tiles are not held to this.
