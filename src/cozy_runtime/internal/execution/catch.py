@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import threading
+import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -23,7 +24,7 @@ from torch import Tensor, nn
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.execution import sizing
-from cozy_runtime.internal.residency import Request
+from cozy_runtime.internal.residency import CAPTURE_WARMUP, Request, diagnose
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
@@ -171,7 +172,10 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
 
     def room() -> sizing.Room:
         nonlocal available
+        began = time.perf_counter_ns()
         available = request.room()
+        request.tm["cut_room_ns"] = request.tm.get("cut_room_ns", 0) + time.perf_counter_ns() - began
+        request.tm["cut_rooms"] = request.tm.get("cut_rooms", 0) + 1
         return available
 
     def whole(level: int) -> T:
@@ -211,6 +215,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
             raise failure from None
 
     try:
+        request.tm["cuts"] = request.tm.get("cuts", 0) + 1
         if _capturing():
             available = request.room()
             return whole(sizing.choose(finest, need, available)[0])

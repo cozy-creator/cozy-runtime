@@ -233,7 +233,19 @@ class PreparedRepeat:
                 selected.close()
 
     @classmethod
-    def capture(
+    def capture(cls, *args: Any, **kwargs: Any) -> PreparedRepeat:
+        from cozy_runtime.internal.residency import diagnose
+
+        try:
+            plan = cls._capture(*args, **kwargs)
+        except BaseException as error:  # PROOF-ONLY diagnostics
+            diagnose("capture_refused", error=f"{type(error).__name__}: {error}"[:400])
+            raise
+        diagnose("capture_done")
+        return plan
+
+    @classmethod
+    def _capture(
         cls,
         step: Callable[[Any], object],
         *,
@@ -804,12 +816,20 @@ class PreparedRepeat:
                 phases.append((after, suffix))
             native = None
             try:
-                with torch.cuda.stream(stream), CaptureOwners(False):
-                    for _, operation in phases:
-                        operation()  # instantiate each phase's library workspaces before capture
-                    for target, original in zip(tensors, saved, strict=True):
-                        target.copy_(original)
-                stream.synchronize()
+                from cozy_runtime.internal.residency import CAPTURE_WARMUP, diagnose
+
+                diagnose("capture_warmup")
+                warming = CAPTURE_WARMUP.set([0])
+                try:
+                    with torch.cuda.stream(stream), CaptureOwners(False):
+                        for _, operation in phases:
+                            operation()  # instantiate each phase's library workspaces before capture
+                        for target, original in zip(tensors, saved, strict=True):
+                            target.copy_(original)
+                    stream.synchronize()
+                finally:
+                    CAPTURE_WARMUP.reset(warming)
+                diagnose("capture_warmed")
                 # Like torch.cuda.graph's preparation, return inactive eager segments
                 # before the graph asks for its own pool. Warmup and its state restore
                 # are joined; live tensors, weight pins and existing graph pools remain
@@ -824,6 +844,7 @@ class PreparedRepeat:
                     "torch_reserved_after_bytes": reserved_after,
                     "torch_returned_bytes": max(reserved_before - reserved_after, 0),
                 }
+                diagnose("capture_begin")
                 context = CURRENT.get()
                 pause = context._pause_stall_watch if context is not None else None
                 with (
