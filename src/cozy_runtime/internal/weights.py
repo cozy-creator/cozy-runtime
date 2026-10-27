@@ -755,8 +755,9 @@ class _Bakes:
         weight's stored name and encoding with each delta's content (a stored factor pair of
         this checkpoint, or the identity a hook's package declares), dtypes and scale. A bake
         waits for no kernel: while its kernels build the LoRAs serve per step, and pages bake
-        once they serve (the identity changes, so varena refills them)."""
-        torch = self.torch
+        once they serve (the identity changes, so varena refills them). Read where varena
+        declares a fill, a pass's start: a hooked component's pass is each forward, after its
+        package armed the overlay (`Placement.using`), so what serves is decided there only."""
         gpu = self.gpu if self.strategy == "bake" else None
         self.how = "eager" if gpu is None else lora_bake.serving(gpu)
         self.serving = self.strategy if self.how is not None else "per_step"
@@ -768,7 +769,17 @@ class _Bakes:
                 hook._cozy_baked = baked
             if bake.leaf is not None:
                 bake.leaf.adopt(functools.partial(_deltas, bake) if baked else None)
-        if not baked:
+        return self._described()
+
+    @property
+    def hooked(self) -> bool:
+        """Whether a package's overlay hook feeds a bake: what it bakes is armed per forward."""
+        return any(bake.hooks for bake in self.bakes.values())
+
+    def _described(self) -> str | None:
+        """`identity` as last decided: a fill seeds its rounding from it, never re-deciding."""
+        torch = self.torch
+        if self.serving != "bake":
             return repr((self.serving,))
         held: list[object] = [lora_bake.recipe(self.how == "fused"), torch.__version__]
         held.append(torch.cuda.get_device_capability(self.gpu) if self.gpu is not None else "cpu")
@@ -789,9 +800,9 @@ class _Bakes:
         return repr(held)
 
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
-        identity = self.identity
         if self.serving != "bake":
             return
+        identity = self._described()
         for stored, bake in self.bakes.items():
             weight = parts.get(stored)
             if bake.leaf is not None or weight is None:
@@ -889,11 +900,16 @@ class Placement:
         """A local scope (`_ComponentScope`): one varena pass per component for the call, its
         forwards nested in it, and its blocks held bound from free bytes while its plan step
         lasts. A hold never outlives the step: a later step's activations cannot evict pinned
-        pages (S3). A component with no free room binds per block."""
+        pages (S3). A component with no free room binds per block. A component whose bakes a
+        package's overlay hook feeds (H3's Turbo) is neither held nor passed here: its package
+        arms the overlay in the forward, so each forward is its own pass and declares the fill
+        identity armed. A hold or pass opened first filled pages unarmed under the identity a
+        LoRA forward reads, and base and LoRA forwards shared it (runs 19464, 19471)."""
         entering = {name for name in components if name in self.models}
+        armed = {n for n in entering if (b := self.bakes.get(n)) is not None and b.hooked}
         self.release(keep=entering.union(*(s for s in self.steps if s & entering)))
         stream = self.torch.cuda.current_stream() if self.memory.cuda else None
-        for name in sorted(entering - self.holds.keys() - self.unheld):
+        for name in sorted(entering - self.holds.keys() - self.unheld - armed):
             shed = functools.partial(self.holds.pop, name, None)
             hold = self.models[name].hold(shed, free_only=True)
             if hold is None:
@@ -907,7 +923,8 @@ class Placement:
                 region = routes.region if routes is not None else None
                 if region is not None and passes.enter_context(region.pin()):
                     routes.forget()
-                passes.enter_context(self.models[name].passing(method))
+                if name not in armed:
+                    passes.enter_context(self.models[name].passing(method))
             yield
 
     def release(self, keep: Collection[str] = ()) -> None:

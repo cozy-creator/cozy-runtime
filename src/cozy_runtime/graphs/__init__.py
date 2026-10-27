@@ -1173,10 +1173,14 @@ def _record(
 
 def _hooked(module: Any) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
-    at every call, which a replay would skip (varena's binds and Runtime's own are served)."""
+    at every call, which a replay would skip (varena's binds and Runtime's own are served). A
+    LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
+    the bound pages follow that answer: a replay would keep the captured one."""
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
+                if callable(getattr(hook, "lora_factors", None)):
+                    return f"a LoRA overlay hook on {type(sub).__name__}"
                 if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
                     return f"a package forward hook on {type(sub).__name__}"
     return ""
