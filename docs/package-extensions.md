@@ -75,4 +75,5 @@ decoded = split(self.decode_tiles, z, Cut(-2, scale=8, overlap=8), Cut(-1, scale
 The op runs whole when the device can hold it. Its peak bytes per input element are measured
 in the executor; later calls start at the fewest pieces that fit what is free plus the idle
 weights the plane may unmap (which unmap first). A piece that still runs out of memory runs
-again at half the size. A run that split records `<op>.pieces`.
+again at half the size. A run that split records `<op>.pieces`, and its record's
+`execution.cuts.levels` holds each site's call count per level (index = level).

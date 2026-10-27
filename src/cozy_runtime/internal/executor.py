@@ -3715,7 +3715,9 @@ class Executor:
                     attention.implementations(served_impls),
                     segments if len(segments) > 1 else (),
                 ),
-                "cuts": self.host.cuts.pop(command.request_id, {"sites": [], "oom_floor": 0}),
+                "cuts": self.host.cuts.pop(
+                    command.request_id, {"sites": [], "levels": {}, "oom_floor": 0}
+                ),
             },
             "quiescent": quiescent,
             **_env_document(),

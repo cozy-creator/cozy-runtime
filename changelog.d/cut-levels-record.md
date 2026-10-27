@@ -1,0 +1,1 @@
+A run record's `execution.cuts.levels` holds each cut site's eager call count per level, so a run whose windows changed (memory pressure, a fresh executor's measurement) shows it; `sites` still lists each site's first dispatch and every descent.
