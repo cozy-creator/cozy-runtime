@@ -463,20 +463,35 @@ _MEASURED_LOCK = threading.Lock()
 
 
 def split[T](
-    name: str, key: str, total: int, finest: int, out_bytes: int, run: Callable[[int], T]
+    name: str,
+    key: str,
+    total: int,
+    finest: int,
+    out_bytes: int,
+    run: Callable[[int], T],
+    working: float = 0.0,
 ) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
-    Its op's bytes are measured at its first two successful window sizes, then fitted: an
-    op quadratic in its window scales as one. The first measurement groups at most 128
-    minimum windows; allocation refusals use the ordinary descent to smaller windows.
+    A declared `working` (bytes a window holds beyond the output, per input element) sizes
+    every call, the first included. Otherwise the op's bytes are measured at its first two
+    successful window sizes, then fitted: an op quadratic in its window scales as one. The
+    first measurement groups at most 128 minimum windows; allocation refusals use the
+    ordinary descent to smaller windows.
     Like every split call, the declared operation must be safe to retry without side effects."""
     deepest = levels(-(-total // max(finest, 1)))
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
+
+    if working > 0:
+
+        def declared(level: int, granularity: int) -> int:
+            return sizing.peak(granularity, out_bytes, (math.ceil(working * window(level)),))
+
+        return catch.cut(f"split:{key}", deepest, declared, lambda level: run(window(level)))
 
     with _MEASURED_LOCK:
         points = sorted(_MEASURED.get(key, ()))
