@@ -501,7 +501,10 @@ def drain(torch: Any, kind: str) -> None:
 #: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
 #: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
 #: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
-ALLOCATOR = "backend:native,expandable_segments:False"
+#: Blocks over 256 MiB are never split: each large activation keeps a segment of its own size,
+#: which a retry after OOM returns whole. Split, they left 2.14 GiB of holes that no 1.09 GiB
+#: row set fit (H3 15 s, RTX 3070, step 2: h3-8gb session 40503269167).
+ALLOCATOR = "backend:native,expandable_segments:False,max_split_size_mb:256"
 
 
 def initialize(torch: Any, kind: str) -> None:
