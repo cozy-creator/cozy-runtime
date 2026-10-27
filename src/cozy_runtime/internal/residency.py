@@ -85,8 +85,46 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+
+
+def diagnose(label: str, **extra: object) -> None:
+    """PROOF-ONLY: a memory snapshot on the current request (`stats()["diag"]`)."""
+    request = _REQUEST.get()
+    if request is None or len(request.diag) >= 160:
+        return
+    memory = request.memory
+    if not memory.cuda or not torch.cuda.is_initialized():
+        return
+    free, _ = torch.cuda.mem_get_info(memory.device)
+    row: dict[str, object] = {
+        "label": label,
+        "ms": round((time.perf_counter_ns() - request.diag_t0) / 1e6, 1),
+        "driver_free": int(free),
+        "torch_allocated": int(torch.cuda.memory_allocated(memory.device)),
+        "torch_reserved": int(torch.cuda.memory_reserved(memory.device)),
+        "capturing": memory.capturing(),
+        **extra,
+    }
+    if memory.native is not None:
+        row["native"] = {k: v for k, v in memory.native.stats().items() if isinstance(v, int)}
+    room = memory.room(request.current)
+    row["room"] = [room.free, room.cold, room.warm]
+    sets: dict[str, list[int]] = {}
+    for model in list(memory.models.values()):
+        groups = list(model.groups())
+        sets[model.name.split("/")[-1]] = [
+            sum(int(b.region.allocated_bytes) for b in groups if b.region is not None and b.region.resident),
+            sum(int(b.final_region.allocated_bytes) for b in groups if b.final_region is not None and b.final_region.resident),
+            sum(b.nbytes for b in groups if b.data is not None),
+            sum(1 for b in groups if b.count or b.retained or b.loading),
+            sum(1 for b in groups if b.preferred),
+        ]
+    row["sets"] = sets
+    request.diag.append(row)
 # During authored stage preparation, undeclared model reads must not page in sibling blocks.
 _CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
+#: PROOF-ONLY: floor cuts counted while a prepared repeat runs its eager warm-up
+CAPTURE_WARMUP: ContextVar[list[int] | None] = ContextVar("cozy_diag_warmup", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -799,6 +837,7 @@ class Binding:
                     raise StaleBinding("TensorFS lacks detached model-stage input ownership")
                 # Native now owns ready inputs, or ordinary resident capture revalidates.
                 ready_uses.clear()
+                diagnose("load_slot", needed=needed, slot=slot is not None)
                 if slot is None:
                     return None  # The caller must revalidate/reacquire its resident binding.
                 self._load_slot = slot
@@ -1985,6 +2024,7 @@ class Memory:
                         ),
                     }
                 )
+                diagnose("phase", models=sorted(n.split("/")[-1] for n in names))
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         model = block.model
@@ -2463,7 +2503,14 @@ class Memory:
                     self._keep_baked(page, use.tensor, streams=not block.preferred)
                 block.overlay = overlay
             if use is not None:
+                committing = time.perf_counter_ns()
                 use.commit()
+                request = _REQUEST.get()
+                if request is not None:
+                    request.prof_commit_ns += time.perf_counter_ns() - committing
+                    request.prof_commits += 1
+                    request.prof_fills += int(read_bytes > 0)
+                    request.prof_demand_read_ns += read_ns
             ready = None
             if self.cuda:
                 ready = torch.cuda.Event()
@@ -2711,10 +2758,14 @@ class Memory:
                         other.overlap = True
             self.requests.add(request)
         token = _REQUEST.set(request)
+        if not idle:
+            diagnose("request_start")
         try:
             yield request
         finally:
             try:
+                if not idle:
+                    diagnose("request_end")
                 with self.lock:
                     if self._prefetch is not None and self._prefetch.request is request:
                         # Cancel/drain unfinished speculation. An already completed read
@@ -2759,6 +2810,11 @@ class Request:
         self.final_fills = self.final_hits = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
+        #: PROOF-ONLY profile: (model, path, event_in, event_out, enter_ns, ensure_ns, prefetch_ns, exit_ns)
+        self.prof_blocks: list[list[Any]] = []
+        self.prof_commit_ns = self.prof_commits = self.prof_fills = self.prof_demand_read_ns = 0
+        self.diag: list[dict[str, object]] = []
+        self.diag_t0 = time.perf_counter_ns()
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
@@ -2872,6 +2928,41 @@ class Request:
         )
         self.sample()
 
+    def _profile(self) -> dict[str, Any]:
+        """PROOF-ONLY: GPU time inside each block's enqueue window and between blocks, and the
+        host time of the residency hooks, per model."""
+        rows = [r for r in self.prof_blocks if r[3] is not None]
+        if not rows:
+            return {}
+        torch.cuda.synchronize(self.memory.device)
+        by: dict[str, dict[str, float]] = {}
+        gaps: list[tuple[float, str]] = []
+        for i, (name, path, ev_in, ev_out, enter_ns, _, pre_ns, exit_ns) in enumerate(rows):
+            m = by.setdefault(name.split("/")[-1], {"blocks": 0, "gpu_in_ms": 0.0, "gpu_gap_ms": 0.0,
+                                                   "host_enter_ms": 0.0, "host_prefetch_ms": 0.0,
+                                                   "host_exit_ms": 0.0})
+            m["blocks"] += 1
+            m["gpu_in_ms"] += ev_in.elapsed_time(ev_out)
+            m["host_enter_ms"] += enter_ns / 1e6
+            m["host_prefetch_ms"] += pre_ns / 1e6
+            m["host_exit_ms"] += exit_ns / 1e6
+            if i + 1 < len(rows) and rows[i + 1][0] == name:
+                gap = ev_out.elapsed_time(rows[i + 1][2])
+                m["gpu_gap_ms"] += gap
+                gaps.append((gap, f"{path}->{rows[i + 1][1]}"))
+        gaps.sort(reverse=True)
+        first, last = rows[0][2], rows[-1][3]
+        return {
+            "scope": "PROOF-ONLY: events on the current stream at each block's entry and exit",
+            "span_ms": round(first.elapsed_time(last), 1),
+            "by_model": {k: {x: round(v, 1) for x, v in m.items()} for k, m in by.items()},
+            "commits": self.prof_commits,
+            "commit_ms": round(self.prof_commit_ns / 1e6, 1),
+            "demand_fills": self.prof_fills,
+            "demand_read_ms": round(self.prof_demand_read_ns / 1e6, 1),
+            "top_gaps": [[round(g, 2), w] for g, w in gaps[:12]],
+        }
+
     def stats(self) -> dict[str, Any]:
         if self.ended is not None:
             return self.ended
@@ -2936,6 +3027,8 @@ class Request:
                     "scope": "one exact raw block; current demand precedes queued speculation",
                     "queued": list(self.queued_prefetch),
                 },
+                profile=self._profile(),
+                diag=list(self.diag),
             )
         elif self.memory.device.type == "mps":
             out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
@@ -3185,8 +3278,10 @@ def _hooks(model: Model) -> None:
 
         def entered(*_: object, b: _Block = block) -> None:
             model._claim()
+            t0 = time.perf_counter_ns()
             try:
                 memory._enter(b)
+                t1 = time.perf_counter_ns()
                 try:
                     memory._prefetch_next(b)
                 except BaseException:
@@ -3195,12 +3290,34 @@ def _hooks(model: Model) -> None:
             except BaseException:
                 model._release()
                 raise
+            t2 = time.perf_counter_ns()
+            request = _REQUEST.get()
+            if request is not None and memory.cuda and not memory.capturing():
+                event = torch.cuda.Event(enable_timing=True)
+                event.record()
+                request.prof_blocks.append(
+                    [model.name, b.path, event, None, t1 - t0, t1 - t0, t2 - t1, 0]
+                )
 
         def exited(b: _Block = block) -> None:
+            request = _REQUEST.get()
+            row = None
+            if request is not None and memory.cuda and not memory.capturing():
+                for candidate in reversed(request.prof_blocks[-8:]):
+                    if candidate[1] == b.path and candidate[3] is None:
+                        row = candidate
+                        break
+                if row is not None:
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record()
+                    row[3] = event
+            t0 = time.perf_counter_ns()
             try:
                 memory._exit(b)
             finally:
                 model._release()
+                if row is not None:
+                    row[7] = time.perf_counter_ns() - t0
 
         model.handles.extend(_paired(sub, entered, exited))
 

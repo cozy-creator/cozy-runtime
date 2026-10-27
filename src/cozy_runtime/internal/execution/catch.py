@@ -21,9 +21,9 @@ import torch
 from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
-from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.author._errors import CapabilityError, Fault, fault
 from cozy_runtime.internal.execution import sizing
-from cozy_runtime.internal.residency import Request
+from cozy_runtime.internal.residency import CAPTURE_WARMUP, Request, diagnose
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
@@ -211,6 +211,27 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
             raise failure from None
 
     try:
+        peek = request.room()  # PROOF-ONLY diagnostics
+        chosen, tier = sizing.choose(finest, need, peek)
+        if tier == "floor":
+            warmup = CAPTURE_WARMUP.get()
+            if sum(1 for row in request.diag if row["label"] == "floor") < 16:
+                diagnose(
+                    "floor",
+                    site=site,
+                    level=chosen,
+                    finest=finest,
+                    need0=need(0, peek.granularity),
+                    need_level=need(chosen, peek.granularity),
+                    warmup=warmup is not None,
+                )
+            if warmup is not None:
+                warmup[0] += 1
+                if warmup[0] > 40:
+                    raise CapabilityError(
+                        "PROOF-ONLY: the capture warm-up cut to its floor 40 times",
+                        code="prepared_graph_ineligible",
+                    )
         if _capturing():
             available = request.room()
             return whole(sizing.choose(finest, need, available)[0])
