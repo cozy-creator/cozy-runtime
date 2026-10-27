@@ -394,7 +394,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.34.7"
+version = "0.34.8"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
@@ -451,8 +451,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", specifier = ">=0.17,<0.18" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.17,<0.18" },
+    { name = "tensorfs", specifier = ">=0.17.3,<0.18" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.17.3,<0.18" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.14" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.14" },
@@ -1683,16 +1683,16 @@ wheels = [
 
 [[package]]
 name = "tensorfs"
-version = "0.17.2"
-source = { registry = "https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/tensorfs-v0.17.2" }
-sdist = { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.2/tensorfs-0.17.2.tar.gz" }
+version = "0.17.3"
+source = { registry = "https://github.com/cozy-creator/cozy-creator/releases/expanded_assets/tensorfs-v0.17.3" }
+sdist = { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.3/tensorfs-0.17.3.tar.gz" }
 wheels = [
-    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.2/tensorfs-0.17.2-cp311-abi3-macosx_10_12_x86_64.whl" },
-    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.2/tensorfs-0.17.2-cp311-abi3-macosx_11_0_arm64.whl" },
-    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.2/tensorfs-0.17.2-cp311-abi3-win_amd64.whl" },
-    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.2/tensorfs-0.17.2-cp311-abi3-win_arm64.whl" },
-    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.2/tensorfs-0.17.2-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" },
-    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.2/tensorfs-0.17.2-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.3/tensorfs-0.17.3-cp311-abi3-macosx_10_12_x86_64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.3/tensorfs-0.17.3-cp311-abi3-macosx_11_0_arm64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.3/tensorfs-0.17.3-cp311-abi3-win_amd64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.3/tensorfs-0.17.3-cp311-abi3-win_arm64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.3/tensorfs-0.17.3-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" },
+    { url = "https://github.com/cozy-creator/cozy-creator/releases/download/tensorfs-v0.17.3/tensorfs-0.17.3-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" },
 ]
 
 [[package]]
