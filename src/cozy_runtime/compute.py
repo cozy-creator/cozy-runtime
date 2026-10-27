@@ -490,9 +490,10 @@ class PreparedRepeat:
                                     memory.request(graphs.IDLE_REQUEST, idle=True)
                                 )
                                 idle.add(id(memory))
-                            if not binding.resident():
+                            if why := binding.unresident():
                                 raise CapabilityError(
-                                    "capture requires the component's weights to be resident",
+                                    f"capture requires the component's weights to be resident"
+                                    f" ({why})",
                                     code="prepared_graph_ineligible",
                                 )
                         try:

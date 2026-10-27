@@ -524,6 +524,11 @@ class Hold:
         self.release()
 
 
+def _state(region: Any) -> str:
+    """A block region's residency, as a refusal names it."""
+    return "none" if region is None else "resident" if region.resident else "cold"
+
+
 class Binding:
     """A cached graph's owning storage, closed after its readers retire.
 
@@ -567,34 +572,54 @@ class Binding:
         self._load_target_strides: list[tuple[_Site, tuple[int, ...]]] = []
 
     def valid(self) -> bool:
+        return not self._invalid()
+
+    def _invalid(self) -> str:
+        """The first reason this binding cannot serve a graph, or empty when it can."""
         # A caller retires this graph before _declare changes the model's cached fill.
-        return (
-            not self.closed
-            and not self.completion_lost
-            and not self.model.closed
-            and self.fill is not None
-            and self.fill == self.model.wanted_identity()
-            and self.generation == self.model.generation
-            and all(block.region is region for block, region in self._stage_regions)
-            and (self._load_source is None or self.model.source is self._load_source)
-            and all(
-                (value := site.table[site.name]) is not None and tuple(value.stride()) == stride
-                for site, stride in self._load_target_strides
-            )
-            and all(
-                (value := site.table[site.name]) is not None
-                and tuple(value.shape) == shape
-                and value.dtype == dtype
-                for site, shape, dtype in self.targets
-            )
-            and all(
-                (self._load_data is not None or b.data is not None) and b.generation == generation
-                for b, generation in self.held
-            )
-        )
+        model = self.model
+        if self.closed or self.completion_lost or model.closed:
+            return "closed"
+        if self.fill is None or self.fill != model.wanted_identity():
+            return "fill identity changed"
+        if self.generation != model.generation:
+            return "model generation changed"
+        if not all(block.region is region for block, region in self._stage_regions):
+            return "stage region replaced"
+        if self._load_source is not None and model.source is not self._load_source:
+            return "load source changed"
+        if not all(
+            (value := site.table[site.name]) is not None and tuple(value.stride()) == stride
+            for site, stride in self._load_target_strides
+        ):
+            return "target strides changed"
+        if not all(
+            (value := site.table[site.name]) is not None
+            and tuple(value.shape) == shape
+            and value.dtype == dtype
+            for site, shape, dtype in self.targets
+        ):
+            return "target shape or dtype changed"
+        if not all(
+            (self._load_data is not None or b.data is not None) and b.generation == generation
+            for b, generation in self.held
+        ):
+            return "held block released"
+        return ""
 
     def resident(self) -> bool:
-        return self.valid() and all(b.data is not None or b.cached() for b in self.groups)
+        return not self.unresident()
+
+    def unresident(self) -> str:
+        """Why `resident()` is false: the component and its first non-resident block."""
+        name = self.model.component
+        if why := self._invalid():
+            return f"{name}: {why}"
+        for b in self.groups:
+            if b.data is None and not b.cached():
+                final = f", final {_state(b.final_region)}" if b.final_bytes else ""
+                return f"{name} block {b.path or '(common)'}: raw {_state(b.region)}{final}"
+        return ""
 
     def prepare_load(self, *, stage: bool = False) -> Any:
         """Create capture-private views for immutable raw blocks, without reading weights.
