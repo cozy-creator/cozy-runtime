@@ -484,6 +484,8 @@ def _attend(
 #: section's peak less what was live at its start and the output). A measurement on the live
 #: tensors, never an OOM; fitted once both are in (`sizing.fitted`)
 _MEASURED: dict[str, list[tuple[int, int]]] = {}
+#: split keys whose larger measuring window the device refused: the second point is a smaller one
+_REFUSED: set[str] = set()
 _MEASURED_LOCK = threading.Lock()
 
 
@@ -505,6 +507,7 @@ def split[T](
 
     with _MEASURED_LOCK:
         points = sorted(_MEASURED.get(key, ()))
+        refused = key in _REFUSED
     request = catch.CURRENT.get()
     measured: tuple[int, int] | None = None
 
@@ -527,12 +530,14 @@ def split[T](
 
         return catch.cut(f"split:{key}", deepest, need, at)
     # A whole long sequence at one token per launch is expensive even when it fits.
-    # Start bounded, then measure the next larger window. OOM still descends to the floor.
-    target = (
-        next((lv for lv in range(deepest, -1, -1) if window(lv) > points[-1][0]), 0)
-        if points
-        else min(deepest, max(deepest - 7, 1))
-    )
+    # Start bounded, then measure the next larger window; where the device refused it (a short
+    # axis: H3's 56 heads start at 28 a window), the next smaller. OOM still descends.
+    if not points:
+        target = min(deepest, max(deepest - 7, 1))
+    elif refused:
+        target = next((lv for lv in range(deepest + 1) if window(lv) < points[0][0]), deepest)
+    else:
+        target = next((lv for lv in range(deepest, -1, -1) if window(lv) > points[-1][0]), 0)
 
     def measuring(level: int, granularity: int) -> int:
         return 0 if level >= target else sys.maxsize  # a coarser window is not yet measured
@@ -546,4 +551,6 @@ def split[T](
         if len(known) < 2 and all(measured[0] != w for w, _ in known):
             known.append(measured)
             known.sort()
+        elif len(known) == 1:
+            _REFUSED.add(key)  # the larger window descended to the known one
     return result

@@ -55,10 +55,18 @@ def levelled(units: int, per: Per) -> Need:
     return lambda level, granularity: per(pieces(units, level), granularity)
 
 
+#: At the floor a finer level must save at least this share of the finest's bytes: past that the
+#: whole output (held throughout) is the need, and pieces only add launches.
+_FLOOR_SHARE = 64
+
+
 def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
     """The coarsest level of 0..`finest` that fits, and its tier: within free and cold bytes
     ("cold": no weight of the step evicted), else within everything revocable less the streaming
-    floor ("warm"), else the finest ("floor"), where only the physical floor refuses."""
+    floor ("warm"), else ("floor") the coarsest within 1/64 of the finest's bytes, where only the
+    physical floor refuses. The room counts driver-free bytes, so Torch's cached blocks make it
+    look short: a floor at the finest ran H3 15 s's norms and FFNs a token or three a piece, 2^21
+    pieces a site (RTX 3070, h3-8gb sessions 40463894354 and 40471655517)."""
     for tier, room_bytes in (
         ("cold", room.free + room.cold),
         ("warm", room.free + room.cold + room.warm - room.floor),
@@ -68,7 +76,9 @@ def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
         )
         if level is not None:
             return level, tier
-    return finest, "floor"
+    least = need(finest, room.granularity)
+    knee = least + least // _FLOOR_SHARE
+    return next(n for n in range(finest + 1) if need(n, room.granularity) <= knee), "floor"
 
 
 def descend[T](
