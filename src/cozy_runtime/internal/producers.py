@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
 from cozy_runtime.author._attention import AttentionProducer, ProducerCall
@@ -76,6 +77,9 @@ class Processor:
             raise ValueError(
                 f"{self.producer.name} requires the model's attention layout and a request scope"
             )
+        if attention_sol.outlier_keys(getattr(attn, "norm_k", None)):
+            # Its dense rows are exact on Runtime's route: the producer leaves it, as an exact path.
+            layout = replace(layout, exact_paths=(*layout.exact_paths, self.path))
         config = self._parallel_config
         group = (
             attention_ulysses.group(config)

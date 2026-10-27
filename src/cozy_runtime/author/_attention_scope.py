@@ -17,7 +17,9 @@ class AttentionLayout:
     refiners or sensitive layers without making a generic backend infer model
     semantics from tensor values. Exact paths are the layers whose dense rows keep
     BF16 attention when the dense kernel quantizes (a layer whose keys a per-head
-    8-bit scale cannot carry). Step indices are zero-based. This describes
+    8-bit scale cannot carry); Runtime adds every layer whose key RMSNorm gain has
+    outlier channels (`attention_sol.outlier_keys`), so a model names only the rest.
+    Step indices are zero-based. This describes
     inference only; it does not authorize a backend or select a kernel.
     """
 

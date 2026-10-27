@@ -30,7 +30,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from importlib import import_module
 from inspect import Parameter, Signature, signature
@@ -57,6 +57,27 @@ from cozy_runtime.internal.attention_ulysses import Local
 class Site:
     component: str
     path: str
+    #: The module's key RMSNorm (`norm_k`), when it has one (`outlier_keys`).
+    keys: Any = field(default=None, compare=False, repr=False)
+
+
+#: A key RMSNorm gain that peaks at this multiple of its RMS or more puts outlier channels in
+#: every key, which no quantized scale carries: its layer's dense rows take the exact kernel,
+#: as a model's exact paths do. H3: 5.1-7.0 at blocks 45, 48, 49 (FP4 0.25-0.56 rel L2 there),
+#: 1.06-1.55 at every other layer.
+KEY_GAIN_CREST = 3.0
+
+
+def outlier_keys(norm: Any) -> bool:
+    """Whether a key RMSNorm's gain has an outlier channel (`KEY_GAIN_CREST`). Read on its
+    module's first call, where its weight is resident, and kept on it: weights alone decide,
+    so every rank and every step agree."""
+    if getattr(norm, "weight", None) is None:
+        return False
+    if not hasattr(norm, "_cozy_outlier_keys"):
+        gain = norm.weight.detach().float().abs()
+        norm._cozy_outlier_keys = bool(gain.amax() >= KEY_GAIN_CREST * gain.square().mean().sqrt())
+    return bool(norm._cozy_outlier_keys)
 
 
 _SITE: ContextVar[Site | None] = ContextVar("cozy_sol_site", default=None)
@@ -179,7 +200,7 @@ def install_site(module: Module, component: str, path: str) -> None:
     always-call post-hook can consume an outer recursive call's token. A local
     try/finally around the real forward has exactly one token per entered call.
     """
-    site = Site(component, path)
+    site = Site(component, path, getattr(module, "norm_k", None))
     existing = getattr(module, "_cozy_sol_site", None)
     if existing is not None:
         if existing.site != site:
@@ -801,14 +822,15 @@ def _execute(
 ) -> Any:
     """Apply the model's explicit policy after hardware/operand validation. An exact path's
     dense rows (its dense steps, its protected prefix, a dense path) take the exact kernel on
-    every route: the walked reference's (`_exact`), or the one a declaring row gives."""
+    every route: the walked reference's (`_exact`), or the one a declaring row gives. A layer
+    whose key gain has outlier channels (`outlier_keys`) is an exact path too."""
     import torch
 
     def on(paths: tuple[str, ...]) -> bool:
         return any(site.path == p or site.path.startswith(p + ".") for p in paths)
 
     dense_path = on(layout.dense_paths)
-    if on(layout.exact_paths):
+    if on(layout.exact_paths) or outlier_keys(site.keys):
         if dense is _dense:
             dense = _exact
         elif exact is not None:
