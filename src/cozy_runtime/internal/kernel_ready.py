@@ -141,8 +141,8 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
                 raise  # the memory manager's to answer
             return None
         if value is not None:
-            _landed(slot, value, "landed" if grouped else "ready")
-            return None if grouped else value
+            selected = _landed(name, slot, value, "landed" if grouped else "ready")
+            return None if grouped else cast("T | None", selected)
     opening = threading.Thread(target=_background, args=(name, slot, opener), daemon=True)
     opening.name = f"{THREAD}{name}"
     opening.start()
@@ -188,10 +188,10 @@ def wait[T](name: str, opener: Opener[T]) -> T:
         elif slot.state == "landed":
             slot.state = "ready"
             LANDED[0] += 1
-    if slot.error is not None:
-        raise slot.error
-    if slot.state == "ready":
-        return cast("T", slot.value)
+        if slot.error is not None:
+            raise slot.error
+        if slot.state == "ready":
+            return cast("T", slot.value)
     try:
         with _opening(name):
             value = opener(True)
@@ -200,10 +200,14 @@ def wait[T](name: str, opener: Opener[T]) -> T:
     except Exception:
         if mine:  # asked again, it opens again: a failed build is on the machine's record
             with _LOCK:
-                _SLOTS.pop(name, None)
+                if _SLOTS.get(name) is slot and slot.state == "opening":
+                    _SLOTS.pop(name)
         raise
-    _landed(slot, value, "ready")
-    return value
+    with _LOCK:  # its slot may be gone (another opener failed): this verified kernel serves then
+        current = _SLOTS.setdefault(name, _Slot("opening"))
+        if current.error is not None:
+            raise current.error
+        return cast("T", _landed(name, current, value, "ready"))
 
 
 def _background(name: str, slot: _Slot, opener: Opener[object]) -> None:
@@ -216,20 +220,35 @@ def _background(name: str, slot: _Slot, opener: Opener[object]) -> None:
     except Exception as exc:
         _ended(name, slot, exc)
         return
-    _landed(slot, value, "landed")
+    _landed(name, slot, value, "landed")
 
 
-def _landed(slot: _Slot, value: object, state: str) -> None:
+def _landed(name: str, slot: _Slot, value: object, state: str) -> object | None:
+    """The kernel `name` serves once `slot`'s opener verified `value`: the first verified one,
+    never replaced by a later one. None when `slot` is no longer `name`'s, or failed."""
     with _LOCK:
-        slot.value, slot.state = value, state
-        LANDED[0] += state == "ready"
+        if _SLOTS.get(name) is not slot or slot.state == "failed":
+            return None
+        if slot.state == "opening":
+            slot.value, slot.state = value, state
+            LANDED[0] += state == "ready"
+        elif slot.state == "landed" and state == "ready":
+            slot.state = "ready"
+            LANDED[0] += 1
+        return slot.value
 
 
 def _ended(name: str, slot: _Slot, exc: Exception) -> None:
-    """A failed opener's kernel stays failed here; one the device ran out under asks again."""
+    """A failed opener's kernel stays failed here, even one another opener made serve (the epoch
+    counts that change); one the device ran out under asks again, unless another's serves."""
     with _LOCK:
+        if _SLOTS.get(name) is not slot:
+            return
         if is_capacity(exc):
-            _SLOTS.pop(name, None)
+            if slot.state == "opening":
+                _SLOTS.pop(name)
+            return
+        LANDED[0] += slot.state == "ready"
         slot.state, slot.error = "failed", exc
 
 
