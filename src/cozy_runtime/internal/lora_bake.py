@@ -9,32 +9,29 @@ quality gate reads: how much of the delta survived and how much rounding error t
 
 On a GPU, `bake` is one fused Triton kernel per weight (`_bake_kernel`): it reads each stored
 byte once, adds the rank-r product computed in its tile, rounds and writes the byte back, with
-counter-based noise (one stream per weight, by element index). The kernel is compiled and
-checked in a child process (`warm`); this process only loads it from Triton's cache, and no
-request waits for it: until it serves, a LoRA serves per step. The eager row-chunk functions are
-its reference on CPU, what `Stats` measures, and what a GPU bakes with when the child failed.
+counter-based noise (one stream per weight, by element index). Its forms are a Runtime kernel
+set (`KERNELS`): built when the executor starts, beside the weight download, then loaded and
+checked at the model's load (`warm`), so a cold executor's first request bakes. No request waits
+for them: until they serve, a LoRA serves per step. The eager row-chunk functions are their
+reference on CPU, what `Stats` measures, and what a GPU bakes with where the set cannot serve.
 """
 
 from __future__ import annotations
 
-import json
 import math
-import subprocess
-import sys
-import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import partial
 from types import ModuleType
-from typing import IO, TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
 if TYPE_CHECKING:
     from torch import Generator, Tensor
     from torch import device as Device
 
-from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.internal import kernel_ready, tools
+from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.internal import kernel_ready, verify
 from cozy_runtime.internal.encoding import E4M3_MAX
 from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, hadamard256
 
@@ -513,7 +510,7 @@ def bake(
         down, up = down.flatten(1), up.flatten(1)
     device = next(iter(stored.values())).device
     if stats is None and device.type == "cuda" and how == "fused":
-        fused(torch, stored, down, up, seed)
+        fused(torch, _launch(device.index or 0), stored, down, up, seed)
         return
     generator = torch.Generator(device=device).manual_seed(seed & SEED_MASK)
     if "scale_2" in stored:
@@ -582,20 +579,15 @@ BF16, F16, F32, ROWWISE, INT8, NVFP4 = range(6)
 SEED_MASK = 0x7FFFFFFF
 _TILE = 64
 _INNER = 16
-#: The bake kernels' `kernel_ready` name: built and checked once per process, in a child (`warm`).
-KERNEL = "lora bake"
-#: That child, and the file holding its output.
-_BUILD: tuple[subprocess.Popen[bytes], IO[bytes]] | None = None
-_CHECK = (
-    "import json, sys; boot = json.loads(sys.argv[1]); sys.path[:] = boot['path']\n"
-    "import torch\n"
-    "from cozy_runtime.internal import lora_bake\n"
-    "lora_bake.check(torch, torch.device('cuda', boot['device']))\n"
-)
 
 
 def fused(
-    torch: ModuleType, stored: dict[str, Tensor], down: Tensor, up: Tensor, seed: int
+    torch: ModuleType,
+    launch: Launch,
+    stored: dict[str, Tensor],
+    down: Tensor,
+    up: Tensor,
+    seed: int,
 ) -> None:
     """`bake`, one kernel launch: each tile adds its `up @ down` (f32) to the decoded stored
     values and rounds them back in place."""
@@ -604,10 +596,11 @@ def fused(
         raw = stored["weight"].view(torch.uint8)
         rows, cols = raw.shape[0], 2 * raw.shape[1]
         second = stored["scale_2"].to(torch.float32).reshape(1)
-        grid = (triton.cdiv(rows, _TILE), triton.cdiv(cols, _TILE))
-        _bake_nvfp4_kernel[grid](
+        grid = (triton.cdiv(rows, _TILE), triton.cdiv(cols, _TILE), 1)
+        launch(
+            _bake_nvfp4_kernel, grid,
             raw, stored["scale"].view(torch.uint8), second, *factors, rows, cols, down.shape[0],
-            seed & SEED_MASK, TILE=_TILE, INNER=_INNER,
+            seed & SEED_MASK, _TILE, _INNER,
         )  # fmt: skip
         return
     if "value" in stored:
@@ -623,62 +616,40 @@ def fused(
     rows, cols = data.shape
     if kind == INT8:
         factors = (factors[0], down.to(torch.float32).contiguous())
-    grid = (triton.cdiv(rows, _TILE), triton.cdiv(cols, _TILE))
-    _bake_kernel[grid](
-        data, scale, *factors, rows, cols, down.shape[0], seed & SEED_MASK,
-        FORM=kind, TILE=_TILE, INNER=_INNER,
+    grid = (triton.cdiv(rows, _TILE), triton.cdiv(cols, _TILE), 1)
+    launch(
+        _bake_kernel, grid,
+        data, scale, *factors, rows, cols, down.shape[0], seed & SEED_MASK, kind, _TILE, _INNER,
     )  # fmt: skip
 
 
-def warm(device: int) -> None:
-    """Start building every fused form for GPU `device`, and checking its numbers (`check`), in
-    a child process under this one's interpreter and import path, once per process at load.
-    This process then only loads the kernels from Triton's cache: it never runs a compiler, so
-    one that crashes ends the child, and this process bakes eagerly with its reason. Nothing
-    waits for it: until it serves, a LoRA serves per step (`serving`)."""
-    serving(device)
+def warm(torch: ModuleType, device: int) -> None:
+    """Open the bake kernels for GPU `device` at load. They build when the executor starts
+    (`KERNELS`, beside the weight download), so a load that follows the build serves them from
+    its first request; nothing waits for them, and until they serve a LoRA serves per step."""
+    serving(torch, device)
 
 
-def serving(device: int) -> How | None:
-    """How a bake on GPU `device` runs now: `fused` once its kernels serve (`kernel_ready`),
-    `eager` (the reference) where they cannot, None while they build."""
-    if kernel_ready.ready(KERNEL, partial(_built, device)) is not None:
+def serving(torch: ModuleType, device: int) -> How | None:
+    """How a bake on GPU `device` runs now: `fused` once its kernels are built, loaded here and
+    pass `probe` (`kernel_ready`), `eager` (the reference) where they cannot, None while they
+    build."""
+    if triton is None or not kernel_ready.TRITON:
+        return "eager"
+    gpu = torch.device("cuda", device)
+    opener = partial(kernel_ready.TRITON[0], KERNELS, partial(probe, torch, gpu), device=gpu)
+    name = f"{KERNELS.name} cuda:{device}"
+    if kernel_ready.ready(name, opener) is not None:
         return "fused"
-    return "eager" if kernel_ready.failed(KERNEL) else None
+    return "eager" if kernel_ready.failed(name) else None
 
 
-def _built(device: int, wait: bool) -> bool | None:
-    """`kernel_ready`'s opener: True once the child built and checked every form."""
-    global _BUILD
-    if triton is None:
-        raise RuntimeError("triton does not import")
-    if not tools.triton():
-        raise RuntimeError("cc not found")
-    if _BUILD is None:
-        log: IO[bytes] = tempfile.TemporaryFile()  # noqa: SIM115 - closed when the child ends
-        boot = json.dumps({"path": sys.path, "device": device})
-        command = [sys.executable, "-I", "-c", _CHECK, boot]
-        _BUILD = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=log, stderr=log), log
-        _say(f"building its kernels in pid {_BUILD[0].pid}; LoRAs serve per step until it ends")
-    child, log = _BUILD
-    if child.poll() is None and not wait:
-        return None
-    with request_path.forbid("kernel build wait: lora bake"):
-        code = child.wait()
-    log.seek(0)
-    said = log.read().decode(errors="replace").strip().splitlines()
-    log.close()
-    _BUILD = None
-    how = (f"killed by signal {-code}" if code < 0 else f"exit {code}") if code else ""
-    _say(f"kernel build pid {child.pid} {how or 'built and checked its kernels'}")
-    if code:
-        raise RuntimeError(f"bake kernel build {how}" + (f": {said[-1]}" if said else "")[:300])
-    return True
-
-
-def _say(line: str) -> None:
-    """The bake build's start and end in the executor's log: no request waits for it."""
-    print(f"lora bake: {line}", file=sys.stderr, flush=True)
+def _launch(device: int) -> Launch:
+    """GPU `device`'s bake launcher: the attempt chose `fused` once it served."""
+    launch = kernel_ready.ready(f"{KERNELS.name} cuda:{device}")
+    if launch is None:
+        raise RuntimeError("a fused bake was chosen before its kernels served")
+    return cast("Launch", launch)
 
 
 def recipe(fused: bool) -> str:
@@ -687,7 +658,7 @@ def recipe(fused: bool) -> str:
     return f"{VARIANT} fused triton {triton.__version__}" if fused else f"{VARIANT} eager"
 
 
-def check(torch: ModuleType, device: Device) -> None:
+def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
     """Bake every form on `device` where the result is exact (0.25 + 24 * +-1/32 is 1.0 or
     -0.5, over partial tiles and two inner steps): one stored value off it is a broken kernel."""
     rows, cols, rank = 70, 96, 24
@@ -695,6 +666,7 @@ def check(torch: ModuleType, device: Device) -> None:
     up[1::2] = -1 / 32
     down = torch.ones((rank, cols), device=device)
     want = torch.tensor([1.0, -0.5], device=device).repeat(rows // 2)[:, None].expand(rows, cols)
+    wrong: dict[int, int] = {}
     for kind in (BF16, F16, F32, ROWWISE):
         if kind == ROWWISE:
             data = torch.full((rows, cols), 0.5, device=device).to(torch.float8_e4m3fn)
@@ -702,11 +674,9 @@ def check(torch: ModuleType, device: Device) -> None:
         else:
             dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
             stored = {"value": torch.full((rows, cols), 0.25, dtype=dtype, device=device)}
-        fused(torch, stored, down, up, kind)
+        fused(torch, launch, stored, down, up, kind)
         got = stored["value"].float() if "value" in stored else decode_e4m3(torch, data) * 0.5
-        if not torch.equal(got, want):
-            wrong = int((got != want).sum())
-            raise RuntimeError(f"the fused bake of form {kind} stored {wrong} values off the grid")
+        wrong[kind] = int((got != want).sum())
     # nvfp4: 0.25 (E2M1 0.5 under a 0.5 block scale) + 24 * +-1/32 is 1.0 or -0.5, both on that
     # block's kept grid, over a partial column tile.
     stored = {
@@ -714,20 +684,19 @@ def check(torch: ModuleType, device: Device) -> None:
         "scale": torch.full((rows, cols // 16), 0.5, device=device).to(torch.float8_e4m3fn),
         "scale_2": torch.ones(1, device=device),
     }
-    fused(torch, stored, down, up, NVFP4)
+    fused(torch, launch, stored, down, up, NVFP4)
     got = _nvfp4_decode(torch, stored["weight"], stored["scale"].view(torch.uint8), 1.0)
-    if not torch.equal(got, want):
-        wrong = int((got != want).sum())
-        raise RuntimeError(f"the fused bake of form {NVFP4} stored {wrong} values off the grid")
+    wrong[NVFP4] = int((got != want).sum())
     # int8 of rotated rows: 2 + 24 * +-1/48 / 0.5 is 3 or 1 (the regular Hadamard keeps a
     # constant row), over partial row tiles and two inner steps.
     data = torch.full((rows, 256), 2, dtype=torch.int8, device=device)
     stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device)}
-    fused(torch, stored, torch.ones((rank, 256), device=device), up * (32 / 48), INT8)
+    fused(torch, launch, stored, torch.ones((rank, 256), device=device), up * (32 / 48), INT8)
     want = torch.tensor([3, 1], device=device).repeat(rows // 2)[:, None].expand(rows, 256)
-    if not torch.equal(data.long(), want):
-        wrong = int((data.long() != want).sum())
-        raise RuntimeError(f"the fused bake of form {INT8} stored {wrong} values off the grid")
+    wrong[INT8] = int((data.long() != want).sum())
+    off = {kind: n for kind, n in wrong.items() if n}
+    detail = f"form(s) {off} stored values off the grid" if off else f"{len(wrong)} forms exact"
+    return verify.Verdict(not off, detail)
 
 
 #: Never specialized on a value or an address's alignment: one compiled kernel per form serves
@@ -891,3 +860,36 @@ if triton is not None:
                 kept = (value.to(tl.uint32, bitcast=True) + (noise >> 16)) >> 16 << 16
                 value = kept.to(tl.float32, bitcast=True)
             tl.store(data + at, value.to(data.dtype.element_ty), mask=inside)
+
+
+def _entries() -> list[TritonEntry]:
+    """One compiled bake per stored form, never specialized on a value or an address."""
+    if triton is None:
+        return []
+    sizes = {"rows": "i32", "cols": "i32", "rank": "i32", "seed": "i32"}
+    tiles = {"TILE": "constexpr", "INNER": "constexpr"}
+    stored = {BF16: "*bf16", F16: "*fp16", F32: "*fp32", ROWWISE: "*u8", INT8: "*i8"}
+    entries = [
+        TritonEntry(
+            _bake_kernel,
+            {
+                "data": data,
+                "scale": data if form in (BF16, F16, F32) else "*fp32",
+                "up": "*fp32",
+                "down": "*fp32",
+                **sizes,
+                "FORM": "constexpr",
+                **tiles,
+            },
+            {"FORM": form, "TILE": _TILE, "INNER": _INNER},
+        )
+        for form, data in stored.items()
+    ]
+    nvfp4 = {"data": "*u8", "blocks": "*u8", "second": "*fp32", "up": "*fp32", "down": "*fp32"}
+    tile = {"TILE": _TILE, "INNER": _INNER}
+    entries.append(TritonEntry(_bake_nvfp4_kernel, {**nvfp4, **sizes, **tiles}, tile))
+    return entries
+
+
+#: Built on every executor's GPUs when it starts (`author.kernels`): a request never compiles.
+KERNELS = TritonKernels("cozy-lora-bake", _entries())

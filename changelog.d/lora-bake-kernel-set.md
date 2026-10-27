@@ -1,0 +1,1 @@
+A cold executor's first LoRA request bakes: the bake kernels are a Runtime kernel set (`cozy-lora-bake`), built when the executor starts beside the weight download and loaded and checked at the model's load, instead of compiled in a child process the request had already passed (every release-gate first H3 run served its LoRA per step).
