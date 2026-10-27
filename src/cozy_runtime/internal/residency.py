@@ -2463,7 +2463,14 @@ class Memory:
                     self._keep_baked(page, use.tensor, streams=not block.preferred)
                 block.overlay = overlay
             if use is not None:
+                committing = time.perf_counter_ns()
                 use.commit()
+                request = _REQUEST.get()
+                if request is not None:
+                    request.prof_commit_ns += time.perf_counter_ns() - committing
+                    request.prof_commits += 1
+                    request.prof_fills += int(read_bytes > 0)
+                    request.prof_demand_read_ns += read_ns
             ready = None
             if self.cuda:
                 ready = torch.cuda.Event()
@@ -2759,6 +2766,9 @@ class Request:
         self.final_fills = self.final_hits = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
+        #: PROOF-ONLY profile: (model, path, event_in, event_out, enter_ns, ensure_ns, prefetch_ns, exit_ns)
+        self.prof_blocks: list[list[Any]] = []
+        self.prof_commit_ns = self.prof_commits = self.prof_fills = self.prof_demand_read_ns = 0
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
@@ -2872,6 +2882,41 @@ class Request:
         )
         self.sample()
 
+    def _profile(self) -> dict[str, Any]:
+        """PROOF-ONLY: GPU time inside each block's enqueue window and between blocks, and the
+        host time of the residency hooks, per model."""
+        rows = [r for r in self.prof_blocks if r[3] is not None]
+        if not rows:
+            return {}
+        torch.cuda.synchronize(self.memory.device)
+        by: dict[str, dict[str, float]] = {}
+        gaps: list[tuple[float, str]] = []
+        for i, (name, path, ev_in, ev_out, enter_ns, _, pre_ns, exit_ns) in enumerate(rows):
+            m = by.setdefault(name.split("/")[-1], {"blocks": 0, "gpu_in_ms": 0.0, "gpu_gap_ms": 0.0,
+                                                   "host_enter_ms": 0.0, "host_prefetch_ms": 0.0,
+                                                   "host_exit_ms": 0.0})
+            m["blocks"] += 1
+            m["gpu_in_ms"] += ev_in.elapsed_time(ev_out)
+            m["host_enter_ms"] += enter_ns / 1e6
+            m["host_prefetch_ms"] += pre_ns / 1e6
+            m["host_exit_ms"] += exit_ns / 1e6
+            if i + 1 < len(rows) and rows[i + 1][0] == name:
+                gap = ev_out.elapsed_time(rows[i + 1][2])
+                m["gpu_gap_ms"] += gap
+                gaps.append((gap, f"{path}->{rows[i + 1][1]}"))
+        gaps.sort(reverse=True)
+        first, last = rows[0][2], rows[-1][3]
+        return {
+            "scope": "PROOF-ONLY: events on the current stream at each block's entry and exit",
+            "span_ms": round(first.elapsed_time(last), 1),
+            "by_model": {k: {x: round(v, 1) for x, v in m.items()} for k, m in by.items()},
+            "commits": self.prof_commits,
+            "commit_ms": round(self.prof_commit_ns / 1e6, 1),
+            "demand_fills": self.prof_fills,
+            "demand_read_ms": round(self.prof_demand_read_ns / 1e6, 1),
+            "top_gaps": [[round(g, 2), w] for g, w in gaps[:12]],
+        }
+
     def stats(self) -> dict[str, Any]:
         if self.ended is not None:
             return self.ended
@@ -2936,6 +2981,7 @@ class Request:
                     "scope": "one exact raw block; current demand precedes queued speculation",
                     "queued": list(self.queued_prefetch),
                 },
+                profile=self._profile(),
             )
         elif self.memory.device.type == "mps":
             out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
@@ -3185,8 +3231,10 @@ def _hooks(model: Model) -> None:
 
         def entered(*_: object, b: _Block = block) -> None:
             model._claim()
+            t0 = time.perf_counter_ns()
             try:
                 memory._enter(b)
+                t1 = time.perf_counter_ns()
                 try:
                     memory._prefetch_next(b)
                 except BaseException:
@@ -3195,12 +3243,34 @@ def _hooks(model: Model) -> None:
             except BaseException:
                 model._release()
                 raise
+            t2 = time.perf_counter_ns()
+            request = _REQUEST.get()
+            if request is not None and memory.cuda and not memory.capturing():
+                event = torch.cuda.Event(enable_timing=True)
+                event.record()
+                request.prof_blocks.append(
+                    [model.name, b.path, event, None, t1 - t0, t1 - t0, t2 - t1, 0]
+                )
 
         def exited(b: _Block = block) -> None:
+            request = _REQUEST.get()
+            row = None
+            if request is not None and memory.cuda and not memory.capturing():
+                for candidate in reversed(request.prof_blocks[-8:]):
+                    if candidate[1] == b.path and candidate[3] is None:
+                        row = candidate
+                        break
+                if row is not None:
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record()
+                    row[3] = event
+            t0 = time.perf_counter_ns()
             try:
                 memory._exit(b)
             finally:
                 model._release()
+                if row is not None:
+                    row[7] = time.perf_counter_ns() - t0
 
         model.handles.extend(_paired(sub, entered, exited))
 
