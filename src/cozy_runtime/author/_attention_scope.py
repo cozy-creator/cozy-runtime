@@ -15,12 +15,13 @@ class AttentionLayout:
 
     Dense paths are component-relative attention module prefixes. They protect
     refiners or sensitive layers without making a generic backend infer model
-    semantics from tensor values. Exact paths are the layers whose dense rows keep
-    BF16 attention when the dense kernel quantizes (a layer whose keys a per-head
-    8-bit scale cannot carry); Runtime adds every layer whose key RMSNorm gain has
-    outlier channels (`attention_sol.outlier_keys`), so a model names only the rest.
-    Step indices are zero-based. This describes
-    inference only; it does not authorize a backend or select a kernel.
+    semantics from tensor values. Exact paths are the layers whose dense rows take
+    the exact kernel when the dense kernel quantizes (a layer whose keys a coarse
+    scale cannot carry): Kitchen INT8 where the route has it, else BF16 SDPA. Runtime
+    adds every layer whose key RMSNorm gain has outlier channels
+    (`attention_sol.outlier_keys`), so a model names only the rest. Step indices are
+    zero-based. This describes inference only; it does not authorize a backend or
+    select a kernel.
     """
 
     live_tokens: int

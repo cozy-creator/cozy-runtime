@@ -6,7 +6,8 @@ Runtime picks each attention site's kernel from the GPU's family, never from a c
 1. **Level.** 16 when the request asks for 16 bits (`bits` on `PrepareRequest`/`Invoke`,
    served as the `exact` pin); otherwise the model's `attention_bits` for the site; 16 when
    the model declares none. A sparse site's exact paths (`AttentionLayout.exact_paths`, and every
-   layer whose key RMSNorm gain peaks at 3x its RMS or more) stay at 16.
+   layer whose key RMSNorm gain peaks at 3x its RMS or more) take Kitchen INT8 where the route
+   declares it, else 16.
 2. **Kernel.** The first kernel of the family's cell at that level (`attention.DENSE`) that
    serves the site's dtype, head dimension and degree, is compiled, imports and launches;
    then each level above; then SDPA. A sparse site (one a package producer validates: its
