@@ -1344,9 +1344,17 @@ class Memory:
 
     def room(self, current: Collection[str] = ()) -> Room:
         self.apply_budget()
+        timing = _REQUEST.get()
         if self.cuda:
+            t0 = time.perf_counter_ns()
             free, _ = torch.cuda.mem_get_info(self.device)
+            t1 = time.perf_counter_ns()
             _, reserved, _ = self._figures()
+            t2 = time.perf_counter_ns()
+            if timing is not None:
+                timing.tm["room_meminfo_ns"] = timing.tm.get("room_meminfo_ns", 0) + t1 - t0
+                timing.tm["room_figures_ns"] = timing.tm.get("room_figures_ns", 0) + t2 - t1
+                timing.tm["rooms"] = timing.tm.get("rooms", 0) + 1
             # reserved - allocated includes graph-private storage that ordinary eager
             # allocation cannot necessarily reuse. Driver free is a conservative bound.
             free = max(int(free) - _RESERVE, 0)
@@ -1364,7 +1372,10 @@ class Memory:
         if self.native is not None:
             # Native pins, including escaped Torch storage aliases, are the authority.
             # Do not count an idle Python block as reclaimable merely because hooks closed.
+            t3 = time.perf_counter_ns()
             cold = int(self.native.stats()["reclaimable_bytes"])
+            if timing is not None:
+                timing.tm["room_stats_ns"] = timing.tm.get("room_stats_ns", 0) + time.perf_counter_ns() - t3
             # Pure-cut workspace estimates still use Torch's allocation granularity.
             return Room(int(free), cold, 0)
         with self.lock:
