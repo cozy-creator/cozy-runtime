@@ -3571,6 +3571,11 @@ class Executor:
         failed = outcome.terminal == "failed" and torch is not None
         if failed and (outcome.code == DEVICE_FAULT or not accel.healthy(torch, self.device_kind)):
             self.poisoned = self.poisoned or f"device fault: {outcome.message}"[:300]
+        elif failed:
+            # With its frames gone, a failed attempt's working set sits in Torch's cache. Return
+            # it: the next request's cuts size against driver free, and on an 8 GB card that
+            # cache left them all at the floor (Anima at 3 GB after an OOM: 69 s per step).
+            accel.release_cached(torch, self.device_kind)
         if self.rank == 0:
             for member in self.model_executors or [self]:
                 self._emit_gemm(record, member)
