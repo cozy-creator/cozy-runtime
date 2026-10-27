@@ -19,7 +19,7 @@ import time
 from collections.abc import Callable, Collection, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, final, overload
+from typing import TYPE_CHECKING, Any, Literal, final
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
 from cozy_runtime.author._prepared import Execution, PreparedWork
@@ -209,32 +209,13 @@ class Context:
         """THE cancellation question. A passed deadline IS cancellation, not a second flag."""
         return self._cancel() or time.monotonic() >= self.deadline
 
-    @overload
-    def plan(self, prepared: PreparedWork, /) -> Execution: ...
-
-    @overload
-    def plan(self, *steps: str | Collection[str]) -> None: ...
-
-    def plan(self, *steps: str | Collection[str] | PreparedWork) -> Execution | None:
+    def plan(self, *steps: str | Collection[str]) -> None:
         """The models this call runs, in order, so GPU memory evicts and restores by them: each
         step a component name, or a set of names used together (`{"unet", "controlnet"}`).
         Declare it before the first model runs; calling again replaces it. No sizes or times.
-
-        A single PreparedWork instead submits already prepared resident GPU work and returns
-        its Execution observer. Further submissions are ordered after earlier completion;
-        a prior failure prevents later work. PreparedSequence submits a whole ordered native
-        plan at once, without Python calls between its stages. Ordinary component hints are
-        not reinterpreted as executable code.
         """
-        if len(steps) == 1 and isinstance(steps[0], PreparedWork):
-            if self._submit_prepared is not None:
-                return self._submit_prepared(steps[0])
-            return steps[0].submit(self)
-        if any(isinstance(step, PreparedWork) for step in steps):
-            raise TypeError("prepared work must be the only ctx.plan argument")
         if self._plan is not None:
-            self._plan(steps)  # type: ignore[arg-type]
-        return None
+            self._plan(steps)
 
     def raise_if_cancelled(self) -> None:
         """THE cancellation spelling."""
