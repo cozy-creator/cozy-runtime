@@ -30,7 +30,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal import proctree
-from cozy_runtime.internal.accel import host_memory
+from cozy_runtime.internal.accel import host_memory, release_cached
 
 __all__ = [
     "Binding",
@@ -1948,6 +1948,18 @@ class Memory:
         model = block.model
         region = self._native_region(block, final=final)
         needed = int(region.allocated_bytes)
+        if (
+            reclaim
+            and self.budget_bytes is None
+            and not region.resident
+            and not self.capturing()
+            and needed > self.room().free
+            and torch.cuda.memory_reserved(self.device) > torch.cuda.memory_allocated(self.device)
+        ):
+            # Common weights may bind before their model's first forward enters its phase.
+            # Return unused Torch cache first; native allocation still decides whether idle
+            # weights actually need eviction. Budgeted demand already does this in reclaim().
+            release_cached(torch, self.device.type)
         if not region.resident and (not reclaim or self.budget_bytes is not None):
             if reclaim and needed > self.room().free:
                 self.reclaim(needed, current={model.name})
