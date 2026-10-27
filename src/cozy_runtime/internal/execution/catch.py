@@ -50,6 +50,8 @@ class Cuts(msgspec.Struct, kw_only=True):
     every one that descended, and the refusals at the floor."""
 
     sites: list[Cut] = msgspec.field(default_factory=list)
+    #: package split sites that ran in windows though a leaf inside scales by its call
+    window_scaled: list[str] = msgspec.field(default_factory=list)
     oom_floor: int = 0
 
 
@@ -85,6 +87,18 @@ def serving(request: Request) -> Iterator[None]:
         yield
     finally:
         CURRENT.reset(token)
+
+
+def window_scaled(site: str) -> None:
+    """`site` ran in windows over a leaf whose activation scale is its call's: the output
+    depends on the windows the memory chose."""
+    request = CURRENT.get()
+    if request is None:
+        return
+    with _ROWS_LOCK:
+        rows = _ROWS.setdefault(id(request), Cuts())
+        if site not in rows.window_scaled:
+            rows.window_scaled.append(site)
 
 
 def cut_rows(request: Request) -> Cuts:

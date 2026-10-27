@@ -78,4 +78,6 @@ declares them: `split(fn, x, *cuts, working=b)`, `b` bytes per input element bey
 Otherwise its peak bytes per input element are measured in the executor over its first two
 calls, the first at small windows. Calls start at the fewest pieces that fit what is free plus
 the idle weights the plane may unmap (which unmap first). A piece that still runs out of memory
-runs again at half the size. A run that split records `<op>.pieces`.
+runs again at half the size. A run that split records `<op>.pieces`. An op over a leaf that scales
+its activation by the call (NVFP4, SVDQ without `input_scale`) quantizes each window on its own
+scale; when it ran in windows, the record's `execution.cuts.window_scaled` names it.

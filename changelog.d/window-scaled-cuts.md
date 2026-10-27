@@ -1,0 +1,1 @@
+A Diffusers FFN whose SVDQ leaf has no calibrated `input_scale` runs whole, as an NVFP4 one does: both scale their activation by the call, so a window would quantize differently. A package `split` over such a leaf still cuts when memory requires it, and the run record's `execution.cuts.window_scaled` names the site.

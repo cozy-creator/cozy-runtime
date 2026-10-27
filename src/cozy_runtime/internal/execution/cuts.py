@@ -15,12 +15,13 @@ import functools
 import math
 import sys
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import cast
 
 import torch
 from torch import Tensor, nn
 
+from cozy_runtime.internal.encoding.leaves import NVFP4, SVDQ
 from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
 
@@ -228,15 +229,41 @@ def _ffn_shape(module: nn.Module, x: Tensor) -> sizing.Ffn:
 
 
 def _token_local(module: nn.Module) -> bool:
-    """NVFP4 uses a tensor-global activation scale and changes backend at small M.
+    """No window-scaled leaf (`_window_scaled`); NVFP4 also changes backend at small M.
 
     Keep the complete call even if a later kernel build would enable that arm. No chunk
     may silently select a different quantizer/backend. Other approved row quantizers keep
     their full channel/block reduction within each token.
     """
-    from cozy_runtime.internal.encoding.leaves import NVFP4
+    return not any(_window_scaled(child) for child in module.modules())
 
-    return not any(getattr(child, "provider", None) == NVFP4 for child in module.modules())
+
+def _window_scaled(module: nn.Module) -> bool:
+    """A leaf whose activation scale is its call's: NVFP4's tensor amax, and SVDQ's amax over
+    the call's rows unless it stores a calibrated `input_scale`. A window scales differently."""
+    provider = getattr(module, "provider", None)
+    return provider == NVFP4 or (
+        provider == SVDQ and "input_scale" not in getattr(module, "_cozy_roles", ())
+    )
+
+
+def _reached(op: object) -> Iterator[nn.Module]:
+    """The modules a package's split op reaches: a module or a bound method's owner, else the
+    modules among its attributes, slots and closure."""
+    owner = getattr(op, "__self__", op)
+    if isinstance(owner, nn.Module):
+        yield from owner.modules()
+        return
+    values = list(getattr(owner, "__dict__", {}).values())
+    values += [getattr(owner, n, None) for n in getattr(type(owner), "__slots__", ())]
+    for cell in getattr(op, "__closure__", None) or ():
+        try:
+            values.append(cell.cell_contents)
+        except ValueError:  # an empty cell
+            continue
+    for value in values:
+        if isinstance(value, nn.Module):
+            yield from value.modules()
 
 
 class _Whole(Exception):
@@ -462,8 +489,19 @@ _MEASURED: dict[str, list[tuple[int, int]]] = {}
 _MEASURED_LOCK = threading.Lock()
 
 
+def _noted[T](site: str, total: int, run: Callable[[int], T]) -> Callable[[int], T]:
+    """`run`, recording `site` (`catch.window_scaled`) whenever it runs in windows."""
+
+    def windows(most: int) -> T:
+        if most < total:
+            catch.window_scaled(site)
+        return run(most)
+
+    return windows
+
+
 def split[T](
-    name: str,
+    op: object,
     key: str,
     total: int,
     finest: int,
@@ -479,9 +517,12 @@ def split[T](
     every call, the first included. Otherwise the op's bytes are measured at its first two
     successful window sizes, then fitted: an op quadratic in its window scales as one. The
     first measurement groups at most 128 minimum windows; allocation refusals use the
-    ordinary descent to smaller windows.
+    ordinary descent to smaller windows. An op reaching a window-scaled leaf (NVFP4, SVDQ
+    without `input_scale`) still cuts when it must, and the record names its site.
     Like every split call, the declared operation must be safe to retry without side effects."""
     deepest = levels(-(-total // max(finest, 1)))
+    if any(_window_scaled(m) for m in _reached(op)):
+        run = _noted(f"split:{key}", total, run)
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
