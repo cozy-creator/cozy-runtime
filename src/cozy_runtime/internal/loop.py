@@ -328,36 +328,43 @@ def _record(
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    in_scope = {id(model) for model in scope}
 
-    def entered(seen: set[Any]) -> tuple[Model, ...]:
-        return tuple(model for model in scope if model in seen and id(model) in in_scope)
+    def used(seen: set[Any]) -> dict[Model, tuple[str, ...]]:
+        """Each scope model the call ran, with the block paths it entered ("" is common)."""
+        paths: dict[Model, set[str]] = {}
+        for item in seen:
+            model = item if isinstance(item, Model) else getattr(item, "model", None)
+            if model is not None and any(model is m for m in scope):
+                paths.setdefault(model, set())
+                if not isinstance(item, Model) and item.path:  # common comes with any binding
+                    paths[model].add(item.path)
+        return {model: tuple(sorted(paths[model])) for model in scope if model in paths}
 
     # The caller's stream: residency records its consumers on the current stream, and the
     # recording's own streams end with the program.
     with _entering() as seen:
         _once(loop.before, tensors)
-    pre = entered(seen)
+    pre = used(seen)
     with _entering() as seen:
         loop.eager(steps[:1], tensors, ctx)
-    models = entered(seen) or scope
-    resident = all(not _unresident(model) for model in models)
-    # A kept program records the whole call: `after` too, when its components (the scope's
-    # others) stay on the device. Its one eager warm-up output is overwritten by the program.
-    rest_of_scope = tuple(m for m in scope if m not in pre and m not in models)
-    ends = (
-        key is not None
-        and loop.after is not None
-        and resident
-        and loop.phases is None
-        and all(not _unresident(model) for model in (*pre, *rest_of_scope))
-    )
-    post: tuple[Model, ...] = ()
+    body = used(seen) or {model: ("",) for model in scope}
+    models = tuple(body)
+    resident = all(not _unresident(model, paths) for model, paths in body.items())
+    # A kept program records the whole call: `after` too, warmed once here (the program
+    # overwrites that output), when every block `before` and `after` ran stays on the device.
+    post: dict[Model, tuple[str, ...]] = {}
+    ends = key is not None and loop.after is not None and resident and loop.phases is None
     if ends:
         with _entering() as seen:
             _once(loop.after, tensors)
-        post = entered(seen)
-        ends = all(not _unresident(model) for model in post)
+        post = used(seen)
+        outside = next(
+            (w for m, paths in (*pre.items(), *post.items()) if (w := _unresident(m, paths))),
+            "",
+        )
+        if outside:
+            row["whole_call"] = f"before/after not resident: {outside}"
+        ends = not outside
     recording = PreparedSequence.record()
     recording.__enter__()
     try:
@@ -382,8 +389,16 @@ def _record(
                 with recording.capturing():
                     if mode == "resident":
                         parts, blocks = _record_resident(
-                            recording, loop, rest, tensors, mutable, counter, models,
-                            pre if ends else None, post if ends else None, ends,
+                            recording,
+                            loop,
+                            rest,
+                            tensors,
+                            mutable,
+                            counter,
+                            body,
+                            pre if ends else None,
+                            post if ends else None,
+                            ends,
                         )
                     else:
                         parts, blocks = _record_streamed(
@@ -532,10 +547,11 @@ def _eligible(
     return models, ""
 
 
-def _unresident(model: Model) -> str:
-    binding = model.retain(("",))
+def _unresident(model: Model, paths: tuple[str, ...] = ("",)) -> str:
+    """Why these blocks of `model` (and its common weights) are not all on the device."""
+    binding = model.retain(paths)
     try:
-        return binding.unresident()
+        return str(binding.unresident())
     finally:
         binding.close()
 
@@ -626,9 +642,9 @@ def _record_resident(
     tensors: tuple[Any, ...],
     mutable: tuple[Any, ...],
     counter: Any,
-    models: tuple[Model, ...],
-    pre: tuple[Model, ...] | None,
-    post: tuple[Model, ...] | None,
+    body: dict[Model, tuple[str, ...]],
+    pre: dict[Model, tuple[str, ...]] | None,
+    post: dict[Model, tuple[str, ...]] | None,
     again: bool,
 ) -> tuple[list[_Part], int]:
     """One WHILE graph per run of equal phases, every component resident and held. With
@@ -636,7 +652,11 @@ def _record_resident(
     last graph's suffix, and `again` also makes the reuse program: `before`, every step and
     `after` over the same graphs."""
     runs = _runs(rest, loop.phases, loop.steps)
-    held = list(models) + [m for m in (*(pre or ()), *(post or ())) if m not in models]
+    paths: dict[Model, set[str]] = {}
+    for used in (body, pre or {}, post or {}):
+        for model, entered in used.items():
+            paths.setdefault(model, set()).update(entered)
+    held = tuple(paths)
     state = (*mutable, counter)
     bindings: list[Binding] = []
     try:
@@ -644,7 +664,7 @@ def _record_resident(
             idle: set[int] = set()
             for model in held:
                 _checked(model)
-                binding = model.retain(("",))
+                binding = model.retain(tuple(sorted(paths[model])))
                 bindings.append(binding)
                 if id(model.memory) not in idle:
                     preparing.enter_context(model.memory.request(graphs.IDLE_REQUEST, idle=True))
@@ -658,15 +678,15 @@ def _record_resident(
             owners = tuple(bindings)
             landed = LANDED[0]
             graphs_: list[tuple[_Graph, int, int]] = []
-            with _guarded(tuple(held), frozenset()):
+            with _guarded(held, frozenset()):
                 for first, count, phase in runs:
 
-                    def body(phase: Any = phase) -> None:
+                    def advance(phase: Any = phase) -> None:
                         _call(loop.step, counter, tensors, phase)
                         counter.add_(1)
 
                     graph = _Graph(recording, state, count, owners)
-                    graph.record(body)
+                    graph.record(advance)
                     graphs_.append((graph, first, count))
                 prefix = suffix = None
                 if loop.after is not None and post is not None:
