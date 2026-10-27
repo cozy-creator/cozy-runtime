@@ -2,8 +2,9 @@
 
 The same names, types and meaning in every image package, so swapping one model for another never
 breaks a request. Every optional knob is None by default: the model's own recommended value, which
-its README and `--describe` state. A model clamps what is outside its range (a `clamp` row) and
-warns for a knob it has no use for; it never refuses either. A package subclasses `ImageRequest`
+its README and `--describe` state. The runtime rejects aspect ratios outside 1:16 through 16:1.
+Within that global envelope, a model clamps to its narrower range (a `clamp` row) and warns for
+a knob it has no use for. A package subclasses `ImageRequest`
 only to narrow `reference_images` to its model's count or to add a knob no other model has.
 """
 
@@ -28,11 +29,48 @@ from cozy_runtime.author._services import AdjustmentRows, Adjustments
 ReferenceImages = Annotated[
     list[ImageAsset], AssetBound(max_bytes=32 << 20), ImagePreparation(max_pixels=16 << 20)
 ]
-AspectRatio = Annotated[str, msgspec.Meta(pattern=r"^[1-9][0-9]*:[1-9][0-9]*$")]
+AspectRatio = Annotated[
+    str,
+    msgspec.Meta(
+        pattern=r"^[1-9][0-9]*:[1-9][0-9]*$",
+        description="Output aspect ratio W:H, from 1:16 through 16:1 inclusive.",
+    ),
+]
 Seed = Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)]
 
 #: Pixels in one megapixel: 1024², as the image packages size their tiers.
 MEGAPIXEL = 1 << 20
+MAX_IMAGE_ASPECT_RATIO = 16
+
+
+def _check_ratio(width: int, height: int) -> None:
+    """Use integer comparisons: float division can hide a ratio just above the limit."""
+    if width <= 0 or height <= 0:
+        raise InvalidRequest(
+            "aspect_ratio must contain two positive integers W:H",
+            code="aspect_ratio",
+            fields=("aspect_ratio",),
+        )
+    if width > MAX_IMAGE_ASPECT_RATIO * height or height > MAX_IMAGE_ASPECT_RATIO * width:
+        raise InvalidRequest(
+            f"image aspect ratio {width}:{height} is outside 1:16 through 16:1",
+            code="aspect_ratio",
+            fields=("aspect_ratio",),
+        )
+
+
+def _ratio(value: str) -> tuple[int, int]:
+    try:
+        width, height = map(int, value.split(":"))
+    except (ValueError, AttributeError) as error:
+        raise InvalidRequest(
+            "aspect_ratio must contain two positive integers W:H",
+            code="aspect_ratio",
+            fields=("aspect_ratio",),
+        ) from error
+    _check_ratio(width, height)
+    return width, height
+
 
 #: `[x0, y0, x1, y1]`: a box's corners, 0-1 of the output canvas, origin top-left, x0 < x1, y0 < y1.
 Box = Annotated[
@@ -55,6 +93,9 @@ class Target:
 
     ratio: tuple[int, int]
     pixels: float
+
+    def __post_init__(self) -> None:
+        _check_ratio(*self.ratio)
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,9 +121,14 @@ class Sizes:
         1/16 over `pixels`. A size off the one the ratio itself rounds to is an `aspect_ratio`
         clamp row."""
         (w, h), (small, large), grid = ratio, self.sides, self.grid
-        widest = min(self.widest, large**2 / pixels, pixels / small**2)
+        _check_ratio(w, h)
+        widest = min(self.widest, MAX_IMAGE_ASPECT_RATIO, large**2 / pixels, pixels / small**2)
         width, height = self._snapped(pixels, min(max(w / h, 1 / widest), widest))
         width, height = min(max(width, small), large), min(max(height, small), large)
+        # Independent side rounding can cross the global limit. Both sides already lie
+        # on the same grid, so shortening the longer side keeps a legal grid canvas.
+        width = min(width, MAX_IMAGE_ASPECT_RATIO * height)
+        height = min(height, MAX_IMAGE_ASPECT_RATIO * width)
         while width * height > pixels * 17 / 16:
             width, height = (width - grid, height) if width >= height else (width, height - grid)
         if (width, height) != self._snapped(pixels, w / h):
@@ -103,7 +149,7 @@ class ImageRequest(msgspec.Struct):
     reference_images: Annotated[ReferenceImages, msgspec.Meta(max_length=16)] = msgspec.field(
         default_factory=list
     )
-    #: Any W:H. None: the first reference's, else the model's default.
+    #: W:H from 1:16 through 16:1. None: the first reference's, else the model's default.
     aspect_ratio: AspectRatio | None = None
     #: Any size, in 1024² pixels. None: the first reference's pixel count, else the model's default.
     megapixels: Annotated[float, msgspec.Meta(gt=0)] | None = None
@@ -118,6 +164,11 @@ class ImageRequest(msgspec.Struct):
     #: reference is an element, not the canvas: the size is the model's text-to-image default.
     reference_boxes: list[Box | None] | None = None
 
+    def __post_init__(self) -> None:
+        # msgspec calls this while decoding, before admission or any model work.
+        if self.aspect_ratio is not None:
+            _ratio(self.aspect_ratio)
+
     def target(
         self, first: tuple[int, int] | None, *, megapixels: float, ratio: str = "1:1"
     ) -> Target:
@@ -125,11 +176,11 @@ class ImageRequest(msgspec.Struct):
         (`first`: its upright width and height), so an edit stays as close as possible to the image
         it edits; with no reference, the model's default (`megapixels`, `ratio`)."""
         if self.aspect_ratio is not None:
-            width, height = map(int, self.aspect_ratio.split(":"))
+            width, height = _ratio(self.aspect_ratio)
         elif first is not None:
             width, height = first
         else:
-            width, height = map(int, ratio.split(":"))
+            width, height = _ratio(ratio)
         if self.megapixels is not None:
             pixels = self.megapixels * MEGAPIXEL
         elif first is not None:
