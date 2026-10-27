@@ -22,13 +22,13 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, final, overload
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
+from cozy_runtime.author._prepared import Execution, PreparedWork
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
 
     from cozy_runtime.author._artifacts import ModelArtifact
     from cozy_runtime.author._loader import Scheduler
-    from cozy_runtime.author._prepared import Execution, PreparedWork
     from cozy_runtime.author._recipes import DeclaredRecipe
     from cozy_runtime.author._weights import Weights
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
@@ -226,8 +226,6 @@ class Context:
         plan at once, without Python calls between its stages. Ordinary component hints are
         not reinterpreted as executable code.
         """
-        from cozy_runtime.author._prepared import PreparedWork
-
         if len(steps) == 1 and isinstance(steps[0], PreparedWork):
             if self._submit_prepared is not None:
                 return self._submit_prepared(steps[0])

@@ -43,6 +43,8 @@ from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
+from PIL import Image
+
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import _color
 from cozy_runtime.author._errors import OutputError
@@ -120,8 +122,6 @@ def require_encoder() -> None:
 
 
 def _image(width: int, height: int, pixels: bytes, mode: str) -> Any:
-    from PIL import Image
-
     return Image.frombytes(mode, (width, height), pixels)
 
 

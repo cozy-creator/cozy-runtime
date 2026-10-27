@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from tensorfs import varena
+
 from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.compute import PreparedRepeat, _native_error
 
@@ -32,7 +34,6 @@ def capture_raw_stage(
     not that adapter. The first slice requires at least one nonresident input at capture.
     """
     import torch
-    from tensorfs import varena
 
     tensors = tuple(state)
     if not tensors or any(not isinstance(t, torch.Tensor) or not t.is_cuda for t in tensors):

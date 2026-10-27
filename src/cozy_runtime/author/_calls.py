@@ -22,6 +22,7 @@ from cozy_runtime import _application_json as application_json
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelArtifact
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
+from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._defaults import undeclared
@@ -441,7 +442,6 @@ class _Broker:
                         )
                     try:
                         value = application_json.decode(raw)
-                        from cozy_runtime.author._call_results import decode
 
                         def guard() -> None:
                             if self.closed:

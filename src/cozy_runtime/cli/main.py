@@ -8,7 +8,13 @@ from __future__ import annotations
 import sys
 from collections.abc import Sequence
 
+from cozy_runtime.cli import describe as describe_verb
+from cozy_runtime.cli import image_prepare as image_prepare_verb
+from cozy_runtime.cli import machine
+from cozy_runtime.cli import new as new_verb
+from cozy_runtime.cli import version as version_verb
 from cozy_runtime.cli.io import CliError, Options, Result, emit, emit_error
+from cozy_runtime.internal import python_interpreters
 from cozy_runtime.internal.config import ConfigError, RuntimeConfig, read_config
 from cozy_runtime.internal.exits import Exit
 
@@ -187,8 +193,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             Exit.usage,
         )
     if verb == "describe":
-        from cozy_runtime.cli import describe as describe_verb
-
         if len(args) > 1:
             raise CliError(
                 "usage",
@@ -199,8 +203,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             )
         return describe_verb.run(args[0] if args else None, opts)
     if verb == "python-interpreters":
-        from cozy_runtime.internal import python_interpreters
-
         if args:
             raise CliError(
                 "usage",
@@ -212,8 +214,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
         except python_interpreters.InterpreterRefusal as exc:
             raise CliError(exc.code, exc.detail, "install a supported Python interpreter") from exc
     if verb == "python-ensure":
-        from cozy_runtime.internal import python_interpreters
-
         if not 1 <= len(args) <= 2:
             raise CliError(
                 "usage",
@@ -232,11 +232,6 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             raise CliError(
                 exc.code, exc.detail, "check Python requirements and uv availability"
             ) from exc
-    # Interpreter plumbing stays portable without importing executor-only modules.
-    from cozy_runtime.cli import image_prepare as image_prepare_verb
-    from cozy_runtime.cli import new as new_verb
-    from cozy_runtime.cli import version as version_verb
-
     if verb == "version":
         return version_verb.run(config, opts.full, opts.fields)
     if verb == "new":
@@ -270,8 +265,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return int(Exit.ok)
         # A machine's own exchanges (`cli/machine.py`): JSON in and out, no config read.
         if verb in ("machine-describe", "frame-codec") and not args:
-            from cozy_runtime.cli import machine
-
             return machine.describe() if verb == "machine-describe" else machine.frame_codec()
         config = read_config()
         emit(dispatch(verb, args, opts, config), opts)

@@ -7,6 +7,7 @@ whether a package is broken or a request is.
 
 from __future__ import annotations
 
+import traceback as _tb
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -137,8 +138,6 @@ TRACEBACK_CAP = 16 * 1024
 
 
 def _trace(exc: BaseException) -> str:
-    import traceback as _tb
-
     text = "".join(_tb.format_exception(exc))
     return text[-TRACEBACK_CAP:] if len(text) > TRACEBACK_CAP else text
 

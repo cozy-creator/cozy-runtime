@@ -28,6 +28,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
+from tensorfs import varena
+
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 from cozy_runtime.internal.hostfacts import available_memory, physical_memory
@@ -519,8 +521,6 @@ def initialize(torch: Any, kind: str) -> None:
 
         torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         try:
-            from tensorfs import varena
-
             varena.install_allocator()
         except (ImportError, AttributeError, RuntimeError) as exc:
             if fault(exc) is not Fault.OTHER:

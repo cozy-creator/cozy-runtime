@@ -31,11 +31,12 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import attention_ulysses
+from cozy_runtime.internal import attention_ulysses, kernel_ready
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
@@ -80,8 +81,6 @@ def capture(
     stream.wait_stream(current)
     stream.wait_stream(work)
     failure: BaseException | None = None
-    from cozy_runtime.internal import kernel_ready
-
     try:
         with (
             kernel_ready.recording(),
@@ -764,8 +763,6 @@ def _unprepared(exc: BaseException) -> bool:
 
 
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
-    from cozy_runtime.author._context import CURRENT
-
     if (
         (context := CURRENT.get()) is not None
         and not (torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())

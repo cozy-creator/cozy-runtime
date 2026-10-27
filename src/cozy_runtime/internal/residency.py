@@ -24,13 +24,16 @@ from typing import Any, Protocol
 
 import tensorfs
 import torch
+from tensorfs import varena
 from tensorfs.raw import parts as stored_parts
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
-from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime import graphs
+from cozy_runtime.author._context import CURRENT
+from cozy_runtime.author._errors import CapabilityError, Fault, fault
 from cozy_runtime.internal import proctree
-from cozy_runtime.internal.accel import host_memory, release_cached
+from cozy_runtime.internal.accel import allocation, host_memory, release_cached
 
 __all__ = [
     "Binding",
@@ -497,8 +500,6 @@ class Model:
                     _HOST_STAGING,
                 )
             if free_only and missing > self.memory.room().free:
-                from cozy_runtime.internal.accel import release_cached
-
                 release_cached(torch, self.memory.device.type)
                 if missing > self.memory.room().free:
                     return None
@@ -719,8 +720,6 @@ class Binding:
         Ordinary block data is never changed here. The native slot atomically retains ready
         regions and owns unpublished missing fills; its views are installed only by prepare().
         """
-        from tensorfs import varena
-
         from cozy_runtime.internal.weights import _Routes
 
         memory, model = self.model.memory, self.model
@@ -1181,8 +1180,6 @@ class Memory:
         self._baked_room = -1
         if self.cuda:
             try:
-                from tensorfs import varena
-
                 if budget_bytes is not None:
                     varena.set_activation_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
@@ -1259,15 +1256,11 @@ class Memory:
                 # Unused private-pool bytes are not headroom for an eager allocation.
                 free = min(free, max(self.budget_bytes - reserved, 0))
         elif self.device.type == "mps":
-            from cozy_runtime.internal.accel import allocation
-
             figures = allocation(torch, "mps")
             free, reserved = figures["driver_free_bytes"], figures["reserved_bytes"]
             if self.budget_bytes is not None:
                 free = min(free, max(self.budget_bytes - reserved, 0))
         else:
-            from cozy_runtime.internal.accel import host_memory
-
             free = host_memory().free_bytes
         if self.native is not None:
             # Native pins, including escaped Torch storage aliases, are the authority.
@@ -1577,8 +1570,6 @@ class Memory:
             raise StaleBinding("an immutable binding layout changed; reconstruct the model")
         identity = model.wanted_identity()
         if identity != model.identity or identity is None:
-            from cozy_runtime import graphs
-
             graphs.retire_stale(torch, model.module)
             if any(b.retained for b in model.groups()):
                 raise StaleBinding("retire old graph bindings before changing a weight fill")
@@ -1719,8 +1710,6 @@ class Memory:
 
     def reclaim(self, need: int = 0, *, current: Collection[str] = ()) -> int:
         """Discard idle local owners at a preparation boundary; never inside an allocator."""
-        from cozy_runtime.internal.accel import release_cached
-
         if self.capturing():
             return 0
         before_allocated, before_reserved, _ = self._figures()
@@ -2281,8 +2270,6 @@ class Memory:
             began = time.perf_counter_ns()
             complete = False
             try:
-                from cozy_runtime.author._context import CURRENT
-
                 context = CURRENT.get()
                 try:
                     if context is not None and not cancel:
@@ -2508,8 +2495,6 @@ class Memory:
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
         declared = _CAPTURE_BLOCKS.get()
         if declared is not None and id(block) not in declared:
-            from cozy_runtime.author._errors import CapabilityError
-
             raise CapabilityError(
                 "model stage reads a block outside its declared paths",
                 code="prepared_graph_ineligible",
@@ -2591,8 +2576,6 @@ class Memory:
         global progress
         declared = _CAPTURE_BLOCKS.get()
         if declared is not None and id(block) not in declared:
-            from cozy_runtime.author._errors import CapabilityError
-
             raise CapabilityError(
                 "model stage reads a block outside its declared paths",
                 code="prepared_graph_ineligible",
