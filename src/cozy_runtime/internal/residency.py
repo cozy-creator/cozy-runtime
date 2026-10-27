@@ -642,6 +642,47 @@ class Binding:
                 return f"{name} block {b.path or '(common)'}: raw {_state(b.region)}{final}"
         return ""
 
+    def _load_refusal(self, stage: bool, region_input: bool, routes: type) -> str:
+        """The first reason `prepare_load` refuses this binding, or empty when it can load."""
+        memory, model = self.model.memory, self.model
+        if why := self._invalid():
+            return f"binding {why}"
+        for why, refused in (
+            ("binding already prepared", self.used),
+            ("binding holds its blocks", self.held),
+            ("a load slot is open", self._load_slot is not None),
+            ("a stage source is open", self._stage_source is not None),
+            ("memory is not CUDA", not memory.cuda),
+            ("a capture is active", memory.capturing()),
+            ("no native memory", memory.native is None),
+            ("TensorFS cannot take region inputs", not region_input),
+            ("the model has a fill", model.fill is not None),
+        ):
+            if refused:
+                return why
+        for block in self.groups:
+            finals = sorted(block.finals)
+            encoded = any(set(parts) != {"value"} for parts in block.parts.values())
+            for why, refused in (
+                ("has no declared layout", block.aliases is None),
+                (f"has {len(finals)} final rows ({', '.join(finals[:3])})", finals),
+                (
+                    "has encoded parts outside a routed stage",
+                    encoded and (not stage or not isinstance(model.finals, routes)),
+                ),
+                ("has no storage", not block.storage_bytes),
+                (
+                    "has packed F4 parts",
+                    any(p.dtype == "F4" for parts in block.parts.values() for p in parts.values()),
+                ),
+                (f"is in use ({block.count})", block.count),
+                (f"is retained ({block.retained})", block.retained),
+                ("is loading", block.loading),
+            ):
+                if refused:
+                    return f"block {block.path or '(common)'} {why}"
+        return ""
+
     def prepare_load(self, *, stage: bool = False) -> Any:
         """Create capture-private views for immutable raw blocks, without reading weights.
 
@@ -656,37 +697,12 @@ class Binding:
         with self.lock:
             model._claim()
             try:
-                if (
-                    not self.valid()
-                    or self.used
-                    or self.held
-                    or self._load_slot is not None
-                    or self._stage_source is not None
-                    or not memory.cuda
-                    or memory.capturing()
-                    or memory.native is None
-                    or not getattr(varena.LoadSlot, "supports_region_input", False)
-                    or model.fill is not None
-                    or any(
-                        block.aliases is None
-                        or block.finals
-                        or (
-                            any(set(parts) != {"value"} for parts in block.parts.values())
-                            and (not stage or not isinstance(model.finals, _Routes))
-                        )
-                        or not block.storage_bytes
-                        or any(
-                            part.dtype == "F4"
-                            for parts in block.parts.values()
-                            for part in parts.values()
-                        )
-                        or block.count
-                        or block.retained
-                        or block.loading
-                        for block in self.groups
-                    )
+                if why := self._load_refusal(
+                    stage, getattr(varena.LoadSlot, "supports_region_input", False), _Routes
                 ):
-                    raise StaleBinding("native component loading needs idle immutable raw layouts")
+                    raise StaleBinding(
+                        f"native component loading needs idle immutable raw layouts: {why}"
+                    )
                 if any(
                     getattr(module, "_compiled_call_impl", None) is not None
                     or hasattr(module, "_orig_mod")
