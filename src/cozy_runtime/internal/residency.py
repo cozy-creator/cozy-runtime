@@ -12,7 +12,7 @@ import math
 import threading
 import time
 import weakref
-from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -118,8 +118,14 @@ class Weights:
 
 
 class Filling(Protocol):
+    """A model's fill. `identity` names what every page's fill shares (None: never kept);
+    `overlay` names what a fill of one block would add to it now (a LoRA a package arms per
+    forward). A block's page serves only a use wanting the overlay it was filled with."""
+
     @property
     def identity(self) -> str | None: ...
+
+    def overlay(self, block: str, keys: Collection[str], /) -> Hashable: ...
 
     def __call__(self, block: str, parts: Mapping[str, Mapping[str, Tensor]], /) -> None: ...
 
@@ -272,6 +278,12 @@ class _Block:
     final_fills: int = 0
     final_hits: int = 0
     next: _Block | None = None
+    #: the fill overlay (`Filling.overlay`) its page was written with
+    overlay: Hashable = None
+
+    def paged(self) -> bool:
+        """Whether a page a fill wrote may still serve: bound data or a native region."""
+        return self.data is not None or self.region is not None or self.final_region is not None
 
     @property
     def nbytes(self) -> int:
@@ -1516,6 +1528,18 @@ class Memory:
             model.identity = identity
             model.generation += 1
 
+    def _forget_overlay(self, block: _Block) -> None:
+        """`block`'s page was filled under another overlay than this use wants (a base page for
+        a LoRA forward, or the reverse): as for a changed fill, its model's holds go first, then
+        the page, so the next fill writes the wanted overlay."""
+        for hold in list(block.model.holds):
+            hold.shed()
+        if block.count or block.retained or block.loading or self.capturing():
+            raise StaleBinding("a weight block in use cannot change its fill overlay")
+        self._discard(block, forget=True)
+        if block.paged():
+            raise StaleBinding("a weight block's page under another overlay could not be dropped")
+
     def _idle(self, block: _Block) -> None:
         if self.native is not None and not (block.count or block.retained or block.loading):
             # The DLPack storage owner holds the physical pin. A surviving external alias
@@ -2210,7 +2234,7 @@ class Memory:
         block.final_data = data
 
     @torch.inference_mode(False)  # type: ignore[untyped-decorator]
-    def _ensure(self, block: _Block, reclaim: bool) -> None:
+    def _ensure(self, block: _Block, reclaim: bool, overlay: Hashable) -> None:
         if block.data is not None:
             return
         if self.capturing():
@@ -2282,7 +2306,9 @@ class Memory:
                         raise ResidencyError(f"stored geometry does not match {key}#{role}")
                     views[role] = view.view(shape)
             if block.model.fill is not None and (use is None or use.needs_fill):
+                # `overlay` was read on this thread just before; no package code ran since.
                 block.model.fill(block.path, data)
+                block.overlay = overlay
             if use is not None:
                 use.commit()
             ready = None
@@ -2333,8 +2359,12 @@ class Memory:
                 code="prepared_graph_ineligible",
             )
         global progress
+        model = block.model
+        overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
+        if overlay != block.overlay and block.paged():
+            self._forget_overlay(block)
         with self.lock:
-            if not block.model.users or block.model.thread != threading.get_ident():
+            if not model.users or model.thread != threading.get_ident():
                 raise ResidencyError("weight preparation requires an active model scope")
             block.count += 1
             nested = block.count > 1
@@ -2344,7 +2374,8 @@ class Memory:
                 raise ResidencyError("capture requires an active prepared weight binding")
             if not nested:
                 request = _REQUEST.get()
-                self._ensure(block, reclaim and not (request is not None and request.idle))
+                reclaim = reclaim and not (request is not None and request.idle)
+                self._ensure(block, reclaim, overlay)
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
