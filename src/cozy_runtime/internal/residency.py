@@ -2329,12 +2329,15 @@ class Memory:
                 try:
                     if provisional:
                         region.set_preferred(True)  # native end-of-prefix watermark still wins
+                    reading = time.perf_counter_ns()
                     read = region.prepare_read(
                         block.model.source.ck,
                         parts,
                         reclaim=False,
                         evict_completed=queued is None,
                     )
+                    if request is not None:
+                        request.tm["prepare_read_ns"] = request.tm.get("prepare_read_ns", 0) + time.perf_counter_ns() - reading
                 finally:
                     if provisional:
                         # The prepared Fill owns its pin. Only demand may assign a lasting
@@ -2367,7 +2370,10 @@ class Memory:
                 if queued is not None and not queued.valid():
                     self._settle_prefetch(cancel=True)
                     return
+                starting = time.perf_counter_ns()
                 read.start()
+                if request is not None:
+                    request.tm["start_ns"] = request.tm.get("start_ns", 0) + time.perf_counter_ns() - starting
             except BaseException as error:
                 self._settle_prefetch(cancel=True)  # a failed start still owns its admitted Fill
                 if (
