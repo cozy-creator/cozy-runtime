@@ -177,8 +177,12 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         checkpoint()
         scope.ordinals.clear()
         # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
-        # site's predicted cold/warm bytes must be reclaimed before running that site.
-        if not _capturing() and (wanted := need(level, available.granularity)) > available.free:
+        # site's predicted cold/warm bytes must be reclaimed before running that site, unless
+        # Torch's own cached blocks already hold them: reclaiming then empties that cache and
+        # syncs the device at every such call (H3 on a 32 GB card, run 19602). A fragmented
+        # cache that cannot serve it fails the allocation, which reclaims and retries below.
+        wanted = need(level, available.granularity)
+        if not _capturing() and wanted > available.free + request.memory.torch_unused():
             request.reclaim(wanted)
         try:
             return run(level)
@@ -208,6 +212,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
                     failure = retry_error
             raise failure from None
 
+    request.memory.observe_activation(need(0, available.granularity))
     try:
         if _capturing():
             return whole(sizing.choose(finest, need, available)[0])

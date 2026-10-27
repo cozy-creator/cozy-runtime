@@ -1078,6 +1078,11 @@ class Memory:
         self.phase_supported = False
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
+        #: Per phase, the activation bytes its calls needed beside its weights, learned in this
+        #: process: Torch allocations above the phase's entry plus the widest call's own need.
+        #: A later call's weights leave this much free, so it starts as roomy as the first did.
+        self.activation_reserve: dict[frozenset[str], int] = {}
+        self._phase_base = 0
         self._forward_depth = 0
         if self.cuda:
             try:
@@ -1710,7 +1715,7 @@ class Memory:
             )
             block.preferred = model.prefix is None
             if block.preferred and not block.cached():
-                wanted = missing + self.window_bytes
+                wanted = missing + self.window_bytes + self._reserve()
                 free = self.room().free
                 if (
                     self.phase_supported
@@ -1764,6 +1769,7 @@ class Memory:
             self._settle_prefetch(cancel=True)
             self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
             self._phase_names, self._phase_request = names, request_id
+            self._phase_base = int(torch.cuda.memory_allocated(self.device))
             incoming = [m for m in self.models.values() if m.name in names]
             # An unrelated registered model must not enlarge this phase's streaming
             # headroom. Native admission still permits an unexpectedly larger group.
@@ -1790,7 +1796,8 @@ class Memory:
                             )
                     if block.cached():
                         block.preferred = block.preference_set = True
-            wanted = missing + self.window_bytes
+            reserve = self._reserve()
+            wanted = missing + self.window_bytes + reserve
             before = int(torch.cuda.memory_reserved(self.device))
             unused = max(before - int(torch.cuda.memory_allocated(self.device)), 0)
             if wanted > self.room().free and unused:
@@ -1801,11 +1808,17 @@ class Memory:
             # Protect the incoming cached bytes above; only other idle backing may go.
             need = max(wanted - self.room().free, 0)
             reclaimed = int(self.native.reclaim_unpreferred(need)) if need else 0
+            if reserve and (short := wanted - self.room().free) > 0:
+                # Resident weights of this phase that would leave less than its activations
+                # stream instead: native reclaim takes the prefix from its end. Once here,
+                # rather than a reclaim at every call that would not fit beside them.
+                reclaimed += int(self.native.reclaim(short))
             if request is not None:
                 request.phase_changes.append(
                     {
                         "models": sorted(names),
                         "window_bytes": self.window_bytes,
+                        "activation_reserve_bytes": reserve,
                         "missing_bytes": missing,
                         "torch_unused_bytes": unused,
                         "torch_returned_bytes": returned,
@@ -1816,6 +1829,34 @@ class Memory:
                         ),
                     }
                 )
+
+    def _reserve(self) -> int:
+        """The current phase's learned activation bytes Torch does not hold yet (its live and
+        cached blocks above the phase's entry already count): weights must leave this free."""
+        names = self._phase_names
+        reserve = self.activation_reserve.get(names, 0) if names is not None else 0
+        if not reserve:
+            return 0
+        return max(reserve - (int(torch.cuda.memory_reserved(self.device)) - self._phase_base), 0)
+
+    def observe_activation(self, need: int) -> None:
+        """A call of the current phase needs `need` bytes beside what Torch already holds."""
+        names = self._phase_names
+        if not self.cuda or names is None or self.capturing():
+            return
+        used = int(torch.cuda.memory_allocated(self.device)) - self._phase_base + need
+        if used > self.activation_reserve.get(names, 0):
+            self.activation_reserve[names] = used
+
+    def torch_unused(self) -> int:
+        """Torch's cached blocks no tensor holds: reusable by its next allocations."""
+        if not (self.cuda and torch.cuda.is_initialized()):
+            return 0
+        return max(
+            int(torch.cuda.memory_reserved(self.device))
+            - int(torch.cuda.memory_allocated(self.device)),
+            0,
+        )
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         model = block.model
