@@ -1,0 +1,1 @@
+A native model stage captured inside a component scope (a package method declared `@uses_components`) no longer refuses with `block (common) is in use (1)`. While the stage prepares, the scope lends its pin on the shared weights and takes it back afterwards. Qwen-Image-2 streams its denoise natively when its transformer does not fit, for example int8 on an 8 GB card.
