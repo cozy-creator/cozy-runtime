@@ -1029,6 +1029,7 @@ class Executor:
             accel.initialize(torch, self.device_kind)
             if self.world > 1 and self.device_kind == "cuda":
                 torch.cuda.set_device(self.rank)
+                kernel_ready.DEVICE[0] = functools.partial(torch.cuda.device, self.rank)
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}

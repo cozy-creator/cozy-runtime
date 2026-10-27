@@ -29,7 +29,7 @@ import re
 import sys
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import TYPE_CHECKING, cast
@@ -73,6 +73,10 @@ THREAD = "kernel-ready: "
 #: bound by `triton_kernels` when the executor imports it past its device boundary (the
 #: families that open one import no torch).
 TRITON: list[Callable[..., Launch | None]] = []
+#: This executor's CUDA device, current for every opener on any thread: a new thread starts on
+#: device 0, where a group follower's probes failed against tensors on its own GPU (run 19454).
+#: Bound by the executor past its device boundary.
+DEVICE: list[Callable[[], AbstractContextManager[object]]] = [nullcontext]
 
 
 class Refused(RuntimeError):
@@ -106,7 +110,8 @@ def _opening(name: str) -> Iterator[None]:
             raise Building(name)
         _OPENERS += 1
     try:
-        yield
+        with DEVICE[0]():
+            yield
     finally:
         with _LOCK:
             _OPENERS -= 1
