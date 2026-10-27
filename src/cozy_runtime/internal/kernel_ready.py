@@ -203,16 +203,11 @@ def wait[T](name: str, opener: Opener[T]) -> T:
                 if _SLOTS.get(name) is slot and slot.state == "opening":
                     _SLOTS.pop(name)
         raise
-    selected = _landed(name, slot, value, "ready")
-    if selected is not None:
-        return cast("T", selected)
-    with _LOCK:
-        current = _SLOTS.get(name)
-        if current is not None and current.error is not None:
+    with _LOCK:  # its slot may be gone (another opener failed): this verified kernel serves then
+        current = _SLOTS.setdefault(name, _Slot("opening"))
+        if current.error is not None:
             raise current.error
-        if current is not None and current.state == "ready":
-            return cast("T", current.value)
-    raise Building(name)
+        return cast("T", _landed(name, current, value, "ready"))
 
 
 def _background(name: str, slot: _Slot, opener: Opener[object]) -> None:
@@ -229,6 +224,8 @@ def _background(name: str, slot: _Slot, opener: Opener[object]) -> None:
 
 
 def _landed(name: str, slot: _Slot, value: object, state: str) -> object | None:
+    """The kernel `name` serves once `slot`'s opener verified `value`: the first verified one,
+    never replaced by a later one. None when `slot` is no longer `name`'s, or failed."""
     with _LOCK:
         if _SLOTS.get(name) is not slot or slot.state == "failed":
             return None
@@ -242,18 +239,17 @@ def _landed(name: str, slot: _Slot, value: object, state: str) -> object | None:
 
 
 def _ended(name: str, slot: _Slot, exc: Exception) -> None:
-    """A failed opener's kernel stays failed here; one the device ran out under asks again."""
+    """A failed opener's kernel stays failed here, even one another opener made serve (the epoch
+    counts that change); one the device ran out under asks again, unless another's serves."""
     with _LOCK:
         if _SLOTS.get(name) is not slot:
             return
         if is_capacity(exc):
             if slot.state == "opening":
                 _SLOTS.pop(name)
-                slot.state, slot.error = "failed", exc
             return
-        was_ready = slot.state == "ready"
+        LANDED[0] += slot.state == "ready"
         slot.state, slot.error = "failed", exc
-        LANDED[0] += was_ready
 
 
 def failed(name: str) -> Exception | None:
