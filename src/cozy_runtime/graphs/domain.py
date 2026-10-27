@@ -42,13 +42,14 @@ def unsupported(torch: Any) -> str:
 
 @dataclass(eq=False, slots=True)
 class Pool:
-    """A stock Torch graph-pool token. Graphs and their static tensors own its allocations.
+    """A stock Torch graph-pool token, or the `torch.cuda.MemPool` a sequence recording shares
+    across its stages' captures and warm-ups. Graphs and their static tensors own its allocations.
 
     Runtime retires every graph and waits for its readers before dropping those tensors.
     The native weight manager does not own this activation/scratch pool.
     """
 
-    handle: tuple[int, int]
+    handle: Any
 
 
 class Domain:

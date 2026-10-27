@@ -701,10 +701,12 @@ class PreparedRepeat:
             )
 
         class CaptureOwners(TorchDispatchMode):  # type: ignore[misc]  # Torch is optional in checks.
-            def __init__(self, retain: bool) -> None:
+            def __init__(self, retain: bool, temporaries: dict[int, Any] | None = None) -> None:
                 super().__init__()
                 self.retain = retain
                 self.produced: dict[int, Any] = {}
+                #: New storages it makes, by tensor: a sequence stage's capture or pooled warm-up.
+                self.temporaries = temporaries
 
             def __torch_dispatch__(
                 self, func: Any, types: Any, args: Any = (), kwargs: Any = None
@@ -757,24 +759,24 @@ class PreparedRepeat:
                         for tensor in tree_leaves((args, kwargs or {}))
                         if isinstance(tensor, torch.Tensor)
                     }
-                    if group is not None and self.retain
+                    if self.temporaries is not None
                     else set()
                 )
                 result = func(*args, **(kwargs or {}))
                 for tensor in tree_leaves(result):
                     if isinstance(tensor, torch.Tensor):
                         self.produced[id(tensor)] = weakref.ref(tensor)
-                        if group is not None and self.retain:
+                        if self.temporaries is not None:
                             storage = tensor.untyped_storage()
                             pointer, size = int(storage.data_ptr()), int(storage.nbytes())
                             aliases_generated = any(
                                 tensor.device == device and pointer < end and start < pointer + size
-                                for _, _, device, start, end in generated.values()
+                                for _, _, device, start, end in self.temporaries.values()
                             )
                             if size and (
                                 (tensor.device, pointer) not in input_storage or aliases_generated
                             ):
-                                generated[id(tensor)] = (
+                                self.temporaries[id(tensor)] = (
                                     weakref.ref(tensor),
                                     weakref.ref(storage),
                                     tensor.device,
@@ -802,13 +804,28 @@ class PreparedRepeat:
             if after is not None:
                 phases.append((after, suffix))
             native = None
+            # A sequence's later stages warm up inside its pool, which earlier stages' graphs
+            # hold: beside it, an eager warm-up would need a second working set. Those graphs
+            # reuse the pool's free blocks as scratch, so nothing the warm-up makes may outlive it.
+            pooled = group is not None and bool(group.stages)
+            warm_pool = torch.cuda.use_mem_pool(group._pool.handle, device) if pooled else None
+            warmed: dict[int, tuple[Any, Any, Any, int, int]] = {}
             try:
-                with torch.cuda.stream(stream), CaptureOwners(False):
+                with (
+                    torch.cuda.stream(stream),
+                    warm_pool or nullcontext(),
+                    CaptureOwners(False, warmed if pooled else None),
+                ):
                     for _, operation in phases:
                         operation()  # instantiate each phase's library workspaces before capture
                     for target, original in zip(tensors, saved, strict=True):
                         target.copy_(original)
                 stream.synchronize()
+                if any(t() is not None or s() is not None for t, s, *_ in warmed.values()):
+                    raise CapabilityError(
+                        "a warm-up temporary outlived its sequence stage's warm-up",
+                        code="prepared_graph_ineligible",
+                    )
                 # Like torch.cuda.graph's preparation, return inactive eager segments
                 # before the graph asks for its own pool. Warmup and its state restore
                 # are joined; live tensors, weight pins and existing graph pools remain
@@ -830,7 +847,7 @@ class PreparedRepeat:
                     kernel_ready.recording(),
                     varena.capture(device),
                     torch.cuda.stream(stream),
-                    CaptureOwners(True),
+                    CaptureOwners(True, generated if group is not None else None),
                 ):
                     for recording, operation in phases:
                         if group is None:
@@ -1730,7 +1747,8 @@ class _SequenceCapture:
                     f"capture waits for kernel readiness: {error}",
                     code="prepared_graph_ineligible",
                 ) from error
-            self._pool = domain.Pool(torch.cuda.graph_pool_handle())
+            # A MemPool, so later stages can also warm up inside it (`_capture_ready`).
+            self._pool = domain.Pool(torch.cuda.MemPool())
         elif self._domain.device != device:
             raise ValueError("sequence captures cannot span devices")
         if why := self._domain.refusal():
