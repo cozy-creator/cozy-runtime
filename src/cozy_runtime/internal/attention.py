@@ -361,9 +361,15 @@ def _sol_objects(candidate: Candidate) -> bool:
     return candidate.sparse and candidate.import_name == "sol_attn"
 
 
-#: The BF16 kernel a declaring sparse row's exact paths take (H3: the token refiner and the blocks
-#: whose key outliers no quantized scale carries), on every family.
-EXACT_DENSE = "sdpa"
+#: The kernel a declaring sparse row's exact paths take (H3: the token refiner, block 1 and the
+#: blocks whose key gain has outlier channels): Kitchen INT8 where the row declares it, whose
+#: per-block scales carry those keys (H3 on an RTX 5090: 0.008-0.030 rel L2, FP4 0.10-0.28),
+#: else BF16 SDPA.
+EXACT_INT8, EXACT_DENSE = "kitchen-int8", "sdpa"
+
+
+def _exact_name(candidate: Candidate) -> str:
+    return EXACT_INT8 if EXACT_INT8 in candidate.dense else EXACT_DENSE
 
 
 def dense_identity(name: str) -> str:
@@ -373,7 +379,7 @@ def dense_identity(name: str) -> str:
     if not dense:
         return attention_sol.dense_identity()
     prefix = f"; sparse-prefix={dense[-1]}" if dense[-1] != dense[0] else ""
-    return f"{dense[0]}{prefix}{_EXACT_AT}{EXACT_DENSE}"
+    return f"{dense[0]}{prefix}{_EXACT_AT}{_exact_name(known()[name])}"
 
 
 def device_row(device: DeviceFacts | None) -> arch.Row:
@@ -482,7 +488,7 @@ def _local(candidate: Candidate) -> Local:
     forward = candidate.local.forward
     if candidate.dense:
         rows = [_dense_rows(BY_NAME[name]) for name in candidate.dense]
-        exact = _dense_rows(BY_NAME[EXACT_DENSE])
+        exact = _dense_rows(BY_NAME[_exact_name(candidate)])
         forward = partial(forward, dense=rows[0], prefix_dense=rows[-1], exact=exact)
 
     def guarded(query: Tensor, key: Tensor, value: Tensor, **options: Any) -> Tensor:
