@@ -12,6 +12,7 @@ import math
 import threading
 import time
 import weakref
+from collections import OrderedDict
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
@@ -27,6 +28,7 @@ from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.internal.accel import host_memory
 
 __all__ = [
     "Binding",
@@ -50,6 +52,8 @@ __all__ = [
 progress = 0
 _RESERVE = 512 << 20
 _HOST_STAGING = 64 << 20
+#: Host RAM a baked-page cache never takes (`Memory._keep_baked`): the larger of this and a tenth.
+_BAKED_HEADROOM = 8 << 30
 _DTYPES = {
     name: kind
     for name, kind in (
@@ -127,7 +131,9 @@ class Filling(Protocol):
 
     def overlay(self, block: str, keys: Collection[str], /) -> Hashable: ...
 
-    def __call__(self, block: str, parts: Mapping[str, Mapping[str, Tensor]], /) -> None: ...
+    def __call__(self, block: str, parts: Mapping[str, Mapping[str, Tensor]], /) -> bool:
+        """Fill `block`'s parts in place; whether their bytes now differ from the stored ones."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -498,6 +504,7 @@ class Model:
             self.handles.clear()
             for block in self.groups():
                 self.memory._discard(block, forget=True)
+            self.memory._forget_baked(self)
             self.memory.models.pop(self.module, None)
 
 
@@ -1116,6 +1123,10 @@ class Memory:
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
         self._forward_depth = 0
+        #: (set, block, fill identity, overlay) -> a streaming block's baked bytes in host RAM:
+        #: its next refill copies them back, with no store read, factor read or bake
+        self._baked: OrderedDict[tuple[object, ...], Tensor] = OrderedDict()
+        self._baked_bytes = 0
         if self.cuda:
             try:
                 from tensorfs import varena
@@ -1525,8 +1536,34 @@ class Memory:
                 raise ResidencyError("a weight fill cannot change during an active use")
             for block in model.groups():
                 self._discard(block, forget=True)
+            self._forget_baked(model)
             model.identity = identity
             model.generation += 1
+
+    def _keep_baked(self, page: tuple[object, ...], tensor: Tensor) -> None:
+        """A streaming block's baked bytes, kept in host RAM for its next refill: process lifetime,
+        never on disk, each page once. They stay within this process's share of free host RAM
+        less a headroom; the least recently used go first, and with them under host pressure."""
+        if page in self._baked:
+            return
+        nbytes = tensor.numel()
+        host = host_memory()
+        if host.free_bytes < 0:
+            return  # unreadable host RAM: nothing kept
+        cap = self._baked_bytes + host.free_bytes - max(_BAKED_HEADROOM, host.total_bytes // 10)
+        while self._baked and self._baked_bytes + nbytes > cap:
+            self._baked_bytes -= self._baked.popitem(last=False)[1].numel()
+        if self._baked_bytes + nbytes > cap:
+            return
+        kept = torch.empty(nbytes, dtype=torch.uint8)
+        kept.copy_(tensor)  # pageable: complete when this returns
+        self._baked[page] = kept
+        self._baked_bytes += nbytes
+
+    def _forget_baked(self, model: Model) -> None:
+        """`model`'s kept baked pages go: its fill changed, or it closed."""
+        for page in [page for page in self._baked if page[0] == model.name]:
+            self._baked_bytes -= self._baked.pop(page).numel()
 
     def _forget_overlay(self, block: _Block) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
@@ -2243,7 +2280,7 @@ class Memory:
             block.loading = True
         data: dict[str, dict[str, Tensor]] = {}
         read_bytes = read_ns = 0
-        use = None
+        use = kept = None
         try:
             with self.lock:
                 if self._prefetch is not None:
@@ -2273,6 +2310,15 @@ class Memory:
                     # gaps between stored parts. Initialize them before publication.
                     use.tensor.zero_()
                 block.native_storage = int(use.tensor.untyped_storage().data_ptr())
+            page: tuple[object, ...] | None = None
+            if block.model.fill is not None and use is not None and use.needs_fill:
+                page = (block.model.name, block.path, block.model.identity, overlay)
+                found = self._baked.get(page)
+                if found is not None and found.numel() == use.tensor.numel():
+                    # The bytes this page's first bake wrote: no store read, factor read or bake.
+                    kept = found
+                    use.tensor.copy_(kept)
+                    self._baked.move_to_end(page)
             offset = 0
             for key, parts in block.parts.items():
                 views = data[key] = {}
@@ -2283,7 +2329,7 @@ class Memory:
                         else self._empty(part.nbytes, reclaim)
                     )
                     offset += (part.nbytes + 255) // 256 * 256
-                    if use is None or use.needs_fill:
+                    if (use is None or use.needs_fill) and kept is None:
                         began = time.perf_counter_ns()
                         try:
                             self._read_into(tensors, key, raw, part.role or None)
@@ -2307,7 +2353,9 @@ class Memory:
                     views[role] = view.view(shape)
             if block.model.fill is not None and (use is None or use.needs_fill):
                 # `overlay` was read on this thread just before; no package code ran since.
-                block.model.fill(block.path, data)
+                changed = kept is None and block.model.fill(block.path, data)
+                if changed and page is not None and use is not None and not block.preferred:
+                    self._keep_baked(page, use.tensor)  # a block that streams
                 block.overlay = overlay
             if use is not None:
                 use.commit()
@@ -2330,6 +2378,8 @@ class Memory:
             request = _REQUEST.get()
             if request is not None and read_bytes:
                 request.read(block, read_ns, read_bytes)
+            if request is not None and kept is not None:
+                request.read(block, 0, kept.numel(), origin="baked")
             with self.lock:
                 block.loading = False
 
@@ -2593,6 +2643,7 @@ class Request:
         self.peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
+        self.baked_hits = self.baked_bytes = 0
         self.final_fills = self.final_hits = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
@@ -2680,16 +2731,29 @@ class Request:
             torch.cuda.reset_peak_memory_stats(self.memory.device)
         return peak
 
-    def read(self, block: _Block, ns: int, nbytes: int, *, speculative: bool = False) -> None:
-        self.moved += nbytes
-        self.read_ns += ns
+    def read(
+        self,
+        block: _Block,
+        ns: int,
+        nbytes: int,
+        *,
+        speculative: bool = False,
+        origin: str = "store",
+    ) -> None:
+        """A block filled: from the store, or (`baked`) from its kept baked bytes."""
+        if origin == "store":
+            self.moved += nbytes
+            self.read_ns += ns
+        else:
+            self.baked_hits += 1
+            self.baked_bytes += nbytes
         self.trace.append(
             {
                 "sequence": len(self.trace),
                 "set": block.model.name,
                 "block": block.index,
                 "bytes": nbytes,
-                "origin": "store",
+                "origin": origin,
                 "speculative": speculative,
             }
         )
@@ -2707,7 +2771,11 @@ class Request:
             "sets": {
                 m.name: sum(b.nbytes for b in m.groups()) for m in self.memory.models.values()
             },
-            "moved": {"store": {"bytes": self.moved, "ns": self.read_ns}},
+            "moved": {
+                "store": {"bytes": self.moved, "ns": self.read_ns},
+                "baked": {"bytes": self.baked_bytes, "fills": self.baked_hits},
+            },
+            "baked_pages": {"pages": len(self.memory._baked), "bytes": self.memory._baked_bytes},
             "trace": list(self.trace),
             "trace_scope": "fills",
             "phases": list(self.phase_changes),

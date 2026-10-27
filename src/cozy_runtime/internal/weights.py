@@ -927,9 +927,11 @@ class _Bakes:
             held.append((stored, bake.encoding, deltas))
         return repr(held)
 
-    def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> None:
+    def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> bool:
+        """Bake `block`'s LoRA'd weights in place; whether any was baked."""
         if self.serving != "bake":
-            return
+            return False
+        baked = self.baked
         identity = self._described(armed=True)
         for stored, bake in self.bakes.items():
             weight = parts.get(stored)
@@ -970,6 +972,7 @@ class _Bakes:
                 how=self.how,
             )
             self.baked += 1
+        return self.baked > baked
 
 
 def _deltas(bake: _Bake) -> list[tuple[object, Tensor, Tensor, float]]:
