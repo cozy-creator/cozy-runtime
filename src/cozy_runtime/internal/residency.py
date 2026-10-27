@@ -53,6 +53,10 @@ __all__ = [
 
 progress = 0
 _RESERVE = 512 << 20
+#: Streamed (non-preferred) blocks resident at once: the one the GPU runs, the one entering, and
+#: the next one being read. The read takes the oldest completed block's room (Varena evicts it on
+#: its last-consumer events, never waiting), so it overlaps compute instead of following it.
+_STREAMED = 3
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
@@ -1346,7 +1350,7 @@ class Memory:
             ).hexdigest()
             model.identity = model.wanted_identity()
             self.window_bytes = max(
-                [self.window_bytes, *(b.allocation_bytes for b in model.groups())]
+                [self.window_bytes, *(_STREAMED * b.allocation_bytes for b in model.groups())]
             )
             self.native.set_streaming_limit(self.window_bytes)
         _placeholders(model)
@@ -1456,7 +1460,7 @@ class Memory:
             layout_identity = hashlib.sha256(
                 repr([(b.path, b.aliases, b.finals) for _, b in layouts]).encode()
             ).hexdigest()
-            window = max([self.window_bytes, *(b.allocation_bytes for _, b in layouts)])
+            window = max([self.window_bytes, *(_STREAMED * b.allocation_bytes for _, b in layouts)])
 
         def apply() -> None:
             if self.capturing():
@@ -1932,7 +1936,7 @@ class Memory:
             incoming = [m for m in self.models.values() if m.name in names]
             # An unrelated registered model must not enlarge this phase's streaming
             # headroom. Native admission still permits an unexpectedly larger group.
-            self.window_bytes = max(
+            self.window_bytes = _STREAMED * max(
                 (b.allocation_bytes for m in incoming for b in m.groups()), default=0
             )
             self.native.set_streaming_limit(self.window_bytes)
@@ -2157,11 +2161,11 @@ class Memory:
                 or block.cached()
             ):
                 return
-            # Capacity is checked before native admission and includes already resident
-            # weights/activation reservations. The native call also refuses window trimming,
-            # OOM recovery and abandoned-writer joins; it never requests a context join.
-            needed = block.allocation_bytes + (self.window_bytes if queued is not None else 0)
-            if needed > self.room().free:
+            # A queued request's read is admitted only into free room. Demand's next block may
+            # also take the room of the oldest streamed block whose consumers completed: Varena
+            # evicts it on its last-consumer events and refuses rather than wait or join.
+            needed = block.allocation_bytes + self.window_bytes
+            if queued is not None and needed > self.room().free:
                 if request is not None:
                     request.prefetch_skipped += 1
                     if queued is not None:
@@ -2196,7 +2200,12 @@ class Memory:
                 try:
                     if provisional:
                         region.set_preferred(True)  # native end-of-prefix watermark still wins
-                    read = region.prepare_read(block.model.source.ck, parts, reclaim=False)
+                    read = region.prepare_read(
+                        block.model.source.ck,
+                        parts,
+                        reclaim=False,
+                        evict_completed=queued is None,
+                    )
                 finally:
                     if provisional:
                         # The prepared Fill owns its pin. Only demand may assign a lasting
