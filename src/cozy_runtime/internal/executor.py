@@ -798,6 +798,8 @@ class Executor:
         #: torch under it (`internal.execution`, imported with the device).
         self.constructions: dict[str, Executor] = {}
         self.memory: Memory | None = None
+        #: HOST ONLY: Start's development GPU memory limit, the memory's budget
+        self.gpu_memory_limit: int | None = None
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -1046,7 +1048,8 @@ class Executor:
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        host.memory, host.execution = Memory.open(device), execution
+        host.memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
+        host.execution = execution
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         _split.install(execution)
@@ -1600,6 +1603,7 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        self.host.gpu_memory_limit = command.gpu_memory_limit
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
         if self.started or (command.import_only and self.imported):
