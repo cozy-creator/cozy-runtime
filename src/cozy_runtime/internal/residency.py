@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import sys
 import threading
 import time
 import weakref
@@ -28,6 +29,7 @@ from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.internal import proctree
 from cozy_runtime.internal.accel import host_memory
 
 __all__ = [
@@ -52,7 +54,7 @@ __all__ = [
 progress = 0
 _RESERVE = 512 << 20
 _HOST_STAGING = 64 << 20
-#: Host RAM a baked-page cache never takes (`Memory._keep_baked`): the larger of this and a tenth.
+#: Host RAM the baked-page cache leaves free (`Memory._keep_baked`).
 _BAKED_HEADROOM = 8 << 30
 _DTYPES = {
     name: kind
@@ -1123,10 +1125,14 @@ class Memory:
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
         self._forward_depth = 0
-        #: (set, block, fill identity, overlay) -> a streaming block's baked bytes in host RAM:
+        #: (set, block, fill identity, overlay) -> a refilled block's baked bytes in host RAM:
         #: its next refill copies them back, with no store read, factor read or bake
         self._baked: OrderedDict[tuple[object, ...], Tensor] = OrderedDict()
         self._baked_bytes = 0
+        #: resident pages baked once: kept from their first refill
+        self._baked_once: set[tuple[object, ...]] = set()
+        #: host RAM this process could still take at the cache's last look; -1 unreadable
+        self._baked_room = -1
         if self.cuda:
             try:
                 from tensorfs import varena
@@ -1540,30 +1546,43 @@ class Memory:
             model.identity = identity
             model.generation += 1
 
-    def _keep_baked(self, page: tuple[object, ...], tensor: Tensor) -> None:
-        """A streaming block's baked bytes, kept in host RAM for its next refill: process lifetime,
-        never on disk, each page once. They stay within this process's share of free host RAM
-        less a headroom; the least recently used go first, and with them under host pressure."""
+    def _keep_baked(self, page: tuple[object, ...], tensor: Tensor, *, streams: bool) -> None:
+        """A block's baked bytes, kept in host RAM for its next refill: process lifetime, never on
+        disk, each page once. A streaming block's from its first bake, a resident one's from its
+        first refill. Only into room beyond the headroom, evicting nothing for it: blocks refill
+        in a fixed order, so replacing the least recently used would miss every refill."""
         if page in self._baked:
             return
+        if not streams and page not in self._baked_once:
+            self._baked_once.add(page)
+            return
         nbytes = tensor.numel()
-        host = host_memory()
-        if host.free_bytes < 0:
-            return  # unreadable host RAM: nothing kept
-        cap = self._baked_bytes + host.free_bytes - max(_BAKED_HEADROOM, host.total_bytes // 10)
-        while self._baked and self._baked_bytes + nbytes > cap:
-            self._baked_bytes -= self._baked.popitem(last=False)[1].numel()
-        if self._baked_bytes + nbytes > cap:
+        if self._trim_baked() - nbytes < _BAKED_HEADROOM:
             return
         kept = torch.empty(nbytes, dtype=torch.uint8)
         kept.copy_(tensor)  # pageable: complete when this returns
         self._baked[page] = kept
         self._baked_bytes += nbytes
 
+    def _trim_baked(self) -> int:
+        """The host RAM this process can still take (its tightest cgroup's, on Linux), after kept
+        pages go, least recently used first, while it is under the headroom; -1 unreadable, and
+        then they all go."""
+        room = self._baked_room = (
+            proctree.available_host_bytes() if sys.platform == "linux" else host_memory().free_bytes
+        )
+        while self._baked and room < _BAKED_HEADROOM:
+            nbytes = self._baked.popitem(last=False)[1].numel()
+            self._baked_bytes -= nbytes
+            if room >= 0:
+                room += nbytes
+        return room
+
     def _forget_baked(self, model: Model) -> None:
         """`model`'s kept baked pages go: its fill changed, or it closed."""
         for page in [page for page in self._baked if page[0] == model.name]:
             self._baked_bytes -= self._baked.pop(page).numel()
+        self._baked_once = {page for page in self._baked_once if page[0] != model.name}
 
     def _forget_overlay(self, block: _Block) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
@@ -2281,6 +2300,7 @@ class Memory:
         data: dict[str, dict[str, Tensor]] = {}
         read_bytes = read_ns = 0
         use = kept = None
+        kept_ns = 0
         try:
             with self.lock:
                 if self._prefetch is not None:
@@ -2313,11 +2333,14 @@ class Memory:
             page: tuple[object, ...] | None = None
             if block.model.fill is not None and use is not None and use.needs_fill:
                 page = (block.model.name, block.path, block.model.identity, overlay)
+                if self._baked:
+                    self._trim_baked()  # host pressure gives kept pages back here
                 found = self._baked.get(page)
                 if found is not None and found.numel() == use.tensor.numel():
                     # The bytes this page's first bake wrote: no store read, factor read or bake.
-                    kept = found
-                    use.tensor.copy_(kept)
+                    kept, began = found, time.perf_counter_ns()
+                    use.tensor.copy_(kept)  # pageable: the host copy is done when this returns
+                    kept_ns = time.perf_counter_ns() - began
                     self._baked.move_to_end(page)
             offset = 0
             for key, parts in block.parts.items():
@@ -2354,8 +2377,8 @@ class Memory:
             if block.model.fill is not None and (use is None or use.needs_fill):
                 # `overlay` was read on this thread just before; no package code ran since.
                 changed = kept is None and block.model.fill(block.path, data)
-                if changed and page is not None and use is not None and not block.preferred:
-                    self._keep_baked(page, use.tensor)  # a block that streams
+                if changed and page is not None and use is not None:
+                    self._keep_baked(page, use.tensor, streams=not block.preferred)
                 block.overlay = overlay
             if use is not None:
                 use.commit()
@@ -2379,7 +2402,7 @@ class Memory:
             if request is not None and read_bytes:
                 request.read(block, read_ns, read_bytes)
             if request is not None and kept is not None:
-                request.read(block, 0, kept.numel(), origin="baked")
+                request.read(block, kept_ns, kept.numel(), origin="baked")
             with self.lock:
                 block.loading = False
 
@@ -2643,7 +2666,7 @@ class Request:
         self.peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
-        self.baked_hits = self.baked_bytes = 0
+        self.baked_hits = self.baked_bytes = self.baked_ns = 0
         self.final_fills = self.final_hits = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
@@ -2747,6 +2770,7 @@ class Request:
         else:
             self.baked_hits += 1
             self.baked_bytes += nbytes
+            self.baked_ns += ns
         self.trace.append(
             {
                 "sequence": len(self.trace),
@@ -2773,9 +2797,13 @@ class Request:
             },
             "moved": {
                 "store": {"bytes": self.moved, "ns": self.read_ns},
-                "baked": {"bytes": self.baked_bytes, "fills": self.baked_hits},
+                "baked": {"bytes": self.baked_bytes, "fills": self.baked_hits, "ns": self.baked_ns},
             },
-            "baked_pages": {"pages": len(self.memory._baked), "bytes": self.memory._baked_bytes},
+            "baked_pages": {
+                "pages": len(self.memory._baked),
+                "bytes": self.memory._baked_bytes,
+                "room": self.memory._baked_room,
+            },
             "trace": list(self.trace),
             "trace_scope": "fills",
             "phases": list(self.phase_changes),
