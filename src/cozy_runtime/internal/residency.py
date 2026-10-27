@@ -580,6 +580,8 @@ class Binding:
         self.completion_lost = False
         self.used = False
         self.held: list[tuple[_Block, int]] = []
+        #: each held block's fill overlay when held: a replay serves only a use that arms it
+        self.overlays: list[tuple[_Block, Hashable]] = []
         self.lock = threading.RLock()
         self.last: Any = None
         self._load_slot: Any = None
@@ -624,7 +626,17 @@ class Binding:
             for b, generation in self.held
         ):
             return "held block released"
+        if not self.armed():
+            return "armed overlay changed"
         return ""
+
+    def armed(self) -> bool:
+        """Every held block's page carries the overlay its model's package arms now (a LoRA
+        baked into it, or none): a replay reads the pages, never the package's hooks."""
+        fill = self.model.fill
+        return fill is None or all(
+            fill.overlay(block.path, block.parts) == overlay for block, overlay in self.overlays
+        )
 
     def resident(self) -> bool:
         return not self.unresident()
@@ -937,6 +949,7 @@ class Binding:
                             entered.append(block)
                         if not self.held:
                             self.held = [(block, block.generation) for block, _ in retained]
+                            self.overlays = [(block, block.overlay) for block, _ in retained]
                             published = True
                         yield self
                     except BaseException:
@@ -1571,6 +1584,10 @@ class Memory:
         the page, so the next fill writes the wanted overlay."""
         for hold in list(block.model.holds):
             hold.shed()
+        if block.retained and not self.capturing():
+            from cozy_runtime import graphs
+
+            graphs.retire_stale(torch, block.model.module)  # graphs of the other overlay go
         if block.count or block.retained or block.loading or self.capturing():
             raise StaleBinding("a weight block in use cannot change its fill overlay")
         self._discard(block, forget=True)
