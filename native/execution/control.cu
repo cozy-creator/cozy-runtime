@@ -6,7 +6,7 @@
 #include <new>
 #include <vector>
 
-template<class Body> static int on_device(int device, Body body) {
+template<class Body> static int switched(int device, Body body) {
     int previous = 0;
     auto selected = cudaGetDevice(&previous);
     if (selected != cudaSuccess) return selected;
@@ -20,6 +20,15 @@ template<class Body> static int on_device(int device, Body body) {
     catch (...) { result = cudaErrorUnknown; }
     const auto restored = previous == device ? cudaSuccess : cudaSetDevice(previous);
     return result == cudaSuccess ? restored : result;
+}
+
+// A failure reaches the caller as the return value. This module links its own cudart, so leaving
+// it as this thread's last error (a refused create's out-of-memory) would make a later launch check
+// here, such as destroy's, report it as its own.
+template<class Body> static int on_device(int device, Body body) {
+    const int result = switched(device, body);
+    if (result != cudaSuccess) (void)cudaGetLastError();
+    return result;
 }
 
 struct Control {
