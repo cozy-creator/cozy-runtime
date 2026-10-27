@@ -1268,9 +1268,12 @@ class Memory:
         if self.native is not None:
             # Native pins, including escaped Torch storage aliases, are the authority.
             # Do not count an idle Python block as reclaimable merely because hooks closed.
-            cold = int(self.native.stats()["reclaimable_bytes"])
+            reclaimable = int(self.native.stats()["reclaimable_bytes"])
+            # Of those, the step's own resident pages are warm: it reads them again, so a cut
+            # that evicts them refills them (H3 15 s on a 4090: 28 GiB more store reads).
+            warm = min(self._resident(current), reclaimable)
             # Pure-cut workspace estimates still use Torch's allocation granularity.
-            return Room(int(free), cold, 0)
+            return Room(int(free), reclaimable - warm, warm)
         with self.lock:
             cold = warm = 0
             for model in self.models.values():
@@ -1286,6 +1289,21 @@ class Memory:
                         else:
                             cold += block.nbytes
         return Room(int(free), cold, warm)
+
+    def _resident(self, current: Collection[str]) -> int:
+        """The resident native pages of `current`'s idle blocks."""
+        if not current:
+            return 0
+        with self.lock:
+            return sum(
+                int(region.allocated_bytes)
+                for model in self.models.values()
+                if model.name in current
+                for block in model.groups()
+                if not (block.count or block.retained or block.loading)
+                for region in (block.region, block.final_region)
+                if region is not None and region.resident
+            )
 
     def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         level = Level(level) if isinstance(level, str) else level

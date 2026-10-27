@@ -104,7 +104,7 @@ def _level(groups: Sequence[int], query: Tensor, rows: int, world: int) -> int:
         gathered = 4 * batch * rows * (step // world) * dim * b
         return sizing.rounded(sent, room.granularity) + sizing.rounded(gathered, room.granularity)
 
-    fits = room.free + room.cold
+    fits = room.free + room.cold + room.warm
     return next((n for n, step in enumerate(groups) if need(step) <= fits), len(groups) - 1)
 
 
