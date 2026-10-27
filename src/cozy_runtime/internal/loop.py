@@ -480,6 +480,13 @@ def _submit(
     reads = [int(stage.get("read_bytes", 0)) for stage in facts.get("stage_inputs", ())]
     if reads:
         row["streamed_bytes"] = row.get("streamed_bytes", 0) + sum(reads)
+    admitted: dict[str, int] = {}
+    for pair in facts.get("stage_prefetch_admission", ()):
+        admitted[str(pair.get("state"))] = admitted.get(str(pair.get("state")), 0) + 1
+    if admitted:
+        row["prefetch"] = admitted
+    if phases := facts.get("native_phases"):
+        row["native_phases"] = len(phases)
 
 
 # ------------------------------------------------------------------ recording
@@ -896,58 +903,53 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
 class _Cutter:
     """One pass of the step recorded as stages cut at a component's block boundaries.
 
-    The component's common weights are held for the program; each block is a stage that loads
-    its own raw block at its own addresses. Scratch that crosses a cut stays in the shared pool:
-    later stages read it at the address the earlier one wrote, as replay runs them in order. A
-    block the cut cannot take cleanly (nested blocks, weights read across a cut, a derived
-    layout) refuses the whole pass.
+    Every stage loads its raw weights at their own addresses: a block's stage its block and the
+    common weights, the stages between blocks the common weights. Scratch that crosses a cut
+    stays in the shared pool: later stages read it at the address the earlier one wrote, as
+    replay runs them in order. A block the cut cannot take cleanly (nested blocks, weights read
+    across a cut, a derived layout) refuses the whole pass.
     """
 
     def __init__(self, recording: _SequenceCapture, model: Model, state: tuple[Any, ...]) -> None:
         self.recording, self.model, self.state = recording, model, state
-        self.common: Binding | None = None
+        self.common = [model.common] if model.common is not None else []
         self.graph: _Graph | None = None
         self.block: Any = None
-        self.block_binding: Binding | None = None
+        self.binding: Binding | None = None
         self.load: Any = None
         self.blocks = 0
         self.failed = False
         self.landed = LANDED[0]
         self.scratch: list[tuple[Any, int, int]] = []
         self.immutable: frozenset[int] = frozenset()
+        self._preparing = ExitStack()
+        self._declared: Any = None
 
     def record(self, body: Callable[[], object]) -> None:
         _checked(self.model)
-        model = self.model
-        common = self.common = _binding(model, [model.common] if model.common else [])
+        census = _binding(self.model, [])
         try:
-            with ExitStack() as preparing:
-                preparing.enter_context(common.prepare())
-                self.immutable = common.immutable_buffer_ids()
-                preparing.enter_context(_guarded((self.model,), self.immutable))
-                token = CUTTER.set(self)
-                preparing.callback(CUTTER.reset, token)
-                self._open_common()
-                try:
-                    body()
-                except BaseException:
-                    self.failed = True
-                    self._abort()
-                    raise
-                self._close()
-            if self.blocks == 0:
-                raise CapabilityError(
-                    "the step entered none of the component's blocks",
-                    code="prepared_graph_ineligible",
-                )
-            # Every common stage reads the one held common binding; the last one closes it.
-            owners = [s for s in self.recording.stages if s._owned_bindings == (common,)]
-            if owners:
-                owners[-1]._binding_cleanup.callback(common.close)
-                self.common = None
+            self.immutable = census.immutable_buffer_ids()
         finally:
-            if self.common is not None:
-                self.common.close()
+            census.close()
+        with ExitStack() as preparing:
+            # The scope's open pass lends its common block to the stages that load it.
+            preparing.enter_context(self.model.lending())
+            preparing.enter_context(_guarded((self.model,), self.immutable))
+            token = CUTTER.set(self)
+            preparing.callback(CUTTER.reset, token)
+            self._open(None)
+            try:
+                body()
+            except BaseException:
+                self.failed = True
+                self._abort()
+                raise
+            self._close()
+        if self.blocks == 0:
+            raise CapabilityError(
+                "the step entered none of the component's blocks", code="prepared_graph_ineligible"
+            )
 
     # Called by residency's block hooks while CUTTER is set.
     def enter(self, block: Any) -> None:
@@ -960,7 +962,7 @@ class _Cutter:
         if self.block is not None:
             raise CapabilityError("nested blocks cannot be cut", code="prepared_graph_ineligible")
         self._close()
-        self._open_block(block)
+        self._open(block)
 
     def exit(self, block: Any) -> None:
         if self.failed or block.model is not self.model:
@@ -974,60 +976,50 @@ class _Cutter:
                 "a block cut closed out of order", code="prepared_graph_ineligible"
             )
         self._close()
-        self._open_common()
+        self._open(None)
 
-    def _open_common(self) -> None:
-        common = self.common
-        assert common is not None
-        self.graph = _Graph(
-            self.recording,
-            self.state,
-            1,
-            (common,),
-            scratch=self.scratch,
-            unbound=self.immutable - common.immutable_buffer_ids(selected=True),
-            undeclared=common.undeclared_input_ranges(),
-        )
-        self._declared = _CAPTURE_BLOCKS.set(frozenset(id(b) for b in common.groups))
-        self.graph.begin()
-
-    def _open_block(self, block: Any) -> None:
-        binding = _binding(self.model, [block])
-        try:
-            load = binding.prepare_load(stage=True)
-        except BaseException:
-            binding.close()
-            raise
-        if load is None:
-            binding.close()
-            raise CapabilityError(
-                f"block {block.path} cannot be detached as a stage",
-                code="prepared_graph_ineligible",
-            )
-        self.block, self.block_binding, self.load = block, binding, load
+    def _open(self, block: Any) -> None:
+        """A stage over `block` (None: the common weights between blocks), loaded natively."""
+        groups = [*self.common, *(() if block is None else (block,))]
+        binding = load = None
+        if groups:
+            binding = _binding(self.model, groups)
+            try:
+                load = binding.prepare_load(stage=True)
+            except BaseException:
+                binding.close()
+                raise
+            if load is None:
+                binding.close()
+                raise CapabilityError(
+                    f"{block.path if block is not None else 'common weights'} cannot be "
+                    "detached as a stage",
+                    code="prepared_graph_ineligible",
+                )
+        self.block, self.binding, self.load = block, binding, load
         self._preparing = ExitStack()
         try:
-            self._preparing.enter_context(binding.prepare())
+            if binding is not None:
+                self._preparing.enter_context(binding.prepare())
             self.graph = _Graph(
                 self.recording,
                 self.state,
                 1,
-                (binding,),
-                loaded=tuple(binding.immutable_inputs()),
+                () if binding is None else (binding,),
+                loaded=() if binding is None else tuple(binding.immutable_inputs()),
                 scratch=self.scratch,
-                unbound=self.immutable - binding.immutable_buffer_ids(selected=True),
-                undeclared=binding.undeclared_input_ranges(),
+                unbound=self.immutable
+                - (frozenset() if binding is None else binding.immutable_buffer_ids(selected=True)),
+                undeclared=() if binding is None else binding.undeclared_input_ranges(),
             )
-            self._declared = _CAPTURE_BLOCKS.set(frozenset(id(b) for b in binding.groups))
+            self._declared = _CAPTURE_BLOCKS.set(frozenset(id(b) for b in groups))
             self.graph.begin()
         except BaseException:
-            self._preparing.close()
-            self.block = self.block_binding = self.load = None
-            binding.close()
+            self._abort()
             raise
 
     def _close(self) -> None:
-        """End the current stage; keep it unless it recorded nothing."""
+        """End the current stage: keep it, or drop it when it recorded nothing."""
         graph, self.graph = self.graph, None
         if graph is None:
             return
@@ -1035,24 +1027,26 @@ class _Cutter:
             graph.end()
         finally:
             _CAPTURE_BLOCKS.reset(self._declared)
+            self._declared = None
         self.scratch.extend(
             (device, start, end) for _, _, device, start, end in graph.generated.values()
         )
-        block, binding, load = self.block, self.block_binding, self.load
-        self.block = self.block_binding = self.load = None
-        if block is None:  # a common stage
-            if not graph.nodes():
-                graph.reset()
-                return
-            assert self.common is not None
-            plan = graph.plan(self.landed)
-            _own(plan, (self.common,), self.recording)
+        block, binding, load = self.block, self.binding, self.load
+        self.block = self.binding = self.load = None
+        if block is None and not graph.nodes():  # nothing ran between two blocks
+            graph.reset()
+            self._preparing.close()
+            if binding is not None:
+                binding.close()  # abandons its load slot; resident inputs keep their cache
             return
-        assert binding is not None
         try:
-            load.seal()
+            if load is not None:
+                load.seal()
             self._preparing.close()  # parameter slots back before any capture-only view drops
             plan = graph.plan(self.landed)
+            if binding is None:
+                _own(plan, (), self.recording)
+                return
             try:
                 source = binding.detach_stage()
             except BaseException as error:
@@ -1062,7 +1056,8 @@ class _Cutter:
                 raise
         except BaseException:
             graph.reset()
-            binding.close()
+            if binding is not None:
+                binding.close()
             raise
         events = bool(getattr(varena.LoadSlot, "supports_event_input", False)) and bool(
             getattr(_execution.ResidentRepeat, "supports_event_input", False)
@@ -1073,17 +1068,19 @@ class _Cutter:
         cleanup = ExitStack()
         cleanup.callback(binding.close)
         _own(plan, (binding,), self.recording, cleanup)
-        self.blocks += 1
+        self.blocks += block is not None
 
     def _abort(self) -> None:
         graph, self.graph = self.graph, None
         if graph is not None:
             graph.abort()
+        if self._declared is not None:
             _CAPTURE_BLOCKS.reset(self._declared)
-        if self.block_binding is not None:
-            self._preparing.close()
-            self.block_binding.close()
-            self.block = self.block_binding = self.load = None
+            self._declared = None
+        self._preparing.close()
+        if self.binding is not None:
+            self.binding.close()
+        self.block = self.binding = self.load = None
 
 
 def _binding(model: Model, blocks: list[Any]) -> Binding:
