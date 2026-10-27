@@ -1,0 +1,1 @@
+A refused native component load (`prepared_graph_ineligible: native component loading needs idle immutable raw layouts`) now names the check that refused it, such as `block transformer_blocks.3 is retained (1)` or `block (common) has 2 final rows (…)`.
