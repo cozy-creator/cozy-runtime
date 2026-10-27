@@ -250,7 +250,7 @@ int tree(int m, int n, int k) {
     return mn <= 108003328 ? 0 : 5;
 }
 
-int choose(int m, int n, int k, int sms) {
+int fitted(int m, int n, int k, int sms) {
     if (m <= 16) return 3;
     if (m <= 128) return 6;
     int config = tree(m, n, k);
@@ -266,6 +266,17 @@ int choose(int m, int n, int k, int sms) {
         std::max<int64_t>(int64_t(device_attribute<cudaDevAttrL2CacheSize>()) * 3 / 4, 48 << 20);
     const bool bands = (m + 127) / 128 >= (n + 255) / 256;
     return bands && int64_t(m) * k > reroute ? 5 : config;
+}
+
+// A 128x256 tile (0, 5) computes N rounded up to 256. Where that is more than the 8% premium
+// `fitted` charges its 128x128 twin (1, 4) over N rounded up to 128, the twin serves: N up to
+// 1408 that is an odd multiple of 128, like SDXL's 640 (768/640). RTX 4090, kernel-regret in
+// release-gate 40478392737, 8192x640x2560: tile 5 (the tree's) 0.0654 ms, tile 4 0.0594 ms,
+// tile 1 0.0629 ms. Its nine other product shapes have N % 256 == 0 and keep their tiles.
+int choose(int m, int n, int k, int sms) {
+    const int config = fitted(m, n, k, sms);
+    if ((n + 255) / 256 * 256 <= 1.08 * ((n + 127) / 128 * 128)) return config;
+    return config == 0 ? 1 : config == 5 ? 4 : config;
 }
 
 template <typename Out>
