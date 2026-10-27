@@ -401,6 +401,8 @@ class Model:
         self.closed = False
         # Once a block streams, later blocks cannot grow the resident prefix again.
         self.prefix: int | None = None
+        #: the block entered last, whose successor in execution order `_enter` records (`next`)
+        self.entered: _Block | None = None
 
     def wanted_identity(self) -> str | None:
         fill = "stored" if self.fill is None else self.fill.identity
@@ -2516,6 +2518,15 @@ class Memory:
             capturing = self.capturing()
             if capturing and (not nested or not block.retained or block.assigned is None):
                 raise ResidencyError("capture requires an active prepared weight binding")
+            if not nested and not capturing:
+                # Prefetch reads the block after this one in execution order. Registration
+                # order lists a down/up block's attentions before its resnets (Diffusers'
+                # UNets), so SDXL read 15 blocks a step on demand at 3 GB; the order a forward
+                # actually takes replaces it, the last block's successor being the next
+                # call's first.
+                if model.entered is not None and model.entered is not block:
+                    model.entered.next = block
+                model.entered = block
             if not nested:
                 request = _REQUEST.get()
                 reclaim = reclaim and not (request is not None and request.idle)
