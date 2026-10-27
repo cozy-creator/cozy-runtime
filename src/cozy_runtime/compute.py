@@ -615,7 +615,11 @@ class PreparedRepeat:
                         if (module := root()) is not None:
                             graphs.retire(torch, module)
 
-                    model.retire_graphs = retire
+                    def stale(root: Any = root) -> None:
+                        if (module := root()) is not None:
+                            graphs.retire_stale(torch, module)
+
+                    model.retire_graphs, model.retire_stale = retire, stale
             plan._binding_cleanup = cleanup.pop_all()
             return plan
 

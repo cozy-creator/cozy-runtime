@@ -1018,6 +1018,8 @@ class Placement:
             # A cached graph owns its exact weight tensors. Residency may ask this owner
             # to retire it only when the model is idle and a later scope actually needs room.
             model.retire_graphs = functools.partial(self._retire_graphs, name)
+            # Before a scope binds its weights: graphs of another fill or overlay go.
+            model.retire_stale = functools.partial(graphs.retire_stale, self.torch, model.module)
 
     def _retire_graphs(self, component: str) -> None:
         root = self.models[component].module

@@ -374,6 +374,9 @@ class Model:
         self.thread: int | None = None
         self.retiring = False
         self.retire_graphs: Callable[[], None] | None = None
+        #: its owner's call retiring graphs recorded against another fill or overlay (graphs sits
+        #: above residency, so residency asks its owner rather than importing it)
+        self.retire_stale: Callable[[], None] | None = None
         self.sites = _sites(module)
         self.handles: list[Any] = []
         self.holds: list[Hold] = []
@@ -580,6 +583,8 @@ class Binding:
         self.completion_lost = False
         self.used = False
         self.held: list[tuple[_Block, int]] = []
+        #: each held block's fill overlay when held: a replay serves only a use that arms it
+        self.overlays: list[tuple[_Block, Hashable]] = []
         self.lock = threading.RLock()
         self.last: Any = None
         self._load_slot: Any = None
@@ -624,7 +629,17 @@ class Binding:
             for b, generation in self.held
         ):
             return "held block released"
+        if not self.armed():
+            return "armed overlay changed"
         return ""
+
+    def armed(self) -> bool:
+        """Every held block's page carries the overlay its model's package arms now (a LoRA
+        baked into it, or none): a replay reads the pages, never the package's hooks."""
+        fill = self.model.fill
+        return fill is None or all(
+            fill.overlay(block.path, block.parts) == overlay for block, overlay in self.overlays
+        )
 
     def resident(self) -> bool:
         return not self.unresident()
@@ -937,6 +952,7 @@ class Binding:
                             entered.append(block)
                         if not self.held:
                             self.held = [(block, block.generation) for block, _ in retained]
+                            self.overlays = [(block, block.overlay) for block, _ in retained]
                             published = True
                         yield self
                     except BaseException:
@@ -1525,9 +1541,8 @@ class Memory:
             raise StaleBinding("an immutable binding layout changed; reconstruct the model")
         identity = model.wanted_identity()
         if identity != model.identity or identity is None:
-            from cozy_runtime import graphs
-
-            graphs.retire_stale(torch, model.module)
+            if model.retire_stale is not None:
+                model.retire_stale()
             if any(b.retained for b in model.groups()):
                 raise StaleBinding("retire old graph bindings before changing a weight fill")
             for hold in list(model.holds):
@@ -1571,6 +1586,8 @@ class Memory:
         the page, so the next fill writes the wanted overlay."""
         for hold in list(block.model.holds):
             hold.shed()
+        if block.retained and not self.capturing() and block.model.retire_stale is not None:
+            block.model.retire_stale()  # graphs of the other overlay go
         if block.count or block.retained or block.loading or self.capturing():
             raise StaleBinding("a weight block in use cannot change its fill overlay")
         self._discard(block, forget=True)

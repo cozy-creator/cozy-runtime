@@ -1180,13 +1180,24 @@ def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
 def _hooked(module: Any) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
     at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
-    LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
-    the bound pages follow that answer: a replay would keep the captured one."""
+    LoRA overlay hook (`lora.Hook`) adds nothing where its armed factors are baked into the
+    page: served, as the binding checks at each replay that the package still arms what the
+    pages carry (`Binding.armed`). One that adds its update itself (per step, a leaf adopting
+    it, a site no block holds) runs Python a replay would skip."""
+    placed = PLACED.get(module)
+    bakes = None if placed is None else placed[0].bakes.get(placed[1])
+    baked = (
+        set()
+        if bakes is None or bakes.serving != "bake"
+        else {id(h) for b in bakes.bakes.values() if b.leaf is None for h in b.hooks}
+    )
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
                 if callable(getattr(hook, "lora_factors", None)):
-                    return f"a LoRA overlay hook on {type(sub).__name__}"
+                    if id(hook) in baked:
+                        continue
+                    return f"a LoRA overlay hook on {type(sub).__name__} that no page bakes"
                 if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
                     return f"a package forward hook on {type(sub).__name__}"
     return ""
