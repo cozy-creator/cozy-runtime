@@ -56,6 +56,17 @@ __all__ = [
 
 progress = 0
 _RESERVE = 512 << 20
+
+
+def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
+    """Torch's allocated, reserved and peak allocated CUDA bytes in one allocator read.
+    `torch.cuda.memory_allocated` and its siblings each flatten the allocator's whole statistics
+    dict (0.1 ms); a cut site read them three to five times, 5 s of each SDXL request at 3 GB."""
+    stats = torch.cuda.memory_stats_as_nested_dict(device)
+    allocated, reserved = stats["allocated_bytes"]["all"], stats["reserved_bytes"]["all"]
+    return int(allocated["current"]), int(reserved["current"]), int(allocated["peak"])
+
+
 #: Streamed (non-preferred) blocks resident at once: the one the GPU runs, the one entering, and
 #: the next one being read. The read takes the oldest completed block's room (Varena evicts it on
 #: its last-consumer events, never waiting), so it overlaps compute instead of following it.
@@ -1238,11 +1249,8 @@ class Memory:
     def _figures(self) -> tuple[int, int, int]:
         if self.cuda and torch.cuda.is_initialized():
             resident = int(self.native.stats()["resident_bytes"]) if self.native is not None else 0
-            return (
-                int(torch.cuda.memory_allocated(self.device)) + resident,
-                int(torch.cuda.memory_reserved(self.device)) + resident,
-                int(torch.cuda.max_memory_allocated(self.device)) + resident,
-            )
+            allocated, reserved, peak = _torch_bytes(self.device)
+            return allocated + resident, reserved + resident, peak + resident
         if self.device.type == "mps":
             used = int(torch.mps.current_allocated_memory())
             return used, int(torch.mps.driver_allocated_memory()), used
@@ -1252,14 +1260,13 @@ class Memory:
         self.apply_budget()
         if self.cuda:
             free, _ = torch.cuda.mem_get_info(self.device)
-            _, reserved, _ = self._figures()
             # reserved - allocated includes graph-private storage that ordinary eager
             # allocation cannot necessarily reuse. Driver free is a conservative bound.
             free = max(int(free) - _RESERVE, 0)
             if self.budget_bytes is not None:
                 # Account native backing beside Torch reservations, including graph pools.
                 # Unused private-pool bytes are not headroom for an eager allocation.
-                free = min(free, max(self.budget_bytes - reserved, 0))
+                free = min(free, max(self.budget_bytes - self._figures()[1], 0))
         elif self.device.type == "mps":
             figures = allocation(torch, "mps")
             free, reserved = figures["driver_free_bytes"], figures["reserved_bytes"]
@@ -1954,13 +1961,13 @@ class Memory:
                     if block.cached():
                         block.preferred = block.preference_set = True
             wanted = missing + self.window_bytes
-            before = int(torch.cuda.memory_reserved(self.device))
-            unused = max(before - int(torch.cuda.memory_allocated(self.device)), 0)
+            allocated, before, _ = _torch_bytes(self.device)
+            unused = max(before - allocated, 0)
             if wanted > self.room().free and unused:
                 # The previous phase's inactive Torch segments are not weight capacity.
                 # Return them once here, not on each block or allocation callback.
                 torch.cuda.empty_cache()
-            returned = max(before - int(torch.cuda.memory_reserved(self.device)), 0)
+            returned = max(before - _torch_bytes(self.device)[1], 0)
             # Protect the incoming cached bytes above; only other idle backing may go.
             need = max(wanted - self.room().free, 0)
             reclaimed = int(self.native.reclaim_unpreferred(need)) if need else 0
@@ -1990,7 +1997,7 @@ class Memory:
             and not region.resident
             and not self.capturing()
             and needed > self.room().free
-            and torch.cuda.memory_reserved(self.device) > torch.cuda.memory_allocated(self.device)
+            and (figures := _torch_bytes(self.device))[1] > figures[0]
         ):
             # Common weights may bind before their model's first forward enters its phase.
             # Return unused Torch cache first; native allocation still decides whether idle
@@ -2801,9 +2808,8 @@ class Request:
         room = self.memory.room(current)
         if not self.memory.cuda or not torch.cuda.is_initialized():
             return room
-        device = self.memory.device
-        cached = int(torch.cuda.memory_reserved(device)) - int(torch.cuda.memory_allocated(device))
-        return replace(room, cached=max(cached, 0))
+        allocated, reserved, _ = _torch_bytes(self.memory.device)
+        return replace(room, cached=max(reserved - allocated, 0))
 
     def reclaim(self, need: int = 0) -> int:
         """A known pure cut may shed the step's speculative whole-model hold.
