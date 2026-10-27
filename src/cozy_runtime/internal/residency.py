@@ -101,6 +101,8 @@ _DTYPES = {
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
 # During authored stage preparation, undeclared model reads must not page in sibling blocks.
 _CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
+#: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
+CUTTER: ContextVar[Any] = ContextVar("cozy_loop_cutter", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -3192,6 +3194,8 @@ def _hooks(model: Model) -> None:
         sub = model.module.get_submodule(block.path)
 
         def entered(*_: object, b: _Block = block) -> None:
+            if (cut := CUTTER.get()) is not None:
+                cut.enter(b)
             model._claim()
             try:
                 memory._enter(b)
@@ -3209,6 +3213,8 @@ def _hooks(model: Model) -> None:
                 memory._exit(b)
             finally:
                 model._release()
+            if (cut := CUTTER.get()) is not None:
+                cut.exit(b)
 
         model.handles.extend(_paired(sub, entered, exited))
 

@@ -1828,8 +1828,7 @@ class _SequenceExecution(Execution):
         for current, following in zip(self._stage_reads, self._stage_reads[1:], strict=False):
             index, job, bindings = current
             next_index, next_job, next_bindings = following
-            if next_index != index + 1:
-                continue  # no resident gaps or repeat wraparound in the first slice
+            # Resident stages between two reading stages run while the next one's bytes arrive.
             repeat = self.plan._repeat
             if repeat is not None and repeat[2] > 1 and next_index == repeat[1]:
                 continue  # the suffix is next only on the final pass

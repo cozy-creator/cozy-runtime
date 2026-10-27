@@ -814,6 +814,8 @@ class Executor:
         self.requests: dict[str, MemoryRequest] = {}
         #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
         self.cuts: dict[str, object] = {}
+        #: each request's `author.denoise_loop` rows (`internal.loop.ROWS`), once memory opens
+        self.loops: dict[str, list[dict[str, object]]] = {}
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
         #: The machine's sealed TensorFS cache directory.
@@ -1051,7 +1053,7 @@ class Executor:
 
     def _open_memory(self, torch: Any) -> None:
         """This executor's local residency and its pure-site execution helpers."""
-        from cozy_runtime.internal import execution
+        from cozy_runtime.internal import execution, loop
         from cozy_runtime.internal.residency import Memory
 
         host = self.host
@@ -1063,6 +1065,8 @@ class Executor:
             DEVICE[:] = [execution.Steps()]
         _split.install(execution)
         attention_ulysses.install(execution)
+        loop.install()
+        host.loops = loop.ROWS
 
     def _rank_identity(self) -> dict[str, Any]:
         owner = self.host
@@ -3720,6 +3724,7 @@ class Executor:
                 "cuts": self.host.cuts.pop(
                     command.request_id, {"sites": [], "levels": {}, "oom_floor": 0}
                 ),
+                "loops": self.host.loops.pop(command.request_id, []),
             },
             "quiescent": quiescent,
             **_env_document(),
@@ -4782,6 +4787,7 @@ class Executor:
                 )
         finally:
             self.host.cuts.pop(command.request_id, None)
+            self.host.loops.pop(command.request_id, None)
         quiet = not entered
         if entered:
             try:
