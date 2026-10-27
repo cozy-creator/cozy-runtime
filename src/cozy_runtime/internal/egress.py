@@ -20,11 +20,19 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import os
 import socket
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+from cozy_runtime.internal.package_environment import (
+    EnvironmentRefusal,
+    _require_public_wheel_url,
+)
 
 #: How much of a body one read() pulls.
 CHUNK = 1 << 20
@@ -153,14 +161,6 @@ def fetch_public_wheel(
     """One public wheel, pinned by URL and sha256, fetched anonymously through this door. A
     transfer that goes silent is asked again from the bytes it holds (`Range`), and fails once
     `STILL_ATTEMPTS` attempts in a row moved nothing."""
-    import os
-    import uuid
-    from urllib.request import HTTPRedirectHandler, Request, build_opener
-
-    from cozy_runtime.internal.package_environment import (
-        EnvironmentRefusal,
-        _require_public_wheel_url,
-    )
 
     class PublicRedirect(HTTPRedirectHandler):
         def redirect_request(

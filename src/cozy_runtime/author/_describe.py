@@ -22,6 +22,7 @@ from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._markers import AssetBound
 from cozy_runtime.author._model_defaults import check_model_arguments
+from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.author._services import UNGRANTABLE
 from cozy_runtime.author._signature import Declaration, Surface, media_kinds
 from cozy_runtime.author._walker import MISSING, is_struct, walk
@@ -148,8 +149,6 @@ def _models(declared: Declaration) -> None:
     check_model_arguments(declared.model_components, slots, what="components")
     check_model_arguments(declared.model_prepared_use, constructed, what="prepared_use")
     if declared.model_prepared_use:
-        from cozy_runtime.author._prepared_use import PreparedUse
-
         if not declared.internal or not declared.accelerator:
             raise ConformanceError(
                 "prepared_use belongs to an internal GPU program, not public request knobs",

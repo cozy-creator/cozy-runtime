@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
 
+from cozy_runtime.author._model import _declared_state
 from cozy_runtime.internal.parallel.plan import GroupRefusal
 
 _tls = threading.local()
@@ -102,8 +103,6 @@ def _modules_of(model: Any) -> Iterator[tuple[str, Any]]:
     """Every torch module reachable from the model's DECLARED state, and the components
     of any pipeline among them. Declared state is the author's statement of what the
     model holds (§1.1); nothing else is walked."""
-    from cozy_runtime.author._model import _declared_state
-
     seen: set[int] = set()
     for name in _declared_state(type(model)):
         held = getattr(model, name, None)

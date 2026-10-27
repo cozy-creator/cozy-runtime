@@ -24,8 +24,10 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from tensorfs import varena
+
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.internal import accel
+from cozy_runtime.internal import accel, kernel_ready
 
 
 class Unavailable(RuntimeError):
@@ -101,8 +103,6 @@ class Domain:
 
     def recovery_blocked(self, *, replay: bool = False) -> AbstractContextManager[Any]:
         """Block reclaim; actual capture also excludes native producers."""
-        from tensorfs import varena
-
         # Older native cohorts retain their conservative capture guard.
         guard = getattr(varena, "replay", varena.capture) if replay else varena.capture
         return guard(self.device)
@@ -113,8 +113,6 @@ class Domain:
             raise Unavailable(why)
         if self.stream is not None:
             return
-        from cozy_runtime.internal import kernel_ready
-
         # Refuse before allocating the owner graph/streams; the same device's background
         # kernel probes must not invalidate this small lifetime-owner capture either.
         with kernel_ready.recording():

@@ -21,6 +21,7 @@ from typing import cast
 import torch
 from torch import Tensor, nn
 
+from cozy_runtime.internal.encoding.leaves import NVFP4
 from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
 
@@ -259,8 +260,6 @@ def _token_local(module: nn.Module) -> bool:
     may silently select a different quantizer/backend. Other approved row quantizers keep
     their full channel/block reduction within each token.
     """
-    from cozy_runtime.internal.encoding.leaves import NVFP4
-
     return not any(getattr(child, "provider", None) == NVFP4 for child in module.modules())
 
 

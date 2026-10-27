@@ -61,6 +61,7 @@ import traceback
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -69,12 +70,12 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, weights_store
+from cozy_runtime.author import ModelRegistry, _split, describe
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author import _split, describe
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import GrantedInput
+from cozy_runtime.author._assets import Asset, GrantedInput, Tree
 from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
@@ -111,6 +112,7 @@ from cozy_runtime.author._invoke import (
     prepare_program,
     run_prepared,
 )
+from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
 from cozy_runtime.author._model import (
     LANDED,
     SCOPES,
@@ -134,6 +136,7 @@ from cozy_runtime.internal import (
     attention_sol,
     attention_ulysses,
     builtin_operations,
+    call_types,
     canonical,
     child_env,
     effect_interfaces,
@@ -141,6 +144,7 @@ from cozy_runtime.internal import (
     executor_commands,
     fp8_linear,
     int8_linear,
+    interface_wheel,
     kernel_cache,
     kernel_compile,
     kernel_ready,
@@ -150,6 +154,7 @@ from cozy_runtime.internal import (
     prepare_diagnostics,
     proctree,
     sandbox,
+    schema,
     spawn,
     stage_memo,
     tolerant,
@@ -158,7 +163,9 @@ from cozy_runtime.internal import (
     zygote,
 )
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
+from cozy_runtime.internal.derive import Observations, serving_substrate
 from cozy_runtime.internal.discovery import discover_installed
+from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
 from cozy_runtime.internal.encoding.leaves import FORMATS, serving
 from cozy_runtime.internal.executor_commands import (
     Activate,
@@ -214,7 +221,13 @@ from cozy_runtime.internal.parallel.plan import (
     GroupRefusal,
     rank_invariant_digest,
 )
-from cozy_runtime.internal.resolution import RefusedLeaves
+from cozy_runtime.internal.resolution import (
+    ConstructionFacts,
+    PlanRefusal,
+    RefusedLeaves,
+    Variant,
+    resolve,
+)
 from cozy_runtime.internal.seam import (
     RESULT_DOCUMENT,
     Channel,
@@ -232,8 +245,6 @@ else:
     import resource
 
 if TYPE_CHECKING:
-    from types import ModuleType
-
     from cozy_runtime.internal.residency import Memory, QueuedPrefetch
     from cozy_runtime.internal.residency import Request as MemoryRequest
 
@@ -2362,16 +2373,6 @@ class Executor:
             return refused
         cuda_ms = (time.perf_counter() - started) * 1000
         stage("cuda_init")
-        from cozy_runtime.author import ModelRegistry
-        from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
-        from cozy_runtime.internal.derive import Observations, serving_substrate
-        from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
-        from cozy_runtime.internal.resolution import (
-            ConstructionFacts,
-            PlanRefusal,
-            Variant,
-            resolve,
-        )
         from cozy_runtime.internal.triton_kernels import load as load_kernels
         from cozy_runtime.internal.triton_kernels import ready as kernels_ready
         from cozy_runtime.internal.weights import Backend, Placement
@@ -4324,12 +4325,10 @@ class Executor:
                 record.emit("confession", "attention.fallback", row["selected"], **row)
 
     def _execution_observation(self, choices: attention.Applied | None = None) -> dict[str, Any]:
-        from cozy_runtime import __version__
-
         # Observed generation facts; image and boot identity are added by the worker.
         # Optional kernel/lane fields stay absent until their execution is observed.
         return {
-            "runtime_version": __version__,
+            "runtime_version": RUNTIME_VERSION,
             "accelerator": str(self.facts.get("gpu_name") or "CPU"),
             "cuda": str(self.facts.get("cuda_version") or ""),
             "driver": str(self.facts.get("device_driver") or ""),
@@ -4345,10 +4344,6 @@ class Executor:
         exports in this caller process become typed proxies; installed files and
         the independently executing callee remain ordinary uv installations.
         """
-        from types import ModuleType
-
-        from cozy_runtime.internal import call_types, interface_wheel
-
         prepared: set[str] = set()
         for row in rows:
             document, module = row.interface_document, row.module
@@ -4579,8 +4574,6 @@ class Executor:
         A digest over the value document would change with every request and would fence
         nothing; the RecordOwner needs to know which CONTRACT the bytes satisfy.
         """
-        from cozy_runtime.internal import schema
-
         cached = self.schema_digests.get(surface.name)
         if cached is None:
             cached = self.schema_digests[surface.name] = canonical.digest(
@@ -5000,10 +4993,6 @@ def _serialize_result(
     non-zero when the canonical result exceeds the 4 MiB inline door, which cr-007 REFUSES
     rather than papering over with a receipt for bytes nobody wrote.
     """
-    import msgspec
-
-    from cozy_runtime.author._assets import Asset, Tree
-
     if envelope is None:
         return None, [], 0
 
