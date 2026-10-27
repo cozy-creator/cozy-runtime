@@ -1124,6 +1124,11 @@ class Memory:
         self.phase_supported = False
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
+        #: Per phase, the most weight bytes one pure cut site had to evict for its activations.
+        #: Retained-prefix admission leaves that much free when the phase next opens, so a warm
+        #: request does not admit weights only to evict them again. Nothing is reserved before
+        #: such an eviction actually happened.
+        self._reserve: dict[frozenset[str], int] = {}
         self._forward_depth = 0
         #: (set, block, fill identity, overlay) -> a refilled block's baked bytes in host RAM:
         #: its next refill copies them back, with no store read, factor read or bake
@@ -1181,6 +1186,23 @@ class Memory:
 
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
+
+    def _held_back(self) -> int:
+        """The current phase's activation reserve beyond Torch's unused cached blocks."""
+        reserve = self._reserve.get(self._phase_names or frozenset(), 0)
+        if not reserve or not self.cuda:
+            return 0
+        unused = int(torch.cuda.memory_reserved(self.device)) - int(
+            torch.cuda.memory_allocated(self.device)
+        )
+        return max(reserve - unused, 0)
+
+    def shortfall(self, evicted: int) -> None:
+        """A pure cut site evicted `evicted` weight bytes for its activations in this phase."""
+        if evicted > 0 and self._phase_names:
+            with self.lock:
+                key = self._phase_names
+                self._reserve[key] = max(self._reserve.get(key, 0), evicted)
 
     def capturing(self) -> bool:
         return bool(
@@ -1815,7 +1837,7 @@ class Memory:
             )
             block.preferred = model.prefix is None
             if block.preferred and not block.cached():
-                wanted = missing + self.window_bytes
+                wanted = missing + self.window_bytes + self._held_back()
                 free = self.room().free
                 if (
                     self.phase_supported
@@ -1898,13 +1920,14 @@ class Memory:
             wanted = missing + self.window_bytes
             before = int(torch.cuda.memory_reserved(self.device))
             unused = max(before - int(torch.cuda.memory_allocated(self.device)), 0)
-            if wanted > self.room().free and unused:
+            if wanted + self._held_back() > self.room().free and unused:
                 # The previous phase's inactive Torch segments are not weight capacity.
                 # Return them once here, not on each block or allocation callback.
                 torch.cuda.empty_cache()
             returned = max(before - int(torch.cuda.memory_reserved(self.device)), 0)
             # Protect the incoming cached bytes above; only other idle backing may go.
-            need = max(wanted - self.room().free, 0)
+            reserve = self._held_back()
+            need = max(wanted + reserve - self.room().free, 0)
             reclaimed = int(self.native.reclaim_unpreferred(need)) if need else 0
             if request is not None:
                 request.phase_changes.append(
@@ -1915,6 +1938,7 @@ class Memory:
                         "torch_unused_bytes": unused,
                         "torch_returned_bytes": returned,
                         "native_reclaimed_bytes": reclaimed,
+                        "activation_reserve_bytes": reserve,
                         # Cumulative snapshot; an older native wheel has no reason counters.
                         "native_reclaimed_by_reason": self.native.stats().get(
                             "reclaimed_by_reason"
@@ -2732,7 +2756,12 @@ class Request:
             ]
         for hold in holds:
             hold.shed()
-        return self.memory.reclaim(need, current=self.current)
+        native = self.memory.native
+        before = int(native.stats()["reclaimed_bytes"]) if native is not None else 0
+        released = self.memory.reclaim(need, current=self.current)
+        if native is not None:
+            self.memory.shortfall(int(native.stats()["reclaimed_bytes"]) - before)
+        return released
 
     @contextmanager
     def on_thread(self) -> Iterator[Request]:
