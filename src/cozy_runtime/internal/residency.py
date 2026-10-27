@@ -1349,7 +1349,7 @@ class Memory:
             t0 = time.perf_counter_ns()
             free, _ = torch.cuda.mem_get_info(self.device)
             t1 = time.perf_counter_ns()
-            _, reserved, _ = self._figures()
+            reserved = self._figures()[1] if self.budget_bytes is not None else 0
             t2 = time.perf_counter_ns()
             if timing is not None:
                 timing.tm["room_meminfo_ns"] = timing.tm.get("room_meminfo_ns", 0) + t1 - t0
