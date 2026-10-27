@@ -1819,7 +1819,7 @@ class Swap:
     pin: str = ""
     #: sites in scope that keep their prepared kernel, and why the pin could not run there
     fallbacks: tuple[execution_evidence.AttentionFallback, ...] = ()
-    #: Sol's dense reference for this request (`EXACT`), restored after it
+    #: Sol's dense reference for this request (`EXACT`, a walked pin), restored after it
     dense: tuple[Ready, Ready | None] | None = None
 
     def apply(self) -> Applied:
@@ -1904,8 +1904,10 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
             if exc.code in ("attention_kernel_unknown", "attention_kernel_needs_executor"):
                 raise
             why = str(exc)
-    if entry is not None and _walked(entry.candidate) and not attention_sol.dense_identity():
-        _bind_sol_dense(_sol_dense((), device, {}, {}))
+    # A pinned walked kernel's dense rows are its own walk's, SDPA, for this request only: never
+    # whichever reference an earlier selection in this executor bound (route by rule).
+    walked = entry is not None and _walked(entry.candidate)
+    dense = _sol_dense((), device, {}, {}) if walked else None
     sites: list[_Site] = []
     fallbacks: list[execution_evidence.AttentionFallback] = []
     for record in records:
@@ -1922,7 +1924,7 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
                 fallbacks.append(row)
             continue
         sites.append((component, path, module, processor, entry))
-    return Swap(tuple(sites), name, tuple(fallbacks))
+    return Swap(tuple(sites), name, tuple(fallbacks), dense)
 
 
 def exact(

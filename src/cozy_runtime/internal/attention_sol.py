@@ -831,6 +831,10 @@ def _execute(
 
     dense_path = on(layout.dense_paths)
     if on(layout.exact_paths) or outlier_keys(site.keys):
+        said = _SAID.get()
+        if said is not None and "exact:" + site.path not in said:
+            said["exact:" + site.path] = "exact"
+            _kernel_row({"source": "exact", "site": site.path})  # the receipt names each exact site
         if dense is _dense:
             dense = _exact
         elif exact is not None:
