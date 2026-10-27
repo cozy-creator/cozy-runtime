@@ -3087,7 +3087,8 @@ class Request:
         for i, (name, path, ev_in, ev_out, enter_ns, _, pre_ns, exit_ns) in enumerate(rows):
             m = by.setdefault(name.split("/")[-1], {"blocks": 0, "gpu_in_ms": 0.0, "gpu_gap_ms": 0.0,
                                                    "host_enter_ms": 0.0, "host_prefetch_ms": 0.0,
-                                                   "host_exit_ms": 0.0})
+                                                   "host_exit_ms": 0.0, "host_forward_ms": 0.0})
+            m["host_forward_ms"] += rows[i][5] / 1e6
             m["blocks"] += 1
             m["gpu_in_ms"] += ev_in.elapsed_time(ev_out)
             m["host_enter_ms"] += enter_ns / 1e6
@@ -3450,7 +3451,7 @@ def _hooks(model: Model) -> None:
                 event = torch.cuda.Event(enable_timing=True)
                 event.record()
                 request.prof_blocks.append(
-                    [model.name, b.path, event, None, t1 - t0, t1 - t0, t2 - t1, 0]
+                    [model.name, b.path, event, None, t1 - t0, time.perf_counter_ns(), t2 - t1, 0]
                 )
 
         def exited(b: _Block = block) -> None:
@@ -3462,6 +3463,7 @@ def _hooks(model: Model) -> None:
                         row = candidate
                         break
                 if row is not None:
+                    row[5] = time.perf_counter_ns() - row[5]  # the block's forward on the host
                     event = torch.cuda.Event(enable_timing=True)
                     event.record()
                     row[3] = event

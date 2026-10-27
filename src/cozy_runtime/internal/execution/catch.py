@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import functools
 import threading
+import time
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -171,7 +172,10 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
 
     def room() -> sizing.Room:
         nonlocal available
+        began = time.perf_counter_ns()
         available = request.room()
+        request.tm["cut_room_ns"] = request.tm.get("cut_room_ns", 0) + time.perf_counter_ns() - began
+        request.tm["cut_rooms"] = request.tm.get("cut_rooms", 0) + 1
         return available
 
     def whole(level: int) -> T:
@@ -211,6 +215,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
             raise failure from None
 
     try:
+        request.tm["cuts"] = request.tm.get("cuts", 0) + 1
         peek = request.room()  # PROOF-ONLY diagnostics
         chosen, tier = sizing.choose(finest, need, peek)
         if tier == "floor":
