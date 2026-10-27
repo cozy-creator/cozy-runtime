@@ -104,6 +104,21 @@ __global__ void begin_body(Control *state, int64_t *index) {
     atomicExch(&state->body_entered, 1u);
 }
 
+#ifdef COZY_REPEAT_DIAGNOSTICS
+__global__ void checked_begin(Control *state, int64_t *index,
+                              cudaGraphConditionalHandle condition) {
+    const auto error = reinterpret_cast<const int *>(state->input_error);
+    const unsigned invalid = error && *error != 0;
+    atomicExch(&state->input_invalid, invalid);
+    const bool accepted = !invalid && !atomicAdd(&state->cancel, 0u);
+    if (accepted) {
+        *index = 0;
+        atomicExch(&state->body_entered, 1u);
+    }
+    cudaGraphSetConditional(condition, accepted);
+}
+#endif
+
 __global__ void advance(Control *state, int64_t *index, unsigned steps,
                         cudaGraphConditionalHandle condition) {
     const unsigned completed = atomicAdd(&state->completed, 1u) + 1u;
@@ -284,6 +299,10 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device, run, "source"));
     if (!run->nodes) return -101;
 #ifdef COZY_REPEAT_DIAGNOSTICS
+    const char *flat_loop = std::getenv("COZY_REPEAT_DIAG_FLAT_LOOP");
+    const bool flat = flat_loop && flat_loop[0] == '1' && flat_loop[1] == '\0';
+    if (flat && (prefix || suffix))
+        return ineligible(run, "flat_loop", "phases_not_supported", -1, 0, 0, run->nodes);
     const char *source_only = std::getenv("COZY_REPEAT_DIAG_SOURCE_INSTANTIATE");
     if (source_only && source_only[0] == '1' && source_only[1] == '\0') {
         // Diagnostic only: never launch this executable. Instantiation may change driver
@@ -321,12 +340,30 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(set_input)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_input)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(begin_body)));
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    if (flat) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(checked_begin)));
+#endif
     if (prefix || suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_phase)));
     if (suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(finish_suffix)));
     CHECK(cudaMalloc(&run->control, sizeof(Control)));
     CHECK(cudaMalloc(&run->device_snapshot, sizeof(Snapshot)));
     CHECK(cudaMallocHost(&run->host_snapshot, sizeof(Snapshot)));
     CHECK(cudaGraphCreate(&run->graph, 0));
+    cudaGraph_t program;
+    cudaGraphNode_t predecessor;
+    cudaGraphConditionalHandle condition;
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    if (flat) {
+        program = run->graph;
+        CHECK(cudaGraphConditionalHandleCreate(&condition, run->graph, 0, cudaGraphCondAssignDefault));
+        void *args[] = {&run->control, &run->index, &condition};
+        cudaKernelNodeParams entry{};
+        entry.func = reinterpret_cast<void *>(checked_begin);
+        entry.gridDim = dim3(1); entry.blockDim = dim3(1); entry.kernelParams = args;
+        CHECK(cudaGraphAddKernelNode(&predecessor, program, nullptr, 0, &entry));
+        DIAGNOSTIC_CALL("condition", "flat_loop", 1);
+    } else {
+#endif
     cudaGraphConditionalHandle accepted;
     CHECK(cudaGraphConditionalHandleCreate(&accepted, run->graph, 0, cudaGraphCondAssignDefault));
     void *input_args[] = {&run->control, &accepted};
@@ -343,15 +380,16 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     cudaGraphNode_t accepted_node;
     CHECK(cudaGraphAddNode(&accepted_node, run->graph, &input_node, nullptr, 1, &input_if));
     DIAGNOSTIC_OUTPUTS("input_if", input_if.conditional.phGraph_out);
-    auto program = input_if.conditional.phGraph_out[0];
+    program = input_if.conditional.phGraph_out[0];
     void *begin_args[] = {&run->control, &run->index};
     cudaKernelNodeParams begin{};
     begin.func = reinterpret_cast<void *>(begin_body);
     begin.gridDim = dim3(1); begin.blockDim = dim3(1); begin.kernelParams = begin_args;
-    cudaGraphNode_t predecessor;
     CHECK(cudaGraphAddKernelNode(&predecessor, program, nullptr, 0, &begin));
-    cudaGraphConditionalHandle condition;
     CHECK(cudaGraphConditionalHandleCreate(&condition, run->graph, 1, cudaGraphCondAssignDefault));
+#ifdef COZY_REPEAT_DIAGNOSTICS
+    }
+#endif
     cudaGraphNodeParams conditional{};
     conditional.type = cudaGraphNodeTypeConditional;
     conditional.conditional.handle = condition;
