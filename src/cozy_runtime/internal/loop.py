@@ -383,7 +383,7 @@ def _record(
                     if mode == "resident":
                         parts, blocks = _record_resident(
                             recording, loop, rest, tensors, mutable, counter, models,
-                            pre if ends else None, post if ends else None, key is not None,
+                            pre if ends else None, post if ends else None, ends,
                         )
                     else:
                         parts, blocks = _record_streamed(
@@ -408,9 +408,10 @@ def _record(
                 (sequence for sequence, part in zip(made, parts, strict=True) if part[3] < 0),
                 None,
             )
+            stages = sum(end - begin for begin, end, _, start, _ in parts if start >= 0)
             row.update(
                 mode=mode,
-                stages=len(recording.stages),
+                stages=stages,
                 blocks=blocks,
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
                 after_native=mode == "resident" and ends and loop.after is not None,
@@ -423,7 +424,7 @@ def _record(
                 tensors,
                 counter,
                 ident,
-                len(recording.stages),
+                stages,
                 blocks,
             )
         _back(work, tensors)  # the eager rest runs on the caller's tensors
