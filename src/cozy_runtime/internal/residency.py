@@ -374,6 +374,9 @@ class Model:
         self.thread: int | None = None
         self.retiring = False
         self.retire_graphs: Callable[[], None] | None = None
+        #: its owner's call retiring graphs recorded against another fill or overlay (graphs sits
+        #: above residency, so residency asks its owner rather than importing it)
+        self.retire_stale: Callable[[], None] | None = None
         self.sites = _sites(module)
         self.handles: list[Any] = []
         self.holds: list[Hold] = []
@@ -1538,9 +1541,8 @@ class Memory:
             raise StaleBinding("an immutable binding layout changed; reconstruct the model")
         identity = model.wanted_identity()
         if identity != model.identity or identity is None:
-            from cozy_runtime import graphs
-
-            graphs.retire_stale(torch, model.module)
+            if model.retire_stale is not None:
+                model.retire_stale()
             if any(b.retained for b in model.groups()):
                 raise StaleBinding("retire old graph bindings before changing a weight fill")
             for hold in list(model.holds):
@@ -1584,10 +1586,8 @@ class Memory:
         the page, so the next fill writes the wanted overlay."""
         for hold in list(block.model.holds):
             hold.shed()
-        if block.retained and not self.capturing():
-            from cozy_runtime import graphs
-
-            graphs.retire_stale(torch, block.model.module)  # graphs of the other overlay go
+        if block.retained and not self.capturing() and block.model.retire_stale is not None:
+            block.model.retire_stale()  # graphs of the other overlay go
         if block.count or block.retained or block.loading or self.capturing():
             raise StaleBinding("a weight block in use cannot change its fill overlay")
         self._discard(block, forget=True)
