@@ -98,6 +98,40 @@ __global__ void snapshot(Control *state, Snapshot *out) {
     out->input_invalid = atomicAdd(&state->input_invalid, 0u);
 }
 
+// A body's memset and memcpy nodes, as kernels (`lower`). `word` repeats the memset value to four
+// bytes; `wide` moves 16 bytes a thread when every address, pitch and row is 16-aligned.
+__global__ void fill_rows(unsigned char *dst, size_t pitch, size_t row_bytes, size_t rows,
+                          unsigned word, bool wide) {
+    const size_t stride = size_t(gridDim.x) * blockDim.x;
+    size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (wide) {
+        const uint4 value = make_uint4(word, word, word, word);
+        const size_t units = row_bytes / 16, total = units * rows;
+        for (; i < total; i += stride)
+            reinterpret_cast<uint4 *>(dst + (i / units) * pitch)[i % units] = value;
+        return;
+    }
+    for (const size_t total = row_bytes * rows; i < total; i += stride) {
+        const size_t column = i % row_bytes;
+        dst[(i / row_bytes) * pitch + column] = static_cast<unsigned char>(word >> (8 * (column % 4)));
+    }
+}
+
+__global__ void copy_rows(unsigned char *dst, const unsigned char *src, size_t dst_pitch,
+                          size_t dst_slice, size_t src_pitch, size_t src_slice, size_t width,
+                          size_t height, size_t depth, bool wide) {
+    const size_t unit = wide ? 16 : 1, per_row = width / unit, total = per_row * height * depth;
+    const size_t stride = size_t(gridDim.x) * blockDim.x;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total; i += stride) {
+        const size_t row = i / per_row, column = (i % per_row) * unit;
+        const size_t y = row % height, z = row / height;
+        unsigned char *to = dst + z * dst_slice + y * dst_pitch + column;
+        const unsigned char *from = src + z * src_slice + y * src_pitch + column;
+        if (wide) *reinterpret_cast<uint4 *>(to) = *reinterpret_cast<const uint4 *>(from);
+        else *to = *from;
+    }
+}
+
 // Preserve only the first refusal, without pointers or another lifetime/ownership mechanism.
 static cudaError_t ineligible(Repeat *run, const char *stage, const char *reason,
                              int type, unsigned depth, size_t count, unsigned total,
@@ -168,6 +202,102 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
                    && type != cudaGraphNodeTypeMemcpy && type != cudaGraphNodeTypeMemset) {
             return ineligible(run, stage, "node_type", type, depth, count, total);
         }
+    }
+    return cudaSuccess;
+}
+
+// The driver runs a conditional body on the device. Replace each memset and memcpy node of an
+// embedded body copy with a `fill_rows`/`copy_rows` kernel node on the same edges, so a body
+// holds only kernel, empty and child-graph nodes. `inspect` already accepted every endpoint.
+static cudaError_t lower(cudaGraph_t graph, Repeat *run, const char *stage, unsigned depth = 0) {
+    if (depth > 32) return ineligible(run, stage, "depth_limit", -1, depth, 0, 0);
+    size_t count = 0;
+    auto error = cudaGraphGetNodes(graph, nullptr, &count);
+    if (error != cudaSuccess) return error;
+    std::vector<cudaGraphNode_t> nodes(count);
+    error = cudaGraphGetNodes(graph, nodes.data(), &count);
+    if (error != cudaSuccess) return error;
+    for (auto node : nodes) {
+        cudaGraphNodeType type;
+        if ((error = cudaGraphNodeGetType(node, &type)) != cudaSuccess) return error;
+        if (type == cudaGraphNodeTypeGraph) {
+            cudaGraph_t child;
+            if ((error = cudaGraphChildGraphNodeGetGraph(node, &child)) != cudaSuccess) return error;
+            if ((error = lower(child, run, stage, depth + 1)) != cudaSuccess) return error;
+            continue;
+        }
+        if (type != cudaGraphNodeTypeMemset && type != cudaGraphNodeTypeMemcpy) continue;
+        unsigned char *dst = nullptr;
+        const unsigned char *src = nullptr;
+        size_t dst_pitch = 0, dst_slice = 0, src_pitch = 0, src_slice = 0, width = 0, height = 0;
+        size_t depth_rows = 1, units = 0;
+        unsigned word = 0;
+        bool wide = false;
+        void *fill_args[] = {&dst, &dst_pitch, &width, &height, &word, &wide};
+        void *copy_args[] = {&dst, &src, &dst_pitch, &dst_slice, &src_pitch, &src_slice,
+                             &width, &height, &depth_rows, &wide};
+        cudaKernelNodeParams kernel{};
+        if (type == cudaGraphNodeTypeMemset) {
+            cudaMemsetParams set{};
+            if ((error = cudaGraphMemsetNodeGetParams(node, &set)) != cudaSuccess) return error;
+            if (set.elementSize != 1 && set.elementSize != 2 && set.elementSize != 4)
+                return ineligible(run, stage, "memset_element", type, depth, count, 0);
+            dst = static_cast<unsigned char *>(set.dst);
+            width = set.width * set.elementSize;
+            height = set.height;
+            dst_pitch = height > 1 ? set.pitch : width;
+            word = set.elementSize == 1 ? (set.value & 0xffu) * 0x01010101u
+                 : set.elementSize == 2 ? (set.value & 0xffffu) * 0x00010001u : set.value;
+            wide = ((reinterpret_cast<uintptr_t>(dst) | dst_pitch | width) & 15) == 0;
+            units = (wide ? width / 16 : width) * height;
+            kernel.func = reinterpret_cast<void *>(fill_rows);
+            kernel.kernelParams = fill_args;
+        } else {
+            cudaMemcpy3DParms copy{};
+            if ((error = cudaGraphMemcpyNodeGetParams(node, &copy)) != cudaSuccess) return error;
+            if (copy.srcArray || copy.dstArray || !copy.srcPtr.ptr || !copy.dstPtr.ptr)
+                return ineligible(run, stage, "memcpy_layout_or_kind", type, depth, count, 0,
+                                  copy.kind);
+            width = copy.extent.width;
+            height = copy.extent.height ? copy.extent.height : 1;
+            depth_rows = copy.extent.depth ? copy.extent.depth : 1;
+            src_pitch = height > 1 || depth_rows > 1 ? copy.srcPtr.pitch : width;
+            dst_pitch = height > 1 || depth_rows > 1 ? copy.dstPtr.pitch : width;
+            src_slice = src_pitch * copy.srcPtr.ysize;
+            dst_slice = dst_pitch * copy.dstPtr.ysize;
+            src = static_cast<const unsigned char *>(copy.srcPtr.ptr) + copy.srcPos.z * src_slice
+                + copy.srcPos.y * src_pitch + copy.srcPos.x;
+            dst = static_cast<unsigned char *>(copy.dstPtr.ptr) + copy.dstPos.z * dst_slice
+                + copy.dstPos.y * dst_pitch + copy.dstPos.x;
+            wide = ((reinterpret_cast<uintptr_t>(src) | reinterpret_cast<uintptr_t>(dst) | width
+                     | (height > 1 || depth_rows > 1 ? src_pitch | dst_pitch | src_slice | dst_slice : 0))
+                    & 15) == 0;
+            units = (wide ? width / 16 : width) * height * depth_rows;
+            kernel.func = reinterpret_cast<void *>(copy_rows);
+            kernel.kernelParams = copy_args;
+        }
+        const size_t blocks = (units + 255) / 256;
+        kernel.gridDim = dim3(static_cast<unsigned>(blocks < 1 ? 1 : blocks > 4096 ? 4096 : blocks));
+        kernel.blockDim = dim3(256);
+        size_t inputs = 0, outputs = 0;
+        if ((error = cudaGraphNodeGetDependencies(node, nullptr, nullptr, &inputs)) != cudaSuccess) return error;
+        if ((error = cudaGraphNodeGetDependentNodes(node, nullptr, nullptr, &outputs)) != cudaSuccess) return error;
+        std::vector<cudaGraphNode_t> before(inputs), after(outputs);
+        std::vector<cudaGraphEdgeData> before_data(inputs), after_data(outputs);
+        if ((error = cudaGraphNodeGetDependencies(node, before.data(), before_data.data(), &inputs)) != cudaSuccess
+            || (error = cudaGraphNodeGetDependentNodes(node, after.data(), after_data.data(), &outputs)) != cudaSuccess)
+            return error;
+        for (const auto *edges : {&before_data, &after_data})
+            for (const auto &edge : *edges)
+                if (edge.type != cudaGraphDependencyTypeDefault || edge.from_port || edge.to_port)
+                    return ineligible(run, stage, "lowered_edge", type, depth, count, 0);
+        cudaGraphNode_t replacement;
+        if ((error = cudaGraphAddKernelNode(&replacement, graph, before.data(), inputs, &kernel)) != cudaSuccess)
+            return error;
+        for (size_t i = 0; i < outputs; ++i)
+            if ((error = cudaGraphAddDependencies(graph, &replacement, &after[i], nullptr, 1)) != cudaSuccess)
+                return error;
+        if ((error = cudaGraphDestroyNode(node)) != cudaSuccess) return error;
     }
     return cudaSuccess;
 }
@@ -249,6 +379,8 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(set_input)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_input)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(begin_body)));
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(fill_rows)));
+    CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(copy_rows)));
     if (prefix || suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_phase)));
     if (suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(finish_suffix)));
     CHECK(cudaMalloc(&run->control, sizeof(Control)));
@@ -289,6 +421,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
         CHECK(cudaGraphAddChildGraphNode(&compute, program, &predecessor, 1, reinterpret_cast<cudaGraph_t>(prefix)));
         cudaGraph_t cloned;
         CHECK(cudaGraphChildGraphNodeGetGraph(compute, &cloned));
+        CHECK(lower(cloned, run, "assembled_prefix"));
         CHECK(inspect(cloned, run->validated_nodes, device, run, "assembled_prefix"));
         bool finishing = false;
         void *args[] = {&run->control, &run->steps, &condition, &finishing};
@@ -302,6 +435,9 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     auto body = conditional.conditional.phGraph_out[0];
     cudaGraphNode_t compute;
     CHECK(cudaGraphAddChildGraphNode(&compute, body, nullptr, 0, reinterpret_cast<cudaGraph_t>(source)));
+    cudaGraph_t embedded;
+    CHECK(cudaGraphChildGraphNodeGetGraph(compute, &embedded));
+    CHECK(lower(embedded, run, "assembled"));
     void *args[] = {&run->control, &run->index, &run->steps, &condition};
     cudaKernelNodeParams kernel{};
     kernel.func = reinterpret_cast<void *>(advance);
@@ -330,6 +466,9 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
         auto final = conditional.conditional.phGraph_out[0];
         cudaGraphNode_t compute, complete;
         CHECK(cudaGraphAddChildGraphNode(&compute, final, nullptr, 0, reinterpret_cast<cudaGraph_t>(suffix)));
+        cudaGraph_t embedded_suffix;
+        CHECK(cudaGraphChildGraphNodeGetGraph(compute, &embedded_suffix));
+        CHECK(lower(embedded_suffix, run, "assembled_suffix"));
         void *done_args[] = {&run->control};
         cudaKernelNodeParams done{};
         done.func = reinterpret_cast<void *>(finish_suffix);

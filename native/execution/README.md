@@ -110,7 +110,9 @@ preferences, shared-pool budgeting and real repeated streaming qualification.
 
 The complete source graph is walked recursively. Only kernel, empty, memcpy, memset and ordinary
 child graph nodes are accepted. Copy and memset nodes must address device memory on the selected
-device; host-ended copies are rejected because graph pools do not own CPU temporaries. CUDA
+device; host-ended copies are rejected because graph pools do not own CPU temporaries. In the
+embedded body copy each memset and memcpy node becomes a Runtime kernel node on the same edges,
+so a conditional body holds only kernel, empty and child graph nodes. CUDA
 instantiation enforces the conditional body's additional context constraints. Host callbacks, allocation/free, event, external
 semaphore and existing conditional nodes are refused. Device graph launch is not mixed into the
 conditional body. Known graph-layout ineligibility is a capability refusal; actual CUDA failures
