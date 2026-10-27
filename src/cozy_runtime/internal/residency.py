@@ -17,7 +17,7 @@ from collections import OrderedDict
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from itertools import pairwise
 from typing import Any, Protocol
@@ -1201,6 +1201,13 @@ class Memory:
 
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
+
+    def reusable(self) -> int:
+        """Torch's cached, unallocated bytes, which an eager activation reuses first."""
+        if not self.cuda or not torch.cuda.is_initialized():
+            return 0
+        reserved = int(torch.cuda.memory_reserved(self.device))
+        return max(reserved - int(torch.cuda.memory_allocated(self.device)), 0)
 
     def capturing(self) -> bool:
         return bool(
@@ -2762,7 +2769,12 @@ class Request:
 
     def room(self, step: int | None = None) -> Room:
         current = self.current if step is None or step >= len(self.steps) else self.steps[step]
-        return self.memory.room(current)
+        room = self.memory.room(current)
+        # A pure cut's activations come from Torch's cache before the driver's free bytes.
+        # Sized against driver free alone, every site cut to its floor once Torch held the
+        # card. A graph pool's cached bytes are counted too; a level they cannot serve takes
+        # the cut's existing refusal path (reclaim, retry, a finer level).
+        return replace(room, free=room.free + self.memory.reusable())
 
     def reclaim(self, need: int = 0) -> int:
         """A known pure cut may shed the step's speculative whole-model hold.
