@@ -10,8 +10,8 @@ import hashlib
 import threading
 import time
 import weakref
-from collections.abc import Callable, Mapping, Sequence
-from contextlib import ExitStack, nullcontext, suppress
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from typing import Any, Literal, NoReturn
 
@@ -1781,6 +1781,15 @@ class _SequenceCapture:
             self._domain = None
             self._finished = True
             return sequence
+
+    @contextmanager
+    def capturing(self) -> Iterator[None]:
+        """Stages are being recorded: residency cannot retire the recording meanwhile."""
+        self._capturing = True
+        try:
+            yield
+        finally:
+            self._capturing = False
 
     def _retire_if_idle(self) -> None:
         if self._capturing:

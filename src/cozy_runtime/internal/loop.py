@@ -286,7 +286,7 @@ class Loops:
             for attempt in attempts:
                 ctx.raise_if_cancelled()
                 try:
-                    with torch.cuda.stream(stream):
+                    with torch.cuda.stream(stream), recording.capturing():
                         mode, stages, blocks = attempt(
                             recording, step, rest, tensors, mutable, counter, phases, steps, models
                         )
@@ -384,7 +384,7 @@ def _eligible(
     if not scopes:
         return (), "outside a @uses_components scope"
     owner, _, components = scopes[-1]
-    placement: Any = owner._cozy_placement
+    placement: Any = owner._cozy_residency
     models = tuple(
         placement.models[name]
         for name in components
