@@ -39,6 +39,9 @@ class Room(Protocol):
     @property
     def floor(self) -> int: ...
 
+    @property
+    def cached(self) -> int: ...
+
 
 def pieces(units: int, level: int) -> int:
     """Units a piece holds at `level` (2^level pieces, the last one short)."""
@@ -61,15 +64,15 @@ _FLOOR_SHARE = 64
 
 
 def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
-    """The coarsest level of 0..`finest` that fits, and its tier: within free and cold bytes
-    ("cold": no weight of the step evicted), else within everything revocable less the streaming
-    floor ("warm"), else ("floor") the coarsest within 1/64 of the finest's bytes, where only the
-    physical floor refuses. The room counts driver-free bytes, so Torch's cached blocks make it
-    look short: a floor at the finest ran H3 15 s's norms and FFNs a token or three a piece, 2^21
-    pieces a site (RTX 3070, h3-8gb sessions 40463894354 and 40471655517)."""
+    """The coarsest level of 0..`finest` that fits, and its tier: within free, Torch-cached and
+    cold bytes ("cold": no weight of the step evicted), else within everything revocable less the
+    streaming floor ("warm"), else ("floor") the coarsest within 1/64 of the finest's bytes, where
+    only the physical floor refuses. Driver-free bytes alone made every site cut to its floor once
+    Torch held the card: H3 15 s's norms and FFNs a token or three a piece (RTX 3070, h3-8gb
+    sessions 40463894354 and 40471655517), SDXL at 6 GB an hour on a warm step 1."""
     for tier, room_bytes in (
-        ("cold", room.free + room.cold),
-        ("warm", room.free + room.cold + room.warm - room.floor),
+        ("cold", room.free + room.cached + room.cold),
+        ("warm", room.free + room.cached + room.cold + room.warm - room.floor),
     ):
         level = next(
             (n for n in range(finest + 1) if need(n, room.granularity) <= room_bytes), None
