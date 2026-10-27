@@ -1,0 +1,1 @@
+A refused native preparation no longer fails a later native program at its close. SDXL with 6 GB free completed all its native steps and then failed with `close resident repeat: CUDA error 2`: the refused attempt's out-of-memory error was left as the thread's last CUDA error in the execution module, and the close's launch check read it as its own.
