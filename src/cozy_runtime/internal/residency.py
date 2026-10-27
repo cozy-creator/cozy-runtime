@@ -88,8 +88,100 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+
+
+def diagnose(label: str, **extra: object) -> None:
+    """PROOF-ONLY: a memory snapshot on the current request (`stats()["diag"]`)."""
+    request = _REQUEST.get()
+    if request is None or len(request.diag) >= 160:
+        return
+    memory = request.memory
+    if not memory.cuda or not torch.cuda.is_initialized():
+        return
+    free, _ = torch.cuda.mem_get_info(memory.device)
+    row: dict[str, object] = {
+        "label": label,
+        "ms": round((time.perf_counter_ns() - request.diag_t0) / 1e6, 1),
+        "driver_free": int(free),
+        "torch_allocated": int(torch.cuda.memory_allocated(memory.device)),
+        "torch_reserved": int(torch.cuda.memory_reserved(memory.device)),
+        "capturing": memory.capturing(),
+        **extra,
+    }
+    if memory.native is not None:
+        row["native"] = {k: v for k, v in memory.native.stats().items() if isinstance(v, int)}
+    room = memory.room(request.current)
+    row["room"] = [room.free, room.cold, room.warm]
+    sets: dict[str, list[int]] = {}
+    for model in list(memory.models.values()):
+        groups = list(model.groups())
+        sets[model.name.split("/")[-1]] = [
+            sum(int(b.region.allocated_bytes) for b in groups if b.region is not None and b.region.resident),
+            sum(int(b.final_region.allocated_bytes) for b in groups if b.final_region is not None and b.final_region.resident),
+            sum(b.nbytes for b in groups if b.data is not None),
+            sum(1 for b in groups if b.count or b.retained or b.loading),
+            sum(1 for b in groups if b.preferred),
+        ]
+    row["sets"] = sets
+    if label == "request_start":
+        row["held"] = _census(memory)
+    request.diag.append(row)
+
+
+def _census(memory: Memory) -> dict[str, object]:
+    """PROOF-ONLY: what holds device memory as a request starts: blocks still in use or
+    loading, prefetch, Torch's live CUDA storages by owner kind, and the largest few."""
+    import gc
+
+    busy = [
+        f"{m.name.split('/')[-1]}/{b.path or '(common)'} count={b.count} retained={b.retained} loading={b.loading}"
+        for m in list(memory.models.values())
+        for b in m.groups()
+        if b.count or b.retained or b.loading
+    ]
+    known: dict[int, str] = {}
+    for m in list(memory.models.values()):
+        for b in m.groups():
+            for pointer in (b.native_storage, b.final_storage):
+                if pointer:
+                    known[pointer] = f"{m.name.split('/')[-1]}/{b.path}"
+    storages: dict[int, list[object]] = {}
+    for obj in gc.get_objects():
+        try:
+            if not isinstance(obj, torch.Tensor) or not obj.is_cuda:
+                continue
+            storage = obj.untyped_storage()
+            pointer, size = int(storage.data_ptr()), int(storage.nbytes())
+        except Exception:
+            continue
+        if pointer not in storages:
+            storages[pointer] = [size, tuple(obj.shape), str(obj.dtype), obj]
+    obj = None
+    mine = {id(v) for v in storages.values()}
+    total = sum(v[0] for v in storages.values())
+    weights = sum(v[0] for k, v in storages.items() if k in known)
+    top = sorted(storages.items(), key=lambda kv: -kv[1][0])[:10]
+    largest = []
+    for pointer, (size, shape, dtype, tensor) in top:
+        owners = sorted(
+            {type(r).__name__ for r in gc.get_referrers(tensor) if id(r) not in mine}
+        )[:6]
+        largest.append([size, list(shape), dtype, known.get(pointer, ""), owners])
+    storages.clear()
+    return {
+        "busy_blocks": busy[:20],
+        "busy_count": len(busy),
+        "prefetch_pending": memory._prefetch is not None,
+        "cuda_storages": len(mine),
+        "cuda_storage_bytes": total,
+        "weight_storage_bytes": weights,
+        "largest": largest,
+        "requests": len(memory.requests),
+    }
 # During authored stage preparation, undeclared model reads must not page in sibling blocks.
 _CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
+#: PROOF-ONLY: floor cuts counted while a prepared repeat runs its eager warm-up
+CAPTURE_WARMUP: ContextVar[list[int] | None] = ContextVar("cozy_diag_warmup", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -305,6 +397,7 @@ class _Block:
     overlay: Hashable = None
     #: native pages of other overlays, parked for reuse (`_switch_overlay`): (raw, final) regions
     parked: dict[Hashable, tuple[Any, Any]] = field(default_factory=dict)
+    prof_read_ns: int = 0  # PROOF-ONLY
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -801,6 +894,7 @@ class Binding:
                     raise StaleBinding("TensorFS lacks detached model-stage input ownership")
                 # Native now owns ready inputs, or ordinary resident capture revalidates.
                 ready_uses.clear()
+                diagnose("load_slot", needed=needed, slot=slot is not None)
                 if slot is None:
                     return None  # The caller must revalidate/reacquire its resident binding.
                 self._load_slot = slot
@@ -1977,6 +2071,7 @@ class Memory:
                         ),
                     }
                 )
+                diagnose("phase", models=sorted(n.split("/")[-1] for n in names))
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         model = block.model
@@ -2131,6 +2226,46 @@ class Memory:
                 pending.read.cancel()
 
     def _prefetch_block(
+        self, block: _Block, request: Request | None, *, queued: QueuedPrefetch | None = None
+    ) -> None:
+        """PROOF-ONLY: the outcome of each admission, by reason."""
+        if request is None or queued is not None:
+            return self._prefetch_admit(block, request, queued=queued)
+        reason = (
+            "unsupported" if not self.prefetch_supported
+            else "capturing" if self.capturing()
+            else "idle" if request.idle
+            else "fill" if block.model.fill is not None
+            else "no_aliases" if block.aliases is None
+            else "finals" if block.finals
+            else "no_storage" if not block.storage_bytes
+            else "busy" if self._prefetch is not None
+            else "loading" if block.loading
+            else "in_use" if block.count
+            else "retained" if block.retained
+            else "cached" if block.cached()
+            else ""
+        )
+        before = (request.prefetch_started, request.prefetch_skipped, request.prefetch_failed)
+        began = time.perf_counter_ns()
+        try:
+            self._prefetch_admit(block, request, queued=queued)
+        finally:
+            request.tm["admit_ns"] = request.tm.get("admit_ns", 0) + time.perf_counter_ns() - began
+            after = (request.prefetch_started, request.prefetch_skipped, request.prefetch_failed)
+            if not reason:
+                reason = (
+                    "started" if after[0] > before[0]
+                    else "oom" if after[1] > before[1]
+                    else "failed" if after[2] > before[2]
+                    else "other"
+                )
+            request.pf[reason] = request.pf.get(reason, 0) + 1
+            if reason not in ("started", "cached"):
+                row = request.pf_skip.setdefault(f"{block.model.name.split('/')[-1]}/{block.index}", {})
+                row[reason] = row.get(reason, 0) + 1
+
+    def _prefetch_admit(
         self, block: _Block, request: Request | None, *, queued: QueuedPrefetch | None = None
     ) -> None:
         """Admit one immutable raw read, without eviction or Python fill callbacks."""
@@ -2390,7 +2525,12 @@ class Memory:
                     block.generation += 1
                     return
             if self.native is not None and block.storage_bytes:
+                preparing = time.perf_counter_ns()
                 use = self._prepare_native(block, reclaim)
+                request = _REQUEST.get()
+                if request is not None:
+                    request.tm["prepare_ns"] = request.tm.get("prepare_ns", 0) + time.perf_counter_ns() - preparing
+                    request.tm["prepares"] = request.tm.get("prepares", 0) + 1
                 request = _REQUEST.get()
                 if use.needs_fill and request is not None and request.idle:
                     raise StaleBinding(
@@ -2453,7 +2593,14 @@ class Memory:
                     self._keep_baked(page, use.tensor, streams=not block.preferred)
                 block.overlay = overlay
             if use is not None:
+                committing = time.perf_counter_ns()
                 use.commit()
+                request = _REQUEST.get()
+                if request is not None:
+                    request.prof_commit_ns += time.perf_counter_ns() - committing
+                    request.prof_commits += 1
+                    request.prof_fills += int(read_bytes > 0)
+                    request.prof_demand_read_ns += read_ns
             ready = None
             if self.cuda:
                 ready = torch.cuda.Event()
@@ -2474,6 +2621,7 @@ class Memory:
             request = _REQUEST.get()
             if request is not None and read_bytes:
                 request.read(block, read_ns, read_bytes)
+            block.prof_read_ns += read_ns
             if request is not None and kept is not None:
                 request.read(block, kept_ns, kept.numel(), origin="baked")
             with self.lock:
@@ -2519,7 +2667,25 @@ class Memory:
             if not nested:
                 request = _REQUEST.get()
                 reclaim = reclaim and not (request is not None and request.idle)
+                had = block.data is not None
+                pending = self._prefetch is not None and self._prefetch.block is block
+                moved = request.moved if request is not None else 0
+                waited = request.prefetch_wait_ns if request is not None else 0
+                began = time.perf_counter_ns()
                 self._ensure(block, reclaim, overlay)
+                if request is not None and not capturing:
+                    kind = (
+                        1 if had else 4 if request.moved > moved else 3 if pending else 2
+                    )
+                    row = request.blog.setdefault(
+                        f"{model.name.split('/')[-1]}/{block.index}", [0.0] * 8
+                    )
+                    row[0] += 1
+                    row[kind] += 1
+                    row[5] += (time.perf_counter_ns() - began) / 1e6
+                    row[6] += (request.prefetch_wait_ns - waited) / 1e6
+                    row[7] += block.prof_read_ns / 1e6
+                    block.prof_read_ns = 0
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
@@ -2527,8 +2693,13 @@ class Memory:
             if block.ready is not None and not capturing:
                 self.stream().wait_event(block.ready)
             if not nested:
+                request = _REQUEST.get()
                 if block.assigned is None:
+                    assigning = time.perf_counter_ns()
                     assigned = _assign(block)
+                    if request is not None:
+                        request.tm["assign_ns"] = request.tm.get("assign_ns", 0) + time.perf_counter_ns() - assigning
+                        request.tm["assigns"] = request.tm.get("assigns", 0) + 1
                     ready = block.ready
                     if self.cuda:
                         ready = torch.cuda.Event()
@@ -2536,10 +2707,19 @@ class Memory:
                     # Binding/decoding and dtype conversion may enqueue more producer work
                     # than the fill alone. Publish their owners and completion together.
                     block.assigned, block.ready = assigned, ready
+                binding = time.perf_counter_ns()
                 for site, value in block.assigned:
                     block.saved.append((site, site.table[site.name]))
                     site.table[site.name] = value
+                if request is not None:
+                    request.tm["bind_ns"] = request.tm.get("bind_ns", 0) + time.perf_counter_ns() - binding
+                    request.tm["binds"] = request.tm.get("binds", 0) + 1
+                    request.tm["sites"] = request.tm.get("sites", 0) + len(block.assigned)
+            using = time.perf_counter_ns()
             self._used(block)
+            request = _REQUEST.get()
+            if request is not None:
+                request.tm["used_ns"] = request.tm.get("used_ns", 0) + time.perf_counter_ns() - using
         except BaseException:
             self._exit(block)
             raise
@@ -2697,10 +2877,14 @@ class Memory:
                         other.overlap = True
             self.requests.add(request)
         token = _REQUEST.set(request)
+        if not idle:
+            diagnose("request_start")
         try:
             yield request
         finally:
             try:
+                if not idle:
+                    diagnose("request_end")
                 with self.lock:
                     if self._prefetch is not None and self._prefetch.request is request:
                         # Cancel/drain unfinished speculation. An already completed read
@@ -2745,6 +2929,17 @@ class Request:
         self.final_fills = self.final_hits = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
+        #: PROOF-ONLY profile: (model, path, event_in, event_out, enter_ns, ensure_ns, prefetch_ns, exit_ns)
+        self.prof_blocks: list[list[Any]] = []
+        self.prof_commit_ns = self.prof_commits = self.prof_fills = self.prof_demand_read_ns = 0
+        self.diag: list[dict[str, object]] = []
+        #: PROOF-ONLY block log: "<set>/<index>" -> [entries, data, region, prefetched, demand,
+        #: ensure_ms, wait_ms, read_ms]; prefetch outcomes; host timers
+        self.blog: dict[str, list[float]] = {}
+        self.pf: dict[str, int] = {}
+        self.pf_skip: dict[str, dict[str, int]] = {}
+        self.tm: dict[str, float] = {}
+        self.diag_t0 = time.perf_counter_ns()
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
@@ -2863,6 +3058,41 @@ class Request:
         )
         self.sample()
 
+    def _profile(self) -> dict[str, Any]:
+        """PROOF-ONLY: GPU time inside each block's enqueue window and between blocks, and the
+        host time of the residency hooks, per model."""
+        rows = [r for r in self.prof_blocks if r[3] is not None]
+        if not rows:
+            return {}
+        torch.cuda.synchronize(self.memory.device)
+        by: dict[str, dict[str, float]] = {}
+        gaps: list[tuple[float, str]] = []
+        for i, (name, path, ev_in, ev_out, enter_ns, _, pre_ns, exit_ns) in enumerate(rows):
+            m = by.setdefault(name.split("/")[-1], {"blocks": 0, "gpu_in_ms": 0.0, "gpu_gap_ms": 0.0,
+                                                   "host_enter_ms": 0.0, "host_prefetch_ms": 0.0,
+                                                   "host_exit_ms": 0.0})
+            m["blocks"] += 1
+            m["gpu_in_ms"] += ev_in.elapsed_time(ev_out)
+            m["host_enter_ms"] += enter_ns / 1e6
+            m["host_prefetch_ms"] += pre_ns / 1e6
+            m["host_exit_ms"] += exit_ns / 1e6
+            if i + 1 < len(rows) and rows[i + 1][0] == name:
+                gap = ev_out.elapsed_time(rows[i + 1][2])
+                m["gpu_gap_ms"] += gap
+                gaps.append((gap, f"{path}->{rows[i + 1][1]}"))
+        gaps.sort(reverse=True)
+        first, last = rows[0][2], rows[-1][3]
+        return {
+            "scope": "PROOF-ONLY: events on the current stream at each block's entry and exit",
+            "span_ms": round(first.elapsed_time(last), 1),
+            "by_model": {k: {x: round(v, 1) for x, v in m.items()} for k, m in by.items()},
+            "commits": self.prof_commits,
+            "commit_ms": round(self.prof_commit_ns / 1e6, 1),
+            "demand_fills": self.prof_fills,
+            "demand_read_ms": round(self.prof_demand_read_ns / 1e6, 1),
+            "top_gaps": [[round(g, 2), w] for g, w in gaps[:12]],
+        }
+
     def stats(self) -> dict[str, Any]:
         if self.ended is not None:
             return self.ended
@@ -2926,6 +3156,15 @@ class Request:
                     "wait_ns": self.prefetch_wait_ns,
                     "scope": "one exact raw block; current demand precedes queued speculation",
                     "queued": list(self.queued_prefetch),
+                },
+                profile=self._profile(),
+                diag=list(self.diag),
+                blocklog={
+                    "scope": "PROOF-ONLY: per block entries by source, prefetch outcomes, host ms",
+                    "blocks": {k: [round(x, 1) for x in v] for k, v in self.blog.items()},
+                    "prefetch": dict(self.pf),
+                    "prefetch_skips": self.pf_skip,
+                    "host_ms": {k: round(v / 1e6, 1) if k.endswith("_ns") else v for k, v in self.tm.items()},
                 },
             )
         elif self.memory.device.type == "mps":
@@ -3176,8 +3415,10 @@ def _hooks(model: Model) -> None:
 
         def entered(*_: object, b: _Block = block) -> None:
             model._claim()
+            t0 = time.perf_counter_ns()
             try:
                 memory._enter(b)
+                t1 = time.perf_counter_ns()
                 try:
                     memory._prefetch_next(b)
                 except BaseException:
@@ -3186,12 +3427,34 @@ def _hooks(model: Model) -> None:
             except BaseException:
                 model._release()
                 raise
+            t2 = time.perf_counter_ns()
+            request = _REQUEST.get()
+            if request is not None and memory.cuda and not memory.capturing():
+                event = torch.cuda.Event(enable_timing=True)
+                event.record()
+                request.prof_blocks.append(
+                    [model.name, b.path, event, None, t1 - t0, t1 - t0, t2 - t1, 0]
+                )
 
         def exited(b: _Block = block) -> None:
+            request = _REQUEST.get()
+            row = None
+            if request is not None and memory.cuda and not memory.capturing():
+                for candidate in reversed(request.prof_blocks[-8:]):
+                    if candidate[1] == b.path and candidate[3] is None:
+                        row = candidate
+                        break
+                if row is not None:
+                    event = torch.cuda.Event(enable_timing=True)
+                    event.record()
+                    row[3] = event
+            t0 = time.perf_counter_ns()
             try:
                 memory._exit(b)
             finally:
                 model._release()
+                if row is not None:
+                    row[7] = time.perf_counter_ns() - t0
 
         model.handles.extend(_paired(sub, entered, exited))
 
