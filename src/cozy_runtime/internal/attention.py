@@ -238,13 +238,14 @@ KERNELS: tuple[Candidate, ...] = (
     ),
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, exact=False,
-        dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, gqa=False, scales=False,
-        artifact=_SAGE3, import_name=_SAGE3,
+        dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, causal=False, gqa=False,
+        scales=False, artifact=_SAGE3, import_name=_SAGE3,
     ),
     Candidate(
         "sageattention3-fp4-global-lowmem", "_cozy_sage3_fp4_global_lowmem",
         upstream.SAGE3_GLOBAL_LOWMEM, _MMA, _FP4, exact=False, dtypes=_HALF, max_head_dim=128,
-        head_dims=_D64_128, gqa=False, scales=False, artifact=_SAGE3, import_name=_SAGE3,
+        head_dims=_D64_128, causal=False, gqa=False, scales=False, artifact=_SAGE3,
+        import_name=_SAGE3,
     ),
     Candidate(
         "sageattention3-fp4-fixed-means", "_cozy_sage3_fp4_fixed_means",
