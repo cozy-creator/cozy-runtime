@@ -209,26 +209,38 @@ class Experts(nn.ModuleList):  # type: ignore[misc]
 def install(plan: Plan, model: nn.Module) -> str:
     """The grouped expert kernels for `model`'s `Experts`. Call from `Model.execution_plan`; it
     never waits for the compile (the kernels serve from the first request after it lands).
-    Returns the plan's identity, "" when nothing applies (no experts, a CPU, no Triton)."""
-    if _kernels.TRITON_ABSENT or torch.device(plan.device).type != "cuda":
-        return ""
+    Returns the plan's identity, "" when nothing applies (no experts, a CPU, no Triton). Either
+    way the outcome is in the run's receipts (`plan_reports`)."""
     if not any(isinstance(module, Experts) for module in model.modules()):
         return ""
+    if _kernels.TRITON_ABSENT:
+        return _report(plan, _kernels.TRITON_ABSENT)
+    if (device := torch.device(plan.device)).type != "cuda":
+        return _report(plan, f"its kernels serve CUDA, not {device}")
 
     def activate(launch: Launch) -> None:
         _LAUNCH[0] = launch
+        _report(plan)
 
     try:
         if plan.when_ready is None:
             activate(plan.load(KERNELS))
         elif not plan.when_ready(KERNELS, activate):
             say(KERNELS.name, f"[moe] {KERNELS.name} compiling: it serves from the next request")
+            _report(plan, "compiling: it serves from the next request")
     except KernelsUnavailable as exc:
         if exc.code == "kernels_corrupt":
             raise
         say(KERNELS.name, f"[moe] each expert runs its own Linears: {exc.code}: {exc}")
-        return ""
+        return _report(plan, f"{exc.code}: {exc}")
     return f"{KERNELS.name}:{KERNELS.identity}"
+
+
+def _report(plan: Plan, reason: str = "") -> str:
+    """The plan's outcome under its kernel set's name, as `fusion` reports it: applied, or why
+    each expert runs its own Linears. Returns the plan's identity when refused: ""."""
+    plan.report(KERNELS.name, {"applied": not reason, **({"reason": reason} if reason else {})})
+    return ""
 
 
 def _kind(linear: nn.Module) -> str | None:

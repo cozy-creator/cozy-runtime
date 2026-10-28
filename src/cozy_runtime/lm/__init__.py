@@ -174,6 +174,9 @@ def generate(
         say(
             type(model).__name__, f"[lm] {type(model).__name__} decodes through Transformers: {why}"
         )
+        row = ("decode ran through Transformers' loop", {"why": why})
+        if row not in WARNINGS:
+            WARNINGS.append(row)
         return _transformers(
             model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell
         )
@@ -279,9 +282,10 @@ def install(plan: Plan, model: Any) -> str:
     token then costs two launches where the reference path runs a few dozen ops. Call it from
     `Model.execution_plan`; it never waits for the compile (the kernels serve from the first
     request after it lands). A layer of another geometry, or a CPU, keeps Transformers' path.
-    Returns the plan's identity, "" when nothing applies."""
-    if ABSENT or _kernels.TRITON_ABSENT or torch.device(plan.device).type != "cuda":
-        return ""
+    Returns the plan's identity, "" when nothing applies. Either way the outcome is in the run's
+    receipts (`plan_reports`)."""
+    if ABSENT:
+        return _report(plan, ABSENT)
     spaces = {sys.modules.get(type(module).__module__) for module in model.modules()}
     slots = [
         (space, name)
@@ -292,6 +296,10 @@ def install(plan: Plan, model: Any) -> str:
     ]
     if not slots:
         return ""
+    if _kernels.TRITON_ABSENT:
+        return _report(plan, _kernels.TRITON_ABSENT)
+    if (device := torch.device(plan.device)).type != "cuda":
+        return _report(plan, f"its kernels serve CUDA, not {device}")
 
     def activate(launch: Launch) -> None:
         for space, name in slots:
@@ -301,6 +309,7 @@ def install(plan: Plan, model: Any) -> str:
         _STEPS[0] = launch
         for engine in list(_ENGINES.values()):  # their graphs recorded Transformers' path
             engine.stale = True
+        _report(plan)
 
     try:
         if plan.when_ready is None:
@@ -310,12 +319,20 @@ def install(plan: Plan, model: Any) -> str:
                 KERNELS.name,
                 f"[lm] {KERNELS.name} compiling: its kernels serve from the next request",
             )
+            _report(plan, "compiling: its kernels serve from the next request")
     except KernelsUnavailable as exc:
         if exc.code == "kernels_corrupt":
             raise
         say(KERNELS.name, f"[lm] Transformers' gated-delta-net path: {exc.code}: {exc}")
-        return ""
+        return _report(plan, f"{exc.code}: {exc}")
     return f"{KERNELS.name}:{KERNELS.identity}"
+
+
+def _report(plan: Plan, reason: str = "") -> str:
+    """The plan's outcome under its kernel set's name, as `fusion` reports it: applied, or why
+    Transformers' path serves. Returns the plan's identity when refused: ""."""
+    plan.report(KERNELS.name, {"applied": not reason, **({"reason": reason} if reason else {})})
+    return ""
 
 
 def _conv_slot(original: Any, launch: Launch) -> Any:
