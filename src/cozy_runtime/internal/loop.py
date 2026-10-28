@@ -11,12 +11,12 @@ A keyed call whose blocks all stay resident records the whole call (`before`, th
 `after`) and keeps it for its call site: later calls run it natively from start to end, until a
 new key replaces it or residency retires it under pressure. A whole call is recorded only after
 an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
-blocks; one that does not fit is not tried again for that layout, and the steps alone are
-recorded. A program that no call keeps is not recorded: the call runs eagerly. Resident, it
-costs no more per step than native execution saves (SDXL, Qwen-Image measured). Streamed (its
-blocks do not all stay on the device), its replay pays for neither its recording nor the extra
-reads the next request makes (Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s, native
-49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
+blocks; one that does not fit is not tried again for that layout, and that call's rest runs
+eagerly with its weights in place. A program that no call keeps is not recorded: the call runs
+eagerly. Resident, it costs no more per step than native execution saves (SDXL, Qwen-Image
+measured). Streamed (its blocks do not all stay on the device), its replay pays for neither its
+recording nor the extra reads the next request makes (Qwen-Image int8 1 MP on an RTX 3070: eager
+45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
 
 A loop outside any component scope (tensor work only) records resident every call and is never
 kept.
@@ -464,8 +464,9 @@ def _record(
         rest = steps[1:]
         began = time.perf_counter()
         row["resident_after_first_step"] = resident
-        attempts = [("resident", True)] if ends else []
-        attempts += [("resident", False)] if resident else []
+        # One attempt: a kept whole call, or a componentless loop's steps. A refused whole call
+        # records no steps-only program, which no call would keep: the rest runs eagerly.
+        attempts = [("resident", ends)]
         for mode, whole in attempts:
             ctx.raise_if_cancelled()
             why = None
