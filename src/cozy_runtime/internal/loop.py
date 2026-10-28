@@ -12,7 +12,9 @@ A keyed call whose blocks all stay resident records the whole call (`before`, th
 new key replaces it or residency retires it under pressure. A whole call is recorded only after
 an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
 blocks; one that does not fit is not tried again for that layout, and the steps alone are
-recorded. Any other program closes before the loop returns, ahead of an eager `after`.
+recorded. Any other program closes before the loop returns, ahead of an eager `after`. Such a
+program is recorded only while its native steps save more than recording costs, as the site's
+last recorded call measured: a second eager step measures each call's eager speed.
 
 A loop outside any component scope (tensor work only) records resident too, and is never kept.
 """
@@ -27,6 +29,7 @@ import time
 import weakref
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -94,6 +97,27 @@ def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], pha
 
 
 _NONE = object()
+#: The recording call's phases, for the run record (`parts_ms`): [{phase: ms}, last lap's clock].
+_LAPS: ContextVar[list[Any] | None] = ContextVar("cozy_loop_laps", default=None)
+
+
+@contextmanager
+def _laps(row: dict[str, Any]) -> Iterator[None]:
+    """Time a recording call's phases into its row (`parts_ms`)."""
+    token = _LAPS.set([row.setdefault("parts_ms", {}), time.perf_counter()])
+    try:
+        yield
+    finally:
+        _LAPS.reset(token)
+
+
+def _lap(name: str) -> None:
+    """Close the current phase of a recording call as `name` (milliseconds since the last lap)."""
+    laps = _LAPS.get()
+    if laps is not None:
+        now = time.perf_counter()
+        laps[0][name] = round(laps[0].get(name, 0.0) + (now - laps[1]) * 1000, 1)
+        laps[1] = now
 
 
 def _now() -> float:
@@ -139,6 +163,8 @@ class _Program:
     lock: threading.Lock = field(default_factory=threading.Lock)
     #: a kept program's cache handle: residency releases it under pressure while it is idle
     region: Any = None
+    #: a program no call keeps: its call's eager-step events, recording ms and layout (`_Site`)
+    timing: tuple[Any, Any, float, Hashable] | None = None
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
         rest = () if self.again is None else (self.again,)
@@ -157,11 +183,13 @@ class _Program:
 
 @dataclass
 class _Site:
-    """What a call site's keyed calls learned, per layout: the blocks an eager `after` ran,
-    and the whole calls that did not fit."""
+    """What a call site learned, per layout: the blocks an eager `after` ran and the whole
+    calls that did not fit (keyed calls), and for a program no call keeps, one eager step, one
+    native step and the recording, in milliseconds, from the last recorded call."""
 
     after: dict[Hashable, dict[Model, tuple[str, ...]]] = field(default_factory=dict)
     unfit: set[Hashable] = field(default_factory=set)
+    costs: dict[Hashable, tuple[float, float, float]] = field(default_factory=dict)
 
 
 class Loops:
@@ -232,7 +260,8 @@ class Loops:
             assert ctx is not None
             site = (step.__code__, tuple(id(model) for model in scope))
             # What a call site learns (`_Site`) depends on a keyed call's layout, not its key.
-            shape = None if key is None else (_layouts(tensors), len(steps), phases)
+            layout = (_layouts(tensors), len(steps), phases)
+            shape = None if key is None else layout
             ident = None if key is None else (key, shape)
             with self._lock:
                 known = self._sites.setdefault(site, _Site())
@@ -255,11 +284,21 @@ class Loops:
                 _close_idle(kept)
             program = None
             try:
-                program = _record(loop, tensors, work, scope, key, ctx, row, ident, shape, known)
+                with _laps(row):
+                    program = _record(
+                        loop, tensors, work, scope, key, ctx, row, ident, shape, layout, known
+                    )
                 if program is None:
                     return
+                began = time.perf_counter()
                 for sequence, first, count in program.first:
                     _submit(program, sequence, range(first, first + count), loop, ctx, row)
+                if program.timing is not None:
+                    start, end, record_ms, at = program.timing
+                    end.synchronize()
+                    native = sum(count for _, _, count in program.first)
+                    elapsed = (time.perf_counter() - began) * 1000 / native
+                    known.costs[at] = (start.elapsed_time(end), elapsed, record_ms)
             except BaseException:
                 if program is not None:
                     program.close()
@@ -367,22 +406,25 @@ def _record(
     row: dict[str, Any],
     ident: Hashable,
     shape: Hashable,
+    layout: Hashable,
     known: _Site,
 ) -> _Program | None:
     """`before` and the first step eagerly, then the rest recorded; None when every mode
-    refused, after the loop ran eagerly to its end."""
-    steps = loop.steps
+    refused or recording would not pay, after the loop ran eagerly to its end."""
     if key is not None:  # the program owns copies; this call's values go in and out
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+    steps = loop.steps
     # The caller's stream: residency records its consumers on the current stream, and the
     # recording's own streams end with the program.
     with _entering() as seen:
         _once(loop.before, tensors)
+    _lap("before")
     pre = _used(seen, scope)
     with _entering() as seen:
         loop.eager(steps[:1], tensors, ctx)
+    _lap("first_step")
     body = _used(seen, scope) or {model: ("",) for model in scope}
     models = tuple(body)
     resident = all(not _unresident(model, paths) for model, paths in body.items())
@@ -406,6 +448,26 @@ def _record(
         if outside:
             row["whole_call"] = f"before/after not resident: {outside}"
         ends = not outside
+    # A resident program no call keeps serves this call alone. A second eager step measures
+    # eager speed; the site's last recorded call measured native speed and the recording.
+    done, events = 1, None
+    if resident and not ends and len(steps) > 2:
+        events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
+        events[0].record()
+        loop.eager(steps[1:2], tensors, ctx)
+        events[1].record()
+        done = 2
+        if (learned := known.costs.get(layout)) is not None:
+            eager_ms, native_ms, record_ms = learned
+            saving = (eager_ms - native_ms) * (len(steps) - done)
+            if saving <= record_ms:
+                row["eager"] = f"recording {record_ms:.0f} ms, saving {saving:.0f} ms"
+                _back(work, tensors)  # the eager rest runs on the caller's tensors
+                tensors = work + tensors[len(work) :]
+                loop.eager(steps[done:], tensors, ctx)
+                _after(loop, tensors, scope, known, shape)
+                return None
+    recorded = time.perf_counter()
     recording = PreparedSequence.record()
     recording.__enter__()
     try:
@@ -416,11 +478,12 @@ def _record(
                 raise
             row["refusals"].append(f"recording: {why}")
             _back(work, tensors)
-            loop.eager(steps[1:], work + tensors[len(work) :], ctx)
+            loop.eager(steps[done:], work + tensors[len(work) :], ctx)
             _after(loop, work + tensors[len(work) :], scope, known, shape)
             return None
         torch.cuda.empty_cache()
-        rest = steps[1:]
+        _lap("prepare")
+        rest = steps[done:]
         began = time.perf_counter()
         row["resident_after_first_step"] = resident
         attempts = [("resident", True)] if ends else []
@@ -451,6 +514,7 @@ def _record(
                 made = recording.finish_parts(
                     outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
                 )
+                _lap("finish")
             except BaseException as error:
                 if (why := _refusal(error)) is None:
                     raise
@@ -481,16 +545,11 @@ def _record(
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
                 after_native=whole,
             )
+            timing = None
+            if events is not None and mode == "resident":
+                timing = (*events, (time.perf_counter() - recorded) * 1000, layout)
             return _Program(
-                first,
-                again,
-                whole,
-                mode,
-                tensors,
-                counter,
-                ident,
-                stages,
-                blocks,
+                first, again, whole, mode, tensors, counter, ident, stages, blocks, timing=timing
             )
         _back(work, tensors)  # the eager rest runs on the caller's tensors
         tensors = work + tensors[len(work) :]
@@ -755,6 +814,7 @@ def _record_resident(
                         code="prepared_graph_ineligible",
                     )
                 preparing.enter_context(binding.prepare())
+            _lap("bind")
             owners = tuple(bindings)
             landed = LANDED[0]
             graphs_: list[tuple[_Graph, int, int]] = []
@@ -775,6 +835,7 @@ def _record_resident(
                 if again and loop.before is not None and pre is not None:
                     prefix = _Graph(recording, state, 1, owners)
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
+            _lap("record")
             parts: list[_Part] = []
             for number, (graph, first, count) in enumerate(graphs_):
                 last = number == len(graphs_) - 1
@@ -789,6 +850,7 @@ def _record_resident(
             for done in (*(g for g, _, _ in graphs_), prefix, suffix):
                 if done is not None:
                     done.done()
+            _lap("plan")
     except BaseException:
         for binding in bindings:
             binding.close()

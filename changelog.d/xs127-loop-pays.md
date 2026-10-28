@@ -1,0 +1,1 @@
+`author.denoise_loop`: a resident program no call keeps is recorded only while its native steps save more than recording costs (a second eager step measures eager speed; the last recorded call measured native speed and the recording). Recording phases are in `execution.loops[].parts_ms`.
