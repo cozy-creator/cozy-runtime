@@ -1,8 +1,8 @@
 """`denoise_loop`: a package declares its loop; the Runtime decides how it runs.
 
-The Runtime runs it eagerly, as one resident captured program, or as streamed block stages, by
-the device's memory and capabilities. It owns capture, scratch pools, fallback, cancellation and
-the program's lifetime; the package writes one step function that every mode runs.
+The Runtime runs it eagerly or as one resident captured program, by the device's memory and
+capabilities. It owns capture, scratch pools, fallback, cancellation and the program's
+lifetime; the package writes one step function that every mode runs.
 """
 
 from __future__ import annotations

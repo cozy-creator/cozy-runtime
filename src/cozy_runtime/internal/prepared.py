@@ -746,6 +746,11 @@ class PreparedSequence:
                 self._closed = True
             finally:
                 self._closing = False
+            # The last execution refers back to this sequence: dropped here, its load
+            # observations and phase controllers go when its request settles, not at a GC.
+            self._active = self._native = None
+            for stage in self.stages:
+                stage._active = None
             if error is not None:
                 _native_error(error)
 

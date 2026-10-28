@@ -1,20 +1,22 @@
-"""`author.denoise_loop` in the Runtime: eager, one resident captured program, or streamed stages.
+"""`author.denoise_loop` in the Runtime: eager, or one resident captured program.
 
 `before` and the first step always run eagerly, for real: they warm kernels and bring the weights
 in through ordinary residency, on the caller's stream (only recorded regions run on the
-recording's streams, which end with the program). Then the loop runs resident when every block of
-its step's components is still on the device, else as streamed stages cut at the residency's own
-block boundaries, else eagerly. A refusal before submission drops that attempt and the next mode
-continues from the next step; nothing runs twice. After submission nothing falls back.
+recording's streams, which end with the program). Then the loop runs resident when a call keeps
+the program and every block of its step's components is still on the device, else eagerly. A
+refusal before submission drops that attempt and the next mode continues from the next step;
+nothing runs twice. After submission nothing falls back.
 
 A keyed call whose blocks all stay resident records the whole call (`before`, the steps and
 `after`) and keeps it for its call site: later calls run it natively from start to end, until a
 new key replaces it or residency retires it under pressure. A whole call is recorded only after
 an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
 blocks; one that does not fit is not tried again for that layout, and the steps alone are
-recorded. A resident program that no call keeps is not recorded: the call runs eagerly, which
-costs no more per step than native execution saves (SDXL, Qwen-Image measured). A streamed loop
-is recorded for every call: its native stages load each block while the last one runs.
+recorded. A program that no call keeps is not recorded: the call runs eagerly. Resident, it
+costs no more per step than native execution saves (SDXL, Qwen-Image measured). Streamed (its
+blocks do not all stay on the device), its replay pays for neither its recording nor the extra
+reads the next request makes (Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s, native
+49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
 
 A loop outside any component scope (tensor work only) records resident every call and is never
 kept.
@@ -436,9 +438,9 @@ def _record(
         if outside:
             row["whole_call"] = f"before/after not resident: {outside}"
         ends = not outside
-    if resident and not ends and scope:
+    if not ends and scope:
         # No call keeps this program: recording it would cost more than its steps save.
-        row["eager"] = "resident, and no call keeps the program"
+        row["eager"] = f"{'resident' if resident else 'streamed'}, and no call keeps the program"
         _back(work, tensors)  # the eager rest runs on the caller's tensors
         tensors = work + tensors[len(work) :]
         loop.eager(steps[1:], tensors, ctx)
@@ -464,7 +466,6 @@ def _record(
         row["resident_after_first_step"] = resident
         attempts = [("resident", True)] if ends else []
         attempts += [("resident", False)] if resident else []
-        attempts += [("streamed", False)] if scope else []
         for mode, whole in attempts:
             ctx.raise_if_cancelled()
             why = None
