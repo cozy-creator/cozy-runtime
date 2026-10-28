@@ -202,7 +202,6 @@ NB_MODULE(_gemm, m) {
           "w_scale"_a, "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a, "config"_a, "stream"_a);
     m.def("w4a8_unpack", &w4a8_unpack, "device"_a, "w"_a, "s"_a, "codebook"_a, "out"_a, "N"_a,
           "K"_a, "stream"_a);
-    m.attr("SVDQ_ROWS") = cozy_svdq::kRows;
     m.def("svdq_quantize", &svdq_quantize, "device"_a, "x"_a, "x_half"_a, "p"_a, "g"_a, "down"_a,
           "act"_a, "ascales"_a, "la"_a, "M"_a, "K"_a, "R"_a, "stream"_a);
     m.def("svdq_gemm", &svdq_gemm, "device"_a, "act"_a, "ascales"_a, "w"_a, "wscales"_a, "gx"_a,

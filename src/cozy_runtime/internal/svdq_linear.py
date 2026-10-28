@@ -29,7 +29,7 @@ import math
 from collections.abc import Callable, Mapping
 from functools import partial
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from cozy_runtime import _kernels
 from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
@@ -322,8 +322,11 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
         q, sx, low, g = _quantized(torch, launch, x, roles)
         return (q, sx, low, g), q, sx, low
 
-    def multiplied(made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object):
-        return _multiplied(torch, launch, *made, roles, bias, half)  # type: ignore[misc]
+    def multiplied(
+        made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object
+    ) -> Tensor:
+        q, sx, low, g = cast("tuple[Tensor, Tensor, Tensor, Tensor]", made)
+        return _multiplied(torch, launch, q, sx, low, g, roles, bias, half)
 
     return checked(torch, device, quantized, multiplied, (200, 144, 256))
 
@@ -338,10 +341,13 @@ def probe_native(torch: ModuleType, device: Device, module: object) -> verify.Ve
         rows = made[4]
         return made, q[:rows], sx[:rows].view(torch.float8_e4m3fn), made[2][:rows]
 
-    def multiplied(made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object):
+    def multiplied(
+        made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object
+    ) -> Tensor:
         weight, scale = tiles(torch, roles["weight"], roles["scale"])
         tiled = {**roles, "weight": weight, "scale": scale}
-        return _native_multiplied(torch, made, tiled, bias, half)  # type: ignore[arg-type]
+        operands = cast("tuple[Tensor, Tensor, Tensor, Tensor, int]", made)
+        return _native_multiplied(torch, operands, tiled, bias, half)
 
     return checked(torch, device, quantized, multiplied, (300, 256, 320))
 
@@ -648,9 +654,7 @@ def linear(
         if half and native(torch, index):
             try:
                 made = _native_quantized(torch, x, roles)
-                return _native_multiplied(torch, made, roles, bias, x.dtype).view(
-                    *x.shape[:-1], -1
-                )
+                return _native_multiplied(torch, made, roles, bias, x.dtype).view(*x.shape[:-1], -1)
             except Exception as exc:  # Triton or the law serves this call, and the run says so
                 int8_linear.failed(NATIVE, index, exc)
         roles = untiled(torch, roles)
