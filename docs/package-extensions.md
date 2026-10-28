@@ -57,6 +57,8 @@ the module's call reaches `produce(call, *args)`; `ProducerCall` carries the lay
 base's kernel module, the request's `state()`, the Ulysses group and `exchange`, the leaf
 quantizer, `original` and `served`. `AttentionProducer.request_state()` reaches the same state
 from a package hook. A package name takes precedence over a Runtime one it repeats.
+`producer_sites(root)` lists the modules under a root a producer serves now (`ProducerSite`: module,
+component, path, producer): a `denoise_loop` step that carries a producer's per-site state declares it from them.
 
 MiniMax-H3 (`minimax_h3/glue.py`, `minimax_h3/producer.py`) and Anima (`anima/optimization.py`)
 are the reference users.

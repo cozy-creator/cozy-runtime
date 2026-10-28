@@ -74,6 +74,29 @@ class AttentionProducer:
         return store[self.name]
 
 
+@dataclass(frozen=True, slots=True)
+class ProducerSite:
+    """An attention module whose calls the Runtime routes to a producer."""
+
+    module: Any
+    component: str
+    path: str
+    producer: AttentionProducer
+
+
+def producer_sites(root: Any) -> tuple[ProducerSite, ...]:
+    """The attention modules under `root` a producer serves now (their site's backend is the
+    producer's), in module order. A package that carries a producer's per-site state across a
+    `denoise_loop` declares it from these before the loop."""
+    sites = []
+    for module in root.modules():
+        processor = getattr(module, "processor", None)
+        producer = getattr(processor, "serving", None)
+        if isinstance(producer, AttentionProducer):
+            sites.append(ProducerSite(module, processor.component, processor.path, producer))
+    return tuple(sites)
+
+
 #: Producers this process's packages registered, by name.
 _PRODUCERS: dict[str, AttentionProducer] = {}
 

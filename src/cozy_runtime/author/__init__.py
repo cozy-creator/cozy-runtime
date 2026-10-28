@@ -33,6 +33,8 @@ from cozy_runtime.author._assets import (
 from cozy_runtime.author._attention import (
     AttentionProducer,
     ProducerCall,
+    ProducerSite,
+    producer_sites,
     register_attention,
 )
 from cozy_runtime.author._attention_scope import (
@@ -285,6 +287,7 @@ __all__ = [
     "PreflightViolation",
     "PreparedRequest",
     "ProducerCall",
+    "ProducerSite",
     "QuantizationPlan",
     "Recipe",
     "ReferenceImages",
@@ -339,6 +342,7 @@ __all__ = [
     "plain_forward",
     "prefetch",
     "prepare",
+    "producer_sites",
     "publish_release",
     "register_adapter",
     "register_attention",
