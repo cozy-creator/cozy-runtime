@@ -1132,7 +1132,16 @@ class _ComponentScope:
     A REMOTE scope, whose every declared component the runtime keeps on another GPU of the
     group (`Placement.remote`), uses nothing on this device."""
 
-    __slots__ = ("_call", "_components", "_local", "_method", "_model", "_remote", "_using")
+    __slots__ = (
+        "_caches",
+        "_call",
+        "_components",
+        "_local",
+        "_method",
+        "_model",
+        "_remote",
+        "_using",
+    )
 
     def __init__(self, model: Model[Any], method: str, components: tuple[str, ...]) -> None:
         self._model = model
@@ -1142,6 +1151,7 @@ class _ComponentScope:
         self._local: contextvars.Token[Any] | None = None
         self._call: Context | None = None
         self._using: AbstractContextManager[None] | None = None
+        self._caches: list[DerivedCache] = []
 
     def __enter__(self) -> None:
         model = self._model
@@ -1192,6 +1202,7 @@ class _ComponentScope:
                 self._using = using
                 for cache in model._cozy_caches:
                     cache.enter()
+                    self._caches.append(cache)
         except BaseException:
             self.__exit__(*sys.exc_info())
             raise
@@ -1207,16 +1218,22 @@ class _ComponentScope:
             if placement is not None:
                 placement.leave(self._components)
             return
-        if self._using is not None:
-            using, self._using = self._using, None
-            for cache in model._cozy_caches:
-                cache.leave()
-            using.__exit__(*sys.exc_info())  # a raise in the scope ends its passes as failed
-        if self._local is not None:
-            _LOCAL_SCOPES.reset(self._local)
-            self._local = None
-        if self._call is not None:
-            SCOPES.leave()
+        # Only what this scope took, innermost first; each release runs even when one before it
+        # raises, so a failed release never keeps the call's turn.
+        failed = sys.exc_info()  # a raise in the scope ends its passes as failed
+        caches, self._caches = self._caches, []
+        using, self._using = self._using, None
+        local, self._local = self._local, None
+        call, self._call = self._call, None
+        with ExitStack() as releases:
+            if call is not None:
+                releases.callback(SCOPES.leave)
+            if local is not None:
+                releases.callback(_LOCAL_SCOPES.reset, local)
+            if using is not None:
+                releases.callback(using.__exit__, *failed)
+            for cache in caches:
+                releases.callback(cache.leave)
 
 
 # --------------------------------------------------------------------------- identity
