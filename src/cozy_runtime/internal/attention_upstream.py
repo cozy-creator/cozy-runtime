@@ -519,7 +519,9 @@ def sage3_fp4_fixed_means(
     """Opt-in fixed means/centering, preserving Sage3's BF16 matmul correction."""
     _options("sageattention3-fp4-fixed-means", dropout_p, scale)
     _cuda_inputs(query, key, value, enable_gqa)
-    result = import_module("cozy_runtime.internal.attention_sage3_fixed").forward(query, key, value)
+    from cozy_runtime.internal import attention_sage3_fixed
+
+    result = attention_sage3_fixed.forward(query, key, value)
     return _output(result, query)
 
 

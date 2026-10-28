@@ -12,7 +12,6 @@ once. torch's own deadlines (`NEVER`) never end a group.
 from __future__ import annotations
 
 import contextlib
-import importlib
 import os
 import queue
 import signal
@@ -245,7 +244,8 @@ def abort_process_group() -> None:
     """Abort this process's communicator, so a collective in flight raises instead of waiting
     on a GPU that left it. Best effort (NCCL; a gloo group is only dropped)."""
     try:
-        c10d = importlib.import_module("torch.distributed.distributed_c10d")
+        import torch.distributed.distributed_c10d as c10d
+
         abort = getattr(c10d, "_abort_process_group", None)
         if abort is not None:
             abort()
@@ -695,7 +695,9 @@ class RankGroup:
                 follower.abort.close()
         if pg is not None:
             with contextlib.suppress(Exception):
-                importlib.import_module("torch.distributed").destroy_process_group()
+                import torch.distributed
+
+                torch.distributed.destroy_process_group()
         self.store = None
         self.formed = False
 

@@ -43,28 +43,28 @@ from cozy_runtime.derive.microscale import encode_int8_convrot256, encode_nvfp4,
 from cozy_runtime.internal import accel
 from cozy_runtime.internal.decode_cores import Cores
 from cozy_runtime.internal.decode_schemes import run, sample
-from cozy_runtime.internal.encoding import (
-    TORCH_DTYPES,
-    DeviceFacts,
-    Encoded,
-    LeafProvider,
-    Nvfp4NativeLeaf,
-    Provider,
-    RuntimeIdentity,
-    admit,
-    implementation_digest,
-    measure_runtime,
-)
 from cozy_runtime.internal.encoding.adapters import CoreDequant
 from cozy_runtime.internal.encoding.formats import (
     E2M1_VALUES,
     E8M0_NAN,
     MX_BLOCK,
     NVFP4_BLOCK,
+    TORCH_DTYPES,
+    Encoded,
+    LeafProvider,
+    Provider,
     Tensor,
     e8m0_multipliers,
     hadamard256,
     params_of,
+)
+from cozy_runtime.internal.encoding.leaves import Nvfp4NativeLeaf
+from cozy_runtime.internal.encoding.selection import (
+    DeviceFacts,
+    RuntimeIdentity,
+    admit,
+    implementation_digest,
+    measure_runtime,
 )
 from cozy_runtime.internal.prebuilt import W4a8, unpack
 

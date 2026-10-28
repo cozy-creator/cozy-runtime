@@ -34,18 +34,18 @@ from cozy_runtime.author._loader import (
 )
 from cozy_runtime.author._model import PLACED, LoRAServing
 from cozy_runtime.internal import execution, lora_bake
+from cozy_runtime.internal.accel import ResidencyError, StaleBinding
 from cozy_runtime.internal.derive import placing
-from cozy_runtime.internal.encoding import (
-    TORCH_DTYPES,
+from cozy_runtime.internal.encoding.formats import TORCH_DTYPES, LeafProvider
+from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
+from cozy_runtime.internal.encoding.selection import (
     DeviceFacts,
-    LeafProvider,
     Selection,
     admit,
     device_line,
     implementation_digest,
     launch_providers,
 )
-from cozy_runtime.internal.encoding.leaves import sites as leaf_sites
 from cozy_runtime.internal.fill import (
     Checkpoint,
     PlanRow,
@@ -66,8 +66,6 @@ from cozy_runtime.internal.residency import (
     Model,
     Region,
     Request,
-    ResidencyError,
-    StaleBinding,
     TensorLayout,
     Weights,
     blocks_of,
@@ -540,6 +538,8 @@ class _Routes:
     releases its decoded storage too; active scopes and graph bindings keep their own owners.
     """
 
+    encoded = True
+
     def __init__(self, backend: Backend, rows: Mapping[str, PlanRow]) -> None:
         self.torch = backend.torch
         self.rows = dict(rows)
@@ -651,6 +651,8 @@ class _Routes:
 
 class _PlainDtype:
     """An immutable cast of ordinary stored values into managed final buffers."""
+
+    encoded = False
 
     def __init__(self, base: _Routes, dtype: str) -> None:
         if any(route != "verbatim" for route in base.routes.values()):

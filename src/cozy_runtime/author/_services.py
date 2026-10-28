@@ -27,7 +27,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
-from cozy_runtime.author import _codec, _stalls
+import cozy_runtime.author._codec as _codec
+import cozy_runtime.author._stalls as _stalls
 from cozy_runtime.author._activity import settle, work_clock
 from cozy_runtime.author._assets import (
     Asset,

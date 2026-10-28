@@ -1211,16 +1211,15 @@ class _State:
             for name, tensor in m._buffers.items()
             if tensor is not None and id(tensor) not in immutable_buffers
         ]
-        from cozy_runtime.internal.residency import Placeholder
-
         self.immutable = []
         for m in self.modules:
             for name, tensor in m._buffers.items():
                 if tensor is None or id(tensor) not in immutable_buffers:
                     continue
-                if isinstance(tensor, Placeholder):
-                    saved = Placeholder(tensor.shape, tensor.dtype, tensor.device)
-                    saved._varena_read = tensor._varena_read
+                read = getattr(tensor, "_varena_read", None)
+                if read is not None:  # residency's unbound weight: keep its reader, not data
+                    saved = type(tensor)(tensor.shape, tensor.dtype, tensor.device)
+                    saved._varena_read = read
                 else:
                     saved = tensor.detach()
                 geometry = (

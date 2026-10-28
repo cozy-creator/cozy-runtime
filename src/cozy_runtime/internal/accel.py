@@ -34,6 +34,21 @@ from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
 from cozy_runtime.internal.hostfacts import available_memory, physical_memory
 
+
+class ResidencyError(RuntimeError):
+    """Device weight residency cannot serve: raised here and by `residency`."""
+
+    code = "RESIDENCY"
+    sticky = False
+    cuda_code = None
+
+
+class StaleBinding(ResidencyError):
+    """A cached graph must retire before these weights can change storage or fill."""
+
+    code = "STALE_BINDING"
+
+
 #: The #450 law, imposed on every MPS executor's sealed environment: enabling the fallback
 #: silently runs unsupported operations on CPU, which violates the CPU-refusal law. Forced,
 #: not defaulted — a package cannot opt back in.
@@ -517,8 +532,6 @@ def initialize(torch: Any, kind: str) -> None:
     if kind == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("this Mac's torch has no usable MPS device")
     if kind == "cuda":
-        from cozy_runtime.internal.residency import ResidencyError
-
         torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         try:
             varena.install_allocator()

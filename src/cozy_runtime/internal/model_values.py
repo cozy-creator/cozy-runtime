@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import importlib
 import math
 from types import ModuleType
+from typing import cast
 
 import numpy as np
 from tensorfs import raw
@@ -62,11 +62,12 @@ def read_values_into(
         return
     if torch is None:
         try:
-            torch = importlib.import_module("torch")
+            import torch as installed
         except ImportError as exc:
             raise CapabilityError(
                 "logical model decoder is unavailable", code="weights_reader_decoder_unavailable"
             ) from exc
+        torch = cast("ModuleType", installed)
     target = torch.frombuffer(into, dtype=torch.float32)
     params = dict(tensor.encoding.params)
     parts = raw.parts(source, component, key)

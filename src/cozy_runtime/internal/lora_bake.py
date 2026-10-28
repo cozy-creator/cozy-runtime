@@ -32,8 +32,7 @@ if TYPE_CHECKING:
 
 from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import kernel_ready, verify
-from cozy_runtime.internal.encoding import E4M3_MAX
-from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, hadamard256
+from cozy_runtime.internal.encoding.formats import E2M1_VALUES, E4M3_MAX, NVFP4_BLOCK, hadamard256
 
 try:
     import triton

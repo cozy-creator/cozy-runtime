@@ -20,8 +20,10 @@ from pathlib import Path
 
 from cozy_runtime.author import ConformanceError
 from cozy_runtime.cli.io import CliError, Options, Result
+from cozy_runtime.derive.recipes import declared_plan
 from cozy_runtime.internal import package_interface, static_interface
 from cozy_runtime.internal.canonical import Json
+from cozy_runtime.internal.discovery import assert_locked_environment, discover
 from cozy_runtime.internal.exits import Exit
 
 
@@ -71,9 +73,6 @@ def run(function: str | None, opts: Options) -> Result:
 
 def _conformance(project: Path, static: Mapping[str, Json]) -> str:
     """Import the app here and refuse unless it agrees with the source reading."""
-    from cozy_runtime.derive.recipes import declared_plan
-    from cozy_runtime.internal.discovery import assert_locked_environment, discover
-
     environment = assert_locked_environment(project)
     recipes = package_interface.parse(package_interface.canonical_bytes(static)).recipes
     found = discover(project, recipes=recipes)

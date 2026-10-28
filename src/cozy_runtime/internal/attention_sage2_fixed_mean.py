@@ -3,13 +3,10 @@ whatever the length (`ENTRIES`), on the machine's compile manager (`triton_kerne
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from torch import Tensor
-
+import torch
 import triton
 import triton.language as tl
+from torch import Tensor
 
 from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
 
@@ -106,8 +103,6 @@ def serve(index: int, launch: Launch) -> None:
 def fixed_mean(launch: Launch, x: Tensor, denominator: int) -> Tensor:
     """BF16 [heads, D] sums of B1/NHD `x` over its tokens, in fixed tiles, over `denominator`.
     `1 / denominator` is f32 as a constant fold rounds it."""
-    import torch
-
     _, tokens, heads, dim = x.shape
     tiles = triton.cdiv(tokens, TOKEN_TILE)
     partial = torch.empty((heads, tiles, dim), device=x.device, dtype=torch.float32)

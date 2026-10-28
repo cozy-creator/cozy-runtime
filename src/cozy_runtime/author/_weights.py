@@ -19,6 +19,7 @@ MAX_WEIGHTS_NEW_BYTES = (1 << 53) - 1
 _OUTPUT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _REF = re.compile(r"^sha256:[0-9a-f]{64}$")
 
+ReadBytes = Callable[["Checkpoint", str, str, str, int, Any], None]
 ReadValues = Callable[["Checkpoint", str, str, int, memoryview], None]
 
 
@@ -55,7 +56,7 @@ class Weights[M: Model[Any]]:
     Reads are bound to the attempt that received it.
     """
 
-    __slots__ = ("_open", "_source", "_values", "checkpoint_ref")
+    __slots__ = ("_bytes", "_open", "_source", "_values", "checkpoint_ref")
 
     def __init__(self, checkpoint_ref: str) -> None:
         if _REF.fullmatch(checkpoint_ref) is None:
@@ -65,12 +66,18 @@ class Weights[M: Model[Any]]:
             )
         self.checkpoint_ref = checkpoint_ref
         self._open: Callable[[], Checkpoint] | None = None
+        self._bytes: ReadBytes | None = None
         self._values: ReadValues | None = None
         self._source: Checkpoint | None = None
 
-    def _bind(self, open: Callable[[], Checkpoint] | None, values: ReadValues | None) -> None:
-        """Runtime: this attempt's source access; `_bind(None, None)` ends it."""
-        self._open, self._values, self._source = open, values, None
+    def _bind(
+        self,
+        open: Callable[[], Checkpoint] | None,
+        read: ReadBytes | None,
+        values: ReadValues | None,
+    ) -> None:
+        """Runtime: this attempt's source access; `_bind(None, None, None)` ends it."""
+        self._open, self._bytes, self._values, self._source = open, read, values, None
 
     def _view(self) -> Checkpoint:
         if self._source is None:
@@ -103,9 +110,13 @@ class Weights[M: Model[Any]]:
     def read_into(self, component: str, key: str, role: str, offset: int, into: Any) -> None:
         """Stored bytes of one part (`""`: a plain tensor's), at most MAX_WEIGHTS_SOURCE_READ
         per call."""
-        from cozy_runtime.weights_store import read_into
-
-        read_into(self._view(), component, key, role, offset, into)
+        source = self._view()
+        if self._bytes is None:
+            raise CapabilityError(
+                "these weights are not bound to a running attempt",
+                code="weights_source_ungranted",
+            )
+        self._bytes(source, component, key, role, offset, into)
 
     def read_values_into(self, component: str, key: str, offset: int, into: Any) -> None:
         """Decode a flat logical element range into a contiguous writable float32 buffer."""

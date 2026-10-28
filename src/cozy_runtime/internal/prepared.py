@@ -12,6 +12,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from typing import Any, NoReturn
 
+import torch
 from tensorfs import varena
 
 from cozy_runtime import graphs
@@ -20,6 +21,15 @@ from cozy_runtime.author._errors import CapabilityError, RuntimeFailure
 from cozy_runtime.author._model import LANDED, Building
 from cozy_runtime.author._prepared import Progress
 from cozy_runtime.graphs import domain
+from cozy_runtime.internal.residency import _REQUEST
+
+_execution: Any
+try:
+    import cozy_runtime._kernels._execution as _execution
+except ModuleNotFoundError as missing:  # CPU and macOS wheels carry no native execution module
+    if missing.name != "cozy_runtime._kernels._execution":
+        raise
+    _execution = None
 
 
 def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
@@ -46,8 +56,6 @@ def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
 
 
 def _native_error(error: Exception) -> NoReturn:
-    import torch
-
     if getattr(error, "load_unavailable", False):
         raise CapabilityError(str(error), code="prepared_load_unavailable") from error
     if getattr(error, "eligibility_refusal", False):
@@ -222,8 +230,6 @@ class Execution:
         self._observation = threading.RLock()
         self._models = models
         self._load_job = load_job
-        from cozy_runtime.internal.residency import _REQUEST
-
         self._load_request = _REQUEST.get()
         self._load_recorded = False
         self._failure: Exception | None = None
@@ -290,8 +296,6 @@ class Execution:
             self._finished = Progress(0, bool(facts.get("canceled", False)), True)
 
     def _finish(self, completed: int, canceled: bool) -> Progress:
-        import torch
-
         if self._finished is None:
             if self._load_job is not None:
                 self._record_load(self._load_job.facts())
@@ -410,17 +414,7 @@ class PreparedSequence:
         repeat: tuple[int, int, int] | None = None,
         prefetch: bool = True,
     ) -> None:
-        import torch
-
-        try:
-            import cozy_runtime._kernels._execution as native
-        except ModuleNotFoundError as error:
-            if error.name != "cozy_runtime._kernels._execution":
-                raise
-            raise CapabilityError(
-                "native sequence module is unavailable", code="prepared_graph_ineligible"
-            ) from error
-        if not callable(getattr(native, "NativeSequence", None)):
+        if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
             )
@@ -446,7 +440,9 @@ class PreparedSequence:
                 raise ValueError("invalid bounded repeat range")
             if (end - begin) * passes + len(self.stages) - (end - begin) > 2**32 - 1:
                 raise ValueError("repeated stage count exceeds uint32")
-            if passes > 1 and not getattr(native.ResidentRepeat, "supports_reusable_input", False):
+            if passes > 1 and not getattr(
+                _execution.ResidentRepeat, "supports_reusable_input", False
+            ):
                 raise CapabilityError(
                     "native stage rearm is unavailable", code="prepared_graph_ineligible"
                 )
@@ -537,10 +533,6 @@ class PreparedSequence:
         }
 
     def submit(self, context: Context | None = None) -> Execution:
-        import torch
-
-        from cozy_runtime._kernels import _execution
-
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
@@ -571,8 +563,6 @@ class PreparedSequence:
             execution = None
             phase_controllers: dict[Any, Any] = {}
             phase_definitions: dict[tuple[Any, tuple[str, ...]], tuple[str, tuple[Any, ...]]] = {}
-            from cozy_runtime.internal.residency import _REQUEST
-
             request = _REQUEST.get()
             phase_type = getattr(varena, "PhaseController", None)
             try:
@@ -799,8 +789,6 @@ class _SequenceCapture:
             )
 
     def _prepare(self, state: tuple[Any, ...]) -> None:
-        import torch
-
         if not self._entered or self._closed or self._finished or not state:
             raise RuntimeError("capture inside an open sequence recording")
         for tensor in state:

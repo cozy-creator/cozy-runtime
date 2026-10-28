@@ -15,7 +15,6 @@ from msgspec import UNSET, UnsetType
 from cozy_runtime.author._assets import FileState, GrantedInput, InputMetadata
 from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.author._services import MAX_OUTPUT_BYTES
-from cozy_runtime.internal.attention import Choice
 from cozy_runtime.internal.canonical import Json
 
 _MANIFEST = Annotated[str, msgspec.Meta(pattern="^sha256:[0-9a-f]{64}$")]
@@ -118,6 +117,16 @@ class Activate(Command, frozen=True, kw_only=True, tag="activate"):
     authorized_device_limit_bytes: int | UnsetType = UNSET
     #: A follower's half: the constructions rank 0 parked to make room.
     park: tuple[str, ...] = ()
+
+
+class Choice(msgspec.Struct, frozen=True, kw_only=True):
+    """One GPU's whole selection, as a group's followers install it (`attention.install`): the
+    kernel each site serves, by (component, module path), and the dense reference Sol recomputes
+    rows with where Sol serves, with the exact kernel beside a quantizing one ("" for none)."""
+
+    sites: tuple[tuple[str, str, str], ...] = ()
+    dense: str = ""
+    exact: str = ""
 
 
 class Attention(Command, frozen=True, kw_only=True, tag="attention"):

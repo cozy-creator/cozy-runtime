@@ -56,8 +56,9 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal import attention_upstream as upstream
 from cozy_runtime.internal.attention_ulysses import Local
-from cozy_runtime.internal.encoding import DeviceFacts
 from cozy_runtime.internal.encoding.formats import Tensor
+from cozy_runtime.internal.encoding.selection import DeviceFacts
+from cozy_runtime.internal.executor_commands import Choice
 
 # Tensors, torch modules and Diffusers' registry, backend members and processors are `Any`:
 # neither torch nor diffusers is installed in the check venv.
@@ -813,7 +814,8 @@ def _launcher(module: ModuleType, name: str, device: DeviceFacts, wait: bool) ->
     the machine's compile manager and loaded onto this card (`triton_kernels.ready`); a build
     still running refuses as compiling, a failed one as absent. A module with an eager floor
     serves without kernels this machine cannot build (None)."""
-    built = import_module("cozy_runtime.internal.triton_kernels")
+    from cozy_runtime.internal import triton_kernels as built
+
     try:
         launch: Launch | None = built.ready(module.KERNELS, wait, device=f"cuda:{device.index}")
     except KernelsUnavailable as exc:
@@ -882,7 +884,8 @@ def _sol_route(device: DeviceFacts, wait: bool) -> None:
         route = attention_sol.backend(device.index)
         if route == "fa4_block_sparse":
             _import(known()["flash-attn4"])
-            fa4 = import_module("cozy_runtime.internal.attention_sol_fa4")
+            from cozy_runtime.internal import attention_sol_fa4 as fa4
+
             launch = _launcher(fa4, "sol-attn FA4", device, wait)
             try:
                 fa4.warm(device.index, cast("Launch", launch))
@@ -1674,16 +1677,6 @@ def observed(roots: Mapping[str, object], pin: str = "") -> Applied:
         if ready.name in served and ready.artifact
     }
     return Applied(hosts, (), pin, artifacts=artifacts or None)
-
-
-class Choice(msgspec.Struct, frozen=True, kw_only=True):
-    """One GPU's whole selection, as a group's followers install it (`install`): the kernel
-    each site serves, by (component, module path), and the dense reference Sol recomputes
-    rows with where Sol serves, with the exact kernel beside a quantizing one ("" for none)."""
-
-    sites: tuple[tuple[str, str, str], ...] = ()
-    dense: str = ""
-    exact: str = ""
 
 
 def chosen(roots: Mapping[str, object]) -> Choice:

@@ -127,7 +127,9 @@ from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
 from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
 from cozy_runtime.author.kernels import Launch, Plan, TritonKernels
+from cozy_runtime.derive import recipes as declared_recipes
 from cozy_runtime.derive.operations import app as builtin_operations_app
+from cozy_runtime.derive.operations import run_recipe
 from cozy_runtime.internal import (
     accel,
     arch,
@@ -161,11 +163,16 @@ from cozy_runtime.internal import (
     w4a8_linear,
     zygote,
 )
+from cozy_runtime.internal.accel import ResidencyError
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
 from cozy_runtime.internal.derive import Observations, serving_substrate
 from cozy_runtime.internal.discovery import discover_installed
-from cozy_runtime.internal.encoding import launch_providers, measure_device, measure_runtime
 from cozy_runtime.internal.encoding.leaves import FORMATS, serving
+from cozy_runtime.internal.encoding.selection import (
+    launch_providers,
+    measure_device,
+    measure_runtime,
+)
 from cozy_runtime.internal.executor_commands import (
     Activate,
     Attention,
@@ -743,12 +750,12 @@ def _dense(kernels: Iterable[str]) -> str:
     return ", ".join(dict.fromkeys(attention.dense_identity(name) for name in sparse))
 
 
-def _attention_divergence(mine: attention.Choice, reply: Mapping[str, object]) -> str:
+def _attention_divergence(mine: executor_commands.Choice, reply: Mapping[str, object]) -> str:
     """How a follower's answer to rank 0's selection differs from it; "" when it serves it."""
     if not reply.get("ok"):
         return f"{reply.get('code', '')}: {reply.get('detail', '')}"
     try:
-        theirs = msgspec.convert(reply.get("choice"), attention.Choice)
+        theirs = msgspec.convert(reply.get("choice"), executor_commands.Choice)
     except msgspec.ValidationError as exc:
         return f"an unreadable selection: {exc}"
     return attention.difference(mine, theirs)
@@ -1034,8 +1041,6 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
-        from cozy_runtime.internal.residency import ResidencyError
-
         try:
             accel.initialize(torch, self.device_kind)
             if self.world > 1 and self.device_kind == "cuda":
@@ -1944,7 +1949,8 @@ class Executor:
                 modules = set().union(*(KERNEL_SETS[name].modules for name in sets))
                 return zygote.expect_kernels(entries, sorted(modules))
             archs = sorted({accel.device_capability(entry) for entry in entries} - {0})
-            built = importlib.import_module("cozy_runtime.internal.triton_kernels")
+            from cozy_runtime.internal import triton_kernels as built
+
             return "; ".join(
                 f"{name} sm{arch} {built.expect(KERNEL_SETS[name], arch)}"
                 for name in sets
@@ -3542,6 +3548,7 @@ class Executor:
                         ),
                         max_output_bytes=command.max_output_bytes,
                         sources=sources,
+                        weights_bytes=weights_store.read_into,
                         weights_values=functools.partial(read_values_into, self.torch),
                         tensorfs_source=(
                             functools.partial(
@@ -4105,7 +4112,9 @@ class Executor:
                 )
         return None
 
-    def _adopt_attention(self, command: Attention, choice: attention.Choice) -> dict[str, Any]:
+    def _adopt_attention(
+        self, command: Attention, choice: executor_commands.Choice
+    ) -> dict[str, Any]:
         """A follower's half of `_agree_attention`: rank 0's whole selection installed here as
         this construction's prepared one, and what this GPU then serves."""
         target = self._follower_target(command.construction, command.model_key)
@@ -5034,6 +5043,7 @@ def main(argv: list[str] | None = None) -> int:
 
     _capture_seal()
     _remember_distributions()
+    declared_recipes.install(run_recipe)
     kernel_cache.configure(kernel_cache.from_sealed(_SEALED))
     # cr-042: the executor's ONE network fence, installed BEFORE the seam dials so the
     # AF_UNIX exemption is exercised on every boot rather than asserted. It refuses

@@ -9,13 +9,11 @@ Only input addressing expands to the actual H3 packed/strided QKV layouts. Its T
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from torch import Tensor
-
+import torch
 import triton
 import triton.language as tl
+from torch import Tensor
 
 from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import attention_sage2_fixed_mean as means
@@ -109,8 +107,6 @@ def fixed_preprocess(
 ) -> dict[str, Tensor]:
     """B1/BF16/NHD/D128 (its row's, `attention.Candidate`) to owned contiguous HND values and
     explicit BF16 means."""
-    import torch
-
     if any(x.stride(-1) != 1 for x in (q, k, v)):
         raise ValueError("Fixed preprocessing requires contiguous channels")
     launch = _LAUNCH[q.device.index or 0]

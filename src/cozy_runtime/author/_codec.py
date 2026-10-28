@@ -45,8 +45,8 @@ from typing import Any
 
 from PIL import Image
 
+import cozy_runtime.author._color as _color
 from cozy_runtime._cpus import cpus
-from cozy_runtime.author import _color
 from cozy_runtime.author._errors import OutputError
 
 #: Raw-snapshot ceiling as a multiple of the attempt's output ceiling. H3's largest launch

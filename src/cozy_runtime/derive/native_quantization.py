@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import tempfile
 import time
 import zlib
 from collections.abc import Callable, Iterator
-from concurrent.futures import CancelledError, Future, TimeoutError
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, TimeoutError
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,23 +16,18 @@ from typing import TYPE_CHECKING, Any, cast
 import msgspec
 import tensorfs
 
+from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput
 from cozy_runtime.author._loader import TENSORFS_NAMES
 from cozy_runtime.author._prepared import Progress
 from cozy_runtime.weights_store import Checkpoint, Output
 
-from .quantization import (
-    _ENCODINGS,
-    PER_ROW,
-    ArtifactQuantizationPlan,
-    QuantizationStats,
-    QuantizationTensor,
-    _pool,
-)
+from .microscale import CONVROT_GROUP, NVFP4_BLOCK, W4A8_GROUP
 
 if TYPE_CHECKING:
     from tensorfs.api import QuantizeTensor
 
+    from .quantization import ArtifactQuantizationPlan, QuantizationTensor
     from .svdq import Calibration
 
 SVDQ_STRATEGY = "svdq-nvfp4-r32-faer/1"
@@ -44,6 +40,43 @@ _STRATEGIES = {
     "fp8.rowwise": "fp8-rowwise-rne/1",
     "w4a8.convrot": "w4a8-convrot256-fixed/1",
 }
+_NVFP4 = {
+    "block_size": NVFP4_BLOCK,
+    "global_scale": "multiply",
+    "nibble_order": "low_first",
+    "scale_layout": "row_major",
+}
+#: Each lane scheme's stored params, written alike by the Writer and the Python encoders.
+PARAMS: dict[str, dict[str, object]] = {
+    "fp8.rowwise": {},
+    "int8.convrot": {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
+    "nvfp4": _NVFP4,
+    "w4a8.convrot": {
+        "group_size": W4A8_GROUP,
+        "rotation": "kron_regular_h4",
+        "rotation_size": CONVROT_GROUP,
+    },
+    "svdq.nvfp4": dict(_NVFP4),
+}
+#: Encodings a derivation reads through the serving decoder (`model_values`): per-row scaled
+#: codes, whose exact values a lane is written from (Ideogram 4 ships only fp8.rowwise).
+PER_ROW = frozenset({"fp8.rowwise", "int8.rowwise"})
+
+
+class QuantizationStats(msgspec.Struct):
+    encoded_keys: int
+    reused_keys: int
+    source_bytes_read: int
+    new_bytes_written: int
+    saturated_elements: int
+    worst_relative_frobenius: float | None
+    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
+
+
+@functools.cache
+def _pool() -> ThreadPoolExecutor:
+    """One process-wide encoder pool: callers that shard their own work share its bound."""
+    return ThreadPoolExecutor(cpus(), thread_name_prefix="cozy-quantize")
 
 
 def supported(source: Checkpoint, selection: ArtifactQuantizationPlan, encoding: str) -> bool:
@@ -79,7 +112,7 @@ def resolved(
             "source_dtype": source.components[row.component].tensors[row.key].dtype,
             "shape": list(row.shape),
             "dtype": TENSORFS_NAMES[logical_dtype(row)],
-            "encoding": {"scheme": scheme, "params": dict(_ENCODINGS[scheme].params)},
+            "encoding": {"scheme": scheme, "params": dict(PARAMS[scheme])},
             "strategy": _STRATEGIES[scheme],
         }
         if scheme == "svdq.nvfp4":

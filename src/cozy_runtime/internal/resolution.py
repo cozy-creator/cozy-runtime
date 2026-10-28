@@ -32,12 +32,10 @@ import msgspec
 from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.internal import arch, canonical
 from cozy_runtime.internal.delivery import DELIVERY_RUNGS, ROUTE_KERNEL
-from cozy_runtime.internal.encoding import (
+from cozy_runtime.internal.encoding.adapters import _nvfp4_kernel
+from cozy_runtime.internal.encoding.formats import Encoded, EncodingRefusal, LeafProvider, Provider
+from cozy_runtime.internal.encoding.selection import (
     DeviceFacts,
-    Encoded,
-    EncodingRefusal,
-    LeafProvider,
-    Provider,
     Refusal,
     RuntimeIdentity,
     Selection,
@@ -46,7 +44,6 @@ from cozy_runtime.internal.encoding import (
     device_line,
     implementation_digest,
 )
-from cozy_runtime.internal.encoding.adapters import _nvfp4_kernel
 from cozy_runtime.internal.nvfp4_linear import DECODE_ROWS
 
 #: The route a tensor PREFERS under each policy (the package's consent decides the policy);

@@ -16,6 +16,7 @@ from cozy_runtime.author._assets import (
     ImageAsset,
     Tree,
     VideoAsset,
+    asset_inputs,
     bind,
     file_state,
 )
@@ -175,8 +176,6 @@ def decode(
     # A received result becomes an input to the rest of the parent's Python
     # composition. Preserve its declared per-field media/decode limits through
     # the same concrete-value traversal used for ordinary input hydration.
-    from cozy_runtime.author._invoke import asset_inputs
-
     for item in asset_inputs(result):
         asset, bound = item.asset, item.bound
         if bound is not None:
