@@ -374,7 +374,8 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
 #: The attribute Runtime sets on a forward wrapper that calls the class's forward unchanged.
-TRANSPARENT = "_cozy_transparent"
+#: Published minimax-h3 reads it by this name until it reads `plain_forward` (Runtime 0.35.0).
+TRANSPARENT = "_varena"
 
 
 def hold_dtype(module: Any, dtype: Any) -> None:
