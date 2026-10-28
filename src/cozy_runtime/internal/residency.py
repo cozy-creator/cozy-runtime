@@ -127,8 +127,8 @@ class Room:
     warm: int
     granularity: int = 512
     floor: int = 0
-    #: Torch's reserved, unallocated bytes: a cut's level counts them (its activations reuse
-    #: them first); its pre-reclaim compares with `free`, which returns them before weights.
+    #: Torch's reserved, unallocated bytes: a cut's level and its pre-reclaim count them (its
+    #: activations reuse them first); a reclaim returns them before weights.
     cached: int = 0
 
 
