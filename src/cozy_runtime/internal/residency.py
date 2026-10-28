@@ -31,7 +31,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
-from cozy_runtime.author._errors import CapabilityError, Fault, fault
+from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
@@ -103,10 +103,6 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
-# During authored stage preparation, undeclared model reads must not page in sibling blocks.
-_CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
-#: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
-CUTTER: ContextVar[Any] = ContextVar("cozy_loop_cutter", default=None)
 #: A native loop's eager call (`internal.loop`): the models and blocks it ran.
 ENTERED: ContextVar[set[Any] | None] = ContextVar("cozy_loop_entered", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
@@ -452,25 +448,6 @@ class Model:
         finally:
             self.memory._close(self, executing=executing)
 
-    @contextmanager
-    def lending(self) -> Iterator[None]:
-        """This thread's open pass lends its common block to a native stage preparation, which
-        needs every input idle, and takes it back after. A failed take-back stays lent."""
-        if (
-            not getattr(self.local, "depth", 0)
-            or self.common is None
-            or getattr(self.local, "lent", False)
-        ):
-            yield
-            return
-        self.memory._exit(self.common)
-        self.local.lent = True
-        try:
-            yield
-        finally:
-            self.memory._enter(self.common)
-            self.local.lent = False
-
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
         try:
@@ -630,13 +607,6 @@ class Binding:
         self.held: list[tuple[_Block, int]] = []
         self.lock = threading.RLock()
         self.last: Any = None
-        self._load_slot: Any = None
-        self._stage_source: Any = None
-        self._stage_regions: tuple[tuple[_Block, Any], ...] = ()
-        self._load_data: dict[_Block, dict[str, dict[str, Tensor]]] | None = None
-        self._load_storage: dict[_Block, int] = {}
-        self._load_source: Weights | None = None
-        self._load_target_strides: list[tuple[_Site, tuple[int, ...]]] = []
 
     def valid(self) -> bool:
         return not self._invalid()
@@ -651,15 +621,6 @@ class Binding:
             return "fill identity changed"
         if self.generation != model.generation:
             return "model generation changed"
-        if not all(block.region is region for block, region in self._stage_regions):
-            return "stage region replaced"
-        if self._load_source is not None and model.source is not self._load_source:
-            return "load source changed"
-        if not all(
-            (value := site.table[site.name]) is not None and tuple(value.stride()) == stride
-            for site, stride in self._load_target_strides
-        ):
-            return "target strides changed"
         if not all(
             (value := site.table[site.name]) is not None
             and tuple(value.shape) == shape
@@ -668,8 +629,7 @@ class Binding:
         ):
             return "target shape or dtype changed"
         if not all(
-            (self._load_data is not None or b.data is not None) and b.generation == generation
-            for b, generation in self.held
+            b.data is not None and b.generation == generation for b, generation in self.held
         ):
             return "held block released"
         return ""
@@ -688,254 +648,6 @@ class Binding:
                 return f"{name} block {b.path or '(common)'}: raw {_state(b.region)}{final}"
         return ""
 
-    def _load_refusal(self, stage: bool, region_input: bool) -> str:
-        """The first reason `prepare_load` refuses this binding, or empty when it can load."""
-        memory, model = self.model.memory, self.model
-        if why := self._invalid():
-            return f"binding {why}"
-        for why, refused in (
-            ("binding already prepared", self.used),
-            ("binding holds its blocks", self.held),
-            ("a load slot is open", self._load_slot is not None),
-            ("a stage source is open", self._stage_source is not None),
-            ("memory is not CUDA", not memory.cuda),
-            ("a capture is active", memory.capturing()),
-            ("no native memory", memory.native is None),
-            ("TensorFS cannot take region inputs", not region_input),
-            ("the model has a fill", model.fill is not None),
-        ):
-            if refused:
-                return why
-        for block in self.groups:
-            finals = sorted(block.finals)
-            encoded = any(set(parts) != {"value"} for parts in block.parts.values())
-            for why, refused in (
-                ("has no declared layout", block.aliases is None),
-                (f"has {len(finals)} final rows ({', '.join(finals[:3])})", finals),
-                (
-                    "has encoded parts outside a routed stage",
-                    encoded and (not stage or model.finals is None or not model.finals.encoded),
-                ),
-                ("has no storage", not block.storage_bytes),
-                (
-                    "has packed F4 parts",
-                    any(p.dtype == "F4" for parts in block.parts.values() for p in parts.values()),
-                ),
-                (f"is in use ({block.count})", block.count),
-                (f"is retained ({block.retained}) in {model.component}", block.retained),
-                ("is loading", block.loading),
-            ):
-                if refused:
-                    return f"block {block.path or '(common)'} {why}"
-        return ""
-
-    def prepare_load(self, *, stage: bool = False) -> Any:
-        """Create capture-private views for immutable raw blocks, without reading weights.
-
-        Ordinary block data is never changed here. The native slot atomically retains ready
-        regions and owns unpublished missing fills; its views are installed only by prepare().
-        """
-        memory, model = self.model.memory, self.model
-        with self.lock:
-            model._claim()
-            try:
-                if why := self._load_refusal(
-                    stage, getattr(varena.LoadSlot, "supports_region_input", False)
-                ):
-                    raise StaleBinding(
-                        f"native component loading needs idle immutable raw layouts: {why}"
-                    )
-                if any(
-                    getattr(module, "_compiled_call_impl", None) is not None
-                    or hasattr(module, "_orig_mod")
-                    for module in model.module.modules()
-                ):
-                    raise StaleBinding("compiled modules require resident weight preparation")
-                self._load_source = model.source
-                self._load_target_strides = [
-                    (site, tuple(site.table[site.name].stride())) for site, _, _ in self.targets
-                ]
-                # Protect every existing ready block before phase policy or a later cold
-                # allocation can reclaim it. Native group admission takes its own pins before
-                # these temporary owners are released. Nothing here exposes unreadable data.
-                ready_uses = [
-                    use
-                    for block in self.groups
-                    if block.region is not None
-                    if (use := block.region.pin()) is not None
-                ]
-                # Run existing phase admission before private capacity is reserved, so
-                # warmup hooks do not mistake those allocated inputs for missing bytes.
-                memory._activate_phase(model)
-                with memory.lock:
-                    if memory._prefetch is not None:
-                        memory._settle_prefetch(cancel=True)
-                groups = []
-                needed = 0
-                for block in self.groups:
-                    region = memory._native_region(block)
-                    if not region.resident:
-                        needed += int(region.allocated_bytes)
-                    offset = 0
-                    parts = []
-                    for key, roles in block.parts.items():
-                        for part in roles.values():
-                            parts.append(
-                                (
-                                    f"{model.component}/{key}#{part.role or 'value'}",
-                                    offset,
-                                    part.nbytes,
-                                )
-                            )
-                            offset += (part.nbytes + 255) // 256 * 256
-                    groups.append((region, parts))
-                if memory.budget_bytes is not None and needed > memory.room().free:
-                    memory.reclaim(needed, current={model.name})
-                    if needed > memory.room().free:
-                        raise torch.OutOfMemoryError(
-                            "native component inputs exceed local capacity"
-                        )
-                if stage and not getattr(varena.LoadSlot, "supports_ready_stage", False):
-                    raise StaleBinding("TensorFS lacks ready-input model stage preparation")
-                slot = (
-                    varena.LoadSlot.from_regions(model.source.ck, groups, keep_ready=True)
-                    if stage
-                    else varena.LoadSlot.from_regions(model.source.ck, groups)
-                )
-                if (
-                    stage
-                    and slot is not None
-                    and not callable(getattr(slot._native, "detach_source", None))
-                ):
-                    slot.close()
-                    raise StaleBinding("TensorFS lacks detached model-stage input ownership")
-                # Native now owns ready inputs, or ordinary resident capture revalidates.
-                ready_uses.clear()
-                if slot is None:
-                    return None  # The caller must revalidate/reacquire its resident binding.
-                self._load_slot = slot
-                data: dict[_Block, dict[str, dict[str, Tensor]]] = {}
-                for block, raw in zip(self.groups, slot.tensors, strict=True):
-                    self._load_storage[block] = int(raw.untyped_storage().data_ptr())
-                    offset = 0
-                    rows = data[block] = {}
-                    for key, parts in block.parts.items():
-                        row = rows[key] = {}
-                        for role, part in parts.items():
-                            if part.dtype == "F4":
-                                raise StaleBinding(
-                                    "native raw component loading excludes packed weights"
-                                )
-                            value = raw[offset : offset + part.nbytes].view(
-                                getattr(torch, _DTYPES[part.dtype])
-                            )
-                            row[role] = value.view(part.shape)
-                            offset += (part.nbytes + 255) // 256 * 256
-                self._load_data = data
-                return slot
-            except BaseException:
-                if self._load_slot is not None:
-                    self._load_slot.close()
-                    self._load_slot = None
-                self._load_data = None
-                self._load_storage.clear()
-                self._load_source = None
-                self._load_target_strides.clear()
-                raise
-            finally:
-                model._release()
-
-    def immutable_buffer_ids(self, *, selected: bool = False) -> frozenset[int]:
-        """Declared checkpoint-backed buffers, including idle placeholders in other blocks.
-
-        They are immutable inputs, not mutable module state to clone while capturing one
-        block. Restrict this to named final-layout targets; ordinary nonweight buffers keep
-        the existing state snapshot and restoration behavior.
-        """
-        names: set[str] = set()
-        for block in self.groups if selected else self.model.groups():
-            for key in block.parts:
-                if self.model.finals is not None:
-                    layout = self.model.finals.layout(key)
-                    if layout is not None:
-                        names.update(layout)
-                elif set(block.parts[key]) == {"value"}:
-                    names.add(
-                        self.model.source.bound.get(key, key) if self.model.source.bound else key
-                    )
-        return frozenset(
-            id(site.table[site.name])
-            for name in names
-            for site in self.model.sites.get(name, ())
-            if not site.parameter and site.table[site.name] is not None
-        )
-
-    def undeclared_input_ranges(self) -> tuple[tuple[Any, int, int], ...]:
-        """Existing source/final reservations outside this stage, including escaped views."""
-        return tuple(
-            (
-                self.model.memory.device,
-                int(region.ptr),
-                int(region.ptr) + int(region.allocated_bytes),
-            )
-            for block in self.model.groups()
-            if block not in self.groups
-            for region in (block.region, block.final_region)
-            if region is not None
-        )
-
-    def detach_stage(self) -> Any:
-        """Keep immutable source/VA identity after checked capture; release physical pins.
-
-        The native source owns the Region reservations. It reacquires ready pins or missing
-        fills on each sequence pass, without calling Python or replacing parameter addresses.
-        """
-        with self.lock:
-            slot = self._load_slot
-            if (
-                slot is None
-                or self._load_data is None
-                or not self.used
-                or self._stage_source is not None
-                or not self.valid()
-            ):
-                raise StaleBinding("detachment requires a valid completed raw capture")
-            if self.last is not None:
-                try:
-                    self.last.synchronize()
-                except BaseException as incomplete:
-                    self._unproven(incomplete)
-            with self.model.memory.lock:
-                if any(block.count or block.loading for block in self.groups):
-                    raise StaleBinding("model stage capture is still using its input views")
-                regions = tuple((block, block.region) for block in self.groups)
-                if any(region is None for _, region in regions):
-                    raise StaleBinding("model stage lost its managed input reservation")
-                for block, _ in self.held:
-                    block.retained -= 1
-                    self.model.memory._idle(block)
-                self.held.clear()
-                self._load_data = None
-                self._load_storage.clear()
-            # Drop every private Python tensor owner before native's actual live-Pin check.
-            # An escaped external view makes this refuse; no refcount guess or gc sweep.
-            slot._tensor = None
-            slot._tensors = None
-            source = slot._native.detach_source()
-            self._stage_regions = regions
-            self._stage_source = source
-            self._load_slot = None
-            slot.close()
-            return source
-
-    def immutable_inputs(self) -> tuple[Tensor, ...]:
-        """The native-loaded source ranges, including the all-ready resident fallback."""
-        if self._load_source is None:
-            return ()
-        if self._load_slot is not None:
-            return tuple(self._load_slot.immutable_inputs)
-        return tuple(tensor for block in self.groups for tensor in block.tensors())
-
     @contextmanager
     def prepare(self, stream: Any = None) -> Iterator[Binding]:
         memory = self.model.memory
@@ -953,15 +665,11 @@ class Binding:
                     and self.model.wanted_identity() is None
                     and self.generation == self.model.generation
                 )
-                if self._stage_source is not None:
-                    raise StaleBinding("detached model stages prepare only through native input")
                 if not self.valid() and not ephemeral:
                     raise StaleBinding("graph weight storage or fill changed")
                 request = _REQUEST.get()
                 if request is not None and request.idle and not self.resident():
                     raise StaleBinding("idle graph preparation cannot page weights in")
-                if self._load_data is not None and self.used:
-                    raise StaleBinding("a native loaded binding can only prepare once")
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None:
@@ -969,7 +677,6 @@ class Binding:
                     entered: list[_Block] = []
                     retained: list[tuple[_Block, int]] = []
                     published = False
-                    restored: list[tuple[_Block, Any, Any, Any, Any]] = []
                     try:
                         if not self.held:
                             # Claim the complete dependency set before any preparation. Neither
@@ -978,20 +685,6 @@ class Binding:
                                 for block in self.groups:
                                     block.retained += 1
                                     retained.append((block, block.generation))
-                        if self._load_data is not None:
-                            for block in self.groups:
-                                restored.append(
-                                    (
-                                        block,
-                                        block.data,
-                                        block.assigned,
-                                        block.ready,
-                                        block.native_storage,
-                                    )
-                                )
-                                block.data = self._load_data[block]
-                                block.assigned = block.ready = None
-                                block.native_storage = self._load_storage[block]
                         for block in self.groups:
                             memory._enter(block)
                             entered.append(block)
@@ -1010,13 +703,8 @@ class Binding:
                             if memory.cuda and entered:
                                 self._finish(stream)
                         finally:
-                            try:
-                                for block in reversed(entered):
-                                    memory._exit(block)
-                            finally:
-                                for block, data, assigned, ready, storage in reversed(restored):
-                                    block.data, block.assigned = data, assigned
-                                    block.ready, block.native_storage = ready, storage
+                            for block in reversed(entered):
+                                memory._exit(block)
             finally:
                 self.model._release()
 
@@ -1082,26 +770,6 @@ class Binding:
                     block.retained -= 1
                     self.model.memory._idle(block)
                 self.held.clear()
-            if self._load_slot is not None:
-                self._load_slot.close()
-                self._load_slot = None
-                # Abandoning the slot drops any unpublished fill, leaving its region Cold.
-                # A capture-only alias may have escaped and outlive it, so retire the region
-                # identity of every block that was being filled (not resident), as _ensure
-                # does on a failed fill. Otherwise a later prepare() returns Busy against the
-                # dropped fill and breaks the eager fallback. Resident inputs keep their cache.
-                with self.model.memory.lock:
-                    for block in self.groups:
-                        region = block.region
-                        if region is not None and not region.resident:
-                            block.region = None
-                            block.preferred = block.preference_set = False
-            self._load_data = None
-            self._load_storage.clear()
-            self._load_source = None
-            self._load_target_strides.clear()
-            self._stage_source = None
-            self._stage_regions = ()
 
 
 class Region:
@@ -1176,7 +844,6 @@ class Memory:
         self.native: Any = None
         self.granularity = 512
         self.window_bytes = 0
-        self._stage_window_owner: object | None = None
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
         self.phase_supported = False
@@ -2040,54 +1707,6 @@ class Memory:
                 raise
             return region.prepare()
 
-    def _stage_prefetch_window(
-        self, required: int, missing: int, request: Request | None, owner: object
-    ) -> Callable[[], None] | None:
-        """Admit bounded next-source speculation after actual graph/readout allocations.
-
-        The streaming limit bounds idle nonpreferred cache, not active physical residency.
-        Existing useful cache may remain beyond the current/next source pair. This never
-        reclaims. Driver free and the request budget already exclude Torch
-        reservations (including graph scratch and boundary slots) and native residency.
-        The speculative native allocation independently rechecks pressure at read time.
-        """
-        if self.native is None or request is None or request.memory is not self or request.idle:
-            return None
-        with self.lock:
-            native_limit = self.native.stats().get("streaming_limit_bytes")
-            if (
-                native_limit is None
-                or native_limit != self.window_bytes
-                or self._stage_window_owner is not None
-                or self._prefetch is not None
-                or self._active_beside(request)
-                or missing > self.room().free
-            ):
-                return None
-            previous = self.window_bytes
-            admitted = max(previous, required)
-            phase = self._phase_names, self._phase_request
-            self.native.set_streaming_limit(admitted)
-            self.window_bytes = admitted
-            self._stage_window_owner = owner
-
-        def restore() -> None:
-            # Called only after checked whole-program completion, including canceled or
-            # unconsumed prefetch. Never overwrite a later phase's independently changed policy.
-            with self.lock:
-                if self._stage_window_owner is not owner:
-                    return
-                if (
-                    self.window_bytes == admitted
-                    and (self._phase_names, self._phase_request) == phase
-                    and self.native.stats().get("streaming_limit_bytes") == admitted
-                ):
-                    self.native.set_streaming_limit(previous)
-                    self.window_bytes = previous
-                self._stage_window_owner = None
-
-        return restore
-
     def _prefetch_next(self, current: _Block) -> None:
         """Demand's own next block takes priority over queued-request speculation."""
         if current.next is None or current.retained:
@@ -2502,12 +2121,6 @@ class Memory:
             raw[offset:stop].copy_(view, non_blocking=False)
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
-        declared = _CAPTURE_BLOCKS.get()
-        if declared is not None and id(block) not in declared:
-            raise CapabilityError(
-                "model stage reads a block outside its declared paths",
-                code="prepared_graph_ineligible",
-            )
         global progress
         model = block.model
         overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
@@ -2596,12 +2209,6 @@ class Memory:
         self, block: _Block, site: _Site, raw_view: tuple[int, _Part] | None = None
     ) -> Tensor:
         global progress
-        declared = _CAPTURE_BLOCKS.get()
-        if declared is not None and id(block) not in declared:
-            raise CapabilityError(
-                "model stage reads a block outside its declared paths",
-                code="prepared_graph_ineligible",
-            )
         model = block.model
         model._claim()
         try:
@@ -3195,8 +2802,6 @@ def _hooks(model: Model) -> None:
         sub = model.module.get_submodule(block.path)
 
         def entered(*_: object, b: _Block = block) -> None:
-            if (cut := CUTTER.get()) is not None:
-                cut.enter(b)
             if (seen := ENTERED.get()) is not None:
                 seen.add(b)
             model._claim()
@@ -3216,8 +2821,6 @@ def _hooks(model: Model) -> None:
                 memory._exit(b)
             finally:
                 model._release()
-            if (cut := CUTTER.get()) is not None:
-                cut.exit(b)
 
         model.handles.extend(_paired(sub, entered, exited))
 

@@ -1,0 +1,1 @@
+`author.denoise_loop`: the streamed native path is gone (the block-cut recording, residency's stage loads and the native sequence's stage inputs, lookahead and passes), unreachable since a loop that would stream runs eagerly. Loop rows lose `blocks`, `streamed_bytes` and `prefetch`.

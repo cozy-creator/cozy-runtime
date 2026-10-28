@@ -8,7 +8,7 @@ import hashlib
 import threading
 import time
 import weakref
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from typing import Any, NoReturn
 
@@ -56,8 +56,6 @@ def _zero_dropout_attention(func: Any, args: Any, kwargs: Any) -> bool:
 
 
 def _native_error(error: Exception) -> NoReturn:
-    if getattr(error, "load_unavailable", False):
-        raise CapabilityError(str(error), code="prepared_load_unavailable") from error
     if getattr(error, "eligibility_refusal", False):
         raise CapabilityError(str(error), code="prepared_graph_ineligible") from error
 
@@ -95,11 +93,8 @@ class PreparedRepeat:
         self._closed = False
         self._owned_bindings: tuple[Any, ...] = ()
         self._binding_cleanup = ExitStack()
-        self._load: Any = None
         self._capture_cache: dict[str, int] = {}
-        self._load_ordering_requested = "checked"
         self._sequence_owner: Any = None
-        self._load_ordering = "checked"
         self._landed = landed
 
     @staticmethod
@@ -194,7 +189,6 @@ class PreparedRepeat:
                 _native_error(error)
             self._closed = True
             self._release_owned_bindings()
-            self._load = None
             if settled_error is not None:
                 _native_error(settled_error)
 
@@ -207,9 +201,8 @@ class PreparedRepeat:
         return {
             **self._native.facts(),
             "capture_cache": dict(self._capture_cache),
-            "load_ordering_requested": self._load_ordering_requested,
-            "load_ordering": self._load_ordering,
         }
+
 
 class Execution:
     """Observer/control handle. No observation or CPU loop is needed for GPU continuation."""
@@ -231,7 +224,6 @@ class Execution:
         self._models = models
         self._load_job = load_job
         self._load_request = _REQUEST.get()
-        self._load_recorded = False
         self._failure: Exception | None = None
         self._queued_eligible = context is not None and load_job is None
         self._queued_offered: str | None = None
@@ -268,27 +260,12 @@ class Execution:
             self._models[-1]._release()
             self._models.pop()
 
-    def _record_load(self, facts: Mapping[str, Any]) -> None:
-        if self._load_recorded or not facts.get("done", False):
-            return
-        self._load_recorded = True
-        if self._load_request is None or not facts.get("read_done", False):
-            return
-        for binding in self.plan._owned_bindings:
-            if binding._load_slot is self.plan._load:
-                for block, nbytes in zip(binding.groups, facts["input_read_bytes"], strict=True):
-                    if nbytes:
-                        # The native worker did this I/O. Record bytes once after completion;
-                        # its separate native clocks are not Python read-wait measurements.
-                        self._load_request.read(block, 0, int(nbytes))
-
     def _failed_load(self, error: Exception) -> None:
         """A native input/sequence job may prove cleanup; an exception is not that proof."""
         if self._load_job is None:
             return
         self._failure = error
         facts = self._load_job.facts()
-        self._record_load(facts)
         if facts.get("completion_proven", False):
             # No readout of failed/partial input. Public observers retain the original error;
             # close may now retire the graph and its bindings after this native certificate.
@@ -297,8 +274,6 @@ class Execution:
 
     def _finish(self, completed: int, canceled: bool) -> Progress:
         if self._finished is None:
-            if self._load_job is not None:
-                self._record_load(self._load_job.facts())
             with torch.cuda.device(self.plan.device), torch.no_grad():
                 for output, state in zip(self._outputs, self.plan.state, strict=True):
                     output.copy_(state)
@@ -395,9 +370,6 @@ class PreparedSequence:
 
     Constructing this object transfers definition ownership: close/idle retirement of any
     stage closes the whole sequence.
-
-    `prefetch=False` omits speculative next-stage reads when other work has priority; True
-    permits bounded lookahead only when actual capacity admits it.
     """
 
     @classmethod
@@ -411,16 +383,11 @@ class PreparedSequence:
         stages: Sequence[PreparedRepeat],
         *,
         outputs: Sequence[Any] | None = None,
-        repeat: tuple[int, int, int] | None = None,
-        prefetch: bool = True,
     ) -> None:
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
             )
-        if type(prefetch) is not bool:
-            raise TypeError("sequence prefetch policy must be a boolean")
-        self.prefetch = prefetch
         self.stages = tuple(stages)
         if not self.stages or len(self.stages) > 65536:
             raise ValueError("a prepared sequence needs 1..65536 stages")
@@ -428,25 +395,6 @@ class PreparedSequence:
             raise TypeError("sequence stages must be PreparedRepeat definitions")
         if len({id(stage) for stage in self.stages}) != len(self.stages):
             raise ValueError("sequence definitions must be distinct; repeat inside a stage")
-        if repeat is not None:
-            if (
-                not isinstance(repeat, tuple)
-                or len(repeat) != 3
-                or any(isinstance(value, bool) or not isinstance(value, int) for value in repeat)
-            ):
-                raise ValueError("repeat must be (first_stage, exclusive_end, positive_passes)")
-            begin, end, passes = repeat
-            if not 0 <= begin < end <= len(self.stages) or not 0 < passes <= 2**32 - 1:
-                raise ValueError("invalid bounded repeat range")
-            if (end - begin) * passes + len(self.stages) - (end - begin) > 2**32 - 1:
-                raise ValueError("repeated stage count exceeds uint32")
-            if passes > 1 and not getattr(
-                _execution.ResidentRepeat, "supports_reusable_input", False
-            ):
-                raise CapabilityError(
-                    "native stage rearm is unavailable", code="prepared_graph_ineligible"
-                )
-        self._repeat = repeat
         self.device = self.stages[0].device
         if any(stage.device != self.device for stage in self.stages):
             raise ValueError("a native sequence belongs to one CUDA device")
@@ -457,9 +405,6 @@ class PreparedSequence:
         ):
             raise ValueError("sequence outputs must be declared persistent stage state")
         self.steps = sum(stage.steps for stage in self.stages)
-        if repeat is not None:
-            begin, end, passes = repeat
-            self.steps += (passes - 1) * sum(stage.steps for stage in self.stages[begin:end])
         self._submission = threading.RLock()
         self._active: _SequenceExecution | None = None
         self._native: Any = None
@@ -468,42 +413,18 @@ class PreparedSequence:
         # not close a stage already transferred to another live sequence.
         self._closed = True
         self._closing = False
-        self._load = None
         self._owned_bindings: tuple[Any, ...] = ()
         with self._locked_stages():
-            for stage_index, stage in enumerate(self.stages):
+            for stage in self.stages:
                 stage._validate()
                 if stage._sequence_owner is not None and stage._sequence_owner() is not None:
                     raise RuntimeError("a prepared stage already belongs to another sequence")
                 if stage._active is not None and not stage._active.poll().done:
                     raise RuntimeError("a running definition cannot enter a new sequence")
-                if stage._load is not None and not callable(
-                    getattr(stage._load, "continuation", None)
-                ):
-                    raise CapabilityError(
-                        "this input loader cannot defer its native stage",
-                        code="prepared_load_unavailable",
-                    )
-                if (
-                    self._repeated(stage_index)
-                    and stage._load is not None
-                    and not getattr(stage._load, "supports_reusable_input", False)
-                ):
-                    raise CapabilityError(
-                        "this input loader cannot rearm a native stage",
-                        code="prepared_load_unavailable",
-                    )
             owner = weakref.ref(self)
             for stage in self.stages:
                 stage._sequence_owner = owner
             self._closed = False
-
-    def _repeated(self, index: int) -> bool:
-        return (
-            self._repeat is not None
-            and self._repeat[2] > 1
-            and self._repeat[0] <= index < self._repeat[1]
-        )
 
     def _locked_stages(self) -> ExitStack:
         locks = ExitStack()
@@ -558,7 +479,6 @@ class PreparedSequence:
                 producer = torch.cuda.current_stream(self.device).cuda_stream
             claimed: list[Any] = []
             capsules: list[Any] = []
-            reads: list[tuple[int, Any, tuple[Any, ...]]] = []
             native = None
             execution = None
             phase_controllers: dict[Any, Any] = {}
@@ -573,17 +493,9 @@ class PreparedSequence:
                         if binding.model not in claimed:
                             binding.model._claim()
                             claimed.append(binding.model)
-                for stage_index, stage in enumerate(self.stages):
+                for stage in self.stages:
                     stage._validate()  # claims now fence concurrent model identity changes
-                    if self._repeated(stage_index):
-                        capsule, _ = stage._native.continuation(producer, reusable=True)
-                    else:
-                        capsule, _ = stage._native.continuation(producer)
-                    if stage._load is not None:
-                        capsule, observation = stage._load.continuation(
-                            capsule, event_ordered=stage._load_ordering == "events"
-                        )
-                        reads.append((stage_index, observation, stage._owned_bindings))
+                    capsule, _ = stage._native.continuation(producer)
                     if callable(phase_type) and request is not None and stage._owned_bindings:
                         memories = {binding.model.memory for binding in stage._owned_bindings}
                         if len(memories) == 1:
@@ -653,20 +565,13 @@ class PreparedSequence:
                                     phase_controllers[memory] = controller
                                 capsule = controller.wrap(capsule, *definition)
                     capsules.append(capsule)
-                native = (
-                    _execution.NativeSequence(capsules, self.device)
-                    if self._repeat is None
-                    else _execution.NativeSequence(capsules, self.device, self._repeat)
-                )
+                native = _execution.NativeSequence(capsules, self.device)
                 execution = _SequenceExecution(
-                    self, context, outputs, readout, claimed, native, reads, phase_controllers
+                    self, context, outputs, readout, claimed, native, phase_controllers
                 )
                 self._native, self._active = native, execution
                 for stage in self.stages:
                     stage._active = execution
-                # Every observer/capsule is strongly owned before optional Weak lookahead
-                # links are installed. Admission allocates no source bytes and launches no work.
-                execution._prepare_lookahead()
                 # All Python/native owners exist before the sole native worker can start.
                 native.start()
                 execution._offer_queued()
@@ -822,11 +727,10 @@ class _SequenceCapture:
             raise CapabilityError(why, code="prepared_graph_ineligible")
 
     def finish_parts(
-        self, *, outputs: Sequence[Any], parts: Sequence[tuple[int, int, int]]
+        self, *, outputs: Sequence[Any], parts: Sequence[tuple[int, int]]
     ) -> tuple[PreparedSequence, ...]:
-        """The recorded stages as sequences, one per (begin, end, passes) slice, each repeating
-        its slice natively. They share this recording's pool and domain, which end with the
-        last of them."""
+        """The recorded stages as sequences, one per (begin, end) slice. They share this
+        recording's pool and domain, which end with the last of them."""
         with self._submission, ExitStack() as locks:
             if not self._entered or self._closed or self._finished:
                 raise RuntimeError("sequence recording is not open")
@@ -839,14 +743,8 @@ class _SequenceCapture:
                 stage._sequence_owner = None
             made: list[PreparedSequence] = []
             try:
-                for begin, end, passes in parts:
-                    made.append(
-                        PreparedSequence(
-                            self.stages[begin:end],
-                            outputs=outputs,
-                            repeat=(0, end - begin, passes) if passes > 1 else None,
-                        )
-                    )
+                for begin, end in parts:
+                    made.append(PreparedSequence(self.stages[begin:end], outputs=outputs))
             except BaseException:
                 for sequence in made:  # transferred stages return to the recording
                     for stage in sequence.stages:
@@ -911,97 +809,16 @@ class _SharedDomain:
 
 
 class _SequenceExecution(Execution):
-    def __init__(self, plan, context, outputs, readout, models, native, reads, phases=None):
+    def __init__(self, plan, context, outputs, readout, models, native, phases=None):
         super().__init__(plan, context, 0, outputs, readout, models, native)
-        self._stage_reads = reads
-        # Only all-resident sequences have already retained every future stage workspace.
-        # Source-backed stages keep their existing separate current-stage lookahead policy.
-        self._queued_eligible = context is not None and not reads
+        # Every stage's workspace is retained: the one queued CPU preflight may be offered.
+        self._queued_eligible = context is not None
         self._phase_controllers = phases or {}
-        self._prefetch_cleanup = ExitStack()
-        self._prefetch_admission: list[dict[str, object]] = []
-
-    def _prepare_lookahead(self) -> None:
-        if not self.plan.prefetch:
-            self._prefetch_admission.append({"state": "disabled_by_author"})
-            return
-        request = self._load_request
-        candidates: dict[Any, list[tuple[Any, ...]]] = {}
-        for current, following in zip(self._stage_reads, self._stage_reads[1:], strict=False):
-            index, job, bindings = current
-            next_index, next_job, next_bindings = following
-            # Resident stages between two reading stages run while the next one's bytes arrive.
-            repeat = self.plan._repeat
-            if repeat is not None and repeat[2] > 1 and next_index == repeat[1]:
-                continue  # the suffix is next only on the final pass
-            if (
-                not bindings
-                or not next_bindings
-                or not getattr(job, "supports_native_lookahead", False)
-                or not getattr(next_job, "supports_native_lookahead", False)
-                or not callable(getattr(job, "link_next", None))
-            ):
-                continue
-            memories = {binding.model.memory for binding in (*bindings, *next_bindings)}
-            if len(memories) != 1:
-                continue
-            memory = next(iter(memories))
-            regions = {
-                id(region): region
-                for binding in (*bindings, *next_bindings)
-                for _, region in binding._stage_regions
-            }
-            current_bytes = sum(
-                int(region.allocated_bytes)
-                for binding in bindings
-                for _, region in binding._stage_regions
-            )
-            next_bytes = sum(
-                int(region.allocated_bytes)
-                for binding in next_bindings
-                for _, region in binding._stage_regions
-            )
-            # Native reports the same actual reservations. Refuse skew or hidden inputs;
-            # do not use Python logical tensor sizes as allocation admission.
-            if (
-                not regions
-                or int(job.reservation_bytes) != current_bytes
-                or int(next_job.reservation_bytes) != next_bytes
-            ):
-                continue
-            required = sum(int(region.allocated_bytes) for region in regions.values())
-            missing = sum(
-                int(region.allocated_bytes) for region in regions.values() if not region.resident
-            )
-            candidates.setdefault(memory, []).append(
-                (index, next_index, job, next_job, required, missing, next_bytes)
-            )
-        for memory, pairs in candidates.items():
-            required = max(pair[4] for pair in pairs)
-            missing = max(pair[5] for pair in pairs)
-            restore = memory._stage_prefetch_window(required, missing, request, self)
-            if restore is None:
-                self._prefetch_admission.append({"state": "capacity_skip", "pair_bytes": required})
-                continue
-            self._prefetch_cleanup.callback(restore)
-            for index, next_index, job, next_job, pair_bytes, _, next_bytes in pairs:
-                linked = bool(job.link_next(next_job, max_prefetch_bytes=next_bytes))
-                self._prefetch_admission.append(
-                    {
-                        "from_stage": index,
-                        "to_stage": next_index,
-                        "pair_bytes": pair_bytes,
-                        "state": "linked" if linked else "native_refusal",
-                    }
-                )
 
     def _release_models(self) -> None:
-        # Base execution calls this only after checked native completion/readout. If the
-        # drain is unproven, owners and this window lease remain retained for retirement.
-        self._prefetch_cleanup.close()
         # Native phase entry changed preferences without a Python callback. After every
-        # source/prefetch/consumer is checked, invalidate only our stale eager-policy cache;
-        # the next ordinary phase recomputes it. Preserve another live request's policy.
+        # consumer is checked, invalidate only our stale eager-policy cache; the next ordinary
+        # phase recomputes it. Preserve another live request's policy.
         for memory in self._phase_controllers:
             with memory.lock:
                 request = self._load_request
@@ -1017,38 +834,7 @@ class _SequenceExecution(Execution):
     def facts(self) -> dict[str, object]:
         facts = self.plan.facts()
         facts["sequence"] = dict(self._load_job.facts())
-        facts["stage_prefetch_admission"] = list(self._prefetch_admission)
         facts["native_phases"] = [
             dict(controller.facts()) for controller in self._phase_controllers.values()
         ]
-        facts["stage_inputs"] = [
-            {"stage": index, **dict(job.facts())} for index, job, _ in self._stage_reads
-        ]
         return facts
-
-    def _record_load(self, facts: Mapping[str, Any]) -> None:
-        if self._load_recorded or not facts.get("done", False):
-            return
-        for _, job, bindings in self._stage_reads:
-            loaded = job.facts()
-            if self._load_request is not None and (
-                loaded.get("read_done", False) or getattr(job, "supports_native_lookahead", False)
-            ):
-                # Lookahead jobs expose complete padded ledgers after aggregate done,
-                # including prefetched bytes when demand was canceled before starting.
-                blocks = [block for binding in bindings for block in binding.groups]
-                if blocks:
-                    prefetched = loaded.get("prefetch_input_read_bytes", [0] * len(blocks))
-                    for block, nbytes, speculative in zip(
-                        blocks, loaded["input_read_bytes"], prefetched, strict=True
-                    ):
-                        nbytes, speculative = int(nbytes), int(speculative)
-                        if not 0 <= speculative <= nbytes:
-                            raise RuntimeError(
-                                "native prefetch byte accounting exceeds total input reads"
-                            )
-                        if nbytes > speculative:
-                            self._load_request.read(block, 0, nbytes - speculative)
-                        if speculative:
-                            self._load_request.read(block, 0, speculative, speculative=True)
-        self._load_recorded = True
