@@ -6,8 +6,8 @@
 // bit for bit the leaf's law (`svdq_linear.quantize`), and stores the codes and E4M3 scales in the
 // order the GEMM's MMA reads them. Its 16-bit MMAs make la = x · downᵀ from the same registers:
 // the sum does not care which MMA slot a k fills, only that both operands agree, so lane t takes
-// k = 8t + 4s .. + 3 at step s. Four warps share a 32-row slice's k-steps; their f32 partials
-// add in a fixed order, so la is the same every run.
+// k = 8t + 4s .. + 3 at step s. Eight warps share a 32-row slice's k-steps (a few row slices
+// still fill the card); their f32 partials add in a fixed order, so la is the same every run.
 //
 // `gemm` multiplies 256x128 tiles with 8 warps of 32 rows by 128 columns. Each warp loads its
 // operands from global memory straight into registers, already in fragment order (no shared
@@ -35,7 +35,7 @@ namespace {
 
 constexpr int kWarps = 8;       // GEMM warps: kRows / kSlice
 constexpr int kSlice = 32;      // rows per GEMM warp, and per quantize block
-constexpr int kQuantWarps = 4;  // quantize warps sharing a slice's k-steps
+constexpr int kQuantWarps = 8;  // quantize warps sharing a slice's k-steps
 constexpr float kScaleFloor = 0.001953125f;  // E4M3's smallest subnormal, 2^-9
 
 template <bool Half>
@@ -256,7 +256,7 @@ __device__ __forceinline__ void add(const float* from, float (&la)[2][R / 8][4])
 
 template <int R, bool Half>
 __global__ void __launch_bounds__(kQuantWarps * 32) quantize_kernel(const QuantArgs a) {
-    extern __shared__ float part[];  // [2][kSlice][R]: the partials' fixed-order sum
+    extern __shared__ float part[];  // [kSlice][R]: the partials' running sum
     const int lane = threadIdx.x & 31, kw = threadIdx.x >> 5, g = lane >> 2, t = lane & 3;
     const int r0 = blockIdx.x * kSlice, bm = r0 / kRows, wg = (r0 % kRows) / kSlice;
     const int steps = a.K / kDepth;
@@ -331,15 +331,15 @@ __global__ void __launch_bounds__(kQuantWarps * 32) quantize_kernel(const QuantA
                                     word(D[kh], 2 * s), word(D[kh], 2 * s + 1));
         }
     }
-    // (w0 + w2) + (w1 + w3)
-    if (kw >= 2) put<R>(part + (kw - 2) * kSlice * R, la);
-    __syncthreads();
-    if (kw < 2) add<R>(part + kw * kSlice * R, la);
-    __syncthreads();
-    if (kw == 1) put<R>(part, la);
-    __syncthreads();
-    if (kw != 0) return;
-    add<R>(part, la);
+    // ((w0 + w1) + w2) + ... + w7, one warp at a time: the last holds the sum.
+    for (int w = 0; w < kQuantWarps; ++w) {
+        if (kw == w) {
+            if (w > 0) add<R>(part, la);
+            if (w + 1 < kQuantWarps) put<R>(part, la);
+        }
+        __syncthreads();
+    }
+    if (kw != kQuantWarps - 1) return;
 #pragma unroll
     for (int i = 0; i < 2; ++i)
 #pragma unroll
@@ -488,8 +488,8 @@ int rows(int M) { return (M + kRows - 1) / kRows * kRows; }
 
 template <int R, bool Half>
 cudaError_t launch_quantize(const QuantArgs& a, cudaStream_t stream) {
-    quantize_kernel<R, Half><<<rows(a.M) / kSlice, kQuantWarps * 32,
-                               2 * kSlice * R * sizeof(float), stream>>>(a);
+    quantize_kernel<R, Half><<<rows(a.M) / kSlice, kQuantWarps * 32, kSlice * R * sizeof(float),
+                               stream>>>(a);
     return cudaGetLastError();
 }
 
