@@ -299,6 +299,9 @@ class Loops:
                     native = sum(count for _, _, count in program.first)
                     elapsed = (time.perf_counter() - began) * 1000 / native
                     known.costs[at] = (start.elapsed_time(end), elapsed, record_ms)
+                    row["costs_ms"] = dict(
+                        zip(("eager_step", "native_step", "record"), known.costs[at], strict=True)
+                    )
             except BaseException:
                 if program is not None:
                     program.close()
@@ -461,6 +464,11 @@ def _record(
             eager_ms, native_ms, record_ms = learned
             saving = (eager_ms - native_ms) * (len(steps) - done)
             if saving <= record_ms:
+                row["costs_ms"] = {
+                    "eager_step": eager_ms,
+                    "native_step": native_ms,
+                    "record": record_ms,
+                }
                 row["eager"] = f"recording {record_ms:.0f} ms, saving {saving:.0f} ms"
                 _back(work, tensors)  # the eager rest runs on the caller's tensors
                 tensors = work + tensors[len(work) :]
