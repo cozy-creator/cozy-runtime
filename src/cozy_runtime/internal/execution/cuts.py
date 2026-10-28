@@ -52,6 +52,12 @@ def install(module: nn.Module) -> int:
             sub._conv_forward = _conv_bands(f"{path}:bands", sub, _conv_of(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
+        if _causal_conv(sub) and "_cozy_cut" not in vars(sub) and "forward" not in vars(sub):
+            causal: nn.Module = sub
+            causal.forward = catch.transparent(_causal_frame(sub))
+            vars(sub)["_cozy_cut"] = True
+            count += 1
+            continue
         if _upsampled_conv(sub) and "_cozy_cut" not in vars(sub) and "forward" not in vars(sub):
             fused: nn.Module = sub
             fused.forward = catch.transparent(_upsample_conv(f"{path}:rows", sub))
@@ -171,6 +177,52 @@ def _bands(
         del part
     assert out is not None
     return out
+
+
+def _causal_conv(module: nn.Module) -> bool:
+    """Diffusers' causal 3-D conv (Wan/Qwen-Image VAEs): it pads time only in front, by its
+    kernel's length less one, and its own forward does the padding (`_padding`)."""
+    pads = getattr(module, "_padding", None)
+    return (
+        isinstance(module, nn.Conv3d)
+        and type(module).__name__.endswith("CausalConv3d")
+        and type(module).forward.__module__.startswith("diffusers.")
+        and isinstance(pads, tuple)
+        and len(pads) == 6
+        and pads[5] == 0
+        and pads[4] == module.kernel_size[0] - 1
+        and module.stride[0] == 1
+        and module.dilation == (1, 1, 1)
+        and module.groups == 1
+    )
+
+
+def _causal_frame(module: nn.Module) -> Callable[..., object]:
+    """One frame with no cached frames is a 2-D conv by the kernel's last time tap: the taps
+    before it read only the front padding's zeros. Diffusers pads the frame to three (580 MiB of
+    copy in Anima's 3 GB decode) and convolves all three; this reads the frame once."""
+    whole = _forward(module)
+
+    def forward(x: object, cache_x: object = None) -> object:
+        if (
+            cache_x is not None
+            or not isinstance(x, Tensor)
+            or x.dim() != 5
+            or x.shape[2] != 1
+            or torch.is_grad_enabled()
+            or type(module.weight) not in (Tensor, nn.Parameter)
+        ):
+            return whole(x, cache_x)
+        pads = module._padding
+        return torch.nn.functional.conv2d(
+            x[:, :, 0],
+            module.weight[:, :, -1],
+            module.bias,
+            stride=module.stride[1:],
+            padding=(pads[2], pads[0]),
+        ).unsqueeze(2)
+
+    return forward
 
 
 def _upsampled_conv(module: nn.Module) -> bool:
