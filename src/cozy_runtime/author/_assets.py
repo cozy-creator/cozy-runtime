@@ -16,21 +16,33 @@ import hashlib
 import stat
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from fractions import Fraction
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, ClassVar, Final, Literal, Self, get_args, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Final,
+    Literal,
+    Self,
+    get_args,
+    get_type_hints,
+    overload,
+)
 
+import msgspec
 from PIL.Image import Image as Image
 
 from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
+    InvalidRequest,
     PreflightViolation,
     RuntimeFailure,
 )
-from cozy_runtime.author._markers import PREPARATIONS, Preparation
-from cozy_runtime.author._walker import strip, unwrap_optional
+from cozy_runtime.author._markers import PREPARATIONS, AssetBound, Preparation
+from cozy_runtime.author._walker import field_values, strip, unwrap_optional
 
 if TYPE_CHECKING:
     from cozy_runtime.author._decode import (
@@ -639,3 +651,99 @@ def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:
     tree._root = root
     tree.digest = digest
     tree._attempt = attempt
+
+
+@dataclass(frozen=True, slots=True)
+class AssetInput:
+    """One typed Asset occurrence and its lossless request address."""
+
+    input_id: str
+    order: int
+    asset: Asset
+    bound: AssetBound | None
+    segments: tuple[str | int, ...]
+    preparation: Preparation | None = None
+
+
+def asset_inputs(payload: object) -> list[AssetInput]:
+    """Every input asset with its identity, order, and concrete typed-field bound.
+
+    `input_id` is the payload FIELD PATH with the list index included, which is
+    inputs are identified, ordered subjects and
+    never a digest-sorted anonymous list. `order` is the position within the containing
+    list — 0 for a scalar field — because for H3's mixed reference sets the ORDER IS MODEL
+    INPUT, not a presentation fact, and two assets with equal bytes are two subjects.
+
+    Deliberately a second walk beside `assets_in`: that one answers "is this handle mine",
+    which is a question about identity and must collect a repeat, while this one answers
+    "which grant entry fills this field", which is a question about position.
+    """
+    found: list[AssetInput] = []
+
+    def walk_value(
+        value: object,
+        segments: tuple[str | int, ...],
+        order: int,
+        seen: set[int],
+        bound: AssetBound | None,
+        preparation: Preparation | None,
+    ) -> None:
+        if isinstance(value, Asset):
+            bad = [part for part in segments if isinstance(part, str) and (not part or "." in part)]
+            if bad:
+                raise InvalidRequest(
+                    "asset field path segments must be non-empty and contain no '.': "
+                    + ", ".join(repr(part) for part in bad),
+                    code="asset_input_path_unsupported",
+                )
+            input_id = ".".join(str(part) for part in segments)
+            prepared = preparation if preparation and preparation.kind == value.kind else None
+            found.append(AssetInput(input_id, order, value, bound, segments, prepared))
+            return
+        if isinstance(value, Tree) or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk_value(item, (*segments, index), index, seen, bound, preparation)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                walk_value(item, (*segments, str(key)), order, seen, bound, preparation)
+            return
+        if isinstance(value, msgspec.Struct):
+            fields = [
+                (field_info.encode_name, field_info.name, field_info.type)
+                for field_info in msgspec.structs.fields(type(value))
+            ]
+        elif is_dataclass(value) and not isinstance(value, type):
+            annotations = get_type_hints(type(value), include_extras=True)
+            fields = [(name, name, annotations.get(name, object)) for name in field_values(value)]
+        else:
+            return
+        for name, attribute, annotation in fields:
+            base, markers = strip(annotation)
+            declared = next((m for m in markers if isinstance(m, AssetBound)), None)
+            prepared = field_preparation(base, markers)
+            walk_value(
+                getattr(value, attribute),
+                (*segments, name),
+                order,
+                seen,
+                declared if declared is not None else bound,
+                prepared if prepared is not None else preparation,
+            )
+
+    walk_value(payload, (), 0, set(), None, None)
+    counts: dict[str, int] = {}
+    for item in found:
+        counts[item.input_id] = counts.get(item.input_id, 0) + 1
+    duplicates = sorted(input_id for input_id, count in counts.items() if count > 1)
+    if duplicates:
+        raise InvalidRequest(
+            "asset field paths are ambiguous after wire-name encoding: "
+            + ", ".join(repr(input_id) for input_id in duplicates),
+            code="asset_input_id_ambiguous",
+            fields=duplicates,
+        )
+    return found

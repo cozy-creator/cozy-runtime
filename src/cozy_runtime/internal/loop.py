@@ -42,6 +42,7 @@ from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fau
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import kernel_ready
+from cozy_runtime.internal.accel import ResidencyError
 from cozy_runtime.internal.prepared import (
     PreparedRepeat,
     PreparedSequence,
@@ -56,7 +57,6 @@ from cozy_runtime.internal.residency import (
     ENTERED,
     Binding,
     Model,
-    ResidencyError,
 )
 
 _execution: Any

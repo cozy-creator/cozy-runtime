@@ -33,7 +33,13 @@ from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import CapabilityError, Fault, fault
 from cozy_runtime.internal import proctree
-from cozy_runtime.internal.accel import allocation, host_memory, release_cached
+from cozy_runtime.internal.accel import (
+    ResidencyError,
+    StaleBinding,
+    allocation,
+    host_memory,
+    release_cached,
+)
 
 __all__ = [
     "Binding",
@@ -46,9 +52,7 @@ __all__ = [
     "QueuedPrefetch",
     "Region",
     "Request",
-    "ResidencyError",
     "Room",
-    "StaleBinding",
     "TensorLayout",
     "Weights",
     "blocks_of",
@@ -109,18 +113,6 @@ _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionar
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
 _UNPROVEN: list[Binding] = []
-
-
-class ResidencyError(RuntimeError):
-    code = "RESIDENCY"
-    sticky = False
-    cuda_code = None
-
-
-class StaleBinding(ResidencyError):
-    """A cached graph must retire before these weights can change storage or fill."""
-
-    code = "STALE_BINDING"
 
 
 class Level(Enum):
@@ -197,7 +189,10 @@ class TensorLayout:
 
 
 class BindingLayout(Protocol):
-    """An explicitly immutable binder. Its cold writer is not a native-prefetch callback."""
+    """An explicitly immutable binder. Its cold writer is not a native-prefetch callback.
+    `encoded`: it binds encoded parts (the ordinary weight routes), so a stage may load them."""
+
+    encoded: bool
 
     @property
     def identity(self) -> str: ...
@@ -693,7 +688,7 @@ class Binding:
                 return f"{name} block {b.path or '(common)'}: raw {_state(b.region)}{final}"
         return ""
 
-    def _load_refusal(self, stage: bool, region_input: bool, routes: type) -> str:
+    def _load_refusal(self, stage: bool, region_input: bool) -> str:
         """The first reason `prepare_load` refuses this binding, or empty when it can load."""
         memory, model = self.model.memory, self.model
         if why := self._invalid():
@@ -719,7 +714,7 @@ class Binding:
                 (f"has {len(finals)} final rows ({', '.join(finals[:3])})", finals),
                 (
                     "has encoded parts outside a routed stage",
-                    encoded and (not stage or not isinstance(model.finals, routes)),
+                    encoded and (not stage or model.finals is None or not model.finals.encoded),
                 ),
                 ("has no storage", not block.storage_bytes),
                 (
@@ -740,14 +735,12 @@ class Binding:
         Ordinary block data is never changed here. The native slot atomically retains ready
         regions and owns unpublished missing fills; its views are installed only by prepare().
         """
-        from cozy_runtime.internal.weights import _Routes
-
         memory, model = self.model.memory, self.model
         with self.lock:
             model._claim()
             try:
                 if why := self._load_refusal(
-                    stage, getattr(varena.LoadSlot, "supports_region_input", False), _Routes
+                    stage, getattr(varena.LoadSlot, "supports_region_input", False)
                 ):
                     raise StaleBinding(
                         f"native component loading needs idle immutable raw layouts: {why}"

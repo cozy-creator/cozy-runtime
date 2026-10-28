@@ -436,7 +436,8 @@ class _Placeholder:
 def compile_variant(route: str, blocks: int = 0, full: bool = False) -> bytes:
     """Upstream `_compile_<route>`, traced from placeholders; SM90's at a length that IS this
     variant. Every route takes q, k, v, output, kc, vc, threshold and lse."""
-    torch = import_module("torch")
+    import torch
+
     cute = import_module("cutlass.cute")
     cuda = import_module("cuda.bindings.driver")
     to_cute_tensor = import_module("sol_attn.common").to_cute_tensor
@@ -518,7 +519,9 @@ def card_jobs(store: kernel_cache.Store, capability: tuple[int, int]) -> list[ke
 
 def submit_card(index: int) -> None:
     """As soon as Sol is ready here, for a machine whose kernel boot has not: `card_jobs`."""
-    device = import_module("torch").device("cuda", index)
+    import torch
+
+    device = torch.device("cuda", index)
     capability = _capability(device)
     store = kernel_cache.configured()
     if capability is None or store is None:
@@ -626,7 +629,9 @@ def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool | None:
     if store is None:
         raise kernel_compile.CompileFailed("absent", "no machine kernel store to compile into")
     major, minor = _arch(index)
-    found = import_module("cozy_runtime.internal.triton_kernels").warm_job(
+    from cozy_runtime.internal import triton_kernels
+
+    found = triton_kernels.warm_job(
         f"{KERNEL}-preprocess",
         f"{__name__}:preprocess",
         [tokens, heads],
@@ -638,7 +643,9 @@ def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool | None:
         return None
     if state.state != "ready":
         raise kernel_compile.CompileFailed(state.state, state.line())
-    with import_module("torch").cuda.device(index):
+    import torch
+
+    with torch.cuda.device(index):
         preprocess(tokens, heads)
     return True
 
@@ -649,7 +656,8 @@ def preprocess(tokens: int, heads: int) -> None:
     in an executor it loads what that built. Its operands are host stand-ins in the live ones'
     class: what compiles is the descriptors' block shapes, the constants and the lengths'
     residues, never the sizes."""
-    torch = import_module("torch")
+    import torch
+
     upstream = import_module("sol_attn.preprocess")
     descriptor = import_module("triton.tools.tensor_descriptor").TensorDescriptor
     _pin_preprocess()
@@ -790,7 +798,9 @@ def _attention(
 
 
 def _arch(device: Device | int) -> tuple[int, int]:
-    found = tuple(import_module("torch").cuda.get_device_capability(device))
+    import torch
+
+    found = tuple(torch.cuda.get_device_capability(device))
     return (found[0], found[1])
 
 
@@ -868,7 +878,9 @@ def _execute(
     elif fa4:
         # The exact tiles take the dense rows' precision; the model's exact paths stay BF16.
         # The protected prefix's query tiles attend every key inside the same call.
-        live_output = import_module("cozy_runtime.internal.attention_sol_fa4").sparse(
+        from cozy_runtime.internal import attention_sol_fa4
+
+        live_output = attention_sol_fa4.sparse(
             q.contiguous(),
             k.contiguous(),
             v.contiguous(),

@@ -20,10 +20,10 @@ import msgspec
 import torch
 from torch import Tensor, nn
 
+import cozy_runtime.internal.execution.sizing as sizing
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import TRANSPARENT
-from cozy_runtime.internal.execution import sizing
 from cozy_runtime.internal.residency import Request
 
 type Args = Sequence[object]

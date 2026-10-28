@@ -28,11 +28,11 @@ import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, suppress
-from dataclasses import dataclass, field, is_dataclass, replace
+from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, get_args, get_type_hints
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import msgspec
 
@@ -46,9 +46,9 @@ from cozy_runtime.author._assets import (
     ImageAsset,
     InputMetadata,
     Tree,
+    asset_inputs,
     bind,
     bind_tree,
-    field_preparation,
 )
 from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import CURRENT, Context, Device
@@ -75,7 +75,7 @@ from cozy_runtime.author._errors import (
     unwind,
 )
 from cozy_runtime.author._executor_requests import Publish, Published
-from cozy_runtime.author._markers import AssetBound, ImagePreparation, Preparation
+from cozy_runtime.author._markers import AssetBound, ImagePreparation
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
@@ -92,7 +92,7 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._signature import Param, Surface
 from cozy_runtime.author._walker import field_values, strip, unwrap_optional, walk
-from cozy_runtime.author._weights import ReadValues, Weights
+from cozy_runtime.author._weights import ReadBytes, ReadValues, Weights
 
 if TYPE_CHECKING:
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
@@ -287,6 +287,7 @@ class Invocation:
     declare none. A larger field never widens an undeclared sibling's allowance."""
     sources: Mapping[str, Weights[Any]] = field(default_factory=dict)
     """`Weights[M]` parameter -> its raw checkpoint, read through this attempt's source."""
+    weights_bytes: ReadBytes | None = None
     weights_values: ReadValues | None = None
     tensorfs_source: Callable[[str], Checkpoint] | None = None
     tensorfs_output: Callable[[str, Derivation], Output] | None = None
@@ -447,8 +448,8 @@ def _bind_tensorfs(
 
     ctx._tensorfs_source, ctx._tensorfs_output, ctx._tensorfs_adopt = source, output, adopt
     for weights in inv.sources.values():
-        weights._bind(functools.partial(source, weights), inv.weights_values)
-        handles.callback(weights._bind, None, None)
+        weights._bind(functools.partial(source, weights), inv.weights_bytes, inv.weights_values)
+        handles.callback(weights._bind, None, None, None)
 
 
 def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> InvocationResult:
@@ -756,102 +757,6 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
                 code="tree_unmaterialized",
             )
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
-
-
-@dataclass(frozen=True, slots=True)
-class AssetInput:
-    """One typed Asset occurrence and its lossless request address."""
-
-    input_id: str
-    order: int
-    asset: Asset
-    bound: AssetBound | None
-    segments: tuple[str | int, ...]
-    preparation: Preparation | None = None
-
-
-def asset_inputs(payload: object) -> list[AssetInput]:
-    """Every input asset with its identity, order, and concrete typed-field bound.
-
-    `input_id` is the payload FIELD PATH with the list index included, which is
-    inputs are identified, ordered subjects and
-    never a digest-sorted anonymous list. `order` is the position within the containing
-    list — 0 for a scalar field — because for H3's mixed reference sets the ORDER IS MODEL
-    INPUT, not a presentation fact, and two assets with equal bytes are two subjects.
-
-    Deliberately a second walk beside `assets_in`: that one answers "is this handle mine",
-    which is a question about identity and must collect a repeat, while this one answers
-    "which grant entry fills this field", which is a question about position.
-    """
-    found: list[AssetInput] = []
-
-    def walk_value(
-        value: object,
-        segments: tuple[str | int, ...],
-        order: int,
-        seen: set[int],
-        bound: AssetBound | None,
-        preparation: Preparation | None,
-    ) -> None:
-        if isinstance(value, Asset):
-            bad = [part for part in segments if isinstance(part, str) and (not part or "." in part)]
-            if bad:
-                raise InvalidRequest(
-                    "asset field path segments must be non-empty and contain no '.': "
-                    + ", ".join(repr(part) for part in bad),
-                    code="asset_input_path_unsupported",
-                )
-            input_id = ".".join(str(part) for part in segments)
-            prepared = preparation if preparation and preparation.kind == value.kind else None
-            found.append(AssetInput(input_id, order, value, bound, segments, prepared))
-            return
-        if isinstance(value, Tree) or id(value) in seen:
-            return
-        seen.add(id(value))
-        if isinstance(value, (list, tuple)):
-            for index, item in enumerate(value):
-                walk_value(item, (*segments, index), index, seen, bound, preparation)
-            return
-        if isinstance(value, dict):
-            for key, item in value.items():
-                walk_value(item, (*segments, str(key)), order, seen, bound, preparation)
-            return
-        if isinstance(value, msgspec.Struct):
-            fields = [
-                (field_info.encode_name, field_info.name, field_info.type)
-                for field_info in msgspec.structs.fields(type(value))
-            ]
-        elif is_dataclass(value) and not isinstance(value, type):
-            annotations = get_type_hints(type(value), include_extras=True)
-            fields = [(name, name, annotations.get(name, object)) for name in field_values(value)]
-        else:
-            return
-        for name, attribute, annotation in fields:
-            base, markers = strip(annotation)
-            declared = next((m for m in markers if isinstance(m, AssetBound)), None)
-            prepared = field_preparation(base, markers)
-            walk_value(
-                getattr(value, attribute),
-                (*segments, name),
-                order,
-                seen,
-                declared if declared is not None else bound,
-                prepared if prepared is not None else preparation,
-            )
-
-    walk_value(payload, (), 0, set(), None, None)
-    counts: dict[str, int] = {}
-    for item in found:
-        counts[item.input_id] = counts.get(item.input_id, 0) + 1
-    duplicates = sorted(input_id for input_id, count in counts.items() if count > 1)
-    if duplicates:
-        raise InvalidRequest(
-            "asset field paths are ambiguous after wire-name encoding: "
-            + ", ".join(repr(input_id) for input_id in duplicates),
-            code="asset_input_id_ambiguous",
-            fields=duplicates,
-        )
-    return found
 
 
 def _check_input(

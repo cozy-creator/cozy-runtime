@@ -17,18 +17,16 @@ B200 and 81-86 ms on a B300, against Sol's 134-146 ms (h3a-093).
 from __future__ import annotations
 
 from importlib import import_module
-from typing import TYPE_CHECKING
 
+import torch
 import triton
 import triton.language as tl
+from torch import Tensor
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import attention_sol
 from cozy_runtime.internal import attention_upstream as upstream
-
-if TYPE_CHECKING:
-    from torch import Tensor
 
 BLOCK = 64
 #: FA4's SM100 forward tile: two 128-row query stages share every key/value tile.
@@ -63,8 +61,6 @@ def _routed(
 ) -> Tensor:
     """`sparse` past upstream's preprocess: Sol's route pooled onto FA4's tiles, FA4's exact
     tiles, then the approximation merged in (`_LAUNCH`'s kernel)."""
-    import torch
-
     pooled = route(query, kc, threshold, scale, sink_tokens)
     count = pooled.sum(-1, dtype=torch.int32)
     index = torch.argsort(pooled.to(torch.int8), dim=-1, descending=True, stable=True)
@@ -96,8 +92,6 @@ def warm(index: int, launch: Launch) -> None:
     preprocess outputs: FA4's cache keys neither on length nor on head count, so a run's first
     sparse step finds them built. FA4 is CuTe-DSL compiled in this process by upstream, which
     has no object to build elsewhere; upstream's preprocess builds per length (`attention_sol`)."""
-    import torch
-
     _LAUNCH[index] = launch
     device = torch.device("cuda", index)
     with torch.no_grad(), torch.cuda.device(device):
@@ -113,8 +107,6 @@ def warm(index: int, launch: Launch) -> None:
 
 def route(query: Tensor, kc: Tensor, threshold: Tensor, scale: float, sink_tokens: int) -> Tensor:
     """Sol's exact-block decisions pooled onto FA4's tiles: bool [heads, query tiles, key tiles]."""
-    import torch
-
     _, tokens, heads, dim = query.shape
     blocks = kc.shape[1]
     pad = blocks * BLOCK - tokens
@@ -140,8 +132,6 @@ def route(query: Tensor, kc: Tensor, threshold: Tensor, scale: float, sink_token
 def _merge_approximation(
     query: Tensor, kc: Tensor, vc: Tensor, pooled: Tensor, out: Tensor, lse: Tensor, scale: float
 ) -> None:
-    import torch
-
     _, tokens, heads, dim = query.shape
     blocks = kc.shape[1]
     if lse.shape != (1, heads, tokens) or not (lse.is_contiguous() and out.is_contiguous()):

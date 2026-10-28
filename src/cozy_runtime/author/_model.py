@@ -42,7 +42,7 @@ from typing import (
     final,
 )
 
-from cozy_runtime.author import _request_path as request_path
+import cozy_runtime.author._request_path as request_path
 from cozy_runtime.author._context import (
     CURRENT,
     AdapterRef,

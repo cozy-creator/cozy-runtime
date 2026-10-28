@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import fnmatch
 import re
+import sys
+from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import Any
 
 from cozy_runtime import canonical_json
@@ -11,7 +14,9 @@ from cozy_runtime.author import (
     MAX_WEIGHTS_NEW_BYTES,
     App,
     Context,
+    DerivationHook,
     MemoDistribution,
+    Model,
     ModelArtifact,
     QuantizationPlan,
     SelectionPlan,
@@ -21,6 +26,7 @@ from cozy_runtime.author import (
     WeightsOutput,
     invocable,
 )
+from cozy_runtime.author._recipes import DeclaredRecipe, Plan, canonical, fingerprint
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
 from . import facade, svdq
@@ -32,6 +38,7 @@ from .quantization import (
     prepare_source_quantization,
     source_rows,
 )
+from .recipes import declared_plan, declared_recipe
 
 # This is the platform's representable grant ceiling, not a model-size estimate.
 # Writer admission uses actual remaining added-role geometry (cr-151).
@@ -304,3 +311,133 @@ def calibrate(
     if not keys:
         raise UnsupportedInput("the plan encodes no weight as svdq.nvfp4", code="quantization_plan")
     return svdq.Calibration(torch, components, keys)
+
+
+def run_recipe(
+    ctx: Context,
+    tel: Telemetry,
+    source: Weights[Any],
+    model: Model[Any] | None,
+    *,
+    lane: str,
+    package: str,
+    release: str,
+    recipe: str,
+) -> ModelArtifact:
+    """The Runtime's side of `recipes.quantize`, which an executor installs."""
+    opened = ctx.tensorfs_source(source)
+    row, plan = choose(ctx._recipes, opened, lane=lane, recipe=recipe, package=package)
+    form = canonical(plan)
+    digest = fingerprint(form, package, release, row.calibrate)
+    provenance = {"package": package, "release": release, "recipe": row.name,
+                  "fingerprint": digest, "source": opened.id, "plan": form}  # fmt: skip
+    if row.calibrate:
+        provenance["calibrate"] = row.calibrate
+    opener = ctx._tensorfs_output
+    if opener is None:
+        raise UnsupportedInput("this attempt writes no weights", code="weights_output_ungranted")
+    ctx._tensorfs_output = lambda slot, made: opener(
+        slot, replace(made, provenance={**provenance, **(made.provenance or {})})
+    )
+    tel.log("recipe", recipe=row.name, lane=row.lane, fingerprint=digest)
+    try:
+        if isinstance(plan, QuantizationPlan):
+            recorded = _calibrated(ctx, tel, opened, model, row, plan) if row.calibrate else None
+            return quantize_into(
+                ctx, tel, source=opened, plan=plan, output=row.lane, calibration=recorded
+            )
+        if isinstance(plan, SelectionPlan):
+            return select_into(ctx, tel, source=opened, plan=plan, output=row.lane)
+        return plan.function(ctx, tel, source, row.lane)
+    finally:
+        ctx._tensorfs_output = opener
+
+
+def _calibrated(
+    ctx: Context,
+    tel: Telemetry,
+    source: Checkpoint,
+    model: Model[Any] | None,
+    row: DeclaredRecipe,
+    plan: QuantizationPlan,
+) -> svdq.Calibration:
+    """What `row`'s `calibrate` recorded running real inputs through `model`."""
+    if model is None:
+        raise UnsupportedInput(
+            f"{row.name} calibrates on its model, and this quantize has no model slot",
+            code="recipe_declaration",
+        )
+    recorders: list[svdq.Calibration] = []
+
+    def record(components: Any) -> svdq.Calibration:
+        torch = sys.modules["torch"]  # the model's own: a module of it is in `components`
+        recorders.append(calibrate(ctx, torch, source=source, components=components, plan=plan))
+        return recorders[-1]
+
+    calibration = declared_recipe(row).calibrate
+    assert calibration is not None
+    calibration(ctx, tel, model, record)
+    if not recorders:
+        raise UnsupportedInput(
+            f"{row.calibrate} recorded nothing: it never opened `record(components)`",
+            code="recipe_calibration",
+        )
+    return recorders[-1]
+
+
+def choose(
+    declared: Sequence[DeclaredRecipe],
+    source: Checkpoint,
+    *,
+    lane: str,
+    recipe: str,
+    package: str,
+    plan: Callable[[DeclaredRecipe], Plan] | None = None,
+) -> tuple[DeclaredRecipe, Plan]:
+    """The one recipe of `lane` (named `recipe`, when given) that reads `source`; each row's
+    plan is the one its module binds (`declared_plan`) unless `plan` reads it otherwise."""
+    named = recipe.replace("-", "_").lower()
+    offered = [r for r in declared if r.lane == lane and (not named or r.name == named)]
+    if not offered:
+        what = f"{recipe!r} writing {lane}" if recipe else lane
+        lanes = ", ".join(sorted({r.lane for r in declared}))
+        raise UnsupportedInput(
+            f"{package} declares no {what} recipe; its lanes: {lanes}", code="recipe_not_found"
+        )
+    held = set(source.components)
+    reads = [r for r in offered if r.model.components() <= held]
+    if not reads:
+        wants = "; ".join(
+            f"{r.name} reads {r.model.class_name} ({', '.join(sorted(r.model.components()))})"
+            for r in offered
+        )
+        raise UnsupportedInput(
+            f"no {lane} recipe of {package} reads this checkpoint ({', '.join(sorted(held))}): "
+            f"{wants}",
+            code="recipe_source",
+        )
+    found = [(row, (plan or declared_plan)(row)) for row in reads]
+    if len(found) > 1:
+        found = [(row, plan) for row, plan in found if fits(source, plan)]
+    if len(found) != 1:
+        names = ", ".join(row.name for row in reads)
+        raise UnsupportedInput(
+            f"{len(found)} of {package}'s {lane} recipes ({names}) select from this checkpoint; "
+            "name one with recipe=",
+            code="recipe_ambiguous",
+        )
+    return found[0]
+
+
+def fits(source: Checkpoint, plan: Plan) -> bool:
+    """Whether every pattern and key of `plan` names a weight of `source`."""
+    if isinstance(plan, DerivationHook):
+        return True
+    within = plan.components if isinstance(plan, QuantizationPlan) else source.components
+    names = [f"{c}.{key}" for c, key, _ in source_rows(source) if c in within]
+    keys = plan.keys if isinstance(plan, QuantizationPlan) else ()
+    return (
+        set(within) <= set(source.components)
+        and all(any(fnmatch.fnmatchcase(n, rule) for n in names) for rule in plan.include)
+        and all(f"{c}.{key}" in names for c in within for key in keys)
+    )

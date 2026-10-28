@@ -21,8 +21,9 @@ from typing import cast
 import torch
 from torch import Tensor, nn
 
+import cozy_runtime.internal.execution.catch as catch
+import cozy_runtime.internal.execution.sizing as sizing
 from cozy_runtime.internal.encoding.leaves import NVFP4
-from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.execution.sizing import levelled, levels, pieces
 
 type Band = Callable[[int, int], Tensor]

@@ -15,7 +15,7 @@ import torch
 
 from cozy_runtime import __version__
 from cozy_runtime.internal import arch, attention, int8_linear, prebuilt
-from cozy_runtime.internal.encoding import launch_providers, measure_device
+from cozy_runtime.internal.encoding.selection import launch_providers, measure_device
 from cozy_runtime.internal.probe import UnmeasuredEvidence, conform
 
 DTYPES = ("bfloat16", "float16", "float32")

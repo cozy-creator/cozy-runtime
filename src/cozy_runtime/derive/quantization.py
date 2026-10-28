@@ -15,7 +15,7 @@ import tempfile
 import threading
 from collections import deque
 from collections.abc import Callable, Generator, Iterator, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from typing import IO, TYPE_CHECKING, Any, NamedTuple
 
 import msgspec
@@ -27,8 +27,8 @@ from cozy_runtime.author._loader import TENSORFS_DTYPES, TENSORFS_NAMES
 from cozy_runtime.internal.model_values import read_values_into
 from cozy_runtime.weights_store import Checkpoint, Output, PartData, read_into
 
+from . import native_quantization, svdq
 from . import safetensors_io as st
-from . import svdq
 from .microscale import (
     CONVROT_GROUP,
     NVFP4_BLOCK,
@@ -39,6 +39,7 @@ from .microscale import (
     encode_nvfp4,
     encode_w4a8,
 )
+from .native_quantization import PARAMS, PER_ROW, QuantizationStats, _pool, _run_native
 
 if TYPE_CHECKING:
     from tensorfs.api import NormalizeBf16Tensor
@@ -46,9 +47,9 @@ if TYPE_CHECKING:
 
 class _Encoding(NamedTuple):
     """A scheme's encoder: its round-trip bound (a multiple of tensor amax), the column multiple
-    it needs, its params, and its parts after `weight`, each `(role, dtype, shape)` for an
-    `[rows, cols]` tensor. A part shaped `()` is one per tensor (nvfp4's second level), so the
-    tensor's amax is read before any chunk is encoded and every chunk encodes against it. A
+    it needs, and its parts after `weight`, each `(role, dtype, shape)` for an `[rows, cols]`
+    tensor; its params are `PARAMS`. A part shaped `()` is one per tensor (nvfp4's second level),
+    so the tensor's amax is read before any chunk is encoded and every chunk encodes against it. A
     `whole` part is also one per tensor but fixed (w4a8's codebook): every chunk writes it the
     same. `pack` weights share a stored element (w4a8's codes are `[rows, cols / 2]` bytes)."""
 
@@ -56,7 +57,6 @@ class _Encoding(NamedTuple):
     encode: Callable[[str, np.ndarray, float], Encoded]
     weight_dtype: str
     block: int
-    params: dict[str, object]
     companions: Callable[[int, int], tuple[tuple[str, str, tuple[int, ...]], ...]]
     whole: frozenset[str] = frozenset()
     pack: int = 1
@@ -83,7 +83,6 @@ _ENCODINGS: dict[str, _Encoding] = {
         _rowwise(encode_fp8_rowwise),
         "F8_E4M3",
         32,
-        {},
         _row_scale,
     ),
     # The bound is a tripwire for a broken encoder, not a quality gate.
@@ -92,7 +91,6 @@ _ENCODINGS: dict[str, _Encoding] = {
         _rowwise(encode_int8_convrot256),
         "I8",
         CONVROT_GROUP,
-        {"rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
         _row_scale,
     ),
     # A block's error is at most half its largest E2M1 step (2 of 6) times its scale, and a
@@ -102,12 +100,6 @@ _ENCODINGS: dict[str, _Encoding] = {
         encode_nvfp4,
         "F4",
         NVFP4_BLOCK,
-        {
-            "block_size": NVFP4_BLOCK,
-            "global_scale": "multiply",
-            "nibble_order": "low_first",
-            "scale_layout": "row_major",
-        },
         lambda rows, cols: (
             ("scale", "F8_E4M3", (rows, cols // NVFP4_BLOCK)),
             ("scale_2", "F32", ()),
@@ -119,7 +111,6 @@ _ENCODINGS: dict[str, _Encoding] = {
         _rowwise(encode_w4a8),
         "I8",
         CONVROT_GROUP,
-        {"group_size": W4A8_GROUP, "rotation": "kron_regular_h4", "rotation_size": CONVROT_GROUP},
         lambda rows, cols: (
             ("group_scale", "F8_E4M3", (rows, cols // W4A8_GROUP)),
             ("scale", "F32", (rows,)),
@@ -134,12 +125,6 @@ _ENCODINGS: dict[str, _Encoding] = {
         lambda key, values, amax: _uncalibrated(key),
         "F4",
         svdq.K_ALIGN,
-        {
-            "block_size": NVFP4_BLOCK,
-            "global_scale": "multiply",
-            "nibble_order": "low_first",
-            "scale_layout": "row_major",
-        },
         svdq.companions,
         calibrated=True,
     ),
@@ -158,11 +143,6 @@ def _uncalibrated(key: str) -> Encoded:
 BF16_ROUND_TRIP_BOUND = 2.0**-8
 _SOURCE_READ_CHUNK = 8 << 20
 _WIDTH = {"bf16": 2, "f16": 2, "f32": 4}
-
-
-#: Encodings a derivation reads through the serving decoder (`model_values`): per-row scaled
-#: codes, whose exact values a lane is written from (Ideogram 4 ships only fp8.rowwise).
-PER_ROW = frozenset({"fp8.rowwise", "int8.rowwise"})
 
 
 class SourceTensor(NamedTuple):
@@ -217,16 +197,6 @@ class ArtifactQuantizationRequest(msgspec.Struct, forbid_unknown_fields=True):
     max_relative_frobenius: float | None = None
     # Explicit initial native calibrated-fit allowance; callers can select a smaller grant.
     fit_workspace_bytes: int = 512 << 20
-
-
-class QuantizationStats(msgspec.Struct):
-    encoded_keys: int
-    reused_keys: int
-    source_bytes_read: int
-    new_bytes_written: int
-    saturated_elements: int
-    worst_relative_frobenius: float | None
-    tensors: list[dict[str, Any]] = msgspec.field(default_factory=list)
 
 
 class Bf16Tensor(msgspec.Struct):
@@ -350,8 +320,6 @@ def write_bf16(
     Reused keys remain in the declaration so Writer validates its normalization journal
     before trusting them. Source decoding, BF16 RNE, tripwires and staging are native.
     """
-    from .native_quantization import _run_native
-
     omitted = excluded or set()
     selected = [tensor for tensor in plan.tensors if (tensor.component, tensor.key) not in omitted]
     if not selected:
@@ -424,8 +392,6 @@ def quantize_component_into(
     def scheme(tensor: QuantizationTensor) -> str:
         return tensor.encoding or encoding
 
-    from . import native_quantization
-
     if native_quantization.supported(source, plan, encoding):
         return native_quantization.quantize(
             source,
@@ -482,7 +448,7 @@ def quantize_component_into(
                 ]
                 output.put_encoded(
                     component, tensor.key, TENSORFS_NAMES[logical_dtype(tensor)], tensor.shape,
-                    name, encoder.params, parts,
+                    name, PARAMS[name], parts,
                 )  # fmt: skip
                 new_bytes += spill_bytes + sum(len(raw) for raw in result.scales)
             worst = _numeric.worst(worst, relative)
@@ -601,12 +567,6 @@ def _in_order(
             if not future.cancel():
                 with contextlib.suppress(Exception):
                     future.result().spill.close()
-
-
-@functools.cache
-def _pool() -> ThreadPoolExecutor:
-    """One process-wide encoder pool: callers that shard their own work share its bound."""
-    return ThreadPoolExecutor(cpus(), thread_name_prefix="cozy-quantize")
 
 
 def _read_chunks(

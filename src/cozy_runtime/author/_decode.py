@@ -31,7 +31,7 @@ from PIL.Image import new as pil_new
 from PIL.Image import open as pil_open
 from PIL.ImageOps import exif_transpose
 
-from cozy_runtime.author import _color
+import cozy_runtime.author._color as _color
 from cozy_runtime.author._errors import AuthorError, CapabilityError, InvalidRequest, RuntimeFailure
 from cozy_runtime.author._markers import ImagePreparation, seconds
 

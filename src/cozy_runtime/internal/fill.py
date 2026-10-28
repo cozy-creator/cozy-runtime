@@ -22,8 +22,14 @@ import tensorfs
 from tensorfs import raw
 
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec, canonical_dtype
-from cozy_runtime.internal.encoding import PLAIN, TORCH_DTYPES, Encoded, RolePart, params_of
-from cozy_runtime.internal.encoding.formats import part_rule
+from cozy_runtime.internal.encoding.formats import (
+    PLAIN,
+    TORCH_DTYPES,
+    Encoded,
+    RolePart,
+    params_of,
+    part_rule,
+)
 from cozy_runtime.internal.resolution import PlanRefusal, ResolvedModelPlan
 
 #: The component of a model without a pipeline, whose folder is the root (a Transformers model).
