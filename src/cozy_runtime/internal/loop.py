@@ -16,7 +16,8 @@ recorded. Any other program closes before the loop returns, ahead of an eager `a
 program is recorded only while its native steps save more than recording costs, as the site's
 last recorded call measured: a second eager step measures each call's eager speed.
 
-A loop outside any component scope (tensor work only) records resident too, and is never kept.
+A loop outside any component scope (tensor work only) records resident too, every call, and is
+never kept.
 """
 
 from __future__ import annotations
@@ -454,7 +455,7 @@ def _record(
     # A resident program no call keeps serves this call alone. A second eager step measures
     # eager speed; the site's last recorded call measured native speed and the recording.
     done, events = 1, None
-    if resident and not ends and len(steps) > 2:
+    if resident and not ends and scope and len(steps) > 2:
         events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         events[0].record()
         loop.eager(steps[1:2], tensors, ctx)
