@@ -109,7 +109,6 @@ from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
     prepare,
-    prepare_program,
     run_prepared,
 )
 from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
@@ -995,7 +994,6 @@ class Executor:
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
-            "program_preparation": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -4709,104 +4707,6 @@ class Executor:
         if checked != set(declarations):
             raise InvalidRequest("a prepared model slot is absent", code="prepared_use_binding")
 
-    def _prepare_program(self, command: Map) -> dict[str, Any]:
-        """A GPU warm command, alone under the existing process order and GPU permit.
-
-        Normal preflight and the declared factory run on the actual loaded models. This
-        neither enters the generation handler nor grants output or inference submission.
-        The returned readiness is a point-in-time fact, not a residency reservation.
-        """
-        record: AuthorAttempt | None = None
-        entered = False
-        reply: dict[str, Any]
-        try:
-            if command.level != "gpu" or not command.request_id:
-                raise InvalidRequest("program warming needs a GPU request", code="prepare_request")
-            if self.world != 1 or self.device_kind != "cuda":
-                raise CapabilityError(
-                    "program warming requires one CUDA device", code="prepare_device"
-                )
-            if not self.ready or self.poisoned:
-                raise CapabilityError("construction is not ready", code="executor_not_ready")
-            if command.entrypoint not in self.surface_names:
-                raise InvalidRequest("unknown warm entrypoint", code="unknown_entrypoint")
-            if not isinstance(command.payload, Mapping):
-                raise InvalidRequest(
-                    "warm payload must be a request object", code="prepare_payload"
-                )
-            registration = self.discovered.app.get(command.entrypoint)
-            if registration.prepare is None:
-                raise CapabilityError(
-                    "entrypoint declares no preparation factory", code="prepare_absent"
-                )
-            self._check_prepared_use(registration, command.payload)
-            prepared = prepare(registration, command.payload)
-            if prepared.asset_bounds:
-                raise CapabilityError(
-                    "program warming takes no input assets", code="prepare_assets"
-                )
-            if self.host.mux.cancelled(command.request_id):
-                raise InvalidRequest("warm preparation was canceled", code="cancelled")
-            entered = True
-            refused = self._grant(self, first=True)
-            if refused is not None:
-                reply = refused
-            else:
-                with self._request(command.request_id):
-                    if prepared.phases:
-                        self._plan_request(command.request_id, prepared.phases)
-                    ready, record = prepare_program(
-                        registration,
-                        prepared,
-                        Invocation(
-                            request_id=command.request_id,
-                            spool=self.root / "preparation",
-                            deadline=float("inf"),
-                            device=self._device(),
-                            cancel=functools.partial(self.host.mux.cancelled, command.request_id),
-                            models=self.models,
-                            progress=self._progress_sink(command.request_id),
-                            plan=functools.partial(self._plan_request, command.request_id),
-                        ),
-                    )
-                reply = {"ok": True, "prepared": ready, **prepared.digests()}
-        except Exception as exc:
-            outcome = classify(exc)
-            unwind(exc)
-            reply = {
-                "ok": False,
-                "code": outcome.code,
-                "detail": ends(outcome.message, 1024),
-                "terminal": outcome.terminal,
-                "origin": outcome.origin,
-                "traceback": outcome.traceback,
-            }
-            if outcome.code == DEVICE_FAULT:
-                self.poisoned = (
-                    self.poisoned or f"preparation device fault: {outcome.message}"[:300]
-                )
-        finally:
-            self.host.cuts.pop(command.request_id, None)
-            self.host.loops.pop(command.request_id, None)
-        quiet = not entered
-        if entered:
-            try:
-                # Capture warmups and fills may use side streams. The whole device joins
-                # before the permit can be reused, including clean eligibility refusals.
-                accel.synchronize(self.torch, self.device_kind)
-                if self.residency is not None:
-                    self.residency.release()
-                quiet = self._quiescent()
-            except Exception as exc:
-                self.poisoned = self.poisoned or f"preparation did not settle: {exc}"[:300]
-            if not quiet:
-                self.poisoned = self.poisoned or "preparation completion was not proven"
-        self.host.poisoned = self.host.poisoned or self.poisoned
-        if record is not None:
-            reply["observations"] = record.ring.rows()
-            reply["adjustments"] = [adjustment_row(row) for row in record.rows]
-        return {**reply, "quiescent": quiet, "poisoned": self.poisoned}
-
     def map(self, command: Map) -> dict[str, Any]:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU
         of a group."""
@@ -4817,8 +4717,6 @@ class Executor:
             return self._refusal(
                 "construction_not_loaded", f"{command.construction!r} is not loaded"
             )
-        if command.payload is not None:
-            return child._prepare_program(command)
         group = self.group if self.rank == 0 else None
         try:
             if group is not None:

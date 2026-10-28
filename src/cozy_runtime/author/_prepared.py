@@ -1,7 +1,5 @@
-"""Pure declarations for prepared computation submitted through Context.plan.
-
-The implementation belongs to the public cozy_runtime.compute facade, not the author plane.
-"""
+"""The request's native-work protocols: what the Runtime's loops (`internal.loop`) and native
+conversions submit through a request's ordered scope. Not author surface."""
 
 from __future__ import annotations
 

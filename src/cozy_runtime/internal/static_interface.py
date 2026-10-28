@@ -371,7 +371,6 @@ _ENTRYPOINT_KEYWORDS = frozenset(
     {
         "name",
         "preflight",
-        "prepare",
         "phases",
         "prepared_use",
         "demand",
@@ -1452,7 +1451,6 @@ class Registration:
     emits_media: bool = False
     #: Local execution advice, not a client callable/schema field. Source identity covers it.
     phases: tuple[tuple[str, ...], ...] = ()
-    prepare: Definition | None = None
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
 
     def declaration(self, **found: Any) -> Declaration:
@@ -1959,7 +1957,6 @@ def _registration(
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
     phases: tuple[tuple[str, ...], ...] = ()
-    preparation: Definition | None = None
     uses: dict[str, str] = {}
     for keyword in keywords:
         if keyword.arg not in _ENTRYPOINT_KEYWORDS:
@@ -1978,12 +1975,6 @@ def _registration(
                 reader.refuse(
                     module, keyword.value, "preflight= must name a function defined in the tree"
                 )
-            continue
-        if keyword.arg == "prepare":
-            hook = reader.resolve(module, keyword.value)
-            if not isinstance(hook, Definition) or not isinstance(hook.node, ast.FunctionDef):
-                reader.refuse(module, keyword.value, "prepare= must name a synchronous function")
-            preparation = hook
             continue
         if keyword.arg == "demand":
             reader.fold(module, keyword.value)
@@ -2055,7 +2046,6 @@ def _registration(
         on_demand,
         emits_media=emits_media,
         phases=phases,
-        prepare=preparation,
         model_prepared_use=uses,
     )
 
@@ -2100,12 +2090,8 @@ def _parameter_annotation(
 
 def _callable(reader: Reader, registration: Registration) -> Declaration:
     if registration.invocable:
-        if registration.prepare is not None:
-            reader.refuse(registration.module, registration.fn, "prepare needs an App entrypoint")
         return static_invocable.build(reader, registration)
     module, fn = registration.module, registration.fn
-    if registration.prepare is not None:
-        _prepare_signature(reader, registration)
     if fn.args.vararg or fn.args.kwarg:
         reader.refuse(module, fn, "*args/**kwargs on a handler", "static_unsupported")
     if fn.args.defaults or any(fn.args.kw_defaults):
@@ -2186,65 +2172,6 @@ def _callable(reader: Reader, registration: Registration) -> Declaration:
         slots=tuple(slots),
         assets=assets,
     )
-
-
-def _prepare_signature(reader: Reader, registration: Registration) -> None:
-    """Resolve the preparation subset without importing or executing package code."""
-    hook = registration.prepare
-    assert hook is not None and isinstance(hook.node, ast.FunctionDef)
-    fn, module = hook.node, hook.module
-    if (
-        fn.args.posonlyargs
-        or fn.args.vararg
-        or fn.args.kwarg
-        or fn.args.defaults
-        or any(fn.args.kw_defaults)
-        or fn.returns is None
-        or reader.translate(module, fn.returns) is not bool
-    ):
-        reader.refuse(module, fn, "prepare takes named typed injections and returns bool")
-    declared = {
-        arg.arg: arg
-        for arg in [
-            *registration.fn.args.posonlyargs,
-            *registration.fn.args.args,
-            *registration.fn.args.kwonlyargs,
-        ]
-    }
-    for arg in [*fn.args.args, *fn.args.kwonlyargs]:
-        original = declared.get(arg.arg)
-        if original is None or original.annotation is None or arg.annotation is None:
-            reader.refuse(module, arg, "prepare parameters must be typed entrypoint injections")
-        assert (
-            original is not None and original.annotation is not None and arg.annotation is not None
-        )
-        own_module, own_node, _ = _parameter_annotation(reader, module, arg.annotation)
-        prior_module, prior_node, _ = _parameter_annotation(
-            reader, registration.module, original.annotation
-        )
-        own_model = reader.model_annotation(own_module, own_node)
-        prior_model = reader.model_annotation(prior_module, prior_node)
-        if own_model is not None or prior_model is not None:
-            if (
-                own_model is None
-                or own_model != prior_model
-                or own_model[1]
-                or arg.arg in registration.model_on_demand
-            ):
-                reader.refuse(module, arg, "prepare needs the entrypoint's constructed model")
-            continue
-        own = _classify(arg.arg, reader.translate(module, arg.annotation), fn.name)
-        prior = _classify(
-            arg.arg,
-            reader.translate(registration.module, original.annotation),
-            registration.fn.name,
-        )
-        if own != prior or not (
-            own.role in {"context", "payload", "preflight"}
-            or own.role == "service"
-            and own.capability in {"telemetry", "adjust"}
-        ):
-            reader.refuse(module, arg, "prepare cannot request this entrypoint capability")
 
 
 def environment_roots(python: Path | None, *, project: Path) -> tuple[Path, ...]:

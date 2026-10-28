@@ -34,7 +34,7 @@ from cozy_runtime.author._model_defaults import (
     model_phases,
     model_prepared_use,
 )
-from cozy_runtime.author._signature import Param, Surface, analyze, preparation_params
+from cozy_runtime.author._signature import Surface, analyze
 from cozy_runtime.author._weights import WeightsOutput
 
 P = ParamSpec("P")
@@ -66,8 +66,6 @@ class Registration:
     weights_outputs: tuple[WeightsOutput, ...] = ()
     demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
-    prepare: Callable[..., bool] | None = None
-    prepare_params: tuple[Param, ...] = field(default=(), repr=False)
     phases: tuple[tuple[str, ...], ...] = ()
     internal: bool = False
     """Managed children from this installed package revision only; never a root request."""
@@ -103,8 +101,6 @@ class Registration:
                 model_prepared_use=self.model_prepared_use,
                 model_classes=self.model_classes,
             )
-            if self.prepare is not None:
-                self.prepare_params = preparation_params(self.prepare, surface)
             self._surface = surface
         return self._surface
 
@@ -124,7 +120,6 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
-        prepare: Callable[..., bool] | None = None,
         phases: Sequence[str | Collection[str]] = (),
         prepared_use: Mapping[str, str] | None = None,
         demand: Bound | None = None,
@@ -150,7 +145,6 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
-        prepare: Callable[..., bool] | None = None,
         phases: Sequence[str | Collection[str]] = (),
         prepared_use: Mapping[str, str] | None = None,
         demand: Bound | None = None,
@@ -176,7 +170,6 @@ class App:
         *,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
-        prepare: Callable[..., bool] | None = None,
         phases: Sequence[str | Collection[str]] = (),
         prepared_use: Mapping[str, str] | None = None,
         demand: Bound | None = None,
@@ -273,7 +266,6 @@ class App:
                 weights_outputs=weights,
                 demand_bound=demand,
                 preflight=preflight,
-                prepare=prepare,
                 phases=declared_phases,
                 hidden=hidden,
                 internal=internal,

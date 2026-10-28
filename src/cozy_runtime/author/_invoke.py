@@ -573,65 +573,6 @@ def run_prepared(
         record.closed = True
 
 
-def prepare_program(
-    registration: Registration, prepared: PreparedRequest, inv: Invocation
-) -> tuple[bool, Attempt]:
-    """Run only a declared preparation factory after the executor admits its GPU turn."""
-    factory = registration.prepare
-    if factory is None:
-        raise CapabilityError(
-            "this entrypoint declares no preparation factory", code="prepare_absent"
-        )
-    if prepared.surface is not registration.surface:
-        raise ConformanceError(
-            "prepared request belongs to another entrypoint", code="prepare_identity"
-        )
-    if prepared.asset_bounds:
-        raise CapabilityError("GPU program warming takes no hydrated assets", code="prepare_assets")
-    record = Attempt(inv.request_id, inv.spool, 0, sink=inv.progress)
-    record.components_active = lambda: any(
-        model._cozy_active is not None for model in inv.models.values()
-    )
-    record.rows.extend(prepared.overlay.rows)
-    ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
-    ctx._plan = inv.plan
-
-    def no_submission(work: PreparedWork) -> Execution:
-        del work
-        raise CapabilityError(
-            "a preparation factory cannot submit inference", code="prepare_submission"
-        )
-
-    ctx._submit_prepared = no_submission
-    kwargs = _inject(
-        prepared.surface,
-        record,
-        ctx,
-        prepared.overlay,
-        prepared.facts,
-        inv,
-        params=registration.prepare_params,
-    )
-    for model in inv.models.values():
-        serve = getattr(model._cozy_residency, "serve_lora", None)
-        if serve is not None:
-            serve(prepared.lora)
-    context, calls = CURRENT.set(ctx), _current.set(None)
-    try:
-        ctx.raise_if_cancelled()
-        ready = factory(**kwargs)
-        ctx.raise_if_cancelled()
-        if type(ready) is not bool:
-            raise ConformanceError("prepare must return bool", code="prepare_result")
-        return ready, record
-    finally:
-        _current.reset(calls)
-        CURRENT.reset(context)
-        if record._stall_watch is not None:
-            record._stall_watch.stop()
-        record.closed = True
-
-
 # ------------------------------------------------------------------------- preflight
 
 

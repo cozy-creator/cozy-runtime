@@ -10,8 +10,8 @@ runtime compiles and hands back (`author.kernels`).
 A handler's SIGNATURE is its capability declaration: `Context` says where it runs, and
 everything it DOES rides a typed service parameter it named. A `Model` has two lifecycle
 methods — `load(loader)` and `unload(loader)` — and the runtime owns when each runs
-(model-lifecycle.md). The public computation facade (`cozy_runtime.compute`) constructs prepared
-GPU work separately; this surface exposes only its submission/observation protocols. The codec
+(model-lifecycle.md). A package declares its denoising loop (`denoise_loop`); the Runtime decides
+whether it runs eagerly or as a native program. The codec
 plane is separate (cr-017). Per-service fakes live in `cozy_runtime.author.fakes`.
 """
 
@@ -152,7 +152,6 @@ from cozy_runtime.author._model import (
     uncaptured,
     uses_components,
 )
-from cozy_runtime.author._prepared import Execution, PreparedWork, Progress
 from cozy_runtime.author._recipes import (
     DerivationHook,
     EncodingRule,
@@ -250,7 +249,6 @@ __all__ = [
     "Egress",
     "EgressResponse",
     "EncodingRule",
-    "Execution",
     "FileAsset",
     "Fit",
     "Image",
@@ -286,9 +284,7 @@ __all__ = [
     "Preflight",
     "PreflightViolation",
     "PreparedRequest",
-    "PreparedWork",
     "ProducerCall",
-    "Progress",
     "QuantizationPlan",
     "Recipe",
     "ReferenceImages",

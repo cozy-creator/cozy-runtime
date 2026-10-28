@@ -38,15 +38,15 @@ from cozy_runtime.author import _loop
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
-from cozy_runtime.compute import (
+from cozy_runtime.graphs import domain
+from cozy_runtime.internal import kernel_ready
+from cozy_runtime.internal.prepared import (
     PreparedRepeat,
     PreparedSequence,
     _native_error,
     _SequenceCapture,
     _zero_dropout_attention,
 )
-from cozy_runtime.graphs import domain
-from cozy_runtime.internal import kernel_ready
 from cozy_runtime.internal.residency import (
     _CAPTURE_BLOCKS,
     _REQUEST,
