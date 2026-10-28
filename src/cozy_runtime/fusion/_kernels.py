@@ -37,9 +37,12 @@ SWIGLU_BLOCK = 1024
 _ROPE_WARPS = 4
 _SWIGLU_WARPS = 4
 #: Each kernel's constexprs, in its parameter order.
-ROW_CONSTEXPRS = ("NORM", "WEIGHT", "ONCE", "MODULATE", "BRANCHES", "TANH", "F16", "X16", "BLOCK")
+ROW_CONSTEXPRS = (
+    "NORM", "WEIGHT", "OFFSET", "ONCE", "MODULATE", "BRANCHES", "TANH", "F16", "X16", "BLOCK"
+)  # fmt: skip
 ROPE_CONSTEXPRS = (
-    "HEAD_DIM", "ROTARY", "HEADS", "INTERLEAVED", "WEIGHT", "ONCE", "ROUND", "PRODUCT", "X32"
+    "HEAD_DIM", "ROTARY", "HEADS", "INTERLEAVED", "WEIGHT", "OFFSET", "ONCE", "ROUND", "PRODUCT",
+    "X32",
 )  # fmt: skip
 
 if not TRITON_ABSENT:
@@ -98,6 +101,7 @@ if not TRITON_ABSENT:
         eps,
         NORM: tl.constexpr,
         WEIGHT: tl.constexpr,
+        OFFSET: tl.constexpr,
         ONCE: tl.constexpr,
         MODULATE: tl.constexpr,
         BRANCHES: tl.constexpr,
@@ -109,6 +113,7 @@ if not TRITON_ABSENT:
         # One row per program. BRANCHES: `hidden = x + act(gate) * (branch [+ other])` first
         # (written); then `norm(hidden) [* (1 + scale) [+ shift]]` (MODULATE 1, 2). Table rows
         # are per token (`index`). F16: fp16 rows over an fp32 residual stream (X16: x is fp16).
+        # OFFSET: the weight is stored zero-centered, `1 + weight` multiplies.
         row = tl.program_id(0).to(tl.int64)
         cols = tl.arange(0, BLOCK)
         mask = cols < n_cols
@@ -132,7 +137,7 @@ if not TRITON_ABSENT:
                 x = tl.where(mask, x - mean, 0.0)
             inv = tl.math.rsqrt(tl.sum(x * x, axis=0) / n_cols + eps)
             if WEIGHT:
-                weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32)
+                weight = tl.load(weight_ptr + cols, mask=mask, other=0.0).to(tl.float32) + OFFSET
             else:
                 weight = inv
             out = _normed(x, inv, weight, WEIGHT, ONCE, 1 + F16)
@@ -183,6 +188,7 @@ if not TRITON_ABSENT:
         HEADS: tl.constexpr,
         INTERLEAVED: tl.constexpr,
         WEIGHT: tl.constexpr,
+        OFFSET: tl.constexpr,
         ONCE: tl.constexpr,
         ROUND: tl.constexpr,
         PRODUCT: tl.constexpr,
@@ -204,7 +210,7 @@ if not TRITON_ABSENT:
         base = (row * heads + head) * HEAD_DIM
         x = tl.load(x_ptr + base + chan, mask=mask, other=0.0).to(tl.float32)
         inv = tl.math.rsqrt(tl.sum(x * x, axis=1)[:, None] / HEAD_DIM + eps)
-        weight = tl.load(weight_ptr + chan).to(tl.float32) if WEIGHT else inv
+        weight = tl.load(weight_ptr + chan).to(tl.float32) + OFFSET if WEIGHT else inv
         normed = _normed(x, inv, weight, WEIGHT, ONCE, ROUND)
         rotating = chan < ROTARY
         if INTERLEAVED:
@@ -217,7 +223,7 @@ if not TRITON_ABSENT:
             column = chan
         paired = tl.load(x_ptr + base + partner, mask=mask & rotating, other=0.0).to(tl.float32)
         if WEIGHT:
-            weight = tl.load(weight_ptr + partner, mask=rotating, other=0.0).to(tl.float32)
+            weight = tl.load(weight_ptr + partner, mask=rotating, other=0.0).to(tl.float32) + OFFSET
         paired = _normed(paired, inv, weight, WEIGHT, ONCE, ROUND)
         paired = tl.where(low, -paired, paired)
         table = token * stride_token + column * stride_channel
@@ -429,6 +435,8 @@ def entries(
     *,
     norm: int,
     weight: bool,
+    offset: int,
+    weights: str,
     once: bool,
     modulate: int,
     tanh: bool,
@@ -441,7 +449,8 @@ def entries(
     composed: bool,
 ) -> Entries:
     """A layout's entries. fp16 rows: x may be fp16 (the stream's first block) or fp32, and an
-    attention module's q/k norm operand fp16 or fp32 (a processor that normalizes in fp32)."""
+    attention module's q/k norm operand fp16 or fp32 (a processor that normalizes in fp32).
+    `weights`: the norm weights' pointer type; `offset` 1: they are stored zero-centered."""
     block = _next_pow2(width)
     row, wide = ("*fp16", "*fp32") if f16 else ("*bf16", "*bf16")
 
@@ -451,6 +460,7 @@ def entries(
             constexprs = {
                 "NORM": norm,
                 "WEIGHT": int(weight and normed),
+                "OFFSET": offset if weight and normed else 0,
                 "ONCE": int(once and weight and normed),
                 "MODULATE": modulate if normed else 0,
                 "BRANCHES": branches,
@@ -471,9 +481,8 @@ def entries(
                 branch_ptr=row,
                 other_ptr=row,
                 out_ptr=row if normed else wide,
-                **dict.fromkeys(
-                    ("gate_ptr", "hidden_ptr", "weight_ptr", "scale_ptr", "shift_ptr"), wide
-                ),
+                **dict.fromkeys(("gate_ptr", "hidden_ptr", "scale_ptr", "shift_ptr"), wide),
+                weight_ptr=weights,
                 index_ptr="*i64",
                 eps="fp32",
             )
@@ -491,6 +500,7 @@ def entries(
             "HEADS": ROPE_HEADS,
             "INTERLEAVED": int(interleaved),
             "WEIGHT": int(qk_weight),
+            "OFFSET": offset if qk_weight else 0,
             "ONCE": int(once and qk_weight),
             "ROUND": round,
             "PRODUCT": int(product),
@@ -503,7 +513,7 @@ def entries(
             ("x_ptr", "out_ptr"),
             x_ptr="*fp32" if x32 else row,
             out_ptr=row,
-            weight_ptr=wide,
+            weight_ptr=weights,
             cos_ptr="*fp32",
             sin_ptr="*fp32",
             eps="fp32",
