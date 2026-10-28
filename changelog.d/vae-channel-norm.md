@@ -1,0 +1,1 @@
+`cozy_runtime.fusion.ChannelNorm` / `install_norms`: a VAE's channel-first RMS norm (Wan's `RMS_norm`, `QwenImageRMS_norm`, `QwenImage21RMS_norm`) is one Triton kernel with fp32 accumulation and the model's roundings, the SiLU after it fused where the package declares the pair. Diffusers computes it in fp32 copies of every activation; ComfyUI in bf16.

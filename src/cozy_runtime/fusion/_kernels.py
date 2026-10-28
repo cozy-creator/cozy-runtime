@@ -252,6 +252,71 @@ def _entry(
     return TritonEntry(kernel, signature, constexprs, aligned, warps)
 
 
+if not TRITON_ABSENT:
+
+    @triton.jit  # type: ignore[untyped-decorator]
+    def channel_norm_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        weight_ptr,
+        bias_ptr,
+        out_ptr,
+        channels,
+        plane,
+        scale,
+        eps,
+        SILU: tl.constexpr,
+        BIAS: tl.constexpr,
+        ROUND: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        # A VAE's channel-first RMS norm over `[batch, channels, plane]`, as Wan's `RMS_norm`
+        # computes it: `F.normalize` over the channels in fp32, rounded to the activations'
+        # dtype, then `* scale`, `* weight[c]` [`+ bias[c]`], each rounded, [then torch's silu].
+        # One program per BLOCK positions of one batch row: the squares in fp32, then the writes.
+        p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        live = p < plane
+        base = tl.program_id(1).to(tl.int64) * channels * plane + p
+        squares = tl.zeros([BLOCK], dtype=tl.float32)
+        for c in range(0, channels):
+            v = tl.load(x_ptr + base + c.to(tl.int64) * plane, mask=live, other=0.0).to(tl.float32)
+            squares += v * v
+        norm = tl.maximum(tl.sqrt_rn(squares), eps)
+        for c in range(0, channels):
+            offset = base + c.to(tl.int64) * plane
+            v = tl.load(x_ptr + offset, mask=live, other=0.0).to(tl.float32)
+            y = _round(tl.div_rn(v, norm), ROUND)
+            y = _round(y * scale, ROUND)
+            y = _round(y * tl.load(weight_ptr + c).to(tl.float32), ROUND)
+            if BIAS:
+                y = _round(y + tl.load(bias_ptr + c).to(tl.float32), ROUND)
+            if SILU:
+                y = _round(tl.div_rn(y, 1.0 + libdevice.exp(-y)), ROUND)
+            tl.store(out_ptr + offset, y.to(out_ptr.dtype.element_ty), mask=live)
+
+
+CHANNEL_BLOCK = 512
+_CHANNEL_WARPS = 4
+#: A channel norm's operand dtype: its pointer type and rounding.
+CHANNEL_DTYPES = {"bf16": ("*bf16", BF16), "fp16": ("*fp16", FP16), "fp32": ("*fp32", FP32)}
+
+
+def channel_entries(dtype: str, bias: bool, silu: bool) -> tuple[TritonEntry, ...]:
+    """A channel norm's entries in `dtype`: without SiLU [and with]."""
+    pointer, rounding = CHANNEL_DTYPES[dtype]
+    return tuple(
+        _entry(
+            channel_norm_kernel,
+            {"SILU": fused, "BIAS": int(bias), "ROUND": rounding, "BLOCK": CHANNEL_BLOCK},
+            _CHANNEL_WARPS,
+            ("x_ptr", "out_ptr"),
+            **dict.fromkeys(("x_ptr", "weight_ptr", "bias_ptr", "out_ptr"), pointer),
+            scale="fp32",
+            eps="fp32",
+        )
+        for fused in ((0, 1) if silu else (0,))
+    )
+
+
 # ---------------------------------------------------------------------------- launches
 
 
@@ -354,6 +419,30 @@ def swiglu(launch: Launch, entry: TritonEntry, gate: Any, up: Any) -> Any:
         SWIGLU_BLOCK,
     )
     return out.view_as(gate)
+
+
+def channel_norm(
+    launch: Launch, entry: TritonEntry, x: Any, weight: Any, bias: Any, scale: float, eps: float
+) -> Any:
+    """`entry`'s channel norm of `[batch, channels, ...]` `x` (weights `[channels, 1, ...]`)."""
+    batch, channels = int(x.shape[0]), int(x.shape[1])
+    plane = x.numel() // max(batch * channels, 1)
+    x = _aligned(x.contiguous())
+    out = torch.empty_like(x)
+    launch(
+        channel_norm_kernel,
+        (triton.cdiv(plane, CHANNEL_BLOCK), batch, 1),
+        x,
+        weight,
+        bias if bias is not None else weight,
+        out,
+        channels,
+        plane,
+        float(scale),
+        float(eps),
+        *(entry.constexprs[k] for k in ("SILU", "BIAS", "ROUND", "BLOCK")),
+    )
+    return out
 
 
 def head_norm_rope(
