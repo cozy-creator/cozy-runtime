@@ -1740,7 +1740,7 @@ class Memory:
         page = (model.name, block.path, model.identity, None)
         if page in self._baked or page in self._populating:
             return
-        kept = self._host_page(int(region.allocated_bytes))
+        kept = self._host_page(block.storage_bytes)  # the fill's bytes; the region rounds up
         if kept is None:
             return
         reads, offset = [], 0
@@ -2390,7 +2390,7 @@ class Memory:
                         if self._host_prepare and block.model.fill is None
                         else None
                     )
-                    if kept is not None and kept.tensor.numel() == int(region.allocated_bytes):
+                    if kept is not None and kept.tensor.numel() == block.storage_bytes:
                         read = self._host_read(region, kept, evict_completed=queued is None)
                         if read is None:
                             return  # resident already
