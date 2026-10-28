@@ -1251,6 +1251,7 @@ class Memory:
         #: pages the populator could not keep, released (unregistered) on the request thread
         self._host_dropped: list[_HostPage] = []
         self._h2d_stream: Any = None
+        self._host_looked = 0.0
         admission = inspect.signature(varena.Region.prepare).parameters
         self._host_prepare = "evict_completed" in admission  # TensorFS 0.17.4
         if self.cuda:
@@ -1675,10 +1676,13 @@ class Memory:
         would miss every refill. A failed pin turns the tier off, with a warning."""
         if not self._host_tier or not self.cuda or self.capturing():
             return None
-        if (
-            self._trim_baked() - nbytes < _BAKED_HEADROOM
-            or self._baked_bytes + self._populating_bytes + nbytes > self._host_cap
-        ):
+        if self._baked_bytes + self._populating_bytes + nbytes > self._host_cap:
+            return None
+        now = time.monotonic()
+        if now - self._host_looked >= 1.0:  # host RAM is re-read at most once a second
+            self._host_looked = now
+            self._trim_baked()
+        if self._baked_room - nbytes < _BAKED_HEADROOM:
             return None
         try:
             return _HostPage(nbytes)
