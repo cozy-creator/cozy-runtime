@@ -221,9 +221,13 @@ class Loops:
         request = _REQUEST.get()
         if request is not None:
             ROWS.setdefault(request.id, []).append(row)
+        # The loop records its own programs: component region graphs neither replay nor learn
+        # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        bypass = graphs.BYPASS.set(True)
         try:
             self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
         finally:
+            graphs.BYPASS.reset(bypass)
             row["at_ms"]["returned"] = _now()
 
     def _run(
@@ -372,14 +376,12 @@ def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
 
 @contextmanager
 def _entering() -> Iterator[set[Any]]:
-    """The models and blocks whose forwards run inside, residency adding each it opens. They
-    run as written: a component region graph would replay them past every block hook."""
+    """The models whose forwards run inside: residency adds each one it opens."""
     seen: set[Any] = set()
-    token, bypass = ENTERED.set(seen), graphs.BYPASS.set(True)
+    token = ENTERED.set(seen)
     try:
         yield seen
     finally:
-        graphs.BYPASS.reset(bypass)
         ENTERED.reset(token)
 
 
