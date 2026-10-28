@@ -12,6 +12,7 @@
 #include <cstdint>
 
 #include "int8.h"
+#include "svdq.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -156,6 +157,29 @@ int w4a8_unpack(int device, uintptr_t w, uintptr_t s, uintptr_t codebook, uintpt
                                   sm_count(device), on(stream));
 }
 
+int svdq_quantize(int device, uintptr_t x, bool x_half, uintptr_t p, uintptr_t g, uintptr_t down,
+                  uintptr_t act, uintptr_t ascales, uintptr_t la, int M, int K, int R,
+                  uintptr_t stream) {
+    if (M < 0 || !cozy_svdq::fits(cozy_svdq::kCols, K, R)) return cudaErrorInvalidValue;
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    return cozy_svdq::quantize(at<const void>(x), x_half, at<const float>(p), at<const float>(g),
+                               at<const void>(down), at<void>(act), at<void>(ascales),
+                               at<void>(la), M, K, R, on(stream));
+}
+
+int svdq_gemm(int device, uintptr_t act, uintptr_t ascales, uintptr_t w, uintptr_t wscales,
+              uintptr_t gx, uintptr_t gw, uintptr_t c, uintptr_t la, uintptr_t up, uintptr_t bias,
+              uintptr_t out, bool out_half, int M, int N, int K, int R, uintptr_t stream) {
+    if (M < 1 || !cozy_svdq::fits(N, K, R)) return cudaErrorInvalidValue;
+    const OnDevice guard(device);
+    if (guard.error() != cudaSuccess) return guard.error();
+    return cozy_svdq::gemm(at<const void>(act), at<const void>(ascales), at<const void>(w),
+                           at<const void>(wscales), at<const float>(gx), at<const float>(gw),
+                           at<const float>(c), at<const void>(la), at<const void>(up),
+                           at<const void>(bias), at<void>(out), out_half, M, N, K, R, on(stream));
+}
+
 }  // namespace
 
 NB_MODULE(_gemm, m) {
@@ -178,6 +202,11 @@ NB_MODULE(_gemm, m) {
           "w_scale"_a, "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a, "config"_a, "stream"_a);
     m.def("w4a8_unpack", &w4a8_unpack, "device"_a, "w"_a, "s"_a, "codebook"_a, "out"_a, "N"_a,
           "K"_a, "stream"_a);
+    m.def("svdq_quantize", &svdq_quantize, "device"_a, "x"_a, "x_half"_a, "p"_a, "g"_a, "down"_a,
+          "act"_a, "ascales"_a, "la"_a, "M"_a, "K"_a, "R"_a, "stream"_a);
+    m.def("svdq_gemm", &svdq_gemm, "device"_a, "act"_a, "ascales"_a, "w"_a, "wscales"_a, "gx"_a,
+          "gw"_a, "c"_a, "la"_a, "up"_a, "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a,
+          "R"_a, "stream"_a);
     m.def("gemm", &gemm, "device"_a, "family"_a, "fp8"_a, "q"_a, "scales"_a, "w"_a, "w_scale"_a,
           "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a, "config"_a, "allocate"_a.none(),
           "stream"_a);

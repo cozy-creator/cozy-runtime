@@ -77,3 +77,38 @@ def w4a8_gemm(
 def w4a8_unpack(
     device: int, w: int, s: int, codebook: int, out: int, N: int, K: int, stream: int
 ) -> int: ...
+def svdq_quantize(
+    device: int,
+    x: int,
+    x_half: bool,
+    p: int,
+    g: int,
+    down: int,
+    act: int,
+    ascales: int,
+    la: int,
+    M: int,
+    K: int,
+    R: int,
+    stream: int,
+) -> int: ...
+def svdq_gemm(
+    device: int,
+    act: int,
+    ascales: int,
+    w: int,
+    wscales: int,
+    gx: int,
+    gw: int,
+    c: int,
+    la: int,
+    up: int,
+    bias: int,
+    out: int,
+    out_half: bool,
+    M: int,
+    N: int,
+    K: int,
+    R: int,
+    stream: int,
+) -> int: ...

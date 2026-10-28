@@ -7,7 +7,13 @@
   `input_scale` (calibrated), else the call's `|x| · p` max / 2688. Each 16-block's scale is
   `amax / (6 g_x)` rounded to E4M3 within [2⁻⁹, 448], each element the nearest E2M1, ties even.
 
-Two Triton kernels, built when the executor starts (`KERNELS`):
+On a card whose row is block-scaled FP4 mma.sync (RTX 50, DGX Spark: `arch`), the wheel's prebuilt
+kernels serve (`_kernels._gemm.svdq_*`, `kernels/csrc/gemm/svdq.cu`): a leaf there holds its weight
+in their tiles from the bind (`tiled`, `tiles`), and they serve once they pass `probe_native` on
+the card. Until then, and on a card where they never do, a call untiles the weight and the Triton
+kernels below serve, else the law, and the run says so.
+
+Elsewhere on Blackwell, two Triton kernels built when the executor starts (`KERNELS`):
 - `_quantize` reads `x` once: it writes the nvfp4 operand and the down-projection `x · downᵀ`;
 - `_gemm` multiplies on the FP4 tensor cores (`tl.dot_scaled`); its epilogue adds the
   up-projection, both second levels, `c` and the bias.
@@ -20,13 +26,14 @@ They serve once they load and pass `probe` on a card whose row has FP4 tensor co
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from functools import partial
 from types import ModuleType
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
+from cozy_runtime import _kernels
 from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
-from cozy_runtime.internal import arch, int8_linear, kernel_ready, verify
+from cozy_runtime.internal import arch, int8_linear, kernel_ready, prebuilt, verify
 from cozy_runtime.internal.encoding.formats import E2M1_VALUES, NVFP4_BLOCK, Tensor
 
 if TYPE_CHECKING:
@@ -45,7 +52,11 @@ TILE_M, TILE_N, TILE_K, GROUP_M, GEMM_WARPS, GEMM_STAGES = 128, 128, 256, 8, 8, 
 #: The column multiple the kernels need (one K step).
 K_ALIGN = TILE_K
 #: What a run's `gemm.selected` names.
-TRITON, EAGER = "cozy-svdq-nvfp4", "torch-eager"
+TRITON, EAGER, NATIVE = "cozy-svdq-nvfp4", "torch-eager", "cozy-svdq-nvfp4-mma"
+#: The rows the prebuilt kernels' operand is padded to, and the columns their weight tiles span.
+NATIVE_ROWS, NATIVE_COLS = 256, 128
+#: The cards the prebuilt kernels serve (`native`): every call reads it.
+_SERVES: set[int] = set()
 #: The probe's budget for the down-projection and the output, against the law's exact products:
 #: their bf16 or fp16 rounding.
 BUDGET = 5e-3
@@ -305,11 +316,57 @@ def _opened(torch: ModuleType, device: Device, wait: bool) -> Launch | None:
 
 
 def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
-    """Both kernels against the law on ragged rows and columns, each dtype and built rank, with
-    and without `c` and the bias: the operand and its scales bit for bit; the down-projection and
-    the output against the law's exact (f64) products, within their bf16 or fp16 rounding."""
+    """The Triton build's verdict here (`checked`), on ragged rows and columns."""
+
+    def quantized(x: Tensor, roles: Mapping[str, Tensor]) -> tuple[object, Tensor, Tensor, Tensor]:
+        q, sx, low, g = _quantized(torch, launch, x, roles)
+        return (q, sx, low, g), q, sx, low
+
+    def multiplied(
+        made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object
+    ) -> Tensor:
+        q, sx, low, g = cast("tuple[Tensor, Tensor, Tensor, Tensor]", made)
+        return _multiplied(torch, launch, q, sx, low, g, roles, bias, half)
+
+    return checked(torch, device, quantized, multiplied, (200, 144, 256))
+
+
+def probe_native(torch: ModuleType, device: Device, module: object) -> verify.Verdict:
+    """The prebuilt kernels' verdict here (`checked`): two row tiles, the second ragged, two
+    column tiles and an odd number of k-steps."""
+
+    def quantized(x: Tensor, roles: Mapping[str, Tensor]) -> tuple[object, Tensor, Tensor, Tensor]:
+        made = _native_quantized(torch, x, roles)
+        q, sx = operand(torch, made[0], made[1])
+        rows = made[4]
+        return made, q[:rows], sx[:rows].view(torch.float8_e4m3fn), made[2][:rows]
+
+    def multiplied(
+        made: object, roles: Mapping[str, Tensor], bias: Tensor | None, half: object
+    ) -> Tensor:
+        weight, scale = tiles(torch, roles["weight"], roles["scale"])
+        tiled = {**roles, "weight": weight, "scale": scale}
+        operands = cast("tuple[Tensor, Tensor, Tensor, Tensor, int]", made)
+        return _native_multiplied(torch, operands, tiled, bias, half)
+
+    return checked(torch, device, quantized, multiplied, (300, 256, 320))
+
+
+def checked(
+    torch: ModuleType,
+    device: Device,
+    quantized: Callable[[Tensor, Mapping[str, Tensor]], tuple[object, Tensor, Tensor, Tensor]],
+    multiplied: Callable[[object, Mapping[str, Tensor], Tensor | None, object], Tensor],
+    shape: tuple[int, int, int],
+) -> verify.Verdict:
+    """One build's two kernels against the law, each dtype and built rank, with and without `c`
+    and the bias: the operand and its scales bit for bit; the down-projection and the output
+    against the law's exact (f64) products, within their bf16 or fp16 rounding.
+    `quantized(x, roles)` returns what `multiplied(it, roles, bias, half)` takes, then the codes
+    `[M, K/2]`, E4M3 scales `[M, K/16]` and down-projection in the law's layout. `shape` is
+    (M, N, K)."""
     generator = torch.Generator(device=device).manual_seed(0)
-    rows, n, k = 200, 144, 256
+    rows, n, k = shape
 
     def draw(*shape: int) -> Tensor:
         return torch.randn(*shape, generator=generator, device=device)
@@ -334,7 +391,8 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
             else:
                 roles = {role: t for role, t in roles.items() if role != "channel_scale"}
             case = f"rank {r} {'bf16' if extras else 'fp16'}"
-            q, sx, low, g = _quantized(torch, launch, x, roles)
+            made, q, sx, low = quantized(x, roles)
+            g = activation_scale(torch, x.reshape(-1, k), roles)
             codes, scales = quantize(torch, _smoothed(torch, x, roles), g)
             exact = torch.equal(q, codes[:, 0::2] | (codes[:, 1::2] << 4)) and torch.equal(
                 sx.view(torch.uint8), scales.view(torch.uint8)
@@ -351,14 +409,150 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
             want = want + low.double() @ roles["lowrank_up"].double().t()
             if bias is not None:
                 want = want + bias.double()
-            got = _multiplied(torch, launch, q, sx, low, g, roles, bias, half)
+            got = multiplied(made, roles, bias, half)
             errors[f"{case} gemm"] = verify.error(torch, got, want)
     return verify.within(errors, BUDGET)
 
 
 def serving(index: int) -> str:
     """The kernel this card's svdq leaves serve now: a run's `gemm.selected`."""
+    if kernel_ready.ready(f"{NATIVE} cuda:{index}") is not None:
+        return NATIVE
     return TRITON if kernel_ready.ready(f"{KERNELS.name} cuda:{index}") is not None else EAGER
+
+
+def tiled(torch: ModuleType, index: int, n: int) -> bool:
+    """Whether a leaf of `n` output columns on cuda:`index` holds its weight in the prebuilt
+    GEMM's tiles: the card's row is block-scaled FP4 mma.sync (`arch`), the wheel carries the
+    kernels and `n` is whole column tiles. Decided at the bind, by rule, whatever the verdict."""
+    if _kernels.ABSENT or n % NATIVE_COLS:
+        return False
+    row = arch.row(int8_linear.capability(torch, index))
+    return row.family == arch.MMA_SYNC and row.fp4
+
+
+def native(torch: ModuleType, index: int) -> bool:
+    """Whether the prebuilt kernels serve cuda:`index` now: once they pass `probe_native` here,
+    off any request thread (`kernel_ready.serve`); a leaf's bind starts that beside its fill.
+    Raises `Building` while a graph records before they serve."""
+    if index in _SERVES:
+        return True
+    opener = partial(_native_opened, torch, index)
+    capturing = torch.cuda.is_current_stream_capturing()
+    if kernel_ready.serve(f"{NATIVE} cuda:{index}", opener, capturing) is None:
+        return False
+    _SERVES.add(index)  # it serves this card from here on
+    return True
+
+
+def _native_opened(torch: ModuleType, index: int, wait: bool) -> object:
+    sm = int8_linear.capability(torch, index)
+    probe = partial(probe_native, torch, torch.device("cuda", index))
+    try:
+        return kernel_ready.verified(_kernels._gemm, NATIVE, prebuilt.artifact(), sm, probe)
+    except Exception as exc:  # they never serve here: Triton or the law does, and the run says so
+        int8_linear.failed(NATIVE, index, exc)
+        raise
+
+
+def tiles(torch: ModuleType, weight: Tensor, scale: Tensor) -> tuple[Tensor, Tensor]:
+    """The weight's codes `[N, K/2]` (u8, element 2k low) and E4M3 scales `[N, K/16]` as the
+    prebuilt GEMM reads them (Nunchaku's fragment layouts): same shapes and bytes, reordered per
+    128 rows and 64 columns into eight 16-row MMA tiles of 32 lanes' 16 bytes, then 32 lanes'
+    four scale words. N % 128 == 0 and K % 64 == 0."""
+    n, k = int(weight.shape[0]), 2 * int(weight.shape[1])
+    words = weight.contiguous().view(torch.int32).view(n // 128, 8, 2, 8, k // 64, 2, 4)
+    words = words.permute(0, 4, 1, 3, 6, 2, 5).contiguous()  # (n/128, k/64, n16, g, t, n8, k32)
+    scales = scale.contiguous().view(torch.uint8).view(torch.int32)
+    scales = scales.view(n // 128, 4, 4, 8, k // 64).permute(0, 4, 3, 2, 1).contiguous()
+    return words.view(torch.uint8).view(n, k // 2), scales.view(torch.float8_e4m3fn).view(n, -1)
+
+
+def untiled(torch: ModuleType, roles: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    """`roles` with the weight and its scales back in their stored layout (`tiles` undone)."""
+    n, k = int(roles["weight"].shape[0]), 2 * int(roles["weight"].shape[1])
+    words = roles["weight"].view(torch.int32).view(n // 128, k // 64, 8, 8, 4, 2, 2)
+    words = words.permute(0, 2, 5, 3, 1, 6, 4).contiguous()
+    scales = roles["scale"].view(torch.uint8).view(torch.int32).view(n // 128, k // 64, 8, 4, 4)
+    scales = scales.permute(0, 4, 3, 2, 1).contiguous()
+    weight = words.view(torch.uint8).view(n, k // 2)
+    return {**roles, "weight": weight, "scale": scales.view(torch.float8_e4m3fn).view(n, -1)}
+
+
+def operand(torch: ModuleType, act: Tensor, ascales: Tensor) -> tuple[Tensor, Tensor]:
+    """The prebuilt quantize's operand `[R, K/2]` and scales `[R, K/16]` (R a multiple of
+    `NATIVE_ROWS`) in the law's layout: codes with element 2k low, E4M3 bytes."""
+    rows, k = int(act.shape[0]), 2 * int(act.shape[1])
+    words = act.view(torch.int32).view(rows // 256, k // 64, 8, 2, 8, 4, 2, 2)
+    words = words.permute(0, 2, 3, 7, 4, 1, 6, 5).contiguous()  # rows then k-chunks, natural
+    scales = ascales.view(torch.int32).view(rows // 256, k // 64, 8, 8, 2, 2)
+    scales = scales.permute(0, 2, 4, 5, 3, 1).contiguous()
+    return words.view(torch.uint8).view(rows, k // 2), scales.view(torch.uint8).view(rows, k // 16)
+
+
+def _aligned(t: Tensor) -> Tensor:
+    """`t` contiguous at a 16-byte address: the prebuilt kernels load 16 bytes at a time."""
+    t = t.contiguous()
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
+def _native_quantized(
+    torch: ModuleType, x: Tensor, roles: Mapping[str, Tensor]
+) -> tuple[Tensor, Tensor, Tensor, Tensor, int]:
+    """`svdq_quantize`: `x`'s operand in the GEMM's tiles, its scales and its down-projection
+    (rows padded to `NATIVE_ROWS`), its `g_x`, and its row count."""
+    cols, r = int(roles["pre_quant_scale"].numel()), int(roles["lowrank_down"].shape[0])
+    flat = _aligned(x.reshape(-1, cols))
+    rows = int(flat.shape[0])
+    padded_rows = -(-rows // NATIVE_ROWS) * NATIVE_ROWS
+    g = activation_scale(torch, flat, roles).contiguous()
+    act = torch.empty(padded_rows, cols // 2, dtype=torch.uint8, device=x.device)
+    ascales = torch.empty(padded_rows, cols // NVFP4_BLOCK, dtype=torch.uint8, device=x.device)
+    low = torch.empty(padded_rows, r, dtype=torch.bfloat16, device=x.device)
+    index = x.device.index or 0
+    code = _kernels._gemm.svdq_quantize(
+        index, flat.data_ptr(), flat.dtype == torch.float16, roles["pre_quant_scale"].data_ptr(),
+        g.data_ptr(), roles["lowrank_down"].data_ptr(), act.data_ptr(), ascales.data_ptr(),
+        low.data_ptr(), rows, cols, r, int(torch.cuda.current_stream(index).cuda_stream),
+    )  # fmt: skip
+    _check(torch, code, "quantize")
+    return act, ascales, low, g, rows
+
+
+def _native_multiplied(
+    torch: ModuleType,
+    quantized: tuple[Tensor, Tensor, Tensor, Tensor, int],
+    roles: Mapping[str, Tensor],
+    bias: Tensor | None,
+    half: object,
+) -> Tensor:
+    """`svdq_gemm`: `[M, N]` in `half`, from `_native_quantized`'s operands and a tiled weight."""
+    act, ascales, low, g, rows = quantized
+    n, r = int(roles["lowrank_up"].shape[0]), int(roles["lowrank_up"].shape[1])
+    c = roles.get("channel_scale")
+    out = torch.empty(rows, n, dtype=half, device=act.device)
+    if rows == 0:
+        return out
+    bias = None if bias is None else _aligned(bias.to(half))
+    index = act.device.index or 0
+    code = _kernels._gemm.svdq_gemm(
+        index, act.data_ptr(), ascales.data_ptr(), roles["weight"].data_ptr(),
+        roles["scale"].data_ptr(), g.data_ptr(), roles["scale_2"].data_ptr(),
+        0 if c is None else c.data_ptr(), low.data_ptr(), roles["lowrank_up"].data_ptr(),
+        0 if bias is None else bias.data_ptr(), out.data_ptr(), half == torch.float16, rows, n,
+        2 * int(act.shape[1]), r, int(torch.cuda.current_stream(index).cuda_stream),
+    )  # fmt: skip
+    _check(torch, code, "GEMM")
+    return out
+
+
+def _check(torch: ModuleType, code: int, what: str) -> None:
+    if code == 0:
+        return
+    detail = f"svdq {what}: {_kernels._gemm.error_name(code)}"
+    if code == _kernels._gemm.OUT_OF_MEMORY:
+        raise torch.cuda.OutOfMemoryError(detail)
+    raise RuntimeError(detail)
 
 
 def activation_scale(torch: ModuleType, flat: Tensor, roles: Mapping[str, Tensor]) -> Tensor:
@@ -447,13 +641,25 @@ def linear(
     roles: Mapping[str, Tensor],
     bias: Tensor | None,
     out_dtype: object,
+    tiled: bool = False,
 ) -> Tensor:
     """`x @ Wᵀ + bias` for one leaf's roles (`SvdqNvfp4NativeLeaf`): `weight` u8 `[N, K/2]`,
     `scale` E4M3 `[N, K/16]`, `scale_2` f32, `pre_quant_scale` f32 `[K]`, `lowrank_down` bf16
     `[R, K]` and `lowrank_up` bf16 `[N, R]` (R one of `RANKS`), optional `channel_scale` `[N]` and
-    `input_scale`. The kernels serve a half `x` written in its own dtype; the law the rest."""
+    `input_scale`. The kernels serve a half `x` written in its own dtype; the law the rest. A
+    `tiled` weight (`tiles`) is the prebuilt kernels' once they serve the card."""
+    half = x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and out_dtype == x.dtype
+    if tiled:
+        index = x.device.index or 0
+        if half and native(torch, index):
+            try:
+                made = _native_quantized(torch, x, roles)
+                return _native_multiplied(torch, made, roles, bias, x.dtype).view(*x.shape[:-1], -1)
+            except Exception as exc:  # Triton or the law serves this call, and the run says so
+                int8_linear.failed(NATIVE, index, exc)
+        roles = untiled(torch, roles)
     launch = None
-    if x.is_cuda and x.dtype in (torch.bfloat16, torch.float16) and out_dtype == x.dtype:
+    if half:
         launch = _launcher(torch, x.device, torch.cuda.is_current_stream_capturing())
     if launch is None:
         return eager(torch, x, roles, bias, out_dtype)

@@ -29,7 +29,7 @@ from cozy_runtime.author import (
 from cozy_runtime.author._recipes import DeclaredRecipe, Plan, canonical, fingerprint
 from cozy_runtime.weights_store import Checkpoint, Derivation
 
-from . import facade, svdq
+from . import facade, native_quantization, svdq
 from .quantization import (
     _ENCODINGS,
     ArtifactQuantizationPlan,
@@ -224,7 +224,7 @@ def quantize_into(
     output: str,
     max_relative_frobenius: float | None = None,
     calibration: svdq.Calibration | None = None,
-    fit_workspace_bytes: int = 512 << 20,
+    fit_workspace_bytes: int = native_quantization.FIT_WORKSPACE_BYTES,
 ) -> ModelArtifact:
     """`plan`'s lane, written into the CALLING job's weights output `output`. A plan with
     `svdq.nvfp4` weights takes the `calibration` its recipe recorded (`calibrate`)."""

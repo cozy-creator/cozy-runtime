@@ -196,7 +196,7 @@ class ArtifactQuantizationPlan(msgspec.Struct, forbid_unknown_fields=True):
 class ArtifactQuantizationRequest(msgspec.Struct, forbid_unknown_fields=True):
     max_relative_frobenius: float | None = None
     # Explicit initial native calibrated-fit allowance; callers can select a smaller grant.
-    fit_workspace_bytes: int = 512 << 20
+    fit_workspace_bytes: int = native_quantization.FIT_WORKSPACE_BYTES
 
 
 class Bf16Tensor(msgspec.Struct):

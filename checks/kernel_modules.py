@@ -46,6 +46,7 @@ code = _gemm.gemv(0, 0, False, 0, 0, 0, 0, False, 1, 8, 256, 0)
 assert code != 0, "a gemv ran with no GPU"
 assert _gemm.gemm(0, 3, False, 0, 0, 0, 0, 0, 0, False, 1, 8, 256, -1, None, 0) == 1
 assert _gemm.TMA == ("tma" not in sys.argv[2:]), f"_gemm.TMA is {_gemm.TMA}"
+assert _gemm.svdq_gemm(0, *(0,) * 11, False, 1, 100, 64, 32, 0) == 1  # N % 128: refused
 assert callable(_norm.rms_rope_split_half)
 if "_fa3" not in sys.argv[2:]:
     _fa3 = load("_fa3")
@@ -154,7 +155,10 @@ def main() -> int:
         module = modules[0]
         cubin, ptx = embedded(module)
         if name == "_gemm" and "tma" in options.without:
-            want = {**want, "cubin": tuple(t for t in want["cubin"] if not t.endswith("a"))}
+            # The svdq GEMM is no TMA kernel: every target carries its sm_120a and sm_121a.
+            keep = ("sm_120a", "sm_121a")
+            cubins = tuple(t for t in want["cubin"] if not t.endswith("a") or t in keep)
+            want = {**want, "cubin": cubins}
         for kind, have, wanted in (("cubin", cubin, want["cubin"]), ("ptx", ptx, want["ptx"])):
             if have != set(wanted):
                 failed.append(
