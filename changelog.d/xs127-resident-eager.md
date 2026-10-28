@@ -1,0 +1,1 @@
+`denoise_loop`: a whole call whose recording does not fit beside its resident weights (Krea 2 Turbo at 2048² on a 24 GB card, SDXL on 8 GB) runs the rest of that call eagerly with its weights in place. It no longer records a steps-only program that no call keeps.
