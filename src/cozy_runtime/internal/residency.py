@@ -389,6 +389,9 @@ class _Prefetch:
     identity: str
     request: Request | None
     queued: QueuedPrefetch | None = None
+    #: the host page this store read also fills (TensorFS's `prepare_read(host=)`), kept once
+    #: the read completes
+    staged: _HostPage | None = None
 
 
 class _HostPage:
@@ -1264,6 +1267,8 @@ class Memory:
         self._host_looked = 0.0
         admission = inspect.signature(varena.Region.prepare).parameters
         self._host_prepare = "evict_completed" in admission  # TensorFS 0.17.4
+        # A prefetch's one store read lands in its host page, then one DMA (TensorFS 0.17.7).
+        self._host_prefetch = bool(getattr(varena, "supports_host_prefetch", bool)())
         if self.cuda:
             try:
                 if budget_bytes is not None:
@@ -2369,6 +2374,7 @@ class Memory:
                     name = f"{block.model.component}/{key}#{part.role or 'value'}"
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
+            staged: _HostPage | None = None
             try:
                 region = self._native_region(block, speculative=True)
                 # Outgoing cached weights may already fill the nonpreferred window even
@@ -2395,18 +2401,36 @@ class Memory:
                         if read is None:
                             return  # resident already
                     else:
+                        page = (block.model.name, block.path, block.model.identity, None)
+                        if (
+                            self._host_prefetch
+                            and block.model.fill is None
+                            and not block.preferred
+                            and page not in self._populating
+                        ):
+                            staged = self._host_page(block.storage_bytes)
+                        host = (
+                            {}
+                            if staged is None
+                            else {"host": staged.window(0, block.storage_bytes)}
+                        )
                         read = region.prepare_read(
                             block.model.source.ck,
                             parts,
                             reclaim=False,
                             evict_completed=queued is None,
+                            **host,
                         )
+                        if staged is not None:
+                            self._populating[page] = staged
+                            self._populating_bytes += block.storage_bytes
                 finally:
                     if provisional:
                         # The prepared Fill owns its pin. Only demand may assign a lasting
                         # preference, so cancellation/failure cannot leave this one behind.
                         region.set_preferred(preferred)
             except (torch.OutOfMemoryError, torch.AcceleratorError) as error:
+                self._unstage(staged)
                 if fault(error) is not Fault.OOM:
                     raise
                 free = int(torch.cuda.mem_get_info(self.device)[0])
@@ -2427,20 +2451,25 @@ class Memory:
                     request.prefetch_skipped += 1
                 return
             except tensorfs.Error as error:
+                self._unstage(staged)
                 if fault(error) is not Fault.OTHER:
                     raise
                 if request is not None:
                     request.prefetch_failed += 1
                 return
             except (RuntimeError, ValueError) as error:
+                self._unstage(staged)
                 if queued is None or fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
                 if request is not None:
                     request.prefetch_failed += 1
                 return
+            except BaseException:
+                self._unstage(staged)
+                raise
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
-            self._prefetch = _Prefetch(block, region, read, identity, request, queued)
+            self._prefetch = _Prefetch(block, region, read, identity, request, queued, staged)
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
                 # cancels this exact read or is observed here before any I/O starts.
@@ -2488,7 +2517,7 @@ class Memory:
             if cancel:
                 read.cancel()
             began = time.perf_counter_ns()
-            complete = False
+            complete = filled = False
             try:
                 context = CURRENT.get()
                 try:
@@ -2517,6 +2546,8 @@ class Memory:
                             request.prefetch_canceled += int(drained["canceled"])
                     raise
                 complete = not row["canceled"]
+                # A region resident already fills no host page (host_bytes 0).
+                filled = complete and int(row.get("host_bytes", 0)) == block.storage_bytes
                 if request is not None:
                     if pending.queued is not None:
                         request.queued_prefetch.append(
@@ -2540,7 +2571,7 @@ class Memory:
                             speculative=True,
                             origin="baked" if row.get("host") else "store",
                         )
-                if complete and not row.get("host"):
+                if complete and not row.get("host") and pending.staged is None:
                     self._populate(block)
             except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) not in (Fault.OTHER, Fault.OOM):
@@ -2556,7 +2587,27 @@ class Memory:
                     block.region = None
                     block.preferred = False
                     block.preference_set = False
+                if (staged := pending.staged) is not None:
+                    self._keep_staged(block, pending.identity, staged, filled)
                 self._prefetch = None
+
+    @staticmethod
+    def _unstage(staged: _HostPage | None) -> None:
+        """A host page whose read was never admitted: no copy ever used it."""
+        if staged is not None:
+            staged.release()
+
+    def _keep_staged(self, block: _Block, identity: str, staged: _HostPage, read: bool) -> None:
+        """A prefetch's host page joins the tier once its store read completed; else it is
+        released with the next trim."""
+        page = (block.model.name, block.path, identity, None)
+        self._populating.pop(page, None)
+        self._populating_bytes -= staged.tensor.numel()
+        if read and block.model.identity == identity and not block.model.closed:
+            self._baked[page] = staged
+            self._baked_bytes += staged.tensor.numel()
+        else:
+            self._host_dropped.append(staged)
 
     def _final_views(self, block: _Block, reclaim: bool) -> None:
         if not block.finals:
