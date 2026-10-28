@@ -727,7 +727,7 @@ class Binding:
                     any(p.dtype == "F4" for parts in block.parts.values() for p in parts.values()),
                 ),
                 (f"is in use ({block.count})", block.count),
-                (f"is retained ({block.retained})", block.retained),
+                (f"is retained ({block.retained}) in {model.component}", block.retained),
                 ("is loading", block.loading),
             ):
                 if refused:
@@ -2528,7 +2528,11 @@ class Memory:
         try:
             capturing = self.capturing()
             if capturing and (not nested or not block.retained or block.assigned is None):
-                raise ResidencyError("capture requires an active prepared weight binding")
+                raise ResidencyError(
+                    "capture requires an active prepared weight binding "
+                    f"({model.component} block {block.path or '(common)'}: entered {block.count}, "
+                    f"retained {block.retained}, assigned {block.assigned is not None})"
+                )
             if not nested and not capturing:
                 # Prefetch reads the block after this one in execution order. Registration
                 # order lists a down/up block's attentions before its resnets (Diffusers'

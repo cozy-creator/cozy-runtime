@@ -194,9 +194,13 @@ class Loops:
         request = _REQUEST.get()
         if request is not None:
             ROWS.setdefault(request.id, []).append(row)
+        # The loop records its own programs: component region graphs neither replay nor learn
+        # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        bypass = graphs.BYPASS.set(True)
         try:
             self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
         finally:
+            graphs.BYPASS.reset(bypass)
             row["at_ms"]["returned"] = _now()
 
     def _run(
@@ -552,16 +556,16 @@ def _taken(lock: threading.Lock, ctx: Context) -> Iterator[None]:
 
 
 def _stale(program: _Program, ident: Hashable, *, checked: bool = False) -> str:
-    """Why a kept program cannot serve this call ("" when it can). `checked`: also its
-    definitions, an O(weights) walk run once per call, after the program is pinned."""
+    """Why a kept program cannot serve this call ("" when it can). `checked`: also the
+    definition a later call runs (`again`), an O(weights) walk, once per call after pinning."""
     if ident is None or program.ident != ident:
         return "another key or layout"
     for sequence in program.sequences():
         if sequence._closed:
             return "released"
-        for stage in sequence.stages if checked else ():
-            if why := stage._invalid_reason():
-                return str(why)
+    for stage in program.again.stages if checked and program.again is not None else ():
+        if why := stage._invalid_reason():
+            return str(why)
     return ""
 
 
