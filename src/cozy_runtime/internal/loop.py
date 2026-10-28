@@ -11,10 +11,11 @@ A keyed call whose blocks all stay resident records the whole call (`before`, th
 `after`) and keeps it for its call site: later calls run it natively from start to end, until a
 new key replaces it or residency retires it under pressure. A whole call is recorded only after
 an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
-blocks; one that does not fit is not tried again for that layout, and the steps alone are
-recorded. A resident program that no call keeps is not recorded: the call runs eagerly, which
-costs no more per step than native execution saves (SDXL, Qwen-Image measured). A streamed loop
-is recorded for every call: its native stages load each block while the last one runs.
+blocks; one that does not fit is not tried again for that layout. No other resident program is
+recorded, since no call keeps it: the call runs eagerly, which costs no more per step than native
+execution saves (SDXL, Qwen-Image measured), and a whole call that did not fit leaves its weights
+resident and runs eagerly too. Streamed stages are only for weights that are not resident,
+recorded for every call: they load each block while the last one runs.
 
 A loop outside any component scope (tensor work only) records resident every call and is never
 kept.
@@ -462,9 +463,10 @@ def _record(
         rest = steps[1:]
         began = time.perf_counter()
         row["resident_after_first_step"] = resident
-        attempts = [("resident", True)] if ends else []
-        attempts += [("resident", False)] if resident else []
-        attempts += [("streamed", False)] if scope else []
+        # One mode: a kept whole call, a componentless loop's steps, or the stages of weights
+        # that are not resident. Resident weights are never streamed: a refused recording
+        # leaves them in place and the rest runs eagerly.
+        attempts = [("resident", ends)] if ends or not scope else [("streamed", False)]
         for mode, whole in attempts:
             ctx.raise_if_cancelled()
             why = None

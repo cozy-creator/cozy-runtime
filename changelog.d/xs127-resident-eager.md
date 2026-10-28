@@ -1,0 +1,1 @@
+`denoise_loop` never streams resident weights. A whole call whose recording does not fit beside them (Krea 2 Turbo at 2048² on a 24 GB card) runs eagerly with its weights in place, instead of re-reading them through streamed stages on every call.
