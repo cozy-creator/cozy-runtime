@@ -1901,6 +1901,11 @@ class Memory:
                         if not self._active_beside(request):
                             free = self.room().free
                             if wanted > free:
+                                # Torch's idle cache goes before another phase's weights (a cold
+                                # Krea 2 DiT fill evicted its 4.3 GB text encoder beside it).
+                                release_cached(torch, self.device.type)
+                                free = self.room().free
+                            if wanted > free:
                                 self.native.reclaim_unpreferred(wanted - free)
                                 free = self.room().free
                 block.preferred = free >= wanted
