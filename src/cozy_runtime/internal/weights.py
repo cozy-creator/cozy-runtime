@@ -33,6 +33,7 @@ from cozy_runtime.author._loader import (
     canonical_dtype,
 )
 from cozy_runtime.author._model import PLACED, LoRAServing
+from cozy_runtime.author._context import CURRENT  # PROOF-ONLY
 from cozy_runtime.internal import execution, lora_bake
 from cozy_runtime.internal.accel import ResidencyError, StaleBinding
 from cozy_runtime.internal.derive import placing
@@ -765,6 +766,8 @@ class LoRALayer(Protocol):
     _cozy_baked: bool
 
 
+_PROOF_SEEN: list[str] = []  # PROOF-ONLY
+
 @dataclass(slots=True)
 class _Bake:
     """One LoRA'd linear: its stored base weight, its PEFT layer with each adapter's factors
@@ -1064,6 +1067,11 @@ class Placement:
                 self.unheld.add(name)
             else:
                 self.holds[name] = (hold, stream)
+        call = CURRENT.get()  # PROOF-ONLY: this executor's second request fails opening its first scope
+        if call is not None and call.request_id not in _PROOF_SEEN:
+            _PROOF_SEEN.append(call.request_id)
+            if len(_PROOF_SEEN) == 2:
+                raise RuntimeError("PROOF-ONLY: forced failure opening a component scope")
         with ExitStack() as passes:
             for name in sorted(entering):
                 passes.enter_context(self.models[name].passing(method))
