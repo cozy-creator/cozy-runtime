@@ -1,0 +1,1 @@
+`cozy_runtime.tiles.tiled`: decode a latent canvas in overlapping tiles with Diffusers' `tiled_decode` arithmetic (AutoencoderKL, Wan, Qwen-Image), bit for bit, in a few kernels a blend. Diffusers blends one overlapped line at a time: 31,000 launches at 2048² in 512 px tiles, Krea 2's decode 9.8 s on a slow host. krea-2 and qwen-image-2 tile through it.
