@@ -59,7 +59,7 @@ from cozy_runtime.internal.residency import (
 
 _execution: Any
 try:
-    from cozy_runtime._kernels import _execution
+    import cozy_runtime._kernels._execution as _execution
 except ModuleNotFoundError as missing:  # CPU and macOS wheels carry no native execution module
     if missing.name != "cozy_runtime._kernels._execution":
         raise
