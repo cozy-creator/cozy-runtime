@@ -142,9 +142,6 @@ class _Program:
         rest = () if self.again is None else (self.again,)
         return (*(sequence for sequence, _, _ in self.first), *rest)
 
-    def valid(self) -> bool:
-        return all(sequence.valid() for sequence in self.sequences())
-
     def close(self) -> None:
         for sequence in self.sequences():
             sequence.close()
@@ -241,9 +238,15 @@ class Loops:
                     kept = None
             if kept is not None:
                 with _taken(kept.lock, ctx), _pinned(kept) as pinned:
-                    if pinned and kept.valid():
+                    why = _stale(kept, ident, checked=True) if pinned else "released"
+                    if not why:
                         self._reuse(kept, loop, tensors, work, ctx, row)
                         return
+                row["dropped"] = why
+                with self._lock:
+                    if self._kept.get(site) is kept:
+                        del self._kept[site]
+                _close_idle(kept)
             program = None
             try:
                 program = _record(loop, tensors, work, scope, key, ctx, row, ident, shape, known)
@@ -263,6 +266,11 @@ class Loops:
                 _back(work, program.tensors)
                 return
             _back(work, program.tensors)
+            # Later calls run `again` only: the recording call's own program goes, so scope
+            # entries and submissions check one definition.
+            for sequence, _, _ in program.first:
+                sequence.close()
+            program.first = ()
             program.region = scope[0].memory.region(
                 "denoise_loop", "program", release=program.close
             )
@@ -543,14 +551,15 @@ def _taken(lock: threading.Lock, ctx: Context) -> Iterator[None]:
         lock.release()
 
 
-def _stale(program: _Program, ident: Hashable) -> str:
-    """Why a kept program cannot serve this call ("" when it can)."""
+def _stale(program: _Program, ident: Hashable, *, checked: bool = False) -> str:
+    """Why a kept program cannot serve this call ("" when it can). `checked`: also its
+    definitions, an O(weights) walk run once per call, after the program is pinned."""
     if ident is None or program.ident != ident:
         return "another key or layout"
     for sequence in program.sequences():
         if sequence._closed:
             return "released"
-        for stage in sequence.stages:
+        for stage in sequence.stages if checked else ():
             if why := stage._invalid_reason():
                 return str(why)
     return ""

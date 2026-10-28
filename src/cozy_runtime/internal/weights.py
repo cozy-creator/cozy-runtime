@@ -1052,8 +1052,8 @@ class Placement:
         pages (S3). A component with no free room binds per block."""
         entering = {name for name in components if name in self.models}
         self.release(keep=entering.union(*(s for s in self.steps if s & entering)))
-        for name in sorted(entering):  # graphs of another fill go before this one binds
-            graphs.retire_stale(self.torch, self.models[name].module)
+        # Graphs of another fill go before this one binds.
+        graphs.retire_stale(self.torch, *(self.models[name].module for name in sorted(entering)))
         stream = self.torch.cuda.current_stream() if self.memory.cuda else None
         for name in sorted(entering - self.holds.keys() - self.unheld):
             shed = functools.partial(self._shed, name)
