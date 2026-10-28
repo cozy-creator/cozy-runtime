@@ -1,0 +1,1 @@
+A streamed block's prefetch takes Torch's idle cache before it is refused for room. Since 0.35.1 kept one more of Qwen-Image's DiT blocks resident on 8 GB, the last streamed block's read was refused every step and read on the request path instead: 9 s of store wait per warm request (2 s in 0.35.0), +17% warm on a slower-disk host.

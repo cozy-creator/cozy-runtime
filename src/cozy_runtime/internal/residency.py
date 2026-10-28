@@ -2159,7 +2159,12 @@ class Memory:
                 pending.read.cancel()
 
     def _prefetch_block(
-        self, block: _Block, request: Request | None, *, queued: QueuedPrefetch | None = None
+        self,
+        block: _Block,
+        request: Request | None,
+        *,
+        queued: QueuedPrefetch | None = None,
+        released: bool = False,
     ) -> None:
         """Admit one immutable raw read, without eviction or Python fill callbacks."""
         if (
@@ -2234,6 +2239,20 @@ class Memory:
             except (torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) is not Fault.OOM:
                     raise
+                free = int(torch.cuda.mem_get_info(self.device)[0])
+                allocated, reserved, _ = _torch_bytes(self.device)
+                if (
+                    not released
+                    and queued is None
+                    and free < block.allocation_bytes <= (free + reserved - allocated)
+                ):
+                    # Demand's next read takes Torch's idle cache before it is refused. Refused,
+                    # it is read on the request path instead (Qwen-Image int8 on 8 GB: the last
+                    # streamed block, every step, 9 s per request).
+                    release_cached(torch, self.device.type)
+                    if request is not None:
+                        request.prefetch_released += 1
+                    return self._prefetch_block(block, request, released=True)
                 if request is not None:
                     request.prefetch_skipped += 1
                 return
@@ -2788,6 +2807,7 @@ class Request:
         self.final_fills = self.final_hits = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
+        self.prefetch_released = 0
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
@@ -2964,6 +2984,7 @@ class Request:
                     "completed": self.prefetch_completed,
                     "canceled": self.prefetch_canceled,
                     "skipped_capacity": self.prefetch_skipped,
+                    "released_cache": self.prefetch_released,
                     "failed": self.prefetch_failed,
                     "wait_ns": self.prefetch_wait_ns,
                     "scope": "one exact raw block; current demand precedes queued speculation",
