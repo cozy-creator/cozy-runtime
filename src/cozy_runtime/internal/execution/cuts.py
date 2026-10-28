@@ -52,6 +52,12 @@ def install(module: nn.Module) -> int:
             sub._conv_forward = _conv_bands(f"{path}:bands", sub, _conv_of(sub))
             vars(sub)["_cozy_cut"] = True
             count += 1
+        if _upsampled_conv(sub) and "_cozy_cut" not in vars(sub) and "forward" not in vars(sub):
+            fused: nn.Module = sub
+            fused.forward = catch.transparent(_upsample_conv(f"{path}:rows", sub))
+            vars(sub)["_cozy_cut"] = True
+            count += 1
+            continue
         # torch's RMS norm reduces each row alone: token pieces are the whole (v7 H3 13826 ran
         # out in a DiT block's 546 MiB rms_norm, a site with no cut).
         if type(sub) is nn.RMSNorm and "forward" not in vars(sub) and "_cozy_cut" not in vars(sub):
@@ -163,6 +169,90 @@ def _bands(
             out = part.new_empty(shape)
         out.narrow(axis, at, part.shape[axis]).copy_(part)
         del part
+    assert out is not None
+    return out
+
+
+def _upsampled_conv(module: nn.Module) -> bool:
+    """A 2x nearest upsample feeding a plain 2-D conv (Diffusers' Wan/Qwen-Image VAE resample)."""
+    if type(module) is not nn.Sequential or len(module) != 2:
+        return False
+    up, conv = module[0], module[1]
+    scale = up.scale_factor if isinstance(up, nn.Upsample) else None
+    return (
+        isinstance(up, nn.Upsample)
+        and up.size is None
+        and up.mode in ("nearest", "nearest-exact")
+        and scale in (2, 2.0, (2, 2), (2.0, 2.0))
+        and type(conv) is nn.Conv2d
+        and conv.stride == (1, 1)
+        and conv.dilation == (1, 1)
+        and conv.padding_mode == "zeros"
+        and isinstance(conv.padding, tuple)
+        and conv.padding[0] == (conv.kernel_size[0] - 1) // 2
+    )
+
+
+def _upsample_conv(site: str, module: nn.Module) -> Callable[..., object]:
+    """`conv(upsample(x))` in bands of output rows, each upsampling only the input rows it reads
+    (its halo included), so the whole upsampled tensor never exists. Anima's decoder at 3 GB ran
+    out allocating it (768 MiB) before the conv's own bands could help. Nearest 2x copies values,
+    so every band's numbers are the whole's."""
+    up, conv = module[0], module[1]
+    whole = _forward(module)
+
+    def cut(x: object, *args: object, **kwargs: object) -> object:
+        if (
+            args
+            or kwargs
+            or not isinstance(x, Tensor)
+            or x.dim() != 4
+            or torch.is_grad_enabled()
+            or type(conv.weight) not in (Tensor, nn.Parameter)
+        ):
+            return whole(x, *args, **kwargs)
+        rows = 2 * int(x.shape[-2])
+        run = functools.partial(_upsampled_rows, module, up, conv, x, rows)
+        return catch.cut(site, levels(rows), levelled(rows, _upsample_need(conv, x, rows)), run)
+
+    return cut
+
+
+def _upsample_need(conv: nn.Module, x: Tensor, rows: int) -> sizing.Per:
+    """The whole output, held throughout; a band's upsampled rows with their halo (in F32 too,
+    where the upsample computes in it, as Diffusers' Qwen-Image one does); and its output."""
+    batch, channels, width = int(x.shape[0]), int(x.shape[1]), 2 * int(x.shape[-1])
+    b = x.element_size()
+    halo = conv.padding[0]
+    out = batch * conv.out_channels * rows * width * b
+
+    def piece(n: int, granularity: int) -> int:
+        upsampled = batch * channels * (n + 2 * halo) * width
+        return sizing.peak(granularity, out, (upsampled * 4, upsampled * b, n * out // rows))
+
+    return piece
+
+
+def _upsampled_rows(
+    module: nn.Module, up: nn.Module, conv: nn.Module, x: Tensor, rows: int, level: int
+) -> Tensor:
+    if not level:
+        return module[1](module[0](x))
+    halo, size, out = conv.padding[0], pieces(rows, level), None
+    for top in range(0, rows, size):
+        catch.piece()
+        bottom = min(top + size, rows)
+        first, last = max(top - halo, 0), min(bottom + halo, rows)
+        band = up(x[:, :, first // 2 : (last - 1) // 2 + 1])
+        band = band[:, :, first - 2 * (first // 2) :][:, :, : last - first]
+        band = torch.nn.functional.pad(band, (0, 0, first - (top - halo), bottom + halo - last))
+        part = torch.nn.functional.conv2d(
+            band, conv.weight, conv.bias, padding=(0, conv.padding[1])
+        )
+        if out is None:
+            out = part.new_empty((part.shape[0], part.shape[1], rows, part.shape[3]))
+        out[:, :, top:bottom].copy_(part)
+        del band, part
     assert out is not None
     return out
 
