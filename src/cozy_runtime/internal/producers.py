@@ -68,9 +68,14 @@ class Processor:
     def _parallel_config(self, value: object) -> None:
         self.original._parallel_config = value
 
-    def __call__(self, attn: Module, *args: object, **kwargs: object) -> Tensor:
+    @property
+    def serving(self) -> AttentionProducer | None:
+        """The producer while the site's backend is its own (`author.producer_sites`)."""
         selected = self._attention_backend
-        if getattr(selected, "value", str(selected)) != self.backend:
+        return self.producer if getattr(selected, "value", str(selected)) == self.backend else None
+
+    def __call__(self, attn: Module, *args: object, **kwargs: object) -> Tensor:
+        if self.serving is None:
             return self.original(attn, *args, **kwargs)
         layout, state = _ACTIVE_LAYOUT.get(), self.producer.request_state()
         if layout is None or state is None:

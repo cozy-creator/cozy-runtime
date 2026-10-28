@@ -1,0 +1,1 @@
+`author.producer_sites(root)`: the attention modules under a root that a package's attention producer serves now (`ProducerSite`). A `denoise_loop` step carrying a producer's per-site state (MiniMax-H3's Kitchen key means) declares its slots from them, instead of importing the Runtime's internal processor.
