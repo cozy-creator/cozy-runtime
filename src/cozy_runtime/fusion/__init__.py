@@ -121,7 +121,10 @@ class DiTBlock:
     casts and copies around the q/k norms are skipped. `qk_norms` (relative to the attention)
     are per-head RMSNorms, with a weight unless not `qk_affine`.
     `gate`: the activation applied to the gates. `scale`: the norms are modulated by
-    `1 + scale` [`+ shift`]. `rows`: `"bf16"`, each step rounding as eager bf16 does, or
+    `1 + scale` [`+ shift`]. `weights`: the norm and q/k norm weights' dtype, the rows' wide one or
+    `"fp32"` (kept in fp32, Diffusers' `_keep_in_fp32_modules`); `centered`: they are stored
+    zero-centered, `1 + weight` multiplies (Krea 2's, Gemma's). `rows`: `"bf16"`, each step
+    rounding as eager bf16 does, or
     `"fp16"`, a block under fp16 autocast over an fp32 residual stream (fp32 norm weights and
     gates; the residual's `x + branch * gate` in fp32; a norm rounds once to fp16).
     """
@@ -141,6 +144,8 @@ class DiTBlock:
     scale: bool = True
     shift: bool = False
     rows: Literal["bf16", "fp16"] = "bf16"
+    weights: Literal["wide", "fp32"] = "wide"
+    centered: bool = False
     rms_rounding: Literal["twice", "once"] = "twice"
     qk_affine: bool = True
     compose: bool = False
@@ -166,6 +171,8 @@ class DiTBlock:
             rotary,
             norm=_kernels.LAYER if self.norm == "layer" else _kernels.RMS,
             weight=self.norm == "rms",
+            offset=int(self.centered),
+            weights="*fp32" if self.weights == "fp32" else "*fp32" if f16 else "*bf16",
             once=self.rms_rounding == "once",
             modulate=(1 + self.shift) if self.scale else 0,
             tanh=self.gate == "tanh",
@@ -205,8 +212,13 @@ class DiTBlock:
 
     @property
     def wide(self) -> Any:
-        """The residual stream's, the norm weights' and the tables' dtype."""
+        """The residual stream's and the tables' dtype."""
         return torch.float32 if self.rows == "fp16" else torch.bfloat16
+
+    @property
+    def weight_dtype(self) -> Any:
+        """The norm and q/k norm weights' dtype."""
+        return torch.float32 if self.weights == "fp32" else self.wide
 
     def contract(self) -> dict[str, object]:
         """What a fused block's numerics depend on, beyond its kernels' sources."""
@@ -221,6 +233,8 @@ class DiTBlock:
             "scale": self.scale,
             "shift": self.shift,
             "rows": self.rows,
+            "weights": self.weights,
+            "centered": self.centered,
             "rms_rounding": self.rms_rounding,
             "qk_affine": self.qk_affine,
             "composed": self.composed,
@@ -305,10 +319,12 @@ def _norm(module: Any, layout: DiTBlock, path: str) -> tuple[Any, float]:
     if (
         weight is None
         or tuple(weight.shape) != (layout.width,)
-        or weight.dtype is not layout.wide
+        or weight.dtype is not layout.weight_dtype
         or getattr(module, "bias", None)
     ):
-        raise _Mismatch(f"{path}: not a {layout.width}-wide {layout.wide} RMSNorm with a weight")
+        raise _Mismatch(
+            f"{path}: not a {layout.width}-wide {layout.weight_dtype} RMSNorm with a weight"
+        )
     return weight, _eps(module, path)
 
 
@@ -359,7 +375,7 @@ def _site(block: Any, layout: DiTBlock, switch: _Switch, path: str) -> _Site:
         affine = (
             weight is not None
             and tuple(weight.shape) == (layout.head_dim,)
-            and weight.dtype is layout.wide
+            and weight.dtype is layout.weight_dtype
         )
         if affine != layout.qk_affine or "forward" in vars(norm):
             raise _Mismatch(f"{path}.{name}: not the {layout.head_dim}-wide RMSNorm declared")
