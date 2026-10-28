@@ -31,8 +31,10 @@ if TYPE_CHECKING:
     from .svdq import Calibration
 
 SVDQ_STRATEGY = "svdq-nvfp4-r32-faer/1"
-# Explicit initial calibrated-fit allowance approved for Runtime callers, not total host RAM.
-FIT_WORKSPACE_BYTES = 512 << 20
+#: The host bytes one calibrated (svdq.nvfp4) fit may hold: an allowance, not an allocation. Its
+#: workspace is about 8 bytes per weight element (FLUX.3 Klein's 18432x3072 needs 526 MiB), so 2 GiB
+#: fits a DiT linear of about 250M elements.
+FIT_WORKSPACE_BYTES = 2 << 30
 _STRATEGIES = {
     "int8.convrot": "int8-convrot256/1",
     "nvfp4": "nvfp4-min-sse/1",
