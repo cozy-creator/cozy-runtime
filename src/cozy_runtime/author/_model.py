@@ -1183,11 +1183,18 @@ class _ComponentScope:
         self._local = _LOCAL_SCOPES.set(
             (*_LOCAL_SCOPES.get(), (model, self._method, self._components))
         )
-        if model._cozy_residency is not None:
-            self._using = model._cozy_residency.using(self._method, self._components)
-            self._using.__enter__()
-            for cache in model._cozy_caches:
-                cache.enter()
+        # A scope that fails to open gets no `__exit__` from its `with`: it gives back the turn
+        # and context it took here, or the next call on this executor waits on it forever.
+        try:
+            if model._cozy_residency is not None:
+                using = model._cozy_residency.using(self._method, self._components)
+                using.__enter__()
+                self._using = using
+                for cache in model._cozy_caches:
+                    cache.enter()
+        except BaseException:
+            self.__exit__(*sys.exc_info())
+            raise
         if model._cozy_harness is not None:
             model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
 
