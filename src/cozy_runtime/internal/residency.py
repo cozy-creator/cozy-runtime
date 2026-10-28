@@ -404,6 +404,11 @@ class _HostPage:
         if int(code) != 0:
             raise RuntimeError(f"cudaHostRegister returned {code}")
 
+    def window(self, offset: int, nbytes: int) -> Any:
+        """`nbytes` of the page from `offset`, as a CPU array for TensorFS to read into: Torch
+        exports registered memory as CUDA host memory, which TensorFS does not take."""
+        return self.tensor.numpy()[offset : offset + nbytes]
+
     def release(self) -> None:
         if self.event is not None:
             self.event.synchronize()
@@ -1759,7 +1764,7 @@ class Memory:
             model, page, kept, tensors, reads = self._host_jobs.get()
             try:
                 for key, role, offset, nbytes in reads:
-                    tensors.read_into(key, kept.tensor[offset : offset + nbytes], role=role)
+                    tensors.read_into(key, kept.window(offset, nbytes), role=role)
                 read = True
             except Exception:  # a store or fetch failure only leaves this page unkept
                 read = False
@@ -2571,7 +2576,7 @@ class Memory:
             block.loading = True
         data: dict[str, dict[str, Tensor]] = {}
         read_bytes = read_ns = 0
-        use = kept = None
+        use = kept = staged = None
         kept_ns = 0
         try:
             with self.lock:
@@ -2604,7 +2609,6 @@ class Memory:
                 block.native_use = use
                 block.native_storage = int(use.tensor.untyped_storage().data_ptr())
             page: tuple[object, ...] | None = None
-            staged: _HostPage | None = None
             if use is not None and use.needs_fill:
                 page = (block.model.name, block.path, block.model.identity, overlay)
                 if self._baked:
@@ -2631,7 +2635,7 @@ class Memory:
                     start, offset = offset, offset + (part.nbytes + 255) // 256 * 256
                     if (use is None or use.needs_fill) and kept is None:
                         began = time.perf_counter_ns()
-                        into = raw if staged is None else staged.tensor[start : start + part.nbytes]
+                        into = raw if staged is None else staged.window(start, part.nbytes)
                         try:
                             self._read_into(tensors, key, into, part.role or None)
                         except tensorfs.Error:
@@ -2673,6 +2677,8 @@ class Memory:
                 block.data, block.ready = data, ready
                 block.generation += 1
         except BaseException:
+            if staged is not None and staged not in self._baked.values():
+                staged.release()  # a host page whose read failed was never kept
             # A failed fill may have exported storage to a transform. Retire this region
             # identity; those exports keep their own pins, never a future fill's bytes.
             if use is not None and use.needs_fill:
