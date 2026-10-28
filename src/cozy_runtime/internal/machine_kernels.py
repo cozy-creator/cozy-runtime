@@ -1,6 +1,7 @@
 """The machine's kernels, compiled at machine start on the cards present while weights download:
 first the links between its GPUs (`parallel.links`), which a group reads, then each card row's
-attention cells (`boot`). The Runtime wheel's prebuilt kernels (the 8-bit op, FA3) need no build.
+attention cells (`boot`) and the LoRA bake set (`lora_bake.KERNELS`), so a new generation's first
+LoRA request bakes. The Runtime wheel's prebuilt kernels (the 8-bit op, FA3) need no build.
 
 The machine launches `python -m cozy_runtime.internal.machine_kernels` once per installed
 generation, under that generation's own seal: its interpreter and torch, every card of the
@@ -33,7 +34,9 @@ from cozy_runtime.internal import (
     kernel_cache,
     kernel_compile,
     kernel_sources,
+    lora_bake,
     prebuilt,
+    triton_kernels,
 )
 from cozy_runtime.internal.parallel import links
 
@@ -68,7 +71,8 @@ def _job(artifact: str, sm: int, device: str) -> kernel_compile.Job | None:
 
 
 def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
-    """Each card architecture's attention (`boot`), once per key; none the wheel serves."""
+    """Each card architecture's attention (`boot`), once per key, none the wheel serves; and its
+    LoRA bake set."""
     found: dict[str, kernel_compile.Job] = {}
     for sm, device in sorted(present.items()):
         for candidate in boot(arch.row(sm)):
@@ -76,6 +80,9 @@ def jobs(present: Mapping[int, str]) -> list[kernel_compile.Job]:
                 job = _job(candidate.artifact, sm, device)
                 if job is not None:
                     found.setdefault(job.key.digest, job)
+        if lora_bake.KERNELS.entries and not triton_kernels.TRITON_ABSENT:
+            bake = triton_kernels.job(lora_bake.KERNELS, sm)
+            found.setdefault(bake.key.digest, bake)
     return list(found.values())
 
 

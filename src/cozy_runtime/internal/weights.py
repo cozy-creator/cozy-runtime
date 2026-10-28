@@ -373,7 +373,7 @@ class Backend:
             if keys:
                 self.models[name] = self._register(name, root, keys)
         if self.device.type == "cuda" and any(b.bakes for b in self.bakes.values()):
-            lora_bake.warm(self.device.index or 0)  # its kernels build at load, in a child
+            lora_bake.warm(self.torch, self.device.index or 0)  # built since the start
             self._leg("lora_warm", leg)
         self.stats["register_ms"] = round((time.perf_counter() - started) * 1000, 2)
         self.state = "ready"
@@ -848,7 +848,9 @@ class _Bakes:
         group = (
             self.torch.distributed.is_initialized() and self.torch.distributed.get_world_size() > 1
         )
-        how: lora_bake.How | None = "eager" if gpu is None or group else lora_bake.serving(gpu)
+        how: lora_bake.How | None = (
+            "eager" if gpu is None or group else lora_bake.serving(self.torch, gpu)
+        )
         self._choice.set((strategy if how is not None else "per_step", how))
 
     @property
