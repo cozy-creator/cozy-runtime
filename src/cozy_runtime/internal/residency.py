@@ -1176,6 +1176,9 @@ class Memory:
         self.native: Any = None
         self.granularity = 512
         self.window_bytes = 0
+        #: The active phase's weights all fit beside the other phases' idle ones: nothing of it
+        #: streams, so its blocks reserve no streaming window (`_activate_phase`).
+        self._fits = False
         self._stage_window_owner: object | None = None
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
@@ -1853,6 +1856,11 @@ class Memory:
         """Live request concurrency; the caller holds lock across its policy decision."""
         return any(other is not request and not other.idle for other in self.requests)
 
+    def _headroom(self) -> int:
+        """The room a preferred block leaves free beside it: the streaming window, unless the
+        active phase fits."""
+        return 0 if self._fits else self.window_bytes
+
     def _native_region(
         self, block: _Block, *, final: bool = False, speculative: bool = False
     ) -> Any:
@@ -1877,7 +1885,7 @@ class Memory:
             )
             block.preferred = model.prefix is None
             if block.preferred and not block.cached():
-                wanted = missing + self.window_bytes
+                wanted = missing + self._headroom()
                 free = self.room().free
                 if (
                     self.phase_supported
@@ -1957,22 +1965,30 @@ class Memory:
                             )
                     if block.cached():
                         block.preferred = block.preference_set = True
-            wanted = missing + self.window_bytes
             allocated, before, _ = _torch_bytes(self.device)
             unused = max(before - allocated, 0)
-            if wanted > self.room().free and unused:
-                # The previous phase's inactive Torch segments are not weight capacity.
-                # Return them once here, not on each block or allocation callback.
+            if unused:
+                # The previous phase's inactive Torch segments are neither weight capacity nor
+                # this phase's activations, which Varena's allocator hook would otherwise take
+                # from idle weights before Torch returns its own cache (Krea 2's 2048² decode
+                # evicted 3.5 GB of its DiT beside 4.8 GB of the DiT's unused activations).
                 torch.cuda.empty_cache()
             returned = max(before - _torch_bytes(self.device)[1], 0)
-            # Protect the incoming cached bytes above; only other idle backing may go.
-            need = max(wanted - self.room().free, 0)
-            reclaimed = int(self.native.reclaim_unpreferred(need)) if need else 0
+            # Protect the incoming cached bytes above; only other phases' idle backing may go.
+            # A phase whose missing bytes then fit streams nothing and reserves no window: a
+            # window beside resident weights only evicts another phase's (a 4.3 GB text
+            # encoder's 13 GB window took 3.9 GB of an idle DiT every request).
+            need = missing - self.room().free
+            reclaimed = int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
+            self._fits = missing <= self.room().free
+            need = 0 if self._fits else missing + self.window_bytes - self.room().free
+            reclaimed += int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
             if request is not None:
                 request.phase_changes.append(
                     {
                         "models": sorted(names),
                         "window_bytes": self.window_bytes,
+                        "fits": self._fits,
                         "missing_bytes": missing,
                         "torch_unused_bytes": unused,
                         "torch_returned_bytes": returned,
@@ -2193,7 +2209,7 @@ class Memory:
                     and self.phase_supported
                     and not preferred
                     and block.model.prefix is None
-                    and block.allocation_bytes + self.window_bytes <= self.room().free
+                    and block.allocation_bytes + self._headroom() <= self.room().free
                 )
                 try:
                     if provisional:
