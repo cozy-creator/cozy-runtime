@@ -101,6 +101,10 @@ _DTYPES = {
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
 # During authored stage preparation, undeclared model reads must not page in sibling blocks.
 _CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
+#: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
+CUTTER: ContextVar[Any] = ContextVar("cozy_loop_cutter", default=None)
+#: A native loop's eager call (`internal.loop`): the models and blocks it ran.
+ENTERED: ContextVar[set[Any] | None] = ContextVar("cozy_loop_entered", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -723,7 +727,7 @@ class Binding:
                     any(p.dtype == "F4" for parts in block.parts.values() for p in parts.values()),
                 ),
                 (f"is in use ({block.count})", block.count),
-                (f"is retained ({block.retained})", block.retained),
+                (f"is retained ({block.retained}) in {model.component}", block.retained),
                 ("is loading", block.loading),
             ):
                 if refused:
@@ -2524,7 +2528,11 @@ class Memory:
         try:
             capturing = self.capturing()
             if capturing and (not nested or not block.retained or block.assigned is None):
-                raise ResidencyError("capture requires an active prepared weight binding")
+                raise ResidencyError(
+                    "capture requires an active prepared weight binding "
+                    f"({model.component} block {block.path or '(common)'}: entered {block.count}, "
+                    f"retained {block.retained}, assigned {block.assigned is not None})"
+                )
             if not nested and not capturing:
                 # Prefetch reads the block after this one in execution order. Registration
                 # order lists a down/up block's attentions before its resnets (Diffusers'
@@ -2646,6 +2654,8 @@ class Memory:
             model._release()
 
     def _open(self, model: Model, key: str, *, executing: bool = False) -> None:
+        if executing and (seen := ENTERED.get()) is not None:
+            seen.add(model)
         model._claim()
         depth = getattr(model.local, "depth", 0)
         model.local.depth = depth + 1
@@ -3192,6 +3202,10 @@ def _hooks(model: Model) -> None:
         sub = model.module.get_submodule(block.path)
 
         def entered(*_: object, b: _Block = block) -> None:
+            if (cut := CUTTER.get()) is not None:
+                cut.enter(b)
+            if (seen := ENTERED.get()) is not None:
+                seen.add(b)
             model._claim()
             try:
                 memory._enter(b)
@@ -3209,6 +3223,8 @@ def _hooks(model: Model) -> None:
                 memory._exit(b)
             finally:
                 model._release()
+            if (cut := CUTTER.get()) is not None:
+                cut.exit(b)
 
         model.handles.extend(_paired(sub, entered, exited))
 

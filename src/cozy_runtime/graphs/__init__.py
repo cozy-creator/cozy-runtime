@@ -609,18 +609,21 @@ def retire(torch: Any, root: Any) -> None:
         recorder.drop()
 
 
-def retire_stale(torch: Any, root: Any) -> None:
-    """Before a scope binds `root`'s weights: graphs recorded against another fill (a LoRA mode
-    or bake recipe this attempt changed) go first, so nothing replays over a refill."""
-    recorder = _RECORDERS.get(root)
-    if recorder is not None:
+def retire_stale(torch: Any, *roots: Any) -> None:
+    """Before a scope binds `roots`' weights: graphs recorded against another fill (a LoRA mode
+    or bake recipe this attempt changed) go first, so nothing replays over a refill. A
+    definition several roots own is checked once."""
+    recorders = [(root, r) for root in roots if (r := _RECORDERS.get(root)) is not None]
+    prepared: dict[int, Any] = {}
+    for _, recorder in recorders:
         with recorder.lock:
-            prepared = tuple(recorder.prepared)
-        for definition in prepared:
-            if not definition.valid():
-                definition._retire_if_idle()
-    if recorder is not None and recorder.binding is not None and not recorder.binding.valid():
-        retire(torch, root)
+            prepared.update((id(d), d) for d in recorder.prepared)
+    for definition in prepared.values():
+        if not definition.valid():
+            definition._retire_if_idle()
+    for root, recorder in recorders:
+        if recorder.binding is not None and not recorder.binding.valid():
+            retire(torch, root)
 
 
 def own_prepared(root: Any, definition: Any) -> None:

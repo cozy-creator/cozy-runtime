@@ -373,6 +373,28 @@ PLACED: weakref.WeakKeyDictionary[object, tuple[Residency, str]] = weakref.WeakK
 #: Kernel builds this process loaded after it started (a boot build landing): calls may take a
 #: faster path from each on, so graphs record them again. None loads while a graph records.
 LANDED: list[int] = [0]
+#: The attribute Runtime sets on a forward wrapper that calls the class's forward unchanged.
+#: Published minimax-h3 reads it by this name until it reads `plain_forward` (Runtime 0.35.0).
+TRANSPARENT = "_varena"
+
+
+def hold_dtype(module: Any, dtype: Any) -> None:
+    """Serve a component root in floating `dtype` from now on. A placed one keeps its stored
+    bytes; the Runtime casts them when it next fills the weights, so nothing loads here."""
+    if next(module.parameters()).dtype == dtype:
+        return
+    placed = PLACED.get(module)
+    if placed is None:
+        module.to(dtype=dtype)
+    else:
+        placed[0].represent(placed[1], dtype)()
+
+
+def plain_forward(module: Any) -> bool:
+    """Whether calling `module` runs its class's forward: it has no forward of its own but the
+    Runtime's transparent wrappers, which call the class's forward at each call."""
+    own = vars(module).get("forward")
+    return own is None or bool(getattr(own, TRANSPARENT, False))
 
 
 class Building(Exception):
