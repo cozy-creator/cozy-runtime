@@ -180,8 +180,13 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         checkpoint()
         scope.ordinals.clear()
         # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
-        # site's predicted cold/warm bytes must be reclaimed before running that site.
-        if not _capturing() and (wanted := need(level, available.granularity)) > available.free:
+        # site's predicted cold/warm bytes must be reclaimed before running that site. Torch's
+        # cached bytes are room too: its activations reuse them first, and returning them at
+        # every call of a step's sites is a device sync each (Krea 2's 2048² DiT stepped 14%
+        # slower beside its resident weights, emptying the cache 28 times a step).
+        if not _capturing() and (wanted := need(level, available.granularity)) > (
+            available.free + available.cached
+        ):
             request.reclaim(wanted)
         try:
             return run(level)
