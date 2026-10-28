@@ -1,8 +1,9 @@
 name: dev-build
 # Builds runtime-publish.yaml's release files for any ref, off the dev box:
 #   gh workflow run dev-build.yaml -R cozy-creator/cozy-runtime -f ref=<sha> [-f build=pure|execution]
-# The artifact is cozy-runtime-<sha>[-aarch64]. The files carry the ref's pyproject version; the
-# commit is stamped in cozy_runtime._build_provenance.
+# The artifact is cozy-runtime-<sha>[-aarch64]. The files are <pyproject version>+dev.g<sha8>, as
+# cozy's dev builds are, so a release always replaces one (xs-129); the commit is stamped in
+# cozy_runtime._build_provenance.
 on:
   workflow_dispatch:
     inputs:
@@ -74,6 +75,8 @@ jobs:
           COZY_RUNTIME_BUILD_COMMIT: ${{ steps.pin.outputs.sha }}
         run: |
           uv run python scripts/stamp-build-provenance.py "$COZY_RUNTIME_BUILD_COMMIT"
+          sed -i "0,/^version = \"\(.*\)\"$/s//version = \"\1+dev.g${COZY_RUNTIME_BUILD_COMMIT:0:8}\"/" pyproject.toml
+          grep -m1 '^version = ".*+dev\.g[0-9a-f]\{8\}"$' pyproject.toml
           uv build --out-dir dist
       - if: env.WHEELS == 'true'
         uses: actions/download-artifact@v4
