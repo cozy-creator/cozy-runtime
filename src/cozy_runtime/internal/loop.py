@@ -13,6 +13,8 @@ new key replaces it or residency retires it under pressure. A whole call is reco
 an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
 blocks; one that does not fit is not tried again for that layout, and the steps alone are
 recorded. Any other program closes before the loop returns, ahead of an eager `after`.
+
+A loop outside any component scope (tensor work only) records resident too, and is never kept.
 """
 
 from __future__ import annotations
@@ -389,6 +391,7 @@ def _record(
     post = known.after.get(shape, {})
     ends = (
         key is not None
+        and bool(scope)  # a kept program is a region of its components' memory
         and loop.after is not None
         and resident
         and loop.phases is None
@@ -422,7 +425,7 @@ def _record(
         row["resident_after_first_step"] = resident
         attempts = [("resident", True)] if ends else []
         attempts += [("resident", False)] if resident else []
-        attempts += [("streamed", False)]
+        attempts += [("streamed", False)] if scope else []
         for mode, whole in attempts:
             ctx.raise_if_cancelled()
             why = None
@@ -609,7 +612,7 @@ def _eligible(
         return (), "one step"
     scopes = _LOCAL_SCOPES.get()
     if not scopes:
-        return (), "outside a @uses_components scope"
+        return (), ""  # no components: tensor work only
     owner, _, components = scopes[-1]
     placement: Any = owner._cozy_residency
     models = tuple(

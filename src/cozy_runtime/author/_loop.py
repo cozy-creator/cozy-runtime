@@ -75,7 +75,8 @@ def denoise_loop(
       encoder writing carried conditioning, a decoder writing an image held in `state`. The
       Runtime records them into the program when their components stay on the device too.
 
-    Call it inside a `@uses_components` method: the components the step runs are that scope's.
+    A step that runs components is called inside a `@uses_components` method, whose components
+    they are. A step of tensor work alone may run outside one; it records resident too.
     """
     if not isinstance(steps, range) or not len(steps) or steps.step != 1:
         raise ValueError("denoise_loop steps are a nonempty range with step 1")
