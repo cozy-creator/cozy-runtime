@@ -237,12 +237,13 @@ def readable[*Ts](*tensors: *Ts) -> Iterator[tuple[*Ts]]:
     its block or model runs) is a placeholder whose pointer is 0: its read binds it, and the
     tensor read holds the pin until it dies, past the launch (`Placeholder._varena_read`).
     Every such launch goes through here, so none is handed a null pointer (cr-208)."""
-    yield cast("tuple[*Ts]", tuple(_read(t) for t in tensors))
+    yield cast("tuple[*Ts]", tuple(read(t) for t in tensors))
 
 
-def _read(tensor: Any) -> Any:
-    read = getattr(tensor, "_varena_read", None)
-    return tensor if read is None else read()
+def read(tensor: Any) -> Any:
+    """`readable` for one operand, without its context: a hot launch's (an int8 decode GEMV)."""
+    bind = getattr(tensor, "_varena_read", None)
+    return tensor if bind is None else bind()
 
 
 def rms_rope_split_half(
@@ -274,6 +275,7 @@ __all__ = [
     "int8_rows",
     "native",
     "quantize_once",
+    "read",
     "readable",
     "rms_rope_split_half",
     "shared_operand",

@@ -42,6 +42,8 @@ BUDGET = 1e-2
 #: (8 or 4 bits): far below the O(1) of garbage, above the measured quantization error.
 ATTENTION_BUDGET = {True: 2e-2, False: 0.25}
 _SAID: set[str] = set()
+#: How many checked weights `Prebuilt` remembers (a few models' linears).
+CHECKED = 4096
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +67,10 @@ class Prebuilt:
     #: whether the wheel carries a CUTLASS fp8 GEMM for this card
     cutlass_fp8: bool
     _scratch: Callable[[int], Tensor] = field(init=False)
+    #: Weights `_weight` has checked, by their pointers, shape and output dtype: a decode step
+    #: calls each linear with a row or two, where re-checking costs more than the GEMV. Paged
+    #: weights land at new addresses, so it is emptied at `CHECKED` entries.
+    _checked: set[tuple[object, ...]] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
         device = self.torch.device("cuda", self.index)
@@ -321,6 +327,10 @@ class Prebuilt:
         width: int,
         out_dtype: object,
     ) -> Tensor | None:
+        key = (data.dtype, scale.dtype, data.data_ptr(), scale.data_ptr(), *data.shape, width,
+               out_dtype)  # fmt: skip
+        if bias is None and key in self._checked and data.is_contiguous():
+            return None
         torch = self.torch
         want = torch.float8_e4m3fn if f.fp8 else torch.int8
         if data.dtype != want or data.dim() != 2 or data.shape[1] != width:
@@ -336,6 +346,9 @@ class Prebuilt:
             raise ValueError(f"{f.name}: the weight's tensors must be on cuda:{self.index}")
         self._half(out_dtype)
         if bias is None:
+            if len(self._checked) >= CHECKED:
+                self._checked.clear()
+            self._checked.add(key)
             return None
         if bias.numel() != data.shape[0]:
             raise ValueError(f"{f.name}: bias must have {data.shape[0]} values")
@@ -358,7 +371,8 @@ class Prebuilt:
         return bool(dtype == self.torch.float16)
 
     def _stream(self) -> int:
-        return int(self.torch.cuda.current_stream(self.index).cuda_stream)
+        # The raw handle, as Triton reads it: `cuda.current_stream` builds a Stream object a call.
+        return int(self.torch._C._cuda_getCurrentRawStream(self.index))
 
     def _check(self, code: int, what: str) -> None:
         if code == 0:
