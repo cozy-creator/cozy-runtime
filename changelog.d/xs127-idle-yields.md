@@ -1,0 +1,1 @@
+An idle region capture yields to an arriving request at once: its device-busy measurement runs on its own stream and waits checking for a command, instead of synchronizing behind a sleep as long as a slow host's warm-up (up to 1.26 s on an RTX 3060).

@@ -1345,27 +1345,45 @@ def _input(torch: Any, leaf: _Leaf, generator: Any) -> Any:
 _CYCLES: dict[int, float] = {}
 #: cycles of the calibrating sleep: ~2 ms at 2 GHz, far above the events' 0.5 us resolution
 _CALIBRATE = 1 << 22
+#: per device, the stream `_busy` measures on: nothing waits on it, so a measurement a request
+#: interrupts leaves no work in a request's way
+_MEASURE: dict[int, Any] = {}
 
 
 def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float:
-    """Device-busy ms of one `run` on the current stream: its launches queue behind a sleep as
-    long as its last host submission (`gate_ms`), so the device runs them back to back. A host
-    slower than the gate leaves the device waiting inside: the time is then an upper bound,
-    which only ever keeps a region eager."""
-    device, stream = torch.cuda.current_device(), torch.cuda.current_stream()
+    """Device-busy ms of one `run`: its launches queue behind a sleep as long as its last host
+    submission (`gate_ms`), so the device runs them back to back. A host slower than the gate
+    leaves the device waiting inside: the time is then an upper bound, which only ever keeps a
+    region eager. It runs on its own stream and waits checking for an arriving command
+    (`_Idle.check`): a request never waits for the gate, which lasts as long as a slow host's
+    warm-up."""
+    device, current = torch.cuda.current_device(), torch.cuda.current_stream()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    if device not in _CYCLES:
-        start.record(stream)
-        torch.cuda._sleep(_CALIBRATE)
-        end.record(stream)
-        end.synchronize()
-        _CYCLES[device] = _CALIBRATE / start.elapsed_time(end)
-    torch.cuda._sleep(int(gate_ms * _CYCLES[device]))
-    start.record(stream)
-    run()
-    end.record(stream)
-    end.synchronize()
+    measure = _MEASURE.get(device)
+    if measure is None:
+        measure = _MEASURE[device] = torch.cuda.Stream(device=device)
+    measure.wait_stream(current)
+    with torch.cuda.stream(measure):
+        if device not in _CYCLES:
+            start.record(measure)
+            torch.cuda._sleep(_CALIBRATE)
+            end.record(measure)
+            _settled(end)
+            _CYCLES[device] = _CALIBRATE / start.elapsed_time(end)
+        torch.cuda._sleep(int(gate_ms * _CYCLES[device]))
+        start.record(measure)
+        run()
+        end.record(measure)
+    _settled(end)
     return float(start.elapsed_time(end))
+
+
+def _settled(event: Any) -> None:
+    """Wait for `event`, yielding to a command that arrives meanwhile (`_Idle.check`)."""
+    while not event.query():
+        if (idle := _IDLE.get(None)) is not None:
+            idle.check()
+        time.sleep(0.0005)
 
 
 def _lease(torch: Any, placed: Any, binding: Any) -> Any:
