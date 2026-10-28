@@ -12,12 +12,12 @@ A keyed call whose blocks all stay resident records the whole call (`before`, th
 new key replaces it or residency retires it under pressure. A whole call is recorded only after
 an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
 blocks; one that does not fit is not tried again for that layout, and the steps alone are
-recorded. Any other program closes before the loop returns, ahead of an eager `after`. Such a
-program is recorded only while its native steps save more than recording costs, as the site's
-last recorded call measured: a second eager step measures each call's eager speed.
+recorded. A resident program that no call keeps is not recorded: the call runs eagerly, which
+costs no more per step than native execution saves (SDXL, Qwen-Image measured). A streamed loop
+is recorded for every call: its native stages load each block while the last one runs.
 
-A loop outside any component scope (tensor work only) records resident too, every call, and is
-never kept.
+A loop outside any component scope (tensor work only) records resident every call and is never
+kept.
 """
 
 from __future__ import annotations
@@ -164,8 +164,6 @@ class _Program:
     lock: threading.Lock = field(default_factory=threading.Lock)
     #: a kept program's cache handle: residency releases it under pressure while it is idle
     region: Any = None
-    #: a program no call keeps: its call's eager-step events, recording ms and layout (`_Site`)
-    timing: tuple[Any, Any, float, Hashable] | None = None
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
         rest = () if self.again is None else (self.again,)
@@ -184,13 +182,11 @@ class _Program:
 
 @dataclass
 class _Site:
-    """What a call site learned, per layout: the blocks an eager `after` ran and the whole
-    calls that did not fit (keyed calls), and for a program no call keeps, one eager step, one
-    native step and the recording, in milliseconds, from the last recorded call."""
+    """What a call site's keyed calls learned, per layout: the blocks an eager `after` ran,
+    and the whole calls that did not fit."""
 
     after: dict[Hashable, dict[Model, tuple[str, ...]]] = field(default_factory=dict)
     unfit: set[Hashable] = field(default_factory=set)
-    costs: dict[Hashable, tuple[float, float, float]] = field(default_factory=dict)
 
 
 class Loops:
@@ -257,8 +253,7 @@ class Loops:
             assert ctx is not None
             site = (step.__code__, tuple(id(model) for model in scope))
             # What a call site learns (`_Site`) depends on a keyed call's layout, not its key.
-            layout = (_layouts(tensors), len(steps), phases)
-            shape = None if key is None else layout
+            shape = None if key is None else (_layouts(tensors), len(steps), phases)
             ident = None if key is None else (key, shape)
             with self._lock:
                 known = self._sites.setdefault(site, _Site())
@@ -283,22 +278,12 @@ class Loops:
             try:
                 with _laps(row):
                     program = _record(
-                        loop, tensors, work, scope, key, ctx, row, ident, shape, layout, known
+                        loop, tensors, work, scope, key, ctx, row, ident, shape, known
                     )
                 if program is None:
                     return
-                began = time.perf_counter()
                 for sequence, first, count in program.first:
                     _submit(program, sequence, range(first, first + count), loop, ctx, row)
-                if program.timing is not None:
-                    start, end, record_ms, at = program.timing
-                    end.synchronize()
-                    native = sum(count for _, _, count in program.first)
-                    elapsed = (time.perf_counter() - began) * 1000 / native
-                    known.costs[at] = (start.elapsed_time(end), elapsed, record_ms)
-                    row["costs_ms"] = dict(
-                        zip(("eager_step", "native_step", "record"), known.costs[at], strict=True)
-                    )
             except BaseException:
                 if program is not None:
                     program.close()
@@ -408,11 +393,10 @@ def _record(
     row: dict[str, Any],
     ident: Hashable,
     shape: Hashable,
-    layout: Hashable,
     known: _Site,
 ) -> _Program | None:
     """`before` and the first step eagerly, then the rest recorded; None when every mode
-    refused or recording would not pay, after the loop ran eagerly to its end."""
+    refused or no call keeps the program, after the loop ran eagerly to its end."""
     if key is not None:  # the program owns copies; this call's values go in and out
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
@@ -450,31 +434,14 @@ def _record(
         if outside:
             row["whole_call"] = f"before/after not resident: {outside}"
         ends = not outside
-    # A resident program no call keeps serves this call alone. A second eager step measures
-    # eager speed; the site's last recorded call measured native speed and the recording.
-    done, events = 1, None
-    if resident and not ends and scope and len(steps) > 2:
-        events = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-        events[0].record()
-        loop.eager(steps[1:2], tensors, ctx)
-        events[1].record()
-        done = 2
-        if (learned := known.costs.get(layout)) is not None:
-            eager_ms, native_ms, record_ms = learned
-            saving = (eager_ms - native_ms) * (len(steps) - done)
-            if saving <= record_ms:
-                row["costs_ms"] = {
-                    "eager_step": eager_ms,
-                    "native_step": native_ms,
-                    "record": record_ms,
-                }
-                row["eager"] = f"recording {record_ms:.0f} ms, saving {saving:.0f} ms"
-                _back(work, tensors)  # the eager rest runs on the caller's tensors
-                tensors = work + tensors[len(work) :]
-                loop.eager(steps[done:], tensors, ctx)
-                _after(loop, tensors, scope, known, shape)
-                return None
-    recorded = time.perf_counter()
+    if resident and not ends and scope:
+        # No call keeps this program: recording it would cost more than its steps save.
+        row["eager"] = "resident, and no call keeps the program"
+        _back(work, tensors)  # the eager rest runs on the caller's tensors
+        tensors = work + tensors[len(work) :]
+        loop.eager(steps[1:], tensors, ctx)
+        _after(loop, tensors, scope, known, shape)
+        return None
     recording = PreparedSequence.record()
     recording.__enter__()
     try:
@@ -485,12 +452,12 @@ def _record(
                 raise
             row["refusals"].append(f"recording: {why}")
             _back(work, tensors)
-            loop.eager(steps[done:], work + tensors[len(work) :], ctx)
+            loop.eager(steps[1:], work + tensors[len(work) :], ctx)
             _after(loop, work + tensors[len(work) :], scope, known, shape)
             return None
         torch.cuda.empty_cache()
         _lap("prepare")
-        rest = steps[done:]
+        rest = steps[1:]
         began = time.perf_counter()
         row["resident_after_first_step"] = resident
         attempts = [("resident", True)] if ends else []
@@ -552,12 +519,7 @@ def _record(
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
                 after_native=whole,
             )
-            timing = None
-            if events is not None and mode == "resident":
-                timing = (*events, (time.perf_counter() - recorded) * 1000, layout)
-            return _Program(
-                first, again, whole, mode, tensors, counter, ident, stages, blocks, timing=timing
-            )
+            return _Program(first, again, whole, mode, tensors, counter, ident, stages, blocks)
         _back(work, tensors)  # the eager rest runs on the caller's tensors
         tensors = work + tensors[len(work) :]
         loop.eager(rest, tensors, ctx)
