@@ -900,15 +900,18 @@ class _Bakes:
         return tuple(self._delta(hook) for hook in hooks)
 
     def _delta(self, hook: LoRASource) -> object:
-        """One hook's armed delta by its content: its factors' model and path, dtypes and scale.
-        Factors no loaded model holds have no name: a fresh object, equal to no other."""
+        """One hook's armed delta by its content: its factors' checkpoint and component (not the
+        package that loaded them: a published package and its source installed locally bake the
+        same bytes), path, dtypes and scale. Factors no loaded model holds have no name: a fresh
+        object, equal to no other."""
         got = hook.lora_factors()
         if got is None:
             return None
         named = self.owner(got[0])
         if named is None:
             return object()
-        return (named[0].name, named[1], str(got[1].dtype), str(got[2].dtype), repr(float(got[3])))
+        model, path = named
+        return (model.content, path, str(got[1].dtype), str(got[2].dtype), repr(float(got[3])))
 
     def _described(self, *, armed: bool) -> str | None:
         """`identity`, or with `armed` each hook's armed delta too: what seeds a bake's rounding."""

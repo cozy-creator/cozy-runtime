@@ -391,7 +391,9 @@ class Model:
     def __init__(self, memory: Memory, module: nn.Module, declared: Declared) -> None:
         self.memory, self.module, self.source = memory, module, declared.weights
         self.component = declared.weights.component
-        self.name = f"{self.source.release}/{self.source.ck.id}/{self.component}"
+        #: The component by its checkpoint's content, however its package was installed.
+        self.content = f"{self.source.ck.id}/{self.component}"
+        self.name = f"{self.source.release}/{self.content}"
         self.fill, self.bind, self.finals = declared.fill, declared.bind, declared.finals
         self.declared_finals = declared.finals
         self.binding_identity = None if self.finals is None else self.finals.identity
