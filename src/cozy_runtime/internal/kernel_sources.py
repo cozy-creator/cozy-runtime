@@ -14,12 +14,13 @@ the component/custom source layout:
 A `Recipe` names the sources an artifact builds from and how. `setup` runs the upstream
 project's own `setup.py build` beside the GPU it will serve, so its arch detection picks this
 card and no upstream patch is needed; a one-line incompatibility with this torch is a text
-replacement applied at build time, in the open, in the recipe. `python` unpacks every Python
-source (wheels, and a tree's pure package by its `package` path) into one importable tree: the
-CuTe DSL, TVM-FFI and the JIT kernels built on them (Sol, FlashAttention-4, FlashInfer). Every
-source's digest is a key input, with the card's architecture, torch, CUDA, Python and the
-compiler, so another image or card builds its own entry and never loads this one's. A driver
-update rebuilds nothing; the kernel is verified again on it (`verify`).
+replacement applied at build time, in the open, in the recipe (to a reviewed wheel's unpacked
+files too). `python` unpacks every Python source (wheels, and a tree's pure package by its
+`package` path) into one importable tree: the CuTe DSL, TVM-FFI and the JIT kernels built on
+them (Sol, FlashAttention-4, FlashInfer). Every source's digest is a key input, with the
+card's architecture, torch, CUDA, Python and the compiler, so another image or card builds its
+own entry and never loads this one's. A driver update rebuilds nothing; the kernel is verified
+again on it (`verify`).
 """
 
 from __future__ import annotations
@@ -425,7 +426,22 @@ RECIPES: dict[str, Recipe] = {
                 *_FA3_TOOLKIT,
             ),
         ),
-        Recipe("comfy-kitchen", "setup", ("comfy-kitchen",), build_deps=("nanobind",)),
+        Recipe(
+            "comfy-kitchen",
+            "setup",
+            ("comfy-kitchen",),
+            build_deps=("nanobind",),
+            # A ragged last Sol block's length was a host-to-device copy, which CUDA graph capture
+            # refuses; fill_ writes the same value on the device. Until upstream takes it:
+            # https://github.com/Comfy-Org/comfy-kitchen/pull/283
+            replace=(
+                (
+                    "comfy_kitchen/backends/eager/sol_attn.py",
+                    "lengths[-1] = float(tail)",
+                    "lengths[-1:].fill_(float(tail))",
+                ),
+            ),
+        ),
         Recipe(PYTHON, "python"),
     )
 }
@@ -524,9 +540,14 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
     if _compatible_kitchen_wheel(wheel):
         assert wheel is not None
         # This exact published binary is the reviewed matrix artifact. Its key is
-        # the installed wheel's bytes and Python ABI, not a source compiler recipe.
+        # the installed wheel's bytes, Python ABI and the recipe's text fixes.
         wheel = replace(wheel, name=name)
-        inputs = {"python": _python(), "sources": {name: wheel.sha256}, "layout": 2}
+        inputs = {
+            "python": _python(),
+            "sources": {name: wheel.sha256},
+            "replace": recipe.replace,
+            "layout": 2,
+        }
         return kernel_compile.Job(
             "python",
             kernel_cache.Key.of(name, inputs),
@@ -706,7 +727,20 @@ def build_python(
             else:
                 _unpack(row, site)
             report(done / len(rows))
+    _fix(site, RECIPES[spec["recipe"]], spec.get("sm", 0))
     return {"sources": [f"{row['name']}=={row['version']}" for row in rows]}
+
+
+def _fix(tree: Path, recipe: Recipe, sm: int) -> None:
+    """The recipe's text fixes, each refused once upstream no longer has its text."""
+    for relative, old, new in (*recipe.replace, *recipe.replace_on.get(sm, ())):
+        path = tree / relative
+        text = path.read_text()
+        if old not in text:
+            raise kernel_compile.CompileFailed(
+                "compile_recipe_stale", f"{relative} no longer contains {old!r}"
+            )
+        path.write_text(text.replace(old, new))
 
 
 #: `PYTORCH_NVCC` for a build: its compiler jobs, each admitted by the machine's compile ledger.
@@ -735,14 +769,7 @@ def build_setup(
             shutil.rmtree(tree / where, ignore_errors=True)
             (tree / where).parent.mkdir(parents=True, exist_ok=True)
             shutil.move(placed, tree / where)
-        for relative, old, new in (*recipe.replace, *recipe.replace_on.get(spec.get("sm", 0), ())):
-            path = tree / relative
-            text = path.read_text()
-            if old not in text:
-                raise kernel_compile.CompileFailed(
-                    "compile_recipe_stale", f"{relative} no longer contains {old!r}"
-                )
-            path.write_text(text.replace(old, new))
+        _fix(tree, recipe, spec.get("sm", 0))
         deps = work / "deps"
         deps.mkdir()
         for name, row in spec.get("build_deps", {}).items():
