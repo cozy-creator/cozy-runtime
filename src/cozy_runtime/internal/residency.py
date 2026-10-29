@@ -1262,6 +1262,8 @@ class Memory:
         self._populator: threading.Thread | None = None
         #: pages the populator could not keep, released (unregistered) on the request thread
         self._host_dropped: list[_HostPage] = []
+        #: stored pages read from the store once: only a second read pins a host page for it
+        self._read_once: set[tuple[object, ...]] = set()
         self._h2d_stream: Any = None
         self._host_looked = 0.0
         admission = inspect.signature(varena.Region.prepare).parameters
@@ -1674,6 +1676,15 @@ class Memory:
             self._baked[page] = kept
             self._baked_bytes += tensor.numel()
 
+    def _read_before(self, page: tuple[object, ...]) -> bool:
+        """Whether this stored page was read from the store before; marks it read. A page read
+        once (a cold request's, a resident model's) never pays for pinning: pinning runs at
+        about the copy's own rate (5.5 GiB/s on an RTX 3070 host), on the request path."""
+        if page in self._read_once:
+            return True
+        self._read_once.add(page)
+        return False
+
     def _host_page(self, nbytes: int) -> _HostPage | None:
         """A zeroed, pinned host page for the tier: process lifetime, never on disk, each page
         once. Only into room beyond the headroom and within half of the host's RAM, evicting
@@ -1733,7 +1744,7 @@ class Memory:
         if model.fill is not None or block.preferred or block.finals or region is None:
             return
         page = (model.name, block.path, model.identity, None)
-        if page in self._baked or page in self._populating:
+        if page in self._baked or page in self._populating or not self._read_before(page):
             return
         kept = self._host_page(block.storage_bytes)  # the fill's bytes; the region rounds up
         if kept is None:
@@ -2396,6 +2407,7 @@ class Memory:
                             and block.model.fill is None
                             and not block.preferred
                             and page not in self._populating
+                            and self._read_before(page)
                         ):
                             staged = self._host_page(block.storage_bytes)
                         host = (
@@ -2679,8 +2691,13 @@ class Memory:
                     use.tensor.copy_(kept)  # complete when this returns
                     kept_ns = time.perf_counter_ns() - began
                     self._baked.move_to_end(page)
-                elif block.model.fill is None and not block.preferred and not block.finals:
-                    # A streaming stored page's first read lands in its host page, then one DMA.
+                elif (
+                    block.model.fill is None
+                    and not block.preferred
+                    and not block.finals
+                    and self._read_before(page)
+                ):
+                    # A streamed page read again lands in its host page, then one DMA.
                     staged = self._host_page(use.tensor.numel())
             offset = 0
             for key, parts in block.parts.items():
