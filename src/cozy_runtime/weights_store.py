@@ -116,6 +116,17 @@ def open_checkpoint(store: Path, ref: str, connection: Connection | None = None)
     return tensorfs.open(ref, cache_dir=store, endpoint=options.endpoint, token=options.token)
 
 
+def open_view(
+    store: Path, header: bytes, own: Sequence[bytes], connection: Connection | None = None
+) -> Checkpoint:
+    """Open a checkpoint whose header is held in memory (an adapter view TensorD composed by
+    reference) over the shared cache; nothing of it is written."""
+    options = connection or Connection()
+    return tensorfs.view(
+        header, own, cache_dir=store, endpoint=options.endpoint, token=options.token
+    )
+
+
 def read_into(
     ck: Checkpoint, component: str, key: str, role: str, offset: int, into: Buffer
 ) -> None:

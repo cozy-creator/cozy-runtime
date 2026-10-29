@@ -197,6 +197,7 @@ from cozy_runtime.internal.executor_commands import (
     Supplied,
     TensorFSOptions,
     Unload,
+    View,
 )
 from cozy_runtime.internal.executor_replies import GpuMemory, RankMemory
 from cozy_runtime.internal.exits import Exit
@@ -2492,7 +2493,7 @@ class Executor:
         opened: dict[str, Checkpoint] = {}
         for manifest in {vmap.get(name, reference.snapshot) for name in names}:
             opened[manifest] = host._checkpoint(
-                manifest, _connection(command.tensorfs, command.actor, host.bearers)
+                manifest, _connection(command.tensorfs, command.actor, host.bearers), binding.views
             )
         checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
         # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
@@ -2531,7 +2532,9 @@ class Executor:
             ),
             None,
         ) or host._checkpoint(
-            reference.snapshot, _connection(command.tensorfs, command.actor, host.bearers)
+            reference.snapshot,
+            _connection(command.tensorfs, command.actor, host.bearers),
+            binding.views,
         )
         config_bytes = model_config.construction_config(config_checkpoint.configs())
         config_document = canonical.parse_canonical(config_bytes)
@@ -4489,9 +4492,17 @@ class Executor:
         return host.store
 
     def _checkpoint(
-        self, ref: str, connection: weights_store.Connection | None = None
+        self,
+        ref: str,
+        connection: weights_store.Connection | None = None,
+        views: Mapping[str, View] | None = None,
     ) -> Checkpoint:
+        """`ref` from the store, or from the bytes TensorD sent when it is a view (`views`)."""
         with store_refusals(f"opening {ref[:23]}"):
+            view = (views or {}).get(ref)
+            if view is not None:
+                opened = weights_store.open_view(self._store(), view.header, view.own, connection)
+                return Checkpoint(opened)
             return Checkpoint(weights_store.open_checkpoint(self._store(), ref, connection))
 
     def _child_events(self, exchange: Exchange) -> Nudges:

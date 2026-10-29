@@ -224,6 +224,15 @@ class Adapter(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     family: str = ""
 
 
+class View(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """A checkpoint whose header lives only in TensorD's memory (an adapter view composed by
+    reference): opened from these bytes, never from the store."""
+
+    header: bytes = b""
+    #: the objects it cites that no store holds (its graph)
+    own: tuple[bytes, ...] = ()
+
+
 class Binding(Release, frozen=True, kw_only=True):
     """One model's construction: its class, where its weights are, and how to fill them.
 
@@ -247,6 +256,8 @@ class Binding(Release, frozen=True, kw_only=True):
     package: str = ""
     model: str = ""
     adapters: tuple[Adapter, ...] = ()
+    #: the snapshots that are views, by id
+    views: dict[str, View] = {}
     prepared_use: PreparedUse | None = None
     #: In a group, each placeable component's GPU (an index within it): 0 keeps it beside the
     #: serial scope, g >= 1 keeps it resident on GPU g, where its calls and remote scopes run.
