@@ -10,11 +10,12 @@ the first sight of a length (a model's intake statement, or the first dense step
 compile, and conditioning and the dense steps cover it. A sparse step never waits for it: while
 the object builds, the step runs the dense reference (`dense_building`), and the object serves
 from the step boundary after it is ready (`kernel_ready`); the run's kernel rows say from which
-step. Upstream's preprocess kernels, which take the length and head count as constants, build
-the same way per (length, heads) (`preprocess`, a `triton_kernels.warm_job`); the step runs the
-dense reference until they are built, and for good when their build failed. Their autotuning is
-pinned to one configuration, because its candidates differ bitwise and a timing race must not
-choose the output.
+step. Upstream's preprocess kernels take the length, the head count and the block count as
+runtime integers here (`kernel_sources`' Python recipe fixes their source): one build per card
+(`preprocess`, a `triton_kernels.warm_job`, at machine start with the card's object) serves every
+length and head window; a step runs the dense reference only while that one build runs, and for
+good when it failed. Their autotuning is pinned to one configuration, because its candidates differ
+bitwise and a timing race must not choose the output.
 """
 
 from __future__ import annotations
@@ -510,11 +511,12 @@ def _job_for(tokens: int, capability: tuple[int, int]) -> kernel_compile.Job:
 
 
 def card_jobs(store: kernel_cache.Store, capability: tuple[int, int]) -> list[kernel_compile.Job]:
-    """What a card compiles ahead of any request: its one object, or on SM90, whose object is
-    per length layout, every layout this machine has served."""
+    """What a card compiles ahead of any request: upstream's preprocess, and its one object, or
+    on SM90, whose object is per length layout, every layout this machine has served."""
+    found = [preprocess_job(capability[0] * 10 + capability[1])]
     if route(capability) != "sm90":
-        return [_job_for(1, capability)]
-    return kernel_compile.learned(store, _scope(capability))
+        return [*found, _job_for(1, capability)]
+    return [*found, *kernel_compile.learned(store, _scope(capability))]
 
 
 def submit_card(index: int) -> None:
@@ -527,6 +529,7 @@ def submit_card(index: int) -> None:
     if capability is None or store is None:
         return
     if route(capability) != "sm90":
+        kernel_compile.submit(store, preprocess_job(capability[0] * 10 + capability[1]))
         _ready(1, device, -2)
         return
     for found in card_jobs(store, capability):
@@ -611,33 +614,34 @@ def _open(
     return None if data is None else load(data)
 
 
-def _preprocessed(tokens: int, query: Tensor) -> str:
-    """Whether upstream's preprocess kernels for this length and head count serve here: "" once
-    they do, else what a sparse step serves instead (`dense_building` while they build,
-    `dense_step` when their build failed)."""
-    heads, index = query.shape[2], query.device.index or 0
-    name = f"{KERNEL} preprocess {tokens}x{heads} cuda:{index}"
-    if kernel_ready.ready(name, functools.partial(_warm, index, tokens, heads)) is not None:
+def _preprocessed(query: Tensor) -> str:
+    """Whether upstream's preprocess kernels serve on this card: "" once they do, else what a
+    sparse step serves instead (`dense_building` while their one build runs, `dense_step` when
+    it failed). Every length and head count shares it."""
+    index = query.device.index or 0
+    name = f"{KERNEL} preprocess cuda:{index}"
+    if kernel_ready.ready(name, functools.partial(_warm, index)) is not None:
         return ""
     return "dense_step" if kernel_ready.failed(name) is not None else "dense_building"
 
 
-def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool | None:
+def preprocess_job(arch: int) -> kernel_compile.Job:
+    """The one build of upstream's preprocess for a card architecture (`preprocess`)."""
+    from cozy_runtime.internal import triton_kernels
+
+    return triton_kernels.warm_job(
+        f"{KERNEL}-preprocess", f"{__name__}:preprocess", [], arch, {"library": sol_library()}
+    )
+
+
+def _warm(index: int, wait: bool) -> bool | None:
     """`_preprocessed`'s opener: `preprocess` built by the machine's compile manager for this
     card, then loaded here (its build waited for when `wait`, else None while it runs)."""
     store = kernel_cache.configured()
     if store is None:
         raise kernel_compile.CompileFailed("absent", "no machine kernel store to compile into")
     major, minor = _arch(index)
-    from cozy_runtime.internal import triton_kernels
-
-    found = triton_kernels.warm_job(
-        f"{KERNEL}-preprocess",
-        f"{__name__}:preprocess",
-        [tokens, heads],
-        major * 10 + minor,
-        {"library": sol_library()},
-    )
+    found = preprocess_job(major * 10 + minor)
     state = (kernel_compile.wait if wait else kernel_compile.submit)(store, found)
     if state.state in ("compiling", "pending"):
         return None
@@ -646,23 +650,24 @@ def _warm(index: int, tokens: int, heads: int, wait: bool) -> bool | None:
     import torch
 
     with torch.cuda.device(index):
-        preprocess(tokens, heads)
+        preprocess()
     return True
 
 
-def preprocess(tokens: int, heads: int) -> None:
-    """Upstream's exact-threshold preprocess (`preprocess.prepare`) for `tokens` and `heads` on
-    the current card, launching nothing: in the compile manager's builder it compiles (`_warm`),
-    in an executor it loads what that built. Its operands are host stand-ins in the live ones'
-    class: what compiles is the descriptors' block shapes, the constants and the lengths'
-    residues, never the sizes."""
+def preprocess() -> None:
+    """Upstream's exact-threshold preprocess (`preprocess.prepare`) on the current card,
+    launching nothing: in the compile manager's builder it compiles (`_warm`), in an executor it
+    loads what that built. Its operands are host stand-ins in the live ones' class: what compiles
+    is the descriptors' block shapes and the constants. Lengths, head counts and block counts are
+    runtime integers none of the kernels specializes on, so any stand-in sizes serve."""
     import torch
 
     upstream = import_module("sol_attn.preprocess")
     descriptor = import_module("triton.tools.tensor_descriptor").TensorDescriptor
     _pin_preprocess()
+    tokens, heads = _BLOCK, 1
     blocks, bf16, f32 = -(-tokens // _BLOCK), torch.bfloat16, torch.float32
-    rows = torch.empty(1, _BLOCK + tokens % 16, heads, 128, dtype=bf16)
+    rows = torch.empty(1, _BLOCK, heads, 128, dtype=bf16)
     tiles = descriptor.from_tensor(rows, [1, _BLOCK, 1, 128])
     shape = (tokens, heads, blocks, 128, _BLOCK, 128)
     upstream._reduce_kc_kernel.warmup(tiles, bf16, *shape, grid=(1,))
@@ -869,7 +874,7 @@ def _execute(
     if not dense_path and sparse is None:
         # The first sight of this length starts its kernels opening off the request (a CuTe
         # route's object, upstream's preprocess), and the dense steps run while they build.
-        unbuilt = "" if card is None else _preprocessed(layout.live_tokens, query)
+        unbuilt = "" if card is None else _preprocessed(query)
         ready, waiting = (FA4, "") if fa4 else _ready(layout.live_tokens, query.device, layout.step)
         if ready is not None and unbuilt:
             ready, waiting = None, unbuilt
