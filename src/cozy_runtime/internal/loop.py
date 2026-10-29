@@ -442,10 +442,13 @@ def _record(
     if ends and (short := _short(known.peak.get(shape, 0), pre, body, post)):
         # Refused before its recording takes any memory: a capture that runs out costs a
         # prepare, a bind and a cleanup, and evicts weights on its way (SDXL int8 at 6 GiB
-        # free: 0.42 s and 713 MB, once per layout).
+        # free: 0.42 s and 713 MB, once per layout). The refusal keeps that cleanup: device
+        # memory held by unreachable objects is returned before the rest of the call needs it.
         row["whole_call"] = short
         known.unfit.add(shape)
         ends = False
+        gc.collect()
+        torch.cuda.empty_cache()
     if not ends and scope:
         # No call keeps this program: recording it would cost more than its steps save.
         row["eager"] = f"{'resident' if resident else 'streamed'}, and no call keeps the program"
