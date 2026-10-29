@@ -1674,6 +1674,14 @@ class Memory:
             self._baked[page] = kept
             self._baked_bytes += tensor.numel()
 
+    def _host_copy(self, into: Tensor, page: _HostPage) -> None:
+        """One DMA from a pinned page on the current stream, not waited for here: the page's
+        event orders its release after the copy."""
+        into.copy_(page.tensor, non_blocking=self.cuda)
+        if self.cuda:
+            page.event = torch.cuda.Event()
+            page.event.record()
+
     def _host_page(self, nbytes: int) -> _HostPage | None:
         """A zeroed, pinned host page for the tier: process lifetime, never on disk, each page
         once. Only into room beyond the headroom and within half of the host's RAM, evicting
@@ -2674,9 +2682,10 @@ class Memory:
                     self._trim_baked()  # host pressure gives kept pages back here
                 found = self._baked.get(page)
                 if found is not None and found.tensor.numel() == use.tensor.numel():
-                    # The page's host copy (its first store read, or bake): one DMA.
+                    # The page's host copy (its first store read, or bake): one DMA, queued on the
+                    # stream that runs the block, so the host keeps running ahead of the GPU.
                     kept, began = found.tensor, time.perf_counter_ns()
-                    use.tensor.copy_(kept)  # complete when this returns
+                    self._host_copy(use.tensor, found)
                     kept_ns = time.perf_counter_ns() - began
                     self._baked.move_to_end(page)
                 elif block.model.fill is None and not block.preferred and not block.finals:
@@ -2716,7 +2725,7 @@ class Memory:
                         raise ResidencyError(f"stored geometry does not match {key}#{role}")
                     views[role] = view.view(shape)
             if staged is not None and use is not None and page is not None:
-                use.tensor.copy_(staged.tensor)  # complete when this returns
+                self._host_copy(use.tensor, staged)
                 with self.lock:
                     self._baked[page] = staged
                     self._baked_bytes += staged.tensor.numel()
