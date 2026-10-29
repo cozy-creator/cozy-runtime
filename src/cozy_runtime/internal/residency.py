@@ -1344,9 +1344,14 @@ class Memory:
         if self.native is not None:
             # Native pins, including escaped Torch storage aliases, are the authority.
             # Do not count an idle Python block as reclaimable merely because hooks closed.
-            cold = int(self.native.stats()["reclaimable_bytes"])
+            # The active phase's resident prefix (preferred) is warm, as current models' blocks
+            # are below: a cut takes a finer level before it evicts the weights it runs (H3 Turbo
+            # on a 4090: one coarser FFN cut evicted 20 transformer blocks, re-read and re-baked).
+            stats = self.native.stats()
+            reclaimable = int(stats["reclaimable_bytes"])
+            own = min(int(stats.get("preferred_bytes", 0)), reclaimable)
             # Pure-cut workspace estimates still use Torch's allocation granularity.
-            return Room(int(free), cold, 0)
+            return Room(int(free), reclaimable - own, own)
         with self.lock:
             cold = warm = 0
             for model in self.models.values():
