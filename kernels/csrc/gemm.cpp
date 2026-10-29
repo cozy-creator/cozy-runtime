@@ -85,8 +85,11 @@ int quantize(int device, bool fp8, uintptr_t x, bool x_half, uintptr_t q, uintpt
              int64_t shift_stride, int rows_per_entry, int norm, float eps, int activation,
              uintptr_t stream) {
     if (!fits(fp8, K) || M < 0 || norm < cozy_int8::kNormNone || norm > cozy_int8::kNormRms ||
-        activation < cozy_int8::kActNone || activation > cozy_int8::kActGeluTanh ||
+        activation < cozy_int8::kActNone || activation > cozy_int8::kActSitu ||
         rows_per_entry < 1)
+        return cudaErrorInvalidValue;
+    // The gated activation reads [M, 2K] and takes no norm or modulation.
+    if (activation == cozy_int8::kActSitu && (norm != cozy_int8::kNormNone || scale || shift))
         return cudaErrorInvalidValue;
     if (M == 0) return cudaSuccess;
     const OnDevice guard(device);
