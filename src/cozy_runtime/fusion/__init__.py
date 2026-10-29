@@ -29,6 +29,9 @@ compile on the executor's GPUs at boot, and install it in `Model.execution_plan`
 A construction never waits for the compile: until it is ready the eager blocks serve, and the
 fused ones from the next request on. A block whose structure, widths or dtype differ from the
 declaration serves eager (reported).
+
+A VAE's channel-first RMS norm (Wan's `RMS_norm` and the Qwen-Image copies of it) is one kernel,
+and with the SiLU after it where the package names that pair (`ChannelNorm`, `install_norms`).
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ import hashlib
 import inspect
 import json
 import sys
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -598,6 +602,10 @@ def _fused(cls: type, kind: str) -> type:
         }
         if kind == "block":
             body["forward"] = _block_forward
+        elif kind == "channel":
+            body["forward"] = _channel_norm_forward
+        elif kind == "identity":
+            body["forward"] = _identity_forward
         else:
             body |= {"forward": _head_norm_forward, "_cozy_rope": None}
         _FUSED[(cls, kind)] = type(f"Fused{cls.__name__}", (cls,), body)
@@ -684,4 +692,161 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
     return _identity(layout)
 
 
-__all__ = ["DiTBlock", "GatedMLP", "Modulation", "Rope", "install"]
+@dataclass(frozen=True, slots=True)
+class ChannelNorm:
+    """A VAE's channel-first RMS norm, `F.normalize(x, dim=1) * scale * gamma [+ bias]` over
+    `[batch, channels, ...]`, which Diffusers computes in fp32 and rounds back (Wan's `RMS_norm`,
+    `QwenImageRMS_norm`, `QwenImage21RMS_norm`): one read for the squares, one for the writes,
+    the same roundings. `silu` names, per block class, the norms its `nonlinearity` (a SiLU)
+    follows; every call of that nonlinearity must follow one of them. Those norms apply the SiLU
+    in the same kernel and the nonlinearity becomes the identity. Activations are `dtype`."""
+
+    norm: type
+    silu: tuple[tuple[type, tuple[str, ...]], ...] = ()
+    nonlinearity: str = "nonlinearity"
+    dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
+    bias: bool = False
+    entries: tuple[Any, ...] = field(init=False, repr=False, compare=False)
+    kernels: TritonKernels = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        entries = _kernels.channel_entries(self.dtype, self.bias, bool(self.silu))
+        name = f"fused.{self.norm.__name__.lower()[:44]}.{self.dtype}"
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "kernels", TritonKernels(name, entries, origin=_declaring_module()))
+
+    @property
+    def torch_dtype(self) -> Any:
+        return {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[self.dtype]
+
+
+@dataclass(slots=True)
+class _NormSite:
+    layout: ChannelNorm
+    switch: _Switch
+    silu: bool
+    scale: float
+    eps: float
+
+
+def _channel_norm_forward(self: Any, x: Any) -> Any:
+    site: _NormSite = vars(self)["_cozy_norm"]
+    launch, layout = site.switch.launch, site.layout
+    bias = self.bias if isinstance(self.bias, torch.Tensor) else None
+    if (
+        launch is None
+        or x.dtype is not layout.torch_dtype
+        or x.dim() < 2
+        or not _cuda(layout.torch_dtype, x, self.gamma, *(() if bias is None else (bias,)))
+    ):
+        y = self._cozy_eager(x)
+        return torch.nn.functional.silu(y) if site.silu else y
+    entry = layout.entries[int(site.silu)]
+    return _kernels.channel_norm(launch, entry, x, self.gamma, bias, site.scale, site.eps)
+
+
+def _identity_forward(self: Any, x: Any) -> Any:
+    return x
+
+
+def _norm_site(norm: Any, layout: ChannelNorm, switch: _Switch, silu: bool, path: str) -> _NormSite:
+    channels = int(norm.gamma.shape[0])
+    if not getattr(norm, "channel_first", False) or int(norm.gamma.numel()) != channels:
+        raise _Mismatch(f"{path}: not a channel-first norm with one weight per channel")
+    if float(getattr(norm, "scale", 0.0)) != channels**0.5:
+        raise _Mismatch(f"{path}: scale is not sqrt({channels})")
+    if isinstance(norm.bias, torch.Tensor) != layout.bias:
+        raise _Mismatch(f"{path}: {'no ' if layout.bias else ''}bias, not as declared")
+    if not isinstance(norm.bias, torch.Tensor) and norm.bias != 0.0:
+        raise _Mismatch(f"{path}: a constant bias {norm.bias}")
+    return _NormSite(layout, switch, silu, channels**0.5, 1e-12)
+
+
+def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
+    """Fuse every `layout.norm` under `roots` on `plan.device` [with the SiLU after it]: the
+    plan's identity, or "" when the eager norms serve (no CUDA sm80+, kernels absent or failed,
+    or a module that is not the declaration; reported). Never waits for the kernels' compile."""
+    device = torch.device(plan.device)
+    document: dict[str, object] = {"norm": layout.norm.__qualname__}
+
+    def report(reason: str = "", **counts: int) -> str:
+        outcome = {**document, "applied": not reason, **({"reason": reason} if reason else counts)}
+        plan.report(layout.kernels.name, outcome)
+        print(f"[cozy] {layout.kernels.name}: {json.dumps(outcome, sort_keys=True)}", file=sys.stderr)
+        return ""
+
+    if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
+        return report(f"fused norms serve CUDA sm80+, not {device}")
+    norms = [
+        (f"{index}.{path}", module)
+        for index, root in enumerate(roots)
+        for path, module in root.named_modules()
+        if type(module) is layout.norm
+    ]
+    if not norms:
+        return report(f"no {layout.norm.__qualname__}")
+    fused_silu: set[int] = set()
+    activations: dict[int, Any] = {}
+    for index, root in enumerate(roots):
+        for path, block in root.named_modules():
+            names = next((n for cls, n in layout.silu if type(block) is cls), None)
+            if names is None:
+                continue
+            activation = getattr(block, layout.nonlinearity, None)
+            if type(activation) is not torch.nn.SiLU:
+                return report(f"{index}.{path}.{layout.nonlinearity}: not a SiLU")
+            for name in names:
+                norm = getattr(block, name, None)
+                if type(norm) is not layout.norm:
+                    return report(f"{index}.{path}.{name}: not a {layout.norm.__qualname__}")
+                fused_silu.add(id(norm))
+            activations[id(activation)] = activation
+    parents = Counter(
+        id(child) for root in roots for module in root.modules() for child in module.children()
+    )
+    if any(parents[key] != 1 for key in activations):
+        return report("a declared nonlinearity is called by another module too")
+    switch = _Switch()
+    try:
+        sites = [
+            (norm, _norm_site(norm, layout, switch, id(norm) in fused_silu, path))
+            for path, norm in norms
+        ]
+    except _Mismatch as exc:
+        return report(str(exc))
+    before = [_census(root) for root in roots]
+    eager = [(m, type(m)) for m in (*(n for n, _ in sites), *activations.values())]
+    for norm, site in sites:
+        norm.__class__ = _fused(type(norm), "channel")
+        norm._cozy_norm = site
+    for activation in activations.values():
+        activation.__class__ = _fused(type(activation), "identity")
+    if [_census(root) for root in roots] != before:
+        raise RuntimeError("the fused substitution moved a parameter or buffer")
+    counts = {"norms": len(sites), "with_silu": len(fused_silu)}
+
+    def activate(launch: Launch) -> None:
+        switch.launch = launch
+        report(**counts)
+
+    try:
+        if plan.when_ready is None:
+            activate(plan.load(layout.kernels))
+        elif not plan.when_ready(layout.kernels, activate):
+            report("compiling; fused from the next request on")
+    except KernelsUnavailable as exc:
+        if exc.code == "kernels_corrupt":
+            raise
+        for module, cls in eager:
+            module.__class__ = cls
+        return report(f"{exc.code}: {exc}")
+    encoded = json.dumps(
+        {"kernels": layout.kernels.identity, "norm": layout.norm.__qualname__,
+         "silu": [[cls.__qualname__, list(names)] for cls, names in layout.silu],
+         "dtype": layout.dtype, "bias": layout.bias},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()
+    return "sha256:" + hashlib.sha256(b"cozy.fusion.channel-norm\0" + encoded).hexdigest()
+
+
+__all__ = ["ChannelNorm", "DiTBlock", "GatedMLP", "Modulation", "Rope", "install", "install_norms"]
