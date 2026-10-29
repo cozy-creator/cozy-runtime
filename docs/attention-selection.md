@@ -11,8 +11,10 @@ Runtime picks each attention site's kernel from the GPU's family, never from a c
 2. **Kernel.** The first kernel of the family's cell at that level (`attention.DENSE`) that
    serves the site's dtype, head dimension and degree, is compiled, imports and launches;
    then each level above; then SDPA. A sparse site (one a package producer validates: its
-   model supplies an `AttentionLayout`) tries `attention.SPARSE` first at each level, its
-   dense rows on the level's dense cell. A producer is tried just before its base.
+   model supplies an `AttentionLayout`) tries the `attention.SPARSE` cells at its level and
+   each above before any dense one, its dense rows on the level's dense cell. A producer is
+   tried just before its base. A cell lists only kernels of its own precision
+   (`Candidate.level`), checked where the tables are built.
 
 ```python
 class H3(Model[object], attention_bits={"fl2va_dit": 4, "ref2va_dit": 4}): ...
@@ -30,7 +32,7 @@ not in the walk.
 | 16 | SDPA | FA3 | cuDNN |
 | 8 | kitchen-int8, Sage2 (fp8 rows) | Sage2 | FA4 fp8 |
 | 4 | Sage3 fp4 (fp4 rows), else 8 | 8 | 8 |
-| sparse 16 / 8 / 4 | Sol / Kitchen Sol, Sol / Kitchen fp4 Sol | Sol / Sol + fixed-Kmean Sage2, Sol | Sol |
+| sparse 16 / 8 / 4 | Sol / Kitchen Sol / Kitchen fp4 Sol | Sol / Sol + fixed-Kmean Sage2 / 8 | Sol (its exact tiles at its dense rows' precision) / 16 / 16 |
 
 A card no row names takes the newest family whose 8-bit op builds for its own target and says
 so on every run (`arch.inherited`).
