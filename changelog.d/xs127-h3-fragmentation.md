@@ -1,0 +1,1 @@
+Torch never splits a cached block of 1 GiB or more, so a freed large tensor's segment returns whole when memory runs short. H3 Turbo 15 s on an 8 GB card no longer runs out of memory beside gigabytes of unusable cached remainders.
