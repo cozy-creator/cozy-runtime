@@ -3597,6 +3597,7 @@ class Executor:
         if self.rank == 0:
             for member in self.model_executors or [self]:
                 self._emit_gemm(record, member)
+                self._emit_lora(record, member)
             for feature, instead in accel.unavailable(self.device_kind) if self.models else ():
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "warn", instead=instead
@@ -3804,6 +3805,21 @@ class Executor:
             for name, root in executor.backend.roots.items():
                 roots[executor._prefix() + name] = root
         return roots
+
+    @staticmethod
+    def _emit_lora(record: AuthorAttempt, member: Executor) -> None:
+        """`gemm.lora`: per component with LoRA'd linears, how this attempt served them: baked
+        (`how` fused or eager) or per step until the bake kernels are ready. A `gemm.` name, so
+        TensorD keeps it in the run's measurements beside `gemm.selected`."""
+        if member.backend is None:
+            return
+        prefix = member._prefix()
+        for component, bakes in sorted(member.backend.bakes.items()):
+            if bakes.bakes:
+                record.emit(
+                    "confession", "gemm.lora", bakes.serving, how=bakes.how or "",
+                    component=prefix + component, linears=len(bakes.bakes),
+                )  # fmt: skip
 
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
