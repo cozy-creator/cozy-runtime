@@ -137,6 +137,52 @@ target_compile_options(fa3_units PRIVATE --use_fast_math --expt-relaxed-constexp
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 endif()
 
+# SageAttention3's Blackwell forward and FP4 quantizers (thu-ml/SageAttention, Apache-2.0), H3's dense
+# kernel on RTX 50 and DGX Spark: upstream's kernel headers unmodified against `csrc/sage3/shim` (the
+# ATen they name), its quantizer kernels cut from their torch wrappers here, both built as Runtime's
+# `sageattn3` recipe builds them through torch's extension builder (`kernel_sources`). MSVC refuses
+# the forward's host stubs as it does the TMA GEMMs' (C2719 on 128-byte-aligned parameters by value,
+# cr-201; the quantizers build); ptxas on an arm64 host is FA3's crash (cr-200), not tried here.
+if(MSVC OR CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    set(sage3 OFF)
+else()
+    set(sage3 ON)
+endif()
+option(COZY_SAGE3 "SageAttention3's forward and quantizers (_sage3)" ${sage3})
+if(COZY_SAGE3)
+pinned(SAGEATTENTION_DIR thu-ml/SageAttention d1a57a546c3d395b1ffcbeecc66d81db76f3b4b5
+       74b6667164f9e368e3799bc2ab59b9b08c4591630f1c6029560208b6fcf354c4)
+set(SAGE3 "${SAGEATTENTION_DIR}/sageattention3_blackwell/sageattn3")
+# The quantizers' kernels: upstream's file up to its first torch wrapper, less its torch includes.
+# The cut and its bytes are this pin's; another pin fails here until they are checked again.
+file(READ "${SAGE3}/quantization/fp4_quantization_4d.cu" sage3_quant)
+string(FIND "${sage3_quant}" "void scaled_fp4_quant(torch::Tensor" sage3_cut)
+if(NOT sage3_cut EQUAL 16390)
+    message(FATAL_ERROR "SageAttention3's quantizer file moved its first wrapper (${sage3_cut})")
+endif()
+string(SUBSTRING "${sage3_quant}" 0 ${sage3_cut} sage3_quant)
+string(REGEX REPLACE "#include <(torch|ATen|c10)/[^>]*>\n" "" sage3_quant "${sage3_quant}")
+string(SHA256 sage3_digest "${sage3_quant}")
+if(NOT sage3_digest STREQUAL "1d15638e2b9ca049c56e18abf0419a3e8a968958e3f70423128c641847567c82")
+    message(FATAL_ERROR "SageAttention3's quantizer kernels are not the checked cut (${sage3_digest})")
+endif()
+file(WRITE "${CMAKE_BINARY_DIR}/sage3/quant_kernels.cuh" "${sage3_quant}")
+add_library(sage3_units OBJECT csrc/sage3/fwd.cu csrc/sage3/quant.cu)
+# C++20 as the recipe patches upstream's setup.py to; sm_*a for the block-scaled FP4 MMA.
+set_target_properties(sage3_units PROPERTIES CUDA_ARCHITECTURES "120a-real;121a-real"
+                      CUDA_STANDARD 20)
+target_include_directories(sage3_units PRIVATE csrc/sage3/shim csrc/sage3 "${SAGE3}/blackwell"
+    "${SAGE3}/quantization" "${SAGE3}" "${CMAKE_BINARY_DIR}/sage3" "${CUTLASS_DIR}/include"
+    "${CUTLASS_DIR}/tools/util/include")
+# Upstream's nvcc flags after torch's: its -U list leaves torch's __CUDA_NO_HALF2_OPERATORS__ alone.
+target_compile_definitions(sage3_units PRIVATE __CUDA_NO_HALF2_OPERATORS__ CUTLASS_DEBUG_TRACE_LEVEL=0
+    NDEBUG QBLKSIZE=128 KBLKSIZE=128 CTA256 DQINRMEM EXECMODE=0
+    $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
+target_compile_options(sage3_units PRIVATE -O3 --use_fast_math --expt-relaxed-constexpr
+                       --expt-extended-lambda -lineinfo $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                       $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
+endif()
+
 # One module: its binding, its units' objects, the static CUDA runtime.
 function(kernel_module name binding)
     nanobind_add_module(${name} NB_STATIC STABLE_ABI LTO "csrc/${binding}")
@@ -166,6 +212,10 @@ target_compile_definitions(_gemm PRIVATE $<$<BOOL:${COZY_TMA}>:COZY_TMA>)
 if(COZY_FA3)
     kernel_module(_fa3 fa3.cpp fa3_units)
     target_include_directories(_fa3 PRIVATE "${FA3}" "${FA3_CUTLASS_DIR}/include")
+endif()
+if(COZY_SAGE3)
+    kernel_module(_sage3 sage3.cpp sage3_units)
+    target_include_directories(_sage3 PRIVATE csrc)
 endif()
 
 # RMSNorm plus split-half RoPE (comfy-kitchen v0.2.31's, `csrc/norm/UPSTREAM.md`).

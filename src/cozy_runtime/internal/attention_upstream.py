@@ -12,6 +12,7 @@ from __future__ import annotations
 import math
 from collections.abc import Callable
 from importlib import import_module
+from types import ModuleType
 from typing import TYPE_CHECKING, Protocol, Unpack
 
 if TYPE_CHECKING:
@@ -40,6 +41,23 @@ _FA3_VARIANT = ""
 def bind_fa3(module: FlashAttn3, variant: str) -> None:
     global _FA3, _FA3_VARIANT
     _FA3, _FA3_VARIANT = module, variant
+
+
+#: SageAttention3's API: the wheel's (`sage3`) or the source build's `sageattn3.api`, the same
+#: functions either way, and which one it is.
+_SAGE3: ModuleType | None = None
+_SAGE3_VARIANT = ""
+
+
+def bind_sage3(module: ModuleType, variant: str) -> None:
+    global _SAGE3, _SAGE3_VARIANT
+    _SAGE3, _SAGE3_VARIANT = module, variant
+
+
+def sage3_api() -> ModuleType:
+    if _SAGE3 is None:
+        raise ValueError("sageattention3 is not bound: its candidate did not open")
+    return _SAGE3
 
 
 def _options(name: str, dropout_p: float, scale: float | None) -> None:
@@ -521,14 +539,14 @@ def sage3_fp4_fixed_means(
     _cuda_inputs(query, key, value, enable_gqa)
     from cozy_runtime.internal import attention_sage3_fixed
 
-    result = attention_sage3_fixed.forward(query, key, value)
+    result = attention_sage3_fixed.forward(query, key, value, api=sage3_api())
     return _output(result, query)
 
 
 def _sage3_global_owned(q: Tensor, k: Tensor, v: Tensor, *, is_causal: bool) -> Tensor:
     import torch
 
-    api = import_module("sageattn3.api")
+    api = sage3_api()
     ql, kl, is_bf16 = q.shape[2], k.shape[2], q.dtype == torch.bfloat16
     # Keep upstream's preprocessing and its order exactly. Only K is mutated;
     # its owned clone dies after preprocessing instead of after attention returns.
@@ -573,7 +591,7 @@ def _sage3_fp4(
         if per_block_mean:
             raise ValueError("owned Sage3 lifetimes require global Q mean")
         return _output(_sage3_global_owned(q, k, v, is_causal=is_causal), query)
-    output = import_module("sageattn3").sageattn3_blackwell(
+    output = sage3_api().sageattn3_blackwell(
         q,
         k.clone(memory_format=torch.contiguous_format),
         v,
@@ -611,14 +629,20 @@ KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
 FLASHINFER = Local(
     flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"), rows=BLOCK
 )
-SAGE3 = Local(sage3_fp4, _named("sageattn3.sageattn3_blackwell(nvfp4, per_block_mean)"), rows=BLOCK)
+SAGE3 = Local(
+    sage3_fp4,
+    lambda *_: f"sageattn3 {_SAGE3_VARIANT}.sageattn3_blackwell(nvfp4, per_block_mean)",
+    rows=BLOCK,
+)
 
 SAGE3_GLOBAL_LOWMEM = Local(
     sage3_fp4_global_lowmem,
-    _named("sageattn3.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd)"),
+    lambda *_: (
+        f"sageattn3 {_SAGE3_VARIANT}.nvfp4_global_head_mean(short_owned_lifetimes, direct_bthd)"
+    ),
 )
 
 SAGE3_FIXED_MEANS = Local(
     sage3_fp4_fixed_means,
-    _named("sageattn3.nvfp4_fixed_means(upstream_bf16_correction)"),
+    lambda *_: f"sageattn3 {_SAGE3_VARIANT}.nvfp4_fixed_means(upstream_bf16_correction)",
 )

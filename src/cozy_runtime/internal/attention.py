@@ -193,6 +193,9 @@ _D64_128 = frozenset({64, 128})
 #: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
 _FA3 = frozenset((d, dtype) for d in (64, 128) for dtype in ("bfloat16", "float16"))
 _PY, _KITCHEN, _SAGE3 = kernel_sources.PYTHON, "comfy-kitchen", "sageattn3"
+#: SageAttention3's API over the wheel's `_sage3` (its group mean is the per-block-mean
+#: candidate's Triton set); the source build's is `sageattn3.api`.
+_SAGE3_WHEEL = "cozy_runtime.internal.sage3"
 _E4M3 = "cozy_runtime.internal.attention_fp8"
 #: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
 _SOL: dict[str, Any] = dict(
@@ -245,7 +248,7 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, level=4,
         dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, causal=False, gqa=False,
-        scales=False, artifact=_SAGE3, import_name=_SAGE3,
+        scales=False, artifact=_SAGE3, import_name=_SAGE3, kernels=_SAGE3_WHEEL,
     ),
     Candidate(
         "sageattention3-fp4-global-lowmem", "_cozy_sage3_fp4_global_lowmem",
@@ -599,6 +602,9 @@ def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str
     when `wait`, or refuse with its state: `failed` for this machine run, `absent`, or
     `compiling` for a caller that only asks. A package environment that carries the module
     itself serves it, as its pinned version always has."""
+    wheel = _wheel(candidate, device)
+    if wheel is not None:
+        return wheel
     _build(candidate)  # another build imported here refuses before any store or compile
     store = kernel_cache.configured()
     found = util.find_spec(candidate.import_name.split(".")[0])
@@ -677,6 +683,25 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
             "attention_kernel_failed_verification",
             f"{ready.name} on {device.name}: {verdict.detail}"[:600],
         )
+
+
+#: Candidates whose wheel module failed its check on this machine run: they build from source.
+_WHEEL_REFUSED: set[str] = set()
+
+
+def _wheel(candidate: Candidate, device: DeviceFacts) -> dict[str, str] | None:
+    """The Runtime wheel's module for CANDIDATE on this card (`prebuilt.serves`), opened as a
+    compiled kernel is and checked by `_launch`, unless it failed that check this run; FA3 opens
+    through `_prebuilt_fa3`. Its record names it, as a build's names its artifact."""
+    module = prebuilt.ATTENTION.get(candidate.name)
+    if (
+        module in (None, "_fa3")
+        or device.kind != "cuda"
+        or candidate.name in _WHEEL_REFUSED
+        or not prebuilt.serves(candidate.name, device.sm)
+    ):
+        return None
+    return {"artifact": "prebuilt", "key": prebuilt.artifact(module).partition(":")[2][:16]}
 
 
 def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
@@ -794,8 +819,14 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
             artifact.update({f"{role}_{key}": value for key, value in opened.items()})
     else:
         artifact = _compiled(candidate, device, wait) if candidate.artifact else None
-    if candidate.import_name:
+    wheel = (artifact or {}).get("artifact") == "prebuilt"
+    if wheel:
+        upstream.bind_sage3(import_module(_SAGE3_WHEEL), f"prebuilt {(artifact or {})['key']}")
+        _STATES[candidate.name] = kernel_compile.State("prebuilt", "ready")
+    elif candidate.import_name:
         module = _import(candidate)
+        if candidate.import_name == _SAGE3:
+            upstream.bind_sage3(import_module("sageattn3.api"), (artifact or {}).get("key", ""))
         if candidate.sparse and candidate.import_name == "comfy_kitchen":
             import torch
 
@@ -821,6 +852,12 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
     try:
         _launch(ready, device)
     except AttentionRefusal as exc:
+        if wheel:  # the run's one warning for it; the source build is tried next
+            _WHEEL_REFUSED.add(candidate.name)
+            _STATES[f"{candidate.name} prebuilt"] = kernel_compile.State(
+                "prebuilt", "failed", detail=str(exc)
+            )
+            return _resolve(candidate, device, wait)
         _STATES[candidate.name] = kernel_compile.State(candidate.name, "failed", detail=str(exc))
         raise
     if candidate.artifact:

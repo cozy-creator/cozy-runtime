@@ -31,6 +31,14 @@ except ModuleNotFoundError:  # Linux aarch64 (cr-200), Windows (cr-201) and the 
     NO_FA3 = "this cozy-runtime wheel carries no FlashAttention-3"
 except ImportError as broken:
     NO_FA3 = f"this cozy-runtime wheel's FlashAttention-3 does not load ({broken})"
+try:
+    import cozy_runtime._kernels._sage3 as _sage3
+
+    NO_SAGE3 = ""
+except ModuleNotFoundError:  # Linux aarch64 (cr-200), Windows (cr-201) and the pure wheel
+    NO_SAGE3 = "this cozy-runtime wheel carries no SageAttention3"
+except ImportError as broken:
+    NO_SAGE3 = f"this cozy-runtime wheel's SageAttention3 does not load ({broken})"
 
 #: The CUDA toolkit the kernels are built with, and the oldest driver that runs it, per
 #: `sys.platform`. cozy's `platform::gpu` holds the same floor for TensorD's startup check.
@@ -66,6 +74,8 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     # FlashAttention-3's forward runs on Hopper only (wgmma, TMA).
     "_fa3": {"cubin": ("sm_90a",), "ptx": ()},
+    # SageAttention3's forward runs on RTX 50 and DGX Spark only (block-scaled FP4 mma.sync, TMA).
+    "_sage3": {"cubin": ("sm_120a", "sm_121a"), "ptx": ()},
     "_norm": {
         "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
         "ptx": ("compute_80",),
@@ -123,4 +133,4 @@ def rms_rope_split_half(
 
 
 # The modules are `internal.prebuilt`'s to call; `rms_rope_split_half` is `author.kernels`'.
-__all__ = ["_fa3", "_gemm", "_norm", "rms_rope_split_half"]
+__all__ = ["_fa3", "_gemm", "_norm", "_sage3", "rms_rope_split_half"]

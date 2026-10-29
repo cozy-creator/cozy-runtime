@@ -456,7 +456,17 @@ def artifact(module: str = "_gemm") -> str:
 
 
 #: The attention kernels the wheel serves, by candidate name (`attention.KERNELS`).
-ATTENTION = {"flash-attn3": "_fa3"}
+ATTENTION = {
+    "flash-attn3": "_fa3",
+    **dict.fromkeys(
+        (
+            "sageattention3-fp4",
+            "sageattention3-fp4-global-lowmem",
+            "sageattention3-fp4-fixed-means",
+        ),
+        "_sage3",
+    ),
+}
 
 
 def serves(kernel: str, sm: int) -> bool:
