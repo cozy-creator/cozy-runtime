@@ -175,9 +175,11 @@ target_include_directories(sage3_units PRIVATE csrc/sage3/shim csrc/sage3 "${SAG
     "${CUTLASS_DIR}/tools/util/include")
 # Upstream's nvcc flags after torch's: its -U list leaves torch's __CUDA_NO_HALF2_OPERATORS__ alone.
 target_compile_definitions(sage3_units PRIVATE __CUDA_NO_HALF2_OPERATORS__ CUTLASS_DEBUG_TRACE_LEVEL=0
-    NDEBUG QBLKSIZE=128 KBLKSIZE=128 CTA256 DQINRMEM EXECMODE=0)
+    NDEBUG QBLKSIZE=128 KBLKSIZE=128 CTA256 DQINRMEM EXECMODE=0
+    $<$<CXX_COMPILER_ID:MSVC>:_USE_MATH_DEFINES>)
 target_compile_options(sage3_units PRIVATE -O3 --use_fast_math --expt-relaxed-constexpr
-                       --expt-extended-lambda -lineinfo $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>)
+                       --expt-extended-lambda -lineinfo $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                       $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 endif()
 
 # One module: its binding, its units' objects, the static CUDA runtime.
