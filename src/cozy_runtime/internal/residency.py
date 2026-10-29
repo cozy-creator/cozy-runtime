@@ -2572,8 +2572,8 @@ class Memory:
                             speculative=True,
                             origin="baked" if row.get("host") else "store",
                         )
-                if complete and not row.get("host") and pending.staged is None:
-                    self._populate(block)
+                if complete and not row.get("host") and not self._host_prefetch:
+                    self._populate(block)  # a TensorFS without prepare_read(host=)
             except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
