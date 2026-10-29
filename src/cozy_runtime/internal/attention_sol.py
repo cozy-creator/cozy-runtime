@@ -832,8 +832,9 @@ def _execute(
 ) -> Any:
     """Apply the model's explicit policy after hardware/operand validation. An exact path's
     dense rows (its dense steps, its protected prefix, a dense path) take the exact kernel on
-    every route: the walked reference's (`_exact`), or the one a declaring row gives. A layer
-    whose key gain has outlier channels (`outlier_keys`) is an exact path too."""
+    every route: the walked reference's (`_exact`), or the one a declaring row gives; on a
+    declaring row's quantizing sparse kernel, its sparse steps run dense on it too. A layer whose
+    key gain has outlier channels (`outlier_keys`) is an exact path too."""
     import torch
 
     def on(paths: tuple[str, ...]) -> bool:
@@ -849,6 +850,10 @@ def _execute(
             dense = _exact
         elif exact is not None:
             dense = prefix_dense = exact
+            # A quantizing sparse kernel (Kitchen's INT8) cannot carry these keys on its sparse
+            # rows either: the whole call is dense on the exact kernel. H3 block 49 on an RTX 4090,
+            # against FP32: Kitchen INT8 Sol 0.10-0.11 rel L2, BF16 Sol 0.05-0.08, this 0.016-0.022.
+            dense_path = dense_path or sparse is not None
     if dense_path and query.shape[1] < layout.live_tokens:
         # A refiner has its own shorter document; its explicit dense policy wins.
         output = dense(query=query, key=key, value=value, scale=scale)

@@ -122,8 +122,9 @@ class Candidate:
     import_name: str = ""
     #: a package's producer, served through its base backend (`known`)
     producer: AttentionProducer | None = None
-    #: keeps the operands' own precision; False quantizes them (8 or 4 bits)
-    exact: bool = True
+    #: its precision: 16 keeps the operands' own, 8 or 4 quantizes them (its coarsest operand);
+    #: the one cell level it may be listed at (`DENSE`, `SPARSE`)
+    level: int = 16
     #: a sparse kernel: the model's layout routes each call's rows (`attention_sol`)
     sparse: bool = False
     #: the dense kernels a sparse one computes rows with, opened beside it: its dense steps',
@@ -132,6 +133,10 @@ class Candidate:
     #: the Runtime module whose `KERNELS` (a `TritonKernels` set) it launches: it serves once
     #: they are built here (`triton_kernels`)
     kernels: str = ""
+
+    @property
+    def exact(self) -> bool:
+        return self.level == 16
 
     def admits(self, dtype: str, head_dim: int) -> bool:
         """Whether a site of DTYPE activations at HEAD_DIM (0: unknown) is one it serves."""
@@ -205,7 +210,7 @@ KERNELS: tuple[Candidate, ...] = (
         shapes=_FA3, artifact="flash-attn3-full", import_name="flash_attn_interface",
     ),
     Candidate(
-        "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, exact=False,
+        "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, level=8,
         dtypes=_HALF, max_head_dim=128, gqa=False, artifact="flash-attn3-full",
         import_name="flash_attn_interface", kernels=_E4M3,
     ),
@@ -214,49 +219,49 @@ KERNELS: tuple[Candidate, ...] = (
         max_head_dim=256, artifact=_PY, import_name="flash_attn.cute",
     ),
     Candidate(
-        "flash-attn4-fp8", "_cozy_flash_attn4_fp8", upstream.FA4_FP8, _TCGEN05, exact=False,
+        "flash-attn4-fp8", "_cozy_flash_attn4_fp8", upstream.FA4_FP8, _TCGEN05, level=8,
         dtypes=_BF16, head_dims=_D64_128, max_head_dim=128, gqa=False, artifact=_PY,
         import_name="flash_attn.cute", kernels=_E4M3,
     ),
     Candidate(
-        "sageattention", "_cozy_sage_int8_fp8", upstream.SAGE, _MMA | _WGMMA, _FP8, exact=False,
+        "sageattention", "_cozy_sage_int8_fp8", upstream.SAGE, _MMA | _WGMMA, _FP8, level=8,
         dtypes=_HALF, max_head_dim=128, artifact="sageattention", import_name="sageattention",
     ),
     Candidate(
-        "sageattention-fp16pv", "_cozy_sage_fp16pv", upstream.SAGE_FP16PV, _WGMMA, exact=False,
+        "sageattention-fp16pv", "_cozy_sage_fp16pv", upstream.SAGE_FP16PV, _WGMMA, level=8,
         dtypes=_HALF, max_head_dim=128, artifact="sageattention-full",
         import_name="sageattention",
     ),
     Candidate(
-        "kitchen-int8", "_cozy_kitchen_int8", upstream.KITCHEN, _GPU, exact=False, dtypes=_HALF,
+        "kitchen-int8", "_cozy_kitchen_int8", upstream.KITCHEN, _GPU, level=8, dtypes=_HALF,
         max_head_dim=256, masks=True, causal=False, artifact=_KITCHEN,
         import_name="comfy_kitchen",
     ),
     Candidate(
         "flashinfer-bf16-fp8", "_cozy_flashinfer_bf16_fp8", upstream.FLASHINFER, _TCGEN05,
-        exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
+        level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
         artifact=_PY, import_name="flashinfer", kernels=_E4M3,
     ),
     Candidate(
-        "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, exact=False,
+        "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, level=4,
         dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, causal=False, gqa=False,
         scales=False, artifact=_SAGE3, import_name=_SAGE3,
     ),
     Candidate(
         "sageattention3-fp4-global-lowmem", "_cozy_sage3_fp4_global_lowmem",
-        upstream.SAGE3_GLOBAL_LOWMEM, _MMA, _FP4, exact=False, dtypes=_HALF, max_head_dim=128,
+        upstream.SAGE3_GLOBAL_LOWMEM, _MMA, _FP4, level=4, dtypes=_HALF, max_head_dim=128,
         head_dims=_D64_128, causal=False, gqa=False, scales=False, artifact=_SAGE3,
         import_name=_SAGE3,
     ),
     Candidate(
         "sageattention3-fp4-fixed-means", "_cozy_sage3_fp4_fixed_means",
-        upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, exact=False, dtypes=_BF16, max_head_dim=128,
+        upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, level=4, dtypes=_BF16, max_head_dim=128,
         head_dims=_D128, causal=False, gqa=False, cross=False, batches=False, scales=False,
         artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
     ),
     Candidate(
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
-        _WGMMA, exact=False, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
+        _WGMMA, level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
         gqa=False, batches=False, artifact="sageattention", import_name="sageattention",
         kernels="cozy_runtime.internal.attention_sage2_fixed_mean",
     ),
@@ -266,22 +271,22 @@ KERNELS: tuple[Candidate, ...] = (
     ),
     Candidate(
         attention_sage2_fixed.SOL_NAME, "_cozy_sol_sage2_fixed_kmean", attention_sage2_fixed.SOL,
-        _WGMMA, artifact=_PY, import_name="sol_attn", dense=(attention_sage2_fixed.DENSE_NAME,),
-        **_SOL,
+        _WGMMA, level=8, artifact=_PY, import_name="sol_attn",
+        dense=(attention_sage2_fixed.DENSE_NAME,), **_SOL,
     ),
     Candidate(
-        "kitchen-sol", "_cozy_kitchen_sol_int8", attention_kitchen_sol.KITCHEN_SOL, _GPU,
+        "kitchen-sol", "_cozy_kitchen_sol_int8", attention_kitchen_sol.KITCHEN_SOL, _GPU, level=8,
         artifact=_KITCHEN, import_name="comfy_kitchen", dense=("kitchen-int8",), **_SOL,
     ),
     Candidate(
         "kitchen-sol-fp4-lowmem", "_cozy_kitchen_sol_fp4_lowmem",
-        attention_kitchen_sol.KITCHEN_SOL_FP4_LOWMEM, _MMA, _FP4, artifact=_KITCHEN,
+        attention_kitchen_sol.KITCHEN_SOL_FP4_LOWMEM, _MMA, _FP4, level=4, artifact=_KITCHEN,
         import_name="comfy_kitchen", dense=("sageattention3-fp4-global-lowmem", "kitchen-int8"),
         **_SOL,
     ),
     Candidate(
         "kitchen-sol-fp4-fixed-means", "_cozy_kitchen_sol_fp4_fixed_means",
-        attention_kitchen_sol.KITCHEN_SOL_FP4_FIXED_MEANS, _MMA, _FP4, artifact=_KITCHEN,
+        attention_kitchen_sol.KITCHEN_SOL_FP4_FIXED_MEANS, _MMA, _FP4, level=4, artifact=_KITCHEN,
         import_name="comfy_kitchen", dense=("sageattention3-fp4-fixed-means", "kitchen-int8"),
         **_SOL,
     ),
@@ -300,18 +305,33 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.TCGEN05: {16: ("cudnn",), 8: ("flash-attn4-fp8",)},
 }
 #: A sparse site's kernels (one a package producer serves: its model supplies an
-#: `AttentionLayout`), tried before DENSE at each level. Sol's dense rows take DENSE at the
-#: site's level, its exact paths level 16 (`_sol_dense`).
+#: `AttentionLayout`), tried at its level and each above before any DENSE kernel. Sol's dense rows
+#: take DENSE at the site's level, its exact paths level 16 (`_sol_dense`); on tcgen05 its exact
+#: tiles take its dense rows' precision (`attention_sol_fa4`), so its 8-bit cell is empty and a
+#: site steps up to it. mma.sync's 8-bit cell is Kitchen's INT8 Sol: INT8 runs 2x BF16 there, 4x
+#: on GeForce (half-rate FP32 accumulation), and BF16 Sol's exact blocks alone outlast Kitchen's
+#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak).
 SPARSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.MMA_SYNC: {
         16: ("sol-attn",),
-        8: ("sol-attn", "kitchen-sol"),
+        8: ("kitchen-sol",),
         4: ("kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem"),
     },
-    arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean", "sol-attn")},
-    arch.TCGEN05: {16: ("sol-attn",), 8: ("sol-attn",)},
+    arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean",)},
+    arch.TCGEN05: {16: ("sol-attn",)},
 }
 LEVELS = (4, 8, 16)
+#: A cell lists only kernels of its own precision: a coarser or finer kernel there could not merge.
+_MISFILED = [
+    f"{family} {'sparse' if table is SPARSE else 'dense'} {level}: {name} is {BY_NAME[name].level}"
+    for table in (DENSE, SPARSE)
+    for family, cells in table.items()
+    for level, names in cells.items()
+    for name in names
+    if BY_NAME[name].level != level or BY_NAME[name].sparse != (table is SPARSE)
+]
+if _MISFILED:
+    raise ValueError(f"attention cells hold kernels of another precision: {_MISFILED}")
 #: The pin of a request at 16 bits: every site in its scope at level 16.
 EXACT = "exact"
 #: Package producers' candidates, each derived once from its registration.
@@ -427,14 +447,13 @@ def sparse_site(module: object) -> bool:
 
 
 def walk(row: arch.Row, at: int, layout: bool = False) -> list[str]:
-    """A site's kernels on ROW, best first: its family's cells at level AT (a LAYOUT site's
-    sparse ones first), then each level above, then SDPA, each producer standing in before
-    its base; none the row cannot run."""
-    found, names = known(), list[str]()
-    for step in LEVELS[LEVELS.index(at) :]:
-        if layout:
-            names += SPARSE.get(row.family, {}).get(step, ())
-        names += DENSE.get(row.family, {}).get(step, ())
+    """A site's kernels on ROW, best first: a LAYOUT site's sparse cells at level AT and each
+    level above (its model asked for sparse attention), then the dense cells the same way, then
+    SDPA, each producer standing in before its base; none the row cannot run."""
+    found, names, levels = known(), list[str](), LEVELS[LEVELS.index(at) :]
+    for table in (SPARSE, DENSE) if layout else (DENSE,):
+        for step in levels:
+            names += table.get(row.family, {}).get(step, ())
     stand_ins: dict[str, list[str]] = {}
     for name, producer in _PRODUCERS.items():
         stand_ins.setdefault(producer.base, []).append(name)
