@@ -4210,7 +4210,7 @@ class Executor:
         if command.phase == "begin":
             if state is not None:
                 return refused(code="request_memory_busy")
-            context = self._request(request_id)
+            context = self.constructions[command.construction]._request(request_id)
             rows = context.__enter__()
             self.host._rank_request = _RankRequest(command.construction, request_id, context, rows)
         elif state is None or (state.id, state.construction) != (
@@ -4674,7 +4674,10 @@ class Executor:
         device = host.memory.device.index if cuda else None
         peak: int | None = None
         try:
-            with host.memory.request(request_id) as request, host.execution.serving(request):
+            with (
+                host.memory.request(request_id, others=self._sibling_sets()) as request,
+                host.execution.serving(request),
+            ):
                 host.requests[request_id] = request
                 if prepared is not None:
                     request.queued = functools.partial(self._queued_prefetch, request_id, prepared)
@@ -4688,6 +4691,22 @@ class Executor:
             if request is not None:
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
                 rows.append(host.execution.record(request, gpu, device, self._store(), peak))
+
+    def _sibling_sets(self) -> list[Any]:
+        """The residency sets of this process's other loaded constructions: their cached weights
+        are not this construction's working set."""
+        memory = self.host.memory
+        if memory is None:
+            return []
+        modules = [
+            model.module
+            for key, child in self.host.constructions.items()
+            if key != self.construction
+            for member in child.model_executors or [child]
+            if member.backend is not None
+            for model in member.backend.models.values()
+        ]
+        return [memory.models[module] for module in modules if module in memory.models]
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
