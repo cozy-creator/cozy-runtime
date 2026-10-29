@@ -3739,6 +3739,9 @@ class Executor:
                     command.request_id, {"sites": [], "levels": {}, "oom_floor": 0}
                 ),
                 "loops": self.host.loops.pop(command.request_id, []),
+                # When this reply was built, and (`_send_reply`) when it went on the seam: a
+                # request's time after its observations splits into this process's and the host's.
+                "reply_built_unix_ms": round(time.time() * 1000, 1),
             },
             "quiescent": quiescent,
             **_env_document(),
@@ -4901,6 +4904,8 @@ _TELEMETRY = ("observations", "execution", "attribution")
 
 def _send_reply(channel: Channel, reply: dict[str, Any]) -> None:
     """Put ONE reply on the seam. Telemetry never costs a reply its outcome."""
+    if isinstance(execution := reply.get("execution"), dict):
+        execution["reply_sent_unix_ms"] = round(time.time() * 1000, 1)
     try:
         channel.send(reply)
     except SeamError as exc:
