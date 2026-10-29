@@ -84,11 +84,25 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src --env-file <(grep -v '^#' kernels/toolchain.env) \
             -e ARCH -e JOBS -e WITHOUT -e HOST_OWNER="$(id -u):$(id -g)" \
             "quay.io/pypa/manylinux_2_28_$ARCH:$MANYLINUX" bash -euo pipefail -c '
-              cuda=$([ "$ARCH" = aarch64 ] && echo sbsa || echo x86_64)
-              dnf install -y -q dnf-plugins-core
-              dnf config-manager --add-repo "https://developer.download.nvidia.com/compute/cuda/repos/rhel8/$cuda/cuda-rhel8.repo"
-              dnf install -y -q "cuda-nvcc-13-0-$CUDA_NVCC" "cuda-cudart-devel-13-0-$CUDA_CUDART" \
-                "cuda-cuobjdump-13-0-$CUDA_CUOBJDUMP"
+              # The pinned toolkit from NVIDIA redistributable archives, each held to its digest, as the
+              # Windows job installs it: no package repository (whose metadata went missing on 10-29).
+              # This script is single-quoted: no apostrophe in it.
+              platform=$([ "$ARCH" = aarch64 ] && echo linux-sbsa || echo linux-x86_64)
+              redist=https://developer.download.nvidia.com/compute/cuda/redist
+              curl -fsSL "$redist/redistrib_$CUDA_REDIST.json" -o /tmp/redist.json
+              mkdir -p /usr/local/cuda-13.0
+              for name in cuda_nvcc cuda_crt libnvvm cuda_cudart cuda_cccl cuda_cuobjdump; do
+                read -r path sha version < <(/opt/python/cp312-cp312/bin/python -c "import json, sys; e = json.load(open(sys.argv[1]))[sys.argv[2]]; print(e[sys.argv[3]][sys.argv[4]], e[sys.argv[3]][sys.argv[5]], e[sys.argv[6]])" \
+                  /tmp/redist.json "$name" "$platform" relative_path sha256 version)
+                case $name in
+                  cuda_nvcc) want=$CUDA_NVCC ;; cuda_cudart) want=$CUDA_CUDART ;; cuda_cuobjdump) want=$CUDA_CUOBJDUMP ;; *) want=$version ;;
+                esac
+                [ "$version" = "$want" ] || { echo "$name is $version in redist $CUDA_REDIST, not $want"; exit 1; }
+                curl -fsSL "$redist/$path" -o "/tmp/$name.tar.xz"
+                echo "$sha  /tmp/$name.tar.xz" | sha256sum -c --quiet -
+                tar -xJf "/tmp/$name.tar.xz" -C /usr/local/cuda-13.0 --strip-components=1
+              done
+              ln -s lib /usr/local/cuda-13.0/lib64
               export PATH=/opt/python/cp312-cp312/bin:/usr/local/cuda-13.0/bin:$PATH
               export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc CXX=/opt/rh/gcc-toolset-14/root/usr/bin/g++
               python -m pip install -q --root-user-action ignore "nanobind==$NANOBIND" "cmake==$CMAKE" "ninja==$NINJA"
