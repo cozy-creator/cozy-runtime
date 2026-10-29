@@ -140,8 +140,9 @@ endif()
 # SageAttention3's Blackwell forward and FP4 quantizers (thu-ml/SageAttention, Apache-2.0), H3's dense
 # kernel on RTX 50 and DGX Spark: upstream's kernel headers unmodified against `csrc/sage3/shim` (the
 # ATen they name), its quantizer kernels cut from their torch wrappers here, both built as Runtime's
-# `sageattn3` recipe builds them through torch's extension builder (`kernel_sources`). MSVC's TMA
-# parameters (cr-201) and ptxas on an arm64 host (cr-200) are FA3's; neither is tried yet.
+# `sageattn3` recipe builds them through torch's extension builder (`kernel_sources`). MSVC refuses
+# the forward's host stubs as it does the TMA GEMMs' (C2719 on 128-byte-aligned parameters by value,
+# cr-201; the quantizers build); ptxas on an arm64 host is FA3's crash (cr-200), not tried here.
 if(MSVC OR CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     set(sage3 OFF)
 else()
