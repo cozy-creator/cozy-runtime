@@ -1050,6 +1050,11 @@ class Executor:
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
         accel.first_launches(torch, self.device_kind)
+        if self.device_kind == "cuda" and self.world == 1:
+            # The prebuilt 8-bit op opens here, before any request: a component first built
+            # mid-request (Klein's on-demand upsampler under a 16-bit main model) would ask for it
+            # only then, and serve its whole stage on a fallback while it lands.
+            int8_linear.native(torch, torch.cuda.current_device())
         self._device_ready = True
         place(self._device())
         return None
