@@ -14,7 +14,7 @@ import math
 import tempfile
 import threading
 from collections import deque
-from collections.abc import Callable, Generator, Iterator, Sequence
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator, Sequence
 from concurrent.futures import Future
 from typing import IO, TYPE_CHECKING, Any, NamedTuple
 
@@ -153,10 +153,18 @@ class SourceTensor(NamedTuple):
     shape: tuple[int, ...]
     plain: bool
     decoded: bool = False
+    #: its stored encoding's scheme ("" when plain)
+    scheme: str = ""
 
     @property
     def readable(self) -> bool:
         return self.plain or self.decoded
+
+    @property
+    def quantized(self) -> bool:
+        """An encoded weight matrix no read decodes exactly (int8.convrot, nvfp4, …): a lane
+        another recipe already wrote, never a quantization's source."""
+        return not self.readable and len(self.shape) == 2
 
 
 def source_rows(source: Checkpoint) -> Iterator[tuple[str, str, SourceTensor]]:
@@ -171,7 +179,28 @@ def source_rows(source: Checkpoint) -> Iterator[tuple[str, str, SourceTensor]]:
                 and not dict(encoding.params)
                 and len(info.shape) == 2
             )
-            yield component, key, SourceTensor(dtype, tuple(info.shape), encoding is None, decoded)
+            scheme = encoding.scheme if encoding is not None else ""
+            shape = tuple(info.shape)
+            yield component, key, SourceTensor(dtype, shape, encoding is None, decoded, scheme)
+
+
+def refuse_quantized(
+    rows: Iterable[tuple[str, str, SourceTensor]], components: Collection[str]
+) -> None:
+    """A source whose `components` hold weights already quantized is refused: a lane comes from
+    the original weights, never from another lane's."""
+    held = [
+        (c, k, t.scheme)
+        for c, k, t in rows
+        if c in components and k.endswith(".weight") and t.quantized
+    ]
+    if held:
+        (component, key, scheme), names = held[0], sorted({c for c, _, _ in held})
+        raise UnsupportedInput(
+            f"quantization source is already quantized: {len(held)} weights of {names} are "
+            f"encoded ({component}.{key} is {scheme}); quantize from the model's 16-bit commit",
+            code="quantization_source",
+        )
 
 
 class QuantizationTensor(msgspec.Struct, forbid_unknown_fields=True):
@@ -291,6 +320,7 @@ def prepare_source_quantization(
     missing = sorted(set(components) - {component for component, _, _ in rows})
     if missing:
         raise UnsupportedInput(f"weights source has no components {missing}")
+    refuse_quantized(rows, components)
     selected = [
         QuantizationTensor(component, key, tensor.logical_dtype, (tensor.shape[0], tensor.shape[1]))
         for component, key, tensor in rows

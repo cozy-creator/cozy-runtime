@@ -36,6 +36,7 @@ from .quantization import (
     QuantizationTensor,
     column_block,
     prepare_source_quantization,
+    refuse_quantized,
     source_rows,
 )
 from .recipes import declared_plan, declared_recipe
@@ -76,6 +77,7 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
     by_key = {(component, key): tensor for component, key, tensor in rows}
     if len(by_key) != len(rows):
         raise UnsupportedInput("quantization source repeats a tensor", code="quantization_source")
+    refuse_quantized(rows, plan.components)
     if (
         plan.source_order_digests
         and canonical_json.digest([[component, key] for component, key, _ in rows])
