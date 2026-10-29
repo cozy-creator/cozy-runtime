@@ -2976,9 +2976,16 @@ class Memory:
 
     @contextmanager
     def request(
-        self, id: str, plan: Sequence[object] = (), *, idle: bool = False
+        self,
+        id: str,
+        plan: Sequence[object] = (),
+        *,
+        idle: bool = False,
+        others: Collection[Model] = (),
     ) -> Iterator[Request]:
-        request = Request(self, id, idle)
+        """`others`: the process's other constructions' sets, whose cached weights are not this
+        request's working set (`Request.sample`)."""
+        request = Request(self, id, idle, others)
         request.plan(plan)
         with self.lock:
             if not idle and any(not other.idle for other in self.requests):
@@ -3021,10 +3028,14 @@ class Memory:
 
 
 class Request:
-    """Request context; Torch observations are process-wide, including overlapping calls."""
+    """Request context; Torch observations are process-wide, including overlapping calls. Its
+    `peak` is its own working set: other constructions' resident sets are left out."""
 
-    def __init__(self, memory: Memory, id: str, idle: bool = False) -> None:
+    def __init__(
+        self, memory: Memory, id: str, idle: bool = False, others: Collection[Model] = ()
+    ) -> None:
         self.memory, self.id, self.idle = memory, id, idle
+        self.others = tuple(others)
         self.current: set[str] = set()
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
@@ -3048,7 +3059,10 @@ class Request:
         return self.memory._prefetch_queued(self)
 
     def sample(self) -> None:
-        self.peak = max(self.peak, self.memory._figures()[2])
+        peak = self.memory._figures()[2]
+        if peak > self.peak and self.others:
+            peak -= sum(_resident_bytes(b) for m in self.others for b in m.groups())
+        self.peak = max(self.peak, peak)
 
     def plan(self, steps: Sequence[object]) -> None:
         def name(value: object) -> str:
@@ -3191,7 +3205,8 @@ class Request:
                 peak=self.peak,
                 allocated=allocated,
                 reserved=reserved,
-                peak_window="Torch high-water plus sampled native backing, carried across resets",
+                peak_window="Torch high-water plus sampled native backing, carried across resets; "
+                "other constructions' resident sets left out",
                 weight_residency=(
                     self.memory.native.stats() if self.memory.native is not None else None
                 ),
@@ -3227,6 +3242,15 @@ class Request:
         elif self.memory.device.type == "mps":
             out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
         return out
+
+
+def _resident_bytes(block: _Block) -> int:
+    """The native backing `block` holds on the device now, raw and final."""
+    return sum(
+        int(region.allocated_bytes)
+        for region in (block.region, block.final_region)
+        if region is not None and region.resident
+    )
 
 
 def _block_of(name: str, paths: Sequence[str]) -> str:
