@@ -84,8 +84,9 @@ jobs:
           docker run --rm -v "$PWD:/src" -w /src --env-file <(grep -v '^#' kernels/toolchain.env) \
             -e ARCH -e JOBS -e WITHOUT -e HOST_OWNER="$(id -u):$(id -g)" \
             "quay.io/pypa/manylinux_2_28_$ARCH:$MANYLINUX" bash -euo pipefail -c '
-              # NVIDIA's redistributable archives of the pinned toolkit, each held to its digest, as the
-              # Windows job installs it: no package repository (its metadata went missing on 10-29).
+              # The pinned toolkit from NVIDIA redistributable archives, each held to its digest, as the
+              # Windows job installs it: no package repository (whose metadata went missing on 10-29).
+              # This script is single-quoted: no apostrophe in it.
               platform=$([ "$ARCH" = aarch64 ] && echo linux-sbsa || echo linux-x86_64)
               redist=https://developer.download.nvidia.com/compute/cuda/redist
               curl -fsSL "$redist/redistrib_$CUDA_REDIST.json" -o /tmp/redist.json
