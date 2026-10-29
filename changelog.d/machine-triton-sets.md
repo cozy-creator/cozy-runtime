@@ -1,0 +1,1 @@
+Machine start builds the Runtime's own Triton sets each card row runs: those its attention cells' kernels launch (Sage3's fixed means, Sage2's fixed K mean, the E4M3 quantizers) and the encoded linears' (nvfp4; SVDQuant on FP4 rows). A fresh machine's first request no longer compiles them, nor serves a fallback while they open.
