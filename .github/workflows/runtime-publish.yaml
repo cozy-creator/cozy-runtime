@@ -9,6 +9,9 @@ name: runtime-publish
 #   manual): a cozy-creator release-gate.yml run id, or the URL of a recorded hand gate. PyPI's trusted publisher
 #   names this file:
 #     gh workflow run runtime-publish.yaml -f release_tag=vX.Y.Z -f mode=prebuilt -f gated_sha256sums='<sha256> <filename> ...' -f gate_run=<id>
+# A release may ship in parts when one platform cannot build: -f linux='["x86_64"]' releases the sdist, pure, x86_64
+# and Windows files (aarch64 resolves the pure wheel); later -f linux='["aarch64"]' builds and publishes only its wheel
+# into the same version, both modes, a prebuilt part taking a hand-gate record URL.
 # Add -f rehearsal=true to verify a tag/files without entering the publish job.
 # Build/download jobs have read-only repository access. Only publish obtains PyPI OIDC.
 on:
@@ -38,6 +41,10 @@ on:
         description: "prebuilt: the passing cozy-creator release-gate run id, or the URL of a recorded hand gate"
         type: string
         default: ''
+      linux:
+        description: 'The Linux CPUs this part releases, a JSON list; x86_64 also carries the sdist, pure and Windows files; without it the part adds to a released version'
+        type: string
+        default: '["x86_64", "aarch64"]'
 
 # Serialize retries for one release name; distinct versions can build independently.
 concurrency:
@@ -52,10 +59,12 @@ jobs:
     uses: ./.github/workflows/kernels.yaml
     with:
       ref: ${{ inputs.release_tag }}
+      linux: ${{ inputs.linux }}
+      windows: ${{ contains(fromJSON(inputs.linux), 'x86_64') && 'yes' || 'no' }}
 
   build:
     needs: modules
-    if: ${{ inputs.mode == 'source' }}
+    if: ${{ inputs.mode == 'source' && contains(fromJSON(inputs.linux), 'x86_64') }}
     outputs:
       version: ${{ steps.dist.outputs.version }}
       sha256sums: ${{ steps.dist.outputs.sha256sums }}
@@ -153,7 +162,7 @@ jobs:
   # The Linux arm64 wheel, on its own runner: the pure wheel plus its kernels.
   build-aarch64:
     needs: modules
-    if: ${{ inputs.mode == 'source' }}
+    if: ${{ inputs.mode == 'source' && contains(fromJSON(inputs.linux), 'aarch64') }}
     outputs:
       sha256sum: ${{ steps.dist.outputs.sha256sum }}
     runs-on: ubuntu-24.04-arm
@@ -178,7 +187,7 @@ jobs:
           repo-token: ${{ github.token }}
       - run: uv python install 3.12
       - id: release
-        run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }}
+        run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }} ${{ !contains(fromJSON(inputs.linux), 'x86_64') && '--adding' || '' }}
       - run: uv sync --locked
         working-directory: source
       - uses: actions/download-artifact@v4
@@ -231,7 +240,7 @@ jobs:
           save-cache: false
       - id: release
         name: Verify immutable release identity without executing artifact code
-        run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }}
+        run: uv run --no-project --python 3.12 python release-tools/checks/release.py --source source ${{ inputs.rehearsal && '--rehearsal' || '' }} ${{ !contains(fromJSON(inputs.linux), 'x86_64') && '--adding' || '' }}
       - name: The release gate passed these files
         env:
           GH_TOKEN: ${{ github.token }}
@@ -253,21 +262,24 @@ jobs:
           TAG: ${{ inputs.release_tag }}
           VERSION: ${{ steps.release.outputs.version }}
           SUMS: ${{ inputs.gated_sha256sums }}
+          LINUX: ${{ inputs.linux }}
         run: |
           set -euo pipefail
           test -n "$SUMS" || { echo "::error::Prebuilt mode requires gated_sha256sums."; exit 1; }
-          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist -p 'cozy_runtime-*'
-          uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION"
+          names=($(awk '{for (i = 2; i <= NF; i += 2) print "-p", $i}' <<< "$SUMS"))
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D dist "${names[@]}"
+          uv run --no-project --python 3.12 python release-tools/checks/release_assets.py --dist dist --version "$VERSION" --linux "$LINUX"
       - uses: actions/upload-artifact@v4
         with:
           name: release-dist
           path: dist/
           if-no-files-found: error
 
-  # The candidate: the release set on the tag's GitHub prerelease, for the gate. Never PyPI.
+  # The candidate: this part's files on the tag's GitHub prerelease, for the gate. Never PyPI. The first part
+  # (with x86_64) creates it; a later part adds files it lacks and extends SHA256SUMS. A file never changes.
   candidate:
     needs: [build, build-aarch64]
-    if: ${{ !cancelled() && !inputs.rehearsal && needs.build.result == 'success' && needs.build-aarch64.result == 'success' }}
+    if: ${{ !cancelled() && !inputs.rehearsal && !contains(needs.*.result, 'failure') && contains(needs.*.result, 'success') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -275,30 +287,43 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.release_tag }}
+      ADDING: ${{ !contains(fromJSON(inputs.linux), 'x86_64') }}
+      LINUX: ${{ inputs.linux }}
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: release-dist
-          path: dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: release-dist-aarch64
+          pattern: release-dist*
+          merge-multiple: true
           path: dist
       - working-directory: dist
         run: |
-          sha256sum -- *.whl *.tar.gz > SHA256SUMS && cat SHA256SUMS
-          if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            [ -z "$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')" ] \
-              || { echo "::error::$TAG already holds files: a candidate's files never change"; exit 1; }
+          set -euo pipefail
+          files=(cozy_runtime-*)
+          sha256sum -- "${files[@]}" > part.sums && cat part.sums
+          held=$(gh release view "$TAG" -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' 2>/dev/null) || held=none
+          if [ "$ADDING" = true ]; then
+            [ "$held" != none ] && grep -qx SHA256SUMS <<< "$held" \
+              || { echo "::error::$TAG has no first part: the part with x86_64 creates the release"; exit 1; }
+            for f in "${files[@]}"; do
+              ! grep -qxF "$f" <<< "$held" || { echo "::error::$TAG already holds $f: a candidate's files never change"; exit 1; }
+            done
+            gh release download "$TAG" -R "$GITHUB_REPOSITORY" -p SHA256SUMS
+            sort -k2 -o SHA256SUMS SHA256SUMS part.sums
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- "${files[@]}"
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" --clobber SHA256SUMS
+          elif [ "$held" != none ]; then
+            [ -z "$held" ] || { echo "::error::$TAG already holds files: a candidate's files never change"; exit 1; }
+            cp part.sums SHA256SUMS
             gh release edit "$TAG" -R "$GITHUB_REPOSITORY" --prerelease
-            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- *.whl *.tar.gz SHA256SUMS
+            gh release upload "$TAG" -R "$GITHUB_REPOSITORY" -- "${files[@]}" SHA256SUMS
           else
+            cp part.sums SHA256SUMS
             gh release create "$TAG" -R "$GITHUB_REPOSITORY" --verify-tag --prerelease --title "cozy-runtime ${TAG#v} (candidate)" \
-              --notes "Gate, then publish: .github/workflows/runtime-publish.yaml" -- *.whl *.tar.gz SHA256SUMS
+              --notes "Gate, then publish: .github/workflows/runtime-publish.yaml" -- "${files[@]}" SHA256SUMS
           fi
-          w=$(grep -E 'manylinux_2_28_x86_64\.whl$' SHA256SUMS)
-          { echo "gate with: runtime_wheel=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${w##* }#sha256=${w%% *}"
-            echo "publish with: gated_sha256sums='$(tr '\n' ' ' < SHA256SUMS)'"; } | tee -a "$GITHUB_STEP_SUMMARY"
+          w=$(grep -E 'manylinux_2_28_x86_64\.whl$' SHA256SUMS || true)
+          { [ -z "$w" ] || echo "gate with: runtime_wheel=https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${w##* }#sha256=${w%% *}"
+            echo "publish with: -f linux='$LINUX' -f gated_sha256sums='$(tr '\n' ' ' < part.sums)'"; } | tee -a "$GITHUB_STEP_SUMMARY"
 
   publish:
     needs: [gated]
@@ -334,6 +359,7 @@ jobs:
         env:
           VERSION: ${{ needs.gated.outputs.version }}
           SUMS: ${{ steps.sums.outputs.all }}
+          ADDING: ${{ !contains(fromJSON(inputs.linux), 'x86_64') }}
         run: |
           python3 - <<'PY'
           import json, os, sys, time, urllib.error, urllib.request
@@ -352,7 +378,9 @@ jobs:
                   time.sleep(5)
                   continue
               served = {f["filename"]: f["digests"].get("sha256") for f in files if f["filename"].startswith(prefixes)}
-              wrong = {name: digest for name, digest in served.items() if want.get(name) != digest}
+              # A part added to a released version leaves the earlier parts' files beside its own.
+              adding = os.environ["ADDING"] == "true"
+              wrong = {name: digest for name, digest in served.items() if (name in want or not adding) and want.get(name) != digest}
               if wrong:
                   sys.exit(f"PyPI serves files this run did not build: {wrong}")
               missing = sorted(set(want) - set(served))

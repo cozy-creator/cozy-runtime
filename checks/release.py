@@ -6,9 +6,9 @@ retain a released manifest version; dev-build's artifacts carry it, with their c
 stamped in `cozy_runtime._build_provenance`.
 
 The selected tag must name this exact clean checkout, and publication requires that PyPI
-does not already know the version (including a partial release). Existing
-filenames remain protected by PyPI and the publishing action; this preflight
-also prevents filling an existing version with artifacts from another source.
+does not already know the version (including a partial release), except for a later part
+(`--adding`: a platform that could not build with the first) of a release made in parts
+from this same tag. Existing filenames remain protected by PyPI and the publishing action.
 """
 
 from __future__ import annotations
@@ -63,6 +63,9 @@ def main() -> int:
     parser.add_argument(
         "--rehearsal", action="store_true", help="Verify source identity only; no publication"
     )
+    parser.add_argument(
+        "--adding", action="store_true", help="A later part of a release made in parts: PyPI may know the version"
+    )
     args = parser.parse_args()
     ROOT = args.source.resolve()
     event = json.loads(pathlib.Path(os.environ["GITHUB_EVENT_PATH"]).read_text())
@@ -101,7 +104,7 @@ def main() -> int:
     if args.rehearsal:
         if not manual:
             raise ValueError("rehearsal requires an explicit manual dispatch")
-    else:
+    elif not args.adding:
         unpublished(version)
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
@@ -110,6 +113,8 @@ def main() -> int:
     purpose = (
         "identity-only rehearsal; publication disabled"
         if args.rehearsal
+        else "a later part of this release"
+        if args.adding
         else "version absent from PyPI"
     )
     print(f"release guard green: {tag} at {head}, {purpose}")
