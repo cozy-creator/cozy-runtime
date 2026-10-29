@@ -2283,7 +2283,16 @@ class Memory:
         with self.lock:
             if self._prefetch is not None and self._prefetch.queued is not None:
                 self._settle_prefetch(cancel=True)
-        self._prefetch_block(current.next, _REQUEST.get())
+        following, ahead = current.next, False
+        if self._fits:
+            # The phase's missing bytes fit beside its resident ones: read ahead past them to
+            # the next missing block, into free room only, while the resident ones run.
+            for _ in range(len(current.model.blocks)):
+                if following is None or following is current or not following.cached():
+                    break
+                following, ahead = following.next, True
+        if following is not None and following is not current:
+            self._prefetch_block(following, _REQUEST.get(), ahead=ahead)
 
     def _prefetch_queued(self, request: Request) -> str | None:
         """Offer one raw block; return its queued assignment even when capacity refuses.
@@ -2331,8 +2340,10 @@ class Memory:
         *,
         queued: QueuedPrefetch | None = None,
         released: bool = False,
+        ahead: bool = False,
     ) -> None:
-        """Admit one immutable raw read, without eviction or Python fill callbacks."""
+        """Admit one immutable raw read, without eviction or Python fill callbacks. A read
+        `ahead` of demand's next block takes free room only."""
         if (
             not self.prefetch_supported
             or self.capturing()
@@ -2398,7 +2409,9 @@ class Memory:
                         else None
                     )
                     if kept is not None and kept.tensor.numel() == block.storage_bytes:
-                        read = self._host_read(region, kept, evict_completed=queued is None)
+                        read = self._host_read(
+                            region, kept, evict_completed=queued is None and not ahead
+                        )
                         if read is None:
                             return  # resident already
                     else:
@@ -2419,7 +2432,7 @@ class Memory:
                             block.model.source.ck,
                             parts,
                             reclaim=False,
-                            evict_completed=queued is None,
+                            evict_completed=queued is None and not ahead,
                             **host,
                         )
                         if staged is not None:
@@ -2447,7 +2460,7 @@ class Memory:
                     release_cached(torch, self.device.type)
                     if request is not None:
                         request.prefetch_released += 1
-                    return self._prefetch_block(block, request, released=True)
+                    return self._prefetch_block(block, request, released=True, ahead=ahead)
                 if request is not None:
                     request.prefetch_skipped += 1
                 return
