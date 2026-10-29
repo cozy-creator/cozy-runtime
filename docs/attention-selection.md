@@ -30,7 +30,7 @@ not in the walk.
 | 16 | SDPA | FA3 | cuDNN |
 | 8 | kitchen-int8, Sage2 (fp8 rows) | Sage2 | FA4 fp8 |
 | 4 | Sage3 fp4 (fp4 rows), else 8 | 8 | 8 |
-| sparse 16 / 8 / 4 | Sol / Sol, Kitchen Sol / Kitchen fp4 Sol | Sol / Sol + fixed-Kmean Sage2, Sol | Sol |
+| sparse 16 / 8 / 4 | Sol / Kitchen Sol, Sol / Kitchen fp4 Sol | Sol / Sol + fixed-Kmean Sage2, Sol | Sol |
 
 A card no row names takes the newest family whose 8-bit op builds for its own target and says
 so on every run (`arch.inherited`).

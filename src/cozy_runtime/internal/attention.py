@@ -301,11 +301,13 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
 }
 #: A sparse site's kernels (one a package producer serves: its model supplies an
 #: `AttentionLayout`), tried before DENSE at each level. Sol's dense rows take DENSE at the
-#: site's level, its exact paths level 16 (`_sol_dense`).
+#: site's level, its exact paths level 16 (`_sol_dense`). mma.sync's 8-bit cell is Kitchen's INT8
+#: Sol: INT8 runs 2x BF16 there, 4x on GeForce (half-rate FP32 accumulation), and BF16 Sol's
+#: exact blocks alone outlast Kitchen's whole sparse step (H3 15 s, RTX 4090: 23 s at peak).
 SPARSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.MMA_SYNC: {
         16: ("sol-attn",),
-        8: ("sol-attn", "kitchen-sol"),
+        8: ("kitchen-sol", "sol-attn"),
         4: ("kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem"),
     },
     arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean", "sol-attn")},
