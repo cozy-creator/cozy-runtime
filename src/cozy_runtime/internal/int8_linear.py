@@ -291,7 +291,9 @@ def quantize(torch: ModuleType, x: Tensor) -> PreQuantized | None:
 
 #: The quantize kernel's prologue codes (`cozy_int8::Prologue`).
 NORMS = {None: 0, "layer": 1, "rms": 2}
-ACTIVATIONS = {None: 0, "gelu": 1, "gelu_tanh": 2}
+ACTIVATIONS = {None: 0, "gelu": 1, "gelu_tanh": 2, "situ": 3}
+#: The gated activations: x holds [hidden | gate] halves, and the operand is half its width.
+GATED = frozenset({"situ"})
 
 
 def prologue(
@@ -306,8 +308,13 @@ def prologue(
     activation: str | None,
 ) -> PreQuantized | None:
     """`activation(norm(x) * (1 + scale) + shift)`, rotated and quantized in one pass, when each
-    of `consumers` is an un-hooked leaf of x's width taking int8.convrot's operand and the op
-    serves this card; else None."""
+    of `consumers` is an un-hooked leaf of the rows' width taking int8.convrot's operand and the
+    op serves this card; else None. A gated activation (`GATED`) reads x's [hidden | gate] halves
+    alone: the rows are half x's width."""
+    gated = activation in GATED
+    if gated and (norm is not None or scale is not None or shift is not None or x.shape[-1] % 2):
+        raise ValueError(f"int8_rows: {activation} takes [hidden | gate] rows, no norm or tables")
+    width = x.shape[-1] // 2 if gated else x.shape[-1]
     if not x.is_cuda or x.dtype not in _HALF or _OPS.get(x.get_device()) is None:
         return None
     if any(t is not None and t.dtype != x.dtype for t in (scale, shift)):
@@ -318,7 +325,7 @@ def prologue(
     for module in consumers:
         if (
             getattr(module, "operand", None) != INT8_CONVROT
-            or getattr(module, "in_features", None) != x.shape[-1]
+            or getattr(module, "in_features", None) != width
             or module._forward_hooks  # type: ignore[attr-defined]
             or module._forward_pre_hooks  # type: ignore[attr-defined]
         ):
@@ -330,7 +337,7 @@ def prologue(
     except Exception as exc:
         failed(OP, x.get_device(), exc)
         return None
-    return PreQuantized(payload, row_scale, tuple(x.shape), INT8_CONVROT)
+    return PreQuantized(payload, row_scale, (*x.shape[:-1], width), INT8_CONVROT)
 
 
 def gemm(

@@ -55,6 +55,8 @@ class _Format:
 
 
 INT8, FP8 = _Format("int8", False, CONVROT_GROUP), _Format("fp8", True, 16)
+#: The prologue's gated activation (`cozy_int8::kActSitu`): rows of [hidden | gate] halves.
+SITU = 3
 
 
 @dataclass(slots=True)
@@ -236,8 +238,12 @@ class Prebuilt:
         activation: int,
     ) -> tuple[Tensor, Tensor]:
         torch = self.torch
-        flat = self._rows(f, x)
-        rows, width = flat.shape
+        # A gated row quantizes to half its width.
+        gated = activation == SITU
+        flat = self._rows(f, x, x.shape[-1] // 2 if gated else x.shape[-1])
+        rows, width = flat.shape[0], flat.shape[1] // 2 if gated else flat.shape[1]
+        if gated and (x.shape[-1] % 2 or norm or scale is not None or shift is not None):
+            raise ValueError(f"{f.name}_quantize: SiTU takes [hidden | gate] rows alone")
         q = torch.empty(rows, width, dtype=torch.float8_e4m3fn if f.fp8 else torch.int8,
                         device=x.device)  # fmt: skip
         scales = torch.empty(rows, dtype=torch.float32, device=x.device)
@@ -307,15 +313,16 @@ class Prebuilt:
             product = acc.mul_(scales.view(-1, 1)).mul_(scale.view(1, -1)).to(out_dtype)
         return product if bias is None else product.add_(bias)
 
-    def _rows(self, f: _Format, x: Tensor) -> Tensor:
-        """The activation as contiguous, 16-byte aligned `[M, K]` rows."""
-        width = x.shape[-1]
+    def _rows(self, f: _Format, x: Tensor, width: int | None = None) -> Tensor:
+        """The activation as contiguous, 16-byte aligned rows; `width` is what each quantizes to
+        (a gated row's half), checked against the kernels' widths."""
+        width = x.shape[-1] if width is None else width
         if not x.is_cuda or x.get_device() != self.index:
             raise ValueError(f"{f.name}: x must be on cuda:{self.index}")
         if width % f.multiple or width > _kernels._gemm.MAX_K:
             raise ValueError(f"{f.name}: K must be a multiple of {f.multiple} up to "
                              f"{_kernels._gemm.MAX_K}, not {width}")  # fmt: skip
-        flat = x.reshape(-1, width).contiguous()
+        flat = x.reshape(-1, x.shape[-1]).contiguous()
         return flat if flat.data_ptr() % 16 == 0 else flat.clone()
 
     def _weight(
@@ -509,8 +516,8 @@ def library(torch: ModuleType, index: int, sm: int) -> tuple[Prebuilt | None, st
 def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     """`f`'s kernels on the card against the exact law in float64: the linear's GEMV rows and its
     tiled GEMM in bf16 and fp16, every GEMM tile the card's table holds (int8's exact integer
-    sums: every tile the same bits), and one quantization with a producer's RMS norm, modulation
-    and tanh GELU."""
+    sums: every tile the same bits), one quantization with a producer's RMS norm, modulation
+    and tanh GELU, and one with the gated SiTU."""
     device = torch.device("cuda", ops.index)
     generator = torch.Generator(device=device).manual_seed(20261017)
 
@@ -555,6 +562,12 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     produced = _prologue(torch, x.double(), modulation.double(), shift.double(), 1e-6)
     errors["prologue rms+modulation+gelu_tanh"] = verify.error(
         torch, got, law(torch, f, produced, data, scale, None)
+    )
+    gated = randn(64, 2 * width, scale=4.0).to(torch.bfloat16)
+    folded = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(gated, activation=SITU)
+    got = (ops.fp8_gemm if f.fp8 else ops.int8_gemm)(*folded, data, scale, None, torch.bfloat16)
+    errors["prologue situ"] = verify.error(
+        torch, got, law(torch, f, _situ(torch, gated.double()), data, scale, None)
     )
     return verify.within(errors, BUDGET)
 
@@ -651,6 +664,12 @@ def _prologue(
     y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
     y = y * (1 + modulation[entry]) + shift[entry]
     return 0.5 * y * (1 + torch.tanh(0.79788456 * (y + 0.044715 * y**3)))
+
+
+def _situ(torch: ModuleType, x: Tensor) -> Tensor:
+    """The gated SiTU of [hidden | gate] rows: `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)`."""
+    hidden, gate = x.chunk(2, -1)
+    return 4 * torch.tanh(gate / 4) * torch.sigmoid(gate) * 25 * torch.tanh(hidden / 25)
 
 
 @dataclass(frozen=True, slots=True)

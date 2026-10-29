@@ -243,6 +243,17 @@ __device__ __forceinline__ void apply_prologue(const Prologue& p, int row, int t
     }
 }
 
+// The gated SiTU of a row's [hidden | gate] halves: `v` holds the hidden tile, `gate_row` the gate.
+template <typename T>
+__device__ __forceinline__ void apply_situ(const T* gate_row, int tile, int K,
+                                           float (&v)[kLaneValues]) {
+    float g[kLaneValues];
+    load_tile(gate_row, tile, K, g);
+#pragma unroll
+    for (int r = 0; r < kLaneValues; ++r)
+        v[r] = (4.f * tanhf(g[r] * 0.25f) / (1.f + expf(-g[r]))) * (25.f * tanhf(v[r] / 25.f));
+}
+
 // The TMA GEMMs (wgmma, tcgen05, block-scaled mma.sync's fp8) launch as programmatic dependents
 // of this kernel: they start their prologue as soon as every block here has begun, and wait
 // for this grid before reading. Before any other kernel the signal does nothing.
@@ -262,8 +273,16 @@ __global__ void __launch_bounds__(1024) quantize_kernel(
     const bool live = row < M;  // a padding row rotates nothing and still meets the barriers
     float v[kLaneValues];
     float amax = 0.f;
-    load_tile(x + int64_t(live ? row : 0) * K, tile, live ? K : 0, v);
-    if constexpr (kPrologue) apply_prologue<T>(prologue, live ? row : 0, tile, K, v, partial + 32);
+    // A gated row is twice the quantized width: its hidden half, then its gate half.
+    const bool gated = kPrologue && prologue.activation == kActSitu;
+    const T* in = x + int64_t(live ? row : 0) * (gated ? 2 * int64_t(K) : K);
+    load_tile(in, tile, live ? K : 0, v);
+    if constexpr (kPrologue) {
+        if (gated)
+            apply_situ(in + K, tile, live ? K : 0, v);
+        else
+            apply_prologue<T>(prologue, live ? row : 0, tile, K, v, partial + 32);
+    }
     if constexpr (kFp8) {
 #pragma unroll
         for (int r = 0; r < kLaneValues; ++r) amax = fmaxf(amax, fabsf(v[r]));

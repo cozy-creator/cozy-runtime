@@ -213,7 +213,9 @@ def int8_rows(
     rotated and quantized for int8 in one pass of the Runtime's op: pass the result to each
     consumer in place of its input. Each part is optional: `norm` "layer" or "rms" (no affine),
     `activation` "gelu" or "gelu_tanh"; `scale` and `shift` are `[..., width]` tables, and x's
-    row r reads table row `r // (x rows / table rows)`.
+    row r reads table row `r // (x rows / table rows)`. `activation="situ"` is gated and stands
+    alone: x is `[..., 2F]`, each row its [hidden | gate] halves, and the F-wide rows are
+    `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU).
 
     None unless every consumer is an un-hooked encoded leaf taking int8.convrot's operand (an int8
     or w4a8 leaf) of x's width and the op serves this card: the caller then runs its own ops."""
