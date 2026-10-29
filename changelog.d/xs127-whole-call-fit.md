@@ -1,0 +1,1 @@
+`denoise_loop` refuses a whole-call recording before it takes any memory when the call's weights beside its layout's Torch high-water (from its eager call) exceed what the process holds and has free. SDXL int8 at 6 GiB free used to prepare, bind and fail that capture on its second call (0.42 s), evicting 713 MB of weights on the way.

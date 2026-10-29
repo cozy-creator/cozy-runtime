@@ -2990,6 +2990,8 @@ class Request:
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
         self.peak = 0
+        #: Torch's allocated high-water, carried across `reset_peak` (`torch_high`)
+        self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
         self.baked_hits = self.baked_bytes = self.baked_ns = 0
@@ -3082,8 +3084,15 @@ class Request:
         self.sample()
         _, _, peak = self.memory._figures()
         if self.memory.cuda and len(self.memory.requests) == 1:
+            self.torch_peak = self.torch_high()
             torch.cuda.reset_peak_memory_stats(self.memory.device)
         return peak
+
+    def torch_high(self) -> int:
+        """Torch's allocated high-water in this request so far."""
+        if not self.memory.cuda or not torch.cuda.is_initialized():
+            return 0
+        return max(self.torch_peak, _torch_bytes(self.memory.device)[2])
 
     def read(
         self,

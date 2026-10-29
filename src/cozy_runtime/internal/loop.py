@@ -185,9 +185,10 @@ class _Program:
 @dataclass
 class _Site:
     """What a call site's keyed calls learned, per layout: the blocks an eager `after` ran,
-    and the whole calls that did not fit."""
+    that call's Torch high-water, and the whole calls that did not fit."""
 
     after: dict[Hashable, dict[Model, tuple[str, ...]]] = field(default_factory=dict)
+    peak: dict[Hashable, int] = field(default_factory=dict)
     unfit: set[Hashable] = field(default_factory=set)
 
 
@@ -438,6 +439,13 @@ def _record(
         if outside:
             row["whole_call"] = f"before/after not resident: {outside}"
         ends = not outside
+    if ends and (short := _short(known.peak.get(shape, 0), pre, body, post)):
+        # Refused before its recording takes any memory: a capture that runs out costs a
+        # prepare, a bind and a cleanup, and evicts weights on its way (SDXL int8 at 6 GiB
+        # free: 0.42 s and 713 MB, once per layout).
+        row["whole_call"] = short
+        known.unfit.add(shape)
+        ends = False
     if not ends and scope:
         # No call keeps this program: recording it would cost more than its steps save.
         row["eager"] = f"{'resident' if resident else 'streamed'}, and no call keeps the program"
@@ -559,6 +567,30 @@ def _after(
     with _entering() as seen:
         _once(loop.after, tensors)
     known.after[shape] = _used(seen, scope)
+    if (request := _REQUEST.get()) is not None:
+        known.peak[shape] = request.torch_high()
+
+
+def _short(peak: int, *used: dict[Model, tuple[str, ...]]) -> str:
+    """Why a whole call cannot fit, or "": the weights it keeps resident beside the Torch
+    high-water of its layout's eager call, against what this process holds and has free."""
+    paths: dict[Model, set[str]] = {}
+    for entered in used:
+        for model, names in entered.items():
+            paths.setdefault(model, set()).update(names)
+    memory = next(iter(paths)).memory if paths else None
+    if memory is None or not memory.cuda or not peak:
+        return ""
+    weights = sum(
+        block.allocation_bytes
+        for model, names in paths.items()
+        for block in model.groups()
+        if block is model.common or block.path in names
+    )
+    room = memory.room().free + memory._figures()[1]  # free, plus Torch's and Varena's own
+    if weights + peak <= room:
+        return ""
+    return f"does not fit: weights {weights >> 20} + peak {peak >> 20} > {room >> 20} MiB"
 
 
 def _back(work: tuple[Any, ...], tensors: tuple[Any, ...]) -> None:
