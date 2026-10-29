@@ -114,7 +114,6 @@ class RequestMemory(Command, frozen=True, kw_only=True, tag="request_memory"):
 
 class Activate(Command, frozen=True, kw_only=True, tag="activate"):
     construction: str
-    authorized_device_limit_bytes: int | UnsetType = UNSET
     #: A follower's half: the constructions rank 0 parked to make room.
     park: tuple[str, ...] = ()
 
@@ -206,6 +205,10 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     call_interfaces: tuple[CallInterface, ...] = ()
     #: What its loads will construct, known before anything heavy is imported.
     constructions: tuple[Construction, ...] = ()
+    #: Development only (the machine's `gpu_memory_limit`, never a user setting): each GPU is a
+    #: card of this many bytes, the executor's memory budget, to test constrained VRAM on bigger
+    #: cards.
+    gpu_memory_limit: int | None = None
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
