@@ -1264,6 +1264,7 @@ class Memory:
         self._host_looked = 0.0
         admission = inspect.signature(varena.Region.prepare).parameters
         self._host_prepare = "evict_completed" in admission  # TensorFS 0.17.4
+        self._request_order = hasattr(varena.Arena, "begin_request")
         if self.cuda:
             try:
                 if budget_bytes is not None:
@@ -2946,6 +2947,10 @@ class Memory:
                 for other in self.requests:
                     if not other.idle:
                         other.overlap = True
+            if not idle and self.native is not None and self._request_order:
+                # Reclaim then takes this request's own idle pages newest first: its phases
+                # repeat in order, so the newest is needed last (TensorFS 0.17.7).
+                self.native.begin_request()
             self.requests.add(request)
         token = _REQUEST.set(request)
         try:
