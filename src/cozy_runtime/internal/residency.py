@@ -1225,7 +1225,6 @@ class Memory:
         self.device = torch.device(device)
         self.cuda: bool = self.device.type == "cuda"
         self.budget_bytes = budget_bytes
-        self._budget_applied = False
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
@@ -1302,17 +1301,6 @@ class Memory:
             _MEMORIES[str(device)] = memory
             return memory
 
-    def apply_budget(self) -> None:
-        """Apply an explicitly assigned LOCAL Torch allowance after device initialization."""
-        if self._budget_applied or not self.cuda:
-            return
-        if self.budget_bytes is not None:
-            total = torch.cuda.get_device_properties(self.device).total_memory
-            torch.cuda.set_per_process_memory_fraction(
-                min(self.budget_bytes / total, 1.0), self.device
-            )
-        self._budget_applied = True
-
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
 
@@ -1332,16 +1320,18 @@ class Memory:
         return 0, 0, 0
 
     def room(self, current: Collection[str] = ()) -> Room:
-        self.apply_budget()
         if self.cuda:
-            free, _ = torch.cuda.mem_get_info(self.device)
+            free, total = torch.cuda.mem_get_info(self.device)
             # reserved - allocated includes graph-private storage that ordinary eager
             # allocation cannot necessarily reuse. Driver free is a conservative bound.
             free = max(int(free) - _RESERVE, 0)
             if self.budget_bytes is not None:
-                # Account native backing beside Torch reservations, including graph pools.
-                # Unused private-pool bytes are not headroom for an eager allocation.
-                free = min(free, max(self.budget_bytes - self._figures()[1], 0))
+                # The card is `budget_bytes` (a development cap): what it lacks of the real one
+                # is never there, whoever holds the rest. Account native backing beside Torch
+                # reservations, including graph pools: unused private-pool bytes are not
+                # headroom for an eager allocation.
+                card = max(free - (int(total) - self.budget_bytes), 0)
+                free = min(card, max(self.budget_bytes - self._figures()[1], 0))
         elif self.device.type == "mps":
             figures = allocation(torch, "mps")
             free, reserved = figures["driver_free_bytes"], figures["reserved_bytes"]
@@ -1998,7 +1988,6 @@ class Memory:
         return region
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
-        self.apply_budget()
         if self.device.type == "mps" and reclaim:
             # TensorFS reads into bounded host staging; account for that transient beside
             # the retained MPS part before asking Torch for its destination allocation.
