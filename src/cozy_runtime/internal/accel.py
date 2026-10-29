@@ -517,8 +517,14 @@ def drain(torch: Any, kind: str) -> None:
 
 #: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
 #: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
+#: Blocks of 1 GiB and more are never split: a smaller tensor left inside a freed large
+#: block keeps that whole segment, which Torch's OOM path cannot return (H3 Turbo 15 s on an
+#: 8 GB card was refused 1.09 GiB beside 2.15 GiB of such remainders, gate 40822058281).
+#: An unsplit block serves only a request within 20 MiB of its size, so below this size the
+#: cache keeps splitting: at 256 MiB, Qwen-Image's 8 GB decode paid a refused cudaMalloc and
+#: Torch's synchronizing release per VAE tensor (+300 ms, session 40829742644).
 #: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
-ALLOCATOR = "backend:native,expandable_segments:False"
+ALLOCATOR = "backend:native,expandable_segments:False,max_split_size_mb:1024"
 
 
 def initialize(torch: Any, kind: str) -> None:
