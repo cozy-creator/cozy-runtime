@@ -59,8 +59,9 @@ jobs:
     env:
       ARCH: ${{ matrix.arch }}
       JOBS: ${{ matrix.arch == 'aarch64' && 1 || 2 }}
-      # ptxas on an arm64 host crashes on FA3's units (signal 11, cr-200): CMake builds none there.
-      WITHOUT: ${{ matrix.arch == 'aarch64' && '_fa3' || '' }}
+      # ptxas on an arm64 host crashes on FA3's units (signal 11, cr-200): CMake builds none there,
+      # nor SageAttention3's (the same TMA kernels, not tried there yet).
+      WITHOUT: ${{ matrix.arch == 'aarch64' && '_fa3 _sage3' || '' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -207,7 +208,7 @@ jobs:
           "built in $(((Get-Date) - $began).TotalMinutes) min"
           & $py -m pip install -q "torch==$env:TORCH" --index-url https://download.pytorch.org/whl/cpu
           # MSVC builds neither CUTLASS's TMA GEMMs nor FA3 (cr-201).
-          & $py checks/kernel_modules.py modules --without tma --without _fa3 --without _execution --python $py `
+          & $py checks/kernel_modules.py modules --without tma --without _fa3 --without _sage3 --without _execution --python $py `
             --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
             --platform-floor platform-gpu.rs --torch-python $py
           exit $LASTEXITCODE

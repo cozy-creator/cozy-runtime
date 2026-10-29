@@ -8,7 +8,7 @@ Only input addressing expands to the actual H3 packed/strided QKV layouts. Its T
 
 from __future__ import annotations
 
-from importlib import import_module
+from types import ModuleType
 
 import torch
 import triton
@@ -149,9 +149,11 @@ def fixed_preprocess(
     return {"q": outputs[0], "k": outputs[1], "v": outputs[2], "qm": qm, "km": km, "delta": delta}
 
 
-def forward(q: Tensor, k: Tensor, v: Tensor, *, fixed_correction: bool = False) -> Tensor:
-    """Preserve the public quantizers/attention and short centered-buffer lifetimes."""
-    api = import_module("sageattn3.api")
+def forward(
+    q: Tensor, k: Tensor, v: Tensor, *, api: ModuleType, fixed_correction: bool = False
+) -> Tensor:
+    """Preserve the public quantizers/attention and short centered-buffer lifetimes, with `api`
+    SageAttention3's (`attention_upstream.sage3_api`)."""
     tokens = q.shape[1]
     prepared = fixed_preprocess(q, k, v, fixed_correction=fixed_correction)
     del prepared["qm"], prepared["km"]
