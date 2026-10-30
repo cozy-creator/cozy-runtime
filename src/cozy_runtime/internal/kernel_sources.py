@@ -144,18 +144,18 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         KITCHEN_WHEEL,
-        "0.2.37",
-        _PYPI + "19/04/d24939d30b077679bfc8bf4a53c7392f9d8650df7ce69164238a673753a1/"
-        "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-        "03cca0d10c314aaa13bff8f9422d03974221a344162b23d4f10d27eb2a35d0e8",
+        "0.2.40",
+        _PYPI + "5d/40/1871ee8c58eeef8d15cbf49a461eba0775303f2d9eb34c11af7c29e455c1/"
+        "comfy_kitchen-0.2.40-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "eb726664c772189e6ece742876487f1349965808b854742790e9001dbb7c0f9d",
         machine="x86_64",
     ),
     Pin(
         KITCHEN_WHEEL,
-        "0.2.37",
-        _PYPI + "ab/3b/77e68e596cb8097e10753b8095164d07b79b976208da8bde3371ecbfc558/"
-        "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl",
-        "0f872625af6b3d1f96f18c54b4ef11129df2d9178d28946e1f3d737b8252416d",
+        "0.2.40",
+        _PYPI + "48/51/5944dd2e8b78c475173eb4afcaa46c07f0b5c68df2f7d6cd94823017aa5c/"
+        "comfy_kitchen-0.2.40-cp312-abi3-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl",
+        "3bd596482a4f69a726845ce75fa751896ce7e5c2d210ed3a30794ea17871bebb",
         machine="aarch64",
     ),
     Pin(
@@ -167,9 +167,9 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "comfy-kitchen",
-        "be003b7c23c5b01328657955b8bc5d3f073d868e",  # v0.2.37: reviewed H3 matrix
-        _GITHUB.format("Comfy-Org/comfy-kitchen", "be003b7c23c5b01328657955b8bc5d3f073d868e"),
-        "364150b13466f51276c08fb77fa54328c9917ea90230151f2abed75a5c362e69",
+        "f8b7e97a1418d2e529bd5405fbf86312be198ae6",  # v0.2.40: Ampere INT8 attention tiles (#234)
+        _GITHUB.format("Comfy-Org/comfy-kitchen", "f8b7e97a1418d2e529bd5405fbf86312be198ae6"),
+        "2053f19423a1cd4092d9278a23e049e17de494f25ddb69c94aa06e728af0ad82",
     ),
     Pin(
         "sol-attn",

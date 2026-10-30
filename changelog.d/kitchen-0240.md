@@ -1,0 +1,1 @@
+comfy-kitchen moves from 0.2.37 to 0.2.40 (the reviewed wheel and its source pin), the release ComfyUI v0.43.0 ships. Its INT8 attention takes 64-row query tiles on Ampere up to 40k keys (comfy-kitchen #234): Qwen-Image 2.1's 4 MP step attends in 776 ms instead of 1038 ms on an RTX 3090, the whole of its steady-step gap to ComfyUI (xs-134).
