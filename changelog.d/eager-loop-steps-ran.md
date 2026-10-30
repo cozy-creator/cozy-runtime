@@ -1,0 +1,1 @@
+`denoise_loop`'s eager steps return once the last step has run on the device. Before, the loop returned with that step still queued, and its time landed in the caller's next stage: about 1 s of Qwen-Image's 4 MP "decoding image" on an RTX 4090 was its last denoise step.

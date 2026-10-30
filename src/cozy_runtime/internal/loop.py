@@ -354,6 +354,9 @@ class _Loop:
         return _NONE if self.phases is None else self.phases[i - self.steps.start]
 
     def eager(self, indices: range, tensors: tuple[Any, ...], ctx: Context | None) -> None:
+        """The steps in order, each reported (`on_step(i)`) once queued; the call returns once the
+        last has run on the device. Returning with it still queued put its time into the caller's
+        next stage (Qwen-Image's last 0.9 s step into its decode)."""
         if not len(indices):
             return
         index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
@@ -364,6 +367,8 @@ class _Loop:
             _call(self.step, index, tensors, self.phase(i))
             if self.on_step is not None:
                 self.on_step(i)
+        if index.is_cuda:
+            torch.cuda.current_stream(index.device).synchronize()
 
     def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
         _once(self.before, tensors)
