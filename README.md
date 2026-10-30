@@ -432,6 +432,14 @@ package may declare any input shape. Attached files are `File`, `ImageFile`, `Vi
 `AudioFile`; Runtime 0.36.0 renamed them from `*Asset`, and a package importing an old name
 fails at import with a remedy.
 
+Shots and upscales have shared interfaces too (xs-136), so a project swaps one renderer for
+another: `ShotRequest`/`ShotResult` (`video/shot`: a shot of any length with `beats`, `assets`,
+`world_state` and `writes`) and `UpscaleRequest`/`UpscaleResult` (`video/upscale`). A package
+subclasses them for its own knobs and declares what it implements on the entrypoint:
+`app.entrypoint(shot, implements=Implements("video/shot", max_piece_s=15))`. The interface
+document carries it as `implements`, so a caller flags a shot longer than `max_piece_s` with
+no beats before anything runs.
+
 Image inputs can separately opt into preparation on a field or an `Files` argument:
 
 ```python

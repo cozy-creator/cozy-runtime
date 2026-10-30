@@ -35,6 +35,7 @@ from cozy_runtime.author._model_defaults import (
     model_prepared_use,
 )
 from cozy_runtime.author._signature import Surface, analyze
+from cozy_runtime.author._video import Implements
 from cozy_runtime.author._weights import WeightsOutput
 
 P = ParamSpec("P")
@@ -71,6 +72,8 @@ class Registration:
     """Managed children from this installed package revision only; never a root request."""
     accelerator: bool = True
     """False: CPU only. True (the default): the machine's GPU when it has one."""
+    implements: Implements | None = None
+    """The interface it implements, as declared."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
     is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
@@ -100,6 +103,7 @@ class Registration:
                 model_on_demand=self.model_on_demand,
                 model_prepared_use=self.model_prepared_use,
                 model_classes=self.model_classes,
+                implements=self.implements,
             )
             self._surface = surface
         return self._surface
@@ -136,6 +140,7 @@ class App:
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        implements: Implements | None = None,
     ) -> Callable[P, R]: ...
 
     @overload
@@ -161,6 +166,7 @@ class App:
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        implements: Implements | None = None,
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
@@ -186,6 +192,7 @@ class App:
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        implements: Implements | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
 
@@ -205,7 +212,10 @@ class App:
         immutable component groups in execution order, available to queued preparation before
         handler entry; it has the same residency meaning as the handler's `ctx.plan` hints.
         `prepared_use={"model": "use"}` marks a typed internal-program field that describes
-        fixed repeated weight use before construction. It is not a user memory setting."""
+        fixed repeated weight use before construction. It is not a user memory setting.
+        `implements=Implements("video/shot", max_piece_s=15)` names the interface it
+        implements (`ImageRequest`, `ShotRequest`, `UpscaleRequest`) and the facts a caller
+        plans by."""
         # Immutable CPU metadata; the source reader uses the same closed validator.
         declared_phases = model_phases(phases)
         policy = memo_policy(memoize)
@@ -218,6 +228,8 @@ class App:
             )
         if hidden and internal:
             raise RegistrationError("an internal callable cannot also be hidden")
+        if implements is not None and not isinstance(implements, Implements):
+            raise RegistrationError("implements is an Implements(interface, ...)")
         declared_defaults = model_defaults(defaults)
         declared_components = model_components(components)
         declared_on_demand = model_on_demand(on_demand)
@@ -270,6 +282,7 @@ class App:
                 hidden=hidden,
                 internal=internal,
                 accelerator=accelerator is not False,
+                implements=implements,
             )
             return target
 

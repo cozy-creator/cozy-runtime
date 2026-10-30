@@ -187,6 +187,16 @@ from cozy_runtime.author._services import (
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._split import Cut, split
 from cozy_runtime.author._spread import spread
+from cozy_runtime.author._video import (
+    Beat,
+    Implements,
+    ShotAsset,
+    ShotRequest,
+    ShotResult,
+    UpscaleRequest,
+    UpscaleResult,
+    WorldState,
+)
 from cozy_runtime.author._weights import (
     MAX_WEIGHTS_NEW_BYTES,
     Weights,
@@ -224,6 +234,7 @@ __all__ = [
     "AudioProbe",
     "AuthorError",
     "Backend",
+    "Beat",
     "Bound",
     "Box",
     "Cancelled",
@@ -269,6 +280,7 @@ __all__ = [
     "ImageProbe",
     "ImageRequest",
     "ImageResult",
+    "Implements",
     "InvalidRequest",
     "Invocation",
     "InvocationResult",
@@ -318,6 +330,9 @@ __all__ = [
     "SelectionPlan",
     "Settings",
     "Shape",
+    "ShotAsset",
+    "ShotRequest",
+    "ShotResult",
     "Sizes",
     "Surface",
     "Target",
@@ -326,12 +341,15 @@ __all__ = [
     "ThreadPoolExecutor",
     "Tree",
     "UnsupportedInput",
+    "UpscaleRequest",
+    "UpscaleResult",
     "VideoFile",
     "VideoJoin",
     "VideoPreparation",
     "VideoProbe",
     "Weights",
     "WeightsOutput",
+    "WorldState",
     "active_attention_layout",
     "assert_declaration_shape",
     "attach_assessment",
