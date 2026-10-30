@@ -4794,20 +4794,25 @@ class Executor:
             if group is not None:
                 group.broadcast(executor_commands.encode(command))
             if self.memory is not None:
+                members = [m for m in child.model_executors or [child] if m.backend is not None]
                 if command.level == "ram":
                     # Map is ordered after every preceding invocation. Join its remaining
                     # consumer streams before retiring owners and returning allocator storage.
                     accel.synchronize(self.torch, self.device_kind)
-                for member in child.model_executors or [child]:
-                    if member.backend is not None:
-                        if command.level == "ram" and member.residency is not None:
+                    # Every slot's decoders, graphs and holds go before any model leaves: a
+                    # language model's engine retains its drafter's weights too, and Klein's
+                    # drafter slot maps before its upsampler, so an idle Klein refused every
+                    # offload and a running call beside it ran out of memory (0.36.0 gate).
+                    for member in members:
+                        if member.residency is not None:
                             member.residency.release()
                         for model in member.backend.models.values():
-                            if command.level == "ram":
-                                for _, release in graphs.DECODERS:
-                                    release(model.module)
-                                graphs.retire(self.torch, model.module)
-                            self.memory.load(model.module, command.level)
+                            for _, release in graphs.DECODERS:
+                                release(model.module)
+                            graphs.retire(self.torch, model.module)
+                for member in members:
+                    for model in member.backend.models.values():
+                        self.memory.load(model.module, command.level)
                 if command.level == "ram":
                     self.memory.trim()
             for reply in group.collect("map") if group is not None else ():
