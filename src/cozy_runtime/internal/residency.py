@@ -1682,13 +1682,11 @@ class Memory:
             self._baked_bytes += tensor.numel()
 
     def _read_before(self, page: tuple[object, ...]) -> bool:
-        """Whether this stored page was read from the store before; marks it read. A page read
-        once (a cold request's, a resident model's) never pays for pinning: pinning runs at
-        about the copy's own rate (5.5 GiB/s on an RTX 3070 host), on the request path."""
-        if page in self._read_once:
-            return True
-        self._read_once.add(page)
-        return False
+        """Whether a read of this stored page from the store completed before. A page read once
+        (a cold request's, a resident model's) never pays for pinning: pinning runs at about the
+        copy's own rate (5.5 GiB/s on an RTX 3070 host), on the request path. A read that was
+        canceled or refused does not count (krea-2's cold request cancels one prefetch a step)."""
+        return page in self._read_once
 
     def _host_page(self, nbytes: int) -> _HostPage | None:
         """A zeroed, pinned host page for the tier: process lifetime, never on disk, each page
@@ -2579,6 +2577,8 @@ class Memory:
                         )
                 if complete and not row.get("host") and not self._host_prefetch:
                     self._populate(block)  # a TensorFS without prepare_read(host=)
+                if complete and not row.get("host") and pending.staged is None:
+                    self._read_once.add((block.model.name, block.path, pending.identity, None))
             except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
@@ -2737,6 +2737,8 @@ class Memory:
                     if view.numel() != math.prod(shape):
                         raise ResidencyError(f"stored geometry does not match {key}#{role}")
                     views[role] = view.view(shape)
+            if page is not None and use is not None and use.needs_fill and kept is None:
+                self._read_once.add(page)  # this store read completed
             if staged is not None and use is not None and page is not None:
                 use.tensor.copy_(staged.tensor)  # complete when this returns
                 with self.lock:
