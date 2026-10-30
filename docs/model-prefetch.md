@@ -14,7 +14,7 @@ The callee must be an existing locked managed callable. Runtime checks the bindi
 serializes any requested `models` choices and sends `ModelPrefetch` to TensorD. The
 acknowledgment does not promise completion or a particular residency state. The later
 ordinary invocation still resolves its own models and performs any required preparation.
-TensorD overlays explicit `ModelArtifact` choices on the same inherited choices used by
+TensorD overlays explicit `ModelChoice` values on the same inherited choices used by
 an ordinary child call. An omitted entry or `None` retains the parent's applicable choice
 or the callee's captured default. Choices must name declared callee model slots, and the
 normal resolver still checks access to the selected data. Pass the same overrides to the

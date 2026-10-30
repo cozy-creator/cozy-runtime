@@ -2,7 +2,7 @@
 
 A `Weights[M]` argument is the raw checkpoint of `M`'s layout (bare `Weights`: any layout). It is
 never constructed. It binds like any model slot (`<fn>.models.<param>`, `defaults=`, a caller's
-`ModelArtifact` override) and its interface row carries `"weights": true`. TensorD selects the
+`ModelChoice`) and its interface row carries `"weights": true`. TensorD selects the
 exact manifest; the attempt reads it through TensorFS and creates no Python model or GPU tensor.
 
 ```python

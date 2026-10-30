@@ -203,6 +203,8 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The callables its attempts may call: their proxies are installed before the package is
     #: imported, and every attempt gets the call broker over them.
     call_interfaces: tuple[CallInterface, ...] = ()
+    #: Its calls take a ModelChoice per slot (`ref`, `lora`); an older machine's do not.
+    model_choices: bool = False
     #: What its loads will construct, known before anything heavy is imported.
     constructions: tuple[Construction, ...] = ()
     #: Development only (the machine's `gpu_memory_limit`, never a user setting): each GPU is a

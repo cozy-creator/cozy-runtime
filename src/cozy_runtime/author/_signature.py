@@ -603,9 +603,8 @@ def analyze(
                     "injected invocable parameters cannot have defaults", code="injected_default"
                 )
             if weights_class(base) is not None or model_class(base) is not None:
-                # Ordinary top-level invocation may use the owner's frozen model
-                # binding. A managed caller may supply an exact produced artifact
-                # override, which the owner also binds through that same model lane.
+                # It marks the slot in the request schema, which then drops it: a
+                # caller chooses the slot's model with a ModelChoice beside the request.
                 wire_fields.append((parameter.name, ModelArtifact | None, None))
         params.append(_classify(parameter.name, annotation, where))
 

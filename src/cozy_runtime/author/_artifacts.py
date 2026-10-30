@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 
 import msgspec
@@ -57,4 +58,49 @@ class ModelArtifact(msgspec.Struct, frozen=True):
             raise ConformanceError(
                 "model artifact requires an exact checkpoint, producer, output and transaction",
                 code="model_artifact",
+            )
+
+
+class Lora(msgspec.Struct, frozen=True, omit_defaults=True):
+    """A LoRA, named as `cozy run --lora` names one: `[org/]name[@release]`,
+    `name@sha256:<commit>`, `local/<alias>`, `hf://…` or `civitai://…`."""
+
+    ref: str
+    strength: float = 1.0
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.ref, str)
+            or not self.ref.strip()
+            or not isinstance(self.strength, (int, float))
+            or isinstance(self.strength, bool)
+            or not math.isfinite(self.strength)
+        ):
+            raise ConformanceError("a LoRA needs a ref and a finite strength", code="model_choice")
+
+
+class ModelChoice(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """A call's model for one slot of its callee.
+
+    `ref` names the model as `cozy run model.<slot>=` does, or is a ModelArtifact; it replaces the
+    slot's model and its LoRAs. Without it the call keeps the model its parent runs for the slot,
+    with that model's LoRAs (a request's `--lora`), and `lora` stacks after them: the same LoRA
+    again takes the new strength, and strength 0 drops it. The machine resolves each name under
+    the run's access, as it resolves the run's own.
+    """
+
+    ref: str | ModelArtifact | None = None
+    lora: tuple[Lora, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not (
+            self.ref is None
+            or isinstance(self.ref, ModelArtifact)
+            or (isinstance(self.ref, str) and self.ref.strip())
+        ) or not (
+            isinstance(self.lora, (tuple, list)) and all(isinstance(x, Lora) for x in self.lora)
+        ):
+            raise ConformanceError(
+                "a model choice takes a ref (a model name or ModelArtifact) and Lora values",
+                code="model_choice",
             )

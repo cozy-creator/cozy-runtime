@@ -20,7 +20,7 @@ import msgspec
 
 from cozy_runtime import _application_json as application_json
 from cozy_runtime import canonical_json
-from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.author._artifacts import ModelChoice
 from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._context import Context
@@ -132,9 +132,9 @@ def invocable[**P, R](
     the implementation privately for ordinary admitted dispatch; importing a module
     never registers it or resolves a package/environment.
 
-    At the call site, a Model parameter takes a retained ModelArtifact from conversion
-    or derivation. The injected Model object itself belongs to its current attempt;
-    it is not a portable artifact receipt and cannot be forwarded to another call.
+    At the call site, a Model parameter takes a ModelChoice: another model (`ref`, a name or
+    a retained ModelArtifact) or LoRAs over the parent's; None keeps the parent's. The
+    injected Model object itself belongs to its current attempt and cannot be forwarded.
 
     Memoized operations automatically bind their Python implementation. Declare
     helper callables or Python modules in ``memo_dependencies`` when their logic
@@ -205,7 +205,7 @@ def _export(fn: Callable[..., object]) -> _Export | None:
 def prefetch(
     callee: Callable[..., object],
     *,
-    models: Mapping[str, ModelArtifact | None] | None = None,
+    models: Mapping[str, ModelChoice | None] | None = None,
 ) -> None:
     """Prepare a known next call's models while current work runs.
 
@@ -225,12 +225,13 @@ def prefetch(
         raise CapabilityError("prefetch needs an exact locked callable", code="child_undeclared")
     selected = {} if models is None else dict(models)
     if any(
-        not isinstance(k, str) or (v is not None and not isinstance(v, ModelArtifact))
+        not isinstance(k, str) or (v is not None and not isinstance(v, ModelChoice))
         for k, v in selected.items()
     ):
         raise ConformanceError(
-            "prefetch models require named ModelArtifact values", code="child_arguments"
+            "prefetch models require named ModelChoice values", code="child_arguments"
         )
+    broker.chooses(selected)
     payload = canonical_json.encode(msgspec.to_builtins(selected))
     if len(payload) > MAX_CALL_BYTES:
         raise CapabilityError("model prefetch exceeds inline bound", code="child_payload_bound")
@@ -303,8 +304,11 @@ class _Broker:
         exchange: Exchange,
         watch: Callable[[], Nudges],
         yielding: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
+        model_choices: bool = False,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
+        #: The machine takes a ModelChoice per slot (`Start.model_choices`).
+        self.model_choices = model_choices
         #: Opens the worker's nudges, at the first wait on a call; None once opened.
         self.watch: Callable[[], Nudges] | None = watch
         #: Around each wait on a child: the attempt's memory yields its step to the child's.
@@ -331,6 +335,19 @@ class _Broker:
         self.telemetry = telemetry
         self.media = media
         ctx._release_gpus = self.release_gpus
+
+    def chooses(self, models: object) -> None:
+        """A call's model choices, refused at once when the machine predates them."""
+        if (
+            isinstance(models, Mapping)
+            and any(choice is not None for choice in models.values())
+            and not self.model_choices
+        ):
+            raise CapabilityError(
+                "this machine's TensorD predates per-call model choices (ref, lora); "
+                "update it: `cozy machine update`",
+                code="child_model_choice_unsupported",
+            )
 
     def release_gpus(self) -> None:
         """`ctx.release_gpus()` of this attempt: its root's GPU lease ends at the worker."""
@@ -363,6 +380,7 @@ class _Broker:
                 "payload": {k: v for k, v in arguments.items() if k not in slots},
                 "models": {k: v for k, v in arguments.items() if k in slots},
             }
+        self.chooses(arguments.get("models"))
         if self.next_index > MAX_CALL_INDEX:
             raise CapabilityError("package call index is exhausted", code="child_index_exhausted")
         try:
@@ -370,9 +388,9 @@ class _Broker:
             def asset_value(value: object) -> object:
                 if isinstance(value, (Model, Weights)):
                     raise CapabilityError(
-                        "managed model calls require a retained ModelArtifact from conversion "
-                        "or derivation; an injected Model belongs to this attempt. Retain it "
-                        "with a zero-byte TensorFS derivation before passing it to a child",
+                        "a call's model is a ModelChoice; an injected Model belongs to this "
+                        "attempt. Retain it with a zero-byte TensorFS derivation and pass "
+                        "ModelChoice(ref=artifact)",
                         code="child.model_artifact_required",
                     )
                 if isinstance(value, Assets):

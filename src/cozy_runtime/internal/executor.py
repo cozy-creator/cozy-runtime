@@ -74,7 +74,7 @@ from cozy_runtime.author import ModelRegistry, _split, describe
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.author._artifacts import ModelChoice
 from cozy_runtime.author._assets import Asset, GrantedInput, Tree
 from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
@@ -606,10 +606,10 @@ def _serving(module: str, export: str, surface: Any) -> _CallType:
             frozen=True,
             forbid_unknown_fields=True,
         )
-    artifact: Any = ModelArtifact | None
+    choice: Any = ModelChoice | None
     models = msgspec.defstruct(
         f"{export}Models",
-        [(slot, artifact, None) for slot in sorted(slots)],
+        [(slot, choice, None) for slot in sorted(slots)],
         module=module,
         kw_only=True,
         frozen=True,
@@ -905,6 +905,8 @@ class Executor:
         self.discovered: Any = None
         #: HOST ONLY: what its attempts may call (`Start.call_interfaces`), and their bindings
         self.call_interfaces: tuple[CallInterface, ...] = ()
+        #: HOST ONLY: its machine takes a ModelChoice per call slot (`Start.model_choices`)
+        self.model_choices = False
         self._bound_calls: tuple[tuple[CallInterface, ...], CallBindings] | None = None
         self.ready = False
         self.poisoned = ""
@@ -1759,6 +1761,7 @@ class Executor:
                 stage("package_import")
             # A fork's own Start names them again; its import-only parent installed them.
             self.call_interfaces = command.call_interfaces or self.call_interfaces
+            self.model_choices = command.model_choices
             compiles = (
                 self._expect_kernels(isolated=command.import_only)
                 if constructs and self.rank == 0 and not imported
@@ -4432,6 +4435,7 @@ class Executor:
             exchange,
             lambda: self._child_events(exchange),
             functools.partial(self._yielding, request_id),
+            self.model_choices,
         )
 
     def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
