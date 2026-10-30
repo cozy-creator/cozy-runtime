@@ -501,6 +501,8 @@ class _Prefetch:
     #: the fill overlay its page holds, and whether it fills the final (cast) region
     overlay: Hashable = None
     final: bool = False
+    #: one DMA from a host-tier page (`_host_read`), not a store read
+    host: bool = False
 
 
 class _HostPage:
@@ -2277,9 +2279,10 @@ class Memory:
                     with self.lock:
                         if not self._active_beside(request):
                             free = self.room().free
-                            if wanted > free:
+                            if wanted > free and not self._running(model):
                                 # Torch's idle cache goes before another phase's weights (a cold
-                                # Krea 2 DiT fill evicted its 4.3 GB text encoder beside it).
+                                # Krea 2 DiT fill evicted its 4.3 GB text encoder beside it); the
+                                # running phase's cache is its own activations' (`_running`).
                                 release_cached(torch, self.device.type)
                                 free = self.room().free
                             if wanted > free:
@@ -2307,6 +2310,13 @@ class Memory:
             )
             block.preferred = False
         return region
+
+    def _running(self, model: Model) -> bool:
+        """Whether `model` belongs to the active phase: Torch's cache then holds that phase's own
+        activations (`_activate_phase` returned the previous phase's), so a block of it filling
+        evicts idle weights, never the cache. Returning it per fill was a device sync and a
+        cudaMalloc back each time: H3 15 s on an RTX 4090, 16 a sparse step (100 GB), 5 s idle."""
+        return self.phase_supported and model.name in (self._phase_names or ())
 
     def _activate_phase(self, model: Model) -> None:
         """Prioritize an actual component phase, never each repeated block/denoising call."""
@@ -2392,6 +2402,7 @@ class Memory:
             and self.budget_bytes is None
             and not region.resident
             and not self.capturing()
+            and not self._running(model)
             and needed > self.room().free
             and (figures := _torch_bytes(self.device))[1] > figures[0]
         ):
@@ -2676,7 +2687,15 @@ class Memory:
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
             self._prefetch = _Prefetch(
-                block, region, read, identity, request, queued, overlay=overlay, final=final
+                block,
+                region,
+                read,
+                identity,
+                request,
+                queued,
+                overlay=overlay,
+                final=final,
+                host=kept is not None,
             )
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
@@ -2841,7 +2860,12 @@ class Memory:
         try:
             with self.lock:
                 if self._prefetch is not None:
-                    self._settle_prefetch(cancel=self._prefetch.block is not block)
+                    # A host-tier prefetch is one DMA already issued: it completes in milliseconds,
+                    # so another block's demand waits for it rather than discarding it. H3 Turbo
+                    # on an RTX 4090 canceled every DiT prefetch at its LoRA block's demand and
+                    # copied each page twice: 24 GB a step for 12 GB of pages.
+                    pending = self._prefetch
+                    self._settle_prefetch(cancel=pending.block is not block and not pending.host)
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:

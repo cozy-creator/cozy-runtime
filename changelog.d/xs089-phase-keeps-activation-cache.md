@@ -1,0 +1,1 @@
+A block filling for the running phase evicts idle weights instead of returning Torch's cache, which holds that phase's own activations: H3 15 s on an RTX 4090 returned it 16 times a step (a device sync and a cudaMalloc back each).
