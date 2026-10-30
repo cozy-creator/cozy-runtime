@@ -25,13 +25,14 @@ that attempt and the rest runs eagerly; nothing runs twice. After submission not
 
 from __future__ import annotations
 
+import bisect
 import ctypes
 import gc
 import sys
 import threading
 import time
 import weakref
-from collections.abc import Callable, Hashable, Iterator
+from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -1274,6 +1275,37 @@ def _own(
         recording.stages.append(plan)
 
 
+class _Spans:
+    """Byte ranges by device, merged and sorted: whether a tensor's storage overlaps any (a
+    plan's held tensors against every output its graph made: O(n log n), where a scan of each
+    against each took an RTX 4090's SDXL plan 320 ms)."""
+
+    def __init__(self, areas: Iterable[tuple[Any, int, int]]) -> None:
+        by: dict[Any, list[tuple[int, int]]] = {}
+        for device, begin, end in areas:
+            by.setdefault(device, []).append((begin, end))
+        self.spans: dict[Any, tuple[list[int], list[int]]] = {}
+        for device, ranges in by.items():
+            starts: list[int] = []
+            ends: list[int] = []
+            for begin, end in sorted(ranges):
+                if ends and begin <= ends[-1]:
+                    ends[-1] = max(ends[-1], end)
+                else:
+                    starts.append(begin)
+                    ends.append(end)
+            self.spans[device] = (starts, ends)
+
+    def overlaps(self, tensor: Any) -> bool:
+        if not isinstance(tensor, torch.Tensor) or (found := self.spans.get(tensor.device)) is None:
+            return False
+        storage = tensor.untyped_storage()
+        first, size = int(storage.data_ptr()), int(storage.nbytes())
+        starts, ends = found
+        i = bisect.bisect_left(starts, first + size) - 1
+        return bool(size) and i >= 0 and ends[i] > first
+
+
 class _Graph:
     """One CUDA graph recorded between begin() and end() into the recording's shared pool.
 
@@ -1419,14 +1451,12 @@ class _Graph:
 
     def external(self) -> dict[int, Any]:
         """What the recorded operations read from outside this graph and its pass's scratch."""
-        areas = tuple(self.scratch) + tuple(
-            (device, start, end) for _, _, device, start, end in self.generated.values()
-        )
+        inside = _Spans((*self.scratch, *((d, b, e) for _, _, d, b, e in self.generated.values())))
+        loaded = _Spans(self.ranges if self.loaded else ())
         return {
             key: tensor
             for key, tensor in self.held.items()
-            if not self._overlaps(tensor, areas)
-            and not (self.loaded and self._overlaps(tensor, self.ranges))
+            if not inside.overlaps(tensor) and not loaded.overlaps(tensor)
         }
 
     def plan(
