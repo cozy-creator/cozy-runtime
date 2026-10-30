@@ -3021,18 +3021,17 @@ class Memory:
             ):
                 # The atomic ready-only pin never fills or reclaims. Its ordinary storage
                 # alias owns the bytes until the consumer dies, without binding other sites.
+                offset, part = raw_view
+                stored = getattr(torch, _DTYPES[part.dtype])
+                widen = _widened(model, site.name, site.table[site.name], stored)
                 with torch.inference_mode(False):
                     use = pin()
                     if use is not None:
-                        offset, part = raw_view
                         value = (
-                            use.tensor[offset : offset + part.nbytes]
-                            .view(getattr(torch, _DTYPES[part.dtype]))
-                            .view(part.shape)
+                            use.tensor[offset : offset + part.nbytes].view(stored).view(part.shape)
                         )
-                        old = site.table[site.name]
-                        if old is not None and old.dtype != value.dtype:
-                            value = value.to(old.dtype)
+                        if widen is not None:
+                            value = value.to(widen)
                         block.last = time.monotonic_ns()
                         progress += 1
                         return nn.Parameter(value, requires_grad=False) if site.parameter else value
@@ -3533,6 +3532,25 @@ def _placeholders(model: Model) -> None:
             site.table[site.name] = held
 
 
+def _widened(
+    model: Model, name: str, site: Tensor | None, served: torch.dtype
+) -> torch.dtype | None:
+    """The dtype a site widens `served` bytes to on each bind, or None. A placed component
+    serves its binding's dtype (stored, or `hold_dtype`'s cast copy); only a CPU executor widens,
+    to float32 (`weights._float32`). Any other mismatch is a `module.to(dtype)`, `.half()` or
+    `.float()` after placement, which would cast every weight on every forward, unaccounted."""
+    if site is None or site.dtype == served:
+        return None
+    if model.memory.device.type == "cpu" and site.dtype == torch.float32:
+        return site.dtype
+    raise ResidencyError(
+        f"{model.name}: {name} serves {served} and the module was changed to {site.dtype} "
+        "after placement: serve a placed component in another dtype with "
+        "`cozy_runtime.author.hold_dtype(module, dtype)`, never `module.to(dtype)`, "
+        "`.half()` or `.float()`"
+    )
+
+
 def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
     model = block.model
     if block.data is None:
@@ -3594,10 +3612,8 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
                 and (block.retained or model.memory.capturing())
             ):
                 raise StaleBinding(f"{name}: graph capture needs a matching destination dtype")
-            # An eager module may temporarily widen weights (SDXL's VAE does this).
-            # Keep the declared cached bytes immutable; this conversion is ordinary
-            # owning Torch storage, not a hit for a different prepared representation.
-            tensor = value if old is None or old.dtype == value.dtype else value.to(old.dtype)
+            widen = _widened(model, name, old, value.dtype)
+            tensor = value if widen is None else value.to(widen)
             if any(site.parameter for site in sites):
                 tensor = nn.Parameter(tensor, requires_grad=False)
             for site in sites:
