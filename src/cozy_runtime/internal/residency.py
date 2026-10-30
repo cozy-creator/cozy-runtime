@@ -60,6 +60,8 @@ __all__ = [
     "TensorLayout",
     "Weights",
     "blocks_of",
+    "paging",
+    "unpaged",
 ]
 
 progress = 0
@@ -255,21 +257,55 @@ def _readable(value: Any) -> Any:
 
 
 def blocks_of(module: nn.Module) -> list[str]:
+    return paging(module)[1]
+
+
+def paging(module: nn.Module) -> tuple[str, list[str]]:
+    """A component's paging blocks and the rule that found them, so no package has to name them:
+    its declaration (`declared`), else its root's `_no_split_modules` (`root`), else those of the
+    models inside it (`submodules`: a wrapper around a Transformers or Diffusers model takes that
+    model's units), else its largest list of repeated same-class children (`repeated`: a model's
+    layers). MOSS-Image's 9B text encoder and 5B DiT each named none and were one block."""
     declared = vars(module).get("_cozy_weights")
     if isinstance(declared, Declared) and declared.blocks is not None:
-        return list(declared.blocks)
-    names = set(getattr(module, "_no_split_modules", None) or ())
-    # A root that names no paging unit pages by what its submodules name: a package's plain wrapper
-    # around a Transformers or Diffusers model takes that model's own units (MOSS-Image's 9B text
-    # encoder was one 8.97 GB block, larger than an 8 GB card).
+        return "declared", list(declared.blocks)
+    rule, names = "root", set(getattr(module, "_no_split_modules", None) or ())
     if not names:
+        rule = "submodules"
         names = {n for sub in module.modules() for n in getattr(sub, "_no_split_modules", None) or ()}
     found = [
         path
         for path, sub in module.named_modules()
         if path and any(kind.__name__ in names for kind in type(sub).__mro__)
     ]
-    return [a for a in found if not any(b.startswith(a + ".") for b in found)]
+    found = [a for a in found if not any(b.startswith(a + ".") for b in found)]
+    if found:
+        return rule, found
+    best, most = [], 0
+    for path, sub in module.named_modules():
+        children = list(sub.named_children()) if isinstance(sub, nn.ModuleList | nn.Sequential) else []
+        if len(children) < 2 or len({type(child) for _, child in children}) > 1:
+            continue
+        size = sum(t.numel() * t.element_size() for t in sub.parameters())
+        if size > most:
+            best, most = [f"{path}.{name}" if path else name for name, _ in children], size
+    return ("repeated", best) if best else ("none", [])
+
+
+#: A paging unit larger than this is a warning: a quarter of an 8 GB card.
+_LARGEST_UNIT = 2 << 30
+
+
+def unpaged(module: nn.Module, rule: str, groups: Mapping[str, int]) -> str | None:
+    """Why this component cannot page on a small card, or None: a unit over `_LARGEST_UNIT` (the
+    whole component, when it has no blocks). `groups` are the bytes by block path ("" common, its
+    embedding tables excluded: one row per token is read, and they are not what pages)."""
+    path, size = max(groups.items(), key=lambda item: item[1], default=("", 0))
+    if size <= _LARGEST_UNIT:
+        return None
+    unit = f"block {path}" if path else "its common weights"
+    return (f"{type(module).__name__} pages by rule '{rule}' and {unit} is {size / (1 << 30):.2f} GiB: "
+            f"a card with less free memory cannot run it; name its paging units (`_no_split_modules`)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1396,8 +1432,10 @@ class Memory:
 
     def _register(self, module: nn.Module, declared: Declared) -> Model:
         model = Model(self, module, declared)
-        w, paths = declared.weights, blocks_of(module)
+        w, (rule, paths) = declared.weights, paging(module)
         tensors = w.ck.components[w.component].tensors
+        tables = [p for p, sub in module.named_modules() if p and isinstance(sub, nn.Embedding)]
+        sizes: dict[str, int] = {}
         by_path: dict[str, dict[str, dict[str, _Part]]] = {}
         for key in tensors:
             if w.keys is not None and key not in w.keys:
@@ -1415,6 +1453,8 @@ class Memory:
             for role, part in stored_parts(w.ck, w.component, key).items():
                 parts[role or "value"] = _Part(part.dtype, tuple(part.shape), part.length, role)
             by_path.setdefault(path, {})[key] = parts
+            if path or not any(bound.startswith(t + ".") for t in tables):
+                sizes[path] = sizes.get(path, 0) + sum(part.nbytes for part in parts.values())
         for index, path in enumerate(p for p in ("", *paths) if p in by_path):
             block = _Block(model, path, index, by_path[path])
             if path:
@@ -1435,6 +1475,9 @@ class Memory:
                 [self.window_bytes, *(_STREAMED * b.allocation_bytes for b in model.groups())]
             )
             self.native.set_streaming_limit(self.window_bytes)
+        why = unpaged(module, rule, sizes)
+        if why is not None:
+            warnings.warn(f"{w.component}: {why}", RuntimeWarning, stacklevel=2)
         _placeholders(model)
         _hooks(model)
         self.models[module] = model
