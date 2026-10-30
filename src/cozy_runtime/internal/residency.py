@@ -498,6 +498,9 @@ class _Prefetch:
     identity: str
     request: Request | None
     queued: QueuedPrefetch | None = None
+    #: the fill overlay its page holds, and whether it fills the final (cast) region
+    overlay: Hashable = None
+    final: bool = False
 
 
 class _HostPage:
@@ -1351,6 +1354,9 @@ class Memory:
         self._baked_bytes = 0
         #: resident pages baked once: kept from their first refill
         self._baked_once: set[tuple[object, ...]] = set()
+        #: a hooked block's pages whose fill wrote nothing: their stored bytes are the page, so a
+        #: store read prefetches and the idle tier pins them as it does a plain block's
+        self._plain: set[tuple[object, ...]] = set()
         #: host RAM this process could still take at the cache's last look; -1 unreadable
         self._baked_room = -1
         #: The host tier holds every streamed page (baked or stored) pinned, within half of the
@@ -1789,15 +1795,43 @@ class Memory:
             self._baked[page] = kept
             self._baked_bytes += tensor.numel()
 
+    def _final_from_host(self, block: _Block, overlay: Hashable) -> None:
+        """A cast block's refill from its kept final bytes: one DMA into the final region, with
+        no store read, raw region or cast (`_host_final`)."""
+        use = block.final_use
+        page = _page(block, block.model.identity, overlay, final=True)
+        found = self._baked.get(page)
+        if found is None or found.tensor.numel() != use.tensor.numel():
+            return
+        began = time.perf_counter_ns()
+        use.tensor.copy_(found.tensor)  # complete when this returns
+        use.commit()
+        self._baked.move_to_end(page)
+        self._refills[page] = self._refills.get(page, 0) + 1
+        block.overlay = overlay
+        if (request := _REQUEST.get()) is not None:
+            ns = time.perf_counter_ns() - began
+            request.read(block, ns, found.tensor.numel(), origin="baked")
+
+    def _keep_final(self, block: _Block, tensor: Tensor) -> None:
+        """A cast block's final bytes, just written from its stored ones: kept in the host tier
+        as a baked page is (`_keep_baked`), so its refills move the cast bytes, not the stored."""
+        if not _host_final(block):
+            return
+        page = _page(block, block.model.identity, block.overlay, final=True)
+        self._refills[page] = self._refills.get(page, 0) + 1
+        self._keep_baked(page, tensor, streams=not block.preferred)
+
     def _want(self, block: _Block, page: tuple[object, ...]) -> None:
         """A store read of `page` completed: the page is pinned once the executor is idle
         (`pin_idle`), a streamed one's after this read, a resident one's after its second (another
         phase's room evicted it). Pinning runs at about the copy's own rate (5.5 GiB/s on an RTX
         3070 host), so it is never on a request's path: Qwen-Image int8 at 8 GB paid 5.4 s of it
-        in its first warm request (Runtime 0.35.6). A canceled or refused read does not count."""
+        in its first warm request (Runtime 0.35.6). A canceled or refused read does not count.
+        A hooked block's page is wanted only when its fill wrote nothing (`_ensure`), and a block
+        the tier keeps cast keeps its final bytes instead (`_host_final`)."""
         if (
-            block.model.fill is None
-            and not block.finals
+            not _host_final(block)
             and page not in self._baked
             and (not block.preferred or page in self._read_once)
         ):
@@ -1940,6 +1974,7 @@ class Memory:
             self._baked_bytes -= kept.tensor.numel()
             kept.release()
         self._baked_once = {page for page in self._baked_once if page[0] != model.name}
+        self._plain = {page for page in self._plain if page[0] != model.name}
 
     def _host_read(
         self, region: Any, kept: _HostPage, *, evict_completed: bool
@@ -2508,17 +2543,28 @@ class Memory:
         queued: QueuedPrefetch | None = None,
         released: bool = False,
     ) -> None:
-        """Admit one immutable raw read, without eviction or Python fill callbacks."""
+        """Admit one immutable read, without eviction or Python fill callbacks: a page the host
+        tier keeps (stored, baked or cast) by one DMA, else the stored bytes, and for a hooked
+        block only when its fill writes nothing under the overlay this forward arms. A cast block
+        the tier keeps cast (`_host_final`) prefetches only its kept final bytes."""
         if (
             not self.prefetch_supported
             or self.capturing()
             or (request is not None and request.idle)
-            or block.model.fill is not None
             or block.aliases is None
-            or block.finals
             or not block.storage_bytes
         ):
             return
+        overlay = None
+        if block.model.fill is not None:
+            if queued is not None:
+                return  # another request's hooks are armed by its own code, not yet run
+            overlay = block.model.fill.overlay(block.path, block.parts)
+            if overlay != block.overlay:
+                return  # demand parks or refills a page of another overlay (`_switch_overlay`)
+        final = _host_final(block)
+        page = _page(block, block.model.identity, overlay, final=final)
+        size = block.final_bytes if final else block.storage_bytes
         with self.lock:
             if (
                 self._prefetch is not None
@@ -2528,6 +2574,14 @@ class Memory:
                 or block.cached()
             ):
                 return
+            if block.finals and not final and block.region is not None and block.region.resident:
+                return  # its stored bytes are resident; demand writes the final ones
+            kept = self._baked.get(page) if self._host_prepare else None
+            if kept is not None and kept.tensor.numel() != size:
+                kept = None
+            hooked = block.model.fill is not None and page not in self._plain
+            if kept is None and (final or hooked):
+                return  # only a kept page, or a hooked one whose fill writes nothing, is read
             # A queued request's read is admitted only into free room. Demand's next block may
             # also take the room of the oldest streamed block whose consumers completed: Varena
             # evicts it on its last-consumer events and refuses rather than wait or join.
@@ -2553,7 +2607,7 @@ class Memory:
                     offset += (part.nbytes + 255) // 256 * 256
             retry = False
             try:
-                region = self._native_region(block, speculative=True)
+                region = self._native_region(block, final=final, speculative=True)
                 # Outgoing cached weights may already fill the nonpreferred window even
                 # when the active phase has ample resident-prefix room. Admit its next
                 # block under that same soft preference without growing a cut prefix.
@@ -2568,12 +2622,7 @@ class Memory:
                 try:
                     if provisional:
                         region.set_preferred(True)  # native end-of-prefix watermark still wins
-                    kept = (
-                        self._baked.get((block.model.name, block.path, block.model.identity, None))
-                        if self._host_prepare and block.model.fill is None
-                        else None
-                    )
-                    if kept is not None and kept.tensor.numel() == block.storage_bytes:
+                    if kept is not None:
                         read = self._host_read(region, kept, evict_completed=queued is None)
                         if read is None:
                             return  # resident already
@@ -2626,7 +2675,9 @@ class Memory:
                 return self._prefetch_block(block, request, released=True)
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
-            self._prefetch = _Prefetch(block, region, read, identity, request, queued)
+            self._prefetch = _Prefetch(
+                block, region, read, identity, request, queued, overlay=overlay, final=final
+            )
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
                 # cancels this exact read or is observed here before any I/O starts.
@@ -2727,7 +2778,7 @@ class Memory:
                             origin="baked" if row.get("host") else "store",
                         )
                 if complete:
-                    page = (block.model.name, block.path, pending.identity, None)
+                    page = _page(block, pending.identity, pending.overlay, final=pending.final)
                     self._refills[page] = self._refills.get(page, 0) + 1
                     if not row.get("host"):
                         self._want(block, page)
@@ -2741,8 +2792,9 @@ class Memory:
             finally:
                 if request is not None:
                     request.prefetch_wait_ns += time.perf_counter_ns() - began
-                if not complete and block.region is pending.region:
-                    block.region = None
+                field = "final_region" if pending.final else "region"
+                if not complete and getattr(block, field) is pending.region:
+                    setattr(block, field, None)
                     block.preferred = False
                     block.preference_set = False
                 self._prefetch = None
@@ -2794,6 +2846,9 @@ class Memory:
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:
                 self._final_views(block, reclaim)
+                final = block.final_use
+                if _host_final(block) and final is not None and final.needs_fill:
+                    self._final_from_host(block, overlay)
                 if block.final_only() and (
                     block.final_use is None or not block.final_use.needs_fill
                 ):
@@ -2818,7 +2873,7 @@ class Memory:
                 block.native_storage = int(use.tensor.untyped_storage().data_ptr())
             page: tuple[object, ...] | None = None
             if use is not None and use.needs_fill:
-                page = (block.model.name, block.path, block.model.identity, overlay)
+                page = _page(block, block.model.identity, overlay)
                 self._refills[page] = self._refills.get(page, 0) + 1
                 if self._baked:
                     self._trim_baked()  # host pressure gives kept pages back here
@@ -2861,15 +2916,18 @@ class Memory:
                     if view.numel() != math.prod(shape):
                         raise ResidencyError(f"stored geometry does not match {key}#{role}")
                     views[role] = view.view(shape)
-            if page is not None and use is not None and use.needs_fill and kept is None:
-                with self.lock:
-                    self._want(block, page)  # this store read completed
+            changed = False
             if block.model.fill is not None and (use is None or use.needs_fill):
                 # `overlay` was read on this thread just before; no package code ran since.
                 changed = kept is None and block.model.fill(block.path, data)
                 if changed and page is not None and use is not None:
                     self._keep_baked(page, use.tensor, streams=not block.preferred)
                 block.overlay = overlay
+            if page is not None and kept is None and not changed:
+                with self.lock:  # this store read completed, and its bytes are the page
+                    if block.model.fill is not None:
+                        self._plain.add(page)
+                    self._want(block, page)
             if use is not None:
                 use.commit()
             ready = None
@@ -3543,6 +3601,22 @@ def _placeholders(model: Model) -> None:
             site.table[site.name] = held
 
 
+def _page(
+    block: _Block, identity: object, overlay: Hashable, *, final: bool = False
+) -> tuple[object, ...]:
+    """A block's host-tier page key: its set, path, fill identity and overlay, and `final` for
+    its cast bytes."""
+    page: tuple[object, ...] = (block.model.name, block.path, identity, overlay)
+    return (*page, "final") if final else page
+
+
+def _host_final(block: _Block) -> bool:
+    """Whether the host tier keeps `block`'s final bytes rather than its stored ones: a block
+    bound only from final buffers that are no larger than its stored bytes (an F32 VAE held in
+    bf16 moves half). A decoded block's finals are larger, so its stored bytes are kept."""
+    return block.final_only() and block.final_bytes <= block.storage_bytes
+
+
 def _widened(
     model: Model, name: str, site: Tensor | None, served: torch.dtype
 ) -> torch.dtype | None:
@@ -3579,6 +3653,7 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
                     for destination in destinations.values():
                         destination.copy_(parts["value"])
             use.commit()
+            model.memory._keep_final(block, use.tensor)
             block.final_fills += 1
             if (request := _REQUEST.get()) is not None:
                 request.final_fills += 1
