@@ -888,9 +888,8 @@ def _lone_conv_forward(self: Any, x: Any, cache_x: Any = None) -> Any:
 def _lone_padding(conv: Any, path: str) -> tuple[int, int]:
     """`conv`'s spatial zero padding (rows, columns) when a lone frame meets its last tap only."""
     pad = tuple(getattr(conv, "_padding", ()))
-    plain = type(conv.weight) in (torch.Tensor, torch.nn.Parameter)
-    if getattr(conv, "padding_mode", None) != "zeros" or not plain:
-        raise _Mismatch(f"{path}: not a zero-padded convolution over plain weights")
+    if getattr(conv, "padding_mode", None) != "zeros":
+        raise _Mismatch(f"{path}: not a zero-padded convolution")
     if isinstance(conv, torch.nn.Conv3d):
         frames = conv.kernel_size[0]
         if (
