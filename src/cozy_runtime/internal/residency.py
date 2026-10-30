@@ -1945,17 +1945,24 @@ class Memory:
         self, region: Any, kept: _HostPage, *, evict_completed: bool
     ) -> _HostRead | None:
         """A refill from a host page: the region's fill under the native prefetch's admission,
-        one async DMA; None when the region is resident already."""
+        one async DMA; None when the region is resident already. The copy stream exists before
+        admission, and a fill admitted here that fails is released before its error leaves: a
+        traceback holding it kept the region `already being filled` for the retry (cr-225)."""
+        if self._h2d_stream is None:
+            self._h2d_stream = torch.cuda.Stream(self.device)
+        stream = self._h2d_stream
         use = region.prepare(reclaim=False, evict_completed=evict_completed)
         if not use.needs_fill:
             return None
-        if self._h2d_stream is None:
-            self._h2d_stream = torch.cuda.Stream(self.device)
-        with torch.cuda.stream(self._h2d_stream):
-            use.tensor.copy_(kept.tensor, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self._h2d_stream)
-        use.consume_on(self._h2d_stream.cuda_stream)
+        try:
+            use.consume_on(stream.cuda_stream)  # its release fences on the copy
+            with torch.cuda.stream(stream):
+                use.tensor.copy_(kept.tensor, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(stream)
+        except BaseException:
+            use = None  # the fill and its tensor go now, not with the traceback
+            raise
         kept.event = event
         return _HostRead(use, event, kept.tensor.numel())
 
@@ -2544,6 +2551,7 @@ class Memory:
                     name = f"{block.model.component}/{key}#{part.role or 'value'}"
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
+            retry = False
             try:
                 region = self._native_region(block, speculative=True)
                 # Outgoing cached weights may already fill the nonpreferred window even
@@ -2586,21 +2594,15 @@ class Memory:
                     raise
                 free = int(torch.cuda.mem_get_info(self.device)[0])
                 allocated, reserved, _ = _torch_bytes(self.device)
-                if (
+                retry = (
                     not released
                     and queued is None
                     and free < block.allocation_bytes <= (free + reserved - allocated)
-                ):
-                    # Demand's next read takes Torch's idle cache before it is refused. Refused,
-                    # it is read on the request path instead (Qwen-Image int8 on 8 GB: the last
-                    # streamed block, every step, 9 s per request).
-                    release_cached(torch, self.device.type)
+                )
+                if not retry:
                     if request is not None:
-                        request.prefetch_released += 1
-                    return self._prefetch_block(block, request, released=True)
-                if request is not None:
-                    request.prefetch_skipped += 1
-                return
+                        request.prefetch_skipped += 1
+                    return
             except tensorfs.Error as error:
                 if fault(error) is not Fault.OTHER:
                     raise
@@ -2613,6 +2615,15 @@ class Memory:
                 if request is not None:
                     request.prefetch_failed += 1
                 return
+            if retry:
+                # Demand's next read takes Torch's idle cache before it is refused. Refused, it
+                # is read on the request path instead (Qwen-Image int8 on 8 GB: the last streamed
+                # block, every step, 9 s per request). Out of the handler, so nothing the refused
+                # attempt admitted lives on in its traceback (cr-225).
+                release_cached(torch, self.device.type)
+                if request is not None:
+                    request.prefetch_released += 1
+                return self._prefetch_block(block, request, released=True)
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
             self._prefetch = _Prefetch(block, region, read, identity, request, queued)
@@ -3021,18 +3032,17 @@ class Memory:
             ):
                 # The atomic ready-only pin never fills or reclaims. Its ordinary storage
                 # alias owns the bytes until the consumer dies, without binding other sites.
+                offset, part = raw_view
+                stored = getattr(torch, _DTYPES[part.dtype])
+                widen = _widened(model, site.name, site.table[site.name], stored)
                 with torch.inference_mode(False):
                     use = pin()
                     if use is not None:
-                        offset, part = raw_view
                         value = (
-                            use.tensor[offset : offset + part.nbytes]
-                            .view(getattr(torch, _DTYPES[part.dtype]))
-                            .view(part.shape)
+                            use.tensor[offset : offset + part.nbytes].view(stored).view(part.shape)
                         )
-                        old = site.table[site.name]
-                        if old is not None and old.dtype != value.dtype:
-                            value = value.to(old.dtype)
+                        if widen is not None:
+                            value = value.to(widen)
                         block.last = time.monotonic_ns()
                         progress += 1
                         return nn.Parameter(value, requires_grad=False) if site.parameter else value
@@ -3533,6 +3543,25 @@ def _placeholders(model: Model) -> None:
             site.table[site.name] = held
 
 
+def _widened(
+    model: Model, name: str, site: Tensor | None, served: torch.dtype
+) -> torch.dtype | None:
+    """The dtype a site widens `served` bytes to on each bind, or None. A placed component
+    serves its binding's dtype (stored, or `hold_dtype`'s cast copy); only a CPU executor widens,
+    to float32 (`weights._float32`). Any other mismatch is a `module.to(dtype)`, `.half()` or
+    `.float()` after placement, which would cast every weight on every forward, unaccounted."""
+    if site is None or site.dtype == served:
+        return None
+    if model.memory.device.type == "cpu" and site.dtype == torch.float32:
+        return site.dtype
+    raise ResidencyError(
+        f"{model.name}: {name} serves {served} and the module was changed to {site.dtype} "
+        "after placement: serve a placed component in another dtype with "
+        "`cozy_runtime.author.hold_dtype(module, dtype)`, never `module.to(dtype)`, "
+        "`.half()` or `.float()`"
+    )
+
+
 def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
     model = block.model
     if block.data is None:
@@ -3594,10 +3623,8 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
                 and (block.retained or model.memory.capturing())
             ):
                 raise StaleBinding(f"{name}: graph capture needs a matching destination dtype")
-            # An eager module may temporarily widen weights (SDXL's VAE does this).
-            # Keep the declared cached bytes immutable; this conversion is ordinary
-            # owning Torch storage, not a hit for a different prepared representation.
-            tensor = value if old is None or old.dtype == value.dtype else value.to(old.dtype)
+            widen = _widened(model, name, old, value.dtype)
+            tensor = value if widen is None else value.to(widen)
             if any(site.parameter for site in sites):
                 tensor = nn.Parameter(tensor, requires_grad=False)
             for site in sites:

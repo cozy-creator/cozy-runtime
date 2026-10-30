@@ -53,7 +53,6 @@ from cozy_runtime.internal.fill import (
     _refuse,
     dtype_name,
     servability,
-    tensorfs_requirement_dtype,
 )
 from cozy_runtime.internal.fill import fit as fill_fit
 from cozy_runtime.internal.parallel import ulysses  # noqa: F401 (Ulysses' torch side, served)
@@ -226,6 +225,7 @@ class Backend:
         unstored: list[str] = []
         warnings: list[str] = []
         routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
+        planned = {key: t.route for key, t in self.resolved.items()}
         for checkpoint, constructed in by_checkpoint.values():
             members = set(constructed)
             requirements = [
@@ -233,7 +233,7 @@ class Backend:
                     component=d.component,
                     key=d.key[len(d.component) + 1 :],
                     shape=list(d.spec.shape),
-                    logical_dtype=tensorfs_requirement_dtype(d.spec.dtype),
+                    logical_dtype=d.spec.dtype,
                     buffer=d.buffer,
                 )
                 for d in walked.destinations
@@ -242,6 +242,7 @@ class Backend:
             fit = fill_fit(
                 requirements,
                 checkpoint,
+                planned=planned,
                 encoded_leaves=encoded_leaves == "accept",
                 custody=self.custody,
                 device=self.device_facts.predicate,
@@ -705,6 +706,28 @@ class _PlainDtype:
         # The original source remains in its stored dtype. copy_ casts directly into the
         # final region; no unowned full-weight temporary or rounded-source round trip.
         self.base.write(key, parts, destinations)
+        torch, source = self.base.torch, parts["value"]
+        for destination in destinations.values():
+            if (
+                destination.dtype == torch.float16
+                and source.dtype != torch.float16
+                and _overflows(torch, source, destination)
+            ):
+                raise StaleBinding(
+                    f"{key}: a stored {source.dtype} value overflows float16 (beyond ±65504), so "
+                    "this component cannot be held in float16"
+                )
+
+
+def _overflows(torch: ModuleType, source: Tensor, narrowed: Tensor) -> bool:
+    """TensorFS import narrowing's rule: a finite stored value that rounds to ±inf in float16.
+    One reduction over the narrowed copy; the exact check runs only when it holds an inf or NaN."""
+    if narrowed.numel() == 0:
+        return False
+    low, high = torch.aminmax(narrowed)
+    if bool(torch.isfinite(low) & torch.isfinite(high)):
+        return False
+    return bool((torch.isinf(narrowed) & torch.isfinite(source)).any())
 
 
 def _float32(torch: ModuleType, root: Module) -> None:
@@ -1141,9 +1164,12 @@ class Placement:
     def represent(
         self, component: str, dtype: Any, *, resident_only: bool = False
     ) -> Callable[[], None]:
-        """Preflight every requested cast before capture applies any representation change."""
+        """Preflight every requested cast before capture applies any representation change. A CPU
+        executor serves every component in float32 (`_float32`), so a hold there changes nothing."""
         if dtype not in (self.torch.float16, self.torch.bfloat16, self.torch.float32):
             raise StaleBinding("prepared weight dtype must be float16, bfloat16 or float32")
+        if self.memory.device.type == "cpu":
+            return lambda: None
         model = self.models[component]
         base = model.declared_finals
         if not isinstance(base, _Routes):
