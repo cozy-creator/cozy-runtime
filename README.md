@@ -266,6 +266,18 @@ The same decorators take `components={"model": ("dit", "vae")}`: the slot's `com
 the components that callable runs (absent means all), so a machine fetches those first. A
 binding that selects only some components leaves the others on meta; a method using one
 refuses `component_unbound`.
+A call chooses a callee slot's model with `ModelChoice`; None keeps the parent's:
+
+```python
+await render(prompt=p, unet=ModelChoice(lora=(Lora("org/style", 0.8),)))
+```
+
+`ref` (a name as `cozy run model.<slot>=` takes, or a ModelArtifact) replaces the slot's model and
+its LoRAs. Without `ref`, `lora` stacks after the parent's LoRAs for the slot (the request's
+`--lora`): the same LoRA again takes the new strength, and strength 0 drops it. TensorD resolves
+each name as `--lora` does, composes the call's adapter view and keys its memo by the stack. A
+machine whose Start lacks `model_choices` (an older TensorD) refuses such a call:
+`cozy machine update`.
 Known-next calls can [prepare their models in the background](docs/model-prefetch.md)
 with `prefetch(callee, models={...})` while another model runs, and a request done with its
 GPUs can [release them early](docs/gpu-release.md) with `ctx.release_gpus()`.

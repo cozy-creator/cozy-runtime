@@ -61,7 +61,7 @@ class GpuRelease(_Request, frozen=True, kw_only=True, tag="gpu_release"):
 class ModelPrefetch(_Request, frozen=True, kw_only=True, tag="model_prefetch"):
     module: str
     export: str
-    #: The canonical `{slot: ModelArtifact | None}` document.
+    #: The canonical `{slot: ModelChoice | None}` document.
     payload: str
 
 

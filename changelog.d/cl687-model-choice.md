@@ -1,0 +1,1 @@
+A child call chooses each callee slot's model with `ModelChoice(ref=…, lora=(Lora(ref, strength), …))`, which replaces `ModelArtifact` as the slot argument (`ModelChoice(ref=artifact)`). Without `ref` the LoRAs stack on the parent's: a segment adds its LoRAs to the request's `--lora`. An older TensorD refuses the call with `cozy machine update`.

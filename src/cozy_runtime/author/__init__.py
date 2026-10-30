@@ -18,7 +18,7 @@ plane is separate (cr-017). Per-service fakes live in `cozy_runtime.author.fakes
 from cozy_runtime import canonical_json
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App, Registration, RegistrationError
-from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
+from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice, ObjectRef
 from cozy_runtime.author._assets import (
     Asset,
     AssetInfo,
@@ -264,6 +264,7 @@ __all__ = [
     "Invocation",
     "InvocationResult",
     "Loader",
+    "Lora",
     "MediaDecodeError",
     "MemoDistribution",
     "MemoResource",
@@ -272,6 +273,7 @@ __all__ = [
     "ModelArtifact",
     "ModelAssets",
     "ModelBinding",
+    "ModelChoice",
     "ModelDefault",
     "ModelFitRefused",
     "ModelRegistry",
