@@ -7,6 +7,7 @@ the catch on every model it loads (`install`); nothing else here is the executor
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import tensorfs
@@ -26,6 +27,7 @@ __all__ = [
     "attend",
     "cut_rows",
     "install",
+    "measure",
     "piece",
     "record",
     "serving",
@@ -75,19 +77,30 @@ def record(
 
 
 
-#: each (device, store)'s measured ceilings, once per executor
-_CEILINGS: dict[tuple[int | None, Path], Ceiling] = {}
+#: each (device, store)'s ceilings: None while being measured, absent until a measure starts
+_CEILINGS: dict[tuple[int | None, Path], Ceiling | None] = {}
+
+
+def measure(device: int | None, store: Path) -> None:
+    """TensorFS times the copies once (no GPU has no H2D), off every request: it reads up to
+    1 GiB of the store and times pinned H2D, 0.2-0.5 s once a boot, which a request's close
+    would add to its reply. The executor starts it when its memory opens, beside its imports."""
+    key = (device, store)
+    if key not in _CEILINGS:
+        _CEILINGS[key] = None
+        threading.Thread(target=_measure, args=key, name="cozy-ceiling", daemon=True).start()
+
+
+def _measure(device: int | None, store: Path) -> None:
+    try:
+        measured = tensorfs.ceiling(device=device, path=store)
+    except tensorfs.Error:  # a store with no bytes to read yet: the next record starts it again
+        _CEILINGS.pop((device, store), None)
+        return
+    _CEILINGS[(device, store)] = Ceiling(h2d_gbps=measured.h2d_gbps, disk_gbps=measured.disk_gbps)
 
 
 def _ceiling(device: int | None, store: Path) -> Ceiling | None:
-    """TensorFS times the copies once (no GPU has no H2D); None while it cannot (a store with
-    no bytes to read yet), measured again at the next record."""
-    found = _CEILINGS.get((device, store))
-    if found is None:
-        try:
-            measured = tensorfs.ceiling(device=device, path=store)
-        except tensorfs.Error:
-            return None
-        found = Ceiling(h2d_gbps=measured.h2d_gbps, disk_gbps=measured.disk_gbps)
-        _CEILINGS[(device, store)] = found
-    return found
+    """The measured ceilings; None while they are being measured."""
+    measure(device, store)
+    return _CEILINGS.get((device, store))
