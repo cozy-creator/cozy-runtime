@@ -21,7 +21,7 @@ from types import ModuleType
 import tensorfs
 from tensorfs import raw
 
-from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec, canonical_dtype
+from cozy_runtime.author._loader import TENSORFS_DTYPES, TensorSpec
 from cozy_runtime.internal.encoding.formats import (
     PLAIN,
     TORCH_DTYPES,
@@ -368,7 +368,9 @@ class TensorRequirement:
     component: str
     key: str
     shape: Sequence[int]
-    logical_dtype: str | None = None
+    #: The built dtype, which the stored dtype must equal: the fill binds stored bytes as they
+    #: are, and a component serves another dtype only through `hold_dtype`.
+    logical_dtype: str
     #: A persistent buffer: one the checkpoint does not store keeps its constructed value.
     buffer: bool = False
 
@@ -377,18 +379,21 @@ def fit(
     requirements: Sequence[TensorRequirement],
     checkpoint: Checkpoint,
     *,
+    planned: Mapping[str, str],
     encoded_leaves: bool,
     custody: str = "",
     device: str = "",
 ) -> dict[str, object]:
     """The construction census against the header: every built tensor is stored with its shape
-    (and its dtype where the census pins one), except a persistent buffer, which keeps its
+    and dtype, except a persistent buffer, which keeps its
     constructed value when the checkpoint does not store it (`unstored`); stored tensors nothing
     builds are skipped (`ignored`). Both are coverage gaps the load reports, never refusals.
     `ok` False carries the first disagreement's code, component, key and sentence. The header's
     order is the construction's traversal (#624): `order` names where the census builds in
     another order (weights then stream out of step), "" when it agrees. Whether a device
-    serves an encoding is plan resolution's (`Selector`); custody and device echo."""
+    serves an encoding is plan resolution's (`Selector`): `planned` is its route per contract
+    key, and only an `encoded_gemm` route needs the package's consent, as the fill's own
+    rule; custody and device echo."""
     routes = {"verbatim": 0, "decoded_float": 0, "encoded_gemm": 0}
     ignored: list[str] = []
     unstored: list[str] = []
@@ -439,7 +444,7 @@ def fit(
                     key,
                 )
             stored_dtype = TENSORFS_DTYPES.get(info.dtype, info.dtype)
-            if requirement.logical_dtype and stored_dtype != requirement.logical_dtype:
+            if stored_dtype != requirement.logical_dtype:
                 return refused(
                     "dtype_mismatch",
                     f"{component}/{key}: the code requires {requirement.logical_dtype}, the "
@@ -449,11 +454,13 @@ def fit(
                 )
             if info.encoding is None:
                 routes["verbatim"] += 1
+            elif planned.get(f"{component}.{key}") == "decoded_float":
+                routes["decoded_float"] += 1
             elif not encoded_leaves:
                 return refused(
                     "encoding_unsupported",
-                    f"{component}/{key} is stored {info.encoding.scheme} and the package does not "
-                    "consent to encoded leaves",
+                    f"{component}/{key} is stored {info.encoding.scheme} and serves through a "
+                    "native encoded leaf, and the package does not consent to encoded leaves",
                     component,
                     key,
                     info.encoding.scheme,
@@ -550,14 +557,6 @@ def dtype_name(dtype: object) -> str:
     """The one dtype spelling: torch's (`float16`), from either side's name."""
     name = str(getattr(dtype, "name", dtype)).removeprefix("torch.")
     return TORCH_DTYPES.get(name, name)
-
-
-def tensorfs_requirement_dtype(dtype: object | None) -> str | None:
-    """A census dtype the fit pins; bf16 and f16 stay convertible."""
-    if dtype is None:
-        return None
-    name = canonical_dtype(dtype)
-    return None if name in ("bf16", "f16") else name
 
 
 def normalized(checkpoint: Checkpoint) -> str:
