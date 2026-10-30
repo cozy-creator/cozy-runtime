@@ -124,16 +124,16 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "cutlass",
-        "098de2a652cf8f00fd70b2df54051c7eccbb855a",
-        _GITHUB.format("NVIDIA/cutlass", "098de2a652cf8f00fd70b2df54051c7eccbb855a"),
-        "a8a1b952c7f6179bc8076f20d45859f18bd81f21f3d22b6766d7f3f0cceb5d54",
+        "2c85f497547eb441f0fe80bfb0fb2e6f9add1719",  # v4.8.1
+        _GITHUB.format("NVIDIA/cutlass", "2c85f497547eb441f0fe80bfb0fb2e6f9add1719"),
+        "bc246a2e5eb99be6e9f8cf30ee17f83af7ede97caa39cb7e8a6c7f8ca54a1583",
         keep=_HEADERS,  # SageAttention3's (Blackwell)
     ),
     Pin(
         "flash-attention",
-        "a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2",  # v2.8.3.post1
-        _GITHUB.format("Dao-AILab/flash-attention", "a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2"),
-        "e06c229e24ad61bcb31eea9446a5e6484cd8b3b5d10d90b0f8f48cc2b0d4c431",
+        "ec83c6834470a4404ee2e3016f904c9e4fbe66a2",  # v2.8.3.post2
+        _GITHUB.format("Dao-AILab/flash-attention", "ec83c6834470a4404ee2e3016f904c9e4fbe66a2"),
+        "41e622db8c04f1f889df4908d709f368cfb6ffefde2d957029ac3459e5939746",
     ),
     Pin(
         "flash-attention-cutlass",
@@ -144,18 +144,18 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         KITCHEN_WHEEL,
-        "0.2.37",
-        _PYPI + "19/04/d24939d30b077679bfc8bf4a53c7392f9d8650df7ce69164238a673753a1/"
-        "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-        "03cca0d10c314aaa13bff8f9422d03974221a344162b23d4f10d27eb2a35d0e8",
+        "0.2.40",
+        _PYPI + "5d/40/1871ee8c58eeef8d15cbf49a461eba0775303f2d9eb34c11af7c29e455c1/"
+        "comfy_kitchen-0.2.40-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "eb726664c772189e6ece742876487f1349965808b854742790e9001dbb7c0f9d",
         machine="x86_64",
     ),
     Pin(
         KITCHEN_WHEEL,
-        "0.2.37",
-        _PYPI + "ab/3b/77e68e596cb8097e10753b8095164d07b79b976208da8bde3371ecbfc558/"
-        "comfy_kitchen-0.2.37-cp312-abi3-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl",
-        "0f872625af6b3d1f96f18c54b4ef11129df2d9178d28946e1f3d737b8252416d",
+        "0.2.40",
+        _PYPI + "48/51/5944dd2e8b78c475173eb4afcaa46c07f0b5c68df2f7d6cd94823017aa5c/"
+        "comfy_kitchen-0.2.40-cp312-abi3-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl",
+        "3bd596482a4f69a726845ce75fa751896ce7e5c2d210ed3a30794ea17871bebb",
         machine="aarch64",
     ),
     Pin(
@@ -167,9 +167,9 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "comfy-kitchen",
-        "be003b7c23c5b01328657955b8bc5d3f073d868e",  # v0.2.37: reviewed H3 matrix
-        _GITHUB.format("Comfy-Org/comfy-kitchen", "be003b7c23c5b01328657955b8bc5d3f073d868e"),
-        "364150b13466f51276c08fb77fa54328c9917ea90230151f2abed75a5c362e69",
+        "f8b7e97a1418d2e529bd5405fbf86312be198ae6",  # v0.2.40
+        _GITHUB.format("Comfy-Org/comfy-kitchen", "f8b7e97a1418d2e529bd5405fbf86312be198ae6"),
+        "2053f19423a1cd4092d9278a23e049e17de494f25ddb69c94aa06e728af0ad82",
     ),
     Pin(
         "sol-attn",
@@ -181,18 +181,18 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "apache-tvm-ffi",
-        "0.1.14.post1",
-        _PYPI + "e8/db/68786fdc0bfb3a9782df7304c1e577b9c5a7d14c75e98e06571cc1869b3f/"
-        "apache_tvm_ffi-0.1.14.post1-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
-        "eb759c039866b541ec2cb07d498082f8ba6ded74d58d9196180a5932f365c077",
+        "0.1.15.post2",
+        _PYPI + "1c/26/5f33831621f3bb493556ad508ee419ba26e134356ecfdb2ca5415f9bbe5c/"
+        "apache_tvm_ffi-0.1.15.post2-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
+        "059eed9bfc94bcd41650fb8eefde74040a1bc7e7b1a6f0a8ff897b02b118875b",
         machine="x86_64",
     ),
     Pin(
         "apache-tvm-ffi",
-        "0.1.14.post1",
-        _PYPI + "35/16/47b9f8c06df3ee1eda3f0cef025bd94e70dcf37fc58296852a175512956b/"
-        "apache_tvm_ffi-0.1.14.post1-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
-        "3fd2255a2e363a40c51ec1eeedb1110a2c74e443f95ae351ee5a81b5ff6808cf",
+        "0.1.15.post2",
+        _PYPI + "60/e3/bd80e7c07573ea1423df4c7f527198bac7801bd8e0f962fc1c9530c95690/"
+        "apache_tvm_ffi-0.1.15.post2-cp312-cp312-manylinux_2_24_aarch64.manylinux_2_28_aarch64.whl",
+        "5c807217f134272d6e08ffdeeb9f1b2c1f366e096712b4e47b88ee9103f80113",
         machine="aarch64",
     ),
     Pin(
@@ -204,62 +204,62 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "flash-attn-4",
-        "4.0.0b32",
-        _PYPI + "40/d0/b1e9ab8eefc9e67179a372c3e1a8e9f83d963c3a8e5bd4c738e55dd134c0/"
-        "flash_attn_4-4.0.0b32-py3-none-any.whl",
-        "9299da3524d579d84eb92954d3243aa095d55ebdafcf80d6a9766fd96fe8a562",
+        "4.0.0b37",
+        _PYPI + "1f/73/1dbd8f083c8f2c9849df6ebdd84ba88ec5f0a1c221d34454c5732f88258e/"
+        "flash_attn_4-4.0.0b37-py3-none-any.whl",
+        "e6c5b99c8d001691a1e6e7b27d553a34cefdee01bcfded3fd945297b7c3e421c",
     ),
     Pin(
         "flashinfer-python",
-        "0.7.0",
-        _PYPI + "55/72/0ccab3f65c91b24e42fbb9abb9453639b738cd4af90718e95ee0431ac53f/"
-        "flashinfer_python-0.7.0-py3-none-any.whl",
-        "11e564820cde80ec13d351b68fc44cb54a537268bca135204abafc5fadd50240",
+        "0.7.2.post1",
+        _PYPI + "b6/ad/da1fc7644b28ab82db922021955a0c85c8d6b3b1d6db224a13ef65cef85e/"
+        "flashinfer_python-0.7.2.post1-py3-none-any.whl",
+        "bfdc18b9e1e4d8d0730fe4343dc0e284cd0c160086de80f99888bc4867922d49",
     ),
     Pin(
         "nvidia-cutlass-dsl",
-        "4.8.0",
-        _PYPI + "e4/f4/e96f452f7975dd2fd4d2a4af88c63205431dad7efbe63aff6e3a4b1ada17/"
-        "nvidia_cutlass_dsl-4.8.0-py3-none-any.whl",
-        "24f996e0e5fa88c8b417f4893e615af135bdfdfdbdbed7e239faf36a88df711b",
+        "4.8.1",
+        _PYPI + "bd/ce/a590b929285faf0aa285c5ccee2b88e0b5259fb39a6326206e0f140ea3fc/"
+        "nvidia_cutlass_dsl-4.8.1-py3-none-any.whl",
+        "43ed46b21d151aa643c6765457c7310827b938c1cf45d5109a0152de4ef06227",
     ),
     Pin(
         "nvidia-cutlass-dsl-libs-base",
-        "4.8.0",
-        _PYPI + "12/1c/2f7a13626af1edfefb5ad69234d47e3b212064a42ad2e6db59351b5ae002/"
-        "nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl",
-        "5bdc80989b0fbbac3d58960057e74e2ce8676fafa76b852d9422b9c4b9b74bdd",
+        "4.8.1",
+        _PYPI + "28/97/d8212f685544dc7208d78186128dc8a454158b1817a76b34d25392b9f910/"
+        "nvidia_cutlass_dsl_libs_base-4.8.1-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "ac2fd8c7fa3d6ded00917fa7cba8686061005da8c4703c6a29e03c1504543909",
         machine="x86_64",
     ),
     Pin(
         "nvidia-cutlass-dsl-libs-base",
-        "4.8.0",
-        _PYPI + "21/59/99fa03da9ace3048379601cf090a629c8d7df3ed33a4fa284848080e342d/"
-        "nvidia_cutlass_dsl_libs_base-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl",
-        "3affcaefb59a976ff5195dd2bff4c13594233cb4941540b74e372b63e497d3f2",
+        "4.8.1",
+        _PYPI + "b1/da/541743caf57efb1256ef9355bb69e80c0f116417d219140a840c5629cf8d/"
+        "nvidia_cutlass_dsl_libs_base-4.8.1-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "c6312f8b2f1aadd959a0276daf3c4bacc05c783c6ea1119859ed4ebd3c07e3b1",
         machine="aarch64",
     ),
     Pin(
         "nvidia-cutlass-dsl-libs-core",
-        "4.8.0",
-        _PYPI + "85/66/d05f0ae372b80fc757e59d5211d93483c6ff721f574cb68cad84ceb87157/"
-        "nvidia_cutlass_dsl_libs_core-4.8.0-py3-none-any.whl",
-        "b32716d2ed10c185cdbbb6b5c6fca26a3113a60e6e2fe4e2f0cb15966422b621",
+        "4.8.1",
+        _PYPI + "6c/03/1c59e3caf7c8b5cae3ae4d1753201c7e64d36cdf182fb882e070b0f14a55/"
+        "nvidia_cutlass_dsl_libs_core-4.8.1-py3-none-any.whl",
+        "bacc6760e3286db447d45720d32ae58ac2e6cecade1152345ef784b2d5e44431",
     ),
     Pin(
         "nvidia-cutlass-dsl-libs-cu13",
-        "4.8.0",
-        _PYPI + "df/75/6c52c58fc0fdab223feb9162886736390a6f902183d24df1508ac620a69d/"
-        "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_x86_64.whl",
-        "463cd7f0c452ffeeecb530a15aeb1b10cbbd2c8da6c5aa2fecf65f836258a732",
+        "4.8.1",
+        _PYPI + "a1/f2/0497bd834c92c8f30d6927388a91903e8e995ab7d1b5cbead87f0fd7187f/"
+        "nvidia_cutlass_dsl_libs_cu13-4.8.1-cp312-cp312-manylinux_2_28_x86_64.whl",
+        "50191a381d8cc1393373ae0bc879b0aefa9a256c23c22d4fa1c2fe3dfe57bc90",
         machine="x86_64",
     ),
     Pin(
         "nvidia-cutlass-dsl-libs-cu13",
-        "4.8.0",
-        _PYPI + "bd/48/d5b62e1e3954dadc5e962d5be81c0c2acf3dcc7ed854f323447967ba3ec0/"
-        "nvidia_cutlass_dsl_libs_cu13-4.8.0-cp312-cp312-manylinux_2_28_aarch64.whl",
-        "d61ebe2416cae8a2d5377889549df9cb5008af006a1692d7d006d8f747e62e6c",
+        "4.8.1",
+        _PYPI + "b6/3e/63f5b39aab33f21c4ddb0fc5a0f6336eccb4e0b18375f901568c88a3205a/"
+        "nvidia_cutlass_dsl_libs_cu13-4.8.1-cp312-cp312-manylinux_2_28_aarch64.whl",
+        "862378c0c51a3af2e053b363656501b06f9a54f777eee5be8c0046d780b66956",
         machine="aarch64",
     ),
     Pin(
@@ -294,10 +294,10 @@ _PINS: tuple[Pin, ...] = (
     ),
     Pin(
         "setuptools",
-        "84.0.0",
-        _PYPI + "95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/"
-        "setuptools-84.0.0-py3-none-any.whl",
-        "51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670",
+        "84.2.1",
+        _PYPI + "ef/55/6dc6d6bb953bdfc52519a0059592c52b6e3b8ad51cf8256dffceb55b0610/"
+        "setuptools-84.2.1-py3-none-any.whl",
+        "ca140b45d5325a9478f880e351484f62fef15f336462e449ca0c03c873d589c2",
     ),
     Pin(
         "wheel",

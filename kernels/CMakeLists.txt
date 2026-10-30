@@ -53,8 +53,8 @@ function(pinned var repository commit sha256)
     endif()
 endfunction()
 
-pinned(CUTLASS_DIR NVIDIA/cutlass 098de2a652cf8f00fd70b2df54051c7eccbb855a
-       a8a1b952c7f6179bc8076f20d45859f18bd81f21f3d22b6766d7f3f0cceb5d54)
+pinned(CUTLASS_DIR NVIDIA/cutlass 2c85f497547eb441f0fe80bfb0fb2e6f9add1719
+       bc246a2e5eb99be6e9f8cf30ee17f83af7ede97caa39cb7e8a6c7f8ca54a1583)
 
 set(INT8 "${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm")
 set(isolated $<$<PLATFORM_ID:Linux>:-fno-gnu-unique>)
@@ -110,9 +110,9 @@ else()
 endif()
 option(COZY_FA3 "FlashAttention-3's forward (_fa3)" ${fa3})
 if(COZY_FA3)
-# FlashAttention-3 (v2.8.3.post1) and the CUTLASS its submodule pins.
-pinned(FLASH_ATTENTION_DIR Dao-AILab/flash-attention a8aa52b1ab3e9ca574c8a33b3f35afc017ffa2e2
-       e06c229e24ad61bcb31eea9446a5e6484cd8b3b5d10d90b0f8f48cc2b0d4c431)
+# FlashAttention-3 (v2.8.3.post2) and the CUTLASS its submodule pins.
+pinned(FLASH_ATTENTION_DIR Dao-AILab/flash-attention ec83c6834470a4404ee2e3016f904c9e4fbe66a2
+       41e622db8c04f1f889df4908d709f368cfb6ffefde2d957029ac3459e5939746)
 pinned(FA3_CUTLASS_DIR NVIDIA/cutlass dc4817921edda44a549197ff3a9dcf5df0636e7b
        f2a3a9df5e6f010c8b02716aa2644a6f071827fafa606fac5f5241cab6a1ab56)
 set(FA3 "${FLASH_ATTENTION_DIR}/hopper")
