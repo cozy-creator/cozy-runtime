@@ -1,0 +1,1 @@
+`split(..., most=n)` fixes a split's windows from the shape alone, and a blended cut (an `overlap`) requires it: cross-faded pieces change the result with their layout, so SeedVR2's tiled VAE decoded differently by free VRAM and by request order (5.9% rel L2 between two layouts of one encode). A refusal inside reclaims and runs the same windows again.
