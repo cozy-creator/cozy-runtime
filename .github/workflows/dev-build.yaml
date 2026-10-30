@@ -90,9 +90,10 @@ jobs:
         if: env.WHEELS == 'true'
         working-directory: source
         run: |
+          set -o pipefail
           stub=$(mktemp -d)
           echo 'void cozy_libcuda_stub(void) {}' | cc -shared -x c -o "$stub/libcuda.so.1" -
-          TRITON_LIBCUDA_PATH=$stub uv run python -m cozy_runtime.internal.triton_prebuild \
+          TRITON_LIBCUDA_PATH=$stub uv run --extra derive python -m cozy_runtime.internal.triton_prebuild \
             "$GITHUB_WORKSPACE/kernels-out/cozy_runtime/_triton" --launchers "$GITHUB_WORKSPACE/kernels-out/triton-launchers" \
             | tee "$RUNNER_TEMP/triton-prebuild.json"
           jq -c '{kernels, bytes, launchers}' "$RUNNER_TEMP/triton-prebuild.json" >> "$GITHUB_STEP_SUMMARY"
