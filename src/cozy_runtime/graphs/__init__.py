@@ -463,7 +463,10 @@ class _Idle:
                     job = self.jobs.popleft()
                 try:
                     self.check()
-                    with _yielding(torch)() if torch is not None else nullcontext():
+                    # A job that yields only at its own boundaries runs without the per-op
+                    # check: every torch call under a Python mode pays its dispatch.
+                    ops = torch is not None and getattr(job, "yields_per_op", True)
+                    with _yielding(torch)() if ops else nullcontext():
                         done = job()
                     if not done:
                         later.append(job)

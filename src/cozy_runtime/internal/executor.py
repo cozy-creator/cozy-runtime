@@ -941,8 +941,13 @@ class Executor:
         self.schema_digests: dict[str, str] = {}
         #: request_id -> the record `prepare_request` resolved, run by `invoke`
         self.prepared: dict[str, PreparedRequest] = {}
+        #: prepared requests whose invoke has not come (`awaiting_invoke`); a refused invoke
+        #: leaves its record in `prepared` for the retry, not here
+        self.awaiting: set[str] = set()
         # A cancel may arrive on the seam reader while preflight is still running.
         self._prepared_lock = threading.Lock()
+        #: the command order `serve` keeps, woken when a prepared request goes (`_discard`)
+        self.order: _Order | None = None
         self.attempts = 0
 
     # ------------------------------------------------------------------ prepare
@@ -3223,9 +3228,23 @@ class Executor:
         for construction in (self, *self.constructions.values()):
             with construction._prepared_lock:
                 construction.prepared.pop(request_id, None)
+                construction.awaiting.discard(request_id)
         if self.host.memory is not None:
             # Never hold the prepared-record lock while touching a native read owner.
             self.host.memory.cancel_queued(request_id)
+        if self.order is not None:
+            self.order.wake()  # an idle period may open now (`awaiting_invoke`)
+
+    def awaiting_invoke(self) -> bool:
+        """A prepared request waits for its invoke, which comes next (TensorD's lookahead or its
+        dispatch): no idle period opens before it, so its first call never waits for idle work
+        to reach a boundary. Each goes with its invoke, its cancel (`_discard`), the trim
+        (`PREPARED_HELD`) or this executor, never with a clock."""
+        for construction in (self, *self.constructions.values()):
+            with construction._prepared_lock:
+                if construction.awaiting:
+                    return True
+        return False
 
     def serve_request(self, command: PrepareRequest) -> dict[str, Any]:
         target = self._target(command, attempt=False)
@@ -3234,6 +3253,9 @@ class Executor:
         return target.prepare_request(command)
 
     def serve_invoke(self, command: Invoke) -> dict[str, Any]:
+        for construction in (self, *self.constructions.values()):  # its invoke came
+            with construction._prepared_lock:
+                construction.awaiting.discard(command.request_id)
         target = self._target(command, attempt=True)
         if isinstance(target, dict):
             return target
@@ -3363,9 +3385,11 @@ class Executor:
                 stages=waits.stages,
                 prefetch_key=(command.attention_kernel, command.bits),
             )
+            self.awaiting.add(command.request_id)
             # A prepared request never dispatched must not survive for the generation.
             for stale in list(self.prepared)[: -PREPARED_HELD or None]:
                 self.prepared.pop(stale, None)
+                self.awaiting.discard(stale)
         return {
             "ok": True,
             "features": dict(prepared.features.values),
@@ -5232,6 +5256,11 @@ class _Order:
         """A command arrived beside the idle holder."""
         return len(self._open) > 1
 
+    def wake(self) -> None:
+        """Something an idle period waits on changed outside a command (`Executor._discard`)."""
+        with self._changed:
+            self._changed.notify_all()
+
 
 def _idle(executor: Executor, order: _Order) -> None:
     """Graphs record and host pages pin off the request path (`graphs.capture_idle`,
@@ -5243,8 +5272,11 @@ def _idle(executor: Executor, order: _Order) -> None:
     def pins() -> bool:
         return executor.host.memory is not None and executor.host.memory.host_pending()
 
+    def ready() -> bool:
+        return (bool(graphs.IDLE.jobs) or pins()) and not executor.awaiting_invoke()
+
     while not executor.poisoned:  # a faulted device takes no idle work: the machine ends it
-        with order.idle(answered, lambda: bool(graphs.IDLE.jobs) or pins()) as answered:
+        with order.idle(answered, ready) as answered:
             if executor.poisoned:
                 return
             try:
@@ -5268,7 +5300,7 @@ def serve(executor: Executor, channel: Channel) -> int:
     request_path.told = functools.partial(_waiting, channel)
     # Runtime-owned workers, none before the first is needed.
     pool = ThreadPoolExecutor(CALLS_IN_FLIGHT, "call")
-    order = _Order()
+    order = executor.order = _Order()
     idle = False
     while True:
         if not idle and executor.started:
