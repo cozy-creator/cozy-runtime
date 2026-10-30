@@ -84,6 +84,19 @@ jobs:
           pattern: kernels-linux-*
           path: kernels-out
           merge-multiple: true
+      # The Runtime's own Triton sets compiled for every card row, CPU-only, with the kernels job's
+      # launcher modules (`triton_prebuild`); Triton's keys need a libcuda, here a stub.
+      - name: The Runtime's Triton sets, prebuilt
+        if: env.WHEELS == 'true'
+        working-directory: source
+        run: |
+          set -o pipefail
+          stub=$(mktemp -d)
+          echo 'void cozy_libcuda_stub(void) {}' | cc -shared -x c -o "$stub/libcuda.so.1" -
+          TRITON_LIBCUDA_PATH=$stub uv run --extra derive python -m cozy_runtime.internal.triton_prebuild \
+            "$GITHUB_WORKSPACE/kernels-out/cozy_runtime/_triton" --launchers "$GITHUB_WORKSPACE/kernels-out/triton-launchers" \
+            | tee "$RUNNER_TEMP/triton-prebuild.json"
+          jq -c '{kernels, bytes, launchers}' "$RUNNER_TEMP/triton-prebuild.json" >> "$GITHUB_STEP_SUMMARY"
       - name: The Linux wheel, the pure one plus its kernels
         if: env.WHEELS == 'true'
         working-directory: source

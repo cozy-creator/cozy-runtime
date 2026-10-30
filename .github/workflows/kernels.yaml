@@ -136,6 +136,17 @@ jobs:
         run: |
           echo "${{ steps.key.outputs.key }}: ${{ steps.cache.outputs.cache-hit == 'true' && 'cached' || 'built' }}" >> "$GITHUB_STEP_SUMMARY"
           grep -E '^(_gemm|_fa3|_norm|FAILED|real)' build.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+      # Triton's launcher modules for the Runtime's prebuilt Triton sets (`triton_prebuild`), at the
+      # wheels' C library floor: the locked Triton's, so never cached with the modules.
+      - name: Triton's launcher modules
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e HOST_OWNER="$(id -u):$(id -g)" \
+            "quay.io/pypa/manylinux_2_28_$ARCH:$MANYLINUX" bash -euo pipefail -c '
+              export CC=/opt/rh/gcc-toolset-14/root/usr/bin/gcc
+              bash scripts/build-triton-launchers.sh modules/triton-launchers \
+                /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python /opt/python/cp314-cp314/bin/python
+              chown -R "$HOST_OWNER" modules/triton-launchers
+            '
       - uses: actions/upload-artifact@v4
         with:
           name: kernels-linux-${{ matrix.arch }}

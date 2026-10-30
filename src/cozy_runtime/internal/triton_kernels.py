@@ -10,14 +10,23 @@ location; a driver update rebuilds nothing. `load` waits for a live build by its
 progress, then serves it or raises `KernelsUnavailable`: a request never compiles. The Runtime's
 own sets open through `opened` (`kernel_ready.TRITON`): loaded, then verified on the card.
 
+The native wheel carries the Runtime's own sets prebuilt (`PREBUILT`, `triton_prebuild`): every
+entry's compiled kernel by its Triton key, and Triton's launcher module per Python tag. The builder
+copies a set's kernels into the cache, as Triton writes them, when every key is shipped, and
+compiles otherwise; the launcher goes in under the key this host gives it. So a machine with no C
+compiler, which Triton needs for its launcher, still serves them.
+
 Executor-only: torch and Triton are imported at the top, guarded; their absence is
 `kernels_absent`.
 """
 
 from __future__ import annotations
 
+import functools
 import hashlib
-from collections.abc import Callable
+import json
+import sysconfig
+from collections.abc import Callable, Iterable
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -91,17 +100,86 @@ def _cache_key(entry: TritonEntry, arch: int) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
-def _launcher_key() -> str:
-    """Triton's cache key for its launcher module (`CudaUtils`) on this host, its own way."""
-    source = (Path(_cuda_driver.__file__).parent / "driver.c").read_bytes()
-    options = {
+def launcher_driver() -> Path:
+    """Triton's launcher module source (`CudaUtils`)."""
+    return Path(_cuda_driver.__file__).parent / "driver.c"
+
+
+def launcher_source() -> bytes:
+    return launcher_driver().read_bytes()
+
+
+def launcher_config() -> dict[str, list[str] | None]:
+    """What Triton builds its launcher module (`CudaUtils`) with on this host, its own way."""
+    return {
         "language": ["c"],
         "library_dirs": _cuda_driver.library_dirs(),
         "include_dirs": _cuda_driver.include_dirs,
         "libraries": _cuda_driver.libraries,
         "ccflags": None,
     }
-    return str(_get_cache_manager(source, config=options).key)
+
+
+def _launcher_key() -> str:
+    """Triton's cache key for its launcher module on this host."""
+    return str(_get_cache_manager(launcher_source(), config=launcher_config()).key)
+
+
+#: The wheel's prebuilt Runtime sets (`triton_prebuild`): `manifest.json`, `kernels/<key>/` and
+#: `launcher/`.
+PREBUILT = Path(__file__).resolve().parents[1] / "_triton"
+#: The launcher module's file name in Triton's cache, this Python's.
+LAUNCHER = f"cuda_utils{sysconfig.get_config_var('EXT_SUFFIX')}"
+
+
+@functools.cache
+def _manifest() -> dict[str, Any]:
+    try:
+        found = json.loads((PREBUILT / "manifest.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    return found if found.get("triton") == triton.__version__ else {}
+
+
+def _shipped(keys: Iterable[str]) -> bool:
+    kernels = _manifest().get("kernels", {})
+    return all(key in kernels for key in keys)
+
+
+def _launcher_shipped() -> dict[str, str] | None:
+    row = _manifest().get("launcher", {}).get(LAUNCHER)
+    if row is None or row.get("driver_sha256") != hashlib.sha256(launcher_source()).hexdigest():
+        return None
+    return dict(row)
+
+
+def _prebuilt(found: kernel_compile.Job) -> bool:
+    """Whether the wheel serves this set's build: its every kernel and this Python's launcher."""
+    return _shipped(found.spec["entries"].values()) and _launcher_shipped() is not None
+
+
+def _seed(keys: Iterable[str]) -> None:
+    """The wheel's compiled kernels into Triton's cache, each group as Triton writes one."""
+    shipped = _manifest()["kernels"]
+    for key in keys:
+        row, cache = shipped[key], get_cache_manager(key)
+        if cache.get_group(row["group"]) is not None:
+            continue
+        files = PREBUILT / "kernels" / key
+        group = {name: cache.put((files / name).read_bytes(), name) for name in row["files"]}
+        cache.put_group(row["group"], group)
+
+
+@functools.cache
+def _seed_launcher() -> None:
+    """The wheel's launcher module into Triton's cache under this host's key, if it has none;
+    once per process."""
+    row = _launcher_shipped()
+    if row is None:
+        return
+    cache = _get_cache_manager(launcher_source(), config=launcher_config())
+    if cache.get_file(LAUNCHER) is None:
+        cache.put((PREBUILT / "launcher" / row["file"]).read_bytes(), LAUNCHER)
 
 
 class _Kernel(Struct, frozen=True):
@@ -167,10 +245,22 @@ def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
 def build(
     spec: dict[str, Any], staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
-    """The compile manager's builder: every entry into Triton's own cache, then Triton's
-    launcher module, so a launch compiles nothing. `staging` stays empty: the published
-    entry marks the cache filled."""
+    """The compile manager's builder: every entry into Triton's own cache (the wheel's, when it
+    ships them all), then Triton's launcher module, so a launch compiles nothing. `staging` stays
+    empty: the published entry marks the cache filled."""
     _require_triton()
+    prebuilt = _shipped(spec["entries"].values())
+    if prebuilt:
+        _seed(spec["entries"].values())
+    else:
+        compile_entries(spec, report)
+    _seed_launcher()
+    _cuda_driver.CudaUtils()
+    return {"entries": len(spec["kernels"]), "prebuilt": prebuilt}
+
+
+def compile_entries(spec: dict[str, Any], report: Callable[[float], None]) -> None:
+    """Every entry of a `job`'s spec compiled into Triton's own cache, each under its key."""
     arch, entries = int(spec["arch"]), spec["entries"]
     todo = [msgspec.convert(row, _Kernel).entry() for row in spec["kernels"]]
     for done, entry in enumerate(todo, 1):
@@ -183,8 +273,6 @@ def build(
                 f"{entry.key} compiled under {compiled.hash[:12]}, keyed {entries[entry.key][:12]}",
             )
         report(done / (len(todo) + 1))
-    _cuda_driver.CudaUtils()
-    return {"entries": len(todo)}
 
 
 class _Card:
@@ -243,8 +331,9 @@ def _store() -> kernel_cache.Store:
 
 
 def _submit(store: kernel_cache.Store, found: kernel_compile.Job) -> kernel_compile.State:
-    """`kernel_compile.submit`; a set not built while Triton has no C compiler is absent."""
-    if kernel_compile.status(store, found).state == "ready" or tools.triton():
+    """`kernel_compile.submit`; a set neither built, nor prebuilt in the wheel, nor buildable
+    (Triton has no C compiler here) is absent."""
+    if kernel_compile.status(store, found).state == "ready" or _prebuilt(found) or tools.triton():
         return kernel_compile.submit(store, found)
     raise KernelsUnavailable("kernels_absent", f"{found.key.kernel}: cc not found")
 
@@ -304,6 +393,7 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
     index = target.index or 0
     if (kernels.name, index) in _LOADED:
         return _LOADED[(kernels.name, index)]
+    _seed_launcher()  # this environment's key: an image boot's builder seeded its own
     major, minor = torch.cuda.get_device_capability(index)
     arch, store = major * 10 + minor, _store()
     found = job(kernels, arch)
