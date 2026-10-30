@@ -59,6 +59,9 @@ __all__ = [
     "TensorLayout",
     "Weights",
     "blocks_of",
+    "paging",
+    "split",
+    "unpaged",
 ]
 
 progress = 0
@@ -211,6 +214,8 @@ class BindingLayout(Protocol):
 class Declared:
     weights: Weights
     blocks: Sequence[str] | None = None
+    #: The `paging` rule that found `blocks` (`+split` when `split` made units smaller).
+    rule: str = ""
     fill: Filling | None = None
     bind: Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]] | None = None
     finals: BindingLayout | None = None
@@ -254,16 +259,121 @@ def _readable(value: Any) -> Any:
 
 
 def blocks_of(module: nn.Module) -> list[str]:
+    return paging(module)[1]
+
+
+def paging(module: nn.Module) -> tuple[str, list[str]]:
+    """A component's paging blocks and the rule that found them, so no package has to name them:
+    its declaration (`declared`), else its root's `_no_split_modules` (`root`), else those of the
+    models inside it (`submodules`: a wrapper around a Transformers or Diffusers model takes that
+    model's units), else its largest list of repeated same-class children (`repeated`: a model's
+    layers). MOSS-Image's 9B text encoder and 5B DiT each named none and were one block."""
     declared = vars(module).get("_cozy_weights")
     if isinstance(declared, Declared) and declared.blocks is not None:
-        return list(declared.blocks)
-    names = set(getattr(module, "_no_split_modules", None) or ())
+        return declared.rule or "declared", list(declared.blocks)
+    rule, names = "root", set(getattr(module, "_no_split_modules", None) or ())
+    if not names:
+        rule = "submodules"
+        names = {n for sub in module.modules() for n in getattr(sub, "_no_split_modules", None) or ()}
     found = [
         path
         for path, sub in module.named_modules()
         if path and any(kind.__name__ in names for kind in type(sub).__mro__)
     ]
-    return [a for a in found if not any(b.startswith(a + ".") for b in found)]
+    found = [a for a in found if not any(b.startswith(a + ".") for b in found)]
+    if found:
+        return rule, found
+    best, most = [], 0
+    for path, sub in module.named_modules():
+        children = list(sub.named_children()) if isinstance(sub, nn.ModuleList | nn.Sequential) else []
+        if len(children) < 2 or len({type(child) for _, child in children}) > 1:
+            continue
+        size = sum(t.numel() * t.element_size() for t in sub.parameters())
+        if size > most:
+            best, most = [f"{path}.{name}" if path else name for name, _ in children], size
+    return ("repeated", best) if best else ("none", [])
+
+
+#: A paging unit larger than this is a warning: a quarter of an 8 GB card.
+_LARGEST_UNIT = 2 << 30
+#: A paging unit holding more than this splits (`split`), the same on every card.
+_SPLIT_UNIT = 1 << 30
+
+
+def _unit(name: str, blocks: Collection[str]) -> str:
+    """The block holding tensor `name` (its longest dotted prefix that is a block), "" for common."""
+    while name:
+        name = name.rpartition(".")[0]
+        if name in blocks:
+            return name
+    return ""
+
+
+def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> list[str]:
+    """`paths` with each unit over `_SPLIT_UNIT` split where child modules allow: a block gives way to
+    its weighted children (its own tensors join the common weights), and the common weights give their
+    largest children that hold no block, one at a time, until under. A new block over the bound splits
+    the same way, down to single layers; one tensor over it stays whole. `sizes` are the stored bytes
+    by module-relative tensor name. Hunyuan-Image-3 kept 10 GB of attention and dense layers in common
+    beside its expert blocks."""
+    modules = dict(module.named_modules())
+    blocks = set(paths)
+
+    def held() -> dict[str, int]:
+        units: dict[str, int] = {}
+        for name, n in sizes.items():
+            unit = _unit(name, blocks)
+            units[unit] = units.get(unit, 0) + n
+        return units
+
+    def free(path: str) -> list[tuple[int, str]]:
+        """`path`'s weighted child modules that hold no block, through children that hold one."""
+        found, stack = [], [path]
+        while stack:
+            parent = stack.pop()
+            for name, _ in modules[parent].named_children():
+                child = f"{parent}.{name}" if parent else name
+                if any(b == child or b.startswith(child + ".") for b in blocks):
+                    if child not in blocks:
+                        stack.append(child)
+                elif size := sum(n for t, n in sizes.items() if t.startswith(child + ".")):
+                    found.append((size, child))
+        return sorted(found, reverse=True)
+
+    units = held()
+    queue = [unit for unit, n in units.items() if n > _SPLIT_UNIT]
+    while queue:
+        unit = queue.pop()
+        if held().get(unit, 0) <= _SPLIT_UNIT:
+            continue
+        if unit:
+            children = free(unit)
+            if not children:
+                continue
+            blocks.discard(unit)
+            blocks.update(child for _, child in children)
+            queue += ["", *(child for size, child in children if size > _SPLIT_UNIT)]
+            continue
+        for size, child in free(""):
+            if held().get("", 0) <= _SPLIT_UNIT:
+                break
+            blocks.add(child)
+            if size > _SPLIT_UNIT:
+                queue.append(child)
+    order = {path: i for i, path in enumerate(modules)}
+    return sorted(blocks, key=order.__getitem__)
+
+
+def unpaged(module: nn.Module, rule: str, groups: Mapping[str, int]) -> str | None:
+    """Why this component cannot page on a small card, or None: a unit over `_LARGEST_UNIT` (the
+    whole component, when it has no blocks). `groups` are the bytes by block path ("" common, its
+    embedding tables excluded: one row per token is read, and they are not what pages)."""
+    path, size = max(groups.items(), key=lambda item: item[1], default=("", 0))
+    if size <= _LARGEST_UNIT:
+        return None
+    unit = f"block {path}" if path else "its common weights"
+    return (f"{type(module).__name__} pages by rule '{rule}' and {unit} is {size / (1 << 30):.2f} GiB: "
+            f"a card with less free memory cannot run it; name its paging units (`_no_split_modules`)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1376,8 +1486,10 @@ class Memory:
 
     def _register(self, module: nn.Module, declared: Declared) -> Model:
         model = Model(self, module, declared)
-        w, paths = declared.weights, blocks_of(module)
+        w, (rule, paths) = declared.weights, paging(module)
         tensors = w.ck.components[w.component].tensors
+        tables = [p for p, sub in module.named_modules() if p and isinstance(sub, nn.Embedding)]
+        sizes: dict[str, int] = {}
         by_path: dict[str, dict[str, dict[str, _Part]]] = {}
         for key in tensors:
             if w.keys is not None and key not in w.keys:
@@ -1395,6 +1507,8 @@ class Memory:
             for role, part in stored_parts(w.ck, w.component, key).items():
                 parts[role or "value"] = _Part(part.dtype, tuple(part.shape), part.length, role)
             by_path.setdefault(path, {})[key] = parts
+            if path or not any(bound.startswith(t + ".") for t in tables):
+                sizes[path] = sizes.get(path, 0) + sum(part.nbytes for part in parts.values())
         for index, path in enumerate(p for p in ("", *paths) if p in by_path):
             block = _Block(model, path, index, by_path[path])
             if path:
@@ -1415,6 +1529,9 @@ class Memory:
                 [self.window_bytes, *(_STREAMED * b.allocation_bytes for b in model.groups())]
             )
             self.native.set_streaming_limit(self.window_bytes)
+        why = unpaged(module, rule, sizes)
+        if why is not None:
+            warnings.warn(f"{w.component}: {why}", RuntimeWarning, stacklevel=2)
         _placeholders(model)
         _hooks(model)
         self.models[module] = model
