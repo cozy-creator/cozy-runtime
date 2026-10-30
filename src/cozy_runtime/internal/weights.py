@@ -669,8 +669,14 @@ class _PlainDtype:
     encoded = False
 
     def __init__(self, base: _Routes, dtype: str) -> None:
-        if any(route != "verbatim" for route in base.routes.values()):
-            raise StaleBinding("prepared dtype overrides require plain stored weights")
+        routes = base.routes.items()
+        encoded = sorted({base.rows[key].encoded.scheme for key, r in routes if r != "verbatim"})
+        if encoded:
+            raise StaleBinding(
+                f"a dtype hold casts plain stored weights, and this lane stores the component's "
+                f"weights encoded ({', '.join(encoded)}), whose leaves compute in the activation "
+                "dtype already: hold it on a plain lane (bf16, f16, f32), or leave it unheld"
+            )
         self.base = base
         layouts: dict[str, Mapping[str, TensorLayout]] = {}
         for key in base.rows:

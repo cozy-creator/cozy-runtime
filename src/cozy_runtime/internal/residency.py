@@ -1611,16 +1611,22 @@ class Memory:
                 for name in targets
                 for site in model.sites.get(name, ())
             }
-            for sites in model.sites.values():
+            # A buffer the checkpoint does not store (H3's VAE rotary `inv_freq`) keeps its
+            # constructed dtype, as building the module in `dtype` leaves it; casting it would
+            # round F32 math. A floating parameter it does not store has no such answer.
+            for name, sites in model.sites.items():
                 for site in sites:
                     value = site.table[site.name]
                     if (
-                        (id(site.table), site.name) not in stored_sites
+                        site.parameter
+                        and (id(site.table), site.name) not in stored_sites
                         and value is not None
                         and value.is_floating_point()
                     ):
                         raise StaleBinding(
-                            "prepared dtype overrides require declared floating buffers"
+                            f"{model.name}: {name} is a {value.dtype} parameter the checkpoint "
+                            "does not store, so a dtype hold would leave it beside cast weights: "
+                            "store it, or build it in the held dtype"
                         )
             layouts: list[tuple[_Block, _Block]] = []
             replacements: dict[int, tuple[list[_Site], Tensor]] = {}

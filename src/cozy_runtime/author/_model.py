@@ -379,7 +379,8 @@ TRANSPARENT = "_cozy_transparent"
 
 def hold_dtype(module: Any, dtype: Any) -> None:
     """Serve a component root in floating `dtype` from now on. A placed one keeps its stored
-    bytes; the Runtime casts them when it next fills the weights, so nothing loads here."""
+    bytes; the Runtime casts them when it next fills the weights, so nothing loads here. Buffers
+    the checkpoint does not store (rotary frequencies) keep their constructed dtype."""
     if next(module.parameters()).dtype == dtype:
         return
     placed = PLACED.get(module)
