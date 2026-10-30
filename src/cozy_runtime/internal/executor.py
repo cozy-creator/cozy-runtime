@@ -1073,6 +1073,7 @@ class Executor:
         device = self._rank_device(torch)
         host.memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
         host.execution = execution
+        execution.measure(device.index if host.memory.cuda else None, self._store())
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         _split.install(execution)
