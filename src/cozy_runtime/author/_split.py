@@ -53,10 +53,8 @@ def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut, most: int | None = None)
     window of `x` to that window of its result. Without a managing memory it runs whole.
 
     With `most`, the windows are the fewest of at most `most` elements, on every device and
-    request, managed or not: the layout for an `fn` whose result depends on it. A blended cut
-    (an `overlap`) is one, and needs `most`: its pieces never follow free memory."""
-    if most is None and any(c.overlap for c in cuts):
-        raise ValueError(f"{_name(fn)}: a blended cut changes the result with its layout; give `most`")
+    request, managed or not: the layout for an `fn` whose result depends on it, as a blended
+    cut's (an `overlap`) does. Without it such a layout follows free memory."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
     if most is not None and cuts:
