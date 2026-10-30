@@ -68,9 +68,11 @@ from cozy_runtime.internal.residency import (
     Request,
     TensorLayout,
     Weights,
-    blocks_of,
+    paging,
+    split,
 )
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
+from tensorfs.raw import parts as stored_parts
 
 if TYPE_CHECKING:
     import torch
@@ -442,11 +444,20 @@ class Backend:
         leg = time.perf_counter()
         root.eval()
         rows = {self.plan[key].name: self.plan[key] for key in keys}
-        bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks_of(root)))
         checkpoint = self.checkpoints[name]
+        bound = {stored: row.key.partition(".")[2] for stored, row in rows.items()}
+        # The paging blocks, found once and split where a unit is too large: residency, the bakes
+        # and the execution catch all read these (`Declared.blocks`).
+        rule, found = paging(root)
+        sizes = {
+            bound[stored]: sum(part.length for part in stored_parts(checkpoint.ck, name, stored).values())
+            for stored in rows
+        }
+        blocks = split(root, found, sizes)
+        rule = rule if blocks == found else f"{rule}+split"
+        bakes = self.bakes[name] = _Bakes(self, root, rows, set(blocks))
         routes = _Routes(self, rows)
         leg = self._leg(f"{name}.routes", leg)
-        bound = {stored: row.key.partition(".")[2] for stored, row in rows.items()}
         vars(root)["_cozy_weights"] = Declared(
             Weights(
                 checkpoint.ck,
@@ -455,9 +466,11 @@ class Backend:
                 keys=tuple(rows),
                 bound={stored: path for stored, path in bound.items() if path != stored},
             ),
+            blocks=blocks,
             fill=bakes if bakes.bakes else None,
             bind=routes,
             finals=routes,
+            rule=rule,
         )
         # At RAM: pages reach the device through placement (passes, the plan, an explicit warm),
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).

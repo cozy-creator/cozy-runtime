@@ -61,6 +61,7 @@ __all__ = [
     "Weights",
     "blocks_of",
     "paging",
+    "split",
     "unpaged",
 ]
 
@@ -214,6 +215,8 @@ class BindingLayout(Protocol):
 class Declared:
     weights: Weights
     blocks: Sequence[str] | None = None
+    #: The `paging` rule that found `blocks` (`+split` when `split` made units smaller).
+    rule: str = ""
     fill: Filling | None = None
     bind: Callable[[str, Mapping[str, Tensor]], Mapping[str, Tensor]] | None = None
     finals: BindingLayout | None = None
@@ -268,7 +271,7 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
     layers). MOSS-Image's 9B text encoder and 5B DiT each named none and were one block."""
     declared = vars(module).get("_cozy_weights")
     if isinstance(declared, Declared) and declared.blocks is not None:
-        return "declared", list(declared.blocks)
+        return declared.rule or "declared", list(declared.blocks)
     rule, names = "root", set(getattr(module, "_no_split_modules", None) or ())
     if not names:
         rule = "submodules"
@@ -294,6 +297,72 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
 
 #: A paging unit larger than this is a warning: a quarter of an 8 GB card.
 _LARGEST_UNIT = 2 << 30
+#: A paging unit holding more than this splits (`split`), the same on every card.
+_SPLIT_UNIT = 1 << 30
+
+
+def _unit(name: str, blocks: Collection[str]) -> str:
+    """The block holding tensor `name` (its longest dotted prefix that is a block), "" for common."""
+    while name:
+        name = name.rpartition(".")[0]
+        if name in blocks:
+            return name
+    return ""
+
+
+def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> list[str]:
+    """`paths` with each unit over `_SPLIT_UNIT` split where child modules allow: a block gives way to
+    its weighted children (its own tensors join the common weights), and the common weights give their
+    largest children that hold no block, one at a time, until under. A new block over the bound splits
+    the same way, down to single layers; one tensor over it stays whole. `sizes` are the stored bytes
+    by module-relative tensor name. Hunyuan-Image-3 kept 10 GB of attention and dense layers in common
+    beside its expert blocks."""
+    modules = dict(module.named_modules())
+    blocks = set(paths)
+
+    def held() -> dict[str, int]:
+        units: dict[str, int] = {}
+        for name, n in sizes.items():
+            unit = _unit(name, blocks)
+            units[unit] = units.get(unit, 0) + n
+        return units
+
+    def free(path: str) -> list[tuple[int, str]]:
+        """`path`'s weighted child modules that hold no block, through children that hold one."""
+        found, stack = [], [path]
+        while stack:
+            parent = stack.pop()
+            for name, _ in modules[parent].named_children():
+                child = f"{parent}.{name}" if parent else name
+                if any(b == child or b.startswith(child + ".") for b in blocks):
+                    if child not in blocks:
+                        stack.append(child)
+                elif size := sum(n for t, n in sizes.items() if t.startswith(child + ".")):
+                    found.append((size, child))
+        return sorted(found, reverse=True)
+
+    units = held()
+    queue = [unit for unit, n in units.items() if n > _SPLIT_UNIT]
+    while queue:
+        unit = queue.pop()
+        if held().get(unit, 0) <= _SPLIT_UNIT:
+            continue
+        if unit:
+            children = free(unit)
+            if not children:
+                continue
+            blocks.discard(unit)
+            blocks.update(child for _, child in children)
+            queue += ["", *(child for size, child in children if size > _SPLIT_UNIT)]
+            continue
+        for size, child in free(""):
+            if held().get("", 0) <= _SPLIT_UNIT:
+                break
+            blocks.add(child)
+            if size > _SPLIT_UNIT:
+                queue.append(child)
+    order = {path: i for i, path in enumerate(modules)}
+    return sorted(blocks, key=order.__getitem__)
 
 
 def unpaged(module: nn.Module, rule: str, groups: Mapping[str, int]) -> str | None:
