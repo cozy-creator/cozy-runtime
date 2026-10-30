@@ -5243,8 +5243,10 @@ def _idle(executor: Executor, order: _Order) -> None:
     def pins() -> bool:
         return executor.host.memory is not None and executor.host.memory.host_pending()
 
-    while True:
+    while not executor.poisoned:  # a faulted device takes no idle work: the machine ends it
         with order.idle(answered, lambda: bool(graphs.IDLE.jobs) or pins()) as answered:
+            if executor.poisoned:
+                return
             try:
                 graphs.capture_idle(order.waiting)
                 if (memory := executor.host.memory) is not None and memory.host_pending():

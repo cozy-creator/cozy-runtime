@@ -128,8 +128,10 @@ class Domain:
                 # its capture stream explicit; reset later clears only this stream.
                 with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
                     self.owner.capture_begin(capture_error_mode="thread_local")
-                    self.join.record(self.stream)
-                    self.owner.capture_end()
+                    try:
+                        self.join.record(self.stream)
+                    finally:
+                        self.owner.capture_end()
                 self.config = self.configuration()
             except BaseException:
                 self.finish()

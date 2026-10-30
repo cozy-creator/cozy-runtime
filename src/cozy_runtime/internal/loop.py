@@ -1043,13 +1043,17 @@ class _Graph:
                 mode.__exit__(None, None, None)
         finally:
             try:
-                self.domain.join.record(stream)
-                control.wait_event(self.domain.join)
-                torch.cuda.set_stream(control)
                 try:
-                    self.graph.capture_end()
+                    self.domain.join.record(stream)
+                    control.wait_event(self.domain.join)
                 finally:
-                    torch.cuda.set_stream(self._caller)
+                    # An invalidated capture refuses the join; only its end takes both streams
+                    # out of capture, so the caller's next CUDA call is not inside it (cr-227).
+                    torch.cuda.set_stream(control)
+                    try:
+                        self.graph.capture_end()
+                    finally:
+                        torch.cuda.set_stream(self._caller)
             finally:
                 self._contexts.close()
         control.synchronize()
