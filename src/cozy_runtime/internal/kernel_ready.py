@@ -52,6 +52,8 @@ class _Slot:
     state: str  # opening | landed | ready | failed
     value: object = None
     error: Exception | None = None
+    #: Set once a `prime`d opener ended: every ask waits for it until then.
+    primed: threading.Event | None = None
 
 
 _SLOTS: dict[str, _Slot] = {}
@@ -117,9 +119,43 @@ def _opening(name: str) -> Iterator[None]:
             _OPENERS -= 1
 
 
+def prime[T](name: str, opener: Opener[T]) -> None:
+    """Opens `name`'s kernel now on a thread of its own, beside what the executor does next (the
+    weight fill), outside any request. An ask while it opens waits for it instead of serving a
+    fallback, so the first call serves it and no call sees it change (cl-681)."""
+    with _LOCK:
+        if name in _SLOTS:
+            return
+        slot = _SLOTS[name] = _Slot("opening", primed=threading.Event())
+
+    def open_it() -> None:
+        try:
+            with _opening(name):
+                value = opener(True)
+            if value is None:
+                raise RuntimeError("its opener waited and returned nothing")
+        except Exception as exc:
+            _ended(name, slot, exc)
+        else:
+            _landed(name, slot, value, "ready")
+        finally:
+            cast("threading.Event", slot.primed).set()
+
+    threading.Thread(target=open_it, name=f"{THREAD}{name}", daemon=True).start()
+
+
+def _primed(name: str) -> None:
+    """Waits for `name`'s `prime`d opener to end."""
+    slot = _SLOTS.get(name)
+    if slot is not None and slot.primed is not None:
+        slot.primed.wait()
+
+
 def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
     """`name`'s kernel once it serves here, else None: opening (started now by `opener` if it
-    was not), or failed. Never blocks a request, except to open a kernel its group serves."""
+    was not), or failed. Never blocks a request, except to open a kernel its group serves or to
+    wait for one `prime`d before it."""
+    _primed(name)
     quiet = not request_path.in_flight()
     grouped = _GROUP[0] is not None
     if grouped and opener is not None and _AGREED and _shared(name) in _AGREED:
@@ -183,6 +219,7 @@ def wait[T](name: str, opener: Opener[T]) -> T:
     """`name`'s kernel, its build waited for on this thread, under this thread's cancel: a
     request that names its kernel holds it for every step (owner, 2026-10-10). Raises why it
     cannot serve."""
+    _primed(name)
     with _LOCK:
         slot = _SLOTS.get(name)
         mine = slot is None
