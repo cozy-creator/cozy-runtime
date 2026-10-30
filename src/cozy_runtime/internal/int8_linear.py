@@ -140,6 +140,12 @@ def native(torch: ModuleType, index: int) -> Op | None:
     return op
 
 
+def prime(torch: ModuleType, index: int) -> None:
+    """Opens the op on this card on its own thread at device init, beside the weight fill: its
+    first ask (`native`) waits for it rather than serve a fallback (`kernel_ready.prime`)."""
+    kernel_ready.prime(f"{NATIVE} cuda:{index}", partial(_library, torch, index))
+
+
 def _library(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
     """`native`'s opener: the library once each format it serves passes its probe here."""
     sm = capability(torch, index)
