@@ -442,7 +442,36 @@ RECIPES: dict[str, Recipe] = {
                 ),
             ),
         ),
-        Recipe(PYTHON, "python"),
+        # Upstream Sol's preprocess kernels take the head count and the block count as constants
+        # and specialize on the token count's residues: a compile per (length, heads), which a
+        # request at a new length waited out on the dense reference. As runtime integers none
+        # is specialized: one compile per card serves every length and head window.
+        Recipe(
+            PYTHON,
+            "python",
+            replace=(
+                (
+                    "sol_attn/preprocess.py",
+                    "    H: tl.constexpr,\n    N: tl.constexpr,\n",
+                    "    H,\n    N,\n",
+                ),
+                *(
+                    (
+                        "sol_attn/preprocess.py",
+                        f"@triton.jit\ndef {kernel}(",
+                        f"@triton.jit(do_not_specialize={names!r})\ndef {kernel}(",
+                    )
+                    for kernel, names in (
+                        ("_reduce_kc_kernel", ("T", "H", "N")),
+                        ("_reduce_vc_kernel", ("T", "H", "N")),
+                        ("_reduce_kc_stats_kernel", ("H", "N")),
+                        ("_diag_threshold_kernel", ("T", "H", "N")),
+                        ("_pool_query_kernel", ("T", "H", "N")),
+                        ("_exact_fused_threshold_kernel", ("H", "N")),
+                    )
+                ),
+            ),
+        ),
     )
 }
 
@@ -562,7 +591,7 @@ def job(name: str, sm: int, root: Path | None = None) -> kernel_compile.Job:
         }
         if not wanted:
             raise Absent(why or "the kernel sources carry no Python sources")
-        inputs = {"python": _python()}
+        inputs = {"python": _python(), "replace": [list(fix) for fix in recipe.replace]}
     else:
         missing = [n for n in (*recipe.sources, *recipe.build_deps) if n not in sources]
         if missing:
