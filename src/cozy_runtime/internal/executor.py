@@ -5224,14 +5224,21 @@ class _Order:
 
 
 def _idle(executor: Executor, order: _Order) -> None:
-    """Graphs record off the request path (`graphs.capture_idle`): after a command is answered,
-    while no other is open. One arriving makes the capture yield at its next region boundary. A
-    device fault there poisons the executor, as one in a request does (the machine ends it)."""
+    """Graphs record and host pages pin off the request path (`graphs.capture_idle`,
+    `Memory.pin_idle`): after a command is answered, while no other is open. One arriving makes
+    either yield at its next region boundary or stored part. A device fault there poisons the
+    executor, as one in a request does (the machine ends it)."""
     answered = 0
+
+    def pins() -> bool:
+        return executor.host.memory is not None and executor.host.memory.host_pending()
+
     while True:
-        with order.idle(answered, lambda: bool(graphs.IDLE.jobs)) as answered:
+        with order.idle(answered, lambda: bool(graphs.IDLE.jobs) or pins()) as answered:
             try:
                 graphs.capture_idle(order.waiting)
+                if (memory := executor.host.memory) is not None and memory.host_pending():
+                    memory.pin_idle(order.waiting)
             except Exception as exc:
                 traceback.print_exc()
                 if fault(exc) in (Fault.STICKY, Fault.DEVICE):
