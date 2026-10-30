@@ -106,17 +106,14 @@ def build(out: Path, launchers: Path | None) -> dict[str, object]:
     with tempfile.TemporaryDirectory(prefix="cozy-triton-") as scratch:
         triton.knobs.cache.dir = scratch
         shipped, report = _kernels(out)
-    manifest = {
-        "triton": triton.__version__,
-        "kernels": shipped,
-        "launcher": _launchers(out, launchers),
-    }
+    modules = _launchers(out, launchers)
+    manifest = {"triton": triton.__version__, "kernels": shipped, "launcher": modules}
     (out / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True))
     size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
     return {
         "kernels": len(shipped),
         "bytes": size,
-        "launchers": sorted(manifest["launcher"]),
+        "launchers": sorted(modules),
         "sets": report,
     }
 
