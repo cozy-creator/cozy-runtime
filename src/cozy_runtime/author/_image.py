@@ -14,7 +14,7 @@ import math
 import secrets
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import msgspec
 
@@ -211,6 +211,16 @@ class ImageRequest(msgspec.Struct):
         target = self.target(first, megapixels=megapixels, ratio=ratio)
         return sizes.fit(adj, target.ratio, sizes.pixels(adj, target))
 
+    # Runtime 0.36.0 renamed these: a package built for an older Runtime reads them and is refused
+    # with the remedy, never an AttributeError deep in its handler.
+    @property
+    def reference_images(self) -> NoReturn:
+        raise _removed("reference_images")
+
+    @property
+    def reference_boxes(self) -> NoReturn:
+        raise _removed("reference_boxes")
+
     def images(self) -> list[ImageFile]:
         """The assets' pictures, in order."""
         return [asset.image for asset in self.assets]
@@ -261,6 +271,15 @@ class ImageResult(msgspec.Struct):
     seed: int
     #: The prompt the image was made from: the upsampled one when upsampling ran.
     prompt: str
+
+
+def _removed(field: str) -> InvalidRequest:
+    return InvalidRequest(
+        f"{field} is gone in Runtime 0.36.0 (assets replaces it, each with its own box): this "
+        "package was built for Runtime < 0.36; use its newest release",
+        code="removed_name",
+        fields=(field,),
+    )
 
 
 def corners(box: Sequence[float], field: str) -> tuple[float, float, float, float]:
