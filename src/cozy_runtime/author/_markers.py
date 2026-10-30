@@ -122,8 +122,8 @@ class Bound:
 
 
 @dataclass(frozen=True, slots=True)
-class AssetLimits:
-    """Upper counts for one Assets input; compiled into its normal request schema."""
+class FileLimits:
+    """Upper counts for one Files input; compiled into its normal request schema."""
 
     images: int | None = None
     videos: int | None = None
@@ -133,7 +133,7 @@ class AssetLimits:
     def __post_init__(self) -> None:
         values = (self.images, self.videos, self.audio, self.total)
         if all(value is None for value in values):
-            raise ConformanceError("AssetLimits must declare a count", code="asset_limits")
+            raise ConformanceError("FileLimits must declare a count", code="asset_limits")
         for value in values:
             if value is not None and (type(value) is not int or value < 0):
                 raise ConformanceError(
@@ -161,7 +161,7 @@ AUDIO_PREPARATION_PROFILE = "audio-trim/1"
 
 @dataclass(frozen=True, slots=True)
 class ImagePreparation:
-    """Opt-in useful image geometry for an image field or Assets, preserving aspect ratio.
+    """Opt-in useful image geometry for an image field or Files, preserving aspect ratio.
 
     These caps request preparation, not rejection of a larger source image. Source
     resource ceilings remain separate. Fidelity is interpreted by the package.
@@ -255,7 +255,7 @@ class _Trim:
 
 @dataclass(frozen=True, slots=True)
 class VideoPreparation(_Trim):
-    """Declared duration policy and fit for a video field or the videos of an Assets input.
+    """Declared duration policy and fit for a video field or the videos of an Files input.
 
     Shorter than `min_seconds`, or longer than `max_seconds` with `excess="refuse"`,
     refuses the request before the handler runs. `excess="truncate"` ends every read
@@ -345,10 +345,10 @@ def seconds(value: object) -> Fraction:
 
 
 @dataclass(frozen=True, slots=True)
-class AssetBound:
+class FileBound:
     """cr-012 — the TYPED bounds on ONE input-asset field.
 
-    An input asset is a typed request field, so its limits belong on the field and not in
+    An input file is a typed request field, so its limits belong on the field and not in
     a deployment's config or a downloader's constant:
 
     * `max_bytes` — the largest this field admits, enforced BEFORE the entrypoint sees the
@@ -358,12 +358,12 @@ class AssetBound:
       that decodes only PNG says so; one that lists a type its kind does not admit is a
       conformance error, because widening a kind would promise a decoder nothing has.
     * `max_decoded_bytes` — the largest immutable RGB8 + float32 PCM value this field may
-      expand to. It is bound into the hydrated asset by the runtime and can only narrow the
+      expand to. It is bound into the hydrated file by the runtime and can only narrow the
       runtime's hard frame/pixel/channel/sample ceilings. It accounts for the value retained
       and returned to the handler, not codec working memory or peak process RSS. Request data
       cannot set it.
 
-    Counts belong to the collection: Meta(max_length=...) or the AssetLimits argument
+    Counts belong to the collection: Meta(max_length=...) or the FileLimits argument
     annotation. Both compile centrally into the same request and kind constraints.
     """
 
@@ -374,17 +374,17 @@ class AssetBound:
     def __post_init__(self) -> None:
         if self.max_bytes is None and not self.media_types and self.max_decoded_bytes is None:
             raise ConformanceError(
-                "AssetBound() declares nothing: give max_bytes, media_types or "
+                "FileBound() declares nothing: give max_bytes, media_types or "
                 "max_decoded_bytes, or drop the annotation and take the deployment's cap"
             )
         for name in ("max_bytes", "max_decoded_bytes"):
             value = getattr(self, name)
             if value is not None and value <= 0:
-                raise ConformanceError(f"AssetBound({name}=) must be positive", fields=[name])
+                raise ConformanceError(f"FileBound({name}=) must be positive", fields=[name])
         for media_type in self.media_types:
             if media_type != media_type.strip().lower() or "/" not in media_type:
                 raise ConformanceError(
-                    f"AssetBound(media_types=) takes lowercase `type/subtype`, got {media_type!r}",
+                    f"FileBound(media_types=) takes lowercase `type/subtype`, got {media_type!r}",
                     fields=["media_types"],
                 )
 
@@ -392,8 +392,8 @@ class AssetBound:
         """A declared type outside the KIND's own set is a conformance error at describe."""
         if self.max_decoded_bytes is not None and kind not in {"image", "video", "audio"}:
             raise ConformanceError(
-                f"AssetBound(max_decoded_bytes=) cannot annotate a {kind!r} asset: only "
-                "ImageAsset, VideoAsset and AudioAsset are read as media",
+                f"FileBound(max_decoded_bytes=) cannot annotate a {kind!r} asset: only "
+                "ImageFile, VideoFile and AudioFile are read as media",
                 fields=["max_decoded_bytes"],
             )
         allowed = KIND_MEDIA.get(kind, ())
@@ -405,7 +405,7 @@ class AssetBound:
         outside = [m for m in self.media_types if allowed and m not in allowed]
         if outside:
             raise ConformanceError(
-                f"AssetBound(media_types={outside!r}) is outside what a {kind!r} asset "
+                f"FileBound(media_types={outside!r}) is outside what a {kind!r} file "
                 f"admits ({list(allowed)}): a bound NARROWS a kind and never widens it, "
                 "because a type the runtime cannot decode is not a capability",
                 fields=["media_types"],

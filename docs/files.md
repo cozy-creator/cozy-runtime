@@ -1,7 +1,7 @@
 # Media inputs
 
-`ImageAsset`, `VideoAsset` and `AudioAsset` are the only media types a signature names,
-as a request field or inside `Assets[...]`. Each is a handle: nothing is decoded until the
+`ImageFile`, `VideoFile` and `AudioFile` are the only media types a signature names,
+as a request field or inside `Files[...]`. Each is a handle: nothing is decoded until the
 function reads it, and every read goes through the attempt's one reader and budget.
 Naming a media handle grants `media_decode`; a function naming a video or audio input
 includes `cozy-runtime[media]` (PyAV) in its dependencies.
@@ -12,13 +12,13 @@ from typing import Annotated
 import msgspec
 
 from cozy_runtime.author import (
-    AssetBound, AssetLimits, Assets, AudioAsset, Context, ImageAsset, ImagePreparation,
-    VideoAsset, VideoPreparation, invocable,
+    FileBound, FileLimits, Files, AudioFile, Context, ImageFile, ImagePreparation,
+    VideoFile, VideoPreparation, invocable,
 )
 
 References = Annotated[
-    Assets[ImageAsset | VideoAsset | AudioAsset],
-    AssetLimits(images=9, videos=3, audio=3, total=12),
+    Files[ImageFile | VideoFile | AudioFile],
+    FileLimits(images=9, videos=3, audio=3, total=12),
     ImagePreparation(max_edge=4096),
     VideoPreparation(min_seconds=2, max_seconds=15, excess="truncate"),
 ]
@@ -26,8 +26,8 @@ References = Annotated[
 
 class Shot(msgspec.Struct):
     clip: Annotated[
-        VideoAsset,
-        AssetBound(max_bytes=1 << 30, max_decoded_bytes=4 << 30),
+        VideoFile,
+        FileBound(max_bytes=1 << 30, max_decoded_bytes=4 << 30),
         VideoPreparation(max_seconds=15, excess="truncate"),
     ]
 
@@ -74,7 +74,7 @@ async def render(ctx: Context, *, shot: Shot, refs: References) -> Done:
 ## Preparation
 
 `ImagePreparation(max_edge=, max_pixels=)`, `VideoPreparation(min_seconds=, max_seconds=,
-excess="refuse"|"truncate")` and `AudioPreparation(...)` annotate one field or an `Assets`
+excess="refuse"|"truncate")` and `AudioPreparation(...)` annotate one field or an `Files`
 argument, where each applies to its kind.
 
 - `VideoPreparation(max_short_edge=, max_long_edge=, max_pixels=, max_fps=, audio=)` also
@@ -99,10 +99,10 @@ argument, where each applies to its kind.
 
 Retained media is budgeted by the machine's memory: every `read()` of an attempt shares one
 budget of the host's physical memory (never below 2 GiB), so a run that fits the machine
-succeeds. `AssetBound(max_decoded_bytes=)` narrows one field's reads to the RGB8/float32 value
+succeeds. `FileBound(max_decoded_bytes=)` narrows one field's reads to the RGB8/float32 value
 it retains, charged after `end`, `fps` and preparation: dropped frames, repeated slots and
 resized pixels cost nothing extra. Every image, video and audio request field declares it
-(describe refuses `asset_decode_unbounded`), and any size describes. An `Assets` kind without
+(describe refuses `asset_decode_unbounded`), and any size describes. An `Files` kind without
 one takes the documented 2 GiB default, which the interface publishes; a 15-second 1080p
 read at 24 fps retains about 2.2 GB, so declare more on a kind that needs it. Streams are
 bounded per event.
@@ -110,9 +110,9 @@ bounded per event.
 ## Collections
 
 `assets["first"]` requires an occurrence labelled `first`; `assets.get("last")` returns
-`None` when absent. Integer indexing preserves input order. Counts in `AssetLimits` are
+`None` when absent. Integer indexing preserves input order. Counts in `FileLimits` are
 upper limits and compile into the request's list constraint; conflicting totals refuse at
-describe. `assets.info(key)` returns readonly `AssetInfo` (`id`, `position`, `label`,
+describe. `assets.info(key)` returns readonly `FileInfo` (`id`, `position`, `label`,
 `fidelity`, `kind`, `media_type`, `size_bytes`, `digest`) without reading. Preflight sees
 metadata only.
 
@@ -129,7 +129,7 @@ A function returning media declares the consumer's decode bound on its result:
 
 ```python
 class SegmentResult(msgspec.Struct):
-    video: Annotated[VideoAsset, AssetBound(max_bytes=256 << 20, max_decoded_bytes=32 << 20)]
+    video: Annotated[VideoFile, FileBound(max_bytes=256 << 20, max_decoded_bytes=32 << 20)]
 ```
 
 The parent reads the returned handle (`result.video.stream()`) through its own attempt
@@ -138,18 +138,18 @@ forwardable but reads refuse `decoded_bound_missing`.
 
 ## Package interface
 
-An `Assets` kind row carries `prepare`, and a field's `asset_bound` carries `prepare`,
+An `Files` kind row carries `prepare`, and a field's `asset_bound` carries `prepare`,
 each with one profile: `image-fit/1` `{max_edge, max_pixels}`, `video-trim/1` and
 `audio-trim/1` `{min_seconds, max_seconds, excess}`, and `video-fit/1`, `video-trim/1`'s
 members with `{max_short_edge, max_long_edge, max_pixels, max_fps, audio}`, written only when
 a video declares a fit. A known profile admits exactly those
 members and must prepare a kind its declaration carries; readers ignore a profile they do
-not know. Preparations annotate inputs (fields, invocable parameters, `Assets`); a result
+not know. Preparations annotate inputs (fields, invocable parameters, `Files`); a result
 declaring one refuses at describe.
 
 ## Tests
 
 `cozy_runtime.author.fakes` reads real files the way the executor grants them:
-`file_input(VideoAsset, path, preparation=...)` returns a hydrated handle,
+`file_input(VideoFile, path, preparation=...)` returns a hydrated handle,
 `fake_input(saved_output)` re-grants an output, and `granted_input(path, input_id=...)` is
 the verified grant `invoke_with_fakes(assets=...)` and `Invocation(assets=...)` take.

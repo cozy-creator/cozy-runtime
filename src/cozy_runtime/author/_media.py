@@ -1,6 +1,6 @@
 """cr-012 — MEDIA-TYPE HONESTY: what the bytes actually are, against what was declared.
 
-A declared media type is a CLAIM by whoever minted the grant. An asset field is a typed
+A declared media type is a CLAIM by whoever minted the grant. A file field is a typed
 promise to author code that `payload.photo` is an image. Between those two sits nothing at
 all unless something reads the first bytes, so this module reads them.
 
@@ -11,8 +11,8 @@ is the image or audio the field asked for: `reconcile` takes the sniffed type an
 own check (`admits`) still decides. Only an image declared and video delivered (another
 family) refuses. Bytes no signature names keep their declaration; the decoder is the judge.
 
-**A kind is a set of media types, declared here and nowhere else.** `ImageAsset` means
-exactly `KIND_MEDIA["image"]`. A package narrows that with `AssetBound(media_types=…)`;
+**A kind is a set of media types, declared here and nowhere else.** `ImageFile` means
+exactly `KIND_MEDIA["image"]`. A package narrows that with `FileBound(media_types=…)`;
 it never widens it, because a decoder the runtime does not have is not a capability.
 
 
@@ -73,7 +73,7 @@ EXTENSIONS: dict[str, str] = {
     "application/json": ".json",
 }
 
-#: The media types each ASSET KIND admits. `file` is deliberately open: `FileAsset` is the
+#: The media types each ASSET KIND admits. `file` is deliberately open: `File` is the
 #: kind that promises nothing about its contents, and pretending otherwise would make the
 #: three specific kinds mean less.
 KIND_MEDIA: dict[str, tuple[str, ...]] = {
@@ -101,7 +101,7 @@ def sniff(head: bytes) -> str:
 
 
 def admits(kind: str, media_type: str) -> bool:
-    """Whether an asset KIND admits a media type. An open kind admits everything."""
+    """Whether a file KIND admits a media type. An open kind admits everything."""
     allowed = KIND_MEDIA.get(kind)
     if allowed is None:
         return False

@@ -30,15 +30,6 @@ from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 import cozy_runtime.author._codec as _codec
 import cozy_runtime.author._stalls as _stalls
 from cozy_runtime.author._activity import settle, work_clock
-from cozy_runtime.author._assets import (
-    Asset,
-    AudioAsset,
-    FileAsset,
-    ImageAsset,
-    Tree,
-    VideoAsset,
-    digest_bytes,
-)
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import (
     DecodedAudioChunk,
@@ -50,11 +41,19 @@ from cozy_runtime.author._decode import (
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
 from cozy_runtime.author._executor_requests import Publish, Published, PublishPart
+from cozy_runtime.author._files import (
+    AudioFile,
+    File,
+    ImageFile,
+    Tree,
+    VideoFile,
+    digest_bytes,
+)
 from cozy_runtime.author._observations import DEVICE, Attribution, EventRing, Observation, Scalar
 
 T = TypeVar("T")
 S = TypeVar("S")
-A = TypeVar("A", bound="Asset")
+A = TypeVar("A", bound="File")
 
 RowKind = Literal["adjusted", "clamp", "warn"]
 
@@ -145,14 +144,14 @@ class Attempt:
     closed: bool = False
     frames: dict[str, HostFrame] = field(default_factory=dict)
     """handle -> the registered host frame awaiting its codec. In the executor these cross
-    the seam and the worker's post thread settles them; the asset in `pending` carries
+    the seam and the worker's post thread settles them; the file in `pending` carries
     the media type and no size or digest until then."""
     settle_at_save: bool = False
     """Encode at the save instead (a fake harness: there is no worker to defer to)."""
     entered: bool = False
     """Whether the package handler itself was entered."""
-    pending: dict[str, Asset] = field(default_factory=dict)
-    committed_files: dict[str, FileAsset] = field(default_factory=dict)
+    pending: dict[str, File] = field(default_factory=dict)
+    committed_files: dict[str, File] = field(default_factory=dict)
     pending_trees: dict[str, Tree] = field(default_factory=dict)
     rows: list[AdjustmentRow] = field(default_factory=list)
     ignored: tuple[str, ...] = ()
@@ -287,7 +286,7 @@ class SavedAudioFacts:
 class SavedVideo:
     """One atomically committed streaming MP4 plus facts re-probed from its bytes."""
 
-    video: VideoAsset
+    video: VideoFile
     width: int
     height: int
     frame_count: int
@@ -340,9 +339,9 @@ def encode_png(frame: ImageFrame) -> bytes:
     return _codec.encode_png(frame.width, frame.height, frame.pixels, frame.mode)
 
 
-def settle_frame(attempt: Attempt, handle: str) -> Asset:
+def settle_frame(attempt: Attempt, handle: str) -> File:
     """Encode ONE registered frame in place: the blob takes the handle's spool name, the
-    asset takes its size and digest, the raw snapshot goes. The worker's post thread does
+    file takes its size and digest, the raw snapshot goes. The worker's post thread does
     the same over the seam row; this is the in-process form a fake harness uses."""
     frame = attempt.frames.pop(handle)
     asset = attempt.pending[handle]
@@ -400,7 +399,7 @@ class Outputs(_Bound):
 
         return _codec.AAC_FRAME_SAMPLES
 
-    def save_image(self, image: object, *, format: str = "png") -> ImageAsset:
+    def save_image(self, image: object, *, format: str = "png") -> ImageFile:
         frame = as_frame(image)
         if format not in ("png", "webp"):
             raise OutputError(
@@ -408,14 +407,14 @@ class Outputs(_Bound):
                 code="encoder_unavailable",
             )
         return self._register_frame(
-            ImageAsset,
+            ImageFile,
             format,
             (frame.pixels,),
             {"width": frame.width, "height": frame.height, "mode": frame.mode},
             charge=len(frame.pixels),
         )
 
-    def save_audio(self, waveform: object, *, sample_rate: int, format: str = "flac") -> AudioAsset:
+    def save_audio(self, waveform: object, *, sample_rate: int, format: str = "flac") -> AudioFile:
         self._attempt.check_open("Outputs.save_audio")
         if format != "flac":
             raise OutputError(
@@ -428,7 +427,7 @@ class Outputs(_Bound):
         self._clip_row(clipped)
         channels, samples = planar.shape
         return self._register_frame(
-            AudioAsset,
+            AudioFile,
             "flac",
             (planar.data,),
             {"channels": channels, "samples": samples, "sample_rate": sample_rate},
@@ -443,7 +442,7 @@ class Outputs(_Bound):
         audio: object = None,
         sample_rate: int | None = None,
         format: str = "mp4",
-    ) -> VideoAsset:
+    ) -> VideoFile:
         self._attempt.check_open("Outputs.save_video")
         if format != "mp4":
             raise OutputError(
@@ -476,7 +475,7 @@ class Outputs(_Bound):
         parts = (video.data,) if planar is None else (video.data, planar.data)
         # h264/aac are lossy: the raw snapshot bounds nothing about the container, so the
         # registration charges nothing and the post phase bounds the encoded bytes.
-        return self._register_frame(VideoAsset, "mp4", parts, facts, charge=0)
+        return self._register_frame(VideoFile, "mp4", parts, facts, charge=0)
 
     def save_video_stream(self, events: Iterator[DecodedMediaEvent]) -> SavedVideo:
         """Consume one canonical event stream into one bounded, probed, atomic MP4."""
@@ -553,7 +552,7 @@ class Outputs(_Bound):
 
     def save_video_concat(
         self,
-        videos: Sequence[VideoAsset],
+        videos: Sequence[VideoFile],
         soundtrack: Callable[[Sequence[int]], Iterator[DecodedMediaEvent]],
     ) -> SavedVideo:
         """Join H.264 videos by packet copy under one newly encoded soundtrack.
@@ -571,7 +570,7 @@ class Outputs(_Bound):
         paths = []
         for video in videos:
             if (
-                not isinstance(video, VideoAsset)
+                not isinstance(video, VideoFile)
                 or video._local is None
                 or video._attempt != self._attempt.request_id
             ):
@@ -696,7 +695,7 @@ class Outputs(_Bound):
     ) -> SavedVideo:
         """Write, probe and atomically register one MP4; `feed` writes `source` and returns
         its audio samples. Only encoder failures become `output_encode`."""
-        handle = self._attempt.next_handle(VideoAsset.kind)
+        handle = self._attempt.next_handle(VideoFile.kind)
         tail = handle.rsplit("/", 1)[-1]
         temporary = self._attempt.spool / f".video-{tail}.partial"
         final = self._attempt.spool / f"video-{tail}"
@@ -759,7 +758,7 @@ class Outputs(_Bound):
             os.link(temporary, final)
             self._fsync_directory(final.parent)
             temporary.unlink()
-            asset = VideoAsset(
+            asset = VideoFile(
                 handle,
                 media_type="video/mp4",
                 size_bytes=size,
@@ -834,8 +833,8 @@ class Outputs(_Bound):
                 )
             )
 
-    def publish(self, output: str, asset: Asset, *, label: str = "") -> None:
-        """Show `asset` to the run's owner now, as a product of `output`: an asset field of
+    def publish(self, output: str, asset: File, *, label: str = "") -> None:
+        """Show `asset` to the run's owner now, as a product of `output`: a file field of
         this function's declared result (any other name warns and drops the product). A single
         field's product is replaced by each publish; a `list[...]` field grows by one.
         Returning the result is the last publish, so the returned value keeps what was
@@ -844,7 +843,7 @@ class Outputs(_Bound):
         publishes what it wants seen."""
         attempt = self._attempt
         attempt.check_open("Outputs.publish")
-        if not isinstance(asset, Asset):
+        if not isinstance(asset, File):
             raise OutputError("publish takes one saved or received asset", code="output_kind")
         # The log carries printable ASCII: anything else reads as "?", never a refusal.
         label = "".join(char if 0x20 <= ord(char) <= 0x7E else "?" for char in label[:256])
@@ -852,7 +851,7 @@ class Outputs(_Bound):
         attempt.shown.add(asset.ref)
         if attempt.outputs is not None and output not in attempt.outputs:
             declared = ", ".join(sorted(attempt.outputs)) or "none"
-            self._drop(output, f"its result declares asset outputs: {declared}")
+            self._drop(output, f"its result declares file outputs: {declared}")
             return
         if asset.ref in attempt.frames:
             settle_frame(attempt, asset.ref)
@@ -884,8 +883,8 @@ class Outputs(_Bound):
         self._attempt.emit("log", "undeclared output dropped", "warn", output=output, reason=why)
         warnings.warn(f"publish to undeclared output {output!r} dropped: {why}", stacklevel=3)
 
-    def save_bytes(self, data: bytes, *, media_type: str) -> FileAsset:
-        return self._register(data, FileAsset, media_type)
+    def save_bytes(self, data: bytes, *, media_type: str) -> File:
+        return self._register(data, File, media_type)
 
     def save_tree(self, path: Path | str) -> Tree:
         """Snapshot regular files now; native retention commits after the handler returns."""
@@ -937,9 +936,9 @@ class Outputs(_Bound):
 
     def save_file(
         self, path: Path | str, *, media_type: str = "application/octet-stream"
-    ) -> FileAsset:
+    ) -> File:
         """Copies immediately: a MUTABLE AUTHOR PATH is never retained (§3.4 step 2)."""
-        return self._register(Path(path).read_bytes(), FileAsset, media_type)
+        return self._register(Path(path).read_bytes(), File, media_type)
 
     def temporary_file(self, suffix: str = "") -> Path:
         """A bounded attempt-spool target for encoders that need a filesystem path.
@@ -1055,18 +1054,18 @@ class VideoJoin:
 
     def append(
         self,
-        video: VideoAsset,
+        video: VideoFile,
         soundtrack: Callable[[int], Iterable[DecodedMediaEvent]] = lambda frames: (),
         *,
         last: bool = False,
-    ) -> VideoAsset:
+    ) -> VideoFile:
         """Join `video` after the others with its stretch of the soundtrack: the audio chunks
         `soundtrack` returns given the video's frame count, continuing the joined sample
         clock. Each returned revision has a duration and seek index. `last` also closes
         the soundtrack; neither publishing nor closing re-encodes the joined media."""
         self._attempt.check_open("VideoJoin.append")
         if (
-            not isinstance(video, VideoAsset)
+            not isinstance(video, VideoFile)
             or video._local is None
             or video._attempt != self._attempt.request_id
         ):
@@ -1094,7 +1093,7 @@ class VideoJoin:
         if not self._join.parts:
             raise OutputError("a joined video needs at least one video", code="media_header")
         self._join.finish()
-        handle = self._attempt.next_handle(VideoAsset.kind)
+        handle = self._attempt.next_handle(VideoFile.kind)
         final = self._attempt.spool / f"video-{handle.rsplit('/', 1)[-1]}"
         with final.open("xb") as writer:
             for part, _ in self._join.parts:
@@ -1113,7 +1112,7 @@ class VideoJoin:
                 code="output_probe",
             )
         size, digest = self._outputs._measure_file(final)
-        asset = VideoAsset(
+        asset = VideoFile(
             handle,
             media_type="video/mp4",
             size_bytes=size,
@@ -1157,11 +1156,11 @@ class VideoJoin:
             for part, micros in self._join.parts
         )
 
-    def _revision(self) -> VideoAsset:
+    def _revision(self) -> VideoFile:
         """Publish one indexed byte identity for desktop and browser playback."""
         path = self._join.indexed_revision()
         handle = self._attempt.next_handle("revision")
-        revision = VideoAsset(
+        revision = VideoFile(
             handle,
             media_type="video/mp4",
             size_bytes=path.stat().st_size,

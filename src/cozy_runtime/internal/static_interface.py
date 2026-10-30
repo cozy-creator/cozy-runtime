@@ -5,10 +5,10 @@ compiles or evaluates a package module. No `importlib`, no `sys.path`, no `exec`
 `compile`, no annotation evaluation, no module top level. It reads text, parses it with
 `ast`, follows the package's own module-scope import graph (plus cozy-runtime's own source
 for `cozy_runtime.derive.*`), folds constants with a shared
-evaluator over literal and arithmetic nodes and values of the package's committed JSON assets
+evaluator over literal and arithmetic nodes and values of the package's committed JSON files
 (`author.data_values`), and translates every interface-bearing declaration into real types built
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
-`Annotated`, cozy-runtime's own asset, marker and service classes. Rendering is then
+`Annotated`, cozy-runtime's own file, marker and service classes. Rendering is then
 `schema.render`, the SAME renderer the import path uses, so the two derivations cannot drift
 by construction.
 
@@ -147,7 +147,7 @@ class Installed:
 
 @dataclass(frozen=True, slots=True)
 class Vocab:
-    """One closed-vocabulary name: `author.ImageAsset`, `msgspec.Struct`, `typing.Literal`."""
+    """One closed-vocabulary name: `author.ImageFile`, `msgspec.Struct`, `typing.Literal`."""
 
     key: str
 
@@ -296,16 +296,15 @@ _ENUM_BASES: dict[str, type[enum.Enum]] = {
 }
 #: Author-surface classes that translate to themselves in a TYPE position.
 _AUTHOR_TYPES = (
-    "Asset",
-    "ImageAsset",
-    "AudioAsset",
-    "VideoAsset",
-    "FileAsset",
+    "File",
+    "ImageFile",
+    "AudioFile",
+    "VideoFile",
     "Tree",
     "ModelArtifact",
     "Context",
     "AdjustmentRow",
-    "Assets",
+    "Files",
     "Settings",
     "Secrets",
     "QuantizationPlan",
@@ -313,8 +312,8 @@ _AUTHOR_TYPES = (
     "EncodingRule",
     "ImageRequest",
     "ImageResult",
-    "Reference",
-    "ImageReference",
+    "Asset",
+    "PictureAsset",
     "Box",
     "Region",
     "AspectRatio",
@@ -322,13 +321,13 @@ _AUTHOR_TYPES = (
     *(cls.__name__ for cls in SERVICES.values()),
 )
 #: Author-surface structs a package's struct may extend: the image interface (cr-219) and the
-#: named references (xs-135).
-_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult", "Reference", "ImageReference")
+#: named assets (xs-135).
+_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult", "Asset", "PictureAsset")
 #: Author-surface callables a folded constant may reach: each validates its own arguments.
 #: `data_values` reads committed JSON through the same function as the imported app.
 _AUTHOR_VALUES = (
-    "AssetBound",
-    "AssetLimits",
+    "FileBound",
+    "FileLimits",
     "ImagePreparation",
     "VideoPreparation",
     "AudioPreparation",
@@ -684,7 +683,7 @@ class Reader:
         if isinstance(node, ast.Name) and node.id in scope:
             return scope[node.id]
         if isinstance(node, ast.Name) and node.id == "__file__":
-            # The one dunder a data asset is addressed from: this module's own file.
+            # The one dunder a data file is addressed from: this module's own file.
             return str(module.path)
         if isinstance(node, ast.Attribute):
             base = self._attribute_base(module, node.value)
@@ -2067,7 +2066,7 @@ def _parameter_annotation(
 ) -> tuple[Module, ast.expr, Resolved | None]:
     """Follow declared aliases before classifying the parameter's role.
 
-    The full original annotation is still translated for Assets, preserving every
+    The full original annotation is still translated for Files, preserving every
     collection/element bound. Resolution never imports or evaluates the alias.
     """
     seen: set[tuple[Path, int]] = set()
@@ -2132,9 +2131,9 @@ def _callable(reader: Reader, registration: Registration) -> Declaration:
                 if parameter.capability:
                     services.append(parameter.capability)
                 continue
-            if vocab_name in ("Assets", "Annotated"):
+            if vocab_name in ("Files", "Annotated"):
                 if assets is not None:
-                    reader.refuse(module, arg, "a second Assets parameter", "static_unsupported")
+                    reader.refuse(module, arg, "a second Files parameter", "static_unsupported")
                 assets = assets_binding(arg.arg, reader.translate(module, arg.annotation))
                 continue
             if found.key in _author_structs():

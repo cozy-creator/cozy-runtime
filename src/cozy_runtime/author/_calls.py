@@ -21,7 +21,6 @@ import msgspec
 from cozy_runtime import _application_json as application_json
 from cozy_runtime import canonical_json
 from cozy_runtime.author._artifacts import ModelChoice
-from cozy_runtime.author._assets import Asset, Assets, Tree, asset_dec_hook
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import MediaReads
@@ -39,6 +38,7 @@ from cozy_runtime.author._executor_requests import (
     GpuRelease,
     ModelPrefetch,
 )
+from cozy_runtime.author._files import File, Files, Tree, asset_dec_hook
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import WARNINGS, Model
@@ -280,7 +280,7 @@ class PendingCall[R](Awaitable[R]):
 def _input_ref(value: object, request_id: str) -> str:
     """Forward only a verified input of this attempt; Creator rechecks its custody."""
     if (
-        isinstance(value, (Asset, Tree))
+        isinstance(value, (File, Tree))
         and value.hydrated
         and value._attempt == request_id
         and re.fullmatch(r"sha256:[0-9a-f]{64}", value.digest)
@@ -393,7 +393,7 @@ class _Broker:
                         "ModelChoice(ref=artifact)",
                         code="child.model_artifact_required",
                     )
-                if isinstance(value, Assets):
+                if isinstance(value, Files):
                     return [
                         {"asset": item, "label": item.label, "fidelity": item.fidelity}
                         for item in value._items
@@ -418,7 +418,7 @@ class _Broker:
             encoded = msgspec.to_builtins(
                 request,
                 enc_hook=lambda value: (
-                    value.ref if isinstance(value, (Asset, Tree)) else asset_value(value)
+                    value.ref if isinstance(value, (File, Tree)) else asset_value(value)
                 ),
             )
         except (TypeError, ValueError, msgspec.ValidationError) as exc:

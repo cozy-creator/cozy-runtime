@@ -1,4 +1,4 @@
-"""Decode host-granted results without widening the request asset decoder."""
+"""Decode host-granted results without widening the request file decoder."""
 
 from __future__ import annotations
 
@@ -9,22 +9,21 @@ from typing import Any
 
 import msgspec
 
-from cozy_runtime.author._assets import (
-    Asset,
-    AudioAsset,
-    FileAsset,
-    ImageAsset,
+from cozy_runtime.author._decode import MediaReads
+from cozy_runtime.author._files import (
+    AudioFile,
+    File,
+    ImageFile,
     Tree,
-    VideoAsset,
+    VideoFile,
     asset_inputs,
     bind,
     file_state,
 )
-from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._media import admits, normalize
 
 _DIGEST = re.compile(r"sha256:[0-9a-f]{64}")
-_ASSETS = {kind.kind: kind for kind in (FileAsset, ImageAsset, AudioAsset, VideoAsset)}
+_ASSETS = {kind.kind: kind for kind in (File, ImageFile, AudioFile, VideoFile)}
 
 
 class ByteResult(msgspec.Struct, frozen=True):
@@ -83,7 +82,7 @@ def decode(
     """Every native result leaf is replaced from the separately verified host grant."""
     if len(grants) > 32:
         raise ValueError("native result grant inventory exceeds its bound")
-    handles: dict[str, Asset | Tree] = {}
+    handles: dict[str, File | Tree] = {}
     for raw_grant in grants:
         grant = msgspec.convert(raw_grant, _Grant, strict=True)
         output_id = grant.output_id
@@ -91,11 +90,11 @@ def decode(
             raise ValueError("native result grant has a repeated or missing output ID")
         node = result_at(value, output_id)
         if not isinstance(node, dict):
-            raise ValueError("native result field is not an asset record")
+            raise ValueError("native result field is not a file record")
         declared = msgspec.convert(node, ByteResult, strict=True)
         kind = declared.kind
         if kind not in _ASSETS and kind != "tree":
-            raise ValueError("native result field has an invalid asset shape")
+            raise ValueError("native result field has an invalid file shape")
         digest, size = declared.digest, declared.size_bytes
         if kind == "tree":
             expected_size = msgspec.convert(raw_grant, _TreeGrant, strict=True).content_bytes
@@ -121,9 +120,9 @@ def decode(
             tree = Tree(digest, digest=digest, root=Path(grant.local), attempt=request_id)
             tree.size_bytes = size
             tree._read_guard = guard
-            handle: Asset | Tree = tree
+            handle: File | Tree = tree
         else:
-            asset: Asset = _ASSETS[kind](
+            asset: File = _ASSETS[kind](
                 digest,
                 digest=digest,
                 media_type=media_type,
@@ -150,15 +149,15 @@ def decode(
             ]
         return node
 
-    def granted(target: type[object], item: object) -> Asset | Tree:
+    def granted(target: type[object], item: object) -> File | Tree:
         if (
             isinstance(target, type)
-            and issubclass(target, (Asset, Tree))
+            and issubclass(target, (File, Tree))
             and isinstance(item, target)
             and any(item is handle for handle in handles.values())
         ):
             return item
-        raise TypeError("result asset is not a verified grant of this attempt")
+        raise TypeError("result file is not a verified grant of this attempt")
 
     result = msgspec.convert(replace(value, ""), type=result_type, dec_hook=granted, strict=True)
     if python_type is not None:
@@ -167,7 +166,7 @@ def decode(
         # retaining each granted native handle as the same object.
         result = msgspec.convert(
             msgspec.to_builtins(
-                result, builtin_types=(FileAsset, ImageAsset, AudioAsset, VideoAsset, Tree)
+                result, builtin_types=(File, ImageFile, AudioFile, VideoFile, Tree)
             ),
             type=python_type,
             dec_hook=granted,
@@ -183,7 +182,7 @@ def decode(
             if (bound.max_bytes is not None and asset.size_bytes > bound.max_bytes) or (
                 bound.media_types and asset.media_type not in bound.media_types
             ):
-                raise ValueError("native result exceeds its declared asset bound")
+                raise ValueError("native result exceeds its declared file bound")
         assert asset._local is not None
         bind(
             asset,

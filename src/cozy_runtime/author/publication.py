@@ -8,9 +8,9 @@ from typing import cast
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact, ObjectRef
-from cozy_runtime.author._assets import FileAsset
 from cozy_runtime.author._calls import _current
 from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._files import File
 
 
 class CheckpointRef(msgspec.Struct, frozen=True):
@@ -79,7 +79,7 @@ def publish_release(
 
 
 def attach_assessment(
-    checkpoint: CheckpointRef, *, report: FileAsset, workloads: FileAsset
+    checkpoint: CheckpointRef, *, report: File, workloads: File
 ) -> Awaitable[AssessmentRef]:
     """Attach a verified assessment and workload sidecar to a published checkpoint.
 

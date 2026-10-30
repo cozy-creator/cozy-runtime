@@ -205,7 +205,7 @@ def _type(rendered: Json) -> str:
         if "fields" in rendered:
             return "object"
         if "asset" in rendered:
-            return f"{rendered['asset']} asset"
+            return f"{rendered['asset']} file"
         if "literal" in rendered:
             return "|".join(repr(v) for v in _as_list(rendered["literal"]))
         if "union" in rendered:

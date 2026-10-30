@@ -39,17 +39,6 @@ import msgspec
 from cozy_runtime.author._activity import asides
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import (
-    Asset,
-    Assets,
-    GrantedInput,
-    ImageAsset,
-    InputMetadata,
-    Tree,
-    asset_inputs,
-    bind,
-    bind_tree,
-)
 from cozy_runtime.author._calls import _Broker, _current
 from cozy_runtime.author._context import CURRENT, Context, Device
 from cozy_runtime.author._decode import (
@@ -75,7 +64,18 @@ from cozy_runtime.author._errors import (
     unwind,
 )
 from cozy_runtime.author._executor_requests import Publish, Published
-from cozy_runtime.author._markers import AssetBound, ImagePreparation
+from cozy_runtime.author._files import (
+    File,
+    Files,
+    GrantedInput,
+    ImageFile,
+    InputMetadata,
+    Tree,
+    asset_inputs,
+    bind,
+    bind_tree,
+)
+from cozy_runtime.author._markers import FileBound, ImagePreparation
 from cozy_runtime.author._media import KIND_MEDIA, admits
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
@@ -276,13 +276,13 @@ class Invocation:
     author surface to reach around it (§2).
     """
     assets: Mapping[str, GrantedInput] = field(default_factory=dict)
-    """input_id -> the verified, spooled input asset (cr-012). The worker fetched it
+    """input_id -> the verified, spooled input file (cr-012). The worker fetched it
     under the grant, held it to its declared length through the one bounded reader, checked
-    its content digest and sniffed its bytes, all BEFORE acceptance. An `Asset` field whose
+    its content digest and sniffed its bytes, all BEFORE acceptance. An `File` field whose
     input_id is absent here never hydrates and refuses typed — same law as `trees`, one
     modality over: the grant IS the read capability, and a ref is never a location."""
     max_input_bytes: int | None = 64 << 20
-    """An explicit deployment ceiling narrows every field's own `AssetBound`.
+    """An explicit deployment ceiling narrows every field's own `FileBound`.
     None honors each installed field's declared bound, with 64 MiB for fields that
     declare none. A larger field never widens an undeclared sibling's allowance."""
     sources: Mapping[str, Weights[Any]] = field(default_factory=dict)
@@ -345,7 +345,7 @@ class PreparedRequest:
     features: RequestFeatures
     facts: object
     facts_digest: str | None
-    asset_bounds: Mapping[str, AssetBound | None] = field(default_factory=dict)
+    asset_bounds: Mapping[str, FileBound | None] = field(default_factory=dict)
     #: how this request's LoRAs are served (`LORA_MODE`): baked unless it asks per step
     lora: str = "bake"
     #: what preparing it waited for (its attention kernel's compile): its attempt's first stages
@@ -512,7 +512,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
         surface, result, attempt, grant_token=inv.calls.grant_token if inv.calls else None
     )
     attempt.closed = True
-    returned_handles: list[Asset | Tree] = [*assets_in(result), *trees_in(result)]
+    returned_handles: list[File | Tree] = [*assets_in(result), *trees_in(result)]
     return InvocationResult(
         result=result,
         outputs=tuple(
@@ -584,7 +584,7 @@ def _preflight(surface: Surface, overlay: Overlay) -> tuple[object, str | None]:
     args: list[object] = [_payload_value(surface, overlay.payload)]
     if spec.assets_parameter is not None:
         args.append(
-            Assets._from_bound(row.asset for row in getattr(overlay.payload, spec.assets_parameter))
+            Files._from_bound(row.asset for row in getattr(overlay.payload, spec.assets_parameter))
         )
     try:
         facts = spec.fn(*args)
@@ -614,12 +614,12 @@ def _payload_value(surface: Surface, payload: object) -> object:
 
 def _prepare_assets(
     surface: Surface, payload: object, metadata: Mapping[str, InputMetadata]
-) -> dict[str, AssetBound | None]:
+) -> dict[str, FileBound | None]:
     binding = surface.assets
     if binding is None:
         return {}
     values = getattr(payload, binding.parameter)
-    bounds: dict[str, AssetBound | None] = {}
+    bounds: dict[str, FileBound | None] = {}
     counts: dict[str, int] = {}
     limits = dict(binding.counts)
     for position, value in enumerate(values):
@@ -627,7 +627,7 @@ def _prepare_assets(
         row = metadata.get(input_id)
         if row is None or row.input_id != input_id or value.asset.ref != row.digest:
             raise InvalidRequest(
-                "Assets occurrence has no matching input binding",
+                "Files occurrence has no matching input binding",
                 code="asset_ungranted",
                 fields=[input_id],
             )
@@ -640,7 +640,7 @@ def _prepare_assets(
             options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == "file"]
         if len(options) != 1:
             raise InvalidRequest(
-                "Assets occurrence has an unsupported media type",
+                "Files occurrence has an unsupported media type",
                 code="asset_media_type",
                 fields=[input_id],
             )
@@ -648,7 +648,7 @@ def _prepare_assets(
         counts[cls.kind] = counts.get(cls.kind, 0) + 1
         if cls.kind in limits and counts[cls.kind] > limits[cls.kind]:
             raise InvalidRequest(
-                "Assets media kind count exceeds its declared limit",
+                "Files media kind count exceeds its declared limit",
                 code="asset_count",
                 fields=[binding.parameter],
             )
@@ -666,7 +666,7 @@ def _prepare_assets(
             bound = replace(bound, max_decoded_bytes=None) if declares else None
         bounds[input_id] = bound
     try:
-        Assets._from_bound(value.asset for value in values)
+        Files._from_bound(value.asset for value in values)
     except ValueError as exc:
         raise InvalidRequest(str(exc), code="asset_labels", fields=[binding.parameter]) from exc
     return bounds
@@ -679,15 +679,15 @@ def _reaches(annotation: object, kind: type, depth: int = 0) -> bool:
     """Whether `kind` is reachable from ONE annotation, THROUGH containers and unions.
 
     The type walker emits a node per FIELD and descends struct-bearing members, so a
-    `list[ImageAsset]` field is emitted as a node whose annotation is the LIST — and asking
-    `issubclass(list[ImageAsset], Asset)` is false. That made a list of assets declare no
-    assets, so `_hydrate` was skipped and every element arrived unhydrated: `read_bytes()`
+    `list[ImageFile]` field is emitted as a node whose annotation is the LIST — and asking
+    `issubclass(list[ImageFile], File)` is false. That made a list of files declare no
+    files, so `_hydrate` was skipped and every element arrived unhydrated: `read_bytes()`
     then refused with `asset_bytes_unavailable`, which reads like a preflight violation and
     is nothing of the kind. Found live by ev-003's judge package (decisions #303), worked
-    around there by wrapping each asset in a one-asset struct.
+    around there by wrapping each file in a one-asset struct.
 
     The SILENT half was the defect. It is fixed rather than refused, because a
-    `list[ImageAsset]` is an ordinary declaration and `assets_in` already collects one
+    `list[ImageFile]` is an ordinary declaration and `assets_in` already collects one
     correctly at the VALUE level — only this predicate could not see it.
     """
     if depth > 8:  # a bound, not a cycle guard: annotations are trees, and shallow ones
@@ -708,9 +708,9 @@ def _declares(tp: object, kind: type) -> bool:
 
 
 def declares_assets(tp: object) -> bool:
-    """Whether a schema can carry an asset at all — a describe-time fact, so a handler
-    with no asset fields never walks a value looking for one."""
-    return _declares(tp, Asset)
+    """Whether a schema can carry a file at all — a describe-time fact, so a handler
+    with no file fields never walks a value looking for one."""
+    return _declares(tp, File)
 
 
 def declares_trees(tp: object) -> bool:
@@ -760,9 +760,9 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
 
 
 def _check_input(
-    asset: Asset,
+    asset: File,
     granted: InputMetadata,
-    bound: AssetBound | None,
+    bound: FileBound | None,
     cap: int | None,
     expected_order: int,
 ) -> None:
@@ -811,15 +811,15 @@ def _check_input(
 def _hydrate(
     payload: object,
     inv: Invocation,
-    assets_bounds: Mapping[str, AssetBound | None] = {},
+    assets_bounds: Mapping[str, FileBound | None] = {},
     record: Attempt | None = None,
 ) -> None:
-    """Bind every declared input asset to the bytes the GRANT already materialized (§1.3).
+    """Bind every declared input file to the bytes the GRANT already materialized (§1.3).
 
     Symmetric with `_materialize_trees` and for the same reason: an ungranted ref is a
     typed refusal here rather than a `FileNotFoundError` deep in the body. What changed at
     cr-012 is where the bytes come from — this used to read the ref as a LOCAL PATH and
-    copy it, which made every asset ref a filesystem read of the caller's choosing. Now
+    copy it, which made every file ref a filesystem read of the caller's choosing. Now
     the worker fetches, verifies and spools before acceptance, and the only thing this
     side does is match an identified input against the FIELD it fills, which is the half
     only this side knows.
@@ -831,7 +831,7 @@ def _hydrate(
         granted = inv.assets.get(item.input_id)
         if granted is None:
             raise InvalidRequest(
-                f"input asset {item.input_id!r} (ref {item.asset.ref!r}) is not granted to this "
+                f"input file {item.input_id!r} (ref {item.asset.ref!r}) is not granted to this "
                 f"attempt: this run materialized {sorted(inv.assets) or 'no assets'}. An "
                 "asset is a digest-verified READ CAPABILITY minted by the RecordOwner, "
                 "never a location a request may name",
@@ -845,7 +845,7 @@ def _hydrate(
             item.asset.size_bytes,
         ) != (granted.digest, granted.media_type, granted.length):
             raise InvalidRequest(
-                "Assets metadata changed during hydration",
+                "Files metadata changed during hydration",
                 code="asset_binding_changed",
                 fields=[item.input_id],
             )
@@ -861,7 +861,7 @@ def _hydrate(
             max_decoded_bytes=(bound.max_decoded_bytes or 0) if bound is not None else 0,
             input_id=item.input_id,
             order=item.order,
-            read_guard=(lambda: record.check_open("Asset.read_bytes")) if record else None,
+            read_guard=(lambda: record.check_open("File.read_bytes")) if record else None,
             media=record.media if record else None,
         )
         if item.input_id not in assets_bounds:
@@ -870,7 +870,7 @@ def _hydrate(
             prepare_duration(item.asset, record)
 
 
-def prepare_duration(asset: Asset, record: Attempt) -> None:
+def prepare_duration(asset: File, record: Attempt) -> None:
     """Hold a hydrated input to its declared duration policy before the handler runs.
 
     Shorter than `min_seconds`, or longer than `max_seconds` under `excess="refuse"`,
@@ -953,7 +953,7 @@ def _inject(
         elif param.role == "payload":
             kwargs[param.name] = _payload_value(surface, overlay.payload)
         elif param.role == "assets":
-            kwargs[param.name] = Assets._from_bound(
+            kwargs[param.name] = Files._from_bound(
                 row.asset for row in getattr(overlay.payload, param.name)
             )
         elif param.role == "wire":
@@ -1059,14 +1059,14 @@ def _call(
 # ------------------------------------------------------------------------- result
 
 
-def assets_in(value: object, _seen: set[int] | None = None) -> list[Asset]:
-    """Every asset reachable from a value, in declaration order.
+def assets_in(value: object, _seen: set[int] | None = None) -> list[File]:
+    """Every file reachable from a value, in declaration order.
 
-    Assets are collected EVERY time they appear — the cycle guard covers containers only,
+    Files are collected EVERY time they appear — the cycle guard covers containers only,
     because "the same handle returned twice" is exactly what step 1 must catch.
     """
     seen = _seen if _seen is not None else set()
-    if isinstance(value, Asset):
+    if isinstance(value, File):
         return [value]
     if id(value) in seen:
         return []
@@ -1075,14 +1075,14 @@ def assets_in(value: object, _seen: set[int] | None = None) -> list[Asset]:
         return [a for item in value for a in assets_in(item, seen)]
     if isinstance(value, dict):
         return [a for item in value.values() for a in assets_in(item, seen)]
-    found: list[Asset] = []
+    found: list[File] = []
     for member in field_values(value).values():
         found += assets_in(member, seen)
     return found
 
 
 def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> None:
-    """Every returned asset meets its result field's AssetBound, whether this attempt
+    """Every returned file meets its result field's FileBound, whether this attempt
     saved it or forwarded a child's grant: the child's own bound proves nothing here."""
     for item in asset_inputs(result):
         asset, bound = item.asset, item.bound
@@ -1107,7 +1107,7 @@ def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> 
         frame = attempt.frames.get(asset.ref)
         if frame is not None:
             decoded = frame.raw_bytes
-        elif isinstance(asset, ImageAsset) and asset._local is not None:
+        elif isinstance(asset, ImageFile) and asset._local is not None:
             try:
                 decoded = image_decoded_bytes(asset._local)
             except Exception as exc:
@@ -1158,12 +1158,12 @@ def _validate_result(
             )
 
     returned: list[str] = []
-    output_handles: list[Asset | Tree] = [*assets_in(result), *trees_in(result)]
+    output_handles: list[File | Tree] = [*assets_in(result), *trees_in(result)]
     pending_handles = (set(attempt.pending) - set(attempt.committed_files)) | set(
         attempt.pending_trees
     )
     if sum(asset.size_bytes for asset in output_handles) > attempt.max_output_bytes:
-        raise OutputError("returned assets exceed the output byte budget", code="output_too_large")
+        raise OutputError("returned files exceed the output byte budget", code="output_too_large")
     for asset in output_handles:
         received = grant_token is not None and asset._grant_token is grant_token and asset.hydrated
         if asset._attempt != attempt.request_id or (
@@ -1183,7 +1183,7 @@ def _validate_result(
 
     _check_result_bounds(surface, result, attempt)
 
-    # A published asset was delivered as a product already; returning it is optional.
+    # A published file was delivered as a product already; returning it is optional.
     unreturned = sorted(pending_handles - set(returned) - attempt.shown)
     if unreturned:
         raise OutputError(

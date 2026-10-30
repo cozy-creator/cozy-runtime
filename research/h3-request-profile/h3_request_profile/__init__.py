@@ -9,16 +9,16 @@ from cozy_runtime.models.minimax_h3.model import H3Model, H3TurboBase, H3TurboLo
 
 from cozy_runtime.author import (
     App,
-    AssetBound,
-    AssetLimits,
-    Assets,
     Context,
-    FileAsset,
-    ImageAsset,
+    File,
+    FileBound,
+    FileLimits,
+    Files,
+    ImageFile,
     Outputs,
     Telemetry,
     Tree,
-    VideoAsset,
+    VideoFile,
 )
 
 from .instrument import profile_request, retained_handler, software_versions, unprofiled_request
@@ -34,7 +34,7 @@ _DEFAULT_MODEL_LADDER = [
 _DEFAULT_TURBO_LORA_LADDER = [
     {"gpu": "5090", "gpus": 1, "lane": "paul/minimax-h3-turbo-lora@1.0.0-audit.1/pdd8"}
 ]
-KeyframeAssets = Annotated[Assets[ImageAsset], AssetLimits(images=2)]
+KeyframeAssets = Annotated[Files[ImageFile], FileLimits(images=2)]
 
 
 class TurboInput(msgspec.Struct, kw_only=True):
@@ -52,14 +52,14 @@ class RegularInput(TurboInput, kw_only=True):
 
 
 class RenderResult(msgspec.Struct):
-    video: Annotated[VideoAsset, AssetBound(media_types=("video/mp4",))]
+    video: Annotated[VideoFile, FileBound(media_types=("video/mp4",))]
     warnings: list[str]
 
 
 class ProfileResult(msgspec.Struct):
     render: RenderResult
-    trace: Annotated[Tree, AssetBound(max_bytes=64 << 30)]
-    summary: Annotated[FileAsset, AssetBound(media_types=("application/json",), max_bytes=64 << 20)]
+    trace: Annotated[Tree, FileBound(max_bytes=64 << 30)]
+    summary: Annotated[File, FileBound(media_types=("application/json",), max_bytes=64 << 20)]
 
 
 class EnvironmentInput(msgspec.Struct, forbid_unknown_fields=True):

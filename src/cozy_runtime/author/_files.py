@@ -1,0 +1,745 @@
+"""Typed files — the ONE file type, both directions (§1.3/§3.4).
+
+Input files are ordinary typed request fields or an explicit ordered Files input.
+Their bytes arrive digest-verified; output files are what `out.save_*` returns and
+what the result struct declares. Both use the same handles and granted reader.
+
+`File` is deliberately NOT a msgspec-native type. The only way one comes into existence
+from the wire is `asset_dec_hook`, which accepts a REF STRING and nothing else — so
+hydration state is unforgeable by request data rather than merely undocumented, and local
+paths cannot enter a schema, a digest, or serialized output.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import stat
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from copy import copy
+from dataclasses import dataclass, is_dataclass
+from fractions import Fraction
+from pathlib import Path
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Final,
+    Literal,
+    Self,
+    get_args,
+    get_type_hints,
+    overload,
+)
+
+import msgspec
+from PIL.Image import Image as Image
+
+from cozy_runtime.author._errors import (
+    CapabilityError,
+    ConformanceError,
+    InvalidRequest,
+    PreflightViolation,
+    RuntimeFailure,
+)
+from cozy_runtime.author._markers import PREPARATIONS, FileBound, Preparation
+from cozy_runtime.author._walker import field_values, strip, unwrap_optional
+
+if TYPE_CHECKING:
+    from cozy_runtime.author._decode import (
+        AudioProbe,
+        DecodedAudio,
+        DecodedMediaStream,
+        DecodedVideo,
+        ImageProbe,
+        MediaReads,
+        Probe,
+        VideoProbe,
+    )
+
+_UNBOUND: Final = ""
+Fidelity = Literal["auto", "low", "medium", "high"]
+
+
+# Private process-handoff facts, never input identity or wire metadata.
+FileState = tuple[int, int, int, int, int]
+
+
+def file_state(path: Path) -> FileState:
+    try:
+        facts = path.lstat()
+    except OSError as exc:
+        raise RuntimeFailure(
+            "verified input file is unavailable", code="input_unavailable"
+        ) from exc
+    if not stat.S_ISREG(facts.st_mode):
+        raise RuntimeFailure("verified input is no longer a regular file", code="input_changed")
+    return (facts.st_dev, facts.st_ino, facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns)
+
+
+class File:
+    """A digest-identified immutable blob, referenced by an opaque handle."""
+
+    __slots__ = (
+        "_attempt",
+        "_end",
+        "_fidelity",
+        "_file_state",
+        "_grant_token",
+        "_input_id",
+        "_label",
+        "_local",
+        "_max_decoded_bytes",
+        "_media",
+        "_position",
+        "_preparation",
+        "_probed",
+        "_read_guard",
+        "digest",
+        "media_type",
+        "ref",
+        "size_bytes",
+    )
+
+    kind: ClassVar[str] = "file"
+
+    def __init__(
+        self,
+        ref: str,
+        *,
+        media_type: str = "",
+        size_bytes: int = 0,
+        digest: str = "",
+        local: Path | None = None,
+        attempt: str = _UNBOUND,
+    ) -> None:
+        self.ref = ref
+        self.media_type = media_type
+        self.size_bytes = size_bytes
+        self.digest = digest
+        self._local = local
+        self._attempt = attempt
+        self._input_id = ""
+        self._preparation: Preparation | None = None
+        self._end: Fraction | None = None
+        self._probed: Probe | None = None
+        self._media: MediaReads | None = None
+        self._fidelity: Fidelity = "auto"
+        self._label = ""
+        self._position = -1
+        self._read_guard: Callable[[], None] | None = None
+        self._max_decoded_bytes = 0
+        self._file_state: FileState | None = None
+        self._grant_token: object | None = None
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.ref!r}, media_type={self.media_type!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, File) and type(other) is type(self) and other.ref == self.ref
+
+    def __hash__(self) -> int:
+        return hash((type(self).__name__, self.ref))
+
+    @property
+    def id(self) -> str:
+        """This input occurrence's request-local ID; empty before it is bound."""
+        return self._input_id
+
+    @property
+    def position(self) -> int:
+        """The input binding's order; -1 before an occurrence is assigned."""
+        return self._position
+
+    @property
+    def label(self) -> str:
+        """An optional caller-supplied name for this occurrence; empty when omitted."""
+        return self._label
+
+    @property
+    def fidelity(self) -> Fidelity:
+        """Per-occurrence model hint; the generic loader never resizes because of it."""
+        return self._fidelity
+
+    def with_fidelity(self, fidelity: Fidelity) -> Self:
+        if fidelity not in get_args(Fidelity):
+            raise ValueError("asset fidelity must be auto, low, medium or high")
+        result = copy(self)
+        result._fidelity = fidelity
+        return result
+
+    def with_label(self, label: str) -> Self:
+        """Name a copy of this handle without changing its bytes or the original."""
+        if not isinstance(label, str):
+            raise TypeError("a file label must be a string")
+        result = copy(self)
+        result._label = label
+        return result
+
+    @property
+    def hydrated(self) -> bool:
+        """True once the worker verified the granted file at its local path."""
+        return self._local is not None
+
+    def read_bytes(self) -> bytes:
+        """The verified bytes. Refuses before hydration — preflight sees METADATA ONLY."""
+        if self._local is None:
+            raise PreflightViolation(
+                f"file {self.ref!r} has no bytes here: preflight and describe read counts, "
+                "kinds and typed metadata only — bytes exist after hydration (§1.3)",
+                code="asset_bytes_unavailable",
+            )
+        if self._read_guard is not None:
+            self._read_guard()
+        self._check_file()
+        try:
+            with self._local.open("rb") as source:
+                data = source.read(self.size_bytes + 1) if self._file_state else source.read()
+            if self._file_state and len(data) != self.size_bytes:
+                raise RuntimeFailure("input file size changed during read", code="input_changed")
+            return data
+        finally:
+            self._check_file()
+
+    def _reads(self) -> MediaReads:
+        """The attempt reader this hydrated handle reads through."""
+        if self._local is None:
+            raise PreflightViolation(
+                f"file {self.ref!r} has no bytes here: preflight and describe read counts, "
+                "kinds and typed metadata only — media is read after hydration",
+                code="asset_bytes_unavailable",
+            )
+        if self._media is None:
+            raise CapabilityError(
+                f"file {self.ref!r} is not a granted media input of a running attempt; an "
+                "output becomes readable when it is granted as an input",
+                code="media_unreadable",
+                fields=[self._input_id] if self._input_id else (),
+            )
+        return self._media
+
+    def _check_file(self) -> None:
+        if self._file_state is not None and (
+            self._local is None or file_state(self._local) != self._file_state
+        ):
+            raise RuntimeFailure(
+                "input file changed after verification; keep sources unchanged until completion",
+                code="input_changed",
+                fields=[self._input_id] if self._input_id else (),
+            )
+
+    def row(self) -> dict[str, Any]:
+        """The manifest row. Names the fields it emits, so no local path can leak. A
+        registered frame nobody has encoded yet (cr-079) has no size or digest to claim,
+        and the row says so by omission: the output manifest is where those facts live."""
+        row: dict[str, Any] = {"ref": self.ref, "kind": self.kind, "media_type": self.media_type}
+        if self.digest:
+            row["size_bytes"] = self.size_bytes
+            row["digest"] = self.digest
+        return row
+
+
+class ImageFile(File):
+    """An image input. `read()` decodes it once per call, charging the attempt budget."""
+
+    kind: ClassVar[str] = "image"
+
+    def read(self, *, mode: Literal["RGB", "RGBA"] = "RGB") -> Image:
+        """Display-oriented pixels with the field's `ImagePreparation` applied. RGB
+        composites transparency over white; RGBA keeps it (opaque sources read alpha 255)."""
+        return self._reads().image(self, mode)
+
+    def probe(self) -> ImageProbe:
+        """Header geometry: `width`/`height` are what `read()` returns. No decode."""
+        return self._reads().probe(self)  # type: ignore[return-value]
+
+
+class AudioFile(File):
+    """An audio input, read at its native rate. Its preparation may end it early."""
+
+    kind: ClassVar[str] = "audio"
+
+    def probe(self) -> AudioProbe:
+        """Header facts; `duration` is the prepared length, `source_duration` the file's."""
+        return self._reads().probe(self)  # type: ignore[return-value]
+
+    def read(self, *, end: float | Fraction | None = None) -> DecodedAudio:
+        """PCM from the first sample to `end` seconds (exact sample), retained in full."""
+        return self._reads().audio(self, end=end)
+
+    def stream(self, *, end: float | Fraction | None = None) -> DecodedMediaStream:
+        """The same PCM as a context-managed stream, bounded per chunk."""
+        return self._reads().stream(self, end=end, audio=True, pictures=True)
+
+
+class VideoFile(File):
+    """A video input. Reads never resize pixels; its preparation may end it early."""
+
+    kind: ClassVar[str] = "video"
+
+    def probe(self) -> VideoProbe:
+        """Display-oriented header facts; `duration` is the prepared length. No decode."""
+        return self._reads().probe(self)  # type: ignore[return-value]
+
+    def read(
+        self,
+        *,
+        end: float | Fraction | None = None,
+        fps: float | Fraction | None = None,
+        audio: bool = True,
+    ) -> DecodedVideo:
+        """Every frame starting before `end` and the soundtrack cut at `end`.
+
+        `end` counts seconds from the first frame; the last frame's duration is clipped to
+        it. `fps` maps the frames onto a constant clock starting at 0: each frame shows until
+        the next starts, rounded to the nearest slot, and a repeated frame is the same bytes.
+        """
+        return self._reads().video(self, end=end, fps=fps, audio=audio)
+
+    def stream(
+        self,
+        *,
+        end: float | Fraction | None = None,
+        audio: bool = True,
+        pictures: bool = True,
+    ) -> DecodedMediaStream:
+        """Time-ordered frames and PCM bounded by `end`; `pictures=False` reads only the
+        soundtrack, without decoding a picture."""
+        return self._reads().stream(self, end=end, audio=audio, pictures=pictures)
+
+
+@dataclass(frozen=True, slots=True)
+class FileInfo:
+    """Readonly declared input metadata; accessing it never reads or decodes bytes."""
+
+    id: str
+    position: int
+    label: str
+    fidelity: Fidelity
+    kind: str
+    media_type: str
+    size_bytes: int
+    digest: str
+
+
+class Files[T](Sequence[T]):
+    """Ordered granted input handles, accessed by position or an optional unique label.
+
+    ``Files[ImageFile | VideoFile | AudioFile]`` yields the handles themselves; each
+    reads through the attempt's one media reader (`read`, `stream`, `probe`).
+    ``info(key)`` exposes metadata without reading, including during preflight.
+    """
+
+    __slots__ = ("_items",)
+
+    def __init__(self, values: Iterable[File] = ()) -> None:
+        items: list[File] = []
+        for position, value in enumerate(values):
+            if not isinstance(value, File):
+                raise TypeError("Files construction accepts granted file handles")
+            item = copy(value)
+            item._input_id = f"assets.{position}.asset"
+            item._position = position
+            items.append(item)
+        self._items = tuple(items)
+        self._check_labels()
+
+    @classmethod
+    def _from_bound(cls, values: Iterable[File]) -> Files[T]:
+        """Retain exact slot IDs/order after binding; no byte acquisition or decode."""
+        result = cls()
+        items: list[File] = []
+        seen: set[str] = set()
+        for position, value in enumerate(values):
+            if not isinstance(value, File):
+                raise TypeError("Files accepts typed file handles")
+            if not value.id or value.id in seen or value.position != position:
+                raise ValueError("bound Files requires distinct input IDs in binding order")
+            seen.add(value.id)
+            items.append(copy(value))
+        result._items = tuple(items)
+        result._check_labels()
+        return result
+
+    def _check_labels(self) -> None:
+        labels = [item.label for item in self._items if item.label]
+        if len(labels) != len(set(labels)):
+            raise ValueError("nonempty file labels must be unique within the collection")
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __iter__(self) -> Iterator[T]:
+        return (self[index] for index in range(len(self)))
+
+    def _index(self, key: int | str) -> int:
+        if isinstance(key, str):
+            if key:
+                for index, item in enumerate(self._items):
+                    if item.label == key:
+                        return index
+            raise KeyError(key)
+        index = key if key >= 0 else len(self) + key
+        if not 0 <= index < len(self):
+            raise IndexError(key)
+        return index
+
+    @overload
+    def __getitem__(self, key: int | str) -> T: ...
+
+    @overload
+    def __getitem__(self, key: slice) -> Files[T]: ...
+
+    def __getitem__(self, key: int | str | slice) -> T | Files[T]:
+        if isinstance(key, slice):
+            return self.select(*range(len(self))[key])
+        return self._items[self._index(key)]  # type: ignore[return-value]
+
+    @overload
+    def get(self, key: int | str, default: None = None) -> T | None: ...
+
+    @overload
+    def get[D](self, key: int | str, default: D) -> T | D: ...
+
+    def get(self, key: int | str, default: object = None) -> object:
+        """Read an optional occurrence, returning default only when the key is absent."""
+        try:
+            index = self._index(key)
+        except (IndexError, KeyError):
+            return default
+        return self[index]
+
+    def info(self, key: int | str) -> FileInfo:
+        item = self._items[self._index(key)]
+        return FileInfo(
+            item.id,
+            item.position,
+            item.label,
+            item.fidelity,
+            item.kind,
+            item.media_type,
+            item.size_bytes,
+            item.digest,
+        )
+
+    def select(self, *keys: int | str) -> Files[T]:
+        """Select/reorder occurrences without decoding or changing their granted bytes."""
+        return Files(self._items[self._index(key)] for key in keys)
+
+    def by_id(self, input_id: str) -> T:
+        for index, item in enumerate(self._items):
+            if item.id == input_id:
+                return self[index]
+        raise KeyError(input_id)
+
+    def by_label(self, label: str) -> T:
+        return self[label]
+
+
+MEDIA_KINDS = frozenset({"image", "video", "audio"})
+
+
+def field_preparation(annotation: object, markers: Sequence[object]) -> Preparation | None:
+    """The one preparation a field's markers declare, checked against the field's kinds."""
+    found = [marker for marker in markers if isinstance(marker, PREPARATIONS)]
+    if not found:
+        return None
+    if len(found) > 1:
+        raise ConformanceError(
+            "a field declares at most one preparation", code="preparation_target"
+        )
+    preparation = found[0]
+    if preparation.kind not in asset_kinds(annotation):
+        raise ConformanceError(
+            f"{type(preparation).__name__} annotates a field with no {preparation.kind} file",
+            code="preparation_target",
+        )
+    return preparation
+
+
+def asset_kinds(annotation: object) -> frozenset[str]:
+    """File kinds reached through containers/unions, stopping at nested records.
+
+    A bound on ``list[ImageFile]`` belongs to that field. A bound on
+    ``list[SomeReference]`` does not: the concrete reference record owns the bound on its
+    own file field. Stopping at records keeps tagged-union reference schemas from growing
+    a second, lossy path-based authority over their leaf fields.
+    """
+    base, _ = strip(annotation)
+    base, _ = unwrap_optional(base)
+    if isinstance(base, type):
+        if base is Tree:
+            return frozenset({"tree"})
+        if issubclass(base, File):
+            return frozenset({base.kind})
+        return frozenset()
+    return frozenset(kind for argument in get_args(base) for kind in asset_kinds(argument))
+
+
+class Tree:
+    """A digest-verified MATERIALIZED input tree — the typed job input (jobs.md §1).
+
+    A model, dataset or checkpoint input is an ordinary typed request FIELD, and the local
+    path rides the field's VALUE (`payload.base_model.path`) rather than a context accessor.
+    `resume_from: Tree | None` is therefore just another verified input, never a reserved
+    payload name (§2).
+
+    The path exists only after the runtime materialized the tree under THIS attempt's grant.
+    A field naming a tree the grant does not cover never hydrates, so a job cannot read one
+    it was not granted — the capability is the grant, and there is no ambient store handle.
+    """
+
+    __slots__ = (
+        "_attempt",
+        "_grant_token",
+        "_read_guard",
+        "_root",
+        "digest",
+        "ref",
+        "size_bytes",
+    )
+
+    kind: ClassVar[str] = "tree"
+
+    def __init__(
+        self, ref: str, *, digest: str = "", root: Path | None = None, attempt: str = _UNBOUND
+    ) -> None:
+        self.ref = ref
+        self.digest = digest
+        self._root = root
+        self._attempt = attempt
+        self.size_bytes = 0
+        self._read_guard: Callable[[], None] | None = None
+        self._grant_token: object | None = None
+
+    def __repr__(self) -> str:
+        return f"Tree({self.ref!r}, hydrated={self.hydrated})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, Tree) and other.ref == self.ref
+
+    def __hash__(self) -> int:
+        return hash(("Tree", self.ref))
+
+    @property
+    def hydrated(self) -> bool:
+        return self._root is not None
+
+    @property
+    def path(self) -> Path:
+        """The materialized tree's root. Refuses before hydration — never a silent miss."""
+        if self._root is None:
+            raise CapabilityError(
+                f"input tree {self.ref!r} was never materialized for this attempt: a tree is "
+                "granted, verified and materialized before the body runs, and a job cannot "
+                "reach one it was not granted",
+                code="tree_unhydrated",
+            )
+        if self._read_guard is not None:
+            self._read_guard()
+        return self._root
+
+    def files(self) -> tuple[Path, ...]:
+        """Every regular file in the tree, sorted. The whole read surface of an input."""
+        return tuple(p for p in sorted(self.path.rglob("*")) if p.is_file())
+
+    def row(self) -> dict[str, Any]:
+        return {
+            "ref": self.ref,
+            "kind": self.kind,
+            "digest": self.digest,
+            "size_bytes": self.size_bytes,
+        }
+
+
+def asset_dec_hook(target: type, obj: Any) -> Any:
+    """msgspec `dec_hook` for file and tree request fields: a bare ref STRING, never a
+    record.
+
+    Anything else — a mapping carrying `local`, a pre-filled digest — is refused, so the
+    request cannot hand itself a hydrated handle or dictate identity-bearing fields.
+    """
+    if isinstance(target, type) and issubclass(target, (File, Tree)):
+        if not isinstance(obj, str):
+            raise TypeError(
+                f"{target.__name__} takes a reference string; "
+                f"got {type(obj).__name__} — hydration state is never wire data"
+            )
+        return target(obj)
+    raise NotImplementedError(f"no decoder for {target!r}")
+
+
+def digest_bytes(data: bytes) -> str:
+    return "blake2b:" + hashlib.blake2b(data, digest_size=16).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
+class InputMetadata:
+    """Identity and declared metadata from one input binding, before byte hydration."""
+
+    input_id: str
+    media_type: str
+    digest: str
+    length: int
+    order: int = 0
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GrantedInput(InputMetadata):
+    """One input the worker verified at its granted or materialized local path.
+
+    Everything on it was established BEFORE acceptance: the bytes were read under the
+    grant through the one bounded reader, checked against the grant's declared length and
+    content digest, and sniffed. The executor never re-fetches and never re-hashes — it
+    matches this against the FIELD it is about to fill, which is the half only it knows.
+    """
+
+    local: Path
+    file_state: FileState | None = None
+
+
+def bind(
+    asset: File,
+    *,
+    local: Path,
+    attempt: str,
+    media_type: str,
+    digest: str,
+    length: int,
+    max_decoded_bytes: int = 0,
+    input_id: str = "",
+    order: int = 0,
+    read_guard: Callable[[], None] | None = None,
+    source_state: FileState | None = None,
+    media: MediaReads | None = None,
+) -> None:
+    """Hydrate a file in place. Runtime-only: author code has no path into this.
+
+    The facts come from the caller because the caller is the runtime and the runtime
+    already established them under the grant. Re-reading the file here to recompute a
+    digest — which is what this did — reads every input twice and produces a SECOND
+    identity for one object, so a handler comparing `asset.digest` to the one the
+    RecordOwner granted would find two different spellings of the same bytes.
+    """
+    if asset._attempt not in (_UNBOUND, attempt):
+        raise CapabilityError(
+            f"file {asset.ref!r} belongs to attempt {asset._attempt!r}", code="foreign_asset"
+        )
+    asset._local = local
+    asset._file_state = source_state
+    asset._attempt = attempt
+    asset._input_id = input_id
+    asset._position = order
+    asset._read_guard = read_guard
+    asset.media_type = media_type
+    asset.size_bytes = length
+    asset.digest = digest
+    asset._max_decoded_bytes = max_decoded_bytes
+    asset._media = media
+    asset._probed = None
+
+
+def bind_tree(tree: Tree, *, root: Path, digest: str, attempt: str) -> None:
+    """Materialize an input tree in place. Runtime-only, like `bind`."""
+    if tree._attempt not in (_UNBOUND, attempt):
+        raise CapabilityError(
+            f"tree {tree.ref!r} belongs to attempt {tree._attempt!r}", code="foreign_tree"
+        )
+    tree._root = root
+    tree.digest = digest
+    tree._attempt = attempt
+
+
+@dataclass(frozen=True, slots=True)
+class AssetInput:
+    """One typed File occurrence and its lossless request address."""
+
+    input_id: str
+    order: int
+    asset: File
+    bound: FileBound | None
+    segments: tuple[str | int, ...]
+    preparation: Preparation | None = None
+
+
+def asset_inputs(payload: object) -> list[AssetInput]:
+    """Every input file with its identity, order, and concrete typed-field bound.
+
+    `input_id` is the payload FIELD PATH with the list index included, which is
+    inputs are identified, ordered subjects and
+    never a digest-sorted anonymous list. `order` is the position within the containing
+    list — 0 for a scalar field — because for H3's mixed reference sets the ORDER IS MODEL
+    INPUT, not a presentation fact, and two files with equal bytes are two subjects.
+
+    Deliberately a second walk beside `assets_in`: that one answers "is this handle mine",
+    which is a question about identity and must collect a repeat, while this one answers
+    "which grant entry fills this field", which is a question about position.
+    """
+    found: list[AssetInput] = []
+
+    def walk_value(
+        value: object,
+        segments: tuple[str | int, ...],
+        order: int,
+        seen: set[int],
+        bound: FileBound | None,
+        preparation: Preparation | None,
+    ) -> None:
+        if isinstance(value, File):
+            bad = [part for part in segments if isinstance(part, str) and (not part or "." in part)]
+            if bad:
+                raise InvalidRequest(
+                    "asset field path segments must be non-empty and contain no '.': "
+                    + ", ".join(repr(part) for part in bad),
+                    code="asset_input_path_unsupported",
+                )
+            input_id = ".".join(str(part) for part in segments)
+            prepared = preparation if preparation and preparation.kind == value.kind else None
+            found.append(AssetInput(input_id, order, value, bound, segments, prepared))
+            return
+        if isinstance(value, Tree) or id(value) in seen:
+            return
+        seen.add(id(value))
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk_value(item, (*segments, index), index, seen, bound, preparation)
+            return
+        if isinstance(value, dict):
+            for key, item in value.items():
+                walk_value(item, (*segments, str(key)), order, seen, bound, preparation)
+            return
+        if isinstance(value, msgspec.Struct):
+            fields = [
+                (field_info.encode_name, field_info.name, field_info.type)
+                for field_info in msgspec.structs.fields(type(value))
+            ]
+        elif is_dataclass(value) and not isinstance(value, type):
+            annotations = get_type_hints(type(value), include_extras=True)
+            fields = [(name, name, annotations.get(name, object)) for name in field_values(value)]
+        else:
+            return
+        for name, attribute, annotation in fields:
+            base, markers = strip(annotation)
+            declared = next((m for m in markers if isinstance(m, FileBound)), None)
+            prepared = field_preparation(base, markers)
+            walk_value(
+                getattr(value, attribute),
+                (*segments, name),
+                order,
+                seen,
+                declared if declared is not None else bound,
+                prepared if prepared is not None else preparation,
+            )
+
+    walk_value(payload, (), 0, set(), None, None)
+    counts: dict[str, int] = {}
+    for item in found:
+        counts[item.input_id] = counts.get(item.input_id, 0) + 1
+    duplicates = sorted(input_id for input_id, count in counts.items() if count > 1)
+    if duplicates:
+        raise InvalidRequest(
+            "asset field paths are ambiguous after wire-name encoding: "
+            + ", ".join(repr(input_id) for input_id in duplicates),
+            code="asset_input_id_ambiguous",
+            fields=duplicates,
+        )
+    return found

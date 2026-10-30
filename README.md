@@ -50,7 +50,7 @@ Exact development and CI versions belong in `uv.lock`; worker images retain thei
 wheel and image digests. The Python ABI bound is independent of dependency version
 policy.
 
-For media inputs (handles, reads, preparation), see [Media inputs](docs/assets.md).
+For media inputs (handles, reads, preparation), see [Media inputs](docs/files.md).
 
 ## Layout
 
@@ -192,9 +192,9 @@ pyproject's `cozy.application` entry point names, following module-scope imports
 names, integer arithmetic, `tuple(…)`/`list(…)` and one comprehension over a folded
 sequence, and a CLOSED vocabulary — `msgspec.Struct` classes with their
 `tag`/`tag_field`/`kw_only` keywords and `msgspec.field(name=…)`, `Annotated` carrying
-`msgspec.Meta`/`AssetBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
-unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Assets[...]` with
-`AssetLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`,
+`msgspec.Meta`/`FileBound`/`ModelDefault`/`Preflight`, `Literal`, `Enum`/`IntEnum`/`StrEnum`,
+unions, `list`/`tuple`/`dict`/`Sequence`/`Mapping`/`Set`, the asset classes, `Files[...]` with
+`FileLimits`, `Tree`, `ModelArtifact`, `Model` subclasses (`encoded_leaves=`,
 `min_bits=`, `phase=`, `@sequence_parallel`, `@uses_components`), `Weights[M]`, and `@app.entrypoint` with literal
 keywords and `WeightsOutput(...)` tuples. Explicit function registrations and async
 `@invocable` exports use the same schema builders, with their declared capabilities and
@@ -410,7 +410,7 @@ never from the header.
 A package whose signature names a video or audio input must install
 `cozy-runtime[media]`; `--conformance describe` refuses the release if PyAV is absent (the
 static reader has no environment to check). Media inputs are handles read through the
-attempt's one budget; see [Media inputs](docs/assets.md).
+attempt's one budget; see [Media inputs](docs/files.md).
 
 Image generation uses the shared `ImageRequest` output-canvas limit: aspect ratios must be
 between **1:16 and 16:1**, inclusive. Explicit ratios outside this range are rejected during
@@ -421,23 +421,26 @@ assets merely because they have unusual dimensions; an explicit valid output rat
 such a reference. Packages that preserve a reference canvas directly must still resolve it
 through `ImageRequest.target()` before choosing output dimensions.
 
-A prompt names its inputs as `<name>` when a package opts into the author library's references
-(xs-135): `references: list[ImageReference]` (or a `Reference` subclass with its own media and
-fields), and `render(prompt, references, label)` puts each mention in the model's own words, the
-label being how the model refers to the Nth reference (`lambda n, ref: f"Picture {n}"`). Names
-match in any case with `_`, `-` and space alike; a mention of no reference stays as written with a
-warning. `ImageRequest.references` takes these, and its first reference sets the default canvas.
-Nothing below the author library knows the convention: a package may declare any input shape.
+A prompt names its production assets (characters, props, environments) as `<name>` when a
+package opts into the author library's assets (xs-135): `assets: list[PictureAsset]` (or an
+`Asset` subclass with its own media and fields), and `render(prompt, assets, label)` puts each
+mention in the model's own words, the label being how the model refers to the Nth asset
+(`lambda n, asset: f"Picture {n}"`). Names match in any case with `_`, `-` and space alike; a
+mention of no asset stays as written with a warning. `ImageRequest.assets` takes these, and its
+first asset sets the default canvas. Nothing below the author library knows the convention: a
+package may declare any input shape. Attached files are `File`, `ImageFile`, `VideoFile` and
+`AudioFile`; Runtime 0.36.0 renamed them from `*Asset`, and a package importing an old name
+fails at import with a remedy.
 
-Image inputs can separately opt into preparation on a field or an `Assets` argument:
+Image inputs can separately opt into preparation on a field or an `Files` argument:
 
 ```python
 from typing import Annotated
-from cozy_runtime.author import AssetLimits, Assets, ImageAsset, ImagePreparation
+from cozy_runtime.author import FileLimits, Files, ImageFile, ImagePreparation
 
 Pictures = Annotated[
-    Assets[ImageAsset],
-    AssetLimits(images=3),
+    Files[ImageFile],
+    FileLimits(images=3),
     ImagePreparation(max_edge=4096, max_pixels=16_777_216),
 ]
 ```

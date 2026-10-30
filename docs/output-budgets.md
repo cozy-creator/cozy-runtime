@@ -20,5 +20,5 @@ Final returned outputs still obey their exact declared bounds. Root input intake
 keeps its separate existing 256 MiB limit. Native storage admission still reserves
 capacity before writes.
 
-`Annotated[Tree, AssetBound(max_bytes=...)]` and its optional form have identical
+`Annotated[Tree, FileBound(max_bytes=...)]` and its optional form have identical
 static and imported interfaces. Tree bounds cover total member bytes.

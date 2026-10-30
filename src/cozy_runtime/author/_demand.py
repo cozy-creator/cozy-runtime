@@ -21,8 +21,8 @@ from dataclasses import dataclass, is_dataclass
 
 import msgspec
 
-from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._files import File
 from cozy_runtime.author._markers import AXES, Shape
 from cozy_runtime.author._signature import AssetInputValue
 from cozy_runtime.author._walker import Node, field_values, is_struct, value_domain, walk
@@ -178,11 +178,11 @@ def normalize(payload: object) -> RequestFeatures:
         if shape is not None and (value is not None or None in shape.table_keys()):
             values.update(shape.resolve(value))
         if isinstance(value, (list, tuple)) and any(
-            isinstance(item, (Asset, AssetInputValue)) for item in value
+            isinstance(item, (File, AssetInputValue)) for item in value
         ):
             # Each listed input (a reference image, a clip) adds tokens and memory, so
             # their count is a demand axis: 1 and 10 references are different cells. An
-            # `Assets` parameter's occurrences arrive as `AssetInputValue` rows.
+            # `Files` parameter's occurrences arrive as `AssetInputValue` rows.
             values["assets"] = values.get("assets", 0) + len(value)
     if "pixels" not in values and "width" in values and "height" in values:
         values["pixels"] = values["width"] * values["height"]

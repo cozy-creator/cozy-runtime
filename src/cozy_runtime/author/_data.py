@@ -1,4 +1,4 @@
-"""Interface values a package reads from its own committed data asset.
+"""Interface values a package reads from its own committed data file.
 
 The admitted values of a wire enum are often a fact of a committed TABLE rather than of
 code: MiniMax-H3's served denoise steps are its task plan's, and decision #705 forbids a
@@ -6,7 +6,7 @@ second copy of them in serving code. Spelling that derivation as a call into pac
 puts the interface behind execution, which the static reader refuses (#713, cr-114).
 
 This reads the DATA — never code. `describe` and the imported app take the values from the
-same bytes through this same function, so the two derivations cannot drift, and the asset
+same bytes through this same function, so the two derivations cannot drift, and the file
 that ships is the one owner of the fact.
 """
 
@@ -21,7 +21,7 @@ from cozy_runtime.author._errors import ConformanceError
 
 
 def data_values(anchor: str, asset: str, *path: str) -> tuple[Any, ...]:
-    """The values a committed JSON asset lists at `path`, as a tuple.
+    """The values a committed JSON file lists at `path`, as a tuple.
 
     `anchor` is the calling module's `__file__`; `asset` is a relative path under that
     module's own directory, so source tree and installed wheel read the same bytes. Each
@@ -53,7 +53,7 @@ def _read(anchor: str, asset: str) -> Any:
     target = (base / asset).resolve()
     if Path(asset).is_absolute() or not target.is_relative_to(base):
         raise ConformanceError(
-            f"data asset {asset!r} resolves outside {base}: a package reads only data that "
+            f"data file {asset!r} resolves outside {base}: a package reads only data that "
             "ships beside the module naming it",
             code="data_asset",
         )
@@ -61,11 +61,11 @@ def _read(anchor: str, asset: str) -> Any:
         return canonical_json.decode(target.read_bytes())
     except OSError as exc:
         raise ConformanceError(
-            f"data asset {asset!r} is unreadable: {exc}", code="data_asset"
+            f"data file {asset!r} is unreadable: {exc}", code="data_asset"
         ) from exc
     except ValueError as exc:
         raise ConformanceError(
-            f"data asset {asset!r} is not readable JSON: {exc}", code="data_asset"
+            f"data file {asset!r} is not readable JSON: {exc}", code="data_asset"
         ) from exc
 
 
@@ -73,7 +73,7 @@ def _dig(value: Any, keys: Sequence[str], asset: str, path: Sequence[str]) -> An
     for key in keys:
         if not isinstance(value, dict) or key not in value:
             raise ConformanceError(
-                f"data asset {asset!r} has no {'.'.join(path)}", code="data_asset"
+                f"data file {asset!r} has no {'.'.join(path)}", code="data_asset"
             )
         value = value[key]
     return value
@@ -83,7 +83,7 @@ def _scalar(value: Any, asset: str, path: Sequence[str]) -> Any:
     if isinstance(value, (bool, int, float, str)) or value is None:
         return value
     raise ConformanceError(
-        f"data asset {asset!r} lists a {type(value).__name__} at {'.'.join(path)}; only JSON "
+        f"data file {asset!r} lists a {type(value).__name__} at {'.'.join(path)}; only JSON "
         "scalars are interface content",
         code="data_asset",
     )

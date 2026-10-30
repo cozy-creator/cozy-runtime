@@ -54,8 +54,8 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         "from enum import Enum",
         "import msgspec",
         "from cozy_runtime.author import "
-        "AssetBound, Assets, AudioPreparation, ImagePreparation, VideoPreparation, "
-        "ImageAsset, AudioAsset, VideoAsset, FileAsset, Tree",
+        "FileBound, Files, AudioPreparation, ImagePreparation, VideoPreparation, "
+        "ImageFile, AudioFile, VideoFile, File, Tree",
         "from cozy_runtime.author import ModelArtifact, ModelChoice",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "from cozy_runtime.author import PendingCall",
@@ -114,7 +114,7 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                         if name in package_interface.ASSET_BOUND_KEYS
                     }
                     if bound:
-                        annotation = f"Annotated[{annotation}, AssetBound(**{bound!r})]"
+                        annotation = f"Annotated[{annotation}, FileBound(**{bound!r})]"
                     if (marker := _preparation(declared.get("prepare"))) is not None:
                         annotation = f"Annotated[{annotation}, {marker}]"
                     default = ""
@@ -169,10 +169,10 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                 )
             if "asset" in node:
                 return {
-                    "image": "ImageAsset",
-                    "audio": "AudioAsset",
-                    "video": "VideoAsset",
-                    "file": "FileAsset",
+                    "image": "ImageFile",
+                    "audio": "AudioFile",
+                    "video": "VideoFile",
+                    "file": "File",
                 }[node["asset"]]
             if node.get("input") == "tree":
                 return "Tree"
@@ -228,9 +228,9 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                         if value is not msgspec.UNSET
                     }
                     if any(bound.values()):
-                        cls = f"Annotated[{cls}, AssetBound(**{bound!r})]"
+                        cls = f"Annotated[{cls}, FileBound(**{bound!r})]"
                     kinds.append(cls)
-                annotation = "Assets[" + " | ".join(kinds) + "]"
+                annotation = "Files[" + " | ".join(kinds) + "]"
                 if markers:
                     annotation = f"Annotated[{annotation}, {', '.join(markers)}]"
             default = (

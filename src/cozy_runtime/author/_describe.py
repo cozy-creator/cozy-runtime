@@ -16,11 +16,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from cozy_runtime.author._assets import asset_kinds, field_preparation
 from cozy_runtime.author._decode import require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
-from cozy_runtime.author._markers import AssetBound
+from cozy_runtime.author._files import asset_kinds, field_preparation
+from cozy_runtime.author._markers import FileBound
 from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.author._services import UNGRANTABLE
@@ -39,8 +39,8 @@ def assert_declaration_shape(declaration: object, *, result: bool = False) -> No
     """
     for node in walk(declaration):
         owner = getattr(node.owner, "__name__", node.owner)
-        bound = node.marker(AssetBound)
-        if isinstance(bound, AssetBound):
+        bound = node.marker(FileBound)
+        if isinstance(bound, FileBound):
             # cr-012: a bound NARROWS a kind. Checking it at DESCRIBE rather than at
             # hydration is the difference between a package that cannot be built and one
             # that refuses every request that reaches it — a field declaring a media type
@@ -48,8 +48,8 @@ def assert_declaration_shape(declaration: object, *, result: bool = False) -> No
             kinds = asset_kinds(node.annotation)
             if not kinds:
                 raise ConformanceError(
-                    f"{owner}.{node.path} puts AssetBound on a field with no direct asset; "
-                    "put the bound on the concrete asset field instead",
+                    f"{owner}.{node.path} puts FileBound on a field with no direct file; "
+                    "put the bound on the concrete file field instead",
                     code="asset_bound_target",
                     fields=[node.path],
                 )
@@ -59,7 +59,7 @@ def assert_declaration_shape(declaration: object, *, result: bool = False) -> No
         if result and preparation is not None:
             raise ConformanceError(
                 f"{owner}.{node.path} declares {type(preparation).__name__} on a result: "
-                "preparations annotate inputs, and a returned asset is never prepared",
+                "preparations annotate inputs, and a returned file is never prepared",
                 code="preparation_target",
                 fields=[node.path],
             )

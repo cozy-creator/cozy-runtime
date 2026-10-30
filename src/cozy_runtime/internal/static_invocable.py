@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Any, get_origin
 import msgspec
 
 from cozy_runtime import author
-from cozy_runtime.author._assets import Assets
+from cozy_runtime.author._files import Files
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import (
     Declaration,
@@ -91,9 +91,9 @@ def build(reader: Reader, registration: Registration) -> Declaration:
         if arg not in fn.args.kwonlyargs:
             reader.refuse(module, arg, "invocable operation arguments must be keyword-only")
         parameters.append(arg.arg)
-        if base is Assets or get_origin(base) is Assets:
+        if base is Files or get_origin(base) is Files:
             if assets is not None or arg.arg in defaults:
-                reader.refuse(module, arg, "one Assets parameter without a default is supported")
+                reader.refuse(module, arg, "one Files parameter without a default is supported")
             assets = assets_binding(arg.arg, translated)
             fields.append((arg.arg, assets.wire_type))
             continue
