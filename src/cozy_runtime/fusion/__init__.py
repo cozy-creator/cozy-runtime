@@ -32,6 +32,8 @@ declaration serves eager (reported).
 
 A VAE's channel-first RMS norm (Wan's `RMS_norm` and the Qwen-Image copies of it) is one kernel,
 and with the SiLU after it where the package names that pair (`ChannelNorm`, `install_norms`).
+A video VAE decoding a lone image frame skips its causal convolutions' zero taps and padded
+copies, and upsamples in its own dtype (`LoneFrame`, `install_lone_frame`).
 """
 
 from __future__ import annotations
@@ -606,6 +608,10 @@ def _fused(cls: type, kind: str) -> type:
             body["forward"] = _channel_norm_forward
         elif kind == "identity":
             body["forward"] = _identity_forward
+        elif kind == "lone-conv":
+            body["forward"] = _lone_conv_forward
+        elif kind == "nearest":
+            body["forward"] = torch.nn.Upsample.forward
         else:
             body |= {"forward": _head_norm_forward, "_cozy_rope": None}
         _FUSED[(cls, kind)] = type(f"Fused{cls.__name__}", (cls,), body)
@@ -849,4 +855,119 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
     return "sha256:" + hashlib.sha256(b"cozy.fusion.channel-norm\0" + encoded).hexdigest()
 
 
-__all__ = ["ChannelNorm", "DiTBlock", "GatedMLP", "Modulation", "Rope", "install", "install_norms"]
+@dataclass(frozen=True, slots=True)
+class LoneFrame:
+    """A video VAE decoding one image frame, `[batch, channels, 1, height, width]` with no frame
+    cache (Diffusers' Wan and Qwen-Image VAEs). `conv`, its causal convolution (a Conv3d, or the
+    Conv2d that specializes it to images, each padding by copy as `_padding` says), runs as one
+    2-D convolution: on its last temporal tap, the only one a lone frame meets (the others meet
+    the causal padding's zeros), with the spatial zero padding inside the convolution, so no
+    padded copy is made. `upsample`, its nearest upsampler, runs in the activations' dtype:
+    Diffusers' goes through fp32, and nearest only copies values, so the bits are the same."""
+
+    conv: type
+    upsample: type | None = None
+
+
+def _lone_conv_forward(self: Any, x: Any, cache_x: Any = None) -> Any:
+    if cache_x is not None or x.dim() != 5 or x.shape[2] != 1:
+        return self._cozy_eager(x, cache_x)
+    weight = self.weight if self.weight.dim() == 4 else self.weight[:, :, -1]
+    y = torch.nn.functional.conv2d(
+        x[:, :, 0],
+        weight,
+        self.bias,
+        self.stride[-2:],
+        self._cozy_lone,
+        self.dilation[-2:],
+        self.groups,
+    )
+    return y.unsqueeze(2)
+
+
+def _lone_padding(conv: Any, path: str) -> tuple[int, int]:
+    """`conv`'s spatial zero padding (rows, columns) when a lone frame meets its last tap only."""
+    pad = tuple(getattr(conv, "_padding", ()))
+    plain = type(conv.weight) in (torch.Tensor, torch.nn.Parameter)
+    if getattr(conv, "padding_mode", None) != "zeros" or not plain:
+        raise _Mismatch(f"{path}: not a zero-padded convolution over plain weights")
+    if isinstance(conv, torch.nn.Conv3d):
+        frames = conv.kernel_size[0]
+        if (
+            tuple(conv.padding) != (0, 0, 0)
+            or len(pad) != 6
+            or pad[4:] != (frames - 1, 0)
+            or conv.dilation[0] != 1
+        ):
+            raise _Mismatch(f"{path}: not a causal convolution padding {frames - 1} frames before")
+    elif not isinstance(conv, torch.nn.Conv2d) or tuple(conv.padding) != (0, 0) or len(pad) != 4:
+        raise _Mismatch(f"{path}: not a causal convolution")
+    if pad[0] != pad[1] or pad[2] != pad[3]:
+        raise _Mismatch(f"{path}: asymmetric spatial padding {pad[:4]}")
+    return (int(pad[2]), int(pad[0]))
+
+
+def install_lone_frame(plan: Plan, layout: LoneFrame, *roots: Any) -> str:
+    """`layout` on every `conv` and `upsample` under `roots`: the plan's identity, or "" when the
+    eager modules serve (a module that is not the declaration; reported). No kernels, so CPU
+    and GPU alike."""
+    name = f"lone-frame.{layout.conv.__name__.lower()}"
+
+    def report(reason: str = "", **counts: int) -> str:
+        outcome = {
+            "conv": layout.conv.__qualname__,
+            "applied": not reason,
+            **({"reason": reason} if reason else counts),
+        }
+        plan.report(name, outcome)
+        print(f"[cozy] {name}: {json.dumps(outcome, sort_keys=True)}", file=sys.stderr)
+        return ""
+
+    found = [
+        (f"{index}.{path}", module)
+        for index, root in enumerate(roots)
+        for path, module in root.named_modules()
+    ]
+    convs = [(path, m) for path, m in found if type(m) is layout.conv]
+    upsamples = [(path, m) for path, m in found if type(m) is layout.upsample]
+    if not convs:
+        return report(f"no {layout.conv.__qualname__}")
+    try:
+        padding = [_lone_padding(conv, path) for path, conv in convs]
+        for path, upsample in upsamples:
+            if not isinstance(upsample, torch.nn.Upsample) or upsample.mode not in (
+                "nearest",
+                "nearest-exact",
+            ):
+                raise _Mismatch(f"{path}: not a nearest upsampler")
+    except _Mismatch as exc:
+        return report(str(exc))
+    before = [_census(root) for root in roots]
+    for (_, conv), pad in zip(convs, padding, strict=True):
+        conv.__class__ = _fused(type(conv), "lone-conv")
+        conv._cozy_lone = pad
+    for _, upsample in upsamples:
+        upsample.__class__ = _fused(type(upsample), "nearest")
+    if [_census(root) for root in roots] != before:
+        raise RuntimeError("the lone-frame substitution moved a parameter or buffer")
+    report(convs=len(convs), upsamples=len(upsamples))
+    upsample = getattr(layout.upsample, "__qualname__", None)
+    encoded = json.dumps(
+        {"conv": layout.conv.__qualname__, "upsample": upsample},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return "sha256:" + hashlib.sha256(b"cozy.fusion.lone-frame\0" + encoded).hexdigest()
+
+
+__all__ = [
+    "ChannelNorm",
+    "DiTBlock",
+    "GatedMLP",
+    "LoneFrame",
+    "Modulation",
+    "Rope",
+    "install",
+    "install_lone_frame",
+    "install_norms",
+]
