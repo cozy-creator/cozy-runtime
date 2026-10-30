@@ -50,6 +50,8 @@ LEVELS_MAX = 448.0 * 6.0
 SCALE_FLOOR = 1e-30
 #: Up to this many rows a product is bandwidth-bound: W4A16 reads the fewest bytes on any card.
 DECODE_ROWS = 16
+#: The eager fallback's decode transient per row chunk.
+_DECODE_CHUNK = 256 << 20
 #: The GEMV's tile: 64 output rows by 32 int32 words (256 weights) of each.
 GEMV_N, GEMV_W = 64, 32
 #: The kernels a leaf serves besides comfy-kitchen's W4A4 (`gemm.selected`).
@@ -344,11 +346,8 @@ def matmul(
                 return out[:rows].reshape(*x.shape[:-1], rows_out)
             except Exception as exc:  # W4A16 serves this call
                 int8_linear.failed("comfy-kitchen nvfp4", index, exc)
-        launch = (
-            _launcher(torch, x.device, capturing)
-            if x.dtype == torch.bfloat16 and out_dtype == torch.bfloat16
-            else None
-        )
+        # Any output dtype: the kernels write bf16, cast after, as the fallback's bf16 GEMM did.
+        launch = _launcher(torch, x.device, capturing) if x.dtype == torch.bfloat16 else None
         if launch is not None:
             with readable(weight, blocked_scale, scale_2) as (weight, blocked_scale, scale_2):
                 if rows <= DECODE_ROWS and weight.data_ptr() % 16 == 0:
@@ -357,12 +356,29 @@ def matmul(
                     flat = flat if flat.data_ptr() % 16 == 0 else flat.clone()
                     split = 4 if rows_out <= 8192 else 2 if rows_out <= 16384 else 1
                     out = _rows(torch, launch, flat, weight, blocked_scale, scale_2, split)
-                    return out.reshape(*x.shape[:-1], rows_out)
-                decoded = _decoded(torch, launch, weight, blocked_scale, scale_2)
-            out = torch.nn.functional.linear(flat, decoded).to(out_dtype)
-            return out.reshape(*x.shape[:-1], rows_out)
-    decoded = nvfp4_values(torch, weight, linear_scale(), scale_2).to(x.dtype)
-    return torch.nn.functional.linear(x, decoded).to(out_dtype)
+                    return out.to(out_dtype).reshape(*x.shape[:-1], rows_out)
+                # 128-row chunks (whole scale tiles) bound the decoded transient: a 248k-row head
+                # decoded whole is 1.9 GB of bf16.
+                step = max(128, _DECODE_CHUNK // (2 * cols) // 128 * 128)
+                out = torch.cat([
+                    torch.nn.functional.linear(
+                        flat, _decoded(torch, launch, weight[i : i + step], blocked_scale[i : i + step], scale_2)
+                    )
+                    for i in range(0, rows_out, step)
+                ], dim=-1) if rows_out > step else torch.nn.functional.linear(
+                    flat, _decoded(torch, launch, weight, blocked_scale, scale_2)
+                )
+            return out.to(out_dtype).reshape(*x.shape[:-1], rows_out)
+    # Row chunks, so no call holds a whole decoded weight: Klein's upsampler decoded its 248k-row
+    # head whole in f32 (3.79 GiB beside a full 24 GB card, gate 40880098766).
+    scale, step = linear_scale(), max(1, _DECODE_CHUNK // (8 * cols))  # int64 codes: 8 B each
+    parts = [
+        torch.nn.functional.linear(
+            x, nvfp4_values(torch, weight[i : i + step], scale[i : i + step], scale_2).to(x.dtype)
+        )
+        for i in range(0, rows_out, step)
+    ]
+    return torch.cat(parts, dim=-1).to(out_dtype)
 
 
 def _quantized(torch: ModuleType, module: ModuleType, flat: Tensor) -> tuple[Tensor, ...]:
