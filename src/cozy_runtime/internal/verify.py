@@ -6,13 +6,16 @@ must be within the kernel's budget. A failure stays in this process: its caller 
 kernel of the family's order, the run says so (`gemm.fallback`), and the next process checks
 again. No stored verdict ever turns a kernel off (owner, 2026-10-22).
 
-The one thing kept on the machine is a probe that never finished: a marker written before the
-probe and removed after it, so a kernel that ends its process (a sticky CUDA error) is refused by
-the next process of this boot instead of crash-looping it. The marker is keyed by the kernel, its
-artifact's digest, the card, the driver and the Runtime build, so an upgrade or a driver update
-checks it again, and it names its boot: a probe a reboot interrupted says nothing of its kernel,
-which the next boot checks again. A device that ran out of memory during the probe keeps nothing:
-the error raises for the memory manager.
+The one thing kept on the machine is a probe that crashed its process: a marker written before
+the probe and removed after it, naming the probing process, while a fatal signal's traceback
+(`faulthandler`) goes to that process's crash file. A marker whose process crashed refuses its
+kernel in the next process of this boot instead of crash-looping it; one whose process was ended
+mid-probe (TensorD ending it for room or an update, a kill) says nothing of the kernel, and the
+next process probes again (cr-227: an ended executor turned cozy-int8 off for the pod's life). The
+marker is keyed by the kernel, its artifact's digest, the card, the driver and the Runtime build,
+so an upgrade or a driver update checks it again, and it names its boot: a probe a reboot
+interrupted says nothing of its kernel. A device that ran out of memory during the probe keeps
+nothing: the error raises for the memory manager.
 
 A kernel first opens at a leaf's bind, inside its model's construction: the probe runs with the
 construction guard stepped aside (`derive.placing`), as the runtime's own placement does.
@@ -20,14 +23,18 @@ construction guard stepped aside (`derive.placing`), as the runtime's own placem
 
 from __future__ import annotations
 
+import faulthandler
 import hashlib
 import json
 import math
 import os
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
@@ -41,8 +48,8 @@ from cozy_runtime.internal.encoding.formats import Tensor
 VERDICTS = "verified"
 #: The Runtime build a marker belongs to: an upgrade checks every kernel again.
 RUNTIME = f"{__version__}+{COMMIT[:12]}" if COMMIT else __version__
-#: What a kernel whose probe ended a process reads in the next one.
-CRASHED = "its probe ended a process before it finished; this Runtime build will not run it here"
+#: What a kernel whose probe crashed a process reads in the next one.
+CRASHED = "its probe crashed a process before it finished; this Runtime build will not run it here"
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,13 +123,14 @@ def _probed(key: Key, probe: Callable[[], Verdict]) -> Verdict:
         return _run(probe)
     with lock:
         filelock.lock(lock)  # another process of this machine probing it finishes first
-        if _boot_of(path) == _BOOT:  # its marker outlived the probe: it ended its process
+        if _crashed(path):  # its marker outlived the probe, which crashed its process
             return Verdict(False, CRASHED)
-        _write(path, key, Verdict(False, CRASHED))
-        try:
-            return _run(probe)
-        finally:
-            path.unlink(missing_ok=True)
+        with _armed(path.parent) as crash:
+            _write(path, key, Verdict(False, CRASHED), crash)
+            try:
+                return _run(probe)
+            finally:
+                path.unlink(missing_ok=True)
 
 
 def _run(probe: Callable[[], Verdict]) -> Verdict:
@@ -156,20 +164,80 @@ def _read_boot() -> str:
 _BOOT = _read_boot()
 
 
-def _boot_of(path: Path) -> str | None:
-    """The boot whose probe left `path`'s marker; None when there is none."""
+def _crashed(path: Path) -> bool:
+    """Whether `path`'s marker is a probe that crashed its process this boot: the process's
+    crash file holds a fatal signal's traceback. One whose process was ended mid-probe holds none:
+    its marker and empty crash file go, and the kernel is probed again."""
     try:
         row = json.loads(path.read_text())
     except (OSError, ValueError):
-        return None
-    return str(row.get("boot", "")) if isinstance(row, dict) else ""
+        return False
+    if not isinstance(row, dict) or str(row.get("boot", "")) != _BOOT:
+        return False
+    if not row.get("crash"):
+        return False
+    crash = path.parent / str(row["crash"])
+    try:
+        if crash.stat().st_size > 0:
+            return True
+        crash.unlink()
+    except OSError:
+        pass
+    return False
 
 
-def _write(path: Path, key: Key, verdict: Verdict) -> None:
+#: This process's probes in flight, the crash file faulthandler writes while any is, and whether
+#: faulthandler wrote to stderr before.
+_ARMED: list[Any] = [0, None, False]
+_ARMING = threading.Lock()
+
+
+@contextmanager
+def _armed(directory: Path) -> Iterator[str]:
+    """While a probe runs, a fatal signal's traceback goes to this process's crash file in
+    `directory` (named by pid and start time), not stderr: it is what tells a probe that crashed
+    its process from one whose process was ended. Its name; empty where it cannot be written."""
+    name = f"crash-{os.getpid()}-{_START}"
+    with _ARMING:
+        if _ARMED[0] == 0:
+            try:
+                _ARMED[2] = faulthandler.is_enabled()
+                _ARMED[1] = (directory / name).open("w")
+                faulthandler.enable(_ARMED[1], all_threads=True)
+            except OSError:
+                _ARMED[1] = None
+        _ARMED[0] += 1
+    try:
+        yield name if _ARMED[1] is not None else ""
+    finally:
+        with _ARMING:
+            _ARMED[0] -= 1
+            if _ARMED[0] == 0 and _ARMED[1] is not None:
+                if _ARMED[2]:
+                    faulthandler.enable(all_threads=True)  # stderr again, as the executor keeps it
+                else:
+                    faulthandler.disable()
+                _ARMED[1].close()
+                (directory / name).unlink(missing_ok=True)
+                _ARMED[1] = None
+
+
+def _read_start() -> str:
+    """This process's start time in clock ticks since boot: with its pid, its name this boot."""
+    try:
+        return Path("/proc/self/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return "0"
+
+
+_START = _read_start()
+
+
+def _write(path: Path, key: Key, verdict: Verdict, crash: str) -> None:
     """Kept whole or not at all; a store that cannot take it guards nothing next process."""
     kernel, artifact, sm, driver, runtime = key
     row = {"kernel": kernel, "artifact": artifact, "sm": sm, "driver": driver, "runtime": runtime,
-           "boot": _BOOT, **asdict(verdict)}  # fmt: skip
+           "boot": _BOOT, "crash": crash, **asdict(verdict)}  # fmt: skip
     temporary = path.with_name(f".{path.name}.{os.getpid()}")
     try:
         temporary.write_text(json.dumps(row))
