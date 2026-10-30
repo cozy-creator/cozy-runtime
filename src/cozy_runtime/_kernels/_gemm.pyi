@@ -23,6 +23,7 @@ def quantize(
     norm: int,
     eps: float,
     activation: int,
+    up: int,
     stream: int,
 ) -> int: ...
 def gemv(

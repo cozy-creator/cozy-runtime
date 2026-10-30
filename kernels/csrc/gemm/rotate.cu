@@ -254,6 +254,20 @@ __device__ __forceinline__ void apply_situ(const T* gate_row, int tile, int K,
         v[r] = (4.f * tanhf(g[r] * 0.25f) / (1.f + expf(-g[r]))) * (25.f * tanhf(v[r] / 25.f));
 }
 
+// `silu(gate) * up` on the gate tile in the registers, rounded as the eager SwiGLU rounds it:
+// torch's silu `g / (1 + exp(-g))` (IEEE divide), then the product, each to the row dtype.
+template <typename T>
+__device__ __forceinline__ void apply_swiglu(const T* up_row, int tile, int K,
+                                             float (&v)[kLaneValues]) {
+    float u[kLaneValues];
+    load_tile(up_row, tile, K, u);
+#pragma unroll
+    for (int r = 0; r < kLaneValues; ++r) {
+        const float silu = as_float(from_float<T>(__fdiv_rn(v[r], 1.f + expf(-v[r]))));
+        v[r] = as_float(from_float<T>(silu * u[r]));
+    }
+}
+
 // The TMA GEMMs (wgmma, tcgen05, block-scaled mma.sync's fp8) launch as programmatic dependents
 // of this kernel: they start their prologue as soon as every block here has begun, and wait
 // for this grid before reading. Before any other kernel the signal does nothing.
@@ -280,6 +294,9 @@ __global__ void __launch_bounds__(1024) quantize_kernel(
     if constexpr (kPrologue) {
         if (gated)
             apply_situ(in + K, tile, live ? K : 0, v);
+        else if (prologue.activation == kActSwiglu)
+            apply_swiglu(static_cast<const T*>(prologue.up) + int64_t(live ? row : 0) * K, tile,
+                         live ? K : 0, v);
         else
             apply_prologue<T>(prologue, live ? row : 0, tile, K, v, partial + 32);
     }

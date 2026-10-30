@@ -52,6 +52,7 @@ from cozy_runtime.author.kernels import (
     Launch,
     Plan,
     TritonKernels,
+    int8_rows,
     quantize_once,
 )
 from cozy_runtime.fusion import _kernels
@@ -459,12 +460,18 @@ def _inputs(linears: Sequence[Any], normed: Any) -> list[Any]:
 
 
 def _mlp(launch: Launch, site: _Site, hidden: Sequence[Any]) -> Any:
+    """`down(silu(gate) * up)`. An int8 `down` gets the product from its own quantization pass
+    when gate and up are two linears' rows: the same rows, never written in bf16."""
     mlp = site.layout.mlp
     if mlp.up is None:
         (both,) = hidden
         half = int(both.shape[-1]) // 2
         hidden = (both[..., :half], both[..., half:])
         hidden = hidden[::-1] if mlp.value_first else hidden
+    else:
+        rows = int8_rows(hidden[0], (site.down,), activation="swiglu", up=hidden[1])
+        if rows is not None:
+            return site.down(rows)
     return site.down(_kernels.swiglu(launch, site.layout.entries.swiglu, *hidden))
 
 

@@ -208,6 +208,7 @@ def int8_rows(
     scale: Any = None,
     shift: Any = None,
     activation: str | None = None,
+    up: Any = None,
 ) -> PreQuantized | None:
     """The rows a producer would hand `consumers`, `activation(norm(x) * (1 + scale) + shift)`,
     rotated and quantized for int8 in one pass of the Runtime's op: pass the result to each
@@ -215,14 +216,16 @@ def int8_rows(
     `activation` "gelu" or "gelu_tanh"; `scale` and `shift` are `[..., width]` tables, and x's
     row r reads table row `r // (x rows / table rows)`. `activation="situ"` is gated and stands
     alone: x is `[..., 2F]`, each row its [hidden | gate] halves, and the F-wide rows are
-    `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU).
+    `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU). `activation="swiglu"`
+    stands alone too: x is the gate rows and `up` the up rows of its shape, and the rows are
+    `silu(x) * up`, rounded as an eager SwiGLU rounds them.
 
     None unless every consumer is an un-hooked encoded leaf taking int8.convrot's operand (an int8
     or w4a8 leaf) of x's width and the op serves this card: the caller then runs its own ops."""
     if not consumers or getattr(consumers[0], "operand", None) != INT8_CONVROT:
         return None
     rows: PreQuantized | None = consumers[0].int8_prologue(
-        x, consumers, norm, eps, scale, shift, activation
+        x, consumers, norm, eps, scale, shift, activation, up
     )
     return rows
 

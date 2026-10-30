@@ -57,6 +57,7 @@ class _Format:
 INT8, FP8 = _Format("int8", False, CONVROT_GROUP), _Format("fp8", True, 16)
 #: The prologue's gated activation (`cozy_int8::kActSitu`): rows of [hidden | gate] halves.
 SITU = 3
+SWIGLU = 4
 
 
 @dataclass(slots=True)
@@ -113,8 +114,9 @@ class Prebuilt:
         norm: int = 0,
         eps: float = 0.0,
         activation: int = 0,
+        up: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        return self._quantize(INT8, x, scale, shift, norm, eps, activation)
+        return self._quantize(INT8, x, scale, shift, norm, eps, activation, up)
 
     def fp8_quantize(
         self,
@@ -124,8 +126,9 @@ class Prebuilt:
         norm: int = 0,
         eps: float = 0.0,
         activation: int = 0,
+        up: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        return self._quantize(FP8, x, scale, shift, norm, eps, activation)
+        return self._quantize(FP8, x, scale, shift, norm, eps, activation, up)
 
     def int8_gemm(
         self,
@@ -236,6 +239,7 @@ class Prebuilt:
         norm: int,
         eps: float,
         activation: int,
+        up: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         torch = self.torch
         # A gated row quantizes to half its width.
@@ -244,6 +248,14 @@ class Prebuilt:
         rows, width = flat.shape[0], flat.shape[1] // 2 if gated else flat.shape[1]
         if gated and (x.shape[-1] % 2 or norm or scale is not None or shift is not None):
             raise ValueError(f"{f.name}_quantize: SiTU takes [hidden | gate] rows alone")
+        # SwiGLU: x is the gate rows, `up` the up rows of the same shape.
+        if (activation == SWIGLU) != (up is not None) or (
+            up is not None
+            and (up.shape != x.shape or up.dtype != x.dtype or norm or scale is not None
+                 or shift is not None)
+        ):
+            raise ValueError(f"{f.name}_quantize: SwiGLU takes gate and up rows of one shape alone")
+        other = None if up is None else self._rows(f, up)
         q = torch.empty(rows, width, dtype=torch.float8_e4m3fn if f.fp8 else torch.int8,
                         device=x.device)  # fmt: skip
         scales = torch.empty(rows, dtype=torch.float32, device=x.device)
@@ -255,7 +267,7 @@ class Prebuilt:
             self.index, f.fp8, flat.data_ptr(), self._half(flat.dtype), q.data_ptr(),
             scales.data_ptr(), rows, width, _ptr(tables[0]), _ptr(tables[1]),
             _stride(tables[0]), _stride(tables[1]), max(rows // entries, 1), norm, eps,
-            activation, self._stream(),
+            activation, _ptr(other), self._stream(),
         )  # fmt: skip
         self._check(code, "the quantization")
         return q, scales
@@ -579,6 +591,13 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     errors["prologue situ"] = verify.error(
         torch, got, law(torch, f, _situ(torch, gated.double()), data, scale, None)
     )
+    for dtype in (torch.bfloat16, torch.float16):
+        gate, up = randn(64, width, scale=4.0).to(dtype), randn(64, width).to(dtype)
+        folded = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(gate, activation=SWIGLU, up=up)
+        got = (ops.fp8_gemm if f.fp8 else ops.int8_gemm)(*folded, data, scale, None, dtype)
+        errors[f"prologue swiglu {dtype}"] = verify.error(
+            torch, got, law(torch, f, _swiglu(torch, gate, up), data, scale, None)
+        )
     return verify.within(errors, BUDGET)
 
 
@@ -674,6 +693,12 @@ def _prologue(
     y = x * torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
     y = y * (1 + modulation[entry]) + shift[entry]
     return 0.5 * y * (1 + torch.tanh(0.79788456 * (y + 0.044715 * y**3)))
+
+
+def _swiglu(torch: ModuleType, gate: Tensor, up: Tensor) -> Tensor:
+    """The rows an eager SwiGLU writes: torch's silu, then the product, each in the rows' dtype."""
+    silu = torch.nn.functional.silu(gate.float()).to(gate.dtype)
+    return (silu.float() * up.float()).to(gate.dtype).double()
 
 
 def _situ(torch: ModuleType, x: Tensor) -> Tensor:
