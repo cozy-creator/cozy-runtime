@@ -369,7 +369,7 @@ def checked(
     rows, n, k = shape
 
     def draw(*shape: int) -> Tensor:
-        return torch.randn(*shape, generator=generator, device=device)
+        return torch.randn(*shape, generator=generator, device=device, dtype=torch.float32)
 
     errors: dict[str, float] = {}
     for r in RANKS:
@@ -378,7 +378,7 @@ def checked(
                 torch.uint8
             ),
             "scale": (draw(n, k // NVFP4_BLOCK).abs() + 0.5).to(torch.float8_e4m3fn),
-            "scale_2": torch.full((1,), 0.01, device=device),
+            "scale_2": torch.full((1,), 0.01, device=device, dtype=torch.float32),
             "pre_quant_scale": draw(k).abs() + 0.5,
             "lowrank_down": (draw(r, k) * 0.05).to(torch.bfloat16),
             "lowrank_up": (draw(n, r) * 0.05).to(torch.bfloat16),

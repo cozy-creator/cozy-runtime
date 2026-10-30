@@ -98,8 +98,8 @@ def warm(index: int, launch: Launch) -> None:
         q, k, v = (
             torch.randn(1, 1024, 2, 128, device=device, dtype=torch.bfloat16) for _ in range(3)
         )
-        kc, vc = (torch.randn(1, 1024 // BLOCK, 2, 128, device=device) for _ in range(2))
-        threshold = torch.zeros(1, 1024 // BLOCK, 2, device=device)
+        kc, vc = (torch.randn(1, 1024 // BLOCK, 2, 128, device=device, dtype=torch.float32) for _ in range(2))
+        threshold = torch.zeros(1, 1024 // BLOCK, 2, device=device, dtype=torch.float32)
         for fp8 in (True, False):
             _routed(q, k, v, kc.bfloat16(), vc.bfloat16(), threshold, 128**-0.5, 64, fp8=fp8)
         torch.cuda.synchronize(device)
@@ -110,7 +110,7 @@ def route(query: Tensor, kc: Tensor, threshold: Tensor, scale: float, sink_token
     _, tokens, heads, dim = query.shape
     blocks = kc.shape[1]
     pad = blocks * BLOCK - tokens
-    counts = torch.full((blocks, 1, 1), float(BLOCK), device=query.device)
+    counts = torch.full((blocks, 1, 1), float(BLOCK), device=query.device, dtype=torch.float32)
     counts[-1] = BLOCK - pad
     padded = torch.nn.functional.pad(query[0], (0, 0, 0, 0, 0, pad))
     centroids = padded.view(blocks, BLOCK, heads, dim).sum(1, dtype=torch.float32) / counts

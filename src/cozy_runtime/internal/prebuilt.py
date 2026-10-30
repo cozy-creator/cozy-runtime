@@ -532,7 +532,7 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
     generator = torch.Generator(device=device).manual_seed(20261017)
 
     def randn(*shape: int, scale: float = 1.0) -> Tensor:
-        return torch.randn(*shape, generator=generator, device=device) * scale
+        return torch.randn(*shape, generator=generator, device=device, dtype=torch.float32) * scale
 
     rows, out_features, width = 300, 512, 1024
     if f.fp8:
@@ -597,7 +597,7 @@ def probe_w4a8(torch: ModuleType, ops: Prebuilt) -> verify.Verdict:
     generator = torch.Generator(device=device).manual_seed(20261022)
 
     def randn(*shape: int, scale: float = 1.0) -> Tensor:
-        return torch.randn(*shape, generator=generator, device=device) * scale
+        return torch.randn(*shape, generator=generator, device=device, dtype=torch.float32) * scale
 
     rows, out_features, width = 300, 520, 1024  # N not a multiple of a tile
     codes = torch.randint(0, 256, (out_features, width // 2), generator=generator,
@@ -758,7 +758,7 @@ def attention_probe(
     errors: dict[str, float] = {}
     for head_dim, name, batch, queries, keys, causal in cases:
         q, k, v = (
-            torch.randn(batch, s, 2, head_dim, generator=generator, device=device)
+            torch.randn(batch, s, 2, head_dim, generator=generator, device=device, dtype=torch.float32)
             for s in (queries, keys, keys)
         )
         want = torch.nn.functional.scaled_dot_product_attention(

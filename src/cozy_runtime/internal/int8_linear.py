@@ -209,13 +209,13 @@ def _probe_kitchen(torch: ModuleType, index: int, module: ModuleType) -> verify.
     out_features, width = 520, 1024
     data = torch.randint(-127, 128, (out_features, width), generator=generator, device=device,
                          dtype=torch.int8)  # fmt: skip
-    scale = torch.rand(out_features, generator=generator, device=device).add_(0.5).mul_(1e-3)
+    scale = torch.rand(out_features, generator=generator, device=device, dtype=torch.float32).add_(0.5).mul_(1e-3)
     weight = data.double() * scale.double()[:, None]
     errors: dict[str, tuple[float, float]] = {}
     for name, dtype in (("bf16", torch.bfloat16), ("fp16", torch.float16)):
-        bias = torch.randn(out_features, generator=generator, device=device).to(dtype)
+        bias = torch.randn(out_features, generator=generator, device=device, dtype=torch.float32).to(dtype)
         for m in (3, 300):
-            x = torch.randn(m, width, generator=generator, device=device).to(dtype)
+            x = torch.randn(m, width, generator=generator, device=device, dtype=torch.float32).to(dtype)
             got = module.int8_linear(
                 x, data, scale, bias, dtype, convrot=True, convrot_groupsize=CONVROT_GROUP
             )
