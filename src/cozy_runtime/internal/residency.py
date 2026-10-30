@@ -1744,7 +1744,7 @@ class Memory:
         """A store page the native prefetch just filled is read once more, off the request thread,
         into a host page: its later refills are one DMA instead of a store read."""
         model, region = block.model, block.region
-        if model.fill is not None or block.preferred or block.finals or region is None:
+        if model.fill is not None or block.finals or region is None:
             return
         page = (model.name, block.path, model.identity, None)
         if page in self._baked or page in self._populating or not self._read_before(page):
@@ -2408,7 +2408,6 @@ class Memory:
                         if (
                             self._host_prefetch
                             and block.model.fill is None
-                            and not block.preferred
                             and page not in self._populating
                             and self._read_before(page)
                         ):
@@ -2696,13 +2695,10 @@ class Memory:
                     use.tensor.copy_(kept)  # complete when this returns
                     kept_ns = time.perf_counter_ns() - began
                     self._baked.move_to_end(page)
-                elif (
-                    block.model.fill is None
-                    and not block.preferred
-                    and not block.finals
-                    and self._read_before(page)
-                ):
-                    # A streamed page read again lands in its host page, then one DMA.
+                elif block.model.fill is None and not block.finals and self._read_before(page):
+                    # A stored page read again lands in its host page, then one DMA: a resident one
+                    # too, since another phase's room evicts it (SDXL at 6 GiB: the decode evicts
+                    # both text encoders) and its refill would read the store again.
                     staged = self._host_page(use.tensor.numel())
             offset = 0
             for key, parts in block.parts.items():
