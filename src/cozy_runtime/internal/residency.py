@@ -1359,6 +1359,10 @@ class Memory:
         self._host_cap = max(physical_memory(), 0) // 2
         #: stored pages to pin once the executor is idle (`pin_idle`), never on a request's path
         self._wanted: OrderedDict[tuple[object, ...], _Block] = OrderedDict()
+        #: each stored page's refills in the running request, and in the last request that
+        #: refilled it: the bytes a kept page saves per request, per byte of host RAM it holds
+        self._refills: dict[tuple[object, ...], int] = {}
+        self._rate: dict[tuple[object, ...], int] = {}
         #: stored pages whose store read completed: a resident block's page is wanted on its second
         self._read_once: set[tuple[object, ...]] = set()
         self._h2d_stream: Any = None
@@ -1811,14 +1815,16 @@ class Memory:
         idle."""
         while self.host_pending() and not waiting():
             with self.lock:
-                page, block = self._wanted.popitem(last=False)
+                # The page refilled most often per request first: it saves the most bytes per
+                # byte of host RAM (an H3 DiT block refilled 8 times a call before a text
+                # encoder's read once).
+                page = max(self._wanted, key=lambda p: self._rate.get(p, 1))
+                block = self._wanted.pop(page)
             model = block.model
             if page in self._baked or model.closed or model.identity != page[2]:
                 continue
-            if not self._host_room(block.storage_bytes):
-                with self.lock:
-                    self._wanted.clear()  # no room: the next completed read asks again
-                return
+            if not self._host_room(block.storage_bytes) and not self._displace(page, block):
+                continue  # kept pages are worth at least as much; a smaller wanted one may fit
             tensors = model.source.ck.components[model.source.component].tensors
             tensor = torch.zeros(block.storage_bytes, dtype=torch.uint8)  # gaps included
             offset = 0
@@ -1847,6 +1853,40 @@ class Memory:
                 else:
                     kept.release()
 
+    def _displace(self, page: tuple[object, ...], block: _Block) -> bool:
+        """Room for `page` from kept pages refilled less often per request, least often and then
+        least recently used first; none go unless together they make the room. The tier follows
+        use, not arrival: a pod's first construction no longer keeps its pages while a later
+        one's most refilled blocks stream from the store (H3 LoRA'd calls on an RTX PRO 4000:
+        177 against 216 s by load order, cl-683)."""
+        rate = self._rate.get(page, 1)
+        with self.lock:
+            cheaper = sorted(
+                (p for p in self._baked if self._rate.get(p, 1) < rate),
+                key=lambda p: self._rate.get(p, 1),
+            )
+            freed, chosen = 0, []
+            for kept in cheaper:
+                if self._host_fits(block.storage_bytes - freed):
+                    break
+                chosen.append(kept)
+                freed += self._baked[kept].tensor.numel()
+            if not self._host_fits(block.storage_bytes - freed):
+                return False
+            for kept in chosen:
+                gone = self._baked.pop(kept)
+                self._baked_bytes -= gone.tensor.numel()
+                self._baked_room += gone.tensor.numel()
+                gone.release()
+        return True
+
+    def _host_fits(self, nbytes: int) -> bool:
+        """Whether `nbytes` more fit the tier as last measured (`_host_room` measures)."""
+        return (
+            self._baked_bytes + nbytes <= self._host_cap
+            and self._baked_room - nbytes >= _BAKED_HEADROOM
+        )
+
     def _host_room(self, nbytes: int) -> bool:
         """Whether a host page of `nbytes` fits the tier: process lifetime, never on disk, each
         page once. Only into room beyond the headroom and within half of the host's RAM, evicting
@@ -1854,13 +1894,11 @@ class Memory:
         would miss every refill."""
         if not self._host_tier or not self.cuda or self.capturing():
             return False
-        if self._baked_bytes + nbytes > self._host_cap:
-            return False
         now = time.monotonic()
         if now - self._host_looked >= 1.0:  # host RAM is re-read at most once a second
             self._host_looked = now
             self._trim_baked()
-        return self._baked_room - nbytes >= _BAKED_HEADROOM
+        return self._host_fits(nbytes)
 
     def _pin(self, tensor: Tensor) -> _HostPage | None:
         """`tensor` registered as a host page; a failed pin turns the tier off, with a warning."""
@@ -1877,17 +1915,22 @@ class Memory:
 
     def _trim_baked(self) -> int:
         """The host RAM this process can still take (its tightest cgroup's, on Linux), after kept
-        pages go, least recently used first, while it is under the headroom; -1 unreadable, and
-        then they all go."""
+        pages go, those refilled least often per request first and then the least recently used,
+        while it is under the headroom; -1 unreadable, and then they all go."""
         room = self._baked_room = (
             proctree.available_host_bytes() if sys.platform == "linux" else host_memory().free_bytes
         )
-        while self._baked and room < _BAKED_HEADROOM:
-            page = self._baked.popitem(last=False)[1]
+        if room >= _BAKED_HEADROOM or not self._baked:
+            return room
+        for key in sorted(self._baked, key=lambda p: self._rate.get(p, 1)):
+            page = self._baked.pop(key)
             self._baked_bytes -= page.tensor.numel()
             page.release()
             if room >= 0:
                 room += page.tensor.numel()
+                if room >= _BAKED_HEADROOM:
+                    break
+        self._baked_room = room
         return room
 
     def _forget_baked(self, model: Model) -> None:
@@ -2660,8 +2703,11 @@ class Memory:
                             speculative=True,
                             origin="baked" if row.get("host") else "store",
                         )
-                if complete and not row.get("host"):
-                    self._want(block, (block.model.name, block.path, pending.identity, None))
+                if complete:
+                    page = (block.model.name, block.path, pending.identity, None)
+                    self._refills[page] = self._refills.get(page, 0) + 1
+                    if not row.get("host"):
+                        self._want(block, page)
             except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
@@ -2750,6 +2796,7 @@ class Memory:
             page: tuple[object, ...] | None = None
             if use is not None and use.needs_fill:
                 page = (block.model.name, block.path, block.model.identity, overlay)
+                self._refills[page] = self._refills.get(page, 0) + 1
                 if self._baked:
                     self._trim_baked()  # host pressure gives kept pages back here
                 found = self._baked.get(page)
@@ -3076,6 +3123,9 @@ class Memory:
                         # Cancel/drain unfinished speculation. An already completed read
                         # keeps valid immutable bytes as ordinary unpinned cache for B.
                         self._settle_prefetch(cancel=True)
+                with self.lock:
+                    self._rate.update(self._refills)  # the pages this request refilled
+                    self._refills.clear()
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
