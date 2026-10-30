@@ -2277,9 +2277,10 @@ class Memory:
                     with self.lock:
                         if not self._active_beside(request):
                             free = self.room().free
-                            if wanted > free:
+                            if wanted > free and not self._running(model):
                                 # Torch's idle cache goes before another phase's weights (a cold
-                                # Krea 2 DiT fill evicted its 4.3 GB text encoder beside it).
+                                # Krea 2 DiT fill evicted its 4.3 GB text encoder beside it); the
+                                # running phase's cache is its own activations' (`_running`).
                                 release_cached(torch, self.device.type)
                                 free = self.room().free
                             if wanted > free:
@@ -2307,6 +2308,13 @@ class Memory:
             )
             block.preferred = False
         return region
+
+    def _running(self, model: Model) -> bool:
+        """Whether `model` belongs to the active phase: Torch's cache then holds that phase's own
+        activations (`_activate_phase` returned the previous phase's), so a block of it filling
+        evicts idle weights, never the cache. Returning it per fill was a device sync and a
+        cudaMalloc back each time: H3 15 s on an RTX 4090, 16 a sparse step (100 GB), 5 s idle."""
+        return self.phase_supported and model.name in (self._phase_names or ())
 
     def _activate_phase(self, model: Model) -> None:
         """Prioritize an actual component phase, never each repeated block/denoising call."""
@@ -2392,6 +2400,7 @@ class Memory:
             and self.budget_bytes is None
             and not region.resident
             and not self.capturing()
+            and not self._running(model)
             and needed > self.room().free
             and (figures := _torch_bytes(self.device))[1] > figures[0]
         ):
