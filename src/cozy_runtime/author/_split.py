@@ -1,5 +1,6 @@
 """`split`: the package says how an op cuts (`Cut`); the memory says how finely (the execution
-layer's `split`, installed with it): whole, else in the windows the level Rust holds gives."""
+layer's `split`, installed with it): whole, else in the windows the level Rust holds gives. A
+layout that changes the result (a blended cut) comes from the shape alone (`most`)."""
 
 from __future__ import annotations
 
@@ -47,13 +48,30 @@ def install(runtime: Pieces | None) -> None:
     _RUNTIME = runtime
 
 
-def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut) -> Any:
+def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut, most: int | None = None) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
-    window of `x` to that window of its result. Without a managing memory it runs whole."""
+    window of `x` to that window of its result. Without a managing memory it runs whole.
+
+    With `most`, the windows are the fewest of at most `most` elements, on every device and
+    request, managed or not: the layout for an `fn` whose result depends on it, as a blended
+    cut's (an `overlap`) does. Without it such a layout follows free memory."""
     runtime = _RUNTIME
+    shape = tuple(int(n) for n in x.shape)
+    if most is not None and cuts:
+        windows = _windows(shape, cuts, most)
+        if runtime is None:
+            return _run(fn, x, cuts, windows, lambda: None)
+        # One level: a refusal reclaims and runs the same windows again, never finer ones.
+        return runtime.split(
+            _name(fn),
+            _key(fn, shape, cuts, x.dtype),
+            most,
+            most,
+            int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size()),
+            lambda _: _run(fn, x, cuts, windows, runtime.piece),
+        )
     if runtime is None or not cuts:
         return fn(x)
-    shape = tuple(int(n) for n in x.shape)
     return runtime.split(
         _name(fn),
         _key(fn, shape, cuts, x.dtype),

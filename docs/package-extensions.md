@@ -71,8 +71,14 @@ starts fall on multiples of `align`, and neighbours share `overlap` input elemen
 output cross-fades (none: the pieces join exactly, as a batch does).
 
 ```python
-decoded = split(self.decode_tiles, z, Cut(-2, scale=8, overlap=8), Cut(-1, scale=8, overlap=8))
+decoded = split(self.decode_tiles, z, Cut(-2, scale=8, overlap=8), Cut(-1, scale=8, overlap=8), most=n)
 ```
+
+Pieces that change the result change it with their layout, so that layout comes from the shape
+alone: `most` fixes the windows at the fewest of at most `most` elements, on every device and
+request. Give it for a blended cut; without it the windows follow free memory. Memory pressure
+inside a window falls to the exact cuts below it (a conv's bands); a refusal reclaims and runs
+the same windows again.
 
 The op runs whole when the device can hold it. Its peak bytes per input element are measured
 in the executor; later calls start at the fewest pieces that fit what is free plus the idle
