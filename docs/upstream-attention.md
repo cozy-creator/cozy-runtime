@@ -35,15 +35,15 @@ optional kernel. The kernels are compiled on the machine from pinned source
   Its HND input layout requires only transposed views for contiguous inner
   dimensions. Kitchen owns Hadamard rotation, adaptive K centering, per-thread
   Q/K scales, per-channel V scales and integer attention.
-- FlashInfer 0.7.0 exposes
-  [`cute_dsl_fmha_ragged_prefill`](https://github.com/flashinfer-ai/flashinfer/blob/v0.7.0/flashinfer/attention/cute_dsl/fmha.py),
+- FlashInfer 0.7.2.post1 exposes
+  [`cute_dsl_fmha_ragged_prefill`](https://github.com/flashinfer-ai/flashinfer/blob/v0.7.2.post1/flashinfer/attention/cute_dsl/fmha.py),
   whose scales are per-tensor scalars. The adapter quantises V per (batch, head)
   (the FA3-FP8 quantiser), passes `scale_v=1` and multiplies each head's BF16
   output by its descale: exact, head-local and without a host synchronisation.
   It compiles the kernel with `compile_cute_dsl_fmha_kernel` (CuTe JIT, counted as
   preparation) and hands it in, because the library otherwise downloads prebuilt
   artifacts on first use.
-- flash-attn-4 4.0.0b32 serves FP8 only on SM100/103 and only through
+- flash-attn-4 4.0.0b37 serves FP8 only on SM100/103 and only through
   `flash_attn.cute.interface._flash_attn_fwd` (`flash_attn_func` takes no descales).
 - SageAttention d1a57a54 `sageattention3_blackwell` (`sageattn3`) refuses every card
   but sm_120/121 in its C++ entry.
