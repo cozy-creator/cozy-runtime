@@ -1,0 +1,1 @@
+A component whose root names no paging unit pages by its submodules' `_no_split_modules`, so a package's wrapper around a Transformers model streams per layer: MOSS-Image's 9B text encoder (one 8.97 GB block before) fits an 8 GB card, and Krea 2's text encoder and HiDream-O1 page too.

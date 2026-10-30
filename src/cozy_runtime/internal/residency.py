@@ -259,6 +259,11 @@ def blocks_of(module: nn.Module) -> list[str]:
     if isinstance(declared, Declared) and declared.blocks is not None:
         return list(declared.blocks)
     names = set(getattr(module, "_no_split_modules", None) or ())
+    # A root that names no paging unit pages by what its submodules name: a package's plain wrapper
+    # around a Transformers or Diffusers model takes that model's own units (MOSS-Image's 9B text
+    # encoder was one 8.97 GB block, larger than an 8 GB card).
+    if not names:
+        names = {n for sub in module.modules() for n in getattr(sub, "_no_split_modules", None) or ()}
     found = [
         path
         for path, sub in module.named_modules()
