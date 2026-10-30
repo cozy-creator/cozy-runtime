@@ -575,7 +575,7 @@ class Reader:
             if isinstance(base, ModuleRef):
                 return self.lookup(base.module, node.attr, node, origin=module)
             if isinstance(base, VocabModule):
-                return Vocab(f"{base.prefix}.{node.attr}")
+                return self._vocab(module, node, f"{base.prefix}.{node.attr}")
             if isinstance(base, External):
                 return External(f"{base.spelling}.{node.attr}")
             self.refuse(module, node, "an attribute of something that is not a module")
@@ -622,6 +622,19 @@ class Reader:
             return Assigned(module, stmt, stmt.value)
         self.refuse(module, stmt, "a binding form the static reader does not follow")
 
+    def _vocab(self, module: Module, node: ast.AST, key: str) -> Vocab:
+        """A vocabulary name, refused with its replacement when Runtime 0.36.0 removed it."""
+        prefix, _, name = key.partition(".")
+        if prefix == "author" and name in author._REMOVED:
+            self.refuse(
+                module,
+                node,
+                f"cozy_runtime.author.{name} is gone in Runtime 0.36.0 ({author._REMOVED[name]} "
+                "replaces it): this package was built for Runtime < 0.36; use its newest release",
+                "removed_name",
+            )
+        return Vocab(key)
+
     def _module_binding(self, module: Module, target: str, stmt: ast.stmt) -> Resolved:
         if target in _VOCAB_MODULES:
             return VocabModule(_VOCAB_MODULES[target])
@@ -635,7 +648,7 @@ class Reader:
         if base is None:
             self.refuse(module, stmt, "a relative import above the package", "static_module")
         if base in _VOCAB_MODULES:
-            return Vocab(f"{_VOCAB_MODULES[base]}.{name}")
+            return self._vocab(module, stmt, f"{_VOCAB_MODULES[base]}.{name}")
         if base.startswith("cozy_runtime.") and not _trusted_module(base):
             return External(f"{base}.{name}")
         if not (_trusted_module(base) or self._tree_tops(base)):
