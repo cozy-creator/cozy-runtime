@@ -2202,6 +2202,15 @@ class Memory:
                     held.set_preferred(block.preferred and protect)
         elif created:
             region.set_preferred(block.preferred and (final or not block.final_only()))
+        if (
+            not block.preferred
+            and model.prefix == block.index
+            and self.phase_supported
+            and model.name in (self._phase_names or ())
+            and not self.capturing()
+            and not (request is not None and request.idle)
+        ):
+            self._grow_prefix(block, request)
         if block.preferred and (final or not block.final_only()) and not region.preferred:
             # Native activation recovery reduces the prefix without calling Python. Keep
             # later unprepared blocks on the streaming side of that same watermark.
@@ -2210,6 +2219,43 @@ class Memory:
             )
             block.preferred = False
         return region
+
+    def _grow_prefix(self, block: _Block, request: Request | None) -> None:
+        """The running phase's working set wins: the streamed block at its prefix's edge joins the
+        prefix at a later refill once the room it missed at its first prepare is there, so the
+        tail stops cycling through the window. Step 1's activations can hold that room: Qwen-Image
+        int8 on 8 GB left its last 3 blocks streaming for all 40 steps, each refilled every step
+        (150 fills against 33, Runtime 0.35.6). Free room only, evicting nothing for it."""
+        with self.lock:
+            if self._active_beside(request):
+                return
+            missing = block.allocation_bytes - sum(
+                int(held.allocated_bytes)
+                for held in (block.region, block.final_region)
+                if held is not None and held.resident
+            )
+            if self.room().free < missing + self._headroom():
+                return
+            for held, protect in (
+                (block.region, not block.final_only()),
+                (block.final_region, True),
+            ):
+                if held is not None:
+                    held.set_preferred(protect)
+            region = block.final_region if block.final_only() else block.region
+            if region is None or not region.preferred:
+                # Native's end-of-prefix watermark still wins: pressure evicted a preferred block
+                # this phase, so none past it may join until the next phase.
+                for held in (block.region, block.final_region):
+                    if held is not None:
+                        held.set_preferred(False)
+                return
+            model = block.model
+            block.preferred = True
+            later = [b.index for b in model.blocks.values() if b.index > block.index]
+            model.prefix = min(later) if later else None
+            if request is not None:
+                request.prefix_grown += 1
 
     def _activate_phase(self, model: Model) -> None:
         """Prioritize an actual component phase, never each repeated block/denoising call."""
@@ -3120,6 +3166,8 @@ class Request:
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
         self.prefetch_released = 0
+        #: streamed blocks of the running phase that joined its prefix after their first prepare
+        self.prefix_grown = 0
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
@@ -3305,6 +3353,7 @@ class Request:
                     "canceled": self.prefetch_canceled,
                     "skipped_capacity": self.prefetch_skipped,
                     "released_cache": self.prefetch_released,
+                    "prefix_grown": self.prefix_grown,
                     "failed": self.prefetch_failed,
                     "wait_ns": self.prefetch_wait_ns,
                     "scope": "one exact raw block; current demand precedes queued speculation",
