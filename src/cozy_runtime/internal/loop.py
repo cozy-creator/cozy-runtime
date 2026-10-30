@@ -1,25 +1,26 @@
 """`author.denoise_loop` in the Runtime: eager, or one resident captured program.
 
-`before` and the first step always run eagerly, for real: they warm kernels and bring the weights
-in through ordinary residency, on the caller's stream (only recorded regions run on the
-recording's streams, which end with the program). Then the loop runs resident when a call keeps
-the program and every block of its step's components is still on the device, else eagerly. A
-refusal before submission drops that attempt and the next mode continues from the next step;
-nothing runs twice. After submission nothing falls back.
+A call runs its site's kept program natively from start to end, else eagerly, for real, on the
+caller's stream (only recorded regions run on the recording's streams, which end with the program).
+A keyed call whose blocks all stay resident gets its whole call (`before`, the steps and `after`)
+recorded and kept for its call site, until a new key replaces it or residency retires it under
+pressure. The first call of a key and layout runs eagerly, warming its kernels and naming its
+blocks, and queues the recording for the idle period after it (`_IdleRecording`, xs-134 F): on
+copies of its tensors, in the call's component scope, so a call after any idle gap runs natively
+from its start. A command that arrives preempts it between its parts (never inside package code). A
+call that finds it unrecorded (no idle period yet, or preempted) records the whole call before
+running any of it and runs it natively from its start: one plan and no eager step. No idle period
+opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so a call queued behind
+another never waits for idle work. One that does not fit, or whose code cannot run outside its
+request, is not tried again for that layout, and the calls say why. A program that no call keeps is
+not recorded: the call runs eagerly. Resident, it costs no more per step than native execution saves
+(SDXL, Qwen-Image measured). Streamed (its blocks do not all stay on the device), its replay pays
+for neither its recording nor the extra reads the next request makes (Qwen-Image int8 1 MP on an RTX
+3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
 
-A keyed call whose blocks all stay resident records the whole call (`before`, the steps and
-`after`) and keeps it for its call site: later calls run it natively from start to end, until a
-new key replaces it or residency retires it under pressure. A whole call is recorded only after
-an earlier call with that key and layout ran `after` eagerly, warming its kernels and naming its
-blocks; one that does not fit is not tried again for that layout, and that call's rest runs
-eagerly with its weights in place. A program that no call keeps is not recorded: the call runs
-eagerly. Resident, it costs no more per step than native execution saves (SDXL, Qwen-Image
-measured). Streamed (its blocks do not all stay on the device), its replay pays for neither its
-recording nor the extra reads the next request makes (Qwen-Image int8 1 MP on an RTX 3070: eager
-45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
-
-A loop outside any component scope (tensor work only) records resident every call and is never
-kept.
+A loop outside any component scope (tensor work only) records resident every call and is never kept:
+`before` and the first step run eagerly, then the rest natively. A refusal before submission drops
+that attempt and the rest runs eagerly; nothing runs twice. After submission nothing falls back.
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ import weakref
 from collections.abc import Callable, Hashable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -44,7 +45,7 @@ from torch.utils._pytree import tree_leaves
 from cozy_runtime import graphs
 from cozy_runtime.author import _loop
 from cozy_runtime.author._context import CURRENT, Context
-from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault
+from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import kernel_ready
@@ -156,7 +157,6 @@ class _Program:
 
     first: tuple[tuple[PreparedSequence, int, int], ...]
     again: PreparedSequence | None
-    after_native: bool
     mode: str
     tensors: tuple[Any, ...]
     counter: Any
@@ -166,6 +166,8 @@ class _Program:
     lock: threading.Lock = field(default_factory=threading.Lock)
     #: a kept program's cache handle: residency releases it under pressure while it is idle
     region: Any = None
+    #: its idle recording's parts and total (ms)
+    recorded: dict[str, float] | None = None
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
         rest = () if self.again is None else (self.again,)
@@ -184,11 +186,13 @@ class _Program:
 
 @dataclass
 class _Site:
-    """What a call site's keyed calls learned, per layout: the blocks an eager `after` ran,
-    and the whole calls that did not fit."""
+    """What a call site's keyed calls learned, per layout: the blocks an eager `after` ran, the
+    whole call queued to record at idle, and the whole calls ruled out (and why)."""
 
     after: dict[Hashable, dict[Model, tuple[str, ...]]] = field(default_factory=dict)
     unfit: set[Hashable] = field(default_factory=set)
+    pending: dict[Hashable, _IdleRecording] = field(default_factory=dict)  # by key and layout
+    why: dict[Hashable, str] = field(default_factory=dict)
 
 
 class Loops:
@@ -280,12 +284,21 @@ class Loops:
                     if self._kept.get(site) is kept:
                         del self._kept[site]
                 _close_idle(kept)
+            job = None if ident is None else known.pending.get(ident)
+            if scope and job is None:
+                with _laps(row):
+                    pre, body = _eager(loop, tensors, scope, known, shape, ctx)
+                row["eager"] = self._queue(
+                    site, known, loop, tensors, len(work), scope, pre, body, ident, shape
+                )
+                return
+            if job is not None:
+                self._take_over(site, known, job, loop, tensors, work, scope, ctx, row)
+                return
             program = None
             try:
                 with _laps(row):
-                    program = _record(
-                        loop, tensors, work, scope, key, ctx, row, ident, shape, known
-                    )
+                    program = _record(loop, tensors, work, key, ctx, row)
                 if program is None:
                     return
                 for sequence, first, count in program.first:
@@ -294,27 +307,111 @@ class Loops:
                 if program is not None:
                     program.close()
                 raise
-            if key is None or not program.after_native:
-                # Only a program that ends the call is kept. Any other closes before the work
-                # after it (an eager decode) needs its pool and weights.
-                program.close()
-                _after(loop, program.tensors, scope, known, shape)
-                _back(work, program.tensors)
-                return
+            # No call keeps a componentless program; it closes before the work after it (an
+            # eager decode) needs its pool.
+            program.close()
+            _after(loop, program.tensors, scope, known, shape)
             _back(work, program.tensors)
-            # Later calls run `again` only: the recording call's own program goes, so scope
-            # entries and submissions check one definition.
-            for sequence, _, _ in program.first:
-                sequence.close()
-            program.first = ()
-            program.region = scope[0].memory.region(
-                "denoise_loop", "program", release=program.close
-            )
-            with self._lock:
-                previous = self._kept.pop(site, None)
-                self._kept[site] = program
-            if previous is not None:
-                _close_idle(previous)
+
+    def _take_over(
+        self,
+        site: Hashable,
+        known: _Site,
+        job: _IdleRecording,
+        loop: _Loop,
+        tensors: tuple[Any, ...],
+        work: tuple[Any, ...],
+        scope: tuple[Model, ...],
+        ctx: Context,
+        row: dict[str, Any],
+    ) -> None:
+        """Its idle recording has not run (no idle period yet) or was preempted: this call
+        records the whole call before running any of it, from what its first call learned,
+        and runs it natively from its start (one plan, no eager step)."""
+        shape = job.ident[1]  # type: ignore[index]
+        with self._lock:
+            known.pending.pop(job.ident, None)
+        program, began = None, time.perf_counter()
+        try:
+            with _laps(row):
+                program = _record_whole(
+                    loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident
+                )
+        except Exception as error:
+            if isinstance(error, Building) or isinstance(error.__cause__, Building):
+                with self._lock:
+                    known.pending[job.ident] = job  # a kernel still opens: the idle period
+                graphs.IDLE.add(job)
+                row["refusals"].append("whole call: a kernel still opens")
+            elif (why := _refusal(error)) is not None:
+                row["refusals"].append(f"whole call: {why}")
+                with self._lock:
+                    known.unfit.add(shape)
+                    known.why[shape] = why[:400]
+            else:
+                raise
+        if program is None:
+            loop.eager_all(tensors, ctx)
+            return
+        row.update(
+            whole_call="recorded on this call, its idle recording not run",
+            capture_ms=round((time.perf_counter() - began) * 1000, 3),
+        )
+        self._install(site, program, scope[0].memory)
+        with _taken(program.lock, ctx), _pinned(program) as pinned:
+            if pinned and not _stale(program, job.ident, checked=True):
+                self._reuse(program, loop, tensors, work, ctx, row)
+                return
+        row["dropped"] = "released"
+        loop.eager_all(tensors, ctx)
+
+    def _queue(
+        self,
+        site: Hashable,
+        known: _Site,
+        loop: _Loop,
+        tensors: tuple[Any, ...],
+        nwork: int,
+        scope: tuple[Model, ...],
+        pre: dict[Model, tuple[str, ...]],
+        body: dict[Model, tuple[str, ...]],
+        ident: Hashable,
+        shape: Hashable,
+    ) -> str:
+        """Why the call ran eagerly: its whole call queued to record at idle, or why none does."""
+        resident = all(not _unresident(model, paths) for model, paths in body.items())
+        if ident is None or loop.after is None or loop.phases is not None or not resident:
+            return f"{'resident' if resident else 'streamed'}, and no call keeps the program"
+        with self._lock:
+            if shape in known.unfit:
+                return f"no whole call: {known.why.get(shape, 'it did not fit')}"
+            if ident not in known.pending:
+                job = _IdleRecording(
+                    self,
+                    site,
+                    known,
+                    replace(loop, on_step=None),  # the call's progress hook stays with the call
+                    tuple(value.clone() for value in tensors),  # the program's own copies
+                    nwork,
+                    scope,
+                    pre,
+                    body,
+                    known.after.get(shape, {}),
+                    ident,
+                    _LOCAL_SCOPES.get()[-1],
+                    tuple(model.wanted_identity() for model in scope),
+                )
+                known.pending[ident] = job
+                graphs.IDLE.add(job)
+        return "resident: the whole call records at idle"
+
+    def _install(self, site: Hashable, program: _Program, memory: Any) -> None:
+        program.region = memory.region("denoise_loop", "program", release=program.close)
+        with self._lock:
+            previous = self._kept.pop(site, None)
+            self._kept[site] = program
+        if previous is not None:
+            _close_idle(previous)
 
     def _reuse(
         self,
@@ -329,6 +426,8 @@ class Loops:
         step and `after`, and the state back out."""
         assert kept.again is not None  # only whole calls are kept
         row.update(mode=kept.mode, reused=True, stages=kept.stages, blocks=kept.blocks)
+        if kept.recorded is not None:
+            row["recorded_idle_ms"] = kept.recorded
         try:
             for slot, value in zip(kept.tensors, tensors, strict=True):
                 slot.copy_(value)
@@ -392,151 +491,264 @@ def _entering() -> Iterator[set[Any]]:
         ENTERED.reset(token)
 
 
-def _record(
+def _eager(
     loop: _Loop,
     tensors: tuple[Any, ...],
-    work: tuple[Any, ...],
     scope: tuple[Model, ...],
-    key: Hashable | None,
-    ctx: Context,
-    row: dict[str, Any],
-    ident: Hashable,
-    shape: Hashable,
     known: _Site,
-) -> _Program | None:
-    """`before` and the first step eagerly, then the rest recorded; None when every mode
-    refused or no call keeps the program, after the loop ran eagerly to its end."""
-    if key is not None:  # the program owns copies; this call's values go in and out
-        tensors = tuple(value.clone() for value in tensors)
-    mutable = tensors[: len(work)]
-    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    steps = loop.steps
-    # The caller's stream: residency records its consumers on the current stream, and the
-    # recording's own streams end with the program.
+    shape: Hashable,
+    ctx: Context,
+) -> tuple[dict[Model, tuple[str, ...]], dict[Model, tuple[str, ...]]]:
+    """A component call eagerly, on the caller's tensors: the blocks its `before` and its first
+    step ran (its site learns its `after`'s)."""
     with _entering() as seen:
         _once(loop.before, tensors)
     _lap("before")
     pre = _used(seen, scope)
     with _entering() as seen:
-        loop.eager(steps[:1], tensors, ctx)
+        loop.eager(loop.steps[:1], tensors, ctx)
     _lap("first_step")
     body = _used(seen, scope) or {model: ("",) for model in scope}
-    models = tuple(body)
-    resident = all(not _unresident(model, paths) for model, paths in body.items())
-    # A kept program records the whole call, `after` too, when every block `before` and an
-    # earlier eager `after` of this key and layout ran is still on the device.
-    post = known.after.get(shape, {})
-    ends = (
-        key is not None
-        and bool(scope)  # a kept program is a region of its components' memory
-        and loop.after is not None
-        and resident
-        and loop.phases is None
-        and shape in known.after
-        and shape not in known.unfit
-    )
-    if ends:
-        outside = next(
-            (w for m, paths in (*pre.items(), *post.items()) if (w := _unresident(m, paths))),
-            "",
-        )
-        if outside:
-            row["whole_call"] = f"before/after not resident: {outside}"
-        ends = not outside
-    if not ends and scope:
-        # No call keeps this program: recording it would cost more than its steps save.
-        row["eager"] = f"{'resident' if resident else 'streamed'}, and no call keeps the program"
-        _back(work, tensors)  # the eager rest runs on the caller's tensors
-        tensors = work + tensors[len(work) :]
-        loop.eager(steps[1:], tensors, ctx)
-        _after(loop, tensors, scope, known, shape)
-        return None
+    loop.eager(loop.steps[1:], tensors, ctx)
+    _after(loop, tensors, scope, known, shape)
+    return pre, body
+
+
+def _record(
+    loop: _Loop,
+    tensors: tuple[Any, ...],
+    work: tuple[Any, ...],
+    key: Hashable | None,
+    ctx: Context,
+    row: dict[str, Any],
+) -> _Program | None:
+    """A componentless loop: `before` and the first step eagerly, then the rest recorded; None
+    when the recording was refused, after the loop ran eagerly to its end."""
+    if key is not None:  # the program owns copies; this call's values go in and out
+        tensors = tuple(value.clone() for value in tensors)
+    mutable = tensors[: len(work)]
+    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+    steps = loop.steps
+    _once(loop.before, tensors)
+    _lap("before")
+    loop.eager(steps[:1], tensors, ctx)
+    _lap("first_step")
+    rest = steps[1:]
     recording = PreparedSequence.record()
     recording.__enter__()
     try:
+        why = None
         try:
             recording._prepare((*mutable, counter))
+            torch.cuda.empty_cache()
+            _lap("prepare")
+            began = time.perf_counter()
+            ctx.raise_if_cancelled()
+            with recording.capturing():
+                parts, blocks = _record_resident(
+                    recording, loop, rest, tensors, mutable, counter, {}, None, None, False
+                )
+            made = recording.finish_parts(
+                outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
+            )
+            _lap("finish")
         except BaseException as error:
             if (why := _refusal(error)) is None:
                 raise
-            row["refusals"].append(f"recording: {why}")
-            _back(work, tensors)
-            loop.eager(steps[1:], work + tensors[len(work) :], ctx)
-            _after(loop, work + tensors[len(work) :], scope, known, shape)
+        if why is not None:
+            # Outside the handler: its traceback no longer holds the attempt's graphs, so their
+            # pool returns before the eager rest.
+            row["refusals"].append(f"resident: {why}")
+            _drop_stages(recording)
+            gc.collect()
+            torch.cuda.empty_cache()
+            _back(work, tensors)  # the eager rest runs on the caller's tensors
+            loop.eager(rest, work + tensors[len(work) :], ctx)
+            _once(loop.after, work + tensors[len(work) :])
             return None
-        torch.cuda.empty_cache()
-        _lap("prepare")
-        rest = steps[1:]
-        began = time.perf_counter()
-        row["resident_after_first_step"] = resident
-        # One attempt: a kept whole call, or a componentless loop's steps. A refused whole call
-        # records no steps-only program, which no call would keep: the rest runs eagerly.
-        attempts = [("resident", ends)]
-        for mode, whole in attempts:
-            ctx.raise_if_cancelled()
-            why = None
-            try:
-                with recording.capturing():
-                    if mode == "resident":
-                        parts, blocks = _record_resident(
-                            recording,
-                            loop,
-                            rest,
-                            tensors,
-                            mutable,
-                            counter,
-                            body,
-                            pre if whole else None,
-                            post if whole else None,
-                            whole,
-                        )
-                    else:
-                        parts, blocks = _record_streamed(
-                            recording, loop, rest, tensors, mutable, counter, models
-                        )
-                made = recording.finish_parts(
-                    outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
-                )
-                _lap("finish")
-            except BaseException as error:
-                if (why := _refusal(error)) is None:
-                    raise
-            if why is not None:
-                # Outside the handler: its traceback no longer holds the attempt's graphs, so
-                # their pool returns before the next attempt.
-                row["refusals"].append(f"{mode}{' whole call' if whole else ''}: {why}")
-                if whole:
-                    known.unfit.add(shape)
-                _drop_stages(recording)
-                gc.collect()
-                torch.cuda.empty_cache()
-                continue
-            first = tuple(
-                (sequence, start, count)
-                for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
-                if start >= 0
-            )
-            again = next(
-                (sequence for sequence, part in zip(made, parts, strict=True) if part[3] < 0),
-                None,
-            )
-            stages = sum(end - begin for begin, end, _, start, _ in parts if start >= 0)
-            row.update(
-                mode=mode,
-                stages=stages,
-                blocks=blocks,
-                capture_ms=round((time.perf_counter() - began) * 1000, 3),
-                after_native=whole,
-            )
-            return _Program(first, again, whole, mode, tensors, counter, ident, stages, blocks)
-        _back(work, tensors)  # the eager rest runs on the caller's tensors
-        tensors = work + tensors[len(work) :]
-        loop.eager(rest, tensors, ctx)
-        _after(loop, tensors, scope, known, shape)
-        return None
+        first = tuple(
+            (sequence, start, count)
+            for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
+        )
+        stages = sum(end - begin for begin, end, _, _, _ in parts)
+        row.update(
+            mode="resident",
+            stages=stages,
+            blocks=blocks,
+            capture_ms=round((time.perf_counter() - began) * 1000, 3),
+            after_native=False,
+        )
+        return _Program(first, None, "resident", tensors, counter, None, stages, blocks)
     finally:
         if not recording._finished:
             recording.close()
+
+
+def _yield_point() -> None:
+    """At idle, a command that arrived ends the recording here (`graphs.Yielded`): at a boundary
+    between its parts, never inside package or library code, whose broad handlers and native
+    frames are not made to unwind it (a yield inside the int8 op served its slower path, then
+    the executor crashed)."""
+    if (idle := graphs._IDLE.get(None)) is not None:
+        idle.check()
+
+
+def _record_whole(
+    loop: _Loop,
+    tensors: tuple[Any, ...],
+    nwork: int,
+    pre: dict[Model, tuple[str, ...]],
+    body: dict[Model, tuple[str, ...]],
+    post: dict[Model, tuple[str, ...]],
+    ident: Hashable,
+) -> _Program:
+    """The whole call (`before`, every step and `after`) recorded on `tensors` as one program
+    a later call runs natively; it yields to a command between its parts (`_yield_point`). A
+    failed or preempted attempt goes as a refused one does: its frames first, then its stages and
+    the tensors of its pool, then its domain (a preemption that closed the domain under its live
+    frames crashed the executor)."""
+    mutable = tensors[:nwork]
+    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+    recording = PreparedSequence.record()
+    recording.__enter__()
+    failure: BaseException | None = None
+    try:
+        recording._prepare((*mutable, counter))
+        torch.cuda.empty_cache()
+        _lap("prepare")
+        _yield_point()
+        with recording.capturing():
+            parts, blocks = _record_resident(
+                recording,
+                loop,
+                loop.steps[1:],
+                tensors,
+                mutable,
+                counter,
+                body,
+                pre,
+                post,
+                True,
+                remaining=False,
+            )
+        if len(parts) != 1:
+            raise CapabilityError(
+                "the whole call is not one pass of equal steps", code="prepared_graph_ineligible"
+            )
+        (again,) = recording.finish_parts(
+            outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
+        )
+        _lap("finish")
+    except BaseException as error:
+        failure = error
+    if failure is not None:
+        unwind(failure)
+        _drop_stages(recording)
+        gc.collect()
+        torch.cuda.empty_cache()
+        recording.close()
+        raise failure
+    stages = parts[0][1] - parts[0][0]
+    return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
+
+
+@dataclass(eq=False)
+class _IdleRecording:
+    """A keyed call's whole program, recorded at an idle period (`graphs.IDLE`) on copies of its
+    tensors, in the call's component scope, and kept for its site. A command preempts it at its
+    next torch op inside the recorded code; it records again at the next idle. One whose models
+    changed fill or left the device goes (the next call queues again); one that cannot be
+    recorded (it does not fit, or its code cannot run outside its request) is ruled out for its
+    layout, and the next calls say why."""
+
+    loops: Loops
+    site: Hashable
+    known: _Site
+    loop: _Loop
+    tensors: tuple[Any, ...]
+    nwork: int
+    scope: tuple[Model, ...]
+    pre: dict[Model, tuple[str, ...]]
+    body: dict[Model, tuple[str, ...]]
+    post: dict[Model, tuple[str, ...]]
+    ident: Hashable
+    #: the call's innermost component scope: its owner, method and components
+    entry: tuple[Any, str, tuple[str, ...]]
+    identities: tuple[Any, ...]
+    #: it yields between its parts (`_yield_point`), not per torch op (`graphs.IDLE`): under the
+    #: per-op mode an RTX 4090's SDXL plan took 3.4 s instead of 0.46 s
+    yields_per_op = False
+
+    def __call__(self) -> bool:
+        shape = self.ident[1]  # type: ignore[index]
+        with self.loops._lock:
+            if self.known.pending.get(self.ident) is not self:
+                return True
+        try:
+            done = self._record()
+        except Exception as error:
+            if isinstance(error, graphs.Yielded) or fault(error) in (Fault.STICKY, Fault.DEVICE):
+                raise
+            if isinstance(error, Building) or isinstance(error.__cause__, Building):
+                return False  # a kernel still opens: a later idle period
+            why = _refusal(error) or f"{type(error).__name__}: {error}"
+            with self.loops._lock:
+                self.known.unfit.add(shape)
+                self.known.why[shape] = f"its idle recording failed: {why}"[:400]
+            graphs.say(f"loop:{why}", f"[loop] a whole call is not recorded: {why}"[:400])
+            done = True
+        if done:
+            with self.loops._lock:
+                if self.known.pending.get(self.ident) is self:
+                    del self.known.pending[self.ident]
+        return done
+
+    def _record(self) -> bool:
+        """True once kept or gone; False to try at a later idle period."""
+        if any(model.closed or model.retiring for model in self.scope):
+            return True
+        if tuple(model.wanted_identity() for model in self.scope) != self.identities:
+            return True  # another fill than the call's (a LoRA'd call's): the next call queues
+        with self.loops._lock:
+            kept = self.loops._kept.get(self.site)
+        if kept is not None and not _stale(kept, self.ident):
+            return True
+        paths: dict[Model, set[str]] = {}
+        for used in (self.body, self.pre, self.post):
+            for model, entered in used.items():
+                paths.setdefault(model, set()).update(entered)
+        owner, method, components = self.entry
+        began = time.perf_counter()
+        parts: dict[str, float] = {}
+        laps = _LAPS.set([parts, began])
+        settling = graphs._SETTLING.set(True)  # no torch op yields: only its boundaries do
+        bypass = graphs.BYPASS.set(True)
+        try:
+            with (
+                torch.cuda.device(self.tensors[0].device),
+                torch.inference_mode(False),
+                torch.no_grad(),
+                owner._cozy_scope(method, components),
+            ):
+                _lap("scope")
+                _yield_point()
+                if any(_unresident(model, tuple(p)) for model, p in paths.items()):
+                    return True  # its weights left the device: the next call queues again
+                _lap("resident")
+                _yield_point()
+                program = _record_whole(
+                    self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident
+                )
+        finally:
+            graphs.BYPASS.reset(bypass)
+            graphs._SETTLING.reset(settling)
+            if (placement := getattr(owner, "_cozy_residency", None)) is not None:
+                placement.release()  # the scope's holds, as a request's end gives them back
+            _lap("release")
+            _LAPS.reset(laps)
+        program.recorded = parts | {"total": round((time.perf_counter() - began) * 1000, 1)}
+        self.loops._install(self.site, program, self.scope[0].memory)
+        return True
 
 
 def _used(seen: set[Any], scope: tuple[Model, ...]) -> dict[Model, tuple[str, ...]]:
@@ -763,11 +975,13 @@ def _record_resident(
     pre: dict[Model, tuple[str, ...]] | None,
     post: dict[Model, tuple[str, ...]] | None,
     again: bool,
+    *,
+    remaining: bool = True,
 ) -> tuple[list[_Part], int]:
     """One WHILE graph per run of equal phases, every component resident and held. With
     `pre`/`post` (the models `before`/`after` run, resident too), `after` is recorded as the
     last graph's suffix, and `again` also makes the reuse program: `before`, every step and
-    `after` over the same graphs."""
+    `after` over the same graphs. `remaining` plans the recording call's own rest too."""
     runs = _runs(rest, loop.phases, loop.steps)
     paths: dict[Model, set[str]] = {}
     for used in (body, pre or {}, post or {}):
@@ -806,16 +1020,19 @@ def _record_resident(
                     graph = _Graph(recording, state, count, owners)
                     graph.record(advance)
                     graphs_.append((graph, first, count))
+                    _yield_point()
                 prefix = suffix = None
                 if loop.after is not None and post is not None:
                     suffix = _Graph(recording, state, 1, owners)
                     suffix.record(lambda: loop.after(*tensors))  # type: ignore[misc]
+                    _yield_point()
                 if again and loop.before is not None and pre is not None:
                     prefix = _Graph(recording, state, 1, owners)
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
             _lap("record")
+            _yield_point()
             parts: list[_Part] = []
-            for number, (graph, first, count) in enumerate(graphs_):
+            for number, (graph, first, count) in enumerate(graphs_ if remaining else ()):
                 last = number == len(graphs_) - 1
                 plan = graph.plan(landed, suffix=suffix if last else None)
                 _own(plan, owners, recording)
