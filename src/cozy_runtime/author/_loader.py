@@ -51,6 +51,9 @@ CONSTRUCTION: ContextVar[object | None] = ContextVar("construction", default=Non
 #: construction's placeholders, and those are the checkpoint destinations from then on (§1.1).
 FILLED: ContextVar[Callable[[object], None] | None] = ContextVar("filled", default=None)
 
+#: Told when a factory returned, before its census: the substrate's constants go weightless.
+BUILT: ContextVar[Callable[[], None] | None] = ContextVar("built", default=None)
+
 
 # ---------------------------------------------------------------------- tensor schema
 
@@ -837,6 +840,8 @@ class Loader:
         construction = CONSTRUCTION.set(object())
         try:
             obj = factory(config)
+            if (built := BUILT.get()) is not None:
+                built()
         except Exception as exc:
             if self._artifact.unnormalized:
                 raise CheckpointUnnormalized(

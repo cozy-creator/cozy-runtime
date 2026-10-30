@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import functools
 import time
+import warnings
 import zlib
 from collections import Counter
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
@@ -1227,14 +1228,29 @@ def _derived_values(
     root: Module, component: str, unstored: Collection[str]
 ) -> dict[tuple[Module, str], Tensor]:
     """Buffers with their constructed values: non-persistent ones, which no checkpoint supplies,
-    and the persistent ones this checkpoint does not store (`unstored`, full keys)."""
+    and the persistent ones this checkpoint does not store (`unstored`, full keys). One built
+    on meta has no value, and a read of it refuses: each is named in a warning now."""
     held: dict[tuple[Module, str], Tensor] = {}
+    unvalued: list[str] = []
     for path, sub in root.named_modules(remove_duplicate=False):
         for local, value in sub._buffers.items():
             key = f"{component}.{path}.{local}" if path else f"{component}.{local}"
             derived = local in getattr(sub, "_non_persistent_buffers_set", ()) or key in unstored
-            if derived and value is not None and str(value.device) != "meta":
+            if not derived or value is None:
+                continue
+            if str(value.device) == "meta":
+                unvalued.append(key)
+            else:
                 held[(sub, local)] = value.detach()
+    if unvalued:
+        more = f", and {len(unvalued) - 3} more" if len(unvalued) > 3 else ""
+        warnings.warn(
+            f"{len(unvalued)} buffer(s) no checkpoint stores were built on meta and have no "
+            f"value, so a read refuses: {', '.join(unvalued[:3])}{more}. Compute them from "
+            "config or a constant, or store them",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return held
 
 

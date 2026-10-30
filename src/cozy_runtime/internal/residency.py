@@ -3108,7 +3108,12 @@ class Memory:
             try:
                 value = site.table[site.name]
                 if isinstance(value, Placeholder):
-                    raise ResidencyError("the declared binder did not supply this weight")
+                    raise ResidencyError(
+                        f"{model.name}: {site.name} has no value: no stored tensor binds it. A "
+                        "buffer no checkpoint stores keeps its constructed value only when "
+                        "construction computed one (from config or a constant), not from a "
+                        "weightless parameter"
+                    )
                 return value
             finally:
                 self._exit(block)
