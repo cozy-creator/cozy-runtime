@@ -313,15 +313,17 @@ _AUTHOR_TYPES = (
     "EncodingRule",
     "ImageRequest",
     "ImageResult",
-    "ReferenceImages",
+    "Reference",
+    "ImageReference",
     "Box",
     "Region",
     "AspectRatio",
     "Seed",
     *(cls.__name__ for cls in SERVICES.values()),
 )
-#: Author-surface structs a package's struct may extend (cr-219): the image interface.
-_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult")
+#: Author-surface structs a package's struct may extend: the image interface (cr-219) and the
+#: named references (xs-135).
+_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult", "Reference", "ImageReference")
 #: Author-surface callables a folded constant may reach: each validates its own arguments.
 #: `data_values` reads committed JSON through the same function as the imported app.
 _AUTHOR_VALUES = (

@@ -421,6 +421,14 @@ assets merely because they have unusual dimensions; an explicit valid output rat
 such a reference. Packages that preserve a reference canvas directly must still resolve it
 through `ImageRequest.target()` before choosing output dimensions.
 
+A prompt names its inputs as `<name>` when a package opts into the author library's references
+(xs-135): `references: list[ImageReference]` (or a `Reference` subclass with its own media and
+fields), and `render(prompt, references, label)` puts each mention in the model's own words, the
+label being how the model refers to the Nth reference (`lambda n, ref: f"Picture {n}"`). Names
+match in any case with `_`, `-` and space alike; a mention of no reference stays as written with a
+warning. `ImageRequest.references` takes these, and its first reference sets the default canvas.
+Nothing below the author library knows the convention: a package may declare any input shape.
+
 Image inputs can separately opt into preparation on a field or an `Assets` argument:
 
 ```python
