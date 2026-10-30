@@ -1945,17 +1945,24 @@ class Memory:
         self, region: Any, kept: _HostPage, *, evict_completed: bool
     ) -> _HostRead | None:
         """A refill from a host page: the region's fill under the native prefetch's admission,
-        one async DMA; None when the region is resident already."""
+        one async DMA; None when the region is resident already. The copy stream exists before
+        admission, and a fill admitted here that fails is released before its error leaves: a
+        traceback holding it kept the region `already being filled` for the retry (cr-225)."""
+        if self._h2d_stream is None:
+            self._h2d_stream = torch.cuda.Stream(self.device)
+        stream = self._h2d_stream
         use = region.prepare(reclaim=False, evict_completed=evict_completed)
         if not use.needs_fill:
             return None
-        if self._h2d_stream is None:
-            self._h2d_stream = torch.cuda.Stream(self.device)
-        with torch.cuda.stream(self._h2d_stream):
-            use.tensor.copy_(kept.tensor, non_blocking=True)
-            event = torch.cuda.Event()
-            event.record(self._h2d_stream)
-        use.consume_on(self._h2d_stream.cuda_stream)
+        try:
+            use.consume_on(stream.cuda_stream)  # its release fences on the copy
+            with torch.cuda.stream(stream):
+                use.tensor.copy_(kept.tensor, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(stream)
+        except BaseException:
+            use = None  # the fill and its tensor go now, not with the traceback
+            raise
         kept.event = event
         return _HostRead(use, event, kept.tensor.numel())
 
@@ -2544,6 +2551,7 @@ class Memory:
                     name = f"{block.model.component}/{key}#{part.role or 'value'}"
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
+            retry = False
             try:
                 region = self._native_region(block, speculative=True)
                 # Outgoing cached weights may already fill the nonpreferred window even
@@ -2586,21 +2594,15 @@ class Memory:
                     raise
                 free = int(torch.cuda.mem_get_info(self.device)[0])
                 allocated, reserved, _ = _torch_bytes(self.device)
-                if (
+                retry = (
                     not released
                     and queued is None
                     and free < block.allocation_bytes <= (free + reserved - allocated)
-                ):
-                    # Demand's next read takes Torch's idle cache before it is refused. Refused,
-                    # it is read on the request path instead (Qwen-Image int8 on 8 GB: the last
-                    # streamed block, every step, 9 s per request).
-                    release_cached(torch, self.device.type)
+                )
+                if not retry:
                     if request is not None:
-                        request.prefetch_released += 1
-                    return self._prefetch_block(block, request, released=True)
-                if request is not None:
-                    request.prefetch_skipped += 1
-                return
+                        request.prefetch_skipped += 1
+                    return
             except tensorfs.Error as error:
                 if fault(error) is not Fault.OTHER:
                     raise
@@ -2613,6 +2615,15 @@ class Memory:
                 if request is not None:
                     request.prefetch_failed += 1
                 return
+            if retry:
+                # Demand's next read takes Torch's idle cache before it is refused. Refused, it
+                # is read on the request path instead (Qwen-Image int8 on 8 GB: the last streamed
+                # block, every step, 9 s per request). Out of the handler, so nothing the refused
+                # attempt admitted lives on in its traceback (cr-225).
+                release_cached(torch, self.device.type)
+                if request is not None:
+                    request.prefetch_released += 1
+                return self._prefetch_block(block, request, released=True)
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
             self._prefetch = _Prefetch(block, region, read, identity, request, queued)
