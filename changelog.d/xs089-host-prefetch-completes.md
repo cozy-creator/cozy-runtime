@@ -1,0 +1,1 @@
+A host-tier prefetch (one DMA already issued) completes when another block's demand arrives instead of being canceled and copied again: H3 Turbo on an RTX 4090 copied every streamed DiT page twice, 24 GB a step for 12 GB of pages.

@@ -501,6 +501,8 @@ class _Prefetch:
     #: the fill overlay its page holds, and whether it fills the final (cast) region
     overlay: Hashable = None
     final: bool = False
+    #: one DMA from a host-tier page (`_host_read`), not a store read
+    host: bool = False
 
 
 class _HostPage:
@@ -2685,7 +2687,15 @@ class Memory:
             identity = block.model.identity
             assert identity is not None  # eligibility excludes mutable/undeclared fills
             self._prefetch = _Prefetch(
-                block, region, read, identity, request, queued, overlay=overlay, final=final
+                block,
+                region,
+                read,
+                identity,
+                request,
+                queued,
+                overlay=overlay,
+                final=final,
+                host=kept is not None,
             )
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
@@ -2850,7 +2860,12 @@ class Memory:
         try:
             with self.lock:
                 if self._prefetch is not None:
-                    self._settle_prefetch(cancel=self._prefetch.block is not block)
+                    # A host-tier prefetch is one DMA already issued: it completes in milliseconds,
+                    # so another block's demand waits for it rather than discarding it. H3 Turbo
+                    # on an RTX 4090 canceled every DiT prefetch at its LoRA block's demand and
+                    # copied each page twice: 24 GB a step for 12 GB of pages.
+                    pending = self._prefetch
+                    self._settle_prefetch(cancel=pending.block is not block and not pending.host)
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:
