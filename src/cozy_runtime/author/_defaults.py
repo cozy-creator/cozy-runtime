@@ -24,8 +24,8 @@ from typing import Any, Literal, cast
 import msgspec
 import msgspec.inspect as mi
 
-from cozy_runtime.author._assets import asset_dec_hook
 from cozy_runtime.author._errors import DefaultResolutionError, InvalidRequest
+from cozy_runtime.author._files import asset_dec_hook
 from cozy_runtime.author._markers import _ModelDefaultMarker
 from cozy_runtime.author._services import AdjustmentRow
 from cozy_runtime.author._walker import MISSING, Node, walk
@@ -285,10 +285,10 @@ def decode_request[T](
 ) -> T:
     """Decode wire data into a request struct the way the runtime decodes it.
 
-    The ONE supported path from wire data to a payload carrying asset fields. `Asset` is
+    The ONE supported path from wire data to a payload carrying file fields. `File` is
     deliberately not a msgspec-native type, so a caller reaching for `msgspec.convert`
     needs `asset_dec_hook` — the hook that accepts a REF STRING and nothing else — and a
-    caller who writes their own hook gets a decoder that can hydrate an asset from request
+    caller who writes their own hook gets a decoder that can hydrate a file from request
     data. Refusals arrive as `InvalidRequest`, the typed outcome the executor raises.
     """
     try:

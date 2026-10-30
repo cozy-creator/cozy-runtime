@@ -696,7 +696,7 @@ def _preparation(value: Json, source: str, path: str, kinds: frozenset[str]) -> 
 
 
 def _schema_asset_kinds(value: Json) -> frozenset[str]:
-    """The asset kinds a rendered type reaches through containers, stopping at records."""
+    """The file kinds a rendered type reaches through containers, stopping at records."""
     if not isinstance(value, dict):
         return frozenset()
     if isinstance(value.get("asset"), str):

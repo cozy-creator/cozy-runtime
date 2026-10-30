@@ -38,19 +38,19 @@ from transformers.video_utils import VideoMetadata
 
 from cozy_runtime import lm, moe
 from cozy_runtime.author import (
-    AssetBound,
     Config,
     ConformanceError,
     Context,
     DecodedVideoFrame,
-    ImageAsset,
+    FileBound,
+    ImageFile,
     InvalidRequest,
     Loader,
     Model,
     ModelAssets,
     Telemetry,
     UnsupportedInput,
-    VideoAsset,
+    VideoFile,
     uses_components,
 )
 from cozy_runtime.author._model import WARNINGS
@@ -66,8 +66,8 @@ TOKENIZER_METADATA = (
 )
 
 Images = Annotated[
-    list[ImageAsset],
-    AssetBound(
+    list[ImageFile],
+    FileBound(
         max_bytes=64 << 20,
         max_decoded_bytes=256 << 20,
         media_types=("image/png", "image/jpeg", "image/webp"),
@@ -75,8 +75,8 @@ Images = Annotated[
     msgspec.Meta(max_length=16),
 ]
 Videos = Annotated[
-    list[VideoAsset],
-    AssetBound(max_bytes=1 << 30, max_decoded_bytes=16 << 30),
+    list[VideoFile],
+    FileBound(max_bytes=1 << 30, max_decoded_bytes=16 << 30),
     msgspec.Meta(max_length=4),
 ]
 Text = Annotated[str, msgspec.Meta(max_length=65536)]
@@ -187,7 +187,7 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
 
 
 def watch(
-    video: VideoAsset, fps: float, frames: tuple[int, int], max_edge: int | None, end: float | None
+    video: VideoFile, fps: float, frames: tuple[int, int], max_edge: int | None, end: float | None
 ) -> Watched:
     """About `fps` frames a second, `frames` at least and at most, an even count (Qwen-VL reads
     frame pairs), each the frame showing at the middle of its slot, downscaled to `max_edge`."""

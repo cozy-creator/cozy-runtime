@@ -5,30 +5,25 @@ breaks a request. Every optional knob is None by default: the model's own recomm
 its README and `--describe` state. The runtime rejects aspect ratios outside 1:16 through 16:1.
 Within that global envelope, a model clamps to its narrower range (a `clamp` row) and warns for
 a knob it has no use for. A package subclasses `ImageRequest`
-only to narrow `reference_images` to its model's count or to add a knob no other model has.
+only to narrow `assets` to its model's count or to add a knob no other model has.
 """
 
 from __future__ import annotations
 
 import math
 import secrets
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Annotated
 
 import msgspec
 
-from cozy_runtime.author._assets import ImageAsset
+from cozy_runtime.author._assets import Asset, name_label, render
 from cozy_runtime.author._errors import InvalidRequest
-from cozy_runtime.author._markers import AssetBound, ImagePreparation, ModelDefault
+from cozy_runtime.author._files import ImageFile
+from cozy_runtime.author._markers import FileBound, ImagePreparation, ModelDefault
 from cozy_runtime.author._services import AdjustmentRows, Adjustments
 
-#: Images, in order, that a request edits or composes; none is text to image. Read upright and
-#: scaled down to 16 MP at most. A package states its model's count by overriding the field with
-#: `Annotated[ReferenceImages, msgspec.Meta(max_length=N)]`; a text-only model says 0.
-ReferenceImages = Annotated[
-    list[ImageAsset], AssetBound(max_bytes=32 << 20), ImagePreparation(max_pixels=16 << 20)
-]
 AspectRatio = Annotated[
     str,
     msgspec.Meta(
@@ -78,8 +73,21 @@ Box = Annotated[
 ]
 
 
+class PictureAsset(Asset, kw_only=True):
+    """An asset given as a picture, which a request edits or composes, named for the prompt's
+    `<name>` mentions. Read upright and scaled down to 16 MP at most."""
+
+    image: Annotated[
+        ImageFile, FileBound(max_bytes=32 << 20), ImagePreparation(max_pixels=16 << 20)
+    ]
+    #: Where it goes in the output, for a model with layout control; None places it nowhere in
+    #: particular. A placed asset is an element, not the canvas: the size is the model's
+    #: text-to-image default.
+    box: Box | None = None
+
+
 class Region(msgspec.Struct):
-    """An element a model places by box without a reference (MOSS-Image, Ideogram, Klein's table):
+    """An element a model places by box without an asset (MOSS-Image, Ideogram, Klein's table):
     `prompt` says what goes in the box, `text` is a literal string to render there."""
 
     box: Box
@@ -145,13 +153,17 @@ class Sizes:
 
 
 class ImageRequest(msgspec.Struct):
+    #: Names assets as `<name>`; the model reads each mention in its own words (`rendered`).
     prompt: str
-    reference_images: Annotated[ReferenceImages, msgspec.Meta(max_length=16)] = msgspec.field(
+    #: Images, in order, that the request edits or composes; none is text to image. A package
+    #: states its model's count with `Annotated[list[PictureAsset], msgspec.Meta(max_length=N)]`;
+    #: a text-only model says 0.
+    assets: Annotated[list[PictureAsset], msgspec.Meta(max_length=16)] = msgspec.field(
         default_factory=list
     )
-    #: W:H from 1:16 through 16:1. None: the first reference's, else the model's default.
+    #: W:H from 1:16 through 16:1. None: the first asset's, else the model's default.
     aspect_ratio: AspectRatio | None = None
-    #: Any size, in 1024² pixels. None: the first reference's pixel count, else the model's default.
+    #: Any size, in 1024² pixels. None: the first asset's pixel count, else the model's default.
     megapixels: Annotated[float, msgspec.Meta(gt=0)] | None = None
     #: A checkpoint's or adapter's recipe may supply these three (`ModelDefault`); else the model's.
     steps: ModelDefault[Annotated[int, msgspec.Meta(ge=1)] | None] = None
@@ -160,9 +172,6 @@ class ImageRequest(msgspec.Struct):
     #: Given, the request is reproducible; omitted, the model draws one and returns it.
     seed: Seed | None = None
     prompt_upsampling: bool | None = None
-    #: One per reference, in order: where it goes in the output, or null for none. A placed
-    #: reference is an element, not the canvas: the size is the model's text-to-image default.
-    reference_boxes: list[Box | None] | None = None
 
     def __post_init__(self) -> None:
         # msgspec calls this while decoding, before admission or any model work.
@@ -172,9 +181,9 @@ class ImageRequest(msgspec.Struct):
     def target(
         self, first: tuple[int, int] | None, *, megapixels: float, ratio: str = "1:1"
     ) -> Target:
-        """`aspect_ratio` and `megapixels` as given. A missing one is the first reference's
+        """`aspect_ratio` and `megapixels` as given. A missing one is the first asset's
         (`first`: its upright width and height), so an edit stays as close as possible to the image
-        it edits; with no reference, the model's default (`megapixels`, `ratio`)."""
+        it edits; with no asset, the model's default (`megapixels`, `ratio`)."""
         if self.aspect_ratio is not None:
             width, height = _ratio(self.aspect_ratio)
         elif first is not None:
@@ -202,22 +211,31 @@ class ImageRequest(msgspec.Struct):
         target = self.target(first, megapixels=megapixels, ratio=ratio)
         return sizes.fit(adj, target.ratio, sizes.pixels(adj, target))
 
+    def images(self) -> list[ImageFile]:
+        """The assets' pictures, in order."""
+        return [asset.image for asset in self.assets]
+
+    def rendered(
+        self,
+        adj: Adjustments | AdjustmentRows,
+        label: Callable[[int, PictureAsset], str] = name_label,
+    ) -> str:
+        """The prompt as the model reads it: each `<name>` mention in the model's own words for
+        the Nth asset (`label`); a mention of no asset stays as written, with a warning."""
+        return render(self.prompt, self.assets, label, adj=adj)
+
     def placements(self) -> list[tuple[float, float, float, float] | None]:
-        """`reference_boxes` checked: one entry per reference, each with x0 < x1 and y0 < y1; none
-        given is no placement for any reference."""
-        boxes, count = self.reference_boxes, len(self.reference_images)
-        if boxes is None:
-            return [None] * count
-        if len(boxes) != count:
-            raise InvalidRequest(
-                f"reference_boxes has {len(boxes)} entries for {count} reference_images",
-                code="reference_boxes_length",
-                fields=("reference_boxes",),
-            )
+        """Each asset's `box` checked (x0 < x1 and y0 < y1), or None where it has none."""
         return [
-            None if box is None else corners(box, f"reference_boxes.{index}")
-            for index, box in enumerate(boxes)
+            None if asset.box is None else corners(asset.box, f"assets.{index}.box")
+            for index, asset in enumerate(self.assets)
         ]
+
+    def unplaced(self, adj: Adjustments, reason: str) -> None:
+        """A warning for each asset's `box`, for a model with no layout control."""
+        for index, asset in enumerate(self.assets):
+            if asset.box is not None:
+                adj.warn(f"assets.{index}.box", f"ignored: {reason}")
 
     def drawn_seed(self) -> int:
         """The seed given, else a fresh one the result reports."""
@@ -233,8 +251,8 @@ class ImageRequest(msgspec.Struct):
 
 class ImageResult(msgspec.Struct):
     image: Annotated[
-        ImageAsset,
-        AssetBound(
+        ImageFile,
+        FileBound(
             max_bytes=64 << 20, max_decoded_bytes=256 << 20, media_types=("image/png", "image/webp")
         ),
     ]

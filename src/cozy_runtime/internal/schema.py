@@ -22,17 +22,16 @@ from typing import Literal, get_args, get_origin
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import (
-    Asset,
-    AudioAsset,
-    FileAsset,
-    ImageAsset,
+from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._files import (
+    AudioFile,
+    File,
+    ImageFile,
     Tree,
-    VideoAsset,
+    VideoFile,
     field_preparation,
 )
-from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import AssetBound, _ModelDefaultMarker
+from cozy_runtime.author._markers import FileBound, _ModelDefaultMarker
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional
 from cozy_runtime.internal.canonical import CanonicalError, Json, write
 
@@ -44,11 +43,11 @@ _PRIMITIVES: dict[object, str] = {
     type(None): "null",
 }
 
-_ASSET_KINDS: tuple[tuple[type[Asset], str], ...] = (
-    (ImageAsset, "image"),
-    (AudioAsset, "audio"),
-    (VideoAsset, "video"),
-    (FileAsset, "file"),
+_ASSET_KINDS: tuple[tuple[type[File], str], ...] = (
+    (ImageFile, "image"),
+    (AudioFile, "audio"),
+    (VideoFile, "video"),
+    (File, "file"),
 )
 
 
@@ -61,7 +60,7 @@ def request(payload_type: object) -> Json:
     """A callable's request: `render`, with each optional top-level field's author default.
 
     Only the payload's own fields carry one. Nested types render exactly as `render` does,
-    because readers compare those by value (the Assets occurrence record, native operations).
+    because readers compare those by value (the Files occurrence record, native operations).
     """
     doc = render(payload_type)
     base, _ = strip(payload_type)
@@ -153,7 +152,7 @@ def _render_bare(
                 return {"asset": kind}
         if issubclass(tp, Tree):
             # A JOB input: a digest-verified materialized tree. The wire spelling is a REF,
-            # exactly like an asset — the local path is never schema content (§2).
+            # exactly like a file — the local path is never schema content (§2).
             return {"input": "tree"}
         if issubclass(tp, enum.Enum):
             return _enumeration(tp, [member.value for member in tp])
@@ -317,7 +316,7 @@ def _field(
         doc["constraints"] = constraints
     bound: dict[str, Json] = {}
     for marker in markers:
-        if isinstance(marker, AssetBound):
+        if isinstance(marker, FileBound):
             if marker.max_bytes is not None:
                 bound["max_bytes"] = marker.max_bytes
             if decoded_bounds and marker.max_decoded_bytes is not None:

@@ -75,7 +75,6 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelChoice
-from cozy_runtime.author._assets import Asset, GrantedInput, Tree
 from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
@@ -105,6 +104,7 @@ from cozy_runtime.author._executor_requests import (
     Request,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
+from cozy_runtime.author._files import File, GrantedInput, Tree
 from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
@@ -4957,10 +4957,10 @@ def _serialize_result(
 
     msgspec encodes the whole annotated result struct — nested structs, lists and all — in
     one pass, so nothing is stringified on the way out and a nested typed value survives as
-    a typed value. Assets are the one thing that cannot go on the wire as themselves: the
+    a typed value. Files are the one thing that cannot go on the wire as themselves: the
     hook replaces each with its MANIFEST ROW (`asset_ref`, kind, media type — and digest and
     size once encoded; a frame the post phase still owes carries neither, cr-079), which is
-    exactly what `Asset.row()` already publishes and carries no local path.
+    exactly what `File.row()` already publishes and carries no local path.
 
     Output identity comes from the result's own FIELD PATH (`image`, `pair.thumb`,
     `frames.0`) — a stable name the RecordOwner can grant against. It is never a list index
@@ -4976,7 +4976,7 @@ def _serialize_result(
         return None, [], 0
 
     def hook(value: object) -> object:
-        if isinstance(value, (Asset, Tree)):
+        if isinstance(value, (File, Tree)):
             row = value.row()
             return {"asset_ref": row.pop("ref"), **row}
         raise TypeError(f"{type(value).__name__} has no wire spelling in a result")
@@ -4996,7 +4996,7 @@ def _serialize_result(
 
 
 def _assets_at(node: Any, path: str) -> list[dict[str, Any]]:
-    """Every asset node in the serialized result, with the field path that names it."""
+    """Every file node in the serialized result, with the field path that names it."""
     found: list[dict[str, Any]] = []
     if isinstance(node, dict):
         if "asset_ref" in node:

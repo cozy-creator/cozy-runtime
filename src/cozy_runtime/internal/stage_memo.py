@@ -38,7 +38,6 @@ import msgspec
 import numpy as np
 from PIL import Image
 
-from cozy_runtime.author._assets import Asset
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._executor_requests import (
     Answer,
@@ -48,6 +47,7 @@ from cozy_runtime.author._executor_requests import (
     StageMemoLookup,
     StageMemoStore,
 )
+from cozy_runtime.author._files import File
 from cozy_runtime.author._stage_memo import exactness
 from cozy_runtime.internal import attention, hostfacts, installed
 from cozy_runtime.internal.executor_commands import MemoSettings
@@ -164,7 +164,7 @@ def _flatten(
         return ["f", value.hex()]
     if isinstance(value, (bytes, bytearray, memoryview)):
         return ["b", bytes(value).hex()]
-    if isinstance(value, Asset) and host and value.digest:
+    if isinstance(value, File) and host and value.digest:
         return ["a", type(value).__name__, value.digest]
     if isinstance(value, tuple) and hasattr(value, "_fields"):
         return ["n", _qualname(value), [walk(v) for v in value]]

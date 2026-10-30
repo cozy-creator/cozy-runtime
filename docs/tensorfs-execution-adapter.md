@@ -66,7 +66,7 @@ part reads require no disk-write grant. Runtime keeps only the logical float32 d
 invocation binding and resource cleanup. Eval's actual native measurement and instrument
 normalization drivers qualify the new types and transport without claiming model quality.
 
-Native `FileAsset` and `Tree` results can be passed directly to another managed
+Native `File` and `Tree` results can be passed directly to another managed
 call. The worker selects only typed input fields, checks the parent's actual
 received or input capability, and retains an independent native root for each
 child input before dispatch. Existing grant loaders materialize those inputs for

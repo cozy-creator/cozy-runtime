@@ -19,27 +19,26 @@ from typing import Any, Literal, get_args, get_origin
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import (
-    MEDIA_KINDS,
-    Asset,
-    Assets,
-    AudioAsset,
-    Fidelity,
-    FileAsset,
-    ImageAsset,
-    Tree,
-    VideoAsset,
-    asset_kinds,
-    field_preparation,
-)
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.author._files import (
+    MEDIA_KINDS,
+    AudioFile,
+    Fidelity,
+    File,
+    Files,
+    ImageFile,
+    Tree,
+    VideoFile,
+    asset_kinds,
+    field_preparation,
+)
 from cozy_runtime.author._markers import (
     PREPARATIONS,
-    AssetBound,
-    AssetLimits,
     Bound,
+    FileBound,
+    FileLimits,
     Preparation,
     _PreflightMarker,
 )
@@ -77,14 +76,14 @@ class PreflightSpec:
     argument_order: tuple[str, ...] = ()
 
 
-_COLLECTION_MARKERS = (AssetLimits, *PREPARATIONS)
+_COLLECTION_MARKERS = (FileLimits, *PREPARATIONS)
 
 
 @dataclass(frozen=True, slots=True)
 class AssetsBinding:
     parameter: str
     annotation: object
-    kinds: tuple[tuple[type[Asset], AssetBound | None], ...]
+    kinds: tuple[tuple[type[File], FileBound | None], ...]
     counts: tuple[tuple[str, int], ...] = ()
     max_length: int | None = None
     preparations: tuple[Preparation, ...] = ()
@@ -115,60 +114,59 @@ class AssetsBinding:
 class AssetInputValue(msgspec.Struct, forbid_unknown_fields=True):
     """Ordinary payload representation of one explicitly forwarded occurrence."""
 
-    asset: FileAsset
+    asset: File
     label: str = ""
     fidelity: Fidelity = "auto"
 
 
 def _marker_code(marker: object) -> str:
-    return "asset_limits" if isinstance(marker, AssetLimits) else "preparation_target"
+    return "asset_limits" if isinstance(marker, FileLimits) else "preparation_target"
 
 
 def assets_binding(name: str, annotation: object) -> AssetsBinding:
-    """The one reading of an Assets input, shared by describe and the static reader.
+    """The one reading of an Files input, shared by describe and the static reader.
 
-    Elements are the media handles (and `FileAsset`); a media kind without a declared
+    Elements are the media handles (and `File`); a media kind without a declared
     decoded bound takes Runtime's ceiling. Counts and preparations annotate the collection.
     """
     base, metadata = strip(annotation)
     args = get_args(base)
-    item = args[0] if args else ImageAsset | VideoAsset | AudioAsset | FileAsset
+    item = args[0] if args else ImageFile | VideoFile | AudioFile | File
     inner, _ = strip(item)
     options = get_args(inner) if get_origin(inner) in (typing.Union, types.UnionType) else (item,)
-    kinds: dict[str, tuple[type[Asset], AssetBound | None]] = {}
+    kinds: dict[str, tuple[type[File], FileBound | None]] = {}
     undeclared: set[str] = set()
     for option in options:
         cls, markers = strip(option)
         for marker in markers:
             if isinstance(marker, _COLLECTION_MARKERS):
                 raise ConformanceError(
-                    f"{type(marker).__name__} annotates the Assets collection",
+                    f"{type(marker).__name__} annotates the Files collection",
                     code=_marker_code(marker),
                 )
-        if cls not in (ImageAsset, VideoAsset, AudioAsset, FileAsset):
+        if cls not in (ImageFile, VideoFile, AudioFile, File):
             raise ConformanceError(
-                "Assets elements are ImageAsset, VideoAsset, AudioAsset or FileAsset handles",
+                "Files elements are ImageFile, VideoFile, AudioFile or File handles",
                 code="assets_element",
             )
-        cls = typing.cast(type[Asset], cls)
         if cls.kind in kinds:
-            raise ConformanceError("Assets repeats a media kind", code="assets_element")
-        bound = next((marker for marker in markers if isinstance(marker, AssetBound)), None)
+            raise ConformanceError("Files repeats a media kind", code="assets_element")
+        bound = next((marker for marker in markers if isinstance(marker, FileBound)), None)
         if cls.kind in MEDIA_KINDS and (bound is None or bound.max_decoded_bytes is None):
             undeclared.add(cls.kind)
             if bound is None:
-                bound = AssetBound(max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
+                bound = FileBound(max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
             else:
                 bound = replace(bound, max_decoded_bytes=DEFAULT_DECODE_LIMITS.max_decoded_bytes)
         if bound is not None:
             bound.check_kind(cls.kind)
         kinds[cls.kind] = cls, bound
-    limits = [marker for marker in metadata if isinstance(marker, AssetLimits)]
+    limits = [marker for marker in metadata if isinstance(marker, FileLimits)]
     if limits and any(marker != limits[0] for marker in limits[1:]):
-        raise ConformanceError("conflicting AssetLimits markers", code="asset_limits")
+        raise ConformanceError("conflicting FileLimits markers", code="asset_limits")
     counts = limits[0].counts if limits else {}
     if set(counts) - set(kinds):
-        raise ConformanceError("AssetLimits names an undeclared media kind", code="asset_limits")
+        raise ConformanceError("FileLimits names an undeclared media kind", code="asset_limits")
     totals = {
         marker.max_length
         for marker in metadata
@@ -177,7 +175,7 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
     if limits and limits[0].total is not None:
         totals.add(limits[0].total)
     if len(totals) > 1:
-        raise ConformanceError("conflicting Assets total/max_length", code="asset_limits")
+        raise ConformanceError("conflicting Files total/max_length", code="asset_limits")
     max_length = next(iter(totals), None)
     if max_length is None and counts and set(counts) == set(kinds):
         max_length = sum(counts.values())
@@ -187,14 +185,14 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         and marker.min_length > max_length
         for marker in metadata
     ):
-        raise ConformanceError("Assets minimum exceeds its total limit", code="asset_limits")
+        raise ConformanceError("Files minimum exceeds its total limit", code="asset_limits")
     preparations: dict[str, Preparation] = {}
     for marker in metadata:
         if not isinstance(marker, PREPARATIONS):
             continue
         if marker.kind not in kinds:
             raise ConformanceError(
-                f"{type(marker).__name__} annotates Assets without {marker.kind} inputs",
+                f"{type(marker).__name__} annotates Files without {marker.kind} inputs",
                 code="preparation_target",
             )
         if preparations.setdefault(marker.kind, marker) != marker:
@@ -213,14 +211,14 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
 
 
 def check_parameter_markers(annotation: object) -> None:
-    """Counts annotate an Assets input; a preparation annotates a parameter or field that
+    """Counts annotate an Files input; a preparation annotates a parameter or field that
     carries its media kind. One rule for describe and the static readers."""
     base, markers = strip(annotation)
-    if base is Assets or get_origin(base) is Assets:
+    if base is Files or get_origin(base) is Files:
         return
     for marker in markers:
-        if isinstance(marker, AssetLimits):
-            raise ConformanceError("AssetLimits annotates an Assets input", code="asset_limits")
+        if isinstance(marker, FileLimits):
+            raise ConformanceError("FileLimits annotates an Files input", code="asset_limits")
     field_preparation(base, markers)
 
 
@@ -371,7 +369,7 @@ class Surface(Declaration):
     @property
     def outputs(self) -> frozenset[str]:
         """The result fields `Outputs.publish` may name, dotted, as the machine reads the
-        result schema: an asset takes one product, a list of assets grows by one."""
+        result schema: a file takes one product, a list of files grows by one."""
         return frozenset(_asset_fields(self.result_type, ""))
 
     @property
@@ -398,12 +396,12 @@ class Surface(Declaration):
         )
 
 
-_PUBLISHABLE = (ImageAsset, AudioAsset, VideoAsset, FileAsset)
+_PUBLISHABLE = (ImageFile, AudioFile, VideoFile, File)
 _LISTS = (list, Sequence, set, frozenset, Set)
 
 
 def _asset_fields(tp: object, prefix: str, seen: frozenset[type] = frozenset()) -> Iterator[str]:
-    """A required struct's asset and asset-list fields; an optional one renders as a union."""
+    """A required struct's file and asset-list fields; an optional one renders as a union."""
     base, _ = strip(tp)
     if not isinstance(base, type) or not is_struct(base) or base in seen:
         return
@@ -467,7 +465,7 @@ def _classify(name: str, annotation: object, where: str) -> Param:
             )
         return Param(name, "model", model)
     origin = get_origin(base)
-    if base is Assets or origin is Assets:
+    if base is Files or origin is Files:
         assets_binding(name, annotation)
         return Param(name, "assets", annotation)
     for capability, service in _PARAMETERIZED.items():
@@ -548,12 +546,12 @@ def analyze(
         annotation = hints[parameter.name]
         base, _ = strip(annotation)
         check_parameter_markers(annotation)
-        if base is Assets or get_origin(base) is Assets:
+        if base is Files or get_origin(base) is Files:
             if parameter.default is not parameter.empty:
-                raise ConformanceError("Assets inputs cannot have defaults", code="assets_default")
+                raise ConformanceError("Files inputs cannot have defaults", code="assets_default")
             if invocable and parameter.kind is not parameter.KEYWORD_ONLY:
                 raise ConformanceError(
-                    "invocable Assets must be keyword-only", code="invocable_signature"
+                    "invocable Files must be keyword-only", code="invocable_signature"
                 )
             binding = assets_binding(parameter.name, annotation)
             params.append(Param(parameter.name, "assets", annotation))
@@ -612,7 +610,7 @@ def analyze(
     assets_params = [p for p in params if p.role == "assets"]
     if len(assets_params) > 1:
         raise ConformanceError(
-            "one Assets input slot is supported per callable", code="assets_arity"
+            "one Files input slot is supported per callable", code="assets_arity"
         )
     if invocable:
         declared = list(signature.parameters.values())
@@ -710,14 +708,14 @@ def analyze(
 def assets_payload(
     payload_type: type[msgspec.Struct], binding: AssetsBinding, fn_name: str, module: str
 ) -> type[msgspec.Struct]:
-    """The request struct with the Assets occurrence field appended — ONE construction, read
+    """The request struct with the Files occurrence field appended — ONE construction, read
     by the import path and the static reader alike."""
     if any(
         f.encode_name == binding.parameter or f.name == binding.parameter
         for f in msgspec.structs.fields(payload_type)
     ):
         raise ConformanceError(
-            "Assets parameter collides with a payload field", code="assets_field_collision"
+            "Files parameter collides with a payload field", code="assets_field_collision"
         )
     return msgspec.defstruct(
         f"{fn_name}Request",
@@ -764,7 +762,7 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
             _wire_type(arg, seen)
         return
     if isinstance(base, type):
-        if issubclass(base, (Asset, Tree)):
+        if issubclass(base, (File, Tree)):
             return
         if issubclass(base, enum.Enum):
             for member in base:
@@ -784,8 +782,8 @@ def _wire_type(annotation: object, seen: frozenset[type] = frozenset()) -> None:
     )
 
 
-#: Attribute names that read asset BYTES. A preflight that names one is refused statically —
-#: the runtime refusal in `Asset.read_bytes` is the structural backstop, not the only gate.
+#: Attribute names that read file BYTES. A preflight that names one is refused statically —
+#: the runtime refusal in `File.read_bytes` is the structural backstop, not the only gate.
 BYTE_ACCESS = frozenset({"read_bytes", "open", "tobytes", "read", "stream", "probe"})
 
 
@@ -833,7 +831,7 @@ def analyze_preflight(
     touched = BYTE_ACCESS & set(code.co_names if code is not None else ())
     if touched:
         raise ConformanceError(
-            f"preflight {where}: reads asset bytes via {sorted(touched)} — preflight inspects "
+            f"preflight {where}: reads file bytes via {sorted(touched)} — preflight inspects "
             "asset identity and trusted metadata only, so a refused request downloads nothing",
             code="preflight_bytes",
         )
@@ -857,10 +855,10 @@ def analyze_preflight(
     for name in positional[1:]:
         annotation = hints.get(name, object)
         base, _ = strip(annotation)
-        if base is Assets or get_origin(base) is Assets:
+        if base is Files or get_origin(base) is Files:
             if assets is None or annotation != assets.annotation or assets_parameter is not None:
                 raise ConformanceError(
-                    "preflight Assets differs from its input slot", code="preflight_assets"
+                    "preflight Files differs from its input slot", code="preflight_assets"
                 )
             assets_parameter = assets.name
             argument_order.append("assets")

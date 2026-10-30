@@ -20,15 +20,13 @@ from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice, ObjectRef
 from cozy_runtime.author._assets import (
+    MENTION,
     Asset,
-    AssetInfo,
-    Assets,
-    AudioAsset,
-    FileAsset,
-    Image,
-    ImageAsset,
-    Tree,
-    VideoAsset,
+    Mention,
+    mentions,
+    name_key,
+    name_label,
+    render,
 )
 from cozy_runtime.author._attention import (
     AttentionProducer,
@@ -89,13 +87,23 @@ from cozy_runtime.author._errors import (
     UnsupportedInput,
     classify,
 )
+from cozy_runtime.author._files import (
+    AudioFile,
+    File,
+    FileInfo,
+    Files,
+    Image,
+    ImageFile,
+    Tree,
+    VideoFile,
+)
 from cozy_runtime.author._image import (
     MEGAPIXEL,
     AspectRatio,
     Box,
     ImageRequest,
     ImageResult,
-    ReferenceImages,
+    PictureAsset,
     Region,
     Seed,
     Sizes,
@@ -128,10 +136,10 @@ from cozy_runtime.author._loader import (
 )
 from cozy_runtime.author._loop import denoise_loop
 from cozy_runtime.author._markers import (
-    AssetBound,
-    AssetLimits,
     AudioPreparation,
     Bound,
+    FileBound,
+    FileLimits,
     ImagePreparation,
     ModelDefault,
     Preflight,
@@ -197,6 +205,7 @@ __all__ = [
     "DEFAULT_DECODE_LIMITS",
     "MAX_WEIGHTS_NEW_BYTES",
     "MEGAPIXEL",
+    "MENTION",
     "NEUTRAL_ERROR_SET",
     "AdapterCompatibility",
     "AdapterRef",
@@ -208,13 +217,9 @@ __all__ = [
     "AspectRatio",
     "AssessmentRef",
     "Asset",
-    "AssetBound",
-    "AssetInfo",
-    "AssetLimits",
-    "Assets",
     "AttentionLayout",
     "AttentionProducer",
-    "AudioAsset",
+    "AudioFile",
     "AudioPreparation",
     "AudioProbe",
     "AuthorError",
@@ -251,10 +256,14 @@ __all__ = [
     "Egress",
     "EgressResponse",
     "EncodingRule",
-    "FileAsset",
+    "File",
+    "FileBound",
+    "FileInfo",
+    "FileLimits",
+    "Files",
     "Fit",
     "Image",
-    "ImageAsset",
+    "ImageFile",
     "ImageFrame",
     "ImagePreparation",
     "ImageProbe",
@@ -269,6 +278,7 @@ __all__ = [
     "MemoDistribution",
     "MemoResource",
     "Memoize",
+    "Mention",
     "Model",
     "ModelArtifact",
     "ModelAssets",
@@ -285,6 +295,7 @@ __all__ = [
     "Outputs",
     "Overlay",
     "PendingCall",
+    "PictureAsset",
     "Preflight",
     "PreflightViolation",
     "PreparedRequest",
@@ -292,7 +303,6 @@ __all__ = [
     "ProducerSite",
     "QuantizationPlan",
     "Recipe",
-    "ReferenceImages",
     "Region",
     "Registration",
     "RegistrationError",
@@ -316,7 +326,7 @@ __all__ = [
     "ThreadPoolExecutor",
     "Tree",
     "UnsupportedInput",
-    "VideoAsset",
+    "VideoFile",
     "VideoJoin",
     "VideoPreparation",
     "VideoProbe",
@@ -340,6 +350,9 @@ __all__ = [
     "held",
     "hold_dtype",
     "invocable",
+    "mentions",
+    "name_key",
+    "name_label",
     "placeable",
     "plain_forward",
     "prefetch",
@@ -349,6 +362,7 @@ __all__ = [
     "register_adapter",
     "register_attention",
     "registered_adapters",
+    "render",
     "sequence_parallel",
     "split",
     "spread",
@@ -356,3 +370,28 @@ __all__ = [
     "upload_checkpoint",
     "uses_components",
 ]
+
+#: Names Runtime 0.36.0 removed (xs-135: an asset is a production element, a file is a file). A
+#: package built for an older Runtime imports one of them and fails here, never decoding a request
+#: with a name that now means something else.
+_REMOVED = {
+    "ImageAsset": "ImageFile",
+    "VideoAsset": "VideoFile",
+    "AudioAsset": "AudioFile",
+    "FileAsset": "File",
+    "Assets": "Files",
+    "AssetBound": "FileBound",
+    "AssetLimits": "FileLimits",
+    "AssetInfo": "FileInfo",
+    "ReferenceImages": "PictureAsset",
+}
+
+
+def __getattr__(name: str) -> object:
+    if name in _REMOVED:
+        raise ImportError(
+            f"cozy_runtime.author.{name} is gone in Runtime 0.36.0 ({_REMOVED[name]} replaces it): "
+            "this package was built for Runtime < 0.36; use its newest release",
+            name=name,
+        )
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

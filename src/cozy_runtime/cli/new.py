@@ -70,7 +70,7 @@ is what derives `gpu`. Nothing else declares either.
 
 import msgspec
 
-from cozy_runtime.author import App, Context, ImageAsset, ImageFrame, Outputs
+from cozy_runtime.author import App, Context, ImageFile, ImageFrame, Outputs
 
 app = App()
 
@@ -84,7 +84,7 @@ class GenerateRequest(msgspec.Struct, forbid_unknown_fields=True):
 
 
 class GenerateResult(msgspec.Struct):
-    image: ImageAsset
+    image: ImageFile
     prompt: str
 
 

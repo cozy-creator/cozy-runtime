@@ -20,7 +20,7 @@ from typing import Annotated
 
 import msgspec
 
-from cozy_runtime.author import App, AssetBound, Outputs, Tree
+from cozy_runtime.author import App, FileBound, Outputs, Tree
 from cozy_runtime.author.fakes import invoke_with_fakes
 
 
@@ -29,7 +29,7 @@ class Request(msgspec.Struct):
 
 
 class Result(msgspec.Struct):
-    trace: Annotated[Tree, AssetBound(max_bytes=2 << 30)]
+    trace: Annotated[Tree, FileBound(max_bytes=2 << 30)]
 
 
 def verify(directory: Path) -> dict[str, object]:

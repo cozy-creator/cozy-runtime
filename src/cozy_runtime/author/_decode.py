@@ -1,6 +1,6 @@
 """The one bounded input-media reader: verified bytes in, bounded media values out.
 
-Every hydrated `ImageAsset`, `VideoAsset` and `AudioAsset` reads through its attempt's
+Every hydrated `ImageFile`, `VideoFile` and `AudioFile` reads through its attempt's
 one `MediaReads`, which owns the attempt's retained-value budget and active-stream count.
 There is deliberately no path, URL, fetch, resize-of-video, model-normalization, or
 output-codec surface here. PyAV is a lazy member of the ``media`` extra; the base author
@@ -36,7 +36,7 @@ from cozy_runtime.author._errors import AuthorError, CapabilityError, InvalidReq
 from cozy_runtime.author._markers import ImagePreparation, seconds
 
 if TYPE_CHECKING:
-    from cozy_runtime.author._assets import Asset, AudioAsset, ImageAsset, VideoAsset
+    from cozy_runtime.author._files import AudioFile, File, ImageFile, VideoFile
 
 
 class _Attempt(Protocol):
@@ -78,7 +78,7 @@ class DecodeLimits:
 
 # Structural codec ceilings, not package policy. Frame and sample ceilings count values a
 # read keeps; duration policy is the field's declared preparation. `max_decoded_bytes` is only
-# what an `Assets` media kind that declares none publishes (its interface stays byte-stable);
+# what an `Files` media kind that declares none publishes (its interface stays byte-stable);
 # it is never enforced: the attempt's budget is what the machine holds (`host_decode_limits`),
 # and only a bound the author declared narrows its field's reads.
 DEFAULT_DECODE_LIMITS = DecodeLimits(
@@ -95,7 +95,7 @@ MAX_ACTIVE_MEDIA_STREAMS = 2
 def host_decode_limits() -> DecodeLimits:
     """The codec ceilings with the retained-media budget set by what this machine holds, its
     memory and swap, never a flat constant: decoded media that fits the machine is served. A
-    field's declared `AssetBound(max_decoded_bytes=...)` still narrows its own value."""
+    field's declared `FileBound(max_decoded_bytes=...)` still narrows its own value."""
     try:
         memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (AttributeError, OSError, ValueError):
@@ -772,7 +772,7 @@ def _soundtrack(container: Any) -> Any | None:
     streams = list(container.streams.audio)
     if len(streams) > 1:
         raise MediaDecodeError(
-            "video asset has more than one soundtrack stream", code="multiple_audio_streams"
+            "video file has more than one soundtrack stream", code="multiple_audio_streams"
         )
     return streams[0] if streams else None
 
@@ -924,7 +924,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
     def __init__(
         self,
         reads: MediaReads,
-        asset: Asset,
+        asset: File,
         *,
         av: Any,
         budget: _Budget,
@@ -1007,7 +1007,7 @@ class DecodedMediaStream(Iterator[DecodedMediaEvent]):
 
 
 @contextmanager
-def _reading(asset: Asset, av: Any, what: str) -> Iterator[None]:
+def _reading(asset: File, av: Any, what: str) -> Iterator[None]:
     """One error boundary for every read: decode refusals name the field."""
     fields = [asset._input_id] if asset._input_id else []
     try:
@@ -1057,10 +1057,10 @@ class MediaReads:
         """Bytes every `read()` of this attempt has retained so far."""
         return self._budget.used
 
-    def image(self, asset: ImageAsset, mode: Literal["RGB", "RGBA"]) -> PILImage:
+    def image(self, asset: ImageFile, mode: Literal["RGB", "RGBA"]) -> PILImage:
         if mode not in ("RGB", "RGBA"):
             raise ValueError(f"image mode must be RGB or RGBA, not {mode!r}")
-        budget, path = self._start(asset, "ImageAsset.read")
+        budget, path = self._start(asset, "ImageFile.read")
         try:
             with _reading(asset, None, "image"):
                 prepared = _image(path, self._limits, budget, _image_preparation(asset), mode)
@@ -1071,10 +1071,10 @@ class MediaReads:
         # EXIF, ICC) reaches the package.
         return pil_frombytes(mode, prepared.size, prepared.tobytes())
 
-    def video(self, asset: VideoAsset, *, end: object, fps: object, audio: bool) -> DecodedVideo:
+    def video(self, asset: VideoFile, *, end: object, fps: object, audio: bool) -> DecodedVideo:
         cut = _effective_end(end, asset._end)
         rate = None if fps is None else _rate(fps)
-        budget, path = self._start(asset, "VideoAsset.read")
+        budget, path = self._start(asset, "VideoFile.read")
         av = _av()
         events = _media_events(
             av, path, "video", self._limits, budget, end=cut, retained=True, audio=audio
@@ -1088,9 +1088,9 @@ class MediaReads:
         finally:
             events.close()
 
-    def audio(self, asset: AudioAsset, *, end: object) -> DecodedAudio:
+    def audio(self, asset: AudioFile, *, end: object) -> DecodedAudio:
         cut = _effective_end(end, asset._end)
-        budget, path = self._start(asset, "AudioAsset.read")
+        budget, path = self._start(asset, "AudioFile.read")
         av = _av()
         events = _media_events(av, path, "audio", self._limits, budget, end=cut, retained=True)
         try:
@@ -1108,7 +1108,7 @@ class MediaReads:
             events.close()
 
     def stream(
-        self, asset: VideoAsset | AudioAsset, *, end: object, audio: bool, pictures: bool
+        self, asset: VideoFile | AudioFile, *, end: object, audio: bool, pictures: bool
     ) -> DecodedMediaStream:
         cut = _effective_end(end, asset._end)
         if not (audio or pictures):
@@ -1133,7 +1133,7 @@ class MediaReads:
             ),
         )
 
-    def probe(self, asset: Asset) -> Probe:
+    def probe(self, asset: File) -> Probe:
         """Source header facts, cached on the handle. Never decodes a picture or sample."""
         _budget, path = self._start(asset, f"{type(asset).__name__}.probe", decode=False)
         if asset._probed is None:
@@ -1160,7 +1160,7 @@ class MediaReads:
         return probed
 
     def _acquire_stream(self) -> None:
-        self._attempt.check_open("VideoAsset.stream")
+        self._attempt.check_open("VideoFile.stream")
         if self._attempt.components_active():
             raise CapabilityError(
                 "media streaming is forbidden inside an active component-use scope",
@@ -1179,7 +1179,7 @@ class MediaReads:
             self._open_streams -= 1
 
     def _start(
-        self, asset: Asset, operation: str, *, retained: bool = True, decode: bool = True
+        self, asset: File, operation: str, *, retained: bool = True, decode: bool = True
     ) -> tuple[_Budget, Path]:
         self._attempt.check_open(operation)
         if self._attempt.components_active():
@@ -1191,7 +1191,7 @@ class MediaReads:
         fields = [asset._input_id] if asset._input_id else []
         if asset._attempt != self._attempt.request_id:
             raise CapabilityError(
-                f"asset {asset.ref!r} belongs to attempt {asset._attempt!r}",
+                f"file {asset.ref!r} belongs to attempt {asset._attempt!r}",
                 code="foreign_asset",
                 fields=fields,
             )
@@ -1211,7 +1211,7 @@ class MediaReads:
         return budget, asset._local
 
 
-def _image_preparation(asset: Asset) -> ImagePreparation | None:
+def _image_preparation(asset: File) -> ImagePreparation | None:
     preparation = asset._preparation
     return preparation if isinstance(preparation, ImagePreparation) else None
 
@@ -1484,7 +1484,7 @@ def require_decoder_dependency() -> None:
 
 
 # Local preparation can read a larger source than the admitted derivative. These
-# are source/working limits, separate from AssetBound and retained RGB budgets.
+# are source/working limits, separate from FileBound and retained RGB budgets.
 IMAGE_SOURCE_MAX_BYTES = 256 << 20
 IMAGE_WORKING_MAX_BYTES = 2 << 30
 
@@ -1581,7 +1581,7 @@ def _image(
 def decode_image_path(
     path: Path, limits: DecodeLimits, budget: _Budget, preparation: ImagePreparation | None = None
 ) -> DecodedImage:
-    """The `ImageAsset.read` pixels as packed RGB8, for local preparation."""
+    """The `ImageFile.read` pixels as packed RGB8, for local preparation."""
     image = _image(path, limits, budget, preparation)
     return DecodedImage(image.width, image.height, image.tobytes())
 
@@ -1740,9 +1740,9 @@ def _check_pixels(width: int, height: int, limits: DecodeLimits) -> None:
 
 def _required_stream(kind: str, count: int) -> None:
     if count == 0:
-        raise MediaDecodeError(f"{kind} asset has no {kind} stream", code=f"{kind}_stream_missing")
+        raise MediaDecodeError(f"{kind} file has no {kind} stream", code=f"{kind}_stream_missing")
     raise MediaDecodeError(
-        f"{kind} asset has {count} {kind} streams; exactly one is required",
+        f"{kind} file has {count} {kind} streams; exactly one is required",
         code=f"multiple_{kind}_streams",
     )
 
@@ -1778,6 +1778,6 @@ def _safe_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
-def _attribute(exc: AuthorError, asset: Asset) -> None:
+def _attribute(exc: AuthorError, asset: File) -> None:
     if not exc.fields and asset._input_id:
         exc.fields = (asset._input_id,)

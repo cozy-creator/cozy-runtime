@@ -1,6 +1,6 @@
 """Observed codec facts for the shared image preparation profile.
 
-Diagnostics only: any codec version is accepted, and asset fingerprinting remains the
+Diagnostics only: any codec version is accepted, and file fingerprinting remains the
 only content-digest authority.
 """
 

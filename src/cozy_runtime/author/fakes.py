@@ -6,10 +6,10 @@ real spool through the real encode and size-limit path, plus recording accessors
 encode under test is the one production runs, so a fake cannot drift from the real thing
 by construction — there is no parallel behavioral runtime here to maintain.
 
-`fake_input()` closes the loop the other way: a saved OUTPUT asset becomes an input
+`fake_input()` closes the loop the other way: a saved OUTPUT file becomes an input
 handle hydrated through the real `bind`, so one attempt's result feeds the next the way
 the executor feeds it. `file_input()` does the same for a file on disk, and
-`granted_input()` is the verified grant `invoke_with_fakes(assets=...)` takes for one.
+`granted_input()` is the verified grant `invoke_with_fakes(files=...)` takes for one.
 
 `invoke_with_fakes()` builds an `Invocation` and runs a registered handler through the one
 production driver, `prepare` then `run_prepared`: same decode, same overlay, same preflight,
@@ -31,10 +31,10 @@ from pathlib import Path
 from typing import Any
 
 from cozy_runtime.author._app import Registration
-from cozy_runtime.author._assets import Asset, GrantedInput, bind, file_state
 from cozy_runtime.author._context import Context, Device
 from cozy_runtime.author._decode import DEFAULT_DECODE_LIMITS
 from cozy_runtime.author._errors import CapabilityError, Outcome
+from cozy_runtime.author._files import File, GrantedInput, bind, file_state
 from cozy_runtime.author._invoke import (
     Invocation,
     InvocationResult,
@@ -80,7 +80,7 @@ def fake_attempt(
     return Attempt(request_id, spool, max_output_bytes, settle_at_save=True)
 
 
-def fake_input[AssetT: Asset](
+def fake_input[AssetT: File](
     source: AssetT,
     *,
     attempt: Attempt | None = None,
@@ -92,14 +92,14 @@ def fake_input[AssetT: Asset](
     """`source`'s bytes as a fresh INPUT handle hydrated into `attempt`.
 
     The round trip a package author needs and cannot otherwise take: `out.save_*` returns
-    an OUTPUT asset, and reading it back is what the executor allows once one attempt's
+    an OUTPUT file, and reading it back is what the executor allows once one attempt's
     result becomes the next attempt's granted input. Hydration runs through the same
     `bind` and duration preparation the executor's `_hydrate` runs, so a fake input reads
     through `attempt.media` exactly as a real one does.
     """
     if source._local is None:
         raise CapabilityError(
-            f"asset {source.ref!r} has no bytes to grant: an input stands for bytes the "
+            f"file {source.ref!r} has no bytes to grant: an input stands for bytes the "
             "worker already fetched, verified and spooled",
             code="asset_unhydrated",
         )
@@ -137,7 +137,7 @@ def granted_input(
     )
 
 
-def file_input[AssetT: Asset](
+def file_input[AssetT: File](
     asset_type: type[AssetT],
     path: Path,
     *,
@@ -152,7 +152,7 @@ def file_input[AssetT: Asset](
     return _hydrated(asset_type(granted.digest), granted, attempt, max_decoded_bytes, preparation)
 
 
-def _hydrated[AssetT: Asset](
+def _hydrated[AssetT: File](
     asset: AssetT,
     granted: GrantedInput,
     attempt: Attempt | None,
@@ -172,7 +172,7 @@ def _hydrated[AssetT: Asset](
         max_decoded_bytes=max_decoded_bytes,
         input_id=granted.input_id,
         order=granted.order,
-        read_guard=lambda: record.check_open("Asset.read_bytes"),
+        read_guard=lambda: record.check_open("File.read_bytes"),
         source_state=granted.file_state,
         media=record.media,
     )
@@ -198,7 +198,7 @@ class OutputsRecorder(Outputs):
     __slots__ = ()
 
     @property
-    def saved(self) -> tuple[Asset, ...]:
+    def saved(self) -> tuple[File, ...]:
         return tuple(self._attempt.pending.values())
 
     def assert_saved(self, *, count: int | None = None, kind: str | None = None) -> None:

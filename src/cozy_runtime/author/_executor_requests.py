@@ -73,7 +73,7 @@ class PublishPart(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class Publish(_Request, frozen=True, kw_only=True, tag="publish"):
-    """Show one asset to the run's owner now, as a product of a declared output."""
+    """Show one file to the run's owner now, as a product of a declared output."""
 
     output: str
     label: str = ""
@@ -179,7 +179,7 @@ class ByteGrant(ByteMetadata):
     """A native result projected into this executor's spool by its worker.
 
     The wire keys stay the same across SDK versions. The consumer validates the
-    declared result against these fields before constructing an asset handle.
+    declared result against these fields before constructing a file handle.
     """
 
     output_id: str
@@ -192,7 +192,7 @@ class CallState(Answer, frozen=True, kw_only=True):
     child_request_id: str = ""
     #: The child's canonical result document, once `state` is "succeeded".
     result: str = ""
-    # A peer may omit fields unused by its asset kind. Hydration reads the
+    # A peer may omit fields unused by its file kind. Hydration reads the
     # consumed fields into a typed record before constructing any handle.
     byte_grants: tuple[Mapping[str, object], ...] = ()
     progress: CallProgress | None = None

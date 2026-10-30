@@ -7,8 +7,8 @@ import dataclasses
 import msgspec
 
 from cozy_runtime.author._artifacts import ModelArtifact
-from cozy_runtime.author._assets import FileAsset
 from cozy_runtime.author._calls import _CallType
+from cozy_runtime.author._files import File
 from cozy_runtime.author.publication import AssessmentRef, CheckpointRef, ReleaseReceipt
 
 MODULE = "cozy_runtime.author.publication"
@@ -28,8 +28,8 @@ class Publish(msgspec.Struct, frozen=True):
 
 class AttachAssessment(msgspec.Struct, frozen=True):
     checkpoint: CheckpointRef
-    report: FileAsset
-    workloads: FileAsset
+    report: File
+    workloads: File
 
 
 TYPES: dict[str, tuple[type[msgspec.Struct], type[msgspec.Struct]]] = {
