@@ -32,6 +32,7 @@ from typing import Any, cast
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._loader import (
+    BUILT,
     CONSTRUCTION,
     FILLED,
     _members,
@@ -442,6 +443,10 @@ def _guard_mode(seen: Observations) -> Any:
     return DeriveGuard()
 
 
+#: The largest parameter a construction may hold as a constant (`serving_substrate`).
+_CONSTANT_BYTES = 1 << 20
+
+
 @contextmanager
 def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
     """The SERVE substrate: parameters weightless, DERIVED BUFFERS REAL (cr-008b).
@@ -462,12 +467,34 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     makes `position_ids` a derived table materialized on the target device rather than a shape
     with garbage in it. The fit decides a persistent buffer: one the checkpoint stores goes to
     meta and binds like a parameter, one it does not keeps that value (`weights.materialize`).
+
+    A constant a module makes a parameter (`requires_grad=False`, at most `_CONSTANT_BYTES`:
+    rotary_embedding_torch's frequencies) keeps its value until the factory returns (`BUILT`),
+    so a buffer derived from it there has one: SeedVR2's F32 rotary frequencies were a meta
+    buffer no checkpoint stores, an unbound placeholder at their first read.
     """
     torch = torch_module()
     nn = torch.nn
     cap = _Capability(variant)
     original = nn.Module.register_parameter
     original_buffer = nn.Module.register_buffer
+    constants: list[tuple[Any, str, Any]] = []
+
+    def weightless(module: Any, name: str, held: Any, made: dict[int, Any]) -> None:
+        # A device move, performed BY THE RUNTIME, so the guard steps aside exactly here —
+        # the fence is on WHO moves bytes, not on what (see `placing`).
+        if id(held) not in made:
+            with placing():
+                made[id(held)] = type(held)(held.to("meta"), requires_grad=held.requires_grad)
+        module._parameters[name] = made[id(held)]
+        seen.register(made[id(held)])
+
+    def built() -> None:
+        made: dict[int, Any] = {}
+        for module, name, held in constants:
+            if module._parameters.get(name) is held:
+                weightless(module, name, held, made)
+        constants.clear()
 
     def register(module: Any, name: str, param: Any) -> None:
         original(module, name, param)
@@ -476,14 +503,12 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
             return
         # A placeholder registered again is a tie (`lm_head.weight = embed_tokens.weight`): it
         # keeps its one object, so the census sees one destination (cr-218).
-        if not is_virtual(held):
-            # A device move, performed BY THE RUNTIME, so the guard steps aside exactly here —
-            # the fence is on WHO moves bytes, not on what (see `placing`).
-            with placing():
-                module._parameters[name] = type(held)(
-                    held.to("meta"), requires_grad=held.requires_grad
-                )
-        seen.register(module._parameters[name])
+        if is_virtual(held):
+            seen.register(held)
+        elif not held.requires_grad and held.nbytes <= _CONSTANT_BYTES:
+            constants.append((module, name, held))
+        else:
+            weightless(module, name, held, {})
 
     def register_buffer(module: Any, name: str, value: Any, persistent: bool = True) -> None:
         original_buffer(module, name, value, persistent=persistent)
@@ -500,6 +525,8 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
         nn.Module.register_buffer = register_buffer
         stack.callback(setattr, nn.Module, "register_buffer", original_buffer)
         stack.callback(FILLED.reset, FILLED.set(seen.fill))
+        stack.callback(built)  # constants a construction outside `loader.construct` made
+        stack.callback(BUILT.reset, BUILT.set(built))
         stack.enter_context(refuse_compile())
         stack.enter_context(_capability(cap))
         stack.enter_context(_guard_mode(seen))
