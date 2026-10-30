@@ -3512,11 +3512,12 @@ class Executor:
         blocking: dict[str, tuple[float, int]] = {}
         own_memory: list[GpuMemory] = []
         rank_memory: list[GpuMemory] = []
+        close_legs: dict[str, float] = {}
         try:
             with (
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
-                self._request(command.request_id, prepared) as own_memory,
+                self._request(command.request_id, prepared, close_legs) as own_memory,
                 self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
@@ -3578,12 +3579,21 @@ class Executor:
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                     ),
                 )
+                close_legs["returned"] = time.perf_counter()
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)
             if record is None:
                 record = AuthorAttempt(command.request_id, spool, 0, sink=progress)
         assert record is not None
+        if "returned" in close_legs:  # proof timing: handler return -> every context exited
+            close_legs["exits"] = time.perf_counter() - close_legs.pop("returned")
+            record.emit(
+                "confession",
+                "request.close",
+                "ms",
+                **{k: round(v * 1000, 1) for k, v in close_legs.items()},
+            )
         self.handled[command.request_id] = (outcome, stage[0], record)
         # A failure the device raised (CUDA's or NCCL's own error, not capacity), or one that
         # left it faulted: this process serves nothing more, so it is poisoned and the machine
@@ -4661,7 +4671,10 @@ class Executor:
 
     @contextlib.contextmanager
     def _request(
-        self, request_id: str, prepared: PreparedRequest | None = None
+        self,
+        request_id: str,
+        prepared: PreparedRequest | None = None,
+        legs: dict[str, float] | None = None,
     ) -> Iterator[list[GpuMemory]]:
         """The request's residency scopes and pure cuts. Tensor ownership determines lifetime;
         its recorded allocator figures are process-wide, not exact per-request allocations."""
@@ -4684,13 +4697,23 @@ class Executor:
                 try:
                     yield rows
                 finally:
+                    began = time.perf_counter()
                     del host.requests[request_id]
                     peak = accel.allocator_peak(host.memory, request_id)  # read while open
                     host.cuts[request_id] = msgspec.to_builtins(host.execution.cut_rows(request))
+                    closing = time.perf_counter()
+                    if legs is not None:
+                        legs["cuts"] = closing - began
         finally:
             if request is not None:
+                if legs is not None and "cuts" in legs:
+                    legs["memory_exit"] = time.perf_counter() - closing
+                    legs.update(getattr(request, "close_s", {}))
+                began = time.perf_counter()
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
                 rows.append(host.execution.record(request, gpu, device, self._store(), peak))
+                if legs is not None:
+                    legs["record"] = time.perf_counter() - began
 
     def _sibling_sets(self) -> list[Any]:
         """The residency sets of this process's other loaded constructions: their cached weights

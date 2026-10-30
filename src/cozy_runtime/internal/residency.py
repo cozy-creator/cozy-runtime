@@ -3018,14 +3018,17 @@ class Memory:
             yield request
         finally:
             try:
+                began = time.perf_counter()
                 with self.lock:
                     if self._prefetch is not None and self._prefetch.request is request:
                         # Cancel/drain unfinished speculation. An already completed read
                         # keeps valid immutable bytes as ordinary unpinned cache for B.
                         self._settle_prefetch(cancel=True)
+                settled = time.perf_counter()
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
+                request.close_s = {"settle": settled - began, "stats": time.perf_counter() - settled}
             finally:
                 with self.lock:
                     self.requests.discard(request)
