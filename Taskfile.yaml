@@ -11,5 +11,7 @@ tasks:
         set -eu; work=$(mktemp -d); trap 'rm -rf "$work"' EXIT
         uvx --from wheel==0.47.0 wheel unpack "$PWD"/dist/cozy_runtime-*-py3-none-any.whl --dest "$work"
         cp "{{.KERNELS}}"/cozy_runtime/_kernels/_* "$work"/*/cozy_runtime/_kernels/
+        # The Runtime's Triton sets prebuilt (`triton_prebuild`), when the build made them.
+        [ ! -d "{{.KERNELS}}"/cozy_runtime/_triton ] || cp -r "{{.KERNELS}}"/cozy_runtime/_triton "$work"/*/cozy_runtime/
         sed -i -e 's/^Root-Is-Purelib: true$/Root-Is-Purelib: false/' -e 's/^Tag: py3-none-any$/Tag: cp312-abi3-{{.PLAT}}/' "$work"/*/*.dist-info/WHEEL
         SOURCE_DATE_EPOCH=946684800 uvx --from wheel==0.47.0 wheel pack "$work"/* --dest-dir dist
