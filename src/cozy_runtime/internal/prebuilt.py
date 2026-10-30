@@ -57,6 +57,7 @@ class _Format:
 INT8, FP8 = _Format("int8", False, CONVROT_GROUP), _Format("fp8", True, 16)
 #: The prologue's gated activation (`cozy_int8::kActSitu`): rows of [hidden | gate] halves.
 SITU = 3
+#: `silu(gate) * up`: gate rows and an `up` pointer, or without it rows of [up | gate] halves.
 SWIGLU = 4
 
 
@@ -242,17 +243,16 @@ class Prebuilt:
         up: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         torch = self.torch
-        # A gated row quantizes to half its width.
-        gated = activation == SITU
+        # A gated row quantizes to half its width: SiTU's, and SwiGLU's [up | gate] halves.
+        gated = activation == SITU or (activation == SWIGLU and up is None)
         flat = self._rows(f, x, x.shape[-1] // 2 if gated else x.shape[-1])
         rows, width = flat.shape[0], flat.shape[1] // 2 if gated else flat.shape[1]
         if gated and (x.shape[-1] % 2 or norm or scale is not None or shift is not None):
-            raise ValueError(f"{f.name}_quantize: SiTU takes [hidden | gate] rows alone")
-        # SwiGLU: x is the gate rows, `up` the up rows of the same shape.
-        if (activation == SWIGLU) != (up is not None) or (
-            up is not None
-            and (up.shape != x.shape or up.dtype != x.dtype or norm or scale is not None
-                 or shift is not None)
+            raise ValueError(f"{f.name}_quantize: a gated activation takes [hidden | gate] rows alone")
+        # SwiGLU with `up`: x is the gate rows, `up` the up rows of the same shape.
+        if up is not None and (
+            activation != SWIGLU or up.shape != x.shape or up.dtype != x.dtype or norm
+            or scale is not None or shift is not None
         ):
             raise ValueError(f"{f.name}_quantize: SwiGLU takes gate and up rows of one shape alone")
         other = None if up is None else self._rows(f, up)
@@ -596,6 +596,13 @@ def probe(torch: ModuleType, ops: Prebuilt, f: _Format) -> verify.Verdict:
         folded = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(gate, activation=SWIGLU, up=up)
         got = (ops.fp8_gemm if f.fp8 else ops.int8_gemm)(*folded, data, scale, None, dtype)
         errors[f"prologue swiglu {dtype}"] = verify.error(
+            torch, got, law(torch, f, _swiglu(torch, gate, up), data, scale, None)
+        )
+        # One fused projection's rows: [up | gate] halves.
+        halves = torch.cat([up, gate], -1)
+        folded = (ops.fp8_quantize if f.fp8 else ops.int8_quantize)(halves, activation=SWIGLU)
+        got = (ops.fp8_gemm if f.fp8 else ops.int8_gemm)(*folded, data, scale, None, dtype)
+        errors[f"prologue swiglu halves {dtype}"] = verify.error(
             torch, got, law(torch, f, _swiglu(torch, gate, up), data, scale, None)
         )
     return verify.within(errors, BUDGET)

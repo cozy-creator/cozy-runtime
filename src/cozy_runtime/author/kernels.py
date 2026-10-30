@@ -218,7 +218,8 @@ def int8_rows(
     alone: x is `[..., 2F]`, each row its [hidden | gate] halves, and the F-wide rows are
     `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU). `activation="swiglu"`
     stands alone too: x is the gate rows and `up` the up rows of its shape, and the rows are
-    `silu(x) * up`, rounded as an eager SwiGLU rounds them.
+    `silu(x) * up`, rounded as an eager SwiGLU rounds them; without `up`, x is `[..., 2F]`, each
+    row the [up | gate] halves of one fused projection (Diffusers' `SwiGLU`).
 
     None unless every consumer is an un-hooked encoded leaf taking int8.convrot's operand (an int8
     or w4a8 leaf) of x's width and the op serves this card: the caller then runs its own ops."""

@@ -89,10 +89,11 @@ int quantize(int device, bool fp8, uintptr_t x, bool x_half, uintptr_t q, uintpt
         rows_per_entry < 1)
         return cudaErrorInvalidValue;
     // The gated activation reads [M, 2K] and takes no norm or modulation.
-    // The gated activations take no norm or modulation; SwiGLU reads its up rows from `up`.
+    // The gated activations take no norm or modulation; SwiGLU reads its up rows from `up`, or
+    // without it the [up | gate] halves of [M, 2K] rows.
     const bool gated = activation == cozy_int8::kActSitu || activation == cozy_int8::kActSwiglu;
     if (gated && (norm != cozy_int8::kNormNone || scale || shift)) return cudaErrorInvalidValue;
-    if ((activation == cozy_int8::kActSwiglu) != (up != 0)) return cudaErrorInvalidValue;
+    if (up != 0 && activation != cozy_int8::kActSwiglu) return cudaErrorInvalidValue;
     if (M == 0) return cudaSuccess;
     const OnDevice guard(device);
     if (guard.error() != cudaSuccess) return guard.error();

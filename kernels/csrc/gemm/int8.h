@@ -32,7 +32,9 @@ enum { kActNone = 0, kActGelu = 1, kActGeluTanh = 2, kActSitu = 3, kActSwiglu = 
 // [M, 2K], each row its [hidden | gate] halves, and the K-wide row quantized is
 // `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU). kActSwiglu stands alone too:
 // `x` is the gate rows [M, K], `up` the up rows, and the row quantized is `silu(gate) * up`,
-// each product rounded to the row dtype as an eager SwiGLU writes it.
+// each product rounded to the row dtype as an eager SwiGLU writes it. Without `up` it is gated as
+// SiTU is: `x` is [M, 2K], each row its [up | gate] halves (one fused projection, Diffusers'
+// `SwiGLU`).
 struct Prologue {
     const void* scale = nullptr;
     const void* shift = nullptr;
