@@ -1,0 +1,1 @@
+An executor the machine offloads for another call releases its pinned host tier too, so the next call has that host RAM: SeedVR2's 2160p upscale after H3 on a 24 GB pod was killed beside 42 GB of the idle H3 executor's pinned pages (since 0.35.3). The offloaded executor's next call refills from the store and pins its pages again.

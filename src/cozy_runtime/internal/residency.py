@@ -2133,13 +2133,25 @@ class Memory:
         return max(before_allocated - allocated, before_reserved - reserved, free - before_free, 0)
 
     def trim(self) -> int:
-        """Idle offload: release eligible owners and return actual reserved-byte reduction."""
+        """Idle offload: release eligible owners and return actual reserved-byte reduction.
+
+        The host tier goes too. Its pages are pinned, so no other process can reclaim them, and
+        the call the machine offloads this executor for needs host RAM as well: beside an idle
+        H3 executor's 42 GB of pages, SeedVR2's 2160p decode on a 4090 pod was killed by the
+        kernel (gate 40991023097). Its pages refill from the store on this executor's next call."""
         if self.capturing():
             raise ResidencyError("idle offload cannot run during graph capture")
         before = self._figures()[1]
         for model in list(self.models.values()):
             self._retire(model)
         self.reclaim()
+        with self.lock:
+            pages = list(self._baked.values())
+            self._baked.clear()
+            self._baked_bytes = 0
+            self._wanted.clear()
+        for page in pages:
+            page.release()
         return max(before - self._figures()[1], 0)
 
     def region(
