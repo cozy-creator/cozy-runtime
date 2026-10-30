@@ -261,6 +261,7 @@ def _native_leaf_class(torch: ModuleType) -> type:
             scale: Tensor | None,
             shift: Tensor | None,
             activation: str | None,
+            up: Tensor | None = None,
         ) -> PreQuantized | None:
             """`kernels.int8_rows` for consumers led by this leaf."""
             return int8_linear.prologue(
@@ -272,6 +273,7 @@ def _native_leaf_class(torch: ModuleType) -> type:
                 scale=scale,
                 shift=shift,
                 activation=activation,
+                up=up,
             )
 
     _native_leaf_class._cached = NativeLinear  # type: ignore[attr-defined]

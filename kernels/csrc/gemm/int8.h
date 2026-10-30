@@ -23,14 +23,16 @@ constexpr int kGemvRows = 4;
 constexpr int kMaxK = 32768;
 
 enum { kNormNone = 0, kNormLayer = 1, kNormRms = 2 };
-enum { kActNone = 0, kActGelu = 1, kActGeluTanh = 2, kActSitu = 3 };
+enum { kActNone = 0, kActGelu = 1, kActGeluTanh = 2, kActSitu = 3, kActSwiglu = 4 };
 
 // What the producer of `x` would have done to it, done here instead: `activation(norm(x) *
 // (1 + scale) + shift)`. The norm has no affine; `scale` and `shift` are tables in x's dtype
 // whose rows are `*_stride` elements apart (16-byte aligned) and row r of x reads table row
 // r / rows_per_entry. Each part is optional. kActSitu is gated and stands alone: `x` is
 // [M, 2K], each row its [hidden | gate] halves, and the K-wide row quantized is
-// `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU).
+// `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU). kActSwiglu stands alone too:
+// `x` is the gate rows [M, K], `up` the up rows, and the row quantized is `silu(gate) * up`,
+// each product rounded to the row dtype as an eager SwiGLU writes it.
 struct Prologue {
     const void* scale = nullptr;
     const void* shift = nullptr;
@@ -39,6 +41,7 @@ struct Prologue {
     int norm = kNormNone;
     float eps = 0.f;
     int activation = kActNone;
+    const void* up = nullptr;
 };
 
 // Each 256-group of every row of `x` [M, K] (after `prologue`) times the regular Hadamard / 16,

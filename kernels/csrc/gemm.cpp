@@ -83,14 +83,16 @@ bool fits(bool fp8, int K) { return K > 0 && K <= cozy_int8::kMaxK && K % (fp8 ?
 int quantize(int device, bool fp8, uintptr_t x, bool x_half, uintptr_t q, uintptr_t scales,
              int M, int K, uintptr_t scale, uintptr_t shift, int64_t scale_stride,
              int64_t shift_stride, int rows_per_entry, int norm, float eps, int activation,
-             uintptr_t stream) {
+             uintptr_t up, uintptr_t stream) {
     if (!fits(fp8, K) || M < 0 || norm < cozy_int8::kNormNone || norm > cozy_int8::kNormRms ||
-        activation < cozy_int8::kActNone || activation > cozy_int8::kActSitu ||
+        activation < cozy_int8::kActNone || activation > cozy_int8::kActSwiglu ||
         rows_per_entry < 1)
         return cudaErrorInvalidValue;
     // The gated activation reads [M, 2K] and takes no norm or modulation.
-    if (activation == cozy_int8::kActSitu && (norm != cozy_int8::kNormNone || scale || shift))
-        return cudaErrorInvalidValue;
+    // The gated activations take no norm or modulation; SwiGLU reads its up rows from `up`.
+    const bool gated = activation == cozy_int8::kActSitu || activation == cozy_int8::kActSwiglu;
+    if (gated && (norm != cozy_int8::kNormNone || scale || shift)) return cudaErrorInvalidValue;
+    if ((activation == cozy_int8::kActSwiglu) != (up != 0)) return cudaErrorInvalidValue;
     if (M == 0) return cudaSuccess;
     const OnDevice guard(device);
     if (guard.error() != cudaSuccess) return guard.error();
@@ -103,6 +105,7 @@ int quantize(int device, bool fp8, uintptr_t x, bool x_half, uintptr_t q, uintpt
     prologue.norm = norm;
     prologue.eps = eps;
     prologue.activation = activation;
+    prologue.up = at<const void>(up);
     if (fp8)
         return cozy_int8::fp8_quantize(at<const void>(x), x_half, at<void>(q), at<float>(scales),
                                        M, K, prologue, on(stream));
@@ -198,7 +201,7 @@ NB_MODULE(_gemm, m) {
     m.def("error_name", [](int code) { return cudaGetErrorName(cudaError_t(code)); });
     m.def("quantize", &quantize, "device"_a, "fp8"_a, "x"_a, "x_half"_a, "q"_a, "scales"_a, "M"_a,
           "K"_a, "scale"_a, "shift"_a, "scale_stride"_a, "shift_stride"_a, "rows_per_entry"_a,
-          "norm"_a, "eps"_a, "activation"_a, "stream"_a);
+          "norm"_a, "eps"_a, "activation"_a, "up"_a, "stream"_a);
     m.def("gemv", &gemv, "device"_a, "x"_a, "x_half"_a, "w"_a, "w_scale"_a, "bias"_a, "out"_a,
           "out_half"_a, "M"_a, "N"_a, "K"_a, "stream"_a);
     m.def("w4a8_gemm", &w4a8_gemm, "device"_a, "q"_a, "scales"_a, "w"_a, "s"_a, "codebook"_a,

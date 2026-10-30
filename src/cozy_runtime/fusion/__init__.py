@@ -43,7 +43,8 @@ import inspect
 import json
 import sys
 from collections import Counter
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -52,6 +53,7 @@ from cozy_runtime.author.kernels import (
     Launch,
     Plan,
     TritonKernels,
+    int8_rows,
     quantize_once,
 )
 from cozy_runtime.fusion import _kernels
@@ -62,9 +64,9 @@ except ImportError:  # pragma: no cover - the base package is torch-free
     torch = None
 
 try:
-    from diffusers.models.attention_dispatch import dispatch_attention_fn
+    from diffusers.models.attention_dispatch import _AttentionBackendRegistry, dispatch_attention_fn
 except ImportError:  # pragma: no cover - only a parallel block composes Diffusers' attention
-    dispatch_attention_fn = None
+    _AttentionBackendRegistry = dispatch_attention_fn = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -459,12 +461,18 @@ def _inputs(linears: Sequence[Any], normed: Any) -> list[Any]:
 
 
 def _mlp(launch: Launch, site: _Site, hidden: Sequence[Any]) -> Any:
+    """`down(silu(gate) * up)`. An int8 `down` gets the product from its own quantization pass
+    when gate and up are two linears' rows: the same rows, never written in bf16."""
     mlp = site.layout.mlp
     if mlp.up is None:
         (both,) = hidden
         half = int(both.shape[-1]) // 2
         hidden = (both[..., :half], both[..., half:])
         hidden = hidden[::-1] if mlp.value_first else hidden
+    else:
+        rows = int8_rows(hidden[0], (site.down,), activation="swiglu", up=hidden[1])
+        if rows is not None:
+            return site.down(rows)
     return site.down(_kernels.swiglu(launch, site.layout.entries.swiglu, *hidden))
 
 
@@ -480,11 +488,28 @@ def _call_attention(launch: Launch, site: _Site, normed: Any, arguments: Any) ->
         for norm in site.qk:
             norm._cozy_rope = (launch, layout.entries.rope, tables, layout)
     try:
-        with quantize_once(normed):
+        with quantize_once(normed), _selected(site.attention):
             return site.attention(normed, **call)
     finally:
         for norm in site.qk:
             norm._cozy_rope = None
+
+
+@contextmanager
+def _selected(attention: Any) -> Iterator[None]:
+    """The attention's own dispatches that name no backend run the kernel Runtime selected for it,
+    not Diffusers' process default: Qwen-Image 2.1's prefill attends each prefix segment and the
+    target image that way (`backend=None`), so its first step attended in bf16 (xs-134)."""
+    backend = getattr(getattr(attention, "processor", None), "_attention_backend", None)
+    if backend is None or _AttentionBackendRegistry is None:
+        yield
+        return
+    default = _AttentionBackendRegistry._active_backend
+    _AttentionBackendRegistry._active_backend = backend
+    try:
+        yield
+    finally:
+        _AttentionBackendRegistry._active_backend = default
 
 
 def _sequential(
