@@ -446,11 +446,11 @@ def _probe_weight(
     tiles, an f32 second level."""
     weight = torch.randint(0, 256, (rows_out, cols // 2), generator=generator, device=device,
                            dtype=torch.uint8)  # fmt: skip
-    linear = torch.rand(rows_out, cols // NVFP4_BLOCK, generator=generator, device=device)
+    linear = torch.rand(rows_out, cols // NVFP4_BLOCK, generator=generator, device=device, dtype=torch.float32)
     linear = (linear * 4 + 0.25).to(torch.float8_e4m3fn)
     padded = -(-(cols // NVFP4_BLOCK) // 4) * 4
     blocked = to_blocked(torch, linear.view(torch.uint8)).view(-1, padded)
-    return weight, linear, blocked.view(torch.float8_e4m3fn), torch.full((1,), 0.02, device=device)
+    return weight, linear, blocked.view(torch.float8_e4m3fn), torch.full((1,), 0.02, device=device, dtype=torch.float32)
 
 
 def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
@@ -462,7 +462,7 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
     exact = nvfp4_values(torch, weight, linear, second).double()
     errors: dict[str, float] = {}
     for m in (1, 3, DECODE_ROWS):
-        x = torch.randn(m, cols, generator=generator, device=device).to(torch.bfloat16)
+        x = torch.randn(m, cols, generator=generator, device=device, dtype=torch.float32).to(torch.bfloat16)
         want = x.double() @ exact.t()
         for split in (1, 2, 4):
             got = _rows(torch, launch, x, weight, blocked, second, split)

@@ -661,15 +661,15 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
     """Bake every form on `device` where the result is exact (0.25 + 24 * +-1/32 is 1.0 or
     -0.5, over partial tiles and two inner steps): one stored value off it is a broken kernel."""
     rows, cols, rank = 70, 96, 24
-    up = torch.full((rows, rank), 1 / 32, device=device)
+    up = torch.full((rows, rank), 1 / 32, device=device, dtype=torch.float32)
     up[1::2] = -1 / 32
-    down = torch.ones((rank, cols), device=device)
-    want = torch.tensor([1.0, -0.5], device=device).repeat(rows // 2)[:, None].expand(rows, cols)
+    down = torch.ones((rank, cols), device=device, dtype=torch.float32)
+    want = torch.tensor([1.0, -0.5], device=device, dtype=torch.float32).repeat(rows // 2)[:, None].expand(rows, cols)
     wrong: dict[int, int] = {}
     for kind in (BF16, F16, F32, ROWWISE):
         if kind == ROWWISE:
-            data = torch.full((rows, cols), 0.5, device=device).to(torch.float8_e4m3fn)
-            stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device)}
+            data = torch.full((rows, cols), 0.5, device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
+            stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device, dtype=torch.float32)}
         else:
             dtype = (torch.bfloat16, torch.float16, torch.float32)[kind]
             stored = {"value": torch.full((rows, cols), 0.25, dtype=dtype, device=device)}
@@ -680,8 +680,8 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
     # block's kept grid, over a partial column tile.
     stored = {
         "weight": torch.full((rows, cols // 2), 0x11, dtype=torch.uint8, device=device),
-        "scale": torch.full((rows, cols // 16), 0.5, device=device).to(torch.float8_e4m3fn),
-        "scale_2": torch.ones(1, device=device),
+        "scale": torch.full((rows, cols // 16), 0.5, device=device, dtype=torch.float32).to(torch.float8_e4m3fn),
+        "scale_2": torch.ones(1, device=device, dtype=torch.float32),
     }
     fused(torch, launch, stored, down, up, NVFP4)
     got = _nvfp4_decode(torch, stored["weight"], stored["scale"].view(torch.uint8), 1.0)
@@ -689,8 +689,8 @@ def probe(torch: ModuleType, device: Device, launch: Launch) -> verify.Verdict:
     # int8 of rotated rows: 2 + 24 * +-1/48 / 0.5 is 3 or 1 (the regular Hadamard keeps a
     # constant row), over partial row tiles and two inner steps.
     data = torch.full((rows, 256), 2, dtype=torch.int8, device=device)
-    stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device)}
-    fused(torch, launch, stored, torch.ones((rank, 256), device=device), up * (32 / 48), INT8)
+    stored = {"weight": data, "scale": torch.full((rows,), 0.5, device=device, dtype=torch.float32)}
+    fused(torch, launch, stored, torch.ones((rank, 256), device=device, dtype=torch.float32), up * (32 / 48), INT8)
     want = torch.tensor([3, 1], device=device).repeat(rows // 2)[:, None].expand(rows, 256)
     wrong[INT8] = int((data.long() != want).sum())
     off = {kind: n for kind, n in wrong.items() if n}
