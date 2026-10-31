@@ -2395,7 +2395,7 @@ class Memory:
         and the weights are all wanted; a pass that still evicted them tightens the budget by
         its overshoot (`_PLANS` times at most). A budget under twice the activations live between
         passes is no plan: no exact split gets that low. Caller holds the lock."""
-        if self._plans >= _PLANS or not self.cuda or (self._fits and self._split_budget is None):
+        if self._plans >= _PLANS or not self.cuda:
             return
         names = self._phase_names or frozenset()
         incoming = [m for m in self.models.values() if m.name in names]
@@ -2417,9 +2417,9 @@ class Memory:
         resident = int(self.native.stats()["resident_bytes"])
         budget = total - max(total - free - reserved - resident, 0) - weights - _RESERVE
         planned = self._split_budget
+        if held >= weights:
+            return  # the phase is whole: nothing streams (with a plan, the plan holds)
         if planned is not None:
-            if held >= weights:
-                return  # the plan holds: the phase stays resident
             budget = min(budget, planned - max(reserved - planned, g))
         elif budget >= reserved:
             return  # its activations already fit beside its weights; something else streams
