@@ -1,0 +1,1 @@
+`split(fn, x, *cuts, out=buffer)`: each window's `fn(window, out_window)` writes its rows of `buffer`, so nothing whole is allocated beside it and an op may write its input's rows in place (xs-141: H3's block tail into its attention output).
