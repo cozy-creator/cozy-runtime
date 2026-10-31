@@ -968,6 +968,158 @@ class HeadNormRope:
         return out.view(x.shape)
 
 
+@dataclass(frozen=True, slots=True)
+class AdaRows:
+    """A pre-norm adaLN stream's row chains, one kernel each, for a block a package composes
+    itself (a dual-stream or windowed block `DiTBlock` does not describe), over `[..., width]`
+    rows of `rows` dtype:
+
+        first(x, scale, shift)                 -> norm(x) * (1 + scale) [+ shift]
+        between(x, branch, gate, scale, shift) -> (x + act(gate) * branch, norm(that) * ...)
+        last(x, branch, gate)                  -> x + act(gate) * branch
+
+    The same kernels `DiTBlock` installs. Tables are `[rows, width]` views (any row stride) read
+    at `index[token]` (it wraps: `index` [0] gives every token the first row). Declare it at
+    module scope, `install_rows(plan, LAYOUT)` in `Model.execution_plan` returns the launcher's
+    site; each call returns None while eager serves (kernels compiling or absent, another device
+    or dtype), and the caller then runs its own chain. `norm`: "rms" or "layer"; `affine`: the
+    norm has a weight (`weights` its dtype); `gate`: its activation; `rms_rounding` as
+    `DiTBlock`'s."""
+
+    name: str
+    width: int
+    norm: Literal["layer", "rms"] = "rms"
+    affine: bool = False
+    shift: bool = True
+    gate: Literal["identity", "tanh"] = "identity"
+    rows: Literal["bf16", "fp16"] = "bf16"
+    weights: Literal["bf16", "fp16", "fp32"] = "bf16"
+    rms_rounding: Literal["twice", "once"] = "twice"
+    entries: _kernels.Entries = field(init=False, repr=False, compare=False)
+    kernels: TritonKernels = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.width % 16:
+            raise ValueError(f"{self.name}: width {self.width} is not a multiple of 16")
+        f16 = self.rows == "fp16"
+        entries = _kernels.entries(
+            self.width,
+            128,
+            None,
+            norm=_kernels.LAYER if self.norm == "layer" else _kernels.RMS,
+            weight=self.affine,
+            offset=0,
+            weights=f"*{self.weights}",
+            once=self.rms_rounding == "once",
+            modulate=1 + self.shift,
+            tanh=self.gate == "tanh",
+            f16=f16,
+            interleaved=False,
+            round=_kernels.FP16 if f16 else _kernels.BF16,
+            product=False,
+            qk_weight=False,
+            parallel=False,
+            composed=False,
+        )
+        digest = hashlib.sha256("\n".join(e.key for e in entries.all()).encode()).hexdigest()[:12]
+        kernels = TritonKernels(
+            f"fused.{self.name.lower()[:40]}.ada-rows.{digest}",
+            entries.all(),
+            origin=_declaring_module(),
+        )
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "kernels", kernels)
+
+    @property
+    def dtype(self) -> Any:
+        return torch.float16 if self.rows == "fp16" else torch.bfloat16
+
+
+@dataclass(slots=True)
+class AdaRowsSite:
+    """An installed `AdaRows`: its chains on this plan's device (None while eager serves)."""
+
+    layout: AdaRows
+    switch: _Switch
+
+    def _ready(self, *tensors: Any) -> Launch | None:
+        launch = self.switch.launch
+        dtype = self.layout.dtype
+        if launch is None or not all(t.is_cuda and t.dtype is dtype for t in tensors):
+            return None
+        return launch
+
+    def first(
+        self, x: Any, scale: Any, shift: Any, index: Any, *, weight: Any = None, eps: float = 1e-6
+    ) -> Any:
+        """`norm(x) * (1 + scale) [+ shift]`, or None."""
+        launch = self._ready(x)
+        if launch is None:
+            return None
+        entry = self.layout.entries.first
+        _, out = _kernels.norm_modulate(launch, entry, x, weight, scale, shift, index, eps)
+        return out
+
+    def between(
+        self, x: Any, branch: Any, gate: Any, scale: Any, shift: Any, index: Any, *,
+        weight: Any = None, eps: float = 1e-6,
+    ) -> tuple[Any, Any] | None:  # fmt: skip
+        """`(x + act(gate) * branch, norm(that) * (1 + scale) [+ shift])`, or None."""
+        launch = self._ready(x, branch)
+        if launch is None or self.layout.entries.second is None:
+            return None
+        entry = self.layout.entries.second
+        return _kernels.norm_modulate(
+            launch, entry, x, weight, scale, shift, index, eps, branch=branch, gate=gate
+        )
+
+    def last(self, x: Any, branch: Any, gate: Any, index: Any) -> Any:
+        """`x + act(gate) * branch`, or None."""
+        launch = self._ready(x, branch)
+        if launch is None:
+            return None
+        entry = self.layout.entries.residual
+        hidden, _ = _kernels.norm_modulate(
+            launch, entry, x, None, None, None, index, 0.0, branch=branch, gate=gate
+        )
+        return hidden
+
+
+def install_rows(plan: Plan, layout: AdaRows) -> AdaRowsSite | None:
+    """`layout`'s kernels on `plan.device`: its site, whose chains serve once the kernels are
+    loaded (never waiting for the compile), or None when eager serves (no CUDA sm80+, kernels
+    absent or failed; reported)."""
+    device = torch.device(plan.device)
+
+    def report(reason: str = "", **counts: int) -> None:
+        said = {"reason": reason} if reason else counts
+        outcome = {"ada_rows": layout.name, "applied": not reason, **said}
+        plan.report(layout.kernels.name, outcome)
+        said = json.dumps(outcome, sort_keys=True)
+        print(f"[cozy] {layout.kernels.name}: {said}", file=sys.stderr)
+
+    if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
+        report(f"fused rows serve CUDA sm80+, not {device}")
+        return None
+    site = AdaRowsSite(layout, _Switch())
+
+    def activate(launch: Launch) -> None:
+        site.switch.launch = launch
+        report(width=layout.width)
+
+    try:
+        if plan.when_ready is None:
+            activate(plan.load(layout.kernels))
+        elif not plan.when_ready(layout.kernels, activate):
+            report("compiling; fused from the next request on")
+    except KernelsUnavailable as exc:
+        if exc.code == "kernels_corrupt":
+            raise
+        report(f"{exc.code}: {exc}")
+        return None
+    return site
+
+
 @dataclass(slots=True)
 class _HeadSite:
     layout: HeadNormRope
@@ -1140,6 +1292,8 @@ def install_lone_frame(plan: Plan, layout: LoneFrame, *roots: Any) -> str:
 
 
 __all__ = [
+    "AdaRows",
+    "AdaRowsSite",
     "ChannelNorm",
     "DiTBlock",
     "GatedMLP",
@@ -1151,4 +1305,5 @@ __all__ = [
     "install_head_norms",
     "install_lone_frame",
     "install_norms",
+    "install_rows",
 ]
