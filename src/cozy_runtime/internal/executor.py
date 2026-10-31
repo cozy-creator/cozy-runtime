@@ -3258,7 +3258,8 @@ class Executor:
         target = frame.get("target")
         try:
             held = int(frame.get("held", 0))
-            limit = memory.room_for(None if target is None else int(target), held)
+            memory.room_target = None if target is None else int(target)
+            limit = memory.room_for(memory.room_target, held)
             if limit is not None and not memory.requests and self.order is not None:
                 ticket = self.order.ticket(True, "room")
                 threading.Thread(

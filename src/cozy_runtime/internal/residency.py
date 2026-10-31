@@ -1335,6 +1335,8 @@ class Memory:
         #: What the machine leaves this process of the GPU while another program needs it
         #: (`make_room`): its weight pages plus Torch's reserved bytes; None for no limit.
         self.room_limit: int | None = None
+        #: the machine's last target for this process's driver bytes (None: none, or lifted)
+        self.room_target: int | None = None
         #: a raised room (or none) for the running call, taken at its next pass (`_take_room`)
         self._room_pending: tuple[int | None] | None = None
         self.last_room: dict[str, object] | None = None
@@ -3275,6 +3277,9 @@ class Memory:
                 self._declare(model)
             if outer_forward:
                 self._take_room()
+                if request is not None and not request.passed:
+                    request.passed = True
+                    request.room_first = {"target": self.room_target, "limit": self.room_limit}
                 self._activate_phase(model)
             if depth:
                 return
@@ -3393,6 +3398,9 @@ class Request:
         self.others = tuple(others)
         self.current: set[str] = set()
         self.last = ""  # the model it entered last: its phase streams between forwards too
+        #: the machine's target and the room it ran its first pass in (None: no limit)
+        self.room_first: dict[str, int | None] | None = None
+        self.passed = False
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
@@ -3562,6 +3570,7 @@ class Request:
             "trace_scope": "fills",
             "phases": list(self.phase_changes),
             "phase_policy_supported": self.memory.phase_supported,
+            "room_first_pass": self.room_first,
             "host": None,
         }
         if self.memory.cuda and torch.cuda.is_initialized():
