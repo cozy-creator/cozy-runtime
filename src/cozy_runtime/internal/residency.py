@@ -1359,6 +1359,9 @@ class Memory:
         #: (`_replan`), and how many re-plans it has had.
         self._split_budget: int | None = None
         self._plans = 0
+        #: The most a split of the active phase's first pass had beside it: what was allocated
+        #: as it began, and its output (`Request.note_split`); `_replan` plans no budget below it.
+        self._floor, self._flooring = 0, True
         self._forward_depth = 0
         #: (set, block, fill identity, overlay) -> a refilled block's baked bytes in host RAM:
         #: its next refill copies them back, with no store read, factor read or bake
@@ -2384,8 +2387,7 @@ class Memory:
                 return
             self._phase_names, self._phase_request = names, request_id
             self._split_budget, self._plans = None, 0
-            if request is not None:
-                request.floor, request.flooring = 0, True
+            self._floor, self._flooring = 0, True
             self._plan_phase(request)
 
     def _replan(self, request: Request | None) -> None:
@@ -2396,11 +2398,10 @@ class Memory:
         Torch and weights, its weights and `_RESERVE`), splits size within that budget from here
         and the weights are all wanted; a pass that still evicted them tightens the budget by
         its overshoot (`_PLANS` times at most). A budget under twice what the first pass kept
-        beside its splits (`Request.floor`) is no plan: no exact split gets that low (H3 15 s on a
+        beside its splits (`_floor`) is no plan: no exact split gets that low (H3 15 s on a
         4090: 3.0 GB planned beside a 0.4 GB between-pass live set; the pass reserved 6.4 GB, was
         abandoned, and its finer splits cost 16.5 s). Caller holds the lock."""
-        if request is not None:
-            request.flooring = False  # the first pass is over
+        self._flooring = False  # the first pass is over
         if self._plans >= _PLANS or not self.cuda:
             return
         names = self._phase_names or frozenset()
@@ -2436,7 +2437,7 @@ class Memory:
             "held_bytes": held,
             "budget_bytes": budget,
         }
-        floor = max(allocated, request.floor if request is not None else 0)
+        floor = max(allocated, self._floor)
         replan["floor_bytes"] = floor
         if budget < 2 * floor:
             if planned is None:
@@ -3401,9 +3402,6 @@ class Request:
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
         self.prefetch_released = 0
-        #: The most a split of the active phase's first pass had beside it: what was allocated
-        #: as it began, and its output (`note_split`); `Memory._replan` plans no budget below it.
-        self.floor, self.flooring = 0, True
         self.allocator = _allocator(memory)
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
@@ -3493,11 +3491,12 @@ class Request:
 
     def note_split(self, out_bytes: int) -> None:
         """A split beginning: what lives beside it and its output, which no window shrinks.
-        Read on the active phase's first pass only (`Memory._replan` closes it)."""
+        Read on the active phase's first pass only (`Memory._replan` closes it). Kept on the
+        Memory: a child call's split and its phase may see different Request objects."""
         memory = self.memory
-        if not self.flooring or self.idle or not memory.cuda or not torch.cuda.is_initialized():
+        if not memory._flooring or self.idle or not memory.cuda or not torch.cuda.is_initialized():
             return
-        self.floor = max(self.floor, _torch_bytes(memory.device)[0] + out_bytes)
+        memory._floor = max(memory._floor, _torch_bytes(memory.device)[0] + out_bytes)
 
     def reset_peak(self) -> int:
         self.sample()
