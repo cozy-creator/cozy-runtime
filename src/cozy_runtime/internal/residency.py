@@ -66,6 +66,9 @@ __all__ = [
 
 progress = 0
 _RESERVE = 512 << 20
+#: Cached Torch bytes beyond a pass's allocated peak that a streaming phase returns at the pass's
+#: end (`Memory._replan`).
+_SLACK = 1 << 30
 
 
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
@@ -2566,6 +2569,14 @@ class Memory:
         floor = max(allocated, self._floor)
         replan["floor_bytes"], replan["floor_splits"] = floor, self._notes
         replan["early_entries"] = dict(self._early)
+        if planned is None and reserved - peak >= _SLACK:
+            # Torch holds cached segments the pass never used (blocks of 1 GiB and more serve
+            # only their own size): returned once at the pass boundary, the phase re-plans so
+            # its weights take that room, and the next pass mallocs only its own peak.
+            replan["released_bytes"] = reserved - peak
+            release_cached(torch, self.device.type)
+            self._plan_phase(request, replan)
+            return
         if budget < 2 * floor:
             if planned is None:
                 if request is not None:
