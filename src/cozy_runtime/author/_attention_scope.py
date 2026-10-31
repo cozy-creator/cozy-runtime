@@ -20,7 +20,9 @@ class AttentionLayout:
     scale cannot carry): Kitchen INT8 where the route has it, else BF16 SDPA. Runtime
     adds every layer whose key RMSNorm gain has outlier channels
     (`attention_sol.outlier_keys`), so a model names only the rest. Step indices are
-    zero-based. This describes inference only; it does not authorize a backend or
+    zero-based. `tau` is the sparse steps' block-selection threshold (Sol-Attn's: higher
+    keeps fewer key blocks; NVIDIA's Regenerate presets run 1.0 and 1.75), read by every
+    sparse route. This describes inference only; it does not authorize a backend or
     select a kernel.
     """
 
@@ -30,6 +32,7 @@ class AttentionLayout:
     dense_until_step: int = 0
     dense_paths: tuple[str, ...] = ()
     exact_paths: tuple[str, ...] = ()
+    tau: float = 1.0
 
     def __post_init__(self) -> None:
         for name in ("live_tokens", "protected_prefix", "step", "dense_until_step"):
@@ -38,6 +41,8 @@ class AttentionLayout:
                 raise ValueError(f"{name} must be a nonnegative integer")
         if not self.live_tokens or self.protected_prefix > self.live_tokens:
             raise ValueError("attention layout requires a live document containing its prefix")
+        if type(self.tau) is not float or not 0.0 <= self.tau < float("inf"):
+            raise ValueError("tau must be a finite nonnegative float")
         for name in ("dense_paths", "exact_paths"):
             paths = getattr(self, name)
             if not isinstance(paths, tuple) or any(

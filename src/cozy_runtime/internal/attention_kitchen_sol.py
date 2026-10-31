@@ -17,13 +17,13 @@ from cozy_runtime.internal.attention_ulysses import Local
 
 
 def sparse(
-    query: Tensor, key: Tensor, value: Tensor, scale: float | None, sink_tokens: int
+    query: Tensor, key: Tensor, value: Tensor, scale: float | None, sink_tokens: int, tau: float
 ) -> Tensor:
     kitchen = import_module("comfy_kitchen")
     tensors = (x if x.stride(-1) == 1 else x.contiguous() for x in (query, key, value))
     return kitchen.sol_attn(
         *tensors,
-        tau=1.0,
+        tau=tau,
         scale=scale,
         sink_blocks=[0, -(-sink_tokens // 64)],
         sink_q=[0, 0],
@@ -57,7 +57,7 @@ def _named(implementation: str) -> Callable[..., str]:
     return lambda *_: implementation
 
 
-KITCHEN_SOL = Local(forward, _named("comfy_kitchen.sol_attn(int8, tau=1, current-call stats)"))
+KITCHEN_SOL = Local(forward, _named("comfy_kitchen.sol_attn(int8, layout tau, current-call stats)"))
 KITCHEN_SOL_FP4_LOWMEM = Local(
     forward,
     _named(
