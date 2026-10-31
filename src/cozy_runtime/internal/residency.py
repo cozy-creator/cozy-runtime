@@ -3384,6 +3384,10 @@ class Request:
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
         self.queued_prefetch: list[dict[str, Any]] = []
+        if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
+            # Torch's peak is the process's since its last reset: alone, a request starts its own,
+            # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
+            torch.cuda.reset_peak_memory_stats(memory.device)
         self.sample()
 
     def prefetch_queued(self) -> str | None:
