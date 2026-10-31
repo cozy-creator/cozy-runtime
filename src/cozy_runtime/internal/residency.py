@@ -2287,8 +2287,11 @@ class Memory:
             with self.lock:
                 model.retiring = False
 
-    def reclaim(self, need: int = 0, *, current: Collection[str] = ()) -> int:
-        """Discard idle local owners at a preparation boundary; never inside an allocator."""
+    def reclaim(
+        self, need: int = 0, *, current: Collection[str] = (), activations: bool = False
+    ) -> int:
+        """Discard idle local owners at a preparation boundary; never inside an allocator.
+        `activations`: the room is for Torch allocations (a pure site's), else for weight pages."""
         if self.capturing():
             return 0
         before_allocated, before_reserved, _ = self._figures()
@@ -2296,8 +2299,15 @@ class Memory:
         # A running phase's Torch cache is its own activations' (`_running`): a pure site of it
         # counts that cache as room and takes the rest from weights. Returning it was a device
         # sync per release and its segments malloc'd back, and the step reserve then held their
-        # high-water free of speculation for the rest of the phase (H3 30-step on a 4090).
-        keep = bool(need and self.phase_supported and set(current) & set(self._phase_names or ()))
+        # high-water free of speculation for the rest of the phase (H3 30-step on a 4090). A
+        # weight block's pages are no Torch allocation: for them the cache goes first (a warm H3
+        # executor's Regenerate refine was refused a 406 MB block beside it, run 23827).
+        keep = bool(
+            need
+            and activations
+            and self.phase_supported
+            and set(current) & set(self._phase_names or ())
+        )
 
         def room_now() -> int:
             room = self.room(current).free
@@ -3679,7 +3689,7 @@ class Request:
             ]
         for hold in holds:
             hold.shed()
-        return self.memory.reclaim(need, current=self.current)
+        return self.memory.reclaim(need, current=self.current, activations=True)
 
     @contextmanager
     def on_thread(self) -> Iterator[Request]:
