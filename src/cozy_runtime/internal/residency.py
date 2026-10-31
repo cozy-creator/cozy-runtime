@@ -2446,6 +2446,8 @@ class Memory:
         replan["floor_bytes"], replan["floor_splits"] = floor, self._notes
         if budget < 2 * floor:
             if planned is None:
+                if request is not None:
+                    request.phase_changes.append({"models": sorted(names), "replan": replan})
                 return  # no split takes activations this low: the phase streams as planned
             self._split_budget, self._plans = None, _PLANS  # the plan failed: stream again
             replan["abandoned"] = True
