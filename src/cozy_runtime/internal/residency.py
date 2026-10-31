@@ -1458,11 +1458,12 @@ class Memory:
             floor = (peak if self.requests else allocated) + pinned
             room = held if self.room_limit is None else min(held, self.room_limit)
             limit = max(room - give, floor)
-            try:
-                with varena.no_capture(index):
-                    torch.cuda.empty_cache()
-            except RuntimeError:
-                pass  # a capture is in progress: the room bounds its next allocations instead
+            if limit < held:
+                try:
+                    with varena.no_capture(index):
+                        torch.cuda.empty_cache()
+                except RuntimeError:
+                    pass  # a capture is in progress: the room bounds its next allocations
         else:
             return
         self.room_limit = limit
