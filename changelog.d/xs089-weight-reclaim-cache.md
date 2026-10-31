@@ -1,0 +1,1 @@
+A weight block's reclaim returns the running phase's unused Torch cache before it gives up: only a pure site's (activation) reclaim counts that cache as room (a warm H3 executor's Regenerate refine was refused a 406 MB block, run 23827).
