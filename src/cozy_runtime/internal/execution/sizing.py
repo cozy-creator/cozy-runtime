@@ -45,6 +45,9 @@ class Room(Protocol):
     @property
     def budget(self) -> int | None: ...
 
+    @property
+    def whole(self) -> int | None: ...
+
 
 def pieces(units: int, level: int) -> int:
     """Units a piece holds at `level` (2^level pieces, the last one short)."""
@@ -64,6 +67,10 @@ def levelled(units: int, per: Per) -> Need:
 #: At the floor a finer level must save at least this share of the finest's bytes: past that the
 #: whole output (held throughout) is the need, and pieces only add launches.
 _FLOOR_SHARE = 64
+#: What a cut that cannot run beside all of its phase's weights may hold beyond its finest level:
+#: every byte more is weights the phase re-reads each pass, while pieces this large keep their
+#: launches negligible.
+_PIECE = 1 << 30
 
 
 def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
@@ -74,10 +81,16 @@ def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
     exact, so finer pieces cost launches, never output; a coarse piece that evicted the phase's
     weights cost their refill every pass (H3 15 s on a 24 GB card: an 11 GB whole attention call
     left the 21 GB DiT 9 GB resident). Driver-free bytes alone made every site cut to its floor
-    once Torch held the card (RTX 3070, h3-8gb sessions 40463894354 and 40471655517)."""
+    once Torch held the card (RTX 3070, h3-8gb sessions 40463894354 and 40471655517). A cut
+    that cannot fit beside all of the phase's weights (`whole`) streams them whatever its level,
+    so it holds at most `_PIECE` beyond its finest level (H3 15 s on a 4090: a whole 56-head
+    attention call held about 4 GB more than two head windows, Torch reserved it every pass, and
+    the 19.7 GB DiT kept 6.8 GB resident)."""
     room_bytes = room.free + room.cached + room.cold
     if room.budget is not None:
         room_bytes = min(room_bytes, room.budget)
+    if room.whole is not None:
+        room_bytes = min(room_bytes, max(room.whole, need(finest, room.granularity) + _PIECE))
     level = next((n for n in range(finest + 1) if need(n, room.granularity) <= room_bytes), None)
     if level is not None:
         return level, "cold"

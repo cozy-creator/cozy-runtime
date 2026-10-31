@@ -142,6 +142,9 @@ class Room:
     #: What a re-planned phase leaves its activations beyond those live now (`Memory._replan`);
     #: None while the phase has no plan.
     budget: int | None = None
+    #: What a cut may hold with every weight of the running phase resident (`Memory._beside`
+    #: less Torch's allocated); None without a phase.
+    whole: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1367,6 +1370,9 @@ class Memory:
         #: (`_replan`), and how many re-plans it has had.
         self._split_budget: int | None = None
         self._plans = 0
+        #: What Torch may hold beside all of the active phase's weights (`_beside_weights`),
+        #: read as the phase is planned and at each pass's end.
+        self._beside: int | None = None
         #: The most a split of the active phase's first pass had beside it: what was allocated
         #: as it began, and its output (`Request.note_split`), over `_notes` splits; `_replan`
         #: plans no budget below it, and none before a split has run.
@@ -2540,12 +2546,10 @@ class Memory:
                     weights += (size + g - 1) // g * g
                     if region is not None and region.resident:
                         held += (size + g - 1) // g * g
-        free, total = (int(n) for n in torch.cuda.mem_get_info(self.device))
         allocated, reserved, peak = _torch_bytes(self.device)
         if request is not None:
             request.reset_peak()  # each pass's own allocated peak (`pass_peak_bytes`)
-        resident = int(self.native.stats()["resident_bytes"])
-        budget = total - max(total - free - reserved - resident, 0) - weights - _RESERVE
+        budget = self._beside = self._beside_weights(weights)
         planned = self._split_budget
         if held >= weights:
             return  # the phase is whole: nothing streams (with a plan, the plan holds)
@@ -2578,6 +2582,19 @@ class Memory:
         release_cached(torch, self.device.type)  # the last pass's coarse pieces' cache
         self._plan_phase(request, replan)
 
+    def _beside_weights(self, weights: int) -> int:
+        """What Torch may hold beside `weights` of resident pages: the card (or the room or
+        development budget given this process), less what lives outside Torch and the pages,
+        and `_RESERVE`."""
+        free, total = (int(n) for n in torch.cuda.mem_get_info(self.device))
+        _, reserved, _ = _torch_bytes(self.device)
+        resident = int(self.native.stats()["resident_bytes"])
+        card = total - max(total - free - reserved - resident, 0)
+        for limit in (self.budget_bytes, self.room_limit):
+            if limit is not None:
+                card = min(card, limit)
+        return card - weights - _RESERVE
+
     def _plan_phase(self, request: Request | None, replan: dict[str, Any] | None = None) -> None:
         """The active phase's residency: its resident blocks preferred, the rest wanted by
         demand; a streaming window unless its missing bytes fit. Caller holds the lock."""
@@ -2598,7 +2615,7 @@ class Memory:
             (b.allocation_bytes for m in incoming for b in m.groups()), default=0
         )
         self.native.set_streaming_limit(self.window_bytes)
-        missing = 0
+        missing = weights = 0
         for member in incoming:
             member.prefix = None
             for block in member.groups():
@@ -2609,12 +2626,12 @@ class Memory:
                 for region, size in required:
                     if not size:
                         continue
+                    rounded = (size + self.granularity - 1) // self.granularity * self.granularity
+                    weights += rounded
                     if region is not None and region.resident:
                         region.set_preferred(True)
                     else:
-                        missing += (
-                            (size + self.granularity - 1) // self.granularity * self.granularity
-                        )
+                        missing += rounded
                 if block.cached():
                     block.preferred = block.preference_set = True
         allocated, before, _ = _torch_bytes(self.device)
@@ -2634,6 +2651,7 @@ class Memory:
         self._fits = missing <= self.room().free
         need = 0 if self._fits else missing + self.window_bytes - self.room().free
         reclaimed += int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
+        self._beside = self._beside_weights(weights)
         if request is not None:
             request.phase_changes.append(
                 {
@@ -3616,9 +3634,10 @@ class Request:
         if not self.memory.cuda or not torch.cuda.is_initialized():
             return room
         allocated, reserved, _ = _torch_bytes(self.memory.device)
-        planned = self.memory._split_budget
+        planned, beside = self.memory._split_budget, self.memory._beside
         budget = None if planned is None else max(planned - allocated, 0)
-        return replace(room, cached=max(reserved - allocated, 0), budget=budget)
+        whole = None if beside is None else max(beside - allocated, 0)
+        return replace(room, cached=max(reserved - allocated, 0), budget=budget, whole=whole)
 
     def reclaim(self, need: int = 0) -> int:
         """A known pure cut may shed the step's speculative whole-model hold.
