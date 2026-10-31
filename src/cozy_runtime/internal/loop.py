@@ -116,10 +116,7 @@ _LAPS: ContextVar[list[Any] | None] = ContextVar("cozy_loop_laps", default=None)
 @contextmanager
 def _laps(row: dict[str, Any]) -> Iterator[None]:
     """Time a recording call's phases into its row (`parts_ms`)."""
-    token = _LAPS.set([
-        row.setdefault("parts_ms", {}), time.perf_counter(),
-        row.setdefault("[DEBUG-xs138-pool]", []),
-    ])
+    token = _LAPS.set([row.setdefault("parts_ms", {}), time.perf_counter()])
     try:
         yield
     finally:
@@ -1405,30 +1402,13 @@ class _Graph:
             self._contexts.enter_context(kernel_ready.recording())
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
-            reserve = domain.working_peak(self.device.index or 0)
-            if (laps := _LAPS.get()) is not None and len(laps) == 3:
-                # Diagnostic only: observe the failing preparation before CUDA capture starts.
-                stats = vt.stats(self.device.index or 0)
-                request = _REQUEST.get()
-                native = None if request is None else request.memory.native
-                weights = {} if native is None else native.stats()
-                laps[2].append({
-                    "reserve_target_bytes": reserve,
-                    "pool": self.recording._pool.handle,
-                    "steps": self.steps,
-                    "driver_free_total": torch.cuda.mem_get_info(self.device),
-                    "weight_residency": {key: weights.get(key, 0) for key in (
-                        "resident_bytes", "pinned_bytes",
-                    )},
-                    **{key: stats[key] for key in (
-                        "allocated_bytes", "allocated_capacity", "allocated_peak", "mapped_bytes",
-                        "free_bytes", "pending_bytes", "unassigned_bytes", "pools_bytes",
-                        "pools", "ooms",
-                    )},
-                })
+            if self.recording._working_bytes is None:
+                # Later capture peaks include the eager snapshots still held outside this
+                # pool. They must not feed back into the next stage's reservation.
+                self.recording._working_bytes = domain.working_peak(self.device.index or 0)
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
-                reserve_bytes=reserve,
+                reserve_bytes=self.recording._working_bytes,
             ))
             torch.cuda.set_stream(stream)
         except BaseException as error:
