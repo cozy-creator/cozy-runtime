@@ -179,9 +179,21 @@ def _leaf_class(torch: Any) -> Any:
         def roles(self) -> dict[str, Any]:
             return {role: getattr(self, self.BUFFERS.get(role, role)) for role in self._cozy_roles}
 
-        def forward(self, x: Any, *, prequantized: PreQuantized | None = None) -> Any:
+        #: Whether `linear` takes `out` and its GEMM writes there (`forward`'s `out`).
+        WRITES_INTO: ClassVar[bool] = False
+
+        def forward(
+            self, x: Any, *, prequantized: PreQuantized | None = None, out: Any = None
+        ) -> Any:
+            """The linear; with `out` (a view, e.g. this linear's column range of a sibling
+            group's packed output) its result lands there, which it also returns."""
             # Semantic hooks still see the original positional float operand.
-            return self.linear(x, prequantized)
+            if out is None:
+                return self.linear(x, prequantized)
+            if self.WRITES_INTO:
+                return self.linear(x, prequantized, out)
+            out.copy_(self.linear(x, prequantized))
+            return out
 
         def linear(self, x: Tensor, prequantized: PreQuantized | None) -> Tensor:
             if prequantized is None and torch.is_autocast_enabled(x.device.type):
@@ -220,12 +232,18 @@ def _native_leaf_class(torch: ModuleType) -> type:
 
     class NativeLinear(_leaf_class(torch)):  # type: ignore[misc]
         BUFFERS: ClassVar[dict[str, str]] = {"weight": "data"}  # no `.weight` on this leaf
+        WRITES_INTO: ClassVar[bool] = True
 
         @property
         def operand(self) -> str:
             return OPERANDS[self.provider]
 
-        def linear(self, x: Tensor | PreQuantized, prequantized: PreQuantized | None) -> Tensor:
+        def linear(
+            self,
+            x: Tensor | PreQuantized,
+            prequantized: PreQuantized | None,
+            out: Tensor | None = None,
+        ) -> Tensor:
             # The ops launch by pointer: a leaf run outside its model's forward (Klein's
             # modulation heads) has its weight read in (cr-208).
             ops = _NATIVE_OPS[self.provider]
@@ -235,7 +253,7 @@ def _native_leaf_class(torch: ModuleType) -> type:
                 # A producer's prologue (`kernels.int8_rows`) hands the operand in place of x.
                 if torch.is_autocast_enabled(x.payload.device.type):
                     out_dtype = torch.get_autocast_dtype(x.payload.device.type)
-                return ops.gemm(torch, x, data, scale, bias, out_dtype)
+                return ops.gemm(torch, x, data, scale, bias, out_dtype, out)
             cast = x
             if torch.is_autocast_enabled(x.device.type):
                 # As the replaced `nn.Linear` does: from and to the autocast dtype.
@@ -245,7 +263,7 @@ def _native_leaf_class(torch: ModuleType) -> type:
             if prequantized is None and few:
                 # A decode step's row or few: the op's one GEMV launch, which no shared operand
                 # serves (`int8_linear.quantize` declines so few rows).
-                return ops.linear(torch, cast, data, scale, bias, out_dtype)
+                return int8_linear.landed(ops.linear(torch, cast, data, scale, bias, out_dtype), out)
             if prequantized is None or prequantized.provider != self.provider:
                 capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
                 sibling = None if capturing else self
@@ -253,8 +271,8 @@ def _native_leaf_class(torch: ModuleType) -> type:
                     x, self.provider, lambda: ops.quantize(torch, cast), sibling
                 )
             if prequantized is not None:
-                return ops.gemm(torch, prequantized, data, scale, bias, out_dtype)
-            return ops.linear(torch, cast, data, scale, bias, out_dtype)
+                return ops.gemm(torch, prequantized, data, scale, bias, out_dtype, out)
+            return int8_linear.landed(ops.linear(torch, cast, data, scale, bias, out_dtype), out)
 
         def int8_prologue(
             self,
@@ -516,12 +534,17 @@ def _w4a8_leaf_class(torch: ModuleType) -> type:
                 self.data, self.group_scale, self.scale, self._buffers.get("codebook")
             )
 
-        def linear(self, x: Tensor | PreQuantized, prequantized: PreQuantized | None) -> Tensor:
+        def linear(
+            self,
+            x: Tensor | PreQuantized,
+            prequantized: PreQuantized | None,
+            out: Tensor | None = None,
+        ) -> Tensor:
             out_dtype = self.out_dtype
             if isinstance(x, PreQuantized):
                 if torch.is_autocast_enabled(x.payload.device.type):
                     out_dtype = torch.get_autocast_dtype(x.payload.device.type)
-                return w4a8_linear.gemm(torch, x, self.weights(), self.bias, out_dtype)
+                return w4a8_linear.gemm(torch, x, self.weights(), self.bias, out_dtype, out)
             cast = x
             if torch.is_autocast_enabled(x.device.type):
                 out_dtype = torch.get_autocast_dtype(x.device.type)
@@ -533,8 +556,12 @@ def _w4a8_leaf_class(torch: ModuleType) -> type:
                     x, INT8_CONVROT, lambda: int8_linear.quantize(torch, cast), sibling
                 )
             if prequantized is not None:
-                return w4a8_linear.gemm(torch, prequantized, self.weights(), self.bias, out_dtype)
-            return w4a8_linear.linear(torch, cast, self.weights(), self.bias, out_dtype)
+                return w4a8_linear.gemm(
+                    torch, prequantized, self.weights(), self.bias, out_dtype, out
+                )
+            return int8_linear.landed(
+                w4a8_linear.linear(torch, cast, self.weights(), self.bias, out_dtype), out
+            )
 
     _w4a8_leaf_class._cached = W4a8Linear  # type: ignore[attr-defined]
     return W4a8Linear

@@ -166,7 +166,7 @@ struct Sm80Gemm {
     // CUTLASS's adapter, without its swallowed launch error: occupancy and the shared-memory
     // opt-in once per card, then the kernel, whose error the caller gets.
     static cudaError_t run(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
-                           const Out* bias, Out* out, int M, int N, int K, int sms,
+                           const Out* bias, Out* out, int64_t ldo, int M, int N, int K, int sms,
                            Workspace workspace, cudaStream_t s) {
         typename EVT::Arguments callbacks{
             {{{{}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {}},
@@ -174,7 +174,7 @@ struct Sm80Gemm {
               {}},
              {const_cast<Out*>(bias), Out(0), {_0{}, _1{}, N}},
              {}},
-            {out, {int64_t(N), _1{}, int64_t(M) * N}}};
+            {out, {ldo, _1{}, int64_t(M) * ldo}}};
         const cutlass::gemm::GemmCoord problem(M, N, K);
         typename Gemm::Arguments args = [&] {
             if constexpr (kStreamK)
@@ -219,7 +219,7 @@ struct Sm80Gemm {
 
 template <typename Out>
 using Fn = cudaError_t (*)(const int8_t*, const int8_t*, const float*, const float*, const Out*,
-                           Out*, int, int, int, int, Workspace, cudaStream_t);
+                           Out*, int64_t, int, int, int, int, Workspace, cudaStream_t);
 
 template <typename Out>
 const Fn<Out> kConfigs[] = {
@@ -281,23 +281,23 @@ int choose(int m, int n, int k, int sms) {
 
 template <typename Out>
 cudaError_t run_as(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
-                   const void* bias, void* out, int M, int N, int K, int sms, int config,
-                   Workspace workspace, cudaStream_t s) {
+                   const void* bias, void* out, int64_t ldo, int M, int N, int K, int sms,
+                   int config, Workspace workspace, cudaStream_t s) {
     if (config < 0) config = choose(M, N, K, sms);
     if (config >= kSm80Configs) return cudaErrorNotSupported;
     return kConfigs<Out>[config](q, w, xs, ws, static_cast<const Out*>(bias),
-                                 static_cast<Out*>(out), M, N, K, sms, workspace, s);
+                                 static_cast<Out*>(out), ldo, M, N, K, sms, workspace, s);
 }
 
 }  // namespace
 
 cudaError_t gemm(const int8_t* q, const int8_t* w, const float* scales, const float* w_scale,
-                 const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
-                 int config, Workspace workspace, cudaStream_t stream) {
-    return out_half ? run_as<cutlass::half_t>(q, w, scales, w_scale, bias, out, M, N, K, sms,
-                                              config, workspace, stream)
-                    : run_as<cutlass::bfloat16_t>(q, w, scales, w_scale, bias, out, M, N, K, sms,
-                                                  config, workspace, stream);
+                 const void* bias, void* out, int64_t ldo, bool out_half, int M, int N, int K,
+                 int sms, int config, Workspace workspace, cudaStream_t stream) {
+    return out_half ? run_as<cutlass::half_t>(q, w, scales, w_scale, bias, out, ldo, M, N, K,
+                                              sms, config, workspace, stream)
+                    : run_as<cutlass::bfloat16_t>(q, w, scales, w_scale, bias, out, ldo, M, N, K,
+                                                  sms, config, workspace, stream);
 }
 
 }  // namespace cozy_int8::mma_sync
