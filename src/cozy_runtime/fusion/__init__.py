@@ -44,7 +44,7 @@ import inspect
 import json
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -604,7 +604,12 @@ def _attend(launch: Launch, site: _Site, q: Any, k: Any, v: Any, arguments: Any)
 def _head_norm_forward(self: Any, hidden_states: Any) -> Any:
     rope = self._cozy_rope
     # fp16 rows: the fp16 projection, or a processor's fp32 upcast of it.
-    if rope is None or hidden_states.dim() != 4 or not _fusable(rope[3], hidden_states):
+    if (
+        rope is None
+        or hidden_states.dim() != 4
+        or not _fusable(rope[3], hidden_states)
+        or _kernels.rope_rows(hidden_states) is None
+    ):
         return self._cozy_eager(hidden_states)
     launch, entry, tables, layout = rope
     return _kernels.head_norm_rope(
@@ -882,6 +887,307 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class HeadNormRope:
+    """A q or k projection's per-head RMSNorm, then RoPE, in one kernel, for an attention a
+    package composes itself (a windowed or dual-stream block `DiTBlock` does not describe).
+
+    Declare it at module scope (`name` names its kernels), install it on the q/k norm modules in
+    `Model.execution_plan` (`install_head_norms`), and call `apply(norm, x, tables)` with
+    `[..., seq, heads, head_dim]` rows and `tables(value)` of the model's rotary operand: it
+    returns the fused rows, or None while eager serves (kernels compiling or absent, another
+    device or dtype), and the caller then runs its own norm and rotary. `rope.rounding` and
+    `rms_rounding` say how the model's eager path rounds (`Rope`, `DiTBlock`); `rows` is the q/k
+    dtype; `weights` the norm weight's."""
+
+    name: str
+    head_dim: int
+    rope: Rope
+    rows: Literal["bf16", "fp16"] = "bf16"
+    weights: Literal["bf16", "fp16", "fp32"] = "bf16"
+    rms_rounding: Literal["twice", "once"] = "twice"
+    affine: bool = True
+    entry: Any = field(init=False, repr=False, compare=False)
+    kernels: TritonKernels = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        rotary = self.rope.rotary or self.head_dim
+        if self.head_dim & (self.head_dim - 1) or rotary > self.head_dim or rotary % 2:
+            raise ValueError(f"{self.name}: rotary {rotary} of head {self.head_dim}")
+        rounding = self.rope.rounding
+        row = "*fp16" if self.rows == "fp16" else "*bf16"
+        entry = _kernels.rope_entry(
+            self.head_dim,
+            rotary,
+            row=row,
+            weights=f"*{self.weights}",
+            interleaved=self.rope.interleaved,
+            weight=self.affine,
+            offset=0,
+            once=self.rms_rounding == "once",
+            round=_kernels.FP32
+            if rounding == "fp32"
+            else _kernels.FP16
+            if self.rows == "fp16"
+            else _kernels.BF16,
+            product=rounding == "product",
+            x32=False,
+        )
+        digest = hashlib.sha256(entry.key.encode()).hexdigest()[:12]
+        name = f"fused.{self.name.lower()[:40]}.head-rope.{digest}"
+        kernels = TritonKernels(name, (entry,), origin=_declaring_module())
+        object.__setattr__(self, "entry", entry)
+        object.__setattr__(self, "kernels", kernels)
+
+    @property
+    def dtype(self) -> Any:
+        return torch.float16 if self.rows == "fp16" else torch.bfloat16
+
+    def tables(self, value: Any) -> tuple[Any, Any, int, int]:
+        """The model's rotary operand as the kernel reads it (fp32 `(cos, sin, strides)`): a
+        complex `[seq, rotary/2]` table, or a `(cos, sin)` pair (`Rope.interleaved` says which
+        layout). Build it once per sequence layout and pass it to every `apply`."""
+        return _kernels.rope_tables(
+            value, interleaved=self.rope.interleaved, rotary=self.rope.rotary or self.head_dim
+        )
+
+    def apply(self, norm: Any, x: Any, tables: tuple[Any, Any, int, int]) -> Any:
+        """`norm` then RoPE of `x` (`[..., seq, heads, head_dim]`), fused; None: eager serves."""
+        site = vars(norm).get("_cozy_head_rope")
+        launch = None if site is None or site.layout is not self else site.switch.launch
+        if launch is None or x.dim() < 3 or int(x.shape[-1]) != self.head_dim:
+            return None
+        weight = getattr(norm, "weight", None) if self.affine else None
+        if not _cuda(self.dtype, x) or (weight is not None and not weight.is_cuda):
+            return None
+        seq, heads = int(x.shape[-3]), int(x.shape[-2])
+        rows = x.reshape(-1, seq, heads, self.head_dim)
+        if _kernels.rope_rows(rows) is None:  # a layout the kernel cannot address: eager
+            return None
+        eps = site.eps
+        out = _kernels.head_norm_rope(launch, self.entry, rows, weight, eps, tables, self.dtype)
+        return out.view(x.shape)
+
+
+@dataclass(frozen=True, slots=True)
+class AdaRows:
+    """A pre-norm adaLN stream's row chains, one kernel each, for a block a package composes
+    itself (a dual-stream or windowed block `DiTBlock` does not describe), over `[..., width]`
+    rows of `rows` dtype:
+
+        first(x, scale, shift)                 -> norm(x) * (1 + scale) [+ shift]
+        between(x, branch, gate, scale, shift) -> (x + act(gate) * branch, norm(that) * ...)
+        last(x, branch, gate)                  -> x + act(gate) * branch
+
+    The same kernels `DiTBlock` installs. Tables are `[rows, width]` views (any row stride) read
+    at `index[token]` (it wraps: `index` [0] gives every token the first row). Declare it at
+    module scope, `install_rows(plan, LAYOUT)` in `Model.execution_plan` returns the launcher's
+    site; each call returns None while eager serves (kernels compiling or absent, another device
+    or dtype), and the caller then runs its own chain. `norm`: "rms" or "layer"; `affine`: the
+    norm has a weight (`weights` its dtype); `gate`: its activation; `rms_rounding` as
+    `DiTBlock`'s."""
+
+    name: str
+    width: int
+    norm: Literal["layer", "rms"] = "rms"
+    affine: bool = False
+    shift: bool = True
+    gate: Literal["identity", "tanh"] = "identity"
+    rows: Literal["bf16", "fp16"] = "bf16"
+    weights: Literal["bf16", "fp16", "fp32"] = "bf16"
+    rms_rounding: Literal["twice", "once"] = "twice"
+    entries: _kernels.Entries = field(init=False, repr=False, compare=False)
+    kernels: TritonKernels = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.width % 16:
+            raise ValueError(f"{self.name}: width {self.width} is not a multiple of 16")
+        f16 = self.rows == "fp16"
+        entries = _kernels.entries(
+            self.width,
+            128,
+            None,
+            norm=_kernels.LAYER if self.norm == "layer" else _kernels.RMS,
+            weight=self.affine,
+            offset=0,
+            weights=f"*{self.weights}",
+            once=self.rms_rounding == "once",
+            modulate=1 + self.shift,
+            tanh=self.gate == "tanh",
+            f16=f16,
+            interleaved=False,
+            round=_kernels.FP16 if f16 else _kernels.BF16,
+            product=False,
+            qk_weight=False,
+            parallel=False,
+            composed=False,
+        )
+        digest = hashlib.sha256("\n".join(e.key for e in entries.all()).encode()).hexdigest()[:12]
+        kernels = TritonKernels(
+            f"fused.{self.name.lower()[:40]}.ada-rows.{digest}",
+            entries.all(),
+            origin=_declaring_module(),
+        )
+        object.__setattr__(self, "entries", entries)
+        object.__setattr__(self, "kernels", kernels)
+
+    @property
+    def dtype(self) -> Any:
+        return torch.float16 if self.rows == "fp16" else torch.bfloat16
+
+
+@dataclass(slots=True)
+class AdaRowsSite:
+    """An installed `AdaRows`: its chains on this plan's device (None while eager serves)."""
+
+    layout: AdaRows
+    switch: _Switch
+
+    def _ready(self, *tensors: Any) -> Launch | None:
+        launch = self.switch.launch
+        dtype = self.layout.dtype
+        if launch is None or not all(t.is_cuda and t.dtype is dtype for t in tensors):
+            return None
+        return launch
+
+    def first(
+        self, x: Any, scale: Any, shift: Any, index: Any, *, weight: Any = None, eps: float = 1e-6
+    ) -> Any:
+        """`norm(x) * (1 + scale) [+ shift]`, or None."""
+        launch = self._ready(x)
+        if launch is None:
+            return None
+        entry = self.layout.entries.first
+        _, out = _kernels.norm_modulate(launch, entry, x, weight, scale, shift, index, eps)
+        return out
+
+    def between(
+        self, x: Any, branch: Any, gate: Any, scale: Any, shift: Any, index: Any, *,
+        weight: Any = None, eps: float = 1e-6,
+    ) -> tuple[Any, Any] | None:  # fmt: skip
+        """`(x + act(gate) * branch, norm(that) * (1 + scale) [+ shift])`, or None."""
+        launch = self._ready(x, branch)
+        if launch is None or self.layout.entries.second is None:
+            return None
+        entry = self.layout.entries.second
+        return _kernels.norm_modulate(
+            launch, entry, x, weight, scale, shift, index, eps, branch=branch, gate=gate
+        )
+
+    def last(self, x: Any, branch: Any, gate: Any, index: Any) -> Any:
+        """`x + act(gate) * branch`, or None."""
+        launch = self._ready(x, branch)
+        if launch is None:
+            return None
+        entry = self.layout.entries.residual
+        hidden, _ = _kernels.norm_modulate(
+            launch, entry, x, None, None, None, index, 0.0, branch=branch, gate=gate
+        )
+        return hidden
+
+
+def install_rows(plan: Plan, layout: AdaRows) -> AdaRowsSite | None:
+    """`layout`'s kernels on `plan.device`: its site, whose chains serve once the kernels are
+    loaded (never waiting for the compile), or None when eager serves (no CUDA sm80+, kernels
+    absent or failed; reported)."""
+    device = torch.device(plan.device)
+
+    def report(reason: str = "", **counts: int) -> None:
+        said = {"reason": reason} if reason else counts
+        outcome = {"ada_rows": layout.name, "applied": not reason, **said}
+        plan.report(layout.kernels.name, outcome)
+        said = json.dumps(outcome, sort_keys=True)
+        print(f"[cozy] {layout.kernels.name}: {said}", file=sys.stderr)
+
+    if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
+        report(f"fused rows serve CUDA sm80+, not {device}")
+        return None
+    site = AdaRowsSite(layout, _Switch())
+
+    def activate(launch: Launch) -> None:
+        site.switch.launch = launch
+        report(width=layout.width)
+
+    try:
+        if plan.when_ready is None:
+            activate(plan.load(layout.kernels))
+        elif not plan.when_ready(layout.kernels, activate):
+            report("compiling; fused from the next request on")
+    except KernelsUnavailable as exc:
+        if exc.code == "kernels_corrupt":
+            raise
+        report(f"{exc.code}: {exc}")
+        return None
+    return site
+
+
+@dataclass(slots=True)
+class _HeadSite:
+    layout: HeadNormRope
+    switch: _Switch
+    eps: float
+
+
+def install_head_norms(plan: Plan, layout: HeadNormRope, norms: Iterable[Any]) -> str:
+    """Install `layout` on the q/k norm modules `norms` on `plan.device`: the plan's identity, or
+    "" when eager serves (no CUDA sm80+, kernels absent or failed, or a norm that is not the
+    declaration; reported). Never waits for the kernels' compile."""
+    device = torch.device(plan.device)
+    document: dict[str, object] = {"head_norms": layout.name}
+
+    def report(reason: str = "", **counts: int) -> str:
+        outcome = {**document, "applied": not reason, **({"reason": reason} if reason else counts)}
+        plan.report(layout.kernels.name, outcome)
+        said = json.dumps(outcome, sort_keys=True)
+        print(f"[cozy] {layout.kernels.name}: {said}", file=sys.stderr)
+        return ""
+
+    if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
+        return report(f"fused head norms serve CUDA sm80+, not {device}")
+    found = [(f"{index}.{type(norm).__qualname__}", norm) for index, norm in enumerate(norms)]
+    if not found:
+        return report("no q/k norm")
+    weights = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[layout.weights]
+    switch = _Switch()
+    sites = []
+    for path, norm in found:
+        weight = getattr(norm, "weight", None)
+        affine = weight is not None and tuple(weight.shape) == (layout.head_dim,)
+        if affine != layout.affine or (affine and weight.dtype is not weights):
+            declared = f"{layout.head_dim}-wide {layout.weights} RMSNorm"
+            return report(f"{path}: not the {declared} declared")
+        try:
+            sites.append((norm, _HeadSite(layout, switch, _eps(norm, path))))
+        except _Mismatch as exc:
+            return report(str(exc))
+    for norm, site in sites:
+        norm._cozy_head_rope = site
+
+    def activate(launch: Launch) -> None:
+        switch.launch = launch
+        report(norms=len(sites))
+
+    try:
+        if plan.when_ready is None:
+            activate(plan.load(layout.kernels))
+        elif not plan.when_ready(layout.kernels, activate):
+            report("compiling; fused from the next request on")
+    except KernelsUnavailable as exc:
+        if exc.code == "kernels_corrupt":
+            raise
+        for norm, _ in sites:
+            del norm._cozy_head_rope
+        return report(f"{exc.code}: {exc}")
+    encoded = json.dumps(
+        {"kernels": layout.kernels.identity, "name": layout.name,
+         "head_dim": layout.head_dim, "rows": layout.rows, "weights": layout.weights,
+         "rope": [layout.rope.interleaved, layout.rope.rotary, layout.rope.rounding],
+         "rms_rounding": layout.rms_rounding, "affine": layout.affine},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()  # fmt: skip
+    return "sha256:" + hashlib.sha256(b"cozy.fusion.head-norm-rope\0" + encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class LoneFrame:
     """A video VAE decoding one image frame, `[batch, channels, 1, height, width]` with no frame
     cache (Diffusers' Wan and Qwen-Image VAEs). `conv`, its causal convolution (a Conv3d, or the
@@ -986,13 +1292,18 @@ def install_lone_frame(plan: Plan, layout: LoneFrame, *roots: Any) -> str:
 
 
 __all__ = [
+    "AdaRows",
+    "AdaRowsSite",
     "ChannelNorm",
     "DiTBlock",
     "GatedMLP",
+    "HeadNormRope",
     "LoneFrame",
     "Modulation",
     "Rope",
     "install",
+    "install_head_norms",
     "install_lone_frame",
     "install_norms",
+    "install_rows",
 ]
