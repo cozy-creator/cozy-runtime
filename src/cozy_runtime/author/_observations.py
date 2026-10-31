@@ -49,7 +49,7 @@ import math
 import re
 import time
 from collections import deque
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
@@ -316,12 +316,16 @@ class DeviceClock(Protocol):
 #: step's host time is when it was queued and its device time is when it ran (v8c: 35 ms
 #: queued against 157 ms run per step, the rest surfacing at the first sync after the loop).
 DEVICE: list[DeviceClock] = []
+#: The executor's execution plans serving now, by name (its plan reports' applied ones, or
+#: "eager"): what each step records it ran.
+PLANS: list[Callable[[], str]] = []
 
 
 @dataclass(slots=True)
 class Track:
     """One named span's timing and wall bounds. A step track also keeps a bounded series of
-    `(end_unix_ms, ms)` points; nothing else grows with the step count."""
+    `(end_unix_ms, ms)` points and the plans its steps ran, run-length; nothing else grows with
+    the step count."""
 
     count: int = 0
     total_ms: float = 0.0
@@ -335,6 +339,8 @@ class Track:
     series_dropped: int = 0
     #: a step track's device marks around each step (its device time, read at the end)
     marks: list[tuple[object, object]] | None = None
+    #: a step track's `(first step, plans)` rows: each change of the plans its steps ran
+    plans: list[tuple[int, str]] | None = None
 
     def add(self, ms: float) -> None:
         end = time.time() * 1000
@@ -370,6 +376,8 @@ class Track:
         if self.series is not None:
             document["series"] = [[end, ms] for end, ms in self.series]
             document["series_dropped"] = self.series_dropped
+        if self.plans:
+            document["plans"] = [[step, plans] for step, plans in self.plans]
         if self.marks and DEVICE:
             device = [round(DEVICE[0].between(a, b), 3) for a, b in self.marks]
             document["device"] = {
@@ -402,6 +410,12 @@ class Attribution:
     def step(self, name: str, ms: float, marks: tuple[object, object] | None = None) -> None:
         track = self._track(self.steps, name, series=True)
         track.add(ms)
+        if PLANS:
+            plans = PLANS[0]()
+            if track.plans is None:
+                track.plans = []
+            if not track.plans or track.plans[-1][1] != plans:
+                track.plans.append((track.count - 1, plans))
         if marks is not None:
             if track.marks is None:
                 track.marks = []

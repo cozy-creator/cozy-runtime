@@ -26,8 +26,9 @@ compile on the executor's GPUs at boot, and install it in `Model.execution_plan`
     def execution_plan(self, plan):
         return fusion.install(plan, BLOCK, self.transformer)
 
-A construction never waits for the compile: until it is ready the eager blocks serve, and the
-fused ones from the next request on. A block whose structure, widths or dtype differ from the
+A construction never waits for a compile: until it is ready the eager blocks serve, and the
+fused ones from the next request on. A package release ships its kernels compiled
+(`triton_prebuild`), so its first request on a fresh machine serves fused. A block whose structure, widths or dtype differ from the
 declaration serves eager (reported).
 
 A VAE's channel-first RMS norm (Wan's `RMS_norm` and the Qwen-Image copies of it) is one kernel,

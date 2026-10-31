@@ -525,6 +525,8 @@ def drain(torch: Any, kind: str) -> None:
 #: Torch's synchronizing release per VAE tensor (+300 ms, session 40829742644).
 #: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
 ALLOCATOR = "backend:native,expandable_segments:False,max_split_size_mb:1024"
+#: torch `_native`'s DSLs that compile at an op's first call.
+JIT_DSLS = ("triton", "cutedsl", "helion")
 
 
 def initialize(torch: Any, kind: str) -> None:
@@ -538,6 +540,12 @@ def initialize(torch: Any, kind: str) -> None:
     if kind == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("this Mac's torch has no usable MPS device")
     if kind == "cuda":
+        # A request never compiles: torch's `_native` overrides JIT their DSL kernels on an op's
+        # first call of each shape (torch 2.14's Triton bmm outer product: 0.1-0.3 s on a cold
+        # machine's request, per prompt-length bucket). aten serves those ops, as before 2.14.
+        native = getattr(torch, "_native", None)
+        if native is not None:
+            native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
         torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         try:
             varena.install_allocator()

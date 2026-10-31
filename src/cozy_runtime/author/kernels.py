@@ -4,10 +4,12 @@ Model code lives in the model's package and the Runtime stays generic (owner rul
 2026-10-14); kernels are hand-written, never `torch.compile`, and compile on the GPU that runs
 them while the executor starts. Compiling fixed shipped source is permitted; consumer
 benchmarking, autotuning, torch.compile and competing implementation search are not.
-A package declares its Triton kernels once, at import, as a
-`TritonKernels`. Each executor that imports the package submits their build for its GPUs'
-architectures when it starts, beside the weight download; the machine's compile manager builds
-each key once, niced, out of process. `Model.execution_plan` receives a `Plan` whose `load`
+A package declares its Triton kernels once, at import, as a `TritonKernels`. Its release ships
+them compiled for every card row in `<package>/_triton` (`python -m
+cozy_runtime.internal.triton_prebuild <package>/_triton --package <package>`, on a CPU). Each
+executor that imports the package submits their build for its GPUs' architectures when it starts,
+beside the weight download; the machine's compile manager copies what the package ships, else
+builds each key once, niced, out of process. `Model.execution_plan` receives a `Plan` whose `load`
 waits for that build and returns the launcher. A request never compiles, and a launch maps any
 weight operand the plane has not mapped (`readable`).
 
