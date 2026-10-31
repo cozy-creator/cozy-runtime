@@ -3754,6 +3754,7 @@ class Request:
                 peak=self.peak,
                 allocated=allocated,
                 reserved=reserved,
+                working_allocator=vt.stats(self.memory.device.index or 0),
                 peak_window="Torch high-water plus sampled native backing, carried across resets; "
                 "other constructions' resident sets left out",
                 weight_residency=(
