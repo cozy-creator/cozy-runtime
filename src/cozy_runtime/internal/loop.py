@@ -1409,14 +1409,19 @@ class _Graph:
             if (laps := _LAPS.get()) is not None and len(laps) == 3:
                 # Diagnostic only: observe the failing preparation before CUDA capture starts.
                 stats = vt.stats(self.device.index or 0)
+                native = self.domain.memory.native
+                weights = {} if native is None else native.stats()
                 laps[2].append({
-                    "reserve_bytes": reserve,
+                    "reserve_target_bytes": reserve,
                     "pool": self.recording._pool.handle,
                     "steps": self.steps,
                     "driver_free_total": torch.cuda.mem_get_info(self.device),
+                    "weight_residency": {key: weights.get(key, 0) for key in (
+                        "resident_bytes", "pinned_bytes",
+                    )},
                     **{key: stats[key] for key in (
-                        "allocated_bytes", "allocated_peak", "mapped_bytes", "free_bytes",
-                        "pending_bytes", "pools_bytes", "pools", "ooms",
+                        "allocated_bytes", "allocated_capacity", "allocated_peak", "mapped_bytes",
+                        "free_bytes", "pending_bytes", "unassigned_bytes", "pools_bytes", "pools", "ooms",
                     )},
                 })
             self._contexts.enter_context(vt.graph(
