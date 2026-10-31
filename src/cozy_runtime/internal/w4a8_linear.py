@@ -72,14 +72,18 @@ def gemm(
     w: prebuilt.W4a8,
     bias: Tensor | None,
     out_dtype: object,
+    out: Tensor | None = None,
 ) -> Tensor:
-    """The linear of an int8.convrot operand (`int8_linear.quantize`, a producer's prologue)."""
+    """The linear of an int8.convrot operand (`int8_linear.quantize`, a producer's prologue);
+    copied into `out` where given (its own GEMM writes dense rows)."""
     index = operand.payload.get_device()
     ops = native(torch, index) if out_dtype in (torch.bfloat16, torch.float16) else None
     if ops is not None:
         try:
-            out = ops.w4a8_gemm(operand.payload, operand.scale, w, bias, out_dtype)
-            return out.view(*operand.shape[:-1], -1)
+            result = ops.w4a8_gemm(operand.payload, operand.scale, w, bias, out_dtype)
+            return int8_linear.landed(result.view(*operand.shape[:-1], -1), out)
         except Exception as exc:
             int8_linear.failed(OP, index, exc)
-    return int8_linear.gemm(torch, operand, prebuilt.unpack(torch, w), w.scale, bias, out_dtype)
+    return int8_linear.gemm(
+        torch, operand, prebuilt.unpack(torch, w), w.scale, bias, out_dtype, out
+    )
