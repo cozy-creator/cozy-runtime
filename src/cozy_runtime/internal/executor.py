@@ -53,6 +53,7 @@ import importlib.util
 import json
 import math
 import os
+import signal
 import socket
 import sys
 import threading
@@ -5203,6 +5204,8 @@ def _remember_distributions() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     faulthandler.enable(all_threads=True)
+    if hasattr(signal, "SIGUSR1"):  # every thread's Python stack to stderr, the process lives on
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
     parser.add_argument("--socket", default="")
     parser.add_argument("--root", required=True)
