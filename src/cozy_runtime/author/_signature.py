@@ -326,7 +326,8 @@ class Declaration:
     weights_outputs: tuple[WeightsOutput, ...] = ()
     """The TensorFS model outputs this function writes; grants mint off this declaration."""
     memoize: Memoize | None = None
-    internal: bool = False
+    child_task: bool = False
+    """Run by its own package's calls only (`app.child_task`), never a root request."""
     accelerator: bool = True
     """False: CPU only, never opens CUDA. True: the machine's GPU when it has one."""
     model_defaults: Mapping[str, str] = field(default_factory=dict)
@@ -506,7 +507,7 @@ def analyze(
     demand_bound: Bound | None = None,
     preflight: Callable[..., object] | None = None,
     hidden: bool = False,
-    internal: bool = False,
+    child_task: bool = False,
     accelerator: bool = True,
     invocable: bool = False,
     memoize: Memoize | None = None,
@@ -692,7 +693,7 @@ def analyze(
         demand_bound=demand_bound,
         preflight=spec,
         hidden=hidden,
-        internal=internal,
+        child_task=child_task,
         accelerator=accelerator,
         invocable=invocable,
         memoize=memoize,

@@ -380,28 +380,30 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
-_ENTRYPOINT_KEYWORDS = frozenset(
+#: Each App registration method's closed keyword set (`author.App`).
+_CHILD_TASK_KEYWORDS = frozenset(
     {
         "name",
         "preflight",
         "phases",
         "prepared_use",
         "demand",
-        "hidden",
         "memoize",
         "memo_version",
         "memo_dependencies",
         "defaults",
         "components",
         "on_demand",
-        "internal",
         "publishes",
         "emits_media",
         "weights",
         "accelerator",
-        "implements",
     }
 )
+_APP_KEYWORDS = {
+    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden", "implements"},
+    "child_task": _CHILD_TASK_KEYWORDS,
+}
 _INVOCABLE_KEYWORDS = frozenset(
     {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
 )
@@ -1467,7 +1469,7 @@ class Registration:
     invocable: bool = False
     memoize: author.Memoize | None = None
     model_defaults: Mapping[str, str] = field(default_factory=dict)
-    internal: bool = False
+    child_task: bool = False
     accelerator: bool = True
     #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
@@ -1491,7 +1493,7 @@ class Registration:
             emits_media=self.emits_media,
             weights_outputs=self.weights,
             memoize=self.memoize,
-            internal=self.internal,
+            child_task=self.child_task,
             accelerator=self.accelerator,
             model_defaults=self.model_defaults,
             model_components=self.model_components,
@@ -1903,7 +1905,7 @@ def _is_invocable(reader: Reader, module: Module, target: ast.expr) -> bool:
 
 
 def _app_method(reader: Reader, module: Module, target: ast.expr, app: Assigned) -> str | None:
-    if not isinstance(target, ast.Attribute) or target.attr != "entrypoint":
+    if not isinstance(target, ast.Attribute) or target.attr not in _APP_KEYWORDS:
         return None
     try:
         receiver = reader.resolve(module, target.value)
@@ -1980,7 +1982,6 @@ def _registration(
     module = declaration or module
     name = fn.name
     publishes = emits_media = False
-    internal = False
     accelerator = True
     hidden = False
     implements: author.Implements | None = None
@@ -1989,7 +1990,7 @@ def _registration(
     phases: tuple[tuple[str, ...], ...] = ()
     uses: dict[str, str] = {}
     for keyword in keywords:
-        if keyword.arg not in _ENTRYPOINT_KEYWORDS:
+        if keyword.arg not in _APP_KEYWORDS[method]:
             reader.refuse(
                 module,
                 keyword,
@@ -2039,10 +2040,6 @@ def _registration(
             name = str(value)
         elif keyword.arg == "hidden" and value is True:
             hidden = True
-        elif keyword.arg == "internal":
-            if type(value) is not bool:
-                reader.refuse(module, keyword.value, "internal must be a boolean")
-            internal = value
         elif keyword.arg == "accelerator":
             if type(value) is not bool:
                 reader.refuse(module, keyword.value, "accelerator is True or False")
@@ -2060,8 +2057,6 @@ def _registration(
         elif keyword.arg == "weights":
             assert isinstance(value, tuple)
             weights = tuple(value)
-    if hidden and internal:
-        reader.refuse(module, fn, "an internal callable cannot also be hidden")
     if hidden:
         return None
     return Registration(
@@ -2073,7 +2068,7 @@ def _registration(
         invocable,
         one_memo(exported, memoize),
         default_models,
-        internal,
+        method == "child_task",
         accelerator,
         tuple(memo_declaration),
         used_components,
