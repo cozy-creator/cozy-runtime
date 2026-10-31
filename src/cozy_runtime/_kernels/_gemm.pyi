@@ -50,6 +50,7 @@ def gemm(
     w_scale: int,
     bias: int,
     out: int,
+    ldo: int,
     out_half: bool,
     M: int,
     N: int,
