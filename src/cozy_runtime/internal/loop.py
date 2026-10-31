@@ -1484,6 +1484,16 @@ class _Graph:
                 self._contexts.close()
         control.synchronize()
         self.domain.graphs.add(self.graph)
+        from cozy_runtime.internal.execution import catch
+
+        if self._diagnostic_stage == "after":
+            record = catch._CAPTURE_METADATA.get()
+            if record is not None:
+                from cozy_runtime.internal.capture_kernel_metadata import snapshot
+
+                metadata = snapshot(self.graph.raw_cuda_graph())
+                metadata.update(stage="after", graph=record["graph_index"])
+                record.setdefault("kernel_metadata", []).append(metadata)
 
     def abort(self) -> None:
         """After a failure inside the recorded region: end the capture, keep nothing."""
