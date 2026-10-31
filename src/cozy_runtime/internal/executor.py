@@ -3232,6 +3232,7 @@ class Executor:
         if self.host.memory is not None:
             # Never hold the prepared-record lock while touching a native read owner.
             self.host.memory.cancel_queued(request_id)
+        IDLE_WAITED.pop(request_id, None)
         if self.order is not None:
             self.order.wake()  # an idle period may open now (`awaiting_invoke`)
 
@@ -3632,10 +3633,14 @@ class Executor:
                 )
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
+            if (waited := IDLE_WAITED.pop(command.request_id, 0.0)) >= 1:
+                record.emit("confession", "idle.waited", _IDLE_WORK, ms=round(waited, 1))
+                if waited >= IDLE_BLOCKING_MS:
+                    blocking[_IDLE_WORK] = (waited, 1)
             for work, (ms, times) in blocking.items():
                 took = {"ms": round(ms, 1), "times": times}
                 record.emit("confession", "request_path.blocking", work, **took)
-                record.emit("log", "kernel work blocked the request", "warn", work=work, **took)
+                record.emit("log", f"{work} blocked the request", "warn", work=work, **took)
             followed()
             for name, where in swapped:
                 record.emit("confession", "kernel.ready", name, **where)
@@ -5186,12 +5191,22 @@ def _waiting(channel: Channel, what: str, fraction: float | None = None) -> None
 
 #: Commands of one call: served on the executor's pool, side by side with other calls.
 _CALL_COMMANDS = frozenset({"prepare_request", "invoke"})
+#: The idle holder's name, as a command waiting for it is told.
+_IDLE_WORK = "idle work"
+#: A call's wait for idle work to give the order back at least this long is request-path
+#: blocking (the release gate fails it): idle work yields at its next op with two ops left on
+#: the device, or after one store window's read or one page's registration.
+IDLE_BLOCKING_MS = 100.0
+#: call -> ms its commands waited for idle work, until its run's record takes it (`_Order.turn`)
+IDLE_WAITED: dict[str, float] = {}
 
 
 class _Order:
     """Commands in the order they came: a call's run side by side, and a process-wide one
     alone, after every command before it and before every command after it. One waiting for
-    its turn is told what it waits on."""
+    its turn is told what it waits on. Idle work holds it as a process-wide command does (`idle`),
+    and every call's wait for it goes into the call's record (`IDLE_WAITED`): the one place each
+    kind of idle work is measured."""
 
     def __init__(self) -> None:
         self._changed = threading.Condition()
@@ -5200,11 +5215,18 @@ class _Order:
         self._next = 0
         #: commands answered so far: an idle period follows each (`idle`)
         self.answered = 0
+        #: the idle holder's ticket while it holds the order, and when each command since came
+        self._idle: int | None = None
+        self._arrived: dict[int, float] = {}
+        #: ticket -> ms it waited for the idle holder
+        self._waited: dict[int, float] = {}
 
     def ticket(self, alone: bool, what: str) -> int:
         with self._changed:
             self._next += 1
             self._open[self._next] = (alone, what)
+            if self._idle is not None:
+                self._arrived[self._next] = time.perf_counter()
             return self._next
 
     def first(self, ticket: int) -> bool:
@@ -5227,6 +5249,9 @@ class _Order:
                     "",
                 ),
             )
+            waited = self._waited.pop(ticket, 0.0)
+        if waited and (call := _CALL.get()):
+            IDLE_WAITED[call] = IDLE_WAITED.get(call, 0.0) + waited
         try:
             yield
         finally:
@@ -5244,12 +5269,18 @@ class _Order:
             self._changed.wait_for(lambda: not self._open and self.answered != answered and ready())
             self._next += 1
             ticket, answered = self._next, self.answered
-            self._open[ticket] = (True, "graph capture")
+            self._open[ticket] = (True, _IDLE_WORK)
+            self._idle = ticket
         try:
             yield answered
         finally:
             with self._changed:
                 del self._open[ticket]
+                self._idle = None
+                now = time.perf_counter()
+                for came, at in self._arrived.items():
+                    self._waited[came] = (now - at) * 1e3
+                self._arrived.clear()
                 self._changed.notify_all()
 
     def waiting(self) -> bool:
@@ -5265,8 +5296,9 @@ class _Order:
 def _idle(executor: Executor, order: _Order) -> None:
     """Graphs record and host pages pin off the request path (`graphs.capture_idle`,
     `Memory.pin_idle`): after a command is answered, while no other is open. One arriving makes
-    either yield at its next region boundary or stored part. A device fault there poisons the
-    executor, as one in a request does (the machine ends it)."""
+    either yield at its next op or stored part, and its wait goes into its call's record
+    (`IDLE_WAITED`). A device fault there poisons the executor, as one in a request does (the
+    machine ends it)."""
     answered = 0
 
     def pins() -> bool:

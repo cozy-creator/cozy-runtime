@@ -94,6 +94,8 @@ _REFUSED = (
 )
 #: cudaError_t stream-capture codes (900-908): an operation the step runs cannot be recorded.
 _CAPTURE_ERRORS = range(900, 909)
+#: a refusal by one of them (`_refusal`)
+_UNRECORDABLE = "the step cannot be recorded"
 #: request id -> its loops, for the run record (`execution.loops`)
 ROWS: dict[str, list[dict[str, Any]]] = {}
 
@@ -145,7 +147,7 @@ def _refusal(error: BaseException) -> str | None:
         return f"residency refused preparation: {error}"
     code = getattr(error, "error_code", None)
     if isinstance(code, int) and code in _CAPTURE_ERRORS:
-        return f"the step cannot be recorded: {error}"
+        return f"{_UNRECORDABLE}: {error}"
     if isinstance(error, Exception) and fault(error) is Fault.OTHER:
         return f"recording failed: {type(error).__name__}: {error}"
     return None
@@ -361,6 +363,12 @@ class Loops:
             row["dropped"] = "released"
         if refused:
             row["refusals"].append(f"whole call on its first call: {refused}")
+            if refused.startswith(_UNRECORDABLE):
+                # Its idle recording would meet the same error and keep the next call waiting
+                # on it (an RTX 3060's SDXL w1 559 ms, then its own doomed recording).
+                with self._lock:
+                    known.unfit.add(shape)
+                    known.why[shape] = refused[:400]
         loop.eager(loop.steps[1:], tensors, ctx)
         _after(loop, tensors, scope, known, shape)
         row["eager"] = self._queue(
@@ -800,11 +808,17 @@ class _IdleRecording:
         try:
             done = self._record()
         except Exception as error:
-            if isinstance(error, graphs.Yielded) or fault(error) in (Fault.STICKY, Fault.DEVICE):
+            # A step that cannot be recorded (an RTX 3060's SDXL step frees memory inside the
+            # capture: 900 from cuMemFree) is refused here as on a call's path, not a device
+            # fault: one at idle poisoned the executor and failed every next request.
+            if isinstance(error, graphs.Yielded):
+                raise
+            refused = _refusal(error)
+            if refused is None and fault(error) in (Fault.STICKY, Fault.DEVICE):
                 raise
             if isinstance(error, Building) or isinstance(error.__cause__, Building):
                 return False  # a kernel still opens: a later idle period
-            why = _refusal(error) or f"{type(error).__name__}: {error}"
+            why = refused or f"{type(error).__name__}: {error}"
             with self.loops._lock:
                 self.known.unfit.add(shape)
                 self.known.why[shape] = f"its idle recording failed: {why}"[:400]

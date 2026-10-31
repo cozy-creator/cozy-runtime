@@ -34,7 +34,7 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Fault, fault, is_capacity
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 
@@ -337,7 +337,7 @@ class _Recorder:
         self.waiting: dict[tuple[object, ...], int] = {}
         #: per signature its idle measure: host submission, device-busy and (recorded) replay
         #: ms a call
-        self.bound: dict[tuple[object, ...], tuple[float, float, float | None]] = {}
+        self.bound: dict[tuple[object, ...], tuple[float, float | None, float | None]] = {}
         self.binding: Any = None
         #: Native prepared definitions owned by this same component retirement boundary.
         self.prepared: weakref.WeakSet[Any] = weakref.WeakSet()
@@ -417,8 +417,21 @@ UNDECLARED: dict[str, set[str]] = {}
 _CLASSES: dict[type, type] = {}
 
 
-class Yielded(Exception):
-    """An idle capture gives the device back at a region boundary: a command arrived."""
+class _Lagging(Yielded):
+    """A busy measure's device fell `_Idle.lag_ms` behind its host: the region is device-bound."""
+
+
+#: an idle job's ops still queued on the device as its host reaches its next one (`_Idle.meter`):
+#: a command that arrives waits for at most these there
+_QUEUED = 2
+#: how far past its gate a busy measure's device may fall behind its host before it ends
+#: device-bound (`_busy`)
+_LAG_MS = 10.0
+#: a busy measure's events, at most one per this much host time: the lag check costs its host
+#: (and so the measure) nothing it would notice
+_LAG_MARK_S = 0.002
+#: the host's poll while idle work waits on the device (`_Idle.meter`, `_settled`)
+_POLL_S = 0.0002
 
 
 class _Idle:
@@ -427,7 +440,9 @@ class _Idle:
     free room) waits for the next period. `check`, before each torch op of a job (`_yielding`)
     and at each region boundary, yields to a command that arrived: the job ends there, a capture
     discarded, first again next period. The longest stretch between checks is the longest a
-    command waited (v17: 386 ms when it was the whole UNet's capture)."""
+    command waited for the host (v17: 386 ms when it was the whole UNet's capture); `meter`
+    keeps the device as close (a DiT forward queued ahead of the host made a 4090's Anima
+    request wait 0.4 s for it after the yield)."""
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -436,6 +451,44 @@ class _Idle:
         self.last = 0.0
         self.periods = self.yields = self.failures = 0
         self.longest_ms = 0.0
+        #: the running job's ops still queued on the device: each one's event and host time
+        self.queued: deque[tuple[Any, float]] = deque()
+        self.spare: list[Any] = []
+        #: host ms the jobs' ops waited for the device (`meter`)
+        self.metered_ms = 0.0
+        #: in a busy measure, how far (ms) its device may fall behind its host (`_busy`)
+        self.lag_ms: float | None = None
+
+    def meter(self) -> None:
+        """Before a job's next op on the device: wait, yielding, while `_QUEUED` of its ops are
+        queued there. In a busy measure the device runs ahead unmetered instead, and falling
+        `lag_ms` behind ends the measure (`_Lagging`)."""
+        self._settle()
+        if self.lag_ms is not None:
+            if self.queued and (time.perf_counter() - self.queued[0][1]) * 1e3 > self.lag_ms:
+                raise _Lagging
+            return
+        if len(self.queued) < _QUEUED:
+            return
+        began = time.perf_counter()
+        while len(self.queued) >= _QUEUED:
+            self.check()
+            time.sleep(_POLL_S)
+            self._settle()
+        self.metered_ms += (time.perf_counter() - began) * 1e3
+
+    def mark(self, torch: Any) -> None:
+        """A job's op was queued on the current stream."""
+        now = time.perf_counter()
+        if self.lag_ms is not None and self.queued and now - self.queued[-1][1] < _LAG_MARK_S:
+            return
+        event = self.spare.pop() if self.spare else torch.cuda.Event()
+        event.record()
+        self.queued.append((event, now))
+
+    def _settle(self) -> None:
+        while self.queued and self.queued[0][0].query():
+            self.spare.append(self.queued.popleft()[0])
 
     def add(self, job: Callable[[], bool]) -> None:
         with self.lock:
@@ -485,6 +538,7 @@ class _Idle:
                     )
         finally:
             _IDLE.reset(token)
+            self.queued.clear()
             self.longest_ms = max(self.longest_ms, (time.perf_counter() - self.last) * 1e3)
             with self.lock:
                 self.jobs.extend(later)
@@ -505,16 +559,24 @@ IDLE = _Idle()
 @functools.cache
 def _yielding(torch: Any) -> Any:
     """The torch function mode an idle job runs under: before each op, a command that arrived
-    ends the job (`_Idle.check`), so a whole component's capture yields within one op. Its
-    cleanup (`_SETTLING`) never yields; a package that catches the raise meets it at its next op."""
+    ends the job (`_Idle.check`), so a whole component's capture yields within one op, and the
+    device is at most `_QUEUED` ops behind (`_Idle.meter`; nothing runs while a stream
+    captures). Its cleanup (`_SETTLING`) never yields."""
 
     class Yielding(torch.overrides.TorchFunctionMode):  # type: ignore[misc]
         def __torch_function__(
             self, func: Any, types: Any, args: Any = (), kwargs: Any = None
         ) -> Any:
-            if not _SETTLING.get() and (idle := _IDLE.get(None)) is not None:
-                idle.check()
-            return func(*args, **(kwargs or {}))
+            if _SETTLING.get() or (idle := _IDLE.get(None)) is None:
+                return func(*args, **(kwargs or {}))
+            idle.check()
+            metered = torch.cuda.is_initialized() and not torch.cuda.is_current_stream_capturing()
+            if metered:
+                idle.meter()
+            out = func(*args, **(kwargs or {}))
+            if metered and isinstance(out, torch.Tensor) and out.is_cuda:
+                idle.mark(torch)
+            return out
 
     return Yielding
 
@@ -753,7 +815,7 @@ def _receipt(recorder: _Recorder) -> dict[str, Any]:
         "measured": [
             {
                 "submit_ms": round(submit, 3),
-                "busy_ms": round(busy, 3),
+                "busy_ms": None if busy is None else round(busy, 3),
                 "replay_ms": None if replayed is None else round(replayed, 3),
             }
             for submit, busy, replayed in recorder.bound.values()
@@ -1074,13 +1136,19 @@ def _record(
                 warming = _WARMING.set(True)
                 try:
                     with attention_ulysses.observing() as served:
-                        took = time.perf_counter()
+                        took, metered = time.perf_counter(), IDLE.metered_ms
                         eager = call(module, *cargs, **ckwargs)
                         took = (time.perf_counter() - took) * 1e3
                         if not _clonable(torch, eager):
                             _failed(module, recorder, key, "output is not a tensor tree")
                             return True
-                        busy = _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
+                        # A device that kept the warm-up's host waiting half its time is the
+                        # bottleneck: no busy measure, which queues the device ahead.
+                        busy = (
+                            None
+                            if 2 * (IDLE.metered_ms - metered) >= took
+                            else _busy(torch, lambda: call(module, *cargs, **ckwargs), took)
+                        )
                 finally:
                     _WARMING.reset(warming)
                 recorder.bound[key] = (submit, busy, None)
@@ -1295,7 +1363,7 @@ def _no_gain(torch: Any, entry: _Recording, eager: _Timing) -> tuple[str, float 
         entry(leaves, out)
         host = (time.perf_counter() - began) * 1e3
         end.record()
-        end.synchronize()
+        _settled(end)
         costs.append(max(host, float(start.elapsed_time(end))))
     replay, called = sum(costs) / len(costs), max(submit, device)
     if called - replay > abs(costs[0] - costs[1]):
@@ -1303,10 +1371,12 @@ def _no_gain(torch: Any, entry: _Recording, eager: _Timing) -> tuple[str, float 
     return f"no gain: replay {replay:.3f} ms a call against eager {called:.3f} ms", replay
 
 
-def _device_bound(submit: float, busy: float) -> str:
+def _device_bound(submit: float, busy: float | None) -> str:
     """Why a signature never records: the device's work a call takes at least as long as the
     host's submission of it, so the device never waited on the host inside it and a graph
-    saves nothing. "" when launch-bound."""
+    saves nothing (None: the device fell behind its host while measured). "" when launch-bound."""
+    if busy is None:
+        return f"device-bound: the device fell behind its host ({submit:.3f} ms to submit a call)"
     if busy < submit:
         return ""
     return f"device-bound: {busy:.3f} ms of device work a call, {submit:.3f} ms to submit it"
@@ -1353,23 +1423,33 @@ _CALIBRATE = 1 << 22
 _GATE_MS = 20.0
 
 
-def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float:
+def _busy(torch: Any, run: Callable[[], object], gate_ms: float) -> float | None:
     """Device-busy ms of one `run` on the current stream: its launches queue behind a sleep as
     long as its last host submission (`gate_ms`, at most `_GATE_MS`), so the device runs them
     back to back. A host slower than the gate leaves the device waiting inside: the time is then
-    an upper bound, which only ever keeps a region eager. Its waits yield to an arriving command
-    (`_Idle.check`); what it queued stays ordered on its stream."""
+    an upper bound, which only ever keeps a region eager. None once the device falls `_LAG_MS`
+    past the gate behind its host (`_Idle.meter`): device-bound, with no more than that queued
+    for an arriving command to wait on. Its waits yield to one (`_Idle.check`)."""
     device, stream = torch.cuda.current_device(), torch.cuda.current_stream()
     start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    _settled(start)  # the warm-up's last ops ran: the lag is this run's alone
     if device not in _CYCLES:
         start.record(stream)
         torch.cuda._sleep(_CALIBRATE)
         end.record(stream)
         _settled(end)
         _CYCLES[device] = _CALIBRATE / start.elapsed_time(end)
-    torch.cuda._sleep(int(min(gate_ms, _GATE_MS) * _CYCLES[device]))
+    gate = min(gate_ms, _GATE_MS)
+    torch.cuda._sleep(int(gate * _CYCLES[device]))
     start.record(stream)
-    run()
+    IDLE.lag_ms = gate + _LAG_MS
+    try:
+        run()
+    except _Lagging:
+        return None
+    finally:
+        IDLE.lag_ms = None
     end.record(stream)
     _settled(end)
     return float(start.elapsed_time(end))
@@ -1380,7 +1460,7 @@ def _settled(event: Any) -> None:
     while not event.query():
         if (idle := _IDLE.get(None)) is not None:
             idle.check()
-        time.sleep(0.0005)
+        time.sleep(_POLL_S)
 
 
 def _lease(torch: Any, placed: Any, binding: Any) -> Any:

@@ -1367,6 +1367,8 @@ class Memory:
         self._host_cap = max(physical_memory(), 0) // 2
         #: stored pages to pin once the executor is idle (`pin_idle`), never on a request's path
         self._wanted: OrderedDict[tuple[object, ...], _Block] = OrderedDict()
+        #: a wanted page read whole when a command arrived: it registers at the next idle
+        self._filled: tuple[tuple[object, ...], _Block, Tensor] | None = None
         #: each stored page's refills in the running request, and in the last request that
         #: refilled it: the bytes a kept page saves per request, per byte of host RAM it holds
         self._refills: dict[tuple[object, ...], int] = {}
@@ -1842,13 +1844,17 @@ class Memory:
 
     def host_pending(self) -> bool:
         """Whether pages wait for an idle executor to pin them (`pin_idle`)."""
-        return bool(self._wanted) and self._host_tier and self.cuda
+        return (bool(self._wanted) or self._filled is not None) and self._host_tier and self.cuda
 
     def pin_idle(self, waiting: Callable[[], bool]) -> None:
         """Pin the wanted pages while the executor is idle, each read again from the store into
         host RAM and registered once filled, until a command arrives (`waiting`). A command waits
-        at most one staging window's read: the page it interrupted is wanted first at the next
-        idle."""
+        at most one staging window's read or one page's registration: the page it interrupted is
+        wanted first at the next idle, and one it found filled registers then."""
+        if self._filled is not None and not waiting():
+            filled, self._filled = self._filled, None
+            if not self._keep(*filled):
+                return
         while self.host_pending() and not waiting():
             with self.lock:
                 # The page refilled most often per request first: it saves the most bytes per
@@ -1862,7 +1868,9 @@ class Memory:
             if not self._host_room(block.storage_bytes) and not self._displace(page, block):
                 continue  # kept pages are worth at least as much; a smaller wanted one may fit
             tensors = model.source.ck.components[model.source.component].tensors
-            tensor = torch.zeros(block.storage_bytes, dtype=torch.uint8)  # gaps included
+            # Its reads touch it window by window, each a point a command can take over; only
+            # the alignment gaps are zeroed (a whole zero fill was one span no command could).
+            tensor = torch.empty(block.storage_bytes, dtype=torch.uint8)
             offset = 0
             try:
                 for key, roles in block.parts.items():
@@ -1876,18 +1884,34 @@ class Memory:
                             stop = min(start + _HOST_STAGING, part.nbytes)
                             into = tensor[offset + start : offset + stop]
                             tensors.read_into(key, into, role=part.role or None, offset=start)
+                        end = offset + part.nbytes
                         offset += (part.nbytes + 255) // 256 * 256
+                        tensor[end:offset].zero_()
+                tensor[offset:].zero_()
             except Exception:  # a store or fetch failure only leaves this page unpinned
                 continue
-            kept = self._pin(tensor)
-            if kept is None:
+            if waiting():
+                self._filled = (page, block, tensor)
                 return
-            with self.lock:
-                if page not in self._baked and not model.closed and model.identity == page[2]:
-                    self._baked[page] = kept
-                    self._baked_bytes += block.storage_bytes
-                else:
-                    kept.release()
+            if not self._keep(page, block, tensor):
+                return
+
+    def _keep(self, page: tuple[object, ...], block: _Block, tensor: Tensor) -> bool:
+        """`page`'s filled bytes registered and kept, unless the page went meanwhile; False once
+        pinning failed (the tier is off)."""
+        model = block.model
+        if page in self._baked or model.closed or model.identity != page[2]:
+            return True
+        kept = self._pin(tensor)
+        if kept is None:
+            return False
+        with self.lock:
+            if page not in self._baked and not model.closed and model.identity == page[2]:
+                self._baked[page] = kept
+                self._baked_bytes += block.storage_bytes
+            else:
+                kept.release()
+        return True
 
     def _displace(self, page: tuple[object, ...], block: _Block) -> bool:
         """Room for `page` from kept pages refilled less often per request, least often and then
@@ -2194,6 +2218,7 @@ class Memory:
             self._baked.clear()
             self._baked_bytes = 0
             self._wanted.clear()
+            self._filled = None
         for page in pages:
             page.release()
         return max(before - self._figures()[1], 0)

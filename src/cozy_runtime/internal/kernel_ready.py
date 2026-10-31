@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._errors import is_capacity
-from cozy_runtime.author._model import LANDED, Building
+from cozy_runtime.author._model import LANDED, Building, Yielded
 from cozy_runtime.internal import kernel_compile, verify
 
 if TYPE_CHECKING:
@@ -176,6 +176,11 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
         try:
             with _opening(name):
                 value = opener(False)
+        except Yielded:  # an idle job's: no verdict, and the next ask opens it
+            with _LOCK:
+                if _SLOTS.get(name) is slot:
+                    del _SLOTS[name]
+            raise
         except Exception as exc:
             _ended(name, slot, exc)
             if is_capacity(exc):
