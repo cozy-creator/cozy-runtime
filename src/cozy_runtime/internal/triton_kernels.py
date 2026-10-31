@@ -16,8 +16,9 @@ module declares the set (a package's fused plan declared over the Runtime's kern
 package's); the native Runtime wheel ships its own sets and Triton's launcher module per Python
 tag (`PREBUILT`). The builder copies a set's kernels into the cache, as Triton writes them, when
 every key is shipped, and compiles otherwise; the launcher goes in under the key this host gives
-it. So a machine with no C compiler, which Triton needs for its launcher, still serves them, and a
-set that only copies is built before its first request, never served eager meanwhile (`ready`).
+it. So a machine with no C compiler, which Triton needs for its launcher, still serves them. A set
+whose package and Runtime ship it whole is copied in the process that asks (`_copy`), so it is
+built before its first request and never served eager meanwhile (`ready`).
 
 Executor-only: torch and Triton are imported at the top, guarded; their absence is
 `kernels_absent`.
@@ -28,6 +29,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import os
 import sys
 import sysconfig
 from collections.abc import Callable, Iterable
@@ -357,11 +359,42 @@ def _store() -> kernel_cache.Store:
 
 
 def _submit(store: kernel_cache.Store, found: kernel_compile.Job) -> kernel_compile.State:
-    """`kernel_compile.submit`; a set neither built, nor prebuilt in the wheel, nor buildable
-    (Triton has no C compiler here) is absent."""
-    if kernel_compile.status(store, found).state == "ready" or _prebuilt(found) or tools.triton():
+    """`kernel_compile.submit`; a prebuilt set is copied here, in milliseconds, not by a builder
+    process (its start imports torch and Triton: 5.4 s of a cold Qwen-Image 2.1 request's
+    execution plan on a 4090). A set neither built, nor prebuilt, nor buildable (Triton has no
+    C compiler here) is absent."""
+    state = kernel_compile.status(store, found)
+    if state.state == "ready":
+        return state
+    if _prebuilt(found):
+        if state.state == "pending" and _copy(store, found):
+            return kernel_compile.status(store, found)
+        return kernel_compile.submit(store, found)
+    if tools.triton():
         return kernel_compile.submit(store, found)
     raise KernelsUnavailable("kernels_absent", f"{found.key.kernel}: cc not found")
+
+
+@request_path.forbid("kernel copy: triton")
+def _copy(store: kernel_cache.Store, found: kernel_compile.Job) -> bool:
+    """A prebuilt set's build in this process: its package's kernels and the Runtime's launcher
+    into Triton's cache, then the store's entry, under the key's build lock; False when another
+    process holds it."""
+    lock = store.claim(found.key)
+    if lock is None:
+        return False
+    try:
+        root = str(found.spec["shipped"])
+
+        def fill(staging: Path) -> dict[str, object]:
+            _seed(root, found.spec["entries"].values())
+            _seed_launcher()
+            return {"entries": len(found.spec["kernels"]), "prebuilt": True, "compile_ms": 0.0}
+
+        store.publish(found.key, fill)
+    finally:
+        os.close(lock)
+    return True
 
 
 def expect(kernels: TritonKernels, arch: int) -> str:
