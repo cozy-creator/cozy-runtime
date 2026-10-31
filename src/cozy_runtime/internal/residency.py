@@ -1335,9 +1335,6 @@ class Memory:
         #: What the machine leaves this process of the GPU while another program needs it
         #: (`make_room`): its weight pages plus Torch's reserved bytes; None for no limit.
         self.room_limit: int | None = None
-        #: Torch's allocated peak over every request this process served: a call's later phases
-        #: (a decode) need what the same calls needed before (`_floor`)
-        self.torch_peak = 0
         #: a raised room (or none) for the running call, taken at its next pass (`_take_room`)
         self._room_pending: tuple[int | None] | None = None
         self.last_room: dict[str, object] | None = None
@@ -1458,14 +1455,11 @@ class Memory:
             return
         accounted = self._figures()[1]
         if limit is not None and max(limit, self._floor()) < accounted:
-            if not self.requests:
-                # Idle, Torch's cache is nobody's: it goes first. A running call's cache is the
-                # memory its next step or phase allocates from, which another program would take.
-                try:
-                    with varena.no_capture(self.device.index or 0):
-                        torch.cuda.empty_cache()
-                except RuntimeError:
-                    pass  # a capture is in progress: the room bounds its next allocations
+            try:
+                with varena.no_capture(self.device.index or 0):
+                    torch.cuda.empty_cache()
+            except RuntimeError:
+                pass  # a capture is in progress: the room bounds its next allocations
             limit = max(limit, self._floor())
         elif limit is not None and limit < accounted:
             limit = max(limit, self._floor())  # at its floor already: nothing more to give
@@ -1482,16 +1476,16 @@ class Memory:
         return self._figures()[1]
 
     def _floor(self) -> int:
-        """What this process must keep to go on: its call's working set as it, or any call before
-        it here, has peaked (across cut resets; a later phase such as a decode needs what it needed
-        before) or Torch's reserve, whichever is more, its pinned pages, and the streamed blocks in
-        flight; idle, what Torch still holds."""
+        """What this process must keep to go on: its call's working set as it has peaked (across
+        cut resets) or Torch's reserve after its cache went, whichever is more, its pinned pages,
+        and the streamed blocks in flight; idle, what Torch still holds. A later phase that needs
+        more (a decode) takes it from the call's weight pages through the allocation hook."""
         native = self.native.stats() if self.native is not None else {}
         pinned = int(native.get("pinned_bytes", 0))
         allocated, reserved, _ = _torch_bytes(self.device)
         if not self.requests:
             return allocated + pinned
-        peak = max([self.torch_peak, *(request.torch_peak for request in self.requests)])
+        peak = max(request.torch_peak for request in self.requests)
         blocks = (b.allocation_bytes for m in list(self.models.values()) for b in m.groups())
         return max(peak, reserved) + pinned + _STREAMED * max(blocks, default=0)
 
@@ -3345,7 +3339,6 @@ class Memory:
             finally:
                 with self.lock:
                     self.requests.discard(request)
-                    self.torch_peak = max(self.torch_peak, request.torch_peak)
                 _REQUEST.reset(token)
 
     def stats(self) -> dict[str, Any] | None:
