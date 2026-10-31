@@ -88,7 +88,7 @@ def capture(
             torch.utils._python_dispatch._disable_current_modes(),
             vt.graph(
                 graph, pool=pool.handle, stream=stream,
-                reserve_bytes=vt.stats(owner.device)["allocated_peak"],
+                reserve_bytes=domain.working_peak(owner.device),
             ),
         ):
             owner.fork.record(stream)

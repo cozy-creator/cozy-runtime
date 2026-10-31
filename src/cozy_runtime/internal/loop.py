@@ -1396,7 +1396,7 @@ class _Graph:
             control.wait_stream(stream)
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
-                reserve_bytes=vt.stats(self.device.index)["allocated_peak"],
+                reserve_bytes=domain.working_peak(self.device.index or 0),
             ))
             torch.cuda.set_stream(stream)
         except BaseException:

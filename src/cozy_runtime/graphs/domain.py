@@ -43,6 +43,23 @@ def unsupported(torch: Any) -> str:
     )
 
 
+def working_peak(device: int) -> int:
+    """Measured working demand, including eager peaks retained across split-site resets."""
+    from cozy_runtime.internal.execution import catch
+    from cozy_runtime.internal.residency import _REQUEST
+
+    peak = int(vt.stats(device)["allocated_peak"])
+    # Capture preparation may open an idle request inside the still-active serving request.
+    for request in (catch.CURRENT.get(), _REQUEST.get()):
+        if (
+            request is not None
+            and request.memory.cuda
+            and (request.memory.device.index or 0) == device
+        ):
+            peak = max(peak, request.torch_peak)
+    return peak
+
+
 @dataclass(eq=False, slots=True)
 class Pool:
     """A Varena-backed graph-pool token; graphs, tensors and completion fences own backing.
