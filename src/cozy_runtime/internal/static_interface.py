@@ -77,6 +77,7 @@ from cozy_runtime.author._signature import (
     _classify,
     assets_binding,
     assets_payload,
+    described,
 )
 from cozy_runtime.author._walker import is_struct
 from cozy_runtime.internal.canonical import Json
@@ -1489,6 +1490,7 @@ class Registration:
             name=self.name,
             module=self.module.name,
             export=self.fn.name,
+            description=described(ast.get_docstring(self.fn, clean=False)),
             publishes=self.publishes,
             emits_media=self.emits_media,
             weights_outputs=self.weights,
