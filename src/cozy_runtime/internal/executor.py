@@ -3279,7 +3279,9 @@ class Executor:
             held = int(frame.get("held", 0))
             memory.room_target = None if target is None else int(target)
             limit = memory.room_for(memory.room_target, held)
+            before = memory.held()
             memory.make_room(limit)
+            self._room_kept(memory, limit, before)
             if limit is not None and not memory.calls() and limit < memory.held() and self.order:
                 ticket = self.order.ticket(True, "room")
                 threading.Thread(
@@ -3297,12 +3299,26 @@ class Executor:
         try:
             with self.order.turn(ticket):
                 if not memory.calls() and limit < memory.held():
+                    before = memory.held()
                     accel.synchronize(self.torch, self.device_kind)
                     self._release_programs()
                     memory.make_room(limit)
+                    self._room_kept(memory, limit, before)
         except Exception:
             traceback.print_exc()
             sys.stderr.flush()
+
+    def _room_kept(self, memory: Memory, limit: int | None, before: int) -> None:
+        """What this process holds after a room, and why, in `room.json` in its root, where the
+        machine reads it when a give moved less than asked (each reason's bytes)."""
+        reading = memory.room_reading(limit, before)
+        reading["order"] = self.order.holders() if self.order is not None else []
+        path = self.root / "room.json"
+        try:
+            path.with_suffix(".tmp").write_text(json.dumps(reading))
+            path.with_suffix(".tmp").replace(path)
+        except OSError:
+            pass  # the report is evidence only; the room was applied
 
     def _release_programs(self, constructions: Iterable[Executor] | None = None) -> None:
         """Every slot's decoders, graphs and holds go: what pins weight pages besides a call."""
@@ -5361,6 +5377,11 @@ class _Order:
                     self._waited[came] = (now - at) * 1e3
                 self._arrived.clear()
                 self._changed.notify_all()
+
+    def holders(self) -> list[str]:
+        """What holds or waits for the order now (`room.json`)."""
+        with self._changed:
+            return [what for _, what in self._open.values()]
 
     def waiting(self) -> bool:
         """A command arrived beside the idle holder."""

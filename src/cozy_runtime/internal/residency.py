@@ -1516,6 +1516,29 @@ class Memory:
         self._room_pending = None
         self._apply_room(limit)
 
+    def room_reading(self, limit: int | None, before: int) -> dict[str, Any]:
+        """A room's outcome and each reason bytes stay: the call's working set, Torch's cache,
+        pages pinned (a call or a kept program on them), pages still filling, and those that could
+        go but did not (reclaim order)."""
+        allocated, reserved, _, resident = self._reading()
+        native = self.native.stats() if self.native is not None else {}
+        return {
+            "at": time.time(),
+            "target": self.room_target,
+            "limit": limit,
+            "held_before": before,
+            "held": reserved + resident,
+            "floor": self._floor(),
+            "calls": len(self.calls()),
+            "idle_requests": len(self.requests) - len(self.calls()),
+            "torch_allocated": allocated,
+            "torch_cached": reserved - allocated,
+            "pages_resident": resident,
+            "pages_pinned": int(native.get("pinned_bytes", 0)),
+            "pages_filling": max(resident - int(native.get("ready_bytes", resident)), 0),
+            "pages_reclaimable": int(native.get("reclaimable_bytes", 0)),
+        }
+
     def held(self) -> int:
         """Torch's reserve plus this process's weight pages: what a room limits."""
         return self._figures()[1]
