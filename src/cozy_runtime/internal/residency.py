@@ -1335,6 +1335,8 @@ class Memory:
         #: What the machine leaves this process of the GPU while another program needs it
         #: (`make_room`): its weight pages plus Torch's reserved bytes; None for no limit.
         self.room_limit: int | None = None
+        #: a raised room (or none) for the running call, taken at its next pass (`_take_room`)
+        self._room_pending: tuple[int | None] | None = None
         self.last_room: dict[str, object] | None = None
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
@@ -1434,39 +1436,66 @@ class Memory:
             return used, int(torch.mps.driver_allocated_memory()), used
         return 0, 0, 0
 
-    def make_room(self, *, give: int = 0, lift: bool = False) -> None:
-        """Another program needs this GPU (`give`: hold that many bytes less, now), or has given
-        it back (`lift`) (design/vram-yield.md). Torch's unused cache goes first, then weight
-        pages in Varena's reclaim order; never below what the running call holds and has needed
-        (its pinned pages and Torch's peak), so a run streams and is never ended for it. Lifted,
-        it grows back at its next fills. Called on the seam's reading thread: no Memory lock."""
+    def room_for(self, target: int | None, held: int) -> int | None:
+        """The machine's `target` for what the driver charges this process (charged `held` at its
+        reading) as a limit on Torch's reserve plus weight pages: the difference is its context
+        and what neither holds, which no limit takes back. Read when the target arrives."""
+        if target is None or not self.cuda:
+            return None
+        return max(target - max(held - self._figures()[1], 0), 0)
+
+    def make_room(self, limit: int | None) -> None:
+        """What the machine leaves this process of the GPU (design/vram-yield.md; `room_for`),
+        None for no limit. Lower than it holds, it gives at once: Torch's unused cache, then
+        weight pages in Varena's reclaim order, never below what its call has needed and runs on,
+        so a run streams and is never ended for it. Higher, the running call takes it at its next
+        pass (`_take_room`); idle, at once. Called on the seam's reading thread (or an idle
+        executor's turn): no Memory lock."""
         if not self.cuda:
             return
-        index = self.device.index or 0
-        if lift:
-            limit = None
-        elif give:
-            native = self.native.stats() if self.native is not None else {}
-            pinned = int(native.get("pinned_bytes", 0))
-            allocated, _, peak = _torch_bytes(self.device)
-            held = self._figures()[1]
-            # A call keeps what it has needed so far; an idle executor, what it holds now.
-            floor = (peak if self.requests else allocated) + pinned
-            room = held if self.room_limit is None else min(held, self.room_limit)
-            limit = max(room - give, floor)
-            if limit < held:
-                try:
-                    with varena.no_capture(index):
-                        torch.cuda.empty_cache()
-                except RuntimeError:
-                    pass  # a capture is in progress: the room bounds its next allocations
+        accounted = self._figures()[1]
+        if limit is not None and limit < accounted:
+            try:
+                with varena.no_capture(self.device.index or 0):
+                    torch.cuda.empty_cache()
+            except RuntimeError:
+                pass  # a capture is in progress: the room bounds its next allocations
+            limit = max(limit, self._floor())
         else:
-            return
+            raised = limit is None or (self.room_limit is not None and limit > self.room_limit)
+            if raised and self.requests:
+                self._room_pending = (limit,)
+                return
+        self._room_pending = None
+        self._apply_room(limit)
+
+    def held(self) -> int:
+        """Torch's reserve plus this process's weight pages: what a room limits."""
+        return self._figures()[1]
+
+    def _floor(self) -> int:
+        """What this process must keep to go on: its call's working set as it has peaked (across
+        cut resets) or Torch's reserve after its cache went, whichever is more, its pinned pages,
+        and the streamed blocks in flight; idle, what Torch still holds."""
+        native = self.native.stats() if self.native is not None else {}
+        pinned = int(native.get("pinned_bytes", 0))
+        allocated, reserved, _ = _torch_bytes(self.device)
+        if not self.requests:
+            return allocated + pinned
+        peak = max((request.torch_peak for request in self.requests), default=0)
+        blocks = (b.allocation_bytes for m in list(self.models.values()) for b in m.groups())
+        return max(peak, reserved) + pinned + _STREAMED * max(blocks, default=0)
+
+    def _apply_room(self, limit: int | None) -> None:
         self.room_limit = limit
-        make_room = getattr(varena, "make_room", None)
-        reclaimed = make_room(index, limit) if callable(make_room) else 0
-        self.last_room = {"limit": limit, "give": give, "lift": lift,
-                          "reclaimed": reclaimed, "at_ns": time.time_ns()}
+        reclaimed = varena.make_room(self.device.index or 0, limit)
+        self.last_room = {"limit": limit, "reclaimed": reclaimed, "at_ns": time.time_ns()}
+
+    def _take_room(self) -> None:
+        """A pass boundary: a raised room the running call was given takes effect."""
+        pending, self._room_pending = self._room_pending, None
+        if pending is not None:
+            self._apply_room(pending[0])
 
     def room(self, current: Collection[str] = ()) -> Room:
         if self.cuda:
@@ -3225,6 +3254,7 @@ class Memory:
             if not depth:
                 self._declare(model)
             if outer_forward:
+                self._take_room()
                 self._activate_phase(model)
             if depth:
                 return
@@ -3337,6 +3367,9 @@ class Request:
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
         self.peak = 0
+        #: Torch's own allocated peak over the whole request, kept across cut-site resets: the
+        #: least room its call runs in (`Memory._floor`)
+        self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
         self.baked_hits = self.baked_bytes = self.baked_ns = 0
@@ -3355,6 +3388,8 @@ class Request:
         return self.memory._prefetch_queued(self)
 
     def sample(self) -> None:
+        if self.memory.cuda and torch.cuda.is_initialized():
+            self.torch_peak = max(self.torch_peak, _torch_bytes(self.memory.device)[2])
         peak = self.memory._figures()[2]
         if peak > self.peak and self.others:
             peak -= sum(_resident_bytes(b) for m in self.others for b in m.groups())

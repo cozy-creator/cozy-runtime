@@ -1054,6 +1054,11 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        # A single-GPU executor tells the machine just before and after its CUDA context opens:
+        # where the driver names other pids (a container), the one that appears between is its.
+        opening = self.device_kind == "cuda" and self.world == 1
+        if opening:
+            _cuda(self.channel, "opening")
         try:
             accel.initialize(torch, self.device_kind)
             if self.world > 1 and self.device_kind == "cuda":
@@ -1063,6 +1068,8 @@ class Executor:
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
         accel.first_launches(torch, self.device_kind)
+        if opening:
+            _cuda(self.channel, "open")
         if self.device_kind == "cuda" and self.world == 1:
             # The prebuilt 8-bit op opens from here, before any request, beside the weight fill:
             # a component first built mid-request (Klein's on-demand upsampler under a 16-bit
@@ -3240,17 +3247,53 @@ class Executor:
             self.order.wake()  # an idle period may open now (`awaiting_invoke`)
 
     def _room(self, frame: Frame) -> None:
-        """TensorD's `room` (design/vram-yield.md): another program needs this GPU, or has given
-        it back. Taken on the thread that read it, a running call's included. A group's
-        followers serve their own GPUs: rank 0 takes only its own."""
+        """TensorD's `room` (design/vram-yield.md): the GPU bytes this process may hold (`target`,
+        against what the driver charged it, `held`; none: no limit). Taken on the thread that read
+        it, a running call's included. Idle and asked to give, its kept programs (graphs,
+        decoders, holds) go first, in its command order. A group's followers serve their own
+        GPUs: rank 0 takes only its own."""
         memory = self.host.memory
         if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
             return
+        target = frame.get("target")
         try:
-            memory.make_room(give=int(frame.get("give", 0)), lift=bool(frame.get("lift", False)))
+            held = int(frame.get("held", 0))
+            limit = memory.room_for(None if target is None else int(target), held)
+            if limit is not None and not memory.requests and self.order is not None:
+                ticket = self.order.ticket(True, "room")
+                threading.Thread(
+                    target=self._idle_room, args=(memory, limit, ticket), name="room", daemon=True
+                ).start()
+                return
+            memory.make_room(limit)
         except Exception:  # the seam outlives a refused room; the next reading asks again
             traceback.print_exc()
             sys.stderr.flush()
+
+    def _idle_room(self, memory: Memory, limit: int, ticket: int) -> None:
+        """An idle executor's room, in its turn: giving, its kept programs release their pins
+        before its pages go."""
+        assert self.order is not None
+        try:
+            with self.order.turn(ticket):
+                if not memory.requests and limit < memory.held():
+                    accel.synchronize(self.torch, self.device_kind)
+                    self._release_programs()
+                memory.make_room(limit)
+        except Exception:
+            traceback.print_exc()
+            sys.stderr.flush()
+
+    def _release_programs(self, constructions: Iterable[Executor] | None = None) -> None:
+        """Every slot's decoders, graphs and holds go: what pins weight pages besides a call."""
+        for child in self.constructions.values() if constructions is None else constructions:
+            for member in [m for m in child.model_executors or [child] if m.backend is not None]:
+                if member.residency is not None:
+                    member.residency.release()
+                for model in member.backend.models.values():
+                    for _, release in graphs.DECODERS:
+                        release(model.module)
+                    graphs.retire(self.torch, model.module)
 
     def awaiting_invoke(self) -> bool:
         """A prepared request waits for its invoke, which comes next (TensorD's lookahead or its
@@ -4848,13 +4891,7 @@ class Executor:
                     # language model's engine retains its drafter's weights too, and Klein's
                     # drafter slot maps before its upsampler, so an idle Klein refused every
                     # offload and a running call beside it ran out of memory (0.36.0 gate).
-                    for member in members:
-                        if member.residency is not None:
-                            member.residency.release()
-                        for model in member.backend.models.values():
-                            for _, release in graphs.DECODERS:
-                                release(model.module)
-                            graphs.retire(self.torch, model.module)
+                    self._release_programs([child])
                 for member in members:
                     for model in member.backend.models.values():
                         self.memory.load(model.module, command.level)
@@ -5187,6 +5224,12 @@ def main(argv: list[str] | None = None) -> int:
 def _compiling(channel: Channel, state: kernel_compile.State) -> None:
     """A wait on a compiling kernel, told to the machine as the waiting call's stage."""
     _waiting(channel, f"waiting for {state.kernel} compile", state.progress)
+
+
+def _cuda(channel: Channel, phase: str) -> None:
+    """The executor's CUDA context opening or open, told to the machine outside every call."""
+    with contextlib.suppress(SeamError):
+        channel.send({"event": "progress", "request_id": "", "kind": "progress", "cuda": phase})
 
 
 def _waiting(channel: Channel, what: str, fraction: float | None = None) -> None:
