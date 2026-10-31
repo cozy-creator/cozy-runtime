@@ -47,7 +47,7 @@ from tensorfs import varena
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
-from cozy_runtime import graphs
+from cozy_runtime import graphs, stepcache
 from cozy_runtime.author import _loop
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
@@ -222,6 +222,7 @@ class Loops:
         on_step: Callable[[int], object] | None,
         before: Callable[..., object] | None,
         after: Callable[..., object] | None,
+        cache: stepcache.Policy | None = None,
     ) -> None:
         row: dict[str, Any] = {
             "steps": len(steps),
@@ -236,29 +237,52 @@ class Loops:
             ROWS.setdefault(request.id, []).append(row)
         # The loop records its own programs: component region graphs neither replay nor learn
         # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        if cache is not None and _ranks() > 1:  # each rank's verdict would differ
+            row["refusals"].append("step cache: off across ranks (its sums are not all-reduced)")
+            cache = None
         bypass = graphs.BYPASS.set(True)
         try:
-            self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
+            loop = _Loop(step, steps, phases, on_step, before, after)
+            if cache is None:
+                self._run(loop, state, carried, inputs, key, row)
+            else:
+                self._cached(loop, state + carried, inputs, cache, row)
         finally:
             graphs.BYPASS.reset(bypass)
             row["at_ms"]["returned"] = _now()
 
+    def _cached(
+        self,
+        loop: _Loop,
+        mutable: tuple[Any, ...],
+        inputs: tuple[Any, ...],
+        cache: stepcache.Policy,
+        row: dict[str, Any],
+    ) -> None:
+        """A call under a step cache, eagerly: each forward's verdict is read on the host."""
+        row["refusals"].append("step cache: eager")
+        with (
+            torch.inference_mode(False),
+            torch.no_grad(),
+            _owned(mutable) as work,
+            stepcache.running(cache, len(loop.steps)) as run,
+        ):
+            try:
+                loop.eager_all(work + inputs, CURRENT.get())
+            finally:
+                row["cache"] = run.document()
+
     def _run(
         self,
-        step: Callable[..., object],
-        steps: range,
+        loop: _Loop,
         state: tuple[Any, ...],
         carried: tuple[Any, ...],
         inputs: tuple[Any, ...],
-        phases: tuple[Hashable, ...] | None,
         key: Hashable | None,
-        on_step: Callable[[int], object] | None,
-        before: Callable[..., object] | None,
-        after: Callable[..., object] | None,
         row: dict[str, Any],
     ) -> None:
         ctx = CURRENT.get()
-        loop = _Loop(step, steps, phases, on_step, before, after)
+        step, steps, phases = loop.step, loop.steps, loop.phases
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
@@ -522,6 +546,8 @@ class _Loop:
             if ctx is not None:
                 ctx.raise_if_cancelled()
             index.fill_(i)
+            if (cached := stepcache._RUN.get()) is not None:
+                cached.begin(i - self.steps.start)
             _call(self.step, index, tensors, self.phase(i))
             if self.on_step is not None:
                 self.on_step(i)
@@ -532,6 +558,11 @@ class _Loop:
         _once(self.before, tensors)
         self.eager(self.steps, tensors, ctx)
         _once(self.after, tensors)
+
+
+def _ranks() -> int:
+    dist = torch.distributed
+    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
 
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
