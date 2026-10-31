@@ -44,7 +44,7 @@ import inspect
 import json
 import sys
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -882,6 +882,153 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
 
 
 @dataclass(frozen=True, slots=True)
+class HeadNormRope:
+    """A q or k projection's per-head RMSNorm, then RoPE, in one kernel, for an attention a
+    package composes itself (a windowed or dual-stream block `DiTBlock` does not describe).
+
+    Declare it at module scope (`name` names its kernels), install it on the q/k norm modules in
+    `Model.execution_plan` (`install_head_norms`), and call `apply(norm, x, tables)` with
+    `[..., seq, heads, head_dim]` rows and `tables(value)` of the model's rotary operand: it
+    returns the fused rows, or None while eager serves (kernels compiling or absent, another
+    device or dtype), and the caller then runs its own norm and rotary. `rope.rounding` and
+    `rms_rounding` say how the model's eager path rounds (`Rope`, `DiTBlock`); `rows` is the q/k
+    dtype; `weights` the norm weight's."""
+
+    name: str
+    head_dim: int
+    rope: Rope
+    rows: Literal["bf16", "fp16"] = "bf16"
+    weights: Literal["bf16", "fp16", "fp32"] = "bf16"
+    rms_rounding: Literal["twice", "once"] = "twice"
+    affine: bool = True
+    entry: Any = field(init=False, repr=False, compare=False)
+    kernels: TritonKernels = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        rotary = self.rope.rotary or self.head_dim
+        if self.head_dim & (self.head_dim - 1) or rotary > self.head_dim or rotary % 2:
+            raise ValueError(f"{self.name}: rotary {rotary} of head {self.head_dim}")
+        rounding = self.rope.rounding
+        row = "*fp16" if self.rows == "fp16" else "*bf16"
+        entry = _kernels.rope_entry(
+            self.head_dim,
+            rotary,
+            row=row,
+            weights=f"*{self.weights}",
+            interleaved=self.rope.interleaved,
+            weight=self.affine,
+            offset=0,
+            once=self.rms_rounding == "once",
+            round=_kernels.FP32
+            if rounding == "fp32"
+            else _kernels.FP16
+            if self.rows == "fp16"
+            else _kernels.BF16,
+            product=rounding == "product",
+            x32=False,
+        )
+        digest = hashlib.sha256(entry.key.encode()).hexdigest()[:12]
+        name = f"fused.{self.name.lower()[:40]}.head-rope.{digest}"
+        kernels = TritonKernels(name, (entry,), origin=_declaring_module())
+        object.__setattr__(self, "entry", entry)
+        object.__setattr__(self, "kernels", kernels)
+
+    @property
+    def dtype(self) -> Any:
+        return torch.float16 if self.rows == "fp16" else torch.bfloat16
+
+    def tables(self, value: Any) -> tuple[Any, Any, int, int]:
+        """The model's rotary operand as the kernel reads it (fp32 `(cos, sin, strides)`): a
+        complex `[seq, rotary/2]` table, or a `(cos, sin)` pair (`Rope.interleaved` says which
+        layout). Build it once per sequence layout and pass it to every `apply`."""
+        return _kernels.rope_tables(
+            value, interleaved=self.rope.interleaved, rotary=self.rope.rotary or self.head_dim
+        )
+
+    def apply(self, norm: Any, x: Any, tables: tuple[Any, Any, int, int]) -> Any:
+        """`norm` then RoPE of `x` (`[..., seq, heads, head_dim]`), fused; None: eager serves."""
+        site = vars(norm).get("_cozy_head_rope")
+        launch = None if site is None or site.layout is not self else site.switch.launch
+        if launch is None or x.dim() < 3 or int(x.shape[-1]) != self.head_dim:
+            return None
+        weight = getattr(norm, "weight", None) if self.affine else None
+        if not _cuda(self.dtype, x) or (weight is not None and not weight.is_cuda):
+            return None
+        seq, heads = int(x.shape[-3]), int(x.shape[-2])
+        rows = x.reshape(-1, seq, heads, self.head_dim)
+        eps = site.eps
+        out = _kernels.head_norm_rope(launch, self.entry, rows, weight, eps, tables, self.dtype)
+        return out.view(x.shape)
+
+
+@dataclass(slots=True)
+class _HeadSite:
+    layout: HeadNormRope
+    switch: _Switch
+    eps: float
+
+
+def install_head_norms(plan: Plan, layout: HeadNormRope, norms: Iterable[Any]) -> str:
+    """Install `layout` on the q/k norm modules `norms` on `plan.device`: the plan's identity, or
+    "" when eager serves (no CUDA sm80+, kernels absent or failed, or a norm that is not the
+    declaration; reported). Never waits for the kernels' compile."""
+    device = torch.device(plan.device)
+    document: dict[str, object] = {"head_norms": layout.name}
+
+    def report(reason: str = "", **counts: int) -> str:
+        outcome = {**document, "applied": not reason, **({"reason": reason} if reason else counts)}
+        plan.report(layout.kernels.name, outcome)
+        said = json.dumps(outcome, sort_keys=True)
+        print(f"[cozy] {layout.kernels.name}: {said}", file=sys.stderr)
+        return ""
+
+    if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
+        return report(f"fused head norms serve CUDA sm80+, not {device}")
+    found = [(f"{index}.{type(norm).__qualname__}", norm) for index, norm in enumerate(norms)]
+    if not found:
+        return report("no q/k norm")
+    weights = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[layout.weights]
+    switch = _Switch()
+    sites = []
+    for path, norm in found:
+        weight = getattr(norm, "weight", None)
+        affine = weight is not None and tuple(weight.shape) == (layout.head_dim,)
+        if affine != layout.affine or (affine and weight.dtype is not weights):
+            declared = f"{layout.head_dim}-wide {layout.weights} RMSNorm"
+            return report(f"{path}: not the {declared} declared")
+        try:
+            sites.append((norm, _HeadSite(layout, switch, _eps(norm, path))))
+        except _Mismatch as exc:
+            return report(str(exc))
+    for norm, site in sites:
+        norm._cozy_head_rope = site
+
+    def activate(launch: Launch) -> None:
+        switch.launch = launch
+        report(norms=len(sites))
+
+    try:
+        if plan.when_ready is None:
+            activate(plan.load(layout.kernels))
+        elif not plan.when_ready(layout.kernels, activate):
+            report("compiling; fused from the next request on")
+    except KernelsUnavailable as exc:
+        if exc.code == "kernels_corrupt":
+            raise
+        for norm, _ in sites:
+            del norm._cozy_head_rope
+        return report(f"{exc.code}: {exc}")
+    encoded = json.dumps(
+        {"kernels": layout.kernels.identity, "name": layout.name,
+         "head_dim": layout.head_dim, "rows": layout.rows, "weights": layout.weights,
+         "rope": [layout.rope.interleaved, layout.rope.rotary, layout.rope.rounding],
+         "rms_rounding": layout.rms_rounding, "affine": layout.affine},
+        sort_keys=True, separators=(",", ":"),
+    ).encode()  # fmt: skip
+    return "sha256:" + hashlib.sha256(b"cozy.fusion.head-norm-rope\0" + encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class LoneFrame:
     """A video VAE decoding one image frame, `[batch, channels, 1, height, width]` with no frame
     cache (Diffusers' Wan and Qwen-Image VAEs). `conv`, its causal convolution (a Conv3d, or the
@@ -989,10 +1136,12 @@ __all__ = [
     "ChannelNorm",
     "DiTBlock",
     "GatedMLP",
+    "HeadNormRope",
     "LoneFrame",
     "Modulation",
     "Rope",
     "install",
+    "install_head_norms",
     "install_lone_frame",
     "install_norms",
 ]

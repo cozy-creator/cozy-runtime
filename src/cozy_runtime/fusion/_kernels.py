@@ -497,6 +497,48 @@ def rope_tables(value: Any, *, interleaved: bool, rotary: int) -> tuple[Any, Any
     return cos, sin, int(cos.stride(-2)), 2 if repeated else 1
 
 
+def rope_entry(
+    head_dim: int,
+    rotary: int,
+    *,
+    row: str,
+    weights: str,
+    interleaved: bool,
+    weight: bool,
+    offset: int,
+    once: bool,
+    round: int,
+    product: bool,
+    x32: bool,
+) -> TritonEntry:
+    """`head_norm_rope_kernel`'s entry: `row` the rows' pointer type, `weights` the norm weight's;
+    `x32`: x is fp32 (a processor that normalizes in fp32)."""
+    constexprs = {
+        "HEAD_DIM": head_dim,
+        "ROTARY": rotary,
+        "HEADS": ROPE_HEADS,
+        "INTERLEAVED": int(interleaved),
+        "WEIGHT": int(weight),
+        "OFFSET": offset if weight else 0,
+        "ONCE": int(once and weight),
+        "ROUND": round,
+        "PRODUCT": int(product),
+        "X32": int(x32),
+    }
+    return _entry(
+        head_norm_rope_kernel,
+        constexprs,
+        _ROPE_WARPS,
+        ("x_ptr", "out_ptr"),
+        x_ptr="*fp32" if x32 else row,
+        out_ptr=row,
+        weight_ptr=weights,
+        cos_ptr="*fp32",
+        sin_ptr="*fp32",
+        eps="fp32",
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Entries:
     """The entries one declared block layout launches."""
@@ -583,29 +625,18 @@ def entries(
     def rope(x32: bool) -> TritonEntry | None:
         if rotary is None:
             return None
-        constexprs = {
-            "HEAD_DIM": head_dim,
-            "ROTARY": rotary,
-            "HEADS": ROPE_HEADS,
-            "INTERLEAVED": int(interleaved),
-            "WEIGHT": int(qk_weight),
-            "OFFSET": offset if qk_weight else 0,
-            "ONCE": int(once and qk_weight),
-            "ROUND": round,
-            "PRODUCT": int(product),
-            "X32": int(x32),
-        }
-        return _entry(
-            head_norm_rope_kernel,
-            constexprs,
-            _ROPE_WARPS,
-            ("x_ptr", "out_ptr"),
-            x_ptr="*fp32" if x32 else row,
-            out_ptr=row,
-            weight_ptr=weights,
-            cos_ptr="*fp32",
-            sin_ptr="*fp32",
-            eps="fp32",
+        return rope_entry(
+            head_dim,
+            rotary,
+            row=row,
+            weights=weights,
+            interleaved=interleaved,
+            weight=qk_weight,
+            offset=offset,
+            once=once,
+            round=round,
+            product=product,
+            x32=x32,
         )
 
     swiglu = ("gate_ptr", "up_ptr", "out_ptr", "n_cols", "stride_gate", "stride_up", "stride_out")
