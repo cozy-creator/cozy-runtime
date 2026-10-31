@@ -2541,7 +2541,9 @@ class Memory:
                     if region is not None and region.resident:
                         held += (size + g - 1) // g * g
         free, total = (int(n) for n in torch.cuda.mem_get_info(self.device))
-        allocated, reserved, _ = _torch_bytes(self.device)
+        allocated, reserved, peak = _torch_bytes(self.device)
+        if request is not None:
+            request.reset_peak()  # each pass's own allocated peak (`pass_peak_bytes`)
         resident = int(self.native.stats()["resident_bytes"])
         budget = total - max(total - free - reserved - resident, 0) - weights - _RESERVE
         planned = self._split_budget
@@ -2553,6 +2555,9 @@ class Memory:
             return  # its activations already fit beside its weights; something else streams
         replan = {
             "pass_reserved_bytes": reserved,
+            # The pass's allocated peak: what Torch held beyond it is cached slack the weights
+            # could have had (a split's measuring pass resets the peak inside it).
+            "pass_peak_bytes": peak,
             "live_bytes": allocated,
             "weights_bytes": weights,
             "held_bytes": held,
