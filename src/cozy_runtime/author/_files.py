@@ -283,28 +283,34 @@ class VideoFile(File):
     def read(
         self,
         *,
+        start: float | Fraction | None = None,
         end: float | Fraction | None = None,
         fps: float | Fraction | None = None,
         audio: bool = True,
     ) -> DecodedVideo:
-        """Every frame starting before `end` and the soundtrack cut at `end`.
+        """Every frame showing from `start` to before `end`, and the soundtrack cut at both.
 
-        `end` counts seconds from the first frame; the last frame's duration is clipped to
-        it. `fps` maps the frames onto a constant clock starting at 0: each frame shows until
-        the next starts, rounded to the nearest slot, and a repeated frame is the same bytes.
+        `start` and `end` count seconds from the first frame. The first frame begins at
+        `start` (the one showing then, its start clipped) and the last frame's duration is
+        clipped to `end`; the soundtrack starts and ends at the exact samples. The decode
+        seeks to the keyframe before `start`, and frames before it are never converted.
+        `fps` maps the frames onto a constant clock starting at the first: each frame shows
+        until the next starts, rounded to the nearest slot, and a repeated frame is the same
+        bytes.
         """
-        return self._reads().video(self, end=end, fps=fps, audio=audio)
+        return self._reads().video(self, start=start, end=end, fps=fps, audio=audio)
 
     def stream(
         self,
         *,
+        start: float | Fraction | None = None,
         end: float | Fraction | None = None,
         audio: bool = True,
         pictures: bool = True,
     ) -> DecodedMediaStream:
-        """Time-ordered frames and PCM bounded by `end`; `pictures=False` reads only the
-        soundtrack, without decoding a picture."""
-        return self._reads().stream(self, end=end, audio=audio, pictures=pictures)
+        """Time-ordered frames and PCM from `start` to `end`, as `read` bounds them;
+        `pictures=False` reads only the soundtrack, without decoding a picture."""
+        return self._reads().stream(self, start=start, end=end, audio=audio, pictures=pictures)
 
 
 @dataclass(frozen=True, slots=True)
