@@ -46,14 +46,15 @@ def sets(package: str = "") -> list[tuple[TritonKernels, int]]:
     `package` declares when imported, for every row."""
     if package:
         import_module(package)  # its sets declare at import, as an executor's start does
-        own = sorted((k.name, k) for k in _SETS.values() if triton_kernels.home(k) == package)
-        return [(kernels, sm) for _, kernels in own if kernels.entries for sm in sorted(arch.ROWS)]
+        declared = [k for k in _SETS.values() if triton_kernels.home(k) == package and k.entries]
+        rows = sorted(arch.ROWS)
+        return [(k, sm) for k in sorted(declared, key=lambda k: k.name) for sm in rows]
     found: dict[tuple[str, int], TritonKernels] = {}
     for sm in sorted(arch.ROWS):
         row = arch.row(sm)
         extra = [attention_sol_fa4.KERNELS] if row.family == arch.TCGEN05 else []
-        own = (*machine_kernels.triton_sets(row), lora_bake.KERNELS, lm.KERNELS, moe.KERNELS)
-        for kernels in (*own, *extra):
+        runtime = (*machine_kernels.triton_sets(row), lora_bake.KERNELS, lm.KERNELS, moe.KERNELS)
+        for kernels in (*runtime, *extra):
             if kernels.entries:
                 found[(kernels.name, sm)] = kernels
     return [(kernels, sm) for (_, sm), kernels in sorted(found.items())]
