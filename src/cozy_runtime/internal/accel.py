@@ -526,33 +526,6 @@ def drain(torch: Any, kind: str) -> None:
 #: Torch's synchronizing release per VAE tensor (+300 ms, session 40829742644).
 #: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
 ALLOCATOR = "backend:native,expandable_segments:False,max_split_size_mb:1024"
-#: Inside a CUDA capture Torch must not return memory: a refused cudaMalloc there first frees
-#: the capture pool's oversize cached blocks (the path `max_split_size_mb` turns on), and that
-#: cudaFree ends the capture (cr-228: 900 from cuMemFree on every SDXL whole call on an RTX
-#: 3060, one free in the capture, no GC or Runtime release). For a capture's span every block
-#: splits, so the pool serves from what it holds, and a capture that does not fit is refused as
-#: out of memory. Torch resets an unnamed size limit to none; the others keep their values.
-CAPTURE_ALLOCATOR = "expandable_segments:False"
-SPLIT_ALLOCATOR = "max_split_size_mb:1024"
-_CAPTURES = [0]
-_CAPTURES_LOCK = threading.Lock()
-
-
-@contextmanager
-def capture_allocation(torch: Any) -> Iterator[None]:
-    """Torch's allocator for a CUDA capture's span (`CAPTURE_ALLOCATOR`); nested and
-    concurrent captures share it until the last ends."""
-    with _CAPTURES_LOCK:
-        _CAPTURES[0] += 1
-        if _CAPTURES[0] == 1:
-            torch._C._accelerator_setAllocatorSettings(CAPTURE_ALLOCATOR)
-    try:
-        yield
-    finally:
-        with _CAPTURES_LOCK:
-            _CAPTURES[0] -= 1
-            if not _CAPTURES[0]:
-                torch._C._accelerator_setAllocatorSettings(SPLIT_ALLOCATOR)
 
 
 def initialize(torch: Any, kind: str) -> None:
@@ -694,6 +667,35 @@ def release_cached(torch: Any, kind: str) -> None:
         row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
         row[0] += 1
         row[1] += freed
+
+
+#: Inside a CUDA capture Torch must not return memory: a refused cudaMalloc there first frees
+#: the capture pool's oversize cached blocks (the path `max_split_size_mb` turns on), and that
+#: cudaFree ends the capture (cr-228: 900 from cuMemFree on every SDXL whole call on an RTX
+#: 3060, one free in the capture, no GC or Runtime release). For a capture's span every block
+#: splits, so the pool serves from what it holds, and a capture that does not fit is refused as
+#: out of memory. Torch resets an unnamed size limit to none; the others keep their values.
+CAPTURE_ALLOCATOR = "expandable_segments:False"
+SPLIT_ALLOCATOR = "max_split_size_mb:1024"
+_CAPTURES = [0]
+_CAPTURES_LOCK = threading.Lock()
+
+
+@contextmanager
+def capture_allocation(torch: Any) -> Iterator[None]:
+    """Torch's allocator for a CUDA capture's span (`CAPTURE_ALLOCATOR`); nested and
+    concurrent captures share it until the last ends."""
+    with _CAPTURES_LOCK:
+        _CAPTURES[0] += 1
+        if _CAPTURES[0] == 1:
+            torch._C._accelerator_setAllocatorSettings(CAPTURE_ALLOCATOR)
+    try:
+        yield
+    finally:
+        with _CAPTURES_LOCK:
+            _CAPTURES[0] -= 1
+            if not _CAPTURES[0]:
+                torch._C._accelerator_setAllocatorSettings(SPLIT_ALLOCATOR)
 
 
 def completion_event(torch: Any, kind: str) -> Any:
