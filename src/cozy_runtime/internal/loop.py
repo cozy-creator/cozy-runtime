@@ -32,6 +32,7 @@ from __future__ import annotations
 import bisect
 import ctypes
 import gc
+import hashlib
 import sys
 import threading
 import time
@@ -99,6 +100,30 @@ _CAPTURE_ERRORS = range(900, 909)
 _UNRECORDABLE = "the step cannot be recorded"
 #: request id -> its loops, for the run record (`execution.loops`)
 ROWS: dict[str, list[dict[str, Any]]] = {}
+
+
+# Temporary xs-138 SDXL diagnostic. Hashes synchronize D2H copies; never use these runs for timing.
+_NUMERIC_DIAGNOSTIC: ContextVar[dict[str, Any] | None] = ContextVar("xs138_numeric_boundaries", default=None)
+
+
+def _numeric_snapshot(name: str, tensors: tuple[Any, ...], positions: Iterable[int]) -> None:
+    record = _NUMERIC_DIAGNOSTIC.get()
+    if record is None or name in record["phases"]:
+        return
+    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("numerical boundary snapshot must run outside CUDA capture")
+    rows = []
+    for position in positions:
+        value = tensors[position]
+        if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+            raise RuntimeError("numerical boundary snapshot requires dense tensor inputs")
+        # Copy first: contiguous conversion and hashing happen on CPU, without a GPU clone.
+        host = value.detach().to(device="cpu", copy=True).contiguous()
+        raw = host.reshape(-1).view(torch.uint8).numpy().tobytes()
+        rows.append({"position": position, "type": type(value).__name__, "dtype": str(value.dtype),
+                     "shape": list(value.shape), "stride": list(value.stride()), "bytes": len(raw),
+                     "sha256": hashlib.sha256(raw).hexdigest()})
+    record["phases"][name] = rows
 
 
 def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], phase: Any) -> None:
@@ -237,11 +262,24 @@ class Loops:
             ROWS.setdefault(request.id, []).append(row)
         # The loop records its own programs: component region graphs neither replay nor learn
         # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        diagnostic = None
+        if isinstance(key, tuple) and key and key[0] == "sdxl.euler":
+            if len(state) != 2 or len(carried) != 2:
+                raise RuntimeError("SDXL diagnostic expected latents/image state and prompt/pooled carried tensors")
+            diagnostic = {"schema": "xs138.sdxl.boundary-bytes/1", "diagnostic_only": True,
+                          "state_count": len(state), "carried_count": len(carried), "phases": {}}
+            row["numeric_boundaries"] = diagnostic
+        probe = _NUMERIC_DIAGNOSTIC.set(diagnostic)
         bypass = graphs.BYPASS.set(True)
         try:
+            # SDXL image/prompt/pooled are empty output slots here: do not read their uninitialized bytes.
+            _numeric_snapshot("original_inputs", state + carried + inputs,
+                              (0, *range(len(state) + len(carried), len(state) + len(carried) + len(inputs))))
             self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
+            _numeric_snapshot("returned_latents_and_decode", state + carried + inputs, range(len(state)))
         finally:
             graphs.BYPASS.reset(bypass)
+            _NUMERIC_DIAGNOSTIC.reset(probe)
             row["at_ms"]["returned"] = _now()
 
     def _run(
@@ -523,7 +561,13 @@ class _Loop:
             if ctx is not None:
                 ctx.raise_if_cancelled()
             index.fill_(i)
+            diagnostic = _NUMERIC_DIAGNOSTIC.get()
+            if diagnostic is not None and i == self.steps.start:
+                _numeric_snapshot("first_eager_step_inputs", tensors,
+                                  (0, *range(diagnostic["state_count"], len(tensors))))
             _call(self.step, index, tensors, self.phase(i))
+            if diagnostic is not None and i == self.steps.start:
+                _numeric_snapshot("first_eager_step_output", tensors, (0,))
             if self.on_step is not None:
                 self.on_step(i)
         if index.is_cuda:
