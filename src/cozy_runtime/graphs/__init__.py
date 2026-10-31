@@ -1013,7 +1013,7 @@ def _replay(
         # do not fit, so drain and retire it before the eager path allocates those outputs.
         recorder.finish()
         recorder.drop()
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         return _EAGER
     try:
         began = time.perf_counter()
@@ -1026,7 +1026,7 @@ def _replay(
         del out
         recorder.finish()
         recorder.drop()
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         _refused(recorder, placed, f"its weights cannot all be resident at once ({exc})")
         return _EAGER
     try:

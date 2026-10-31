@@ -640,7 +640,7 @@ def _record_first(
                     loading.callback(hold.release)  # the recording's bindings retain them
             _lap("load")
             recording._prepare((*mutable, counter))
-            torch.cuda.empty_cache()
+            vt.trim(torch.cuda.current_device())
             _lap("prepare")
             with recording.capturing():
                 parts, blocks = _record_resident(
@@ -657,7 +657,7 @@ def _record_first(
         _drop_stages(recording)
         recording.close()
         gc.collect()
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         if (why := _refusal(failure)) is None:
             raise failure
         return None, why
@@ -693,7 +693,7 @@ def _record(
         why = None
         try:
             recording._prepare((*mutable, counter))
-            torch.cuda.empty_cache()
+            vt.trim(torch.cuda.current_device())
             _lap("prepare")
             began = time.perf_counter()
             ctx.raise_if_cancelled()
@@ -715,7 +715,7 @@ def _record(
             _drop_stages(recording)
             recording.close()
             gc.collect()
-            torch.cuda.empty_cache()
+            vt.trim(torch.cuda.current_device())
             _back(work, tensors)  # the eager rest runs on the caller's tensors
             loop.eager(rest, work + tensors[len(work) :], ctx)
             _once(loop.after, work + tensors[len(work) :])
@@ -768,7 +768,7 @@ def _record_whole(
     failure: BaseException | None = None
     try:
         recording._prepare((*mutable, counter))
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         _lap("prepare")
         _yield_point()
         with recording.capturing():
@@ -800,7 +800,7 @@ def _record_whole(
         _drop_stages(recording)
         recording.close()
         gc.collect()
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         raise failure
     stages = parts[0][1] - parts[0][0]
     return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
