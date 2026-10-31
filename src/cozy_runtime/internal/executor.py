@@ -3265,10 +3265,12 @@ class Executor:
 
     def _room(self, frame: Frame) -> None:
         """TensorD's `room` (design/vram-yield.md): the GPU bytes this process may hold (`target`,
-        against what the driver charged it, `held`; none: no limit). Taken on the thread that read
-        it, a running call's included. Idle and asked to give, its kept programs (graphs,
-        decoders, holds) go first, in its command order. A group's followers serve their own
-        GPUs: rank 0 takes only its own."""
+        against what the driver charged it, `held`; none: no limit). Taken at once on the thread
+        that read it, a running call's included: an idle executor's unpinned pages go here too,
+        never behind its idle work (riful/theresia: a game waited 2-3 s behind host pages pinning
+        after a call). Only if they cannot meet it do its kept programs (graphs, decoders, holds)
+        release their pins, in its command order. A group's followers serve their own GPUs: rank
+        0 takes only its own."""
         memory = self.host.memory
         if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
             return
@@ -3277,25 +3279,23 @@ class Executor:
             held = int(frame.get("held", 0))
             memory.room_target = None if target is None else int(target)
             limit = memory.room_for(memory.room_target, held)
-            if limit is not None and not memory.requests and self.order is not None:
+            memory.make_room(limit)
+            if limit is not None and not memory.requests and limit < memory.held() and self.order:
                 ticket = self.order.ticket(True, "room")
                 threading.Thread(
                     target=self._idle_room, args=(memory, limit, ticket), name="room", daemon=True
                 ).start()
-                return
-            memory.make_room(limit)
         except Exception:  # the seam outlives a refused room; the next reading asks again
             traceback.print_exc()
             sys.stderr.flush()
 
     def _idle_room(self, memory: Memory, limit: int, ticket: int) -> None:
-        """An idle executor's room, in its turn: its unpinned pages go first; only if they cannot
-        meet it do its kept programs (graphs, decoders, holds) release their pins, so its next
-        call stays a native replay when they can."""
+        """An idle executor's room its unpinned pages could not meet, in its turn: its kept
+        programs (graphs, decoders, holds) release their pins and their pages go, so its next call
+        stays a native replay whenever the pages alone can."""
         assert self.order is not None
         try:
             with self.order.turn(ticket):
-                memory.make_room(limit)
                 if not memory.requests and limit < memory.held():
                     accel.synchronize(self.torch, self.device_kind)
                     self._release_programs()
