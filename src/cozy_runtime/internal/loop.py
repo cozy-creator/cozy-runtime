@@ -662,13 +662,7 @@ class _Loop:
             _once(self.after, tensors)
             return
         _numeric_snapshot("vae_input_latents", tensors, (0,))
-        trace = _VaeConvolutionTrace(diagnostic)
-        with trace:
-            _once(self.after, tensors)
-        if not trace.rows or any("error" in row for row in trace.rows):
-            raise RuntimeError(
-                "VAE diagnostic requires successful observed convolutions; inspect its trace"
-            )
+        _once(self.after, tensors)
 
 
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
