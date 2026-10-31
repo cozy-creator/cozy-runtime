@@ -70,7 +70,7 @@ import tensorfs.varena
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime import graphs, weights_store
+from cozy_runtime import graphs, stepcache, weights_store
 from cozy_runtime.author import ModelRegistry, _split, describe
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
@@ -1972,7 +1972,7 @@ class Executor:
             for name, report in list(reports.items())
             if report.get("applied")
         }
-        return " ".join(sorted(applied)) or "eager"
+        return " ".join([*sorted(applied), stepcache.verdict()]).strip() or "eager"
 
     def _model_classes(self) -> list[type[Model[Any]]]:
         """The classes the package's constructed Model slots declare, wherever they are
