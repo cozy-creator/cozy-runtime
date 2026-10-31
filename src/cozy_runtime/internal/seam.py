@@ -421,7 +421,8 @@ class Mux:
     """One seam shared by every thread of the process. Whoever needs a frame reads the next
     one and routes it: an answer to the request waiting on its `seq`, a `cancel` to its call's
     mark and to `cancelled`, a frame that may carry a capability (`SUPPLYING`) to `bearer` as it
-    is read (a `capability` frame goes nowhere else), anything else to the commands, in order. No
+    is read (a `capability` frame goes nowhere else), a `room` to `room` as it is read (a running
+    call takes it at once), anything else to the commands, in order. No
     reader thread exists, so a process that has served no call stays single-threaded and
     forkable (`zygote`)."""
 
@@ -430,9 +431,10 @@ class Mux:
         channel: Channel,
         bearer: Callable[[Frame], None] = _nothing,
         cancelled: Callable[[str], None] = _nothing,
+        room: Callable[[Frame], None] = _nothing,
     ) -> None:
         self.channel = channel
-        self._bearer, self._cancelled = bearer, cancelled
+        self._bearer, self._cancelled, self._room = bearer, cancelled, room
         self._seq = 0
         self._asked: dict[int, _Asked] = {}
         self._commands: deque[Frame] = deque()
@@ -560,6 +562,8 @@ class Mux:
             self._cancelled(str(frame.get("request_id", "")))
         elif frame.get("cmd") == "capability":
             self._bearer(frame)
+        elif frame.get("cmd") == "room":
+            self._room(frame)
         else:
             if frame.get("cmd") in SUPPLYING:
                 self._bearer(frame)
