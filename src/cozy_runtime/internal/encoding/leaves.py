@@ -247,7 +247,11 @@ def _native_leaf_class(torch: ModuleType) -> type:
                 # serves (`int8_linear.quantize` declines so few rows).
                 return ops.linear(torch, cast, data, scale, bias, out_dtype)
             if prequantized is None or prequantized.provider != self.provider:
-                prequantized = shared_operand(x, self.provider, lambda: ops.quantize(torch, cast))
+                capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
+                sibling = None if capturing else self
+                prequantized = shared_operand(
+                    x, self.provider, lambda: ops.quantize(torch, cast), sibling
+                )
             if prequantized is not None:
                 return ops.gemm(torch, prequantized, data, scale, bias, out_dtype)
             return ops.linear(torch, cast, data, scale, bias, out_dtype)
@@ -523,8 +527,10 @@ def _w4a8_leaf_class(torch: ModuleType) -> type:
                 out_dtype = torch.get_autocast_dtype(x.device.type)
                 cast = x.to(out_dtype)
             if prequantized is None or prequantized.provider != INT8_CONVROT:
+                capturing = x.is_cuda and torch.cuda.is_current_stream_capturing()
+                sibling = None if capturing else self
                 prequantized = shared_operand(
-                    x, INT8_CONVROT, lambda: int8_linear.quantize(torch, cast)
+                    x, INT8_CONVROT, lambda: int8_linear.quantize(torch, cast), sibling
                 )
             if prequantized is not None:
                 return w4a8_linear.gemm(torch, prequantized, self.weights(), self.bias, out_dtype)

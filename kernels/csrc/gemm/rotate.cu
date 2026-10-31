@@ -268,6 +268,19 @@ __device__ __forceinline__ void apply_swiglu(const T* up_row, int tile, int K,
     }
 }
 
+// The same on a row's [up | gate] halves: `v` holds the up tile, `gate_row` the gate.
+template <typename T>
+__device__ __forceinline__ void apply_swiglu_halves(const T* gate_row, int tile, int K,
+                                                    float (&v)[kLaneValues]) {
+    float g[kLaneValues];
+    load_tile(gate_row, tile, K, g);
+#pragma unroll
+    for (int r = 0; r < kLaneValues; ++r) {
+        const float silu = as_float(from_float<T>(__fdiv_rn(g[r], 1.f + expf(-g[r]))));
+        v[r] = as_float(from_float<T>(silu * v[r]));
+    }
+}
+
 // The TMA GEMMs (wgmma, tcgen05, block-scaled mma.sync's fp8) launch as programmatic dependents
 // of this kernel: they start their prologue as soon as every block here has begun, and wait
 // for this grid before reading. Before any other kernel the signal does nothing.
@@ -288,11 +301,14 @@ __global__ void __launch_bounds__(1024) quantize_kernel(
     float v[kLaneValues];
     float amax = 0.f;
     // A gated row is twice the quantized width: its hidden half, then its gate half.
-    const bool gated = kPrologue && prologue.activation == kActSitu;
+    const bool halves = kPrologue && prologue.activation == kActSwiglu && prologue.up == nullptr;
+    const bool gated = kPrologue && (prologue.activation == kActSitu || halves);
     const T* in = x + int64_t(live ? row : 0) * (gated ? 2 * int64_t(K) : K);
     load_tile(in, tile, live ? K : 0, v);
     if constexpr (kPrologue) {
-        if (gated)
+        if (halves)
+            apply_swiglu_halves(in + K, tile, live ? K : 0, v);
+        else if (gated)
             apply_situ(in + K, tile, live ? K : 0, v);
         else if (prologue.activation == kActSwiglu)
             apply_swiglu(static_cast<const T*>(prologue.up) + int64_t(live ? row : 0) * K, tile,
