@@ -95,7 +95,10 @@ def _key(
 
 
 def _name(fn: Callable[[Any], Any]) -> str:
-    return str(getattr(fn, "__qualname__", type(fn).__qualname__))
+    """The op's module and qualified name: two modules' same-named ops are two ops (H3's dense
+    and sparse `_Heads` shared one pair of measured windows)."""
+    owner = fn if hasattr(fn, "__qualname__") else type(fn)
+    return f"{owner.__module__}.{owner.__qualname__}"
 
 
 def _step(length: int, cut: Cut, count: int) -> int:
