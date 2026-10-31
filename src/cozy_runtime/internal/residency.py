@@ -1495,14 +1495,14 @@ class Memory:
                 )
             return
         accounted = self._figures()[1]
-        if limit is not None and max(limit, self._floor()) < accounted:
+        if limit is not None and max(limit, self._room_floor()) < accounted:
             # A call's cache is its working set: emptied, another program takes it at once and
             # the call's next step finds the card full (sieg 23082: out of memory mid-step).
             if not self.requests:
                 self._release_cache()
-            limit = max(limit, self._floor())
+            limit = max(limit, self._room_floor())
         elif limit is not None and limit < accounted:
-            limit = max(limit, self._floor())  # at its floor already: nothing more to give
+            limit = max(limit, self._room_floor())  # at its floor already: nothing more to give
         else:
             raised = limit is None or (self.room_limit is not None and limit > self.room_limit)
             if raised and self.requests:
@@ -1511,11 +1511,36 @@ class Memory:
         self._room_pending = None
         self._apply_room(limit)
 
+    def room_reading(self, limit: int | None, before: int) -> dict[str, Any]:
+        """A room's outcome and each reason bytes stay: the call's working set, Torch's cache,
+        pages pinned (a call or a kept program on them), pages still filling, and those that could
+        go but did not (reclaim order)."""
+        allocated, reserved, _ = _torch_bytes(self.device)
+        native = self.native.stats() if self.native is not None else {}
+        resident = int(native.get("resident_bytes", 0))
+        calls = sum(1 for request in list(self.requests) if not request.idle)
+        return {
+            "at": time.time(),
+            "target": self.room_target,
+            "limit": limit,
+            "held_before": before,
+            "held": reserved + resident,
+            "floor": self._room_floor(),
+            "calls": calls,
+            "idle_requests": len(self.requests) - calls,
+            "torch_allocated": allocated,
+            "torch_cached": reserved - allocated,
+            "pages_resident": resident,
+            "pages_pinned": int(native.get("pinned_bytes", 0)),
+            "pages_filling": max(resident - int(native.get("ready_bytes", resident)), 0),
+            "pages_reclaimable": int(native.get("reclaimable_bytes", 0)),
+        }
+
     def held(self) -> int:
         """Torch's reserve plus this process's weight pages: what a room limits."""
         return self._figures()[1]
 
-    def _floor(self) -> int:
+    def _room_floor(self) -> int:
         """What this process must keep to go on: its call's working set as it has peaked (across
         cut resets) or Torch's reserve, whichever is more, its pinned pages, and the streamed
         blocks in flight of the models of its phase (running, or the last entered, between
@@ -3566,7 +3591,7 @@ class Request:
         self.phase_changes: list[dict[str, Any]] = []
         self.peak = 0
         #: Torch's own allocated peak over the whole request, kept across cut-site resets: the
-        #: least room its call runs in (`Memory._floor`)
+        #: least room its call runs in (`Memory._room_floor`)
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
