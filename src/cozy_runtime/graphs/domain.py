@@ -187,6 +187,7 @@ class Domain:
                 self.owner = None
             for stream in (self.stream, self.control):
                 if stream is not None:
+                    vt.retire_stream(stream, device=self.device)
                     self.torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
