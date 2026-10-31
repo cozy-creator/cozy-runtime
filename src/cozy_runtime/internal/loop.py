@@ -94,6 +94,8 @@ _REFUSED = (
 )
 #: cudaError_t stream-capture codes (900-908): an operation the step runs cannot be recorded.
 _CAPTURE_ERRORS = range(900, 909)
+#: a refusal by one of them (`_refusal`)
+_UNRECORDABLE = "the step cannot be recorded"
 #: request id -> its loops, for the run record (`execution.loops`)
 ROWS: dict[str, list[dict[str, Any]]] = {}
 
@@ -145,7 +147,7 @@ def _refusal(error: BaseException) -> str | None:
         return f"residency refused preparation: {error}"
     code = getattr(error, "error_code", None)
     if isinstance(code, int) and code in _CAPTURE_ERRORS:
-        return f"the step cannot be recorded: {error}"
+        return f"{_UNRECORDABLE}: {error}"
     if isinstance(error, Exception) and fault(error) is Fault.OTHER:
         return f"recording failed: {type(error).__name__}: {error}"
     return None
@@ -361,6 +363,12 @@ class Loops:
             row["dropped"] = "released"
         if refused:
             row["refusals"].append(f"whole call on its first call: {refused}")
+            if refused.startswith(_UNRECORDABLE):
+                # Its idle recording would meet the same error and keep the next call waiting
+                # on it (an RTX 3060's SDXL w1 559 ms, then its own doomed recording).
+                with self._lock:
+                    known.unfit.add(shape)
+                    known.why[shape] = refused[:400]
         loop.eager(loop.steps[1:], tensors, ctx)
         _after(loop, tensors, scope, known, shape)
         row["eager"] = self._queue(
