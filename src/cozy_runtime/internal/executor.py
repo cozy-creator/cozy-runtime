@@ -1012,8 +1012,11 @@ class Executor:
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
-            # `room` read at once, a running call's included (`_room`), where TensorFS can hold one.
-            "room": callable(getattr(tensorfs.varena, "make_room", None)),
+            # `room` read at once, a running call's included (`_room`), where TensorFS can hold one
+            # (`residency.yields`: imported here, residency would bring Torch in before the hello).
+            "room": all(
+                callable(getattr(tensorfs.varena, f, None)) for f in ("make_room", "no_capture")
+            ),
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
