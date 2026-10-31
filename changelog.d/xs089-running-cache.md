@@ -1,1 +1,0 @@
-In a running phase, a pure site's reclaim counts Torch's cache as room and takes the rest from weights instead of returning the cache (no OOM-retry cache drops in H3's sparse steps on a 4090); each phase row records the phase that ended there.
