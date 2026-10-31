@@ -10,11 +10,14 @@ location; a driver update rebuilds nothing. `load` waits for a live build by its
 progress, then serves it or raises `KernelsUnavailable`: a request never compiles. The Runtime's
 own sets open through `opened` (`kernel_ready.TRITON`): loaded, then verified on the card.
 
-The native wheel carries the Runtime's own sets prebuilt (`PREBUILT`, `triton_prebuild`): every
-entry's compiled kernel by its Triton key, and Triton's launcher module per Python tag. The builder
-copies a set's kernels into the cache, as Triton writes them, when every key is shipped, and
-compiles otherwise; the launcher goes in under the key this host gives it. So a machine with no C
-compiler, which Triton needs for its launcher, still serves them.
+A set's own package ships it prebuilt (`triton_prebuild`), in `<package>/_triton` (`shipped`):
+every entry's compiled kernel by its Triton key, for every card row. The package is the one whose
+module declares the set (a package's fused plan declared over the Runtime's kernels is the
+package's); the native Runtime wheel ships its own sets and Triton's launcher module per Python
+tag (`PREBUILT`). The builder copies a set's kernels into the cache, as Triton writes them, when
+every key is shipped, and compiles otherwise; the launcher goes in under the key this host gives
+it. So a machine with no C compiler, which Triton needs for its launcher, still serves them, and a
+set that only copies is built before its first request, never served eager meanwhile (`ready`).
 
 Executor-only: torch and Triton are imported at the top, guarded; their absence is
 `kernels_absent`.
@@ -25,6 +28,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import sys
 import sysconfig
 from collections.abc import Callable, Iterable
 from importlib import import_module
@@ -125,47 +129,62 @@ def _launcher_key() -> str:
     return str(_get_cache_manager(launcher_source(), config=launcher_config()).key)
 
 
-#: The wheel's prebuilt Runtime sets (`triton_prebuild`): `manifest.json`, `kernels/<key>/` and
-#: `launcher/`.
-PREBUILT = Path(__file__).resolve().parents[1] / "_triton"
+#: Where a package ships its prebuilt sets: `manifest.json` and `kernels/<key>/`.
+SHIPPED = "_triton"
+#: The Runtime's own (`triton_prebuild`), with Triton's launcher modules in `launcher/`.
+PREBUILT = Path(__file__).resolve().parents[1] / SHIPPED
 #: The launcher module's file name in Triton's cache, this Python's.
 LAUNCHER = f"cuda_utils{sysconfig.get_config_var('EXT_SUFFIX')}"
 
 
+def home(kernels: TritonKernels) -> str:
+    """The top-level package that declares `kernels`: its origin's, else its kernels'."""
+    module = kernels.origin or (kernels.entries[0].kernel.fn.__module__ if kernels.entries else "")
+    return module.partition(".")[0]
+
+
+def shipped(kernels: TritonKernels) -> Path | None:
+    """`<package>/_triton` of the set's own package, imported here, whether or not it ships any."""
+    file = getattr(sys.modules.get(home(kernels)), "__file__", None)
+    return Path(file).parent / SHIPPED if file else None
+
+
 @functools.cache
-def _manifest() -> dict[str, Any]:
+def _manifest(root: str) -> dict[str, Any]:
     try:
-        found = json.loads((PREBUILT / "manifest.json").read_text())
+        found = json.loads((Path(root) / "manifest.json").read_text())
     except (OSError, ValueError):
         return {}
     return found if found.get("triton") == triton.__version__ else {}
 
 
-def _shipped(keys: Iterable[str]) -> bool:
-    kernels = _manifest().get("kernels", {})
-    return all(key in kernels for key in keys)
+def _shipped(root: str, keys: Iterable[str]) -> bool:
+    kernels = _manifest(root).get("kernels", {}) if root else {}
+    return bool(kernels) and all(key in kernels for key in keys)
 
 
 def _launcher_shipped() -> dict[str, str] | None:
-    row = _manifest().get("launcher", {}).get(LAUNCHER)
+    row = _manifest(str(PREBUILT)).get("launcher", {}).get(LAUNCHER)
     if row is None or row.get("driver_sha256") != hashlib.sha256(launcher_source()).hexdigest():
         return None
     return dict(row)
 
 
 def _prebuilt(found: kernel_compile.Job) -> bool:
-    """Whether the wheel serves this set's build: its every kernel and this Python's launcher."""
-    return _shipped(found.spec["entries"].values()) and _launcher_shipped() is not None
+    """Whether this set's build only copies: its package ships every kernel, the Runtime this
+    Python's launcher."""
+    root = str(found.spec.get("shipped", ""))
+    return _shipped(root, found.spec["entries"].values()) and _launcher_shipped() is not None
 
 
-def _seed(keys: Iterable[str]) -> None:
-    """The wheel's compiled kernels into Triton's cache, each group as Triton writes one."""
-    shipped = _manifest()["kernels"]
+def _seed(root: str, keys: Iterable[str]) -> None:
+    """A package's compiled kernels into Triton's cache, each group as Triton writes one."""
+    rows = _manifest(root)["kernels"]
     for key in keys:
-        row, cache = shipped[key], get_cache_manager(key)
+        row, cache = rows[key], get_cache_manager(key)
         if cache.get_group(row["group"]) is not None:
             continue
-        files = PREBUILT / "kernels" / key
+        files = Path(root) / "kernels" / key
         group = {name: cache.put((files / name).read_bytes(), name) for name in row["files"]}
         cache.put_group(row["group"], group)
 
@@ -222,36 +241,43 @@ class _Kernel(Struct, frozen=True):
         )
 
 
+def spec(kernels: TritonKernels, arch: int) -> dict[str, Any]:
+    """What `kernels`' builder does for `arch`: each entry's Triton key, its kernel by module and
+    name, and where its package ships it prebuilt."""
+    _require_triton()
+    return {
+        "arch": arch,
+        "entries": {entry.key: _cache_key(entry, arch) for entry in kernels.entries},
+        "kernels": [msgspec.to_builtins(_Kernel.of(entry)) for entry in kernels.entries],
+        "shipped": str(shipped(kernels) or ""),
+    }
+
+
 def job(kernels: TritonKernels, arch: int) -> kernel_compile.Job:
     """`kernels` for `arch`, compiled into this process's Triton cache."""
-    _require_triton()
-    entries = {entry.key: _cache_key(entry, arch) for entry in kernels.entries}
+    found = spec(kernels, arch)
     inputs = {
         "arch": arch,
         "triton": triton.__version__,
-        "entries": entries,
+        "entries": found["entries"],
         "launcher": _launcher_key(),
         "cache": triton.knobs.cache.dir,
     }
-    spec = {
-        "arch": arch,
-        "entries": entries,
-        "kernels": [msgspec.to_builtins(_Kernel.of(entry)) for entry in kernels.entries],
-    }
-    return kernel_compile.Job("triton", kernel_cache.Key.of(kernels.name, inputs), spec)
+    return kernel_compile.Job("triton", kernel_cache.Key.of(kernels.name, inputs), found)
 
 
 @request_path.forbid("kernel build: triton")
 def build(
     spec: dict[str, Any], staging: Path, report: Callable[[float], None]
 ) -> dict[str, object]:
-    """The compile manager's builder: every entry into Triton's own cache (the wheel's, when it
+    """The compile manager's builder: every entry into Triton's own cache (its package's, when it
     ships them all), then Triton's launcher module, so a launch compiles nothing. `staging` stays
     empty: the published entry marks the cache filled."""
     _require_triton()
-    prebuilt = _shipped(spec["entries"].values())
+    root = str(spec.get("shipped", ""))
+    prebuilt = _shipped(root, spec["entries"].values())
     if prebuilt:
-        _seed(spec["entries"].values())
+        _seed(root, spec["entries"].values())
     else:
         compile_entries(spec, report)
     _seed_launcher()
@@ -427,7 +453,8 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
 
 def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Launch | None:
     """`load`, when this machine's build of `kernels` for `device` is done; None while it
-    compiles (started here when nobody had). Waits for it only when `wait`."""
+    compiles (started here when nobody had). Waits for it when `wait`, or when the build only
+    copies what the set's package ships: a prebuilt set never serves its first request eager."""
     if wait:
         return load(kernels, device=device)
     _require_triton()
@@ -439,7 +466,8 @@ def ready(kernels: TritonKernels, wait: bool = False, *, device: object) -> Laun
     if torch.cuda.is_current_stream_capturing():  # a load would end the graph being recorded
         return None
     major, minor = torch.cuda.get_device_capability(target.index or 0)
-    if _submit(_store(), job(kernels, major * 10 + minor)).state == "compiling":
+    found = job(kernels, major * 10 + minor)
+    if _submit(_store(), found).state == "compiling" and not _prebuilt(found):
         return None
     launch = load(kernels, device=device)
     LANDED[0] += 1

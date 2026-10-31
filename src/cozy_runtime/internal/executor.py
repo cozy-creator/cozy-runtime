@@ -120,7 +120,7 @@ from cozy_runtime.author._model import (
     WarningRow,
     component_use,
 )
-from cozy_runtime.author._observations import DEVICE, Attribution
+from cozy_runtime.author._observations import DEVICE, PLANS, Attribution
 from cozy_runtime.author._prepared_use import PreparedUse, prepared_use
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
@@ -1083,6 +1083,7 @@ class Executor:
         host.execution = execution
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
+        PLANS[:] = [host.serving]
         _split.install(execution)
         attention_ulysses.install(execution)
         loop.install()
@@ -1946,6 +1947,18 @@ class Executor:
             **({"compiles": compiles} if compiles else {}),
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
         }
+
+    def serving(self) -> str:
+        """The execution plans applied now (`Plan.report`), by name, or "eager": what each step
+        records it ran (`Attribution.step`)."""
+        applied = {
+            name
+            for member in self.model_executors or [self]
+            for reports in list(member.plan_reports.values())
+            for name, report in list(reports.items())
+            if report.get("applied")
+        }
+        return " ".join(sorted(applied)) or "eager"
 
     def _model_classes(self) -> list[type[Model[Any]]]:
         """The classes the package's constructed Model slots declare, wherever they are
