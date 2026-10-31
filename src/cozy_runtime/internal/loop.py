@@ -803,6 +803,8 @@ class _IdleRecording:
             # A step that cannot be recorded (an RTX 3060's SDXL step frees memory inside the
             # capture: 900 from cuMemFree) is refused here as on a call's path, not a device
             # fault: one at idle poisoned the executor and failed every next request.
+            if isinstance(error, graphs.Yielded):
+                raise
             refused = _refusal(error)
             if refused is None and fault(error) in (Fault.STICKY, Fault.DEVICE):
                 raise

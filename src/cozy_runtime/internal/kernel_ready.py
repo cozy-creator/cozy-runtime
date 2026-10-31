@@ -36,7 +36,7 @@ from typing import TYPE_CHECKING, cast
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._errors import is_capacity
-from cozy_runtime.author._model import LANDED, Building
+from cozy_runtime.author._model import LANDED, Building, Yielded
 from cozy_runtime.internal import kernel_compile, verify
 
 if TYPE_CHECKING:
@@ -176,16 +176,16 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
         try:
             with _opening(name):
                 value = opener(False)
+        except Yielded:  # an idle job's: no verdict, and the next ask opens it
+            with _LOCK:
+                if _SLOTS.get(name) is slot:
+                    del _SLOTS[name]
+            raise
         except Exception as exc:
             _ended(name, slot, exc)
             if is_capacity(exc):
                 raise  # the memory manager's to answer
             return None
-        except BaseException:  # an idle job's yield: no verdict, and the next ask opens it
-            with _LOCK:
-                if _SLOTS.get(name) is slot:
-                    del _SLOTS[name]
-            raise
         if value is not None:
             selected = _landed(name, slot, value, "landed" if grouped else "ready")
             return None if grouped else cast("T | None", selected)
@@ -244,7 +244,7 @@ def wait[T](name: str, opener: Opener[T]) -> T:
             value = opener(True)
         if value is None:
             raise RuntimeError("its opener waited and returned nothing")
-    except BaseException:
+    except Exception:
         if mine:  # asked again, it opens again: a failed build is on the machine's record
             with _LOCK:
                 if _SLOTS.get(name) is slot and slot.state == "opening":

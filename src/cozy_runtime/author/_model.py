@@ -402,6 +402,13 @@ class Building(Exception):
     records once a kernel lands (`LANDED`)."""
 
 
+class Yielded(Exception):
+    """An idle job gives the device back at its next op: a command arrived. An Exception, so a
+    module's `always_call` forward hooks run as it unwinds (residency's block exits: as a
+    BaseException it left a block claimed and the next call refused "concurrent model use");
+    a kernel's fallback passes it on rather than serve a slower path or a failed verdict."""
+
+
 type WarningRow = tuple[str, dict[str, str | bool | int | float | None]]
 
 

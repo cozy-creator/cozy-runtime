@@ -34,7 +34,7 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Fault, fault, is_capacity
-from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
+from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
 
@@ -102,7 +102,7 @@ def capture(
                         finally:
                             owner.join.record(work)
                             stream.wait_event(owner.join)
-                except BaseException as exc:  # a yield too: the capture ends first
+                except Exception as exc:
                     failure = exc
                 try:
                     graph.capture_end()
@@ -124,7 +124,7 @@ def capture(
             )
             error.error_code = 999
             raise error from failure
-    if isinstance(failure, Building) or not isinstance(failure, Exception | None):
+    if isinstance(failure, Building | Yielded):
         raise failure
     if failure is not None:
         if fault(failure) in (Fault.STICKY, Fault.DEVICE):
@@ -417,13 +417,7 @@ UNDECLARED: dict[str, set[str]] = {}
 _CLASSES: dict[type, type] = {}
 
 
-class Yielded(BaseException):
-    """An idle job gives the device back at its next op: a command arrived. A BaseException, as
-    any cancellation is, so a package's or kernel's `except Exception` neither swallows it nor
-    serves a slower path in its place (cozy-int8's eager law, a kernel marked failed)."""
-
-
-class _Lagging(BaseException):
+class _Lagging(Yielded):
     """A busy measure's device fell `_Idle.lag_ms` behind its host: the region is device-bound."""
 
 
@@ -1086,7 +1080,7 @@ def _capture_pending(pending: _Pending) -> bool:
         except Building:
             return False  # a cold probe postpones capture without consuming the signature
         except Exception as exc:  # the signature runs as written; the period goes on
-            if fault(exc) in (Fault.STICKY, Fault.DEVICE):
+            if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
                 raise
             if is_capacity(exc):
                 return False
