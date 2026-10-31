@@ -1409,7 +1409,8 @@ class _Graph:
             if (laps := _LAPS.get()) is not None and len(laps) == 3:
                 # Diagnostic only: observe the failing preparation before CUDA capture starts.
                 stats = vt.stats(self.device.index or 0)
-                native = self.domain.memory.native
+                request = _REQUEST.get()
+                native = None if request is None else request.memory.native
                 weights = {} if native is None else native.stats()
                 laps[2].append({
                     "reserve_target_bytes": reserve,
@@ -1421,7 +1422,8 @@ class _Graph:
                     )},
                     **{key: stats[key] for key in (
                         "allocated_bytes", "allocated_capacity", "allocated_peak", "mapped_bytes",
-                        "free_bytes", "pending_bytes", "unassigned_bytes", "pools_bytes", "pools", "ooms",
+                        "free_bytes", "pending_bytes", "unassigned_bytes", "pools_bytes",
+                        "pools", "ooms",
                     )},
                 })
             self._contexts.enter_context(vt.graph(
