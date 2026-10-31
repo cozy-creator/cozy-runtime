@@ -61,11 +61,11 @@ int choose(int, int, int, int) { return 0; }
 }  // namespace
 
 cudaError_t fp8_gemm(const void* q, const void* w, const float* scales, const float* w_scale,
-                     const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
-                     int config, cudaStream_t stream) {
+                     const void* bias, void* out, int64_t ldo, bool out_half, int M, int N, int K,
+                     int sms, int config, cudaStream_t stream) {
     return launch(kConfigs<cutlass::bfloat16_t>, kConfigs<cutlass::half_t>,
                   config < 0 ? choose(M, N, K, sms) : config, out_half, q, w, scales, w_scale,
-                  bias, out, M, N, K, sms, stream);
+                  bias, out, ldo, M, N, K, sms, stream);
 }
 
 }  // namespace cozy_int8::COZY_FAMILY

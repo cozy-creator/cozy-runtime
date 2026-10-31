@@ -62,18 +62,20 @@ cudaError_t fp8_quantize(const void* x, bool x_half, void* q, float* scales, int
 cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale, const void* bias,
           void* out, bool out_half, int M, int N, int K, int sms, cudaStream_t stream);
 
-// D[M, N] = (q @ w.T) * scales[m] * w_scale[n] + bias[n]; `config` < 0 picks the tile by shape,
-// else names one (a sweep); cudaErrorNotSupported when that tile cannot take the problem.
+// D[M, N] = (q @ w.T) * scales[m] * w_scale[n] + bias[n], D's rows `ldo` elements apart (N, or
+// wider: sibling linears writing their column ranges of one output); `config` < 0 picks the tile
+// by shape, else names one (a sweep); cudaErrorNotSupported when that tile cannot take the problem.
 using Gemm = cudaError_t(const int8_t* q, const int8_t* w, const float* scales,
-                         const float* w_scale, const void* bias, void* out, bool out_half, int M,
-                         int N, int K, int sms, int config, Workspace workspace,
-                         cudaStream_t stream);
+                         const float* w_scale, const void* bias, void* out, int64_t ldo,
+                         bool out_half, int M, int N, int K, int sms, int config,
+                         Workspace workspace, cudaStream_t stream);
 
 // The same epilogue on E4M3 operands, f32 accumulation: wgmma on Hopper, tcgen05 on datacenter
 // Blackwell, RTX 50's TMA mma.
 using Fp8Gemm = cudaError_t(const void* q, const void* w, const float* scales,
-                            const float* w_scale, const void* bias, void* out, bool out_half,
-                            int M, int N, int K, int sms, int config, cudaStream_t stream);
+                            const float* w_scale, const void* bias, void* out, int64_t ldo,
+                            bool out_half, int M, int N, int K, int sms, int config,
+                            cudaStream_t stream);
 
 // The w4a8 linear's GEMM (`w4a8.convrot`, group 16, rotation 256): `w` [N, K/2] 4-bit
 // codes (even k in the low nibble), `s` [N, K/16] E4M3 group scales, `codebook` 16 floats or null
