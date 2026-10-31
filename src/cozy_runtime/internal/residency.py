@@ -1360,8 +1360,9 @@ class Memory:
         self._split_budget: int | None = None
         self._plans = 0
         #: The most a split of the active phase's first pass had beside it: what was allocated
-        #: as it began, and its output (`Request.note_split`); `_replan` plans no budget below it.
-        self._floor, self._flooring = 0, True
+        #: as it began, and its output (`Request.note_split`), over `_notes` splits; `_replan`
+        #: plans no budget below it, and none before a split has run.
+        self._floor, self._notes, self._flooring = 0, 0, True
         self._forward_depth = 0
         #: (set, block, fill identity, overlay) -> a refilled block's baked bytes in host RAM:
         #: its next refill copies them back, with no store read, factor read or bake
@@ -2387,7 +2388,7 @@ class Memory:
                 return
             self._phase_names, self._phase_request = names, request_id
             self._split_budget, self._plans = None, 0
-            self._floor, self._flooring = 0, True
+            self._floor, self._notes, self._flooring = 0, 0, True
             self._plan_phase(request)
 
     def _replan(self, request: Request | None) -> None:
@@ -2401,6 +2402,10 @@ class Memory:
         beside its splits (`_floor`) is no plan: no exact split gets that low (H3 15 s on a
         4090: 3.0 GB planned beside a 0.4 GB between-pass live set; the pass reserved 6.4 GB, was
         abandoned, and its finer splits cost 16.5 s). Caller holds the lock."""
+        if not self._notes:
+            # A phase's activation before any of its splits ran (a loop preparing its loads
+            # enters the phase ahead of its first forward): its first pass has not happened.
+            return
         self._flooring = False  # the first pass is over
         if self._plans >= _PLANS or not self.cuda:
             return
@@ -2438,7 +2443,7 @@ class Memory:
             "budget_bytes": budget,
         }
         floor = max(allocated, self._floor)
-        replan["floor_bytes"] = floor
+        replan["floor_bytes"], replan["floor_splits"] = floor, self._notes
         if budget < 2 * floor:
             if planned is None:
                 return  # no split takes activations this low: the phase streams as planned
@@ -3497,6 +3502,7 @@ class Request:
         if not memory._flooring or not memory.cuda or not torch.cuda.is_initialized():
             return
         memory._floor = max(memory._floor, _torch_bytes(memory.device)[0] + out_bytes)
+        memory._notes += 1
 
     def reset_peak(self) -> int:
         self.sample()
