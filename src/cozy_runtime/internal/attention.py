@@ -265,8 +265,6 @@ KERNELS: tuple[Candidate, ...] = (
         head_dims=_D128, causal=False, gqa=False, cross=False, batches=False, scales=False,
         artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
     ),
-    # INT4 Q·Kᵀ (owner, 10-31: a test, quality judged against 8-bit) is reached only by a pin
-    # (`--attention-kernel`) until the owner rules: no cell lists it, so no default walk does.
     Candidate(
         "kitchen-int4qk", "_cozy_kitchen_int4qk", attention_int4.KITCHEN_INT4QK, _MMA, _INT4,
         level=4, dtypes=_HALF, head_dims=_D128, max_head_dim=128, causal=False,
@@ -317,7 +315,7 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.MMA_SYNC: {
         16: ("sdpa",),
         8: ("kitchen-int8", "sageattention"),
-        4: ("sageattention3-fp4",),
+        4: ("sageattention3-fp4", "kitchen-int4qk"),
     },
     arch.WGMMA: {16: ("flash-attn3",), 8: ("sageattention",)},
     arch.TCGEN05: {16: ("cudnn",), 8: ("flash-attn4-fp8",)},
@@ -328,12 +326,14 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
 #: tiles take its dense rows' precision (`attention_sol_fa4`), so its 8-bit cell is empty and a
 #: site steps up to it. mma.sync's 8-bit cell is Kitchen's INT8 Sol: INT8 runs 2x BF16 there, 4x
 #: on GeForce (half-rate FP32 accumulation), and BF16 Sol's exact blocks alone outlast Kitchen's
-#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak).
+#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak). Its 4-bit cell is FP4 on FP4 rows, else INT4
+#: Q·Kᵀ on int4 rows (owner, 10-31: no difference he can see from 8-bit; H3 Turbo 15 s on an RTX
+#: 4090 1.10x end to end).
 SPARSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.MMA_SYNC: {
         16: ("sol-attn",),
         8: ("kitchen-sol",),
-        4: ("kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem"),
+        4: ("kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem", "kitchen-sol-int4qk"),
     },
     arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean",)},
     arch.TCGEN05: {16: ("sol-attn",)},
