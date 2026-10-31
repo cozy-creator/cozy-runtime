@@ -800,7 +800,7 @@ class _IdleRecording:
         try:
             done = self._record()
         except Exception as error:
-            if isinstance(error, graphs.Yielded) or fault(error) in (Fault.STICKY, Fault.DEVICE):
+            if fault(error) in (Fault.STICKY, Fault.DEVICE):
                 raise
             if isinstance(error, Building) or isinstance(error.__cause__, Building):
                 return False  # a kernel still opens: a later idle period

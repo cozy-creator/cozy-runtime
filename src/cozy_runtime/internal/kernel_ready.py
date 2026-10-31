@@ -181,6 +181,11 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
             if is_capacity(exc):
                 raise  # the memory manager's to answer
             return None
+        except BaseException:  # an idle job's yield: no verdict, and the next ask opens it
+            with _LOCK:
+                if _SLOTS.get(name) is slot:
+                    del _SLOTS[name]
+            raise
         if value is not None:
             selected = _landed(name, slot, value, "landed" if grouped else "ready")
             return None if grouped else cast("T | None", selected)
@@ -239,7 +244,7 @@ def wait[T](name: str, opener: Opener[T]) -> T:
             value = opener(True)
         if value is None:
             raise RuntimeError("its opener waited and returned nothing")
-    except Exception:
+    except BaseException:
         if mine:  # asked again, it opens again: a failed build is on the machine's record
             with _LOCK:
                 if _SLOTS.get(name) is slot and slot.state == "opening":
