@@ -1477,9 +1477,9 @@ class Memory:
     def _floor(self) -> int:
         """What this process must keep to go on: its call's working set as it has peaked (across
         cut resets) or Torch's reserve, whichever is more, its pinned pages, and the streamed
-        blocks in flight of the models now running; idle, what Torch still holds. A later phase
-        that needs more (a decode) takes it from the call's weight pages through the allocation
-        hook."""
+        blocks in flight of the models of its phase (running, or the last entered, between
+        forwards); idle, what Torch still holds. A later phase that needs more (a decode) takes
+        it from the call's weight pages through the allocation hook."""
         native = self.native.stats() if self.native is not None else {}
         pinned = int(native.get("pinned_bytes", 0))
         allocated, reserved, _ = _torch_bytes(self.device)
@@ -1487,7 +1487,9 @@ class Memory:
         if not requests:
             return allocated + pinned
         peak = max(request.torch_peak for request in requests)
-        running = set().union(*(request.current for request in requests))
+        running = set().union(
+            *(r.current | (r.phase(r.last) if r.last else frozenset()) for r in requests)
+        )
         blocks = (
             b.allocation_bytes
             for m in list(self.models.values())
@@ -3279,6 +3281,7 @@ class Memory:
             model.local.request = request
             if request is not None:
                 request.current.add(model.name)
+                request.last = model.name
             if model.common is not None:
                 self._enter(model.common)
         except BaseException:
@@ -3335,6 +3338,7 @@ class Memory:
                     if not other.idle:
                         other.overlap = True
             self.requests.add(request)
+        self._take_room()  # a raise or lift that came between calls binds this one from its start
         token = _REQUEST.set(request)
         try:
             yield request
@@ -3355,6 +3359,8 @@ class Memory:
                 with self.lock:
                     self.requests.discard(request)
                     alone = not self.requests
+                if alone:
+                    self._take_room()  # one that came in the call's last forward
                 if alone and self.room_limit is not None:
                     # Held to a room, the next call starts with its own cache, not this one's
                     # (sieg: SDXL's decode cache left its next denoise nothing to give)
@@ -3386,6 +3392,7 @@ class Request:
         self.memory, self.id, self.idle = memory, id, idle
         self.others = tuple(others)
         self.current: set[str] = set()
+        self.last = ""  # the model it entered last: its phase streams between forwards too
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []

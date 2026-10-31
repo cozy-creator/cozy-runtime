@@ -3271,15 +3271,17 @@ class Executor:
             sys.stderr.flush()
 
     def _idle_room(self, memory: Memory, limit: int, ticket: int) -> None:
-        """An idle executor's room, in its turn: giving, its kept programs release their pins
-        before its pages go."""
+        """An idle executor's room, in its turn: its unpinned pages go first; only if they cannot
+        meet it do its kept programs (graphs, decoders, holds) release their pins, so its next
+        call stays a native replay when they can."""
         assert self.order is not None
         try:
             with self.order.turn(ticket):
+                memory.make_room(limit)
                 if not memory.requests and limit < memory.held():
                     accel.synchronize(self.torch, self.device_kind)
                     self._release_programs()
-                memory.make_room(limit)
+                    memory.make_room(limit)
         except Exception:
             traceback.print_exc()
             sys.stderr.flush()
