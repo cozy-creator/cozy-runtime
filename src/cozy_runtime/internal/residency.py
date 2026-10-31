@@ -312,6 +312,8 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
 _LARGEST_UNIT = 2 << 30
 #: A paging unit holding more than this splits (`split`), the same on every card.
 _SPLIT_UNIT = 1 << 30
+#: An embedding table outside every block and this large pages as its own unit (`split`).
+_TABLE_UNIT = 64 << 20
 
 
 def _unit(name: str, blocks: Collection[str]) -> str:
@@ -374,6 +376,16 @@ def split(module: nn.Module, paths: Sequence[str], sizes: Mapping[str, int]) -> 
             blocks.add(child)
             if size > _SPLIT_UNIT:
                 queue.append(child)
+    # A table pages as its own unit, so one that does not fit the room gathers its rows on the
+    # host (`Memory._gather`) and the weights beside it still fit.
+    blocks.update(
+        path
+        for path, sub in modules.items()
+        if path
+        and isinstance(sub, nn.Embedding)
+        and _unit(f"{path}.weight", blocks) == ""
+        and sizes.get(f"{path}.weight", 0) >= _TABLE_UNIT
+    )
     order = {path: i for i, path in enumerate(modules)}
     return sorted(blocks, key=order.__getitem__)
 
@@ -442,6 +454,12 @@ class _Block:
     overlay: Hashable = None
     #: native pages of other overlays, parked for reuse (`_switch_overlay`): (raw, final) regions
     parked: dict[Hashable, tuple[Any, Any]] = field(default_factory=dict)
+    #: an `nn.Embedding`'s table: one that does not fit the room gathers its rows on the host
+    table: bool = False
+    #: its host copy while it gathers, by overlay: (overlay, raw views, final views)
+    gathered: tuple[Hashable, dict[str, dict[str, Tensor]], dict[str, dict[str, Tensor]]] | None = (
+        None
+    )
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -1561,6 +1579,7 @@ class Memory:
             for m in list(self.models.values())
             if m.name in running
             for b in m.groups()
+            if not b.table  # one that does not fit gathers (`_gather`)
         )
         return max(peak, reserved) + pinned + _STREAMED * max(blocks, default=0)
 
@@ -1699,6 +1718,7 @@ class Memory:
         for index, path in enumerate(p for p in ("", *paths) if p in by_path):
             block = _Block(model, path, index, by_path[path])
             if path:
+                block.table = isinstance(module.get_submodule(path), nn.Embedding)
                 model.blocks[path] = block
             else:
                 model.common = block
@@ -2269,6 +2289,7 @@ class Memory:
                 block.parked.clear()
                 block.preferred = False
                 block.preference_set = False
+                block.gathered = None
             if present or forget:
                 block.generation += 1
             return block.nbytes if present else 0
@@ -3241,16 +3262,7 @@ class Memory:
                             raise
                         read_ns += time.perf_counter_ns() - began
                         read_bytes += part.nbytes
-                    dtype = getattr(torch, _DTYPES[part.dtype])
-                    shape = part.shape
-                    if part.dtype == "F4":
-                        if not shape or shape[-1] % 2:
-                            raise ResidencyError("packed F4 weights require an even last axis")
-                        shape = (*shape[:-1], shape[-1] // 2)
-                    view = raw.view(dtype)
-                    if view.numel() != math.prod(shape):
-                        raise ResidencyError(f"stored geometry does not match {key}#{role}")
-                    views[role] = view.view(shape)
+                    views[role] = _view(key, role, part, raw)
             changed = False
             if block.model.fill is not None and (use is None or use.needs_fill):
                 # `overlay` was read on this thread just before; no package code ran since.
@@ -3289,6 +3301,58 @@ class Memory:
                 request.read(block, kept_ns, kept.numel(), origin="baked")
             with self.lock:
                 block.loading = False
+
+    def _gather(self, block: _Block, overlay: Hashable) -> None:
+        """An embedding table that does not fit the room stays on the host: its forward looks up
+        there and moves only the rows it read (`_gathering`), so a room below the table never
+        fails the call (Qwen-Image's 1.2 GB text-encoder table beside a 5 GB game on 8 GB). The
+        copy is the host tier's page when it keeps one, else read once and held while the table
+        gathers; each entry tries the device first."""
+        if block.gathered is None or block.gathered[0] != overlay:
+            block.gathered = None
+            model = block.model
+            kept = self._baked.get(_page(block, model.identity, overlay))
+            stored = (
+                kept is None
+                or kept.tensor.numel() < block.storage_bytes
+                or model.fill is not None
+            )
+            raw = (
+                kept.tensor
+                if kept is not None and not stored
+                else torch.empty(block.storage_bytes, dtype=torch.uint8)
+            )
+            tensors = model.source.ck.components[model.source.component].tensors
+            data: dict[str, dict[str, Tensor]] = {}
+            offset = 0
+            for key, parts in block.parts.items():
+                views = data[key] = {}
+                for role, part in parts.items():
+                    into = raw[offset : offset + part.nbytes]
+                    if stored:
+                        self._read_into(tensors, key, into, part.role or None)
+                    views[role] = _view(key, role, part, into)
+                    offset += (part.nbytes + 255) // 256 * 256
+            if stored and model.fill is not None:
+                model.fill(block.path, data)
+            finals: dict[str, dict[str, Tensor]] = {}
+            for key, row in block.finals.items():
+                finals[key] = {
+                    name: torch.empty(part.nbytes, dtype=torch.uint8)
+                    .view(getattr(torch, _DTYPES[part.dtype]))
+                    .as_strided(part.shape, part.strides)
+                    for name, part in row.items()
+                }
+                if model.finals is not None:
+                    model.finals.write(key, data[key], finals[key])
+                else:
+                    for destination in finals[key].values():
+                        destination.copy_(data[key]["value"])
+            block.gathered = overlay, data, finals
+        with self.lock:
+            block.data, block.final_data, block.ready = block.gathered[1], block.gathered[2], None
+            block.final_use = None
+            block.generation += 1
 
     def _read_into(self, tensors: Any, key: str, raw: Tensor, role: str | None) -> None:
         if self.device.type != "mps":
@@ -3343,7 +3407,13 @@ class Memory:
             if not nested:
                 request = _REQUEST.get()
                 reclaim = reclaim and not (request is not None and request.idle)
-                self._ensure(block, reclaim, overlay)
+                try:
+                    self._ensure(block, reclaim, overlay)
+                    block.gathered = None
+                except torch.OutOfMemoryError:
+                    if not (block.table and reclaim and self.cuda and not capturing):
+                        raise
+                    self._gather(block, overlay)
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
@@ -3378,7 +3448,7 @@ class Memory:
                 if use is not None:
                     use.consume_on(stream.cuda_stream)
             for tensor in block.tensors():
-                if tensor.untyped_storage().data_ptr() not in (
+                if tensor.is_cuda and tensor.untyped_storage().data_ptr() not in (
                     block.native_storage,
                     block.final_storage,
                 ):
@@ -3869,6 +3939,19 @@ def _sites(module: nn.Module) -> dict[str, list[_Site]]:
     return {name: groups[key] for name, key in names.items()}
 
 
+def _view(key: str, role: str, part: _Part, raw: Tensor) -> Tensor:
+    """A stored part's bytes `raw` as its tensor."""
+    shape = part.shape
+    if part.dtype == "F4":
+        if not shape or shape[-1] % 2:
+            raise ResidencyError("packed F4 weights require an even last axis")
+        shape = (*shape[:-1], shape[-1] // 2)
+    view = raw.view(getattr(torch, _DTYPES[part.dtype]))
+    if view.numel() != math.prod(shape):
+        raise ResidencyError(f"stored geometry does not match {key}#{role}")
+    return view.view(shape)
+
+
 def _strides(shape: Sequence[int]) -> tuple[int, ...]:
     stride = 1
     out = []
@@ -4151,6 +4234,43 @@ def _hooks(model: Model) -> None:
                 cut.exit(b)
 
         model.handles.extend(_paired(sub, entered, exited))
+        if block.table:
+            model.handles.extend(_gathering(sub, memory))
+
+
+def _gathering(module: nn.Module, memory: Memory) -> list[Any]:
+    """A gathered table's forward runs on the host (`Memory._gather`): its inputs go there, and
+    only the rows it read come back."""
+
+    on_host = threading.local()
+
+    def host(value: object) -> object:
+        return value.cpu() if isinstance(value, Tensor) else value
+
+    def device(value: object) -> object:
+        return value.to(memory.device) if isinstance(value, Tensor) else value
+
+    def pre(
+        sub: nn.Module, args: tuple[object, ...], kwargs: dict[str, object]
+    ) -> tuple[Any, Any] | None:
+        weight = getattr(sub, "weight", None)
+        on_host.now = memory.cuda and isinstance(weight, Tensor) and not weight.is_cuda
+        if not on_host.now:
+            return None
+        if memory.capturing():
+            raise ResidencyError("all graph weights must be resident before capture")
+        return tree_map(host, args), tree_map(host, kwargs)
+
+    def back(_: nn.Module, args: object, output: object) -> object:
+        if not getattr(on_host, "now", False):
+            return None
+        on_host.now = False
+        return tree_map(device, output)
+
+    return [
+        module.register_forward_pre_hook(pre, with_kwargs=True),
+        module.register_forward_hook(back),
+    ]
 
 
 def _paired(module: nn.Module, enter: Callable[..., None], leave: Callable[[], None]) -> list[Any]:

@@ -1,0 +1,1 @@
+An embedding table that does not fit the room gathers the rows it looks up from a host copy instead of failing the call, and a table of 64 MiB or more outside every block pages as its own unit (Qwen-Image's 1.2 GB text-encoder table beside a 5 GB game on an 8 GB card: out of memory at the prompt, erich 24033/24058/24082).
