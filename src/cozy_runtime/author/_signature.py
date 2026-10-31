@@ -46,7 +46,7 @@ from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._video import Implements
-from cozy_runtime.author._walker import is_struct, strip, walk
+from cozy_runtime.author._walker import is_struct, strip, unwrap_optional, walk
 from cozy_runtime.author._weights import WeightsOutput, weights_class
 
 Role = Literal["context", "payload", "wire", "assets", "preflight", "model", "weights", "service"]
@@ -405,13 +405,14 @@ _LISTS = (list, Sequence, set, frozenset, Set)
 
 
 def _asset_fields(tp: object, prefix: str, seen: frozenset[type] = frozenset()) -> Iterator[str]:
-    """A required struct's file and asset-list fields; an optional one renders as a union."""
+    """A struct's file and asset-list fields, an optional one's (`T | None`) too, as the machine's
+    schema walk reads them: an optional is delivered when present."""
     base, _ = strip(tp)
     if not isinstance(base, type) or not is_struct(base) or base in seen:
         return
     for row in msgspec.structs.fields(base):
         name = prefix + row.encode_name
-        item, _ = strip(row.type)
+        item, _ = strip(unwrap_optional(strip(row.type)[0])[0])
         origin, args = get_origin(item), get_args(item)
         listed = (origin in _LISTS and len(args) == 1) or (origin is tuple and args[1:] == (...,))
         if listed:
