@@ -24,6 +24,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+import tensorfs.varena.torch as vt
 from tensorfs import varena
 
 from cozy_runtime.author._context import device as placed_device
@@ -44,10 +45,9 @@ def unsupported(torch: Any) -> str:
 
 @dataclass(eq=False, slots=True)
 class Pool:
-    """A stock Torch graph-pool token. Graphs and their static tensors own its allocations.
+    """A Varena-backed graph-pool token; graphs, tensors and completion fences own backing.
 
-    Runtime retires every graph and waits for its readers before dropping those tensors.
-    The native weight manager does not own this activation/scratch pool.
+    Runtime retires every graph and joins its readers before dropping those tensors.
     """
 
     handle: tuple[int, int]
@@ -126,12 +126,8 @@ class Domain:
                 self.owner = self.torch.cuda.CUDAGraph()
                 # No library work or allocation inside this owner graph. Recording an event makes
                 # its capture stream explicit; reset later clears only this stream.
-                with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
-                    self.owner.capture_begin(capture_error_mode="thread_local")
-                    try:
-                        self.join.record(self.stream)
-                    finally:
-                        self.owner.capture_end()
+                with vt.graph(self.owner, stream=self.stream, reserve_bytes=0):
+                    self.join.record(self.stream)
                 self.config = self.configuration()
             except BaseException:
                 self.finish()

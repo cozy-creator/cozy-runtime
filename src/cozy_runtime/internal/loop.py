@@ -42,6 +42,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import tensorfs.varena.torch as vt
 import torch
 from tensorfs import varena
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -53,7 +54,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import accel, kernel_ready
+from cozy_runtime.internal import kernel_ready
 from cozy_runtime.internal.accel import ResidencyError
 from cozy_runtime.internal.prepared import (
     PreparedRepeat,
@@ -1391,17 +1392,13 @@ class _Graph:
         try:
             self._contexts.enter_context(pause() if pause is not None else nullcontext())
             self._contexts.enter_context(kernel_ready.recording())
-            self._contexts.enter_context(varena.capture(self.device.index))
-            self._contexts.enter_context(accel.capture_allocation(torch))
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
-            torch.cuda.set_stream(control)
-            try:
-                self.graph.capture_begin(
-                    pool=self.recording._pool.handle, capture_error_mode="global"
-                )
-            finally:
-                torch.cuda.set_stream(stream)
+            self._contexts.enter_context(vt.graph(
+                self.graph, pool=self.recording._pool.handle, stream=control,
+                reserve_bytes=vt.stats(self.device.index)["allocated_peak"],
+            ))
+            torch.cuda.set_stream(stream)
         except BaseException:
             torch.cuda.set_stream(self._caller)
             self._contexts.close()
@@ -1422,19 +1419,15 @@ class _Graph:
                 mode.__exit__(None, None, None)
         finally:
             try:
-                try:
-                    self.domain.join.record(stream)
-                    control.wait_event(self.domain.join)
-                finally:
-                    # An invalidated capture refuses the join; only its end takes both streams
-                    # out of capture, so the caller's next CUDA call is not inside it (cr-227).
-                    torch.cuda.set_stream(control)
-                    try:
-                        self.graph.capture_end()
-                    finally:
-                        torch.cuda.set_stream(self._caller)
+                self.domain.join.record(stream)
+                control.wait_event(self.domain.join)
             finally:
-                self._contexts.close()
+                try:
+                    # The owner ends actual CUDA capture even when the join was invalidated,
+                    # then completes routing and the Varena capture exclusion exactly once.
+                    self._contexts.close()
+                finally:
+                    torch.cuda.set_stream(self._caller)
         control.synchronize()
         self.domain.graphs.add(self.graph)
 

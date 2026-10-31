@@ -25,6 +25,7 @@ from itertools import pairwise
 from typing import Any, Protocol
 
 import tensorfs
+import tensorfs.varena.torch as vt
 import torch
 from tensorfs import varena
 from tensorfs.raw import parts as stored_parts
@@ -69,12 +70,9 @@ _RESERVE = 512 << 20
 
 
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
-    """Torch's allocated, reserved and peak allocated CUDA bytes in one allocator read.
-    `torch.cuda.memory_allocated` and its siblings each flatten the allocator's whole statistics
-    dict (0.1 ms); a cut site read them three to five times, 5 s of each SDXL request at 3 GB."""
-    stats = torch.cuda.memory_stats_as_nested_dict(device)
-    allocated, reserved = stats["allocated_bytes"]["all"], stats["reserved_bytes"]["all"]
-    return int(allocated["current"]), int(reserved["current"]), int(allocated["peak"])
+    """Working allocation demand/backing/peak; native weight bytes are counted separately."""
+    stats = vt.stats(device.index or 0)
+    return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), int(stats["allocated_peak"])
 
 
 #: Streamed (non-preferred) blocks resident at once: the one the GPU runs, the one entering, and
@@ -1415,7 +1413,10 @@ class Memory:
         if self.cuda:
             try:
                 if budget_bytes is not None:
-                    varena.set_activation_limit(self.device.index or 0, budget_bytes)
+                    raise ResidencyError(
+                        "Varena P0 has no managed-memory cap; use a physical-capacity proof "
+                        "until the working allocator implements this constraint"
+                    )
                 self.native = varena.Arena(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = bool(
@@ -3800,10 +3801,17 @@ class Request:
 
 
 def _allocator(memory: Memory) -> dict[str, int]:
-    """The process's cudaMalloc hook counters on this device (TensorFS `allocator_stats`)."""
+    """Cumulative native working-allocator counters; live/backing gauges are separate."""
     if not memory.cuda or memory.native is None:
         return {}
-    return dict(varena.allocator_stats(memory.device.index or 0))
+    stats = vt.stats(memory.device.index or 0)
+    return {
+        key: int(stats[key])
+        for key in (
+            "allocations", "frees", "ooms", "driver_memory_calls",
+            "event_queries", "event_records", "event_waits",
+        )
+    }
 
 
 def _resident_bytes(block: _Block) -> int:
