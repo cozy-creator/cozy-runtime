@@ -100,6 +100,41 @@ _UNRECORDABLE = "the step cannot be recorded"
 ROWS: dict[str, list[dict[str, Any]]] = {}
 
 
+def _capture_attention_metadata(record: dict[str, Any], graph: Any, func: Any,
+                                args: Any, kwargs: Any, result: Any) -> None:
+    """Temporary xs-138 metadata only: observe this dispatch, never select or execute again."""
+    schema = func._schema
+    if schema.name not in (
+        "aten::_fused_sdp_choice", "aten::scaled_dot_product_attention",
+        "aten::_scaled_dot_product_attention_math", "aten::_scaled_dot_product_flash_attention",
+        "aten::_scaled_dot_product_efficient_attention",
+        "aten::_scaled_dot_product_cudnn_attention",
+    ):
+        return
+    tensors, scalars = {}, {}
+    for position, argument in enumerate(schema.arguments):
+        value = kwargs.get(
+            argument.name, args[position] if position < len(args) else argument.default_value
+        )
+        if isinstance(value, torch.Tensor):
+            tensors[argument.name] = {"dtype": str(value.dtype), "shape": list(value.shape),
+                                      "stride": list(value.stride())}
+        elif value is None or type(value) in (bool, int, float, str):
+            scalars[argument.name] = value
+        elif isinstance(value, (tuple, list)) and all(
+            type(v) in (bool, int, float, str) for v in value
+        ):
+            scalars[argument.name] = list(value)
+    row = {"stage": graph._diagnostic_stage, "graph": record["graph_index"],
+           "graph_steps": graph.steps, "graph_op_index": graph.ops, "op": str(func),
+           "tensors": tensors, "scalars": scalars}
+    if schema.name == "aten::_fused_sdp_choice":
+        # This is the already-computed CPU selector result; never call .item() or the selector.
+        row["selector_result"] = result if type(result) is int else None
+        row["selector_result_type"] = type(result).__name__
+    record["attention"].append(row)
+
+
 def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], phase: Any) -> None:
     if phase is _NONE:
         step(index, *tensors)
@@ -236,11 +271,20 @@ class Loops:
             ROWS.setdefault(request.id, []).append(row)
         # The loop records its own programs: component region graphs neither replay nor learn
         # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        from cozy_runtime.internal.execution import catch
+
+        diagnostic = None
+        if isinstance(key, tuple) and key and key[0] == "sdxl.euler":
+            diagnostic = {"schema": "xs138.capture-metadata/1", "diagnostic_only": True,
+                          "stage": "", "graph_index": -1, "attention": [], "cuts": []}
+            row["capture_metadata"] = diagnostic
+        probe = catch._CAPTURE_METADATA.set(diagnostic)
         bypass = graphs.BYPASS.set(True)
         try:
             self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
         finally:
             graphs.BYPASS.reset(bypass)
+            catch._CAPTURE_METADATA.reset(probe)
             row["at_ms"]["returned"] = _now()
 
     def _run(
@@ -262,10 +306,6 @@ class Loops:
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
-            if isinstance(key, tuple) and key and key[0] == "sdxl.euler":
-                row["eager"] = "xs138 reference: eager only, without tensor observers"
-                loop.eager_all(tensors, ctx)
-                return
             scope, why = _eligible(ctx, steps, tensors)
             if why:
                 row["refusals"].append(why)
@@ -1156,11 +1196,13 @@ def _record_resident(
                 prefix = suffix = None
                 if loop.after is not None and post is not None:
                     suffix = _Graph(recording, state, 1, owners)
+                    suffix._diagnostic_stage = "after"
                     suffix.record(lambda: loop.after(*tensors))  # type: ignore[misc]
                     _lap("record_after")
                     _yield_point()
                 if again and loop.before is not None and pre is not None:
                     prefix = _Graph(recording, state, 1, owners)
+                    prefix._diagnostic_stage = "before"
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
                     _lap("record_before")
             _lap("record")
@@ -1349,6 +1391,7 @@ class _Graph:
         undeclared: tuple[tuple[Any, int, int], ...] = (),
     ) -> None:
         self.recording, self.state, self.steps, self.bindings = recording, state, steps, bindings
+        self._diagnostic_stage = "step"
         self.device = state[0].device
         self.domain = recording._domain
         self.ranges = tuple(
@@ -1554,6 +1597,12 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
     def __init__(self, graph: _Graph) -> None:
         super().__init__()
         self.g = graph
+        from cozy_runtime.internal.execution import catch
+
+        self._metadata = catch._CAPTURE_METADATA.get()
+        if self._metadata is not None:
+            self._metadata["stage"] = graph._diagnostic_stage
+            self._metadata["graph_index"] += 1
 
     def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
         g, kwargs = self.g, kwargs or {}
@@ -1588,6 +1637,8 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
                     g.held[id(tensor)] = tensor
                 inputs.add((tensor.device, tensor.untyped_storage().data_ptr()))
         result = func(*args, **kwargs)
+        if self._metadata is not None:
+            _capture_attention_metadata(self._metadata, g, func, args, kwargs, result)
         g.ops += 1
         for tensor in tree_leaves(result):
             if isinstance(tensor, torch.Tensor):
