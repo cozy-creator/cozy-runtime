@@ -46,7 +46,6 @@ from cozy_runtime.author._markers import (
 from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
-from cozy_runtime.author._video import Implements
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional, walk
 from cozy_runtime.author._weights import WeightsOutput, weights_class
 
@@ -344,8 +343,6 @@ class Declaration:
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
     """Model arguments built, and their weights fetched, on first use (`on_demand=`)."""
-    implements: Implements | None = None
-    """The interface it implements (`implements=`)."""
     parameters: tuple[str, ...] | None = None
     """An invocable's caller parameters; None: a handler, whose request is its struct."""
     parameter_defaults: Mapping[str, object] = field(default_factory=dict)
@@ -525,7 +522,6 @@ def analyze(
     model_on_demand: tuple[str, ...] = (),
     model_prepared_use: Mapping[str, str] | None = None,
     model_classes: Mapping[str, type[Model[Any]]] | None = None,
-    implements: Implements | None = None,
 ) -> Surface:
     """Derive the whole surface from the signature. Every refusal here is a BUILD refusal.
     `model_classes` names a model argument's class in place of its annotation."""
@@ -711,7 +707,6 @@ def analyze(
         model_components=model_components or {},
         model_on_demand=model_on_demand,
         model_prepared_use=model_prepared_use or {},
-        implements=implements,
         parameters=tuple(callers) if invocable else None,
         parameter_defaults={
             name: signature.parameters[name].default
