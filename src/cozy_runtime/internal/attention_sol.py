@@ -695,7 +695,13 @@ def _pin_preprocess() -> None:
 
 
 def _native(
-    query: Tensor, key: Tensor, value: Tensor, scale: float | None, sink_tokens: int, loaded: Loaded
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    scale: float | None,
+    sink_tokens: int,
+    tau: float,
+    loaded: Loaded,
 ) -> Tensor:
     """Call the upstream kernel through the compiled variant; a full-document sink selects
     every KV block. This does not perform the wrapper's protected-query recomputation."""
@@ -710,7 +716,7 @@ def _native(
         value.contiguous(),
         arch=named,
         scale=_SCALE if scale is None else float(scale),
-        tau=1.0,
+        tau=tau,
         thresh_type="exact",
         kv_splits=1,
         sink_tokens=sink_tokens,
@@ -731,7 +737,8 @@ def sol_attention(
 ) -> Tensor:
     """One BF16 NHD document; preserve its prefix and zero explicit trailing padding.
 
-    Policy v1 uses upstream tau=1, exact threshold statistics and one KV split.
+    Policy v1 uses the layout's tau (upstream's 1 by default), exact threshold statistics
+    and one KV split.
     `exact` names threshold computation, not dense-equivalent attention. Initial
     dense steps and paths are explicit model policy in the active layout. Under
     Ulysses this runs after the exchange, on the full document of a head subset;
@@ -896,16 +903,19 @@ def _execute(
             v.contiguous(),
             scale,
             layout.protected_prefix,
+            layout.tau,
             fp8=_EXACT is not None and dense is _dense,
         )
         _validate_result(live_output, q)
         _count("sparse")
     else:
         if sparse is not None:
-            live_output = sparse(q, k, v, scale, layout.protected_prefix)
+            live_output = sparse(q, k, v, scale, layout.protected_prefix, layout.tau)
         else:
             assert loaded is not None
-            live_output = _native(q, k, v, scale, layout.protected_prefix, cast("Loaded", loaded))
+            live_output = _native(
+                q, k, v, scale, layout.protected_prefix, layout.tau, cast("Loaded", loaded)
+            )
         _validate_result(live_output, q)
         if any(
             live_output.untyped_storage().data_ptr() == t.untyped_storage().data_ptr()
