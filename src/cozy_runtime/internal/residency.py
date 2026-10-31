@@ -3494,7 +3494,7 @@ class Request:
         Read on the active phase's first pass only (`Memory._replan` closes it). Kept on the
         Memory: a child call's split and its phase may see different Request objects."""
         memory = self.memory
-        if not memory._flooring or self.idle or not memory.cuda or not torch.cuda.is_initialized():
+        if not memory._flooring or not memory.cuda or not torch.cuda.is_initialized():
             return
         memory._floor = max(memory._floor, _torch_bytes(memory.device)[0] + out_bytes)
 
