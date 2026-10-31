@@ -116,7 +116,10 @@ _LAPS: ContextVar[list[Any] | None] = ContextVar("cozy_loop_laps", default=None)
 @contextmanager
 def _laps(row: dict[str, Any]) -> Iterator[None]:
     """Time a recording call's phases into its row (`parts_ms`)."""
-    token = _LAPS.set([row.setdefault("parts_ms", {}), time.perf_counter()])
+    token = _LAPS.set([
+        row.setdefault("parts_ms", {}), time.perf_counter(),
+        row.setdefault("[DEBUG-xs138-pool]", []),
+    ])
     try:
         yield
     finally:
@@ -1402,9 +1405,23 @@ class _Graph:
             self._contexts.enter_context(kernel_ready.recording())
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
+            reserve = domain.working_peak(self.device.index or 0)
+            if (laps := _LAPS.get()) is not None:
+                # Diagnostic only: observe the failing preparation before CUDA capture starts.
+                stats = vt.stats(self.device.index or 0)
+                laps[2].append({
+                    "reserve_bytes": reserve,
+                    "pool": self.recording._pool.handle,
+                    "steps": self.steps,
+                    "driver_free_total": torch.cuda.mem_get_info(self.device),
+                    **{key: stats[key] for key in (
+                        "allocated_bytes", "allocated_peak", "mapped_bytes", "free_bytes",
+                        "pending_bytes", "pools_bytes", "pools", "ooms",
+                    )},
+                })
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
-                reserve_bytes=domain.working_peak(self.device.index or 0),
+                reserve_bytes=reserve,
             ))
             torch.cuda.set_stream(stream)
         except BaseException as error:
