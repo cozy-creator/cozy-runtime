@@ -30,13 +30,15 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
+import tensorfs.varena.torch as vt
+
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import accel, attention_ulysses, kernel_ready
+from cozy_runtime.internal import attention_ulysses, kernel_ready
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
@@ -69,11 +71,10 @@ def say(key: str, line: str) -> None:
 def capture(
     torch: Any, step: Callable[[], object], pool: domain.Pool, owner: domain.Domain
 ) -> tuple[Any, str]:
-    """Record a caller-owned capture-safe computation in its already prepared pool.
+    """Record a pure computation after preparing Varena's mapped capture pool.
 
-    The caller owns purity, residency, static-data lifetime and all consuming streams. No
-    weight staging or eviction is allowed inside capture. Torch owns the capture pool and its
-    allocation bookkeeping; a failed capture is reset before its caller may try eager execution.
+    Bindings and outputs remain caller-owned. The measured eager working peak seeds pool
+    capacity; a larger actual capture refuses cleanly instead of mapping inside capture.
     """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
@@ -84,32 +85,21 @@ def capture(
     try:
         with (
             kernel_ready.recording(),
-            owner.recovery_blocked(),
-            accel.capture_allocation(torch),
             torch.utils._python_dispatch._disable_current_modes(),
-            torch.cuda.stream(stream),
+            vt.graph(
+                graph, pool=pool.handle, stream=stream,
+                reserve_bytes=domain.working_peak(owner.device),
+            ),
         ):
-            try:
-                graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
-            except Exception as exc:
-                failure = exc
-            else:
+            owner.fork.record(stream)
+            work.wait_event(owner.fork)
+            with torch.cuda.stream(work):
                 try:
-                    owner.fork.record(stream)
-                    work.wait_event(owner.fork)
-                    with torch.cuda.stream(work):
-                        try:
-                            step()
-                        finally:
-                            owner.join.record(work)
-                            stream.wait_event(owner.join)
-                except Exception as exc:
-                    failure = exc
-                try:
-                    graph.capture_end()
-                except Exception as exc:
-                    failure = failure or exc
-    except Building as exc:
+                    step()
+                finally:
+                    owner.join.record(work)
+                    stream.wait_event(owner.join)
+    except Exception as exc:
         failure = exc
     current.wait_stream(stream)
     current.wait_stream(work)
@@ -130,7 +120,7 @@ def capture(
     if failure is not None:
         if fault(failure) in (Fault.STICKY, Fault.DEVICE):
             code = getattr(failure, "error_code", None)
-            if code not in (900, 901):  # unsupported or invalidated capture, already ended
+            if code not in (900, 901):
                 raise failure
         return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
     owner.graphs.add(graph)
@@ -187,7 +177,7 @@ class _Recording:
                     static.copy_(value)
                     copied += static.nbytes
             with self.owner.recovery_blocked(replay=True):
-                self.graph.replay()
+                vt.replay(self.graph, stream=stream)
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
             source = torch.utils._pytree.tree_leaves(self.outputs)
@@ -199,6 +189,7 @@ class _Recording:
         finally:
             self.copied = copied
             self.done.record(stream)
+            vt.record_pool_stream(self.pool.handle, stream)
             self.fenced = True
 
     def close(self) -> None:
@@ -1192,7 +1183,7 @@ def _record(
                     if target is not None:
                         target.copy_(value)
                 with owner.recovery_blocked(replay=True):
-                    graph.replay()  # served only when it reproduces the eager run bit for bit
+                    vt.replay(graph)  # served only when replay reproduces eager bit for bit
                 pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
                 if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
                     why = "its replay differs from the eager run on the same inputs"
