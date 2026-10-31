@@ -72,3 +72,6 @@ KITCHEN_SOL_FP4_FIXED_MEANS = Local(
         "sparse=comfy_kitchen.sol_attn(int8)"
     ),
 )
+KITCHEN_SOL_INT4QK = Local(
+    forward, _named("dense=cozy _attn4(int4 Q·Kᵀ); sparse=comfy_kitchen.sol_attn(int8)")
+)

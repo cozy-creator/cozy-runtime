@@ -183,6 +183,21 @@ target_compile_options(sage3_units PRIVATE -O3 --use_fast_math --expt-relaxed-co
                        $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus>)
 endif()
 
+# INT4 Q·Kᵀ attention (`csrc/attn4`): comfy-kitchen's pure-integer attention kernel at its int4 Q/K
+# instantiation and its INT8 V quantizer, unmodified (Comfy-Org/comfy-kitchen at Runtime's
+# `kernel_sources` pin, Apache-2.0), built with upstream's nvcc flags for the cards with s4 tensor
+# cores: Ampere (8.x, 8.0's cubin serving 8.7) and Ada.
+pinned(KITCHEN_DIR Comfy-Org/comfy-kitchen f8b7e97a1418d2e529bd5405fbf86312be198ae6
+       2053f19423a1cd4092d9278a23e049e17de494f25ddb69c94aa06e728af0ad82)
+set(KITCHEN "${KITCHEN_DIR}/comfy_kitchen/backends/cuda")
+add_library(attn4_units OBJECT csrc/attn4/fwd.cu csrc/attn4/quant.cu
+            "${KITCHEN}/sage_attention/quant_v_int8.cu")
+set_target_properties(attn4_units PROPERTIES CUDA_ARCHITECTURES "80-real;86-real;89-real")
+target_include_directories(attn4_units PRIVATE csrc/attn4 "${KITCHEN}/sage_attention" "${KITCHEN}")
+target_compile_options(attn4_units PRIVATE -O3 --use_fast_math --expt-relaxed-constexpr
+                       --expt-extended-lambda $<$<PLATFORM_ID:Linux>:-Xcompiler=-fno-gnu-unique>
+                       $<$<CXX_COMPILER_ID:MSVC>:-Xcompiler=/Zc:__cplusplus -Xcompiler=/Zc:preprocessor>)
+
 # One module: its binding, its units' objects, the static CUDA runtime.
 function(kernel_module name binding)
     nanobind_add_module(${name} NB_STATIC STABLE_ABI LTO "csrc/${binding}")
@@ -217,6 +232,8 @@ if(COZY_SAGE3)
     kernel_module(_sage3 sage3.cpp sage3_units)
     target_include_directories(_sage3 PRIVATE csrc)
 endif()
+kernel_module(_attn4 attn4.cpp attn4_units)
+target_include_directories(_attn4 PRIVATE csrc)
 
 # RMSNorm plus split-half RoPE (comfy-kitchen v0.2.31's, `csrc/norm/UPSTREAM.md`).
 add_library(rms_rope OBJECT csrc/norm/rms_rope.cu)
