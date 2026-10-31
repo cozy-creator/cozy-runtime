@@ -294,6 +294,16 @@ _ENUM_BASES: dict[str, type[enum.Enum]] = {
     "IntEnum": enum.IntEnum,
     "StrEnum": enum.StrEnum,
 }
+#: The video interfaces (xs-136): types, and bases a package's struct extends.
+_VIDEO_STRUCTS = (
+    "Beat",
+    "ShotAsset",
+    "WorldState",
+    "ShotRequest",
+    "ShotResult",
+    "UpscaleRequest",
+    "UpscaleResult",
+)
 #: Author-surface classes that translate to themselves in a TYPE position.
 _AUTHOR_TYPES = (
     "File",
@@ -318,11 +328,12 @@ _AUTHOR_TYPES = (
     "Region",
     "AspectRatio",
     "Seed",
+    *_VIDEO_STRUCTS,
     *(cls.__name__ for cls in SERVICES.values()),
 )
 #: Author-surface structs a package's struct may extend: the image interface (cr-219) and the
 #: named assets (xs-135).
-_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult", "Asset", "PictureAsset")
+_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult", "Asset", "PictureAsset", *_VIDEO_STRUCTS)
 #: Author-surface callables a folded constant may reach: each validates its own arguments.
 #: `data_values` reads committed JSON through the same function as the imported app.
 _AUTHOR_VALUES = (
@@ -339,6 +350,7 @@ _AUTHOR_VALUES = (
     "QuantizationPlan",
     "SelectionPlan",
     "EncodingRule",
+    "Implements",
 )
 
 #: Struct class keywords `msgspec.defstruct` takes verbatim. `rename` and `array_like` change
@@ -387,6 +399,7 @@ _ENTRYPOINT_KEYWORDS = frozenset(
         "emits_media",
         "weights",
         "accelerator",
+        "implements",
     }
 )
 _INVOCABLE_KEYWORDS = frozenset(
@@ -1466,6 +1479,7 @@ class Registration:
     #: Local execution advice, not a client callable/schema field. Source identity covers it.
     phases: tuple[tuple[str, ...], ...] = ()
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
+    implements: author.Implements | None = None
 
     def declaration(self, **found: Any) -> Declaration:
         """Its record, with what its signature declares (`found`)."""
@@ -1483,6 +1497,7 @@ class Registration:
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
             model_prepared_use=self.model_prepared_use,
+            implements=self.implements,
             **found,
         )
 
@@ -1968,6 +1983,7 @@ def _registration(
     internal = False
     accelerator = True
     hidden = False
+    implements: author.Implements | None = None
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
     phases: tuple[tuple[str, ...], ...] = ()
@@ -2031,6 +2047,10 @@ def _registration(
             if type(value) is not bool:
                 reader.refuse(module, keyword.value, "accelerator is True or False")
             accelerator = value
+        elif keyword.arg == "implements":
+            if not isinstance(value, author.Implements):
+                reader.refuse(module, keyword.value, "implements is an Implements(interface, ...)")
+            implements = value
         elif keyword.arg == "publishes":
             publishes = bool(value)
         elif keyword.arg == "emits_media":
@@ -2061,6 +2081,7 @@ def _registration(
         emits_media=emits_media,
         phases=phases,
         model_prepared_use=uses,
+        implements=implements,
     )
 
 
