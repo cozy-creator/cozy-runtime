@@ -70,7 +70,7 @@ _FLOOR_SHARE = 64
 #: What a cut that cannot run beside all of its phase's weights may hold beyond its finest level:
 #: every byte more is weights the phase re-reads each pass, while pieces this large keep their
 #: launches negligible.
-_PIECE = 1 << 30
+_PIECE = 2 << 30
 
 
 def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
