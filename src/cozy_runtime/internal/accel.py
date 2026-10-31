@@ -22,8 +22,7 @@ import re
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -518,14 +517,12 @@ def drain(torch: Any, kind: str) -> None:
 
 #: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
 #: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
-#: Blocks of 1 GiB and more are never split: a smaller tensor left inside a freed large
-#: block keeps that whole segment, which Torch's OOM path cannot return (H3 Turbo 15 s on an
-#: 8 GB card was refused 1.09 GiB beside 2.15 GiB of such remainders, gate 40822058281).
-#: An unsplit block serves only a request within 20 MiB of its size, so below this size the
-#: cache keeps splitting: at 256 MiB, Qwen-Image's 8 GB decode paid a refused cudaMalloc and
-#: Torch's synchronizing release per VAE tensor (+300 ms, session 40829742644).
+#: Every cached block splits: an unsplit block serves only a request within 20 MiB of its size,
+#: so a 1 GiB limit left H3's attention segments cached beside each pass's peak and cudaMalloc'd
+#: new ones (Turbo 15 s on a 4090: 13.3 s slower, first step 6.2 s, xs-089 runs 23416/23457).
+#: A limit also makes a refused cudaMalloc free oversize blocks, which ends a capture (cr-228).
 #: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
-ALLOCATOR = "backend:native,expandable_segments:False,max_split_size_mb:1024"
+ALLOCATOR = "backend:native,expandable_segments:False"
 #: torch `_native`'s DSLs that compile at an op's first call.
 JIT_DSLS = ("triton", "cutedsl", "helion")
 
@@ -675,35 +672,6 @@ def release_cached(torch: Any, kind: str) -> None:
         row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
         row[0] += 1
         row[1] += freed
-
-
-#: Inside a CUDA capture Torch must not return memory: a refused cudaMalloc there first frees
-#: the capture pool's oversize cached blocks (the path `max_split_size_mb` turns on), and that
-#: cudaFree ends the capture (cr-228: 900 from cuMemFree on every SDXL whole call on an RTX
-#: 3060, one free in the capture, no GC or Runtime release). For a capture's span every block
-#: splits, so the pool serves from what it holds, and a capture that does not fit is refused as
-#: out of memory. Torch resets an unnamed size limit to none; the others keep their values.
-CAPTURE_ALLOCATOR = "expandable_segments:False"
-SPLIT_ALLOCATOR = "max_split_size_mb:1024"
-_CAPTURES = [0]
-_CAPTURES_LOCK = threading.Lock()
-
-
-@contextmanager
-def capture_allocation(torch: Any) -> Iterator[None]:
-    """Torch's allocator for a CUDA capture's span (`CAPTURE_ALLOCATOR`); nested and
-    concurrent captures share it until the last ends."""
-    with _CAPTURES_LOCK:
-        _CAPTURES[0] += 1
-        if _CAPTURES[0] == 1:
-            torch._C._accelerator_setAllocatorSettings(CAPTURE_ALLOCATOR)
-    try:
-        yield
-    finally:
-        with _CAPTURES_LOCK:
-            _CAPTURES[0] -= 1
-            if not _CAPTURES[0]:
-                torch._C._accelerator_setAllocatorSettings(SPLIT_ALLOCATOR)
 
 
 def completion_event(torch: Any, kind: str) -> Any:
