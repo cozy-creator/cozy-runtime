@@ -1,5 +1,7 @@
 """A linear cut by its output features: `rows(linear)(x, start, stop)` is
-`linear(x)[..., start:stop]` computed from weight rows [start, stop) alone. A package cuts a
+`linear(x)[..., start:stop]` computed from weight rows [start, stop) alone; with `out=` (a view,
+e.g. its range of a packed `[..., q | k | v]` buffer a kernel reads whole) it lands there, an
+encoded leaf's GEMM writing it in place. A package cuts a
 projection with it where its consumer reads output features apart (attention's heads), and
 `author.split` sizes the windows, so the whole projection is never live at once.
 
@@ -12,7 +14,7 @@ caller computes the whole."""
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable
+from typing import Protocol
 
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -20,7 +22,10 @@ from torch.nn import functional as F
 from cozy_runtime import lora
 from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8, PreQuantized, readable
 
-type Rows = Callable[[Tensor | PreQuantized, int, int], Tensor]
+class Rows(Protocol):
+    def __call__(
+        self, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None = None
+    ) -> Tensor: ...
 
 #: Encoded leaves whose weight scale is one per output row.
 _ROWWISE = frozenset({INT8_CONVROT, ROWWISE_FP8})
@@ -32,20 +37,28 @@ def rows(linear: nn.Module) -> Rows | None:
     if linear._forward_pre_hooks or any(not isinstance(h, lora.Hook) for h in hooks):
         return None
     if type(linear) is nn.Linear:
-        return lambda x, a, b: _hooked(linear, x, _plain(linear, x, a, b), a, b)
+        return lambda x, a, b, out=None: _hooked(linear, x, _plain(linear, x, a, b, out), a, b)
     if getattr(linear, "provider", None) in _ROWWISE and set(linear.roles()) == {"weight", "scale"}:
-        return lambda x, a, b: _hooked(linear, x, _leaf(linear, x, a, b), a, b)
+        return lambda x, a, b, out=None: _hooked(linear, x, _leaf(linear, x, a, b, out), a, b)
     return None
 
 
-def _plain(linear: nn.Linear, x: Tensor | PreQuantized, start: int, stop: int) -> Tensor:
+def _plain(
+    linear: nn.Linear, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None
+) -> Tensor:
     if isinstance(x, PreQuantized):
         raise ValueError("an nn.Linear takes its float input, not a quantized operand")
     with readable(linear.weight, linear.bias) as (weight, bias):
-        return F.linear(x, weight[start:stop], None if bias is None else bias[start:stop])
+        found = F.linear(x, weight[start:stop], None if bias is None else bias[start:stop])
+    if out is None:
+        return found
+    out.copy_(found)
+    return out
 
 
-def _leaf(leaf: nn.Module, x: Tensor | PreQuantized, start: int, stop: int) -> Tensor:
+def _leaf(
+    leaf: nn.Module, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None
+) -> Tensor:
     """The leaf's own forward over a copy holding its rows: one code path for its GEMM, its
     operand sharing (`quantize_once`) and its autocast rule."""
     with readable(leaf.data, leaf.scale, leaf.bias) as (data, scale, bias):
@@ -58,7 +71,14 @@ def _leaf(leaf: nn.Module, x: Tensor | PreQuantized, start: int, stop: int) -> T
         }
         vars(window)["_forward_hooks"] = {}
         vars(window)["out_features"] = stop - start
-        return window.linear(x, None)
+        # `linear`, never `forward`: a residency wrapper on the leaf's forward is the whole's.
+        if out is not None and window.WRITES_INTO:
+            return window.linear(x, None, out)
+        found = window.linear(x, None)
+    if out is None:
+        return found
+    out.copy_(found)
+    return out
 
 
 def _hooked(

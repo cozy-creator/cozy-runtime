@@ -78,20 +78,23 @@ def gemm(
     scale: Tensor,
     bias: Tensor | None,
     out_dtype: object,
+    out: Tensor | None = None,
 ) -> Tensor:
     """The linear of a quantized operand: the op's GEMM, both scales and the bias in its
-    epilogue, or `_scaled_mm` (fast accumulation, #517b) and the bias after it."""
+    epilogue, or `_scaled_mm` (fast accumulation, #517b) and the bias after it; into `out` where
+    given (`int8_linear.into`)."""
     if _op(torch, operand.payload, out_dtype) is not None:
         try:
-            out = int8_linear.library(operand.payload.get_device()).fp8_gemm(
-                operand.payload, operand.scale, data, scale, bias, out_dtype
-            )
-            return out.view(*operand.shape[:-1], -1)
+            result = int8_linear.library(operand.payload.get_device()).fp8_gemm(
+                operand.payload, operand.scale, data, scale, bias, out_dtype,
+                out=int8_linear.into(out, data.shape[0]),
+            )  # fmt: skip
+            return int8_linear.landed(result.view(*operand.shape[:-1], -1), out)
         except Exception as exc:  # `_scaled_mm` serves this call
             int8_linear.failed(OP, operand.payload.get_device(), exc)
     # `payload.t()` of a contiguous `[out, in]` is the column-major operand `_scaled_mm`
     # wants; its `scale_b` is per output row, rank-1 and rank-2 scales alike.
-    out = torch._scaled_mm(
+    product = torch._scaled_mm(
         operand.payload,
         data.t(),
         scale_a=operand.scale.reshape(-1, 1),
@@ -100,8 +103,8 @@ def gemm(
         use_fast_accum=True,
     )
     if bias is not None:
-        out = out + bias.to(out.dtype)
-    return out.view(*operand.shape[:-1], -1)
+        product = product + bias.to(product.dtype)
+    return int8_linear.landed(product.view(*operand.shape[:-1], -1), out)
 
 
 def linear(

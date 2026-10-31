@@ -30,9 +30,11 @@ def accumulate(
     `chunk` rows, a short tail padded to it (through a temporary)."""
     if not isinstance(x, torch.Tensor):
         raise ValueError("a LoRA update requires the original tensor operand")
-    if not out.is_contiguous():
-        raise ValueError("a LoRA update accumulates into a contiguous base output only")
-    flat, inputs = out.view(-1, out.shape[-1]), x.reshape(-1, x.shape[-1])
+    try:  # a column range of a packed sibling output too: its rows are a strided 2-D view
+        flat = out.view(-1, out.shape[-1])
+    except RuntimeError as exc:
+        raise ValueError("a LoRA update accumulates into a base output whose rows flatten") from exc
+    inputs = x.reshape(-1, x.shape[-1])
     # Each factor read once (`.t()` reads a weight varena holds unbound; `.to` alone defers it)
     down, up = down.to(inputs.dtype).t(), up.to(flat.dtype).t()
     if chunk is None:

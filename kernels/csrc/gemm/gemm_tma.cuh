@@ -89,9 +89,9 @@ using EpilogueOf = std::conditional_t<std::is_same_v<Schedule, Cooperative>,
                                       cutlass::epilogue::TmaWarpSpecialized>;
 #endif
 
-// One tile's launcher: `(q, w, scales, w_scale, bias, out, M, N, K, sms, stream)`.
+// One tile's launcher: `(q, w, scales, w_scale, bias, out, ldo, M, N, K, sms, stream)`.
 using Fn = cudaError_t (*)(const void*, const void*, const float*, const float*, const void*,
-                           void*, int, int, int, int, cudaStream_t);
+                           void*, int64_t, int, int, int, int, cudaStream_t);
 
 template <typename In, typename Out, typename Tile, typename Cluster, typename Schedule>
 struct TmaGemm {
@@ -130,7 +130,7 @@ struct TmaGemm {
     // `cudaLaunchKernelEx` with the cluster and the programmatic dependency on the quantize
     // kernel before it (`rotate.cu`).
     static cudaError_t run(const void* q, const void* w, const float* xs, const float* ws,
-                           const void* bias, void* out, int M, int N, int K, int sms,
+                           const void* bias, void* out, int64_t ldo, int M, int N, int K, int sms,
                            cudaStream_t s) {
         static std::atomic<uint64_t> configured{0};
         int device = 0;
@@ -146,6 +146,10 @@ struct TmaGemm {
         using StrideA = typename Kernel::StrideA;
         using StrideB = typename Kernel::StrideB;
         using StrideD = typename Kernel::StrideD;
+        // D's rows `ldo` apart: N, or a sibling's column range of one wider output.
+        StrideD stride_d = cutlass::make_cute_packed_stride(StrideD{}, make_shape(M, N, 1));
+        cute::get<0>(stride_d) = ldo;
+        cute::get<2>(stride_d) = int64_t(M) * ldo;
         typename Gemm::Arguments args{
             cutlass::gemm::GemmUniversalMode::kGemm,
             {M, N, K, 1},
@@ -153,8 +157,7 @@ struct TmaGemm {
              cutlass::make_cute_packed_stride(StrideA{}, make_shape(M, K, 1)),
              static_cast<const In*>(w),
              cutlass::make_cute_packed_stride(StrideB{}, make_shape(N, K, 1))},
-            {{}, nullptr, {}, static_cast<Out*>(out),
-             cutlass::make_cute_packed_stride(StrideD{}, make_shape(M, N, 1))}};
+            {{}, nullptr, {}, static_cast<Out*>(out), stride_d}};
         args.epilogue.thread = {{xs}, {{ws}, {}, {}}, {static_cast<const Out*>(bias)}, {}};
         args.hw_info.device_id = device;
         args.hw_info.sm_count = sms;
@@ -175,9 +178,10 @@ struct TmaGemm {
 template <int Count>
 cudaError_t launch(const Fn (&bf16)[Count], const Fn (&fp16)[Count], int config, bool out_half,
                    const void* q, const void* w, const float* xs, const float* ws,
-                   const void* bias, void* out, int M, int N, int K, int sms, cudaStream_t s) {
+                   const void* bias, void* out, int64_t ldo, int M, int N, int K, int sms,
+                   cudaStream_t s) {
     if (config >= Count) return cudaErrorNotSupported;
-    return (out_half ? fp16 : bf16)[config](q, w, xs, ws, bias, out, M, N, K, sms, s);
+    return (out_half ? fp16 : bf16)[config](q, w, xs, ws, bias, out, ldo, M, N, K, sms, s);
 }
 
 }  // namespace cozy_int8::COZY_FAMILY

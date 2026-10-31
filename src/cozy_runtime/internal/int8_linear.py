@@ -362,18 +362,40 @@ def gemm(
     scale: Tensor,
     bias: Tensor | None,
     out_dtype: object,
+    out: Tensor | None = None,
 ) -> Tensor:
     """The linear of a `quantize`d operand: the op's GEMM, both scales and the bias in its
-    epilogue."""
+    epilogue; into `out` where given (`into`)."""
+    rows = into(out, data.shape[0])
     try:
-        out = _LIBS[operand.payload.get_device()].int8_gemm(
-            operand.payload, operand.scale, data, scale, bias, out_dtype
+        result = _LIBS[operand.payload.get_device()].int8_gemm(
+            operand.payload, operand.scale, data, scale, bias, out_dtype, out=rows
         )
     except Exception as exc:  # torch's int8 GEMM serves this call
         failed(OP, operand.payload.get_device(), exc)
-        out = _product(torch, operand.payload, operand.scale, data, scale, out_dtype)
-        out = out if bias is None else out + bias.to(out.dtype)
-    return out.view(*operand.shape[:-1], -1)
+        result = _product(torch, operand.payload, operand.scale, data, scale, out_dtype)
+        result = result if bias is None else result + bias.to(result.dtype)
+    return landed(result.view(*operand.shape[:-1], -1), out)
+
+
+def into(out: Tensor | None, n: int) -> Tensor | None:
+    """`out`'s rows as the `[M, n]` view a GEMM writes, None where they do not flatten (its
+    caller then copies into `out`)."""
+    if out is None:
+        return None
+    try:
+        return out.view(-1, n)
+    except RuntimeError:
+        return None
+
+
+def landed(result: Tensor, out: Tensor | None) -> Tensor:
+    """`result`, in `out` where one was given; a GEMM that wrote `out` in place already did."""
+    if out is None:
+        return result
+    if result.data_ptr() != out.data_ptr():  # fresh storage: the GEMM did not write `out`
+        out.copy_(result)
+    return out
 
 
 def eager(torch: ModuleType, x: Tensor, data: Tensor, scale: Tensor, out_dtype: Tensor) -> Tensor:
