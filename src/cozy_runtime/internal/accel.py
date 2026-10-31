@@ -28,7 +28,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
-from tensorfs import varena
+import tensorfs.varena.torch as vt
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
@@ -515,14 +515,6 @@ def drain(torch: Any, kind: str) -> None:
         torch.cuda.current_stream().synchronize()
 
 
-#: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
-#: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
-#: Every cached block splits: an unsplit block serves only a request within 20 MiB of its size,
-#: so a 1 GiB limit left H3's attention segments cached beside each pass's peak and cudaMalloc'd
-#: new ones (Turbo 15 s on a 4090: 13.3 s slower, first step 6.2 s, xs-089 runs 23416/23457).
-#: A limit also makes a refused cudaMalloc free oversize blocks, which ends a capture (cr-228).
-#: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
-ALLOCATOR = "backend:native,expandable_segments:False"
 #: torch `_native`'s DSLs that compile at an op's first call.
 JIT_DSLS = ("triton", "cutedsl", "helion")
 
@@ -544,13 +536,12 @@ def initialize(torch: Any, kind: str) -> None:
         native = getattr(torch, "_native", None)
         if native is not None:
             native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
-        torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         try:
-            varena.install_allocator()
+            vt.install()
         except (ImportError, AttributeError, RuntimeError) as exc:
             if fault(exc) is not Fault.OTHER:
                 raise
-            raise ResidencyError(f"native CUDA allocation recovery is unavailable: {exc}") from exc
+            raise ResidencyError(f"native CUDA allocator is unavailable: {exc}") from exc
         torch.cuda.init()
 
 
