@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -185,18 +187,105 @@ def quantize_once(*tensors: Any) -> Iterator[None]:
         _SHARED.reset(token)
 
 
+@dataclass(slots=True)
+class _Recent:
+    """The operand an encoded leaf last quantized on this thread, while sibling leaves may still
+    read the same input: `tensor` unchanged (its version, storage and geometry) and `provider`'s.
+    `left` is how many more its maker's group read (learned), None until it is known."""
+
+    tensor: weakref.ref[Any] | None
+    version: int
+    key: tuple[object, ...]
+    provider: str
+    operand: PreQuantized | None
+    maker: Any
+    uses: int
+    left: int | None
+
+
+_RECENT = threading.local()
+
+
+def _geometry(x: Any) -> tuple[object, ...]:
+    return (x.data_ptr(), tuple(x.shape), tuple(x.stride()), x.dtype)
+
+
+def _retire(held: _Recent) -> None:
+    """Drop the held operand at once (its device memory returns now, not at a cycle collection);
+    its maker learns how many leaves read it, the most it has seen."""
+    if getattr(_RECENT, "held", None) is held:
+        _RECENT.held = None
+    if held.maker is not None:
+        held.maker._cozy_siblings = max(getattr(held.maker, "_cozy_siblings", 1), held.uses)
+    held.operand = held.maker = held.tensor = None
+
+
+#: The group whose last learned reader just retired its operand: (input, version, geometry, maker).
+_RECENT.last = None
+
+
 def shared_operand(
-    x: Any, provider: str, make: Callable[[], PreQuantized | None]
+    x: Any, provider: str, make: Callable[[], PreQuantized | None], consumer: Any = None
 ) -> PreQuantized | None:
-    """`provider`'s operand for `x` inside a `quantize_once` scope that holds it, `make()` by the
-    first leaf to ask; None outside one, or when `make` declines (the leaf's own op then serves
-    it)."""
+    """`provider`'s operand for `x`, `make()` by the first leaf to ask, the rest reading it: inside
+    a `quantize_once` scope that holds `x`, and otherwise for the sibling leaves that read one
+    unchanged input in a row (q, k and v of one normed input, an MLP's gate and up, any model).
+    Outside a scope the operand is held only until the leaves that read it before (`consumer`'s
+    learned group) have read it again, another input is quantized, or `x` is freed: one operand
+    held at most, never a stale one. No `consumer` (a leaf recording a graph), or an inference
+    tensor (no version counter to see an in-place change by), shares in scopes only. None when
+    `make` declines (the leaf's own op serves it)."""
     for shared in _SHARED.get():
         if shared.tensor is x:
             if provider not in shared.operands:
                 shared.operands[provider] = make()
             return shared.operands[provider]
-    return None
+    held: _Recent | None = getattr(_RECENT, "held", None)
+    if consumer is None or x.is_inference():  # an inference tensor counts no in-place change
+        if held is not None:
+            _retire(held)
+        return None
+    if (
+        held is not None
+        and held.tensor is not None
+        and held.provider == provider
+        and held.tensor() is x
+        and held.version == x._version
+        and held.key == _geometry(x)
+    ):
+        held.uses += 1
+        operand = held.operand
+        if held.left is not None:
+            held.left -= 1
+            if held.left <= 0:
+                # Its group has read it; one more reader of the same input grows the group.
+                _RECENT.last = (held.tensor, held.version, held.key, held.maker)
+                _retire(held)
+        return operand
+    if held is not None:
+        _retire(held)
+    last = getattr(_RECENT, "last", None)
+    _RECENT.last = None
+    if last is not None and last[0]() is x and last[1:3] == (x._version, _geometry(x)):
+        last[3]._cozy_siblings += 1
+    operand = make()
+    if operand is None:
+        return None
+    group = getattr(consumer, "_cozy_siblings", None)
+    if group == 1:  # this leaf reads its input alone: nothing to hold
+        return operand
+    entry = _Recent(
+        weakref.ref(x, lambda _: _retire(entry)),
+        x._version,
+        _geometry(x),
+        provider,
+        operand,
+        consumer,
+        1,
+        None if group is None else group - 1,
+    )
+    _RECENT.held = entry
+    return operand
 
 
 def int8_rows(
@@ -218,7 +307,8 @@ def int8_rows(
     alone: x is `[..., 2F]`, each row its [hidden | gate] halves, and the F-wide rows are
     `4 tanh(g / 4) sigmoid(g) * 25 tanh(h / 25)` (MOSS-Image's SiTU). `activation="swiglu"`
     stands alone too: x is the gate rows and `up` the up rows of its shape, and the rows are
-    `silu(x) * up`, rounded as an eager SwiGLU rounds them.
+    `silu(x) * up`, rounded as an eager SwiGLU rounds them; without `up`, x is `[..., 2F]`, each
+    row the [up | gate] halves of one fused projection (Diffusers' `SwiGLU`).
 
     None unless every consumer is an un-hooked encoded leaf taking int8.convrot's operand (an int8
     or w4a8 leaf) of x's width and the op serves this card: the caller then runs its own ops."""

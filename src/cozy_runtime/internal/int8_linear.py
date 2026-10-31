@@ -318,12 +318,13 @@ def prologue(
     of `consumers` is an un-hooked leaf of the rows' width taking int8.convrot's operand and the
     op serves this card; else None. A gated activation (`GATED`) reads x's [hidden | gate] halves
     alone: the rows are half x's width. `swiglu` reads x as the gate rows and `up` as the up rows
-    of the same shape, alone: `silu(x) * up` as an eager SwiGLU rounds it."""
-    gated = activation in GATED
+    of the same shape, alone: `silu(x) * up` as an eager SwiGLU rounds it; without `up` it is
+    gated, x's rows the [up | gate] halves of one fused projection (Diffusers' `SwiGLU`)."""
+    gated = activation in GATED or (activation == "swiglu" and up is None)
     if gated and (norm is not None or scale is not None or shift is not None or x.shape[-1] % 2):
         raise ValueError(f"int8_rows: {activation} takes [hidden | gate] rows, no norm or tables")
-    if (activation == "swiglu") != (up is not None) or (
-        up is not None and (norm is not None or scale is not None or shift is not None)
+    if up is not None and (
+        activation != "swiglu" or norm is not None or scale is not None or shift is not None
     ):
         raise ValueError("int8_rows: swiglu takes gate and up rows, no norm or tables")
     if up is not None and (up.shape != x.shape or up.dtype != x.dtype or not up.is_cuda):
