@@ -1459,7 +1459,7 @@ class _Graph:
         self.held.clear()
 
     def record(self, body: Callable[[], object]) -> None:
-        probe = _Probe(self.device)
+        probe = _Probe(self.device, getattr(self.recording._pool, "handle", None))
         self.begin()
         try:
             body()
@@ -1808,19 +1808,38 @@ def install() -> None:
 class _Probe:
     """DIAGNOSTIC (cr-228, never merged): what freed device memory inside a capture."""
 
-    def __init__(self, device: Any) -> None:
+    def __init__(self, device: Any, pool: Any = None) -> None:
         from cozy_runtime.internal import accel
 
-        self.device, self.accel = device, accel
+        self.device, self.accel, self.pool = device, accel, pool
         self.gcs: list[str] = []
         self.free, self.total = torch.cuda.mem_get_info(device)
         self.allocated = torch.cuda.memory_allocated(device)
         self.reserved = torch.cuda.memory_reserved(device)
         self.stats = dict(torch.cuda.memory_stats(device))
         self.released = {k: list(v) for k, v in accel.RELEASED.items()}
+        version = ctypes.c_int(0)
+        _DRIVER.cuDriverGetVersion(ctypes.byref(version))
+        self.api = version.value
+        self.pools = self._pools()
         self.began = time.time() * 1e6
         gc.callbacks.append(self._gc)
         torch.cuda.memory._record_memory_history(max_entries=200000, stacks="python")
+
+    def _pools(self) -> str:
+        rows: dict[str, list[int]] = {}
+        for seg in torch.cuda.memory._snapshot().get("segments", []):
+            if seg.get("device") != (self.device.index or 0):
+                continue
+            pool = str(tuple(seg.get("segment_pool_id", (0, 0))))
+            row = rows.setdefault(pool, [0, 0, 0, 0])
+            row[0] += seg.get("total_size", 0) >> 20
+            for block in seg.get("blocks", []):
+                if block.get("state") == "inactive":
+                    row[1] += block.get("size", 0) >> 20
+                    row[2] = max(row[2], block.get("size", 0) >> 20)
+                    row[3] += block.get("size", 0) >= 1 << 30
+        return "; ".join(f"pool {k}: {v[0]} MiB, free {v[1]} (largest {v[2]}, >=1GiB {v[3]})" for k, v in rows.items())
 
     def _gc(self, phase: str, info: dict[str, Any]) -> None:
         if phase == "start":
@@ -1835,17 +1854,24 @@ class _Probe:
             torch.cuda.memory._record_memory_history(enabled=None)
         index = self.device.index or 0
         traces = snap.get("device_traces", [])
-        events = []
-        for row in traces[index] if index < len(traces) else []:
-            if row.get("time_us", 0) < self.began:
-                continue
-            if row.get("action") in ("segment_free", "segment_unmap", "oom", "segment_alloc"):
+        rows = [r for r in (traces[index] if index < len(traces) else []) if r.get("time_us", 0) >= self.began]
+        frees, allocs, last = [], [0, 0], None
+        for row in rows:
+            action = row.get("action")
+            if action == "alloc":
+                last = row.get("size", 0) >> 20
+            if action == "segment_alloc":
+                allocs[0] += 1
+                allocs[1] += row.get("size", 0) >> 20
+            if action in ("segment_free", "segment_unmap", "oom"):
                 frames = [
                     f"{f.get('filename', '').rpartition('/')[2]}:{f.get('line')}:{f.get('name')}"
                     for f in row.get("frames", [])
-                    if "torch/" not in f.get("filename", "") or "cozy" in f.get("filename", "")
-                ][:7]
-                events.append(f"{row['action']} {row.get('size', 0) >> 20}MiB {frames}")
+                ][:14]
+                frees.append(
+                    f"{action} {row.get('size', 0) >> 20}MiB stream {row.get('stream')} "
+                    f"after a request of {last}MiB, segments so far {allocs}, frames {frames}"
+                )
         stats = torch.cuda.memory_stats(self.device)
         moved = {
             k: stats.get(k, 0) - self.stats.get(k, 0)
@@ -1857,8 +1883,8 @@ class _Probe:
             if v[0] != self.released.get(k, [0, 0])[0]
         }
         return (
-            f"before: free {self.free >> 20} of {self.total >> 20} MiB, torch allocated "
-            f"{self.allocated >> 20} reserved {self.reserved >> 20} MiB; inside: torch {moved}, "
-            f"release_cached {released}, gc {self.gcs[:12]} ({len(self.gcs)}), "
-            f"segment events {len(events)}: {events[:6]}"
-        )[:3000]
+            f"driver API {self.api}; before: free {self.free >> 20} of {self.total >> 20} MiB, torch "
+            f"allocated {self.allocated >> 20} reserved {self.reserved >> 20} MiB; recording pool "
+            f"{self.pool}; {self.pools}; inside: torch {moved}, segment allocs {allocs}, "
+            f"release_cached {released}, gc {self.gcs[:12]} ({len(self.gcs)}), frees: {frees}"
+        )[:6000]
