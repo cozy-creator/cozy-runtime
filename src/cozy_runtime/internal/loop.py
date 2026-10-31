@@ -237,6 +237,9 @@ class Loops:
             ROWS.setdefault(request.id, []).append(row)
         # The loop records its own programs: component region graphs neither replay nor learn
         # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        if cache is not None and _ranks() > 1:  # each rank's verdict would differ
+            row["refusals"].append("step cache: off across ranks (its sums are not all-reduced)")
+            cache = None
         bypass = graphs.BYPASS.set(True)
         try:
             loop = _Loop(step, steps, phases, on_step, before, after)
@@ -555,6 +558,11 @@ class _Loop:
         _once(self.before, tensors)
         self.eager(self.steps, tensors, ctx)
         _once(self.after, tensors)
+
+
+def _ranks() -> int:
+    dist = torch.distributed
+    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
 
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
