@@ -525,7 +525,7 @@ def drain(torch: Any, kind: str) -> None:
 #: cache keeps splitting: at 256 MiB, Qwen-Image's 8 GB decode paid a refused cudaMalloc and
 #: Torch's synchronizing release per VAE tensor (+300 ms, session 40829742644).
 #: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
-ALLOCATOR = "backend:native,expandable_segments:False,max_split_size_mb:1024"
+ALLOCATOR = "backend:native,expandable_segments:False"
 #: torch `_native`'s DSLs that compile at an op's first call.
 JIT_DSLS = ("triton", "cutedsl", "helion")
 
@@ -684,7 +684,7 @@ def release_cached(torch: Any, kind: str) -> None:
 #: splits, so the pool serves from what it holds, and a capture that does not fit is refused as
 #: out of memory. Torch resets an unnamed size limit to none; the others keep their values.
 CAPTURE_ALLOCATOR = "expandable_segments:False"
-SPLIT_ALLOCATOR = "max_split_size_mb:1024"
+SPLIT_ALLOCATOR = "expandable_segments:False"
 _CAPTURES = [0]
 _CAPTURES_LOCK = threading.Lock()
 
