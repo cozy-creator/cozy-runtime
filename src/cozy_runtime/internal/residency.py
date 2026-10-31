@@ -1733,7 +1733,10 @@ class Memory:
             ).hexdigest()
             model.identity = model.wanted_identity()
             self.window_bytes = max(
-                [self.window_bytes, *(_STREAMED * b.allocation_bytes for b in model.groups())]
+                [
+                    self.window_bytes,
+                    *(_STREAMED * b.allocation_bytes for b in model.groups() if not b.table),
+                ]
             )
             self.native.set_streaming_limit(self.window_bytes)
         why = unpaged(module, rule, sizes)
@@ -2533,9 +2536,7 @@ class Memory:
                 block.preferred = free >= wanted
             block.preference_set = True
             if not block.preferred:
-                model.prefix = (
-                    min(model.prefix, block.index) if model.prefix is not None else block.index
-                )
+                _shorten(block)
             for held, protect in (
                 (block.region, not block.final_only()),
                 (block.final_region, True),
@@ -2547,9 +2548,7 @@ class Memory:
         if block.preferred and (final or not block.final_only()) and not region.preferred:
             # Native activation recovery reduces the prefix without calling Python. Keep
             # later unprepared blocks on the streaming side of that same watermark.
-            model.prefix = (
-                min(model.prefix, block.index) if model.prefix is not None else block.index
-            )
+            _shorten(block)
             block.preferred = False
         return region
 
@@ -2667,7 +2666,7 @@ class Memory:
         # An unrelated registered model must not enlarge this phase's streaming
         # headroom. Native admission still permits an unexpectedly larger group.
         self.window_bytes = _STREAMED * max(
-            (b.allocation_bytes for m in incoming for b in m.groups()), default=0
+            (b.allocation_bytes for m in incoming for b in m.groups() if not b.table), default=0
         )
         self.native.set_streaming_limit(self.window_bytes)
         missing = 0
@@ -2774,9 +2773,7 @@ class Memory:
             # a smaller resident prefix. Retire eligible owners only after this miss;
             # retry the allocation only if reclamation actually returned memory.
             block.preferred = False
-            model.prefix = (
-                min(model.prefix, block.index) if model.prefix is not None else block.index
-            )
+            _shorten(block)
             region.set_preferred(False)
             if not self.reclaim(needed, current={model.name}):
                 raise
@@ -2896,6 +2893,7 @@ class Memory:
             or (request is not None and request.idle)
             or block.aliases is None
             or not block.storage_bytes
+            or block.gathered is not None
         ):
             return
         overlay = None
@@ -3324,7 +3322,7 @@ class Memory:
             )
             tensors = model.source.ck.components[model.source.component].tensors
             data: dict[str, dict[str, Tensor]] = {}
-            offset = 0
+            offset, began = 0, time.perf_counter_ns()
             for key, parts in block.parts.items():
                 views = data[key] = {}
                 for role, part in parts.items():
@@ -3333,6 +3331,8 @@ class Memory:
                         self._read_into(tensors, key, into, part.role or None)
                     views[role] = _view(key, role, part, into)
                     offset += (part.nbytes + 255) // 256 * 256
+            if stored and (request := _REQUEST.get()) is not None:
+                request.read(block, time.perf_counter_ns() - began, block.nbytes)
             if stored and model.fill is not None:
                 model.fill(block.path, data)
             finals: dict[str, dict[str, Tensor]] = {}
@@ -3353,6 +3353,8 @@ class Memory:
             block.data, block.final_data, block.ready = block.gathered[1], block.gathered[2], None
             block.final_use = None
             block.generation += 1
+        if (request := _REQUEST.get()) is not None:
+            request.gathered += 1
 
     def _read_into(self, tensors: Any, key: str, raw: Tensor, role: str | None) -> None:
         if self.device.type != "mps":
@@ -3677,6 +3679,8 @@ class Request:
         self.moved = self.read_ns = 0
         self.baked_hits = self.baked_bytes = self.baked_ns = 0
         self.final_fills = self.final_hits = 0
+        #: table lookups served on the host (`Memory._gather`)
+        self.gathered = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
         self.prefetch_released = 0
@@ -3850,6 +3854,7 @@ class Request:
             "phases": list(self.phase_changes),
             "phase_policy_supported": self.memory.phase_supported,
             "room_first_pass": self.room_first,
+            "gathered": self.gathered,
             "host": None,
         }
         if self.memory.cuda and torch.cuda.is_initialized():
@@ -3937,6 +3942,15 @@ def _sites(module: nn.Module) -> dict[str, list[_Site]]:
                 if not any(s.table is table and s.name == attr for s in sites):
                     sites.append(_Site(table, attr, parameter))
     return {name: groups[key] for name, key in names.items()}
+
+
+def _shorten(block: _Block) -> None:
+    """`block` does not stay resident: its model's resident prefix ends before it. A table's does
+    not end there: one that does not fit gathers (`Memory._gather`) and the blocks after it may
+    still stay (a 1.2 GB text-encoder table ahead of every layer streamed them all)."""
+    model = block.model
+    if not block.table:
+        model.prefix = min(model.prefix, block.index) if model.prefix is not None else block.index
 
 
 def _view(key: str, role: str, part: _Part, raw: Tensor) -> Tensor:
