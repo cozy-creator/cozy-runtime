@@ -30,6 +30,9 @@ Video = Annotated[VideoFile, FileBound(max_bytes=1 << 30, max_decoded_bytes=2 <<
 #: A shot's own latents, in its renderer's format and opaque to the caller: an upscaler of the same
 #: model starts from them instead of re-encoding the video (the shot's real latent, not a decode's).
 Latents = Annotated[File, FileBound(max_bytes=1 << 30, media_types=("application/octet-stream",))]
+#: Speed against fidelity, as a video encoder's presets: `quality` the slowest and closest to the
+#: model's reference, `fast` the quickest; each renderer or upscaler maps them to its own recipes.
+Preset = Literal["quality", "balanced", "fast"]
 
 
 class Implements(msgspec.Struct, frozen=True, omit_defaults=True):
@@ -88,6 +91,7 @@ class ShotRequest(msgspec.Struct, kw_only=True):
     writes: list[Literal["first", "last"] | Annotated[float, msgspec.Meta(ge=0)]] = msgspec.field(
         default_factory=list
     )
+    preset: Preset = "balanced"
 
 
 class ShotResult(msgspec.Struct):
@@ -109,6 +113,7 @@ class UpscaleRequest(msgspec.Struct, kw_only=True):
     #: The `latents` the shot came with. An upscaler that reads them starts from them; without
     #: them, or one that cannot, it works from `video`.
     latents: Latents | None = None
+    preset: Preset = "balanced"
 
 
 class UpscaleResult(msgspec.Struct):
