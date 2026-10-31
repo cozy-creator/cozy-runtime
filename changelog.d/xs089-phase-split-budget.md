@@ -1,0 +1,1 @@
+A pure split sizes against free, Torch-cached and other phases' idle bytes, never the running phase's own weights, and only its floor level may evict them; a streaming phase whose weights would all fit beside a smaller activation budget re-plans once after its first pass (H3 15 s on a 32 GB card).

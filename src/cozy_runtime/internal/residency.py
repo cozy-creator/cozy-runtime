@@ -81,6 +81,9 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
 #: the next one being read. The read takes the oldest completed block's room (Varena evicts it on
 #: its last-consumer events, never waiting), so it overlaps compute instead of following it.
 _STREAMED = 3
+#: Re-plans of one phase's activation budget (`Memory._replan`): its first, and tightenings by
+#: a pass's overshoot.
+_PLANS = 3
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
@@ -136,6 +139,9 @@ class Room:
     #: Torch's reserved, unallocated bytes: a cut's level and its pre-reclaim count them (its
     #: activations reuse them first); a reclaim returns them before weights.
     cached: int = 0
+    #: What a re-planned phase leaves its activations beyond those live now (`Memory._replan`);
+    #: None while the phase has no plan.
+    budget: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1349,6 +1355,10 @@ class Memory:
         self.phase_supported = False
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
+        #: The active phase's activation budget once a re-plan made its weights all wanted
+        #: (`_replan`), and how many re-plans it has had.
+        self._split_budget: int | None = None
+        self._plans = 0
         self._forward_depth = 0
         #: (set, block, fill identity, overlay) -> a refilled block's baked bytes in host RAM:
         #: its next refill copies them back, with no store read, factor read or bake
@@ -1458,7 +1468,7 @@ class Memory:
             # on a 4090: one coarser FFN cut evicted 20 transformer blocks, re-read and re-baked).
             stats = self.native.stats()
             reclaimable = int(stats["reclaimable_bytes"])
-            own = min(int(stats.get("preferred_bytes", 0)), reclaimable)
+            own = min(int(stats.get("preferred_bytes", 0)) + self._own_idle(), reclaimable)
             # Pure-cut workspace estimates still use Torch's allocation granularity.
             return Room(int(free), reclaimable - own, own)
         with self.lock:
@@ -1476,6 +1486,22 @@ class Memory:
                         else:
                             cold += block.nbytes
         return Room(int(free), cold, warm)
+
+    def _own_idle(self) -> int:
+        """The active phase's resident, idle, unpreferred weight bytes (its streamed blocks'
+        cache): weights of the running phase, never room for its activations (`Room.cold`)."""
+        names = self._phase_names or ()
+        total = 0
+        for model in self.models.values():
+            if model.name not in names:
+                continue
+            for block in model.groups():
+                if block.count or block.retained or block.loading:
+                    continue
+                for region in (block.region, block.final_region):
+                    if region is not None and region.resident and not region.preferred:
+                        total += int(region.allocated_bytes)
+        return total
 
     def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         level = Level(level) if isinstance(level, str) else level
@@ -2354,69 +2380,132 @@ class Memory:
             if self._active_beside(request):
                 return
             if names == self._phase_names and request_id == self._phase_request:
+                self._replan(request)  # a later pass of the active phase
                 return
-            self._settle_prefetch(cancel=True)
-            self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
             self._phase_names, self._phase_request = names, request_id
-            incoming = [m for m in self.models.values() if m.name in names]
-            # An unrelated registered model must not enlarge this phase's streaming
-            # headroom. Native admission still permits an unexpectedly larger group.
-            self.window_bytes = _STREAMED * max(
-                (b.allocation_bytes for m in incoming for b in m.groups()), default=0
+            self._split_budget, self._plans = None, 0
+            self._plan_phase(request)
+
+    def _replan(self, request: Request | None) -> None:
+        """A later pass of the active phase. Its first pass sized each split against free and
+        cached room while the phase's weights were still arriving, so Torch reserved what the
+        coarsest levels needed and the weights streamed around it. Where the phase's weights
+        would all fit beside a smaller activation budget (the card, less what lives outside
+        Torch and weights, its weights and `_RESERVE`), splits size within that budget from here
+        and the weights are all wanted; a pass that still evicted them tightens the budget by
+        its overshoot (`_PLANS` times at most). A budget under twice the activations live between
+        passes is no plan: no exact split gets that low. Caller holds the lock."""
+        if self._plans >= _PLANS or not self.cuda or (self._fits and self._split_budget is None):
+            return
+        names = self._phase_names or frozenset()
+        incoming = [m for m in self.models.values() if m.name in names]
+        g = self.granularity
+        weights = held = 0
+        for member in incoming:
+            for block in member.groups():
+                required = [(block.final_region, block.final_bytes)]
+                if not block.final_only():
+                    required.append((block.region, block.storage_bytes))
+                for region, size in required:
+                    if not size:
+                        continue
+                    weights += (size + g - 1) // g * g
+                    if region is not None and region.resident:
+                        held += (size + g - 1) // g * g
+        free, total = (int(n) for n in torch.cuda.mem_get_info(self.device))
+        allocated, reserved, _ = _torch_bytes(self.device)
+        resident = int(self.native.stats()["resident_bytes"])
+        budget = total - max(total - free - reserved - resident, 0) - weights - _RESERVE
+        planned = self._split_budget
+        if planned is not None:
+            if held >= weights:
+                return  # the plan holds: the phase stays resident
+            budget = min(budget, planned - max(reserved - planned, g))
+        elif budget >= reserved:
+            return  # its activations already fit beside its weights; something else streams
+        replan = {
+            "pass_reserved_bytes": reserved,
+            "live_bytes": allocated,
+            "weights_bytes": weights,
+            "held_bytes": held,
+            "budget_bytes": budget,
+        }
+        if budget < 2 * allocated:
+            if planned is None:
+                return  # no split takes activations this low: the phase streams as planned
+            self._split_budget, self._plans = None, _PLANS  # the plan failed: stream again
+            replan["abandoned"] = True
+        else:
+            self._split_budget, self._plans = budget, self._plans + 1
+        release_cached(torch, self.device.type)  # the last pass's coarse pieces' cache
+        self._plan_phase(request, replan)
+
+    def _plan_phase(self, request: Request | None, replan: dict[str, Any] | None = None) -> None:
+        """The active phase's residency: its resident blocks preferred, the rest wanted by
+        demand; a streaming window unless its missing bytes fit. Caller holds the lock."""
+        names = self._phase_names or frozenset()
+        self._settle_prefetch(cancel=True)
+        self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
+        incoming = [m for m in self.models.values() if m.name in names]
+        # An unrelated registered model must not enlarge this phase's streaming
+        # headroom. Native admission still permits an unexpectedly larger group.
+        self.window_bytes = _STREAMED * max(
+            (b.allocation_bytes for m in incoming for b in m.groups()), default=0
+        )
+        self.native.set_streaming_limit(self.window_bytes)
+        missing = 0
+        for member in incoming:
+            member.prefix = None
+            for block in member.groups():
+                block.preferred = block.preference_set = False
+                required = [(block.final_region, block.final_bytes)]
+                if not block.final_only():
+                    required.append((block.region, block.storage_bytes))
+                for region, size in required:
+                    if not size:
+                        continue
+                    if region is not None and region.resident:
+                        region.set_preferred(True)
+                    else:
+                        missing += (
+                            (size + self.granularity - 1) // self.granularity * self.granularity
+                        )
+                if block.cached():
+                    block.preferred = block.preference_set = True
+        allocated, before, _ = _torch_bytes(self.device)
+        unused = max(before - allocated, 0)
+        if unused:
+            # The previous phase's inactive Torch segments are neither weight capacity nor
+            # this phase's activations. Returned once here, not by Torch inside the first op
+            # of this phase that does not fit (Krea 2's 2048² decode: 1.1 s, not 1.3 s).
+            torch.cuda.empty_cache()
+        returned = max(before - _torch_bytes(self.device)[1], 0)
+        # Protect the incoming cached bytes above; only other phases' idle backing may go.
+        # A phase whose missing bytes then fit streams nothing and reserves no window: a
+        # window beside resident weights only evicts another phase's (a 4.3 GB text
+        # encoder's 13 GB window took 3.9 GB of an idle DiT every request).
+        need = missing - self.room().free
+        reclaimed = int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
+        self._fits = missing <= self.room().free
+        need = 0 if self._fits else missing + self.window_bytes - self.room().free
+        reclaimed += int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
+        if request is not None:
+            request.phase_changes.append(
+                {
+                    "models": sorted(names),
+                    **({"replan": replan} if replan is not None else {}),
+                    "window_bytes": self.window_bytes,
+                    "fits": self._fits,
+                    "missing_bytes": missing,
+                    "torch_unused_bytes": unused,
+                    "torch_returned_bytes": returned,
+                    "native_reclaimed_bytes": reclaimed,
+                    # Cumulative snapshot; an older native wheel has no reason counters.
+                    "native_reclaimed_by_reason": self.native.stats().get(
+                        "reclaimed_by_reason"
+                    ),
+                }
             )
-            self.native.set_streaming_limit(self.window_bytes)
-            missing = 0
-            for member in incoming:
-                member.prefix = None
-                for block in member.groups():
-                    block.preferred = block.preference_set = False
-                    required = [(block.final_region, block.final_bytes)]
-                    if not block.final_only():
-                        required.append((block.region, block.storage_bytes))
-                    for region, size in required:
-                        if not size:
-                            continue
-                        if region is not None and region.resident:
-                            region.set_preferred(True)
-                        else:
-                            missing += (
-                                (size + self.granularity - 1) // self.granularity * self.granularity
-                            )
-                    if block.cached():
-                        block.preferred = block.preference_set = True
-            allocated, before, _ = _torch_bytes(self.device)
-            unused = max(before - allocated, 0)
-            if unused:
-                # The previous phase's inactive Torch segments are neither weight capacity nor
-                # this phase's activations. Returned once here, not by Torch inside the first op
-                # of this phase that does not fit (Krea 2's 2048² decode: 1.1 s, not 1.3 s).
-                torch.cuda.empty_cache()
-            returned = max(before - _torch_bytes(self.device)[1], 0)
-            # Protect the incoming cached bytes above; only other phases' idle backing may go.
-            # A phase whose missing bytes then fit streams nothing and reserves no window: a
-            # window beside resident weights only evicts another phase's (a 4.3 GB text
-            # encoder's 13 GB window took 3.9 GB of an idle DiT every request).
-            need = missing - self.room().free
-            reclaimed = int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
-            self._fits = missing <= self.room().free
-            need = 0 if self._fits else missing + self.window_bytes - self.room().free
-            reclaimed += int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
-            if request is not None:
-                request.phase_changes.append(
-                    {
-                        "models": sorted(names),
-                        "window_bytes": self.window_bytes,
-                        "fits": self._fits,
-                        "missing_bytes": missing,
-                        "torch_unused_bytes": unused,
-                        "torch_returned_bytes": returned,
-                        "native_reclaimed_bytes": reclaimed,
-                        # Cumulative snapshot; an older native wheel has no reason counters.
-                        "native_reclaimed_by_reason": self.native.stats().get(
-                            "reclaimed_by_reason"
-                        ),
-                    }
-                )
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         model = block.model
@@ -3353,7 +3442,9 @@ class Request:
         if not self.memory.cuda or not torch.cuda.is_initialized():
             return room
         allocated, reserved, _ = _torch_bytes(self.memory.device)
-        return replace(room, cached=max(reserved - allocated, 0))
+        planned = self.memory._split_budget
+        budget = None if planned is None else max(planned - allocated, 0)
+        return replace(room, cached=max(reserved - allocated, 0), budget=budget)
 
     def reclaim(self, need: int = 0) -> int:
         """A known pure cut may shed the step's speculative whole-model hold.
