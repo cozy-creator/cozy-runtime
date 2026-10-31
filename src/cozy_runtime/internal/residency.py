@@ -1454,13 +1454,15 @@ class Memory:
         if not self.cuda:
             return
         accounted = self._figures()[1]
-        if limit is not None and limit < accounted:
+        if limit is not None and max(limit, self._floor()) < accounted:
             try:
                 with varena.no_capture(self.device.index or 0):
                     torch.cuda.empty_cache()
             except RuntimeError:
                 pass  # a capture is in progress: the room bounds its next allocations
             limit = max(limit, self._floor())
+        elif limit is not None and limit < accounted:
+            limit = max(limit, self._floor())  # at its floor already: nothing more to give
         else:
             raised = limit is None or (self.room_limit is not None and limit > self.room_limit)
             if raised and self.requests:
