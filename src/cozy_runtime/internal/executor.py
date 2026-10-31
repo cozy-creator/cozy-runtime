@@ -1949,11 +1949,12 @@ class Executor:
         }
 
     def serving(self) -> str:
-        """The execution plans applied now (`Plan.report`), by name, or "eager": what each step
-        records it ran (`Attribution.step`)."""
+        """The active construction's execution plans applied now (`Plan.report`), by name, or
+        "eager": what each step records it ran (`Attribution.step`)."""
+        construction = self.constructions.get(self.active, self)
         applied = {
             name
-            for member in self.model_executors or [self]
+            for member in construction.model_executors or [construction]
             for reports in list(member.plan_reports.values())
             for name, report in list(reports.items())
             if report.get("applied")
