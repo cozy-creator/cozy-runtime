@@ -163,6 +163,7 @@ class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     name: str
     request: JsonValue
     result: JsonValue
+    #: A child task (`app.child_task`): cozy and TensorD refuse it as a root request.
     internal: bool = False
     models: Annotated[tuple[ModelSlot, ...], msgspec.Meta(max_length=16)] = ()
     assets: AssetsSlot | msgspec.UnsetType = msgspec.UNSET
@@ -256,7 +257,7 @@ def entry(declared: Declaration) -> dict[str, Json]:
         "request": schema.request(payload),
         "result": schema.render(result, decoded_bounds=True),
     }
-    if declared.internal:
+    if declared.child_task:
         doc["internal"] = True
     if declared.slots:
         doc["models"] = [model_slot(declared, slot) for slot in declared.slots]
