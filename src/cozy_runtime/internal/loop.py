@@ -32,6 +32,7 @@ from __future__ import annotations
 import bisect
 import ctypes
 import gc
+import hashlib
 import sys
 import threading
 import time
@@ -47,7 +48,7 @@ from tensorfs import varena
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
-from cozy_runtime import graphs, stepcache
+from cozy_runtime import graphs
 from cozy_runtime.author import _loop
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
@@ -98,6 +99,30 @@ _CAPTURE_ERRORS = range(900, 909)
 _UNRECORDABLE = "the step cannot be recorded"
 #: request id -> its loops, for the run record (`execution.loops`)
 ROWS: dict[str, list[dict[str, Any]]] = {}
+
+
+# Temporary xs-138 SDXL diagnostic. Hashes synchronize D2H copies; never use these runs for timing.
+_NUMERIC_DIAGNOSTIC: ContextVar[dict[str, Any] | None] = ContextVar("xs138_numeric_boundaries", default=None)
+
+
+def _numeric_snapshot(name: str, tensors: tuple[Any, ...], positions: Iterable[int]) -> None:
+    record = _NUMERIC_DIAGNOSTIC.get()
+    if record is None or name in record["phases"]:
+        return
+    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("numerical boundary snapshot must run outside CUDA capture")
+    rows = []
+    for position in positions:
+        value = tensors[position]
+        if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
+            raise RuntimeError("numerical boundary snapshot requires dense tensor inputs")
+        # Copy first: contiguous conversion and hashing happen on CPU, without a GPU clone.
+        host = value.detach().to(device="cpu", copy=True).contiguous()
+        raw = host.reshape(-1).view(torch.uint8).numpy().tobytes()
+        rows.append({"position": position, "type": type(value).__name__, "dtype": str(value.dtype),
+                     "shape": list(value.shape), "stride": list(value.stride()), "bytes": len(raw),
+                     "sha256": hashlib.sha256(raw).hexdigest()})
+    record["phases"][name] = rows
 
 
 def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], phase: Any) -> None:
@@ -222,7 +247,6 @@ class Loops:
         on_step: Callable[[int], object] | None,
         before: Callable[..., object] | None,
         after: Callable[..., object] | None,
-        cache: stepcache.Policy | None = None,
     ) -> None:
         row: dict[str, Any] = {
             "steps": len(steps),
@@ -237,52 +261,42 @@ class Loops:
             ROWS.setdefault(request.id, []).append(row)
         # The loop records its own programs: component region graphs neither replay nor learn
         # its calls (a replayed step enters no blocks, and its graph holds their weights).
-        if cache is not None and _ranks() > 1:  # each rank's verdict would differ
-            row["refusals"].append("step cache: off across ranks (its sums are not all-reduced)")
-            cache = None
+        diagnostic = None
+        if isinstance(key, tuple) and key and key[0] == "sdxl.euler":
+            if len(state) != 2 or len(carried) != 2:
+                raise RuntimeError("SDXL diagnostic expected latents/image state and prompt/pooled carried tensors")
+            diagnostic = {"schema": "xs138.sdxl.boundary-bytes/1", "diagnostic_only": True,
+                          "state_count": len(state), "carried_count": len(carried), "phases": {}}
+            row["numeric_boundaries"] = diagnostic
+        probe = _NUMERIC_DIAGNOSTIC.set(diagnostic)
         bypass = graphs.BYPASS.set(True)
         try:
-            loop = _Loop(step, steps, phases, on_step, before, after)
-            if cache is None:
-                self._run(loop, state, carried, inputs, key, row)
-            else:
-                self._cached(loop, state + carried, inputs, cache, row)
+            # SDXL image/prompt/pooled are empty output slots here: do not read their uninitialized bytes.
+            _numeric_snapshot("original_inputs", state + carried + inputs,
+                              (0, *range(len(state) + len(carried), len(state) + len(carried) + len(inputs))))
+            self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
+            _numeric_snapshot("returned_latents_and_decode", state + carried + inputs, range(len(state)))
         finally:
             graphs.BYPASS.reset(bypass)
+            _NUMERIC_DIAGNOSTIC.reset(probe)
             row["at_ms"]["returned"] = _now()
-
-    def _cached(
-        self,
-        loop: _Loop,
-        mutable: tuple[Any, ...],
-        inputs: tuple[Any, ...],
-        cache: stepcache.Policy,
-        row: dict[str, Any],
-    ) -> None:
-        """A call under a step cache, eagerly: each forward's verdict is read on the host."""
-        row["refusals"].append("step cache: eager")
-        with (
-            torch.inference_mode(False),
-            torch.no_grad(),
-            _owned(mutable) as work,
-            stepcache.running(cache, len(loop.steps)) as run,
-        ):
-            try:
-                loop.eager_all(work + inputs, CURRENT.get())
-            finally:
-                row["cache"] = run.document()
 
     def _run(
         self,
-        loop: _Loop,
+        step: Callable[..., object],
+        steps: range,
         state: tuple[Any, ...],
         carried: tuple[Any, ...],
         inputs: tuple[Any, ...],
+        phases: tuple[Hashable, ...] | None,
         key: Hashable | None,
+        on_step: Callable[[int], object] | None,
+        before: Callable[..., object] | None,
+        after: Callable[..., object] | None,
         row: dict[str, Any],
     ) -> None:
         ctx = CURRENT.get()
-        step, steps, phases = loop.step, loop.steps, loop.phases
+        loop = _Loop(step, steps, phases, on_step, before, after)
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
@@ -546,9 +560,13 @@ class _Loop:
             if ctx is not None:
                 ctx.raise_if_cancelled()
             index.fill_(i)
-            if (cached := stepcache._RUN.get()) is not None:
-                cached.begin(i - self.steps.start)
+            diagnostic = _NUMERIC_DIAGNOSTIC.get()
+            if diagnostic is not None and i == self.steps.start:
+                _numeric_snapshot("first_eager_step_inputs", tensors,
+                                  (0, *range(diagnostic["state_count"], len(tensors))))
             _call(self.step, index, tensors, self.phase(i))
+            if diagnostic is not None and i == self.steps.start:
+                _numeric_snapshot("first_eager_step_output", tensors, (0,))
             if self.on_step is not None:
                 self.on_step(i)
         if index.is_cuda:
@@ -558,11 +576,6 @@ class _Loop:
         _once(self.before, tensors)
         self.eager(self.steps, tensors, ctx)
         _once(self.after, tensors)
-
-
-def _ranks() -> int:
-    dist = torch.distributed
-    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
 
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
