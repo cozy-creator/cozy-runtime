@@ -2247,13 +2247,26 @@ class Memory:
             return 0
         before_allocated, before_reserved, _ = self._figures()
         before_free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
-        available = self.room(current).free if need else 0
-        if need and available < need:
+        # A running phase's Torch cache is its own activations' (`_running`): a pure site of it
+        # counts that cache as room and takes the rest from weights. Returning it was a device
+        # sync per release and its segments malloc'd back, and the step reserve then held their
+        # high-water free of speculation for the rest of the phase (H3 30-step on a 4090).
+        keep = bool(need and self.phase_supported and set(current) & set(self._phase_names or ()))
+
+        def room_now() -> int:
+            room = self.room(current).free
+            if keep and self.cuda:
+                allocated, reserved, _ = _torch_bytes(self.device)
+                room += max(reserved - allocated, 0)
+            return room
+
+        available = room_now() if need else 0
+        if need and available < need and not keep:
             # Return actual unused activation storage before sacrificing reusable weights.
             # Private graph pools and live tensors may remain; measure instead of crediting
             # reserved-minus-allocated bytes as available memory.
             release_cached(torch, self.device.type)
-            available = self.room(current).free
+            available = room_now()
         dropped = 0
 
         def enough(released: int = 0, *, flush: bool = False) -> bool:
@@ -2264,13 +2277,13 @@ class Memory:
             if flush or dropped >= max(need - available, 1):
                 # Dropped owner bytes only trigger a batch flush. Aliases, allocator
                 # fragmentation and graph pools can keep them resident; measure again.
-                available = self.room(current).free
-                if available < need:
+                available = room_now()
+                if available < need and not keep:
                     release_cached(torch, self.device.type)
-                    available = self.room(current).free
+                    available = room_now()
                 if self.native is not None and available < need:
                     self.native.reclaim(need - available)
-                    available = self.room(current).free
+                    available = room_now()
                 dropped = 0
             return available >= need
 
@@ -2288,7 +2301,7 @@ class Memory:
             self.native.reclaim(
                 max(need - available, 0) if need else int(self.native.stats()["resident_bytes"])
             )
-            available = self.room(current).free if need else 0
+            available = room_now() if need else 0
         with self.lock:
             blocks = sorted(
                 (b for m in self.models.values() for b in m.groups()),
@@ -2565,6 +2578,13 @@ class Memory:
         demand; a streaming window unless its missing bytes fit. Caller holds the lock."""
         names = self._phase_names or frozenset()
         self._settle_prefetch(cancel=True)
+        # The phase that ends here: Torch's high-water in it and the speculative fills that
+        # high-water refused (TensorFS's step reserve; absent on an older native wheel).
+        ended = {
+            k: v
+            for k, v in self.native.stats().items()
+            if k in ("torch_high_bytes", "torch_reserved_bytes", "reserve_refusals")
+        }
         self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
         incoming = [m for m in self.models.values() if m.name in names]
         # An unrelated registered model must not enlarge this phase's streaming
@@ -2614,6 +2634,7 @@ class Memory:
                 {
                     "models": sorted(names),
                     **({"replan": replan} if replan is not None else {}),
+                    "ended_phase": ended,
                     "window_bytes": self.window_bytes,
                     "fits": self._fits,
                     "missing_bytes": missing,
