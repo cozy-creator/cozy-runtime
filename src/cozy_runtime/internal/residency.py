@@ -1446,20 +1446,19 @@ class Memory:
 
     def make_room(self, limit: int | None) -> None:
         """What the machine leaves this process of the GPU (design/vram-yield.md; `room_for`),
-        None for no limit. Lower than it holds, it gives at once: Torch's unused cache, then
-        weight pages in Varena's reclaim order, never below what its call has needed and runs on,
-        so a run streams and is never ended for it. Higher, the running call takes it at its next
-        pass (`_take_room`); idle, at once. Called on the seam's reading thread (or an idle
-        executor's turn): no Memory lock."""
+        None for no limit. Lower than it holds, it gives at once: idle, Torch's unused cache, then
+        weight pages in Varena's reclaim order; in a call, pages only, never below what the call
+        has needed and runs on, so a run streams and is never ended for it. Higher, the running
+        call takes it at its next pass (`_take_room`); idle, at once. Called on the seam's reading
+        thread (or an idle executor's turn): no Memory lock."""
         if not self.cuda:
             return
         accounted = self._figures()[1]
         if limit is not None and max(limit, self._floor()) < accounted:
-            try:
-                with varena.no_capture(self.device.index or 0):
-                    torch.cuda.empty_cache()
-            except RuntimeError:
-                pass  # a capture is in progress: the room bounds its next allocations
+            # A call's cache is its working set: emptied, another program takes it at once and
+            # the call's next step finds the card full (sieg 23082: out of memory mid-step).
+            if not self.requests:
+                self._release_cache()
             limit = max(limit, self._floor())
         elif limit is not None and limit < accounted:
             limit = max(limit, self._floor())  # at its floor already: nothing more to give
@@ -1477,17 +1476,33 @@ class Memory:
 
     def _floor(self) -> int:
         """What this process must keep to go on: its call's working set as it has peaked (across
-        cut resets) or Torch's reserve after its cache went, whichever is more, its pinned pages,
-        and the streamed blocks in flight; idle, what Torch still holds. A later phase that needs
-        more (a decode) takes it from the call's weight pages through the allocation hook."""
+        cut resets) or Torch's reserve, whichever is more, its pinned pages, and the streamed
+        blocks in flight of the models now running; idle, what Torch still holds. A later phase
+        that needs more (a decode) takes it from the call's weight pages through the allocation
+        hook."""
         native = self.native.stats() if self.native is not None else {}
         pinned = int(native.get("pinned_bytes", 0))
         allocated, reserved, _ = _torch_bytes(self.device)
-        if not self.requests:
+        requests = list(self.requests)
+        if not requests:
             return allocated + pinned
-        peak = max(request.torch_peak for request in self.requests)
-        blocks = (b.allocation_bytes for m in list(self.models.values()) for b in m.groups())
+        peak = max(request.torch_peak for request in requests)
+        running = set().union(*(request.current for request in requests))
+        blocks = (
+            b.allocation_bytes
+            for m in list(self.models.values())
+            if m.name in running
+            for b in m.groups()
+        )
         return max(peak, reserved) + pinned + _STREAMED * max(blocks, default=0)
+
+    def _release_cache(self) -> None:
+        """Torch's unused cache back to the driver, no capture beginning meanwhile."""
+        try:
+            with varena.no_capture(self.device.index or 0):
+                torch.cuda.empty_cache()
+        except RuntimeError:
+            pass  # a capture is in progress: the room bounds its next allocations
 
     def _apply_room(self, limit: int | None) -> None:
         self.room_limit = limit
@@ -3339,6 +3354,11 @@ class Memory:
             finally:
                 with self.lock:
                     self.requests.discard(request)
+                    alone = not self.requests
+                if alone and self.room_limit is not None:
+                    # Held to a room, the next call starts with its own cache, not this one's
+                    # (sieg: SDXL's decode cache left its next denoise nothing to give)
+                    self._release_cache()
                 _REQUEST.reset(token)
 
     def stats(self) -> dict[str, Any] | None:
