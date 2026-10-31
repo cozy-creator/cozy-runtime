@@ -2,8 +2,8 @@
 
 `app.child_task` registers a function only its own package's code calls: a managed child of the
 same installed package revision, never a root request or another package's call. It keeps its
-executable metadata and model bindings and takes `app.entrypoint`'s options except `hidden`,
-`implements` and `model_classes`.
+executable metadata and model bindings and takes `app.entrypoint`'s options except `hidden` and
+`model_classes`.
 
 ```python
 app.child_task(regenerate_shot)

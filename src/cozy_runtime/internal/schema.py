@@ -314,6 +314,9 @@ def _field(
     constraints = _constraints(markers)
     if constraints:
         doc["constraints"] = constraints
+    extra = _extra(markers)
+    if extra:
+        doc["extra"] = extra
     bound: dict[str, Json] = {}
     for marker in markers:
         if isinstance(marker, FileBound):
@@ -345,6 +348,16 @@ _CONSTRAINTS = (
     "max_length",
     "tz",
 )
+
+
+def _extra(markers: Sequence[object]) -> dict[str, Json]:
+    """A field's `msgspec.Meta(extra=...)`, passed through verbatim: facts a package states for its
+    callers (a shot renderer's `max_piece_s`), which Runtime never reads."""
+    out: dict[str, Json] = {}
+    for marker in markers:
+        if isinstance(marker, msgspec.Meta) and marker.extra:
+            out.update(marker.extra)
+    return out
 
 
 def _constraints(markers: Sequence[object]) -> dict[str, Json]:
