@@ -32,7 +32,6 @@ from __future__ import annotations
 import bisect
 import ctypes
 import gc
-import hashlib
 import sys
 import threading
 import time
@@ -102,100 +101,39 @@ _UNRECORDABLE = "the step cannot be recorded"
 ROWS: dict[str, list[dict[str, Any]]] = {}
 
 
-# Temporary xs-138 SDXL diagnostic. Hashes synchronize D2H copies; never use these runs for timing.
-_NUMERIC_DIAGNOSTIC: ContextVar[dict[str, Any] | None] = ContextVar(
-    "xs138_numeric_boundaries", default=None,
-)
-
-
-def _numeric_tensor(value: Any) -> dict[str, Any]:
-    if not isinstance(value, torch.Tensor) or value.layout != torch.strided:
-        raise RuntimeError("numerical snapshot requires a dense tensor")
-    # GPU input is only copied; contiguous conversion and hashing happen on CPU.
-    host = value.detach().to(device="cpu", copy=True).contiguous()
-    raw = host.reshape(-1).view(torch.uint8).numpy().tobytes()
-    return {"type": type(value).__name__, "dtype": str(value.dtype),
-            "shape": list(value.shape), "stride": list(value.stride()), "bytes": len(raw),
-            "sha256": hashlib.sha256(raw).hexdigest()}
-
-
-def _numeric_snapshot(name: str, tensors: tuple[Any, ...], positions: Iterable[int]) -> None:
-    record = _NUMERIC_DIAGNOSTIC.get()
-    if record is None or name in record["phases"]:
+def _capture_attention_metadata(record: dict[str, Any], graph: Any, func: Any,
+                                args: Any, kwargs: Any, result: Any) -> None:
+    """Temporary xs-138 metadata only: observe this dispatch, never select or execute again."""
+    schema = func._schema
+    if schema.name not in (
+        "aten::_fused_sdp_choice", "aten::scaled_dot_product_attention",
+        "aten::_scaled_dot_product_attention_math", "aten::_scaled_dot_product_flash_attention",
+        "aten::_scaled_dot_product_efficient_attention",
+        "aten::_scaled_dot_product_cudnn_attention",
+    ):
         return
-    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("numerical boundary snapshot must run outside CUDA capture")
-    record["phases"][name] = [{"position": position, **_numeric_tensor(tensors[position])}
-                              for position in positions]
-
-
-class _VaeConvolutionTrace(TorchDispatchMode):
-    """Temporary SDXL diagnostic: actual convolution operands/results, no kernel replacement."""
-
-    def __init__(self, record: dict[str, Any]) -> None:
-        super().__init__()
-        self.rows: list[dict[str, Any]] = []
-        record["vae_convolutions"] = self.rows
-        record["convolution_schema"] = "xs138.sdxl.vae-convolutions/1"
-        record["vae_execution"] = "ordinary eager; no capture or diagnostic retry"
-
-    def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
-        kwargs = kwargs or {}
-        schema = func._schema
-        if schema.name not in {
-            "aten::convolution", "aten::_convolution", "aten::conv2d", "aten::conv3d",
-            "aten::conv_transpose2d", "aten::conv_transpose3d",
-            "aten::cudnn_convolution", "aten::cudnn_convolution_transpose",
-        }:
-            return func(*args, **kwargs)
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("VAE convolution trace cannot run during capture")
-        from cozy_runtime.internal.execution import catch
-
-        bound = {
-            argument.name: value for argument, value in zip(schema.arguments, args, strict=False)
-        }
-        bound.update(kwargs)
-        # Observe the existing cut site without incrementing its ordinals.
-        scopes = catch._local.scopes
-        row: dict[str, Any] = {
-            "ordinal": len(self.rows), "op": str(func),
-            "site": scopes[-1].site if scopes else catch._local.named,
-            "parameters": {key: bound[key] for key in (
-                "stride", "padding", "dilation", "transposed", "output_padding", "groups",
-                "benchmark", "deterministic", "cudnn_enabled", "allow_tf32",
-            ) if key in bound},
-            "cudnn": {"enabled": torch.backends.cudnn.enabled,
-                      "benchmark": torch.backends.cudnn.benchmark,
-                      "deterministic": torch.backends.cudnn.deterministic,
-                      "allow_tf32": torch.backends.cudnn.allow_tf32},
-        }
-        self.rows.append(row)
-        operands = {"input": bound.get("input", bound.get("self")),
-                    "weight": bound.get("weight"), "bias": bound.get("bias")}
-        if (
-            not isinstance(operands["input"], torch.Tensor)
-            or not isinstance(operands["weight"], torch.Tensor)
+    tensors, scalars = {}, {}
+    for position, argument in enumerate(schema.arguments):
+        value = kwargs.get(
+            argument.name, args[position] if position < len(args) else argument.default_value
+        )
+        if isinstance(value, torch.Tensor):
+            tensors[argument.name] = {"dtype": str(value.dtype), "shape": list(value.shape),
+                                      "stride": list(value.stride())}
+        elif value is None or type(value) in (bool, int, float, str):
+            scalars[argument.name] = value
+        elif isinstance(value, (tuple, list)) and all(
+            type(v) in (bool, int, float, str) for v in value
         ):
-            raise RuntimeError(f"unrecognized convolution operands for {func}")
-        for name, value in operands.items():
-            row[name] = None if value is None else {
-                **_numeric_tensor(value), "storage_offset": value.storage_offset(),
-                "alignment_mod512": value.data_ptr() % 512,
-            }
-        try:
-            # Exactly one dispatch; this mode is popped for redispatch.
-            output = func(*args, **kwargs)
-        except BaseException as error:
-            row["error"] = f"{type(error).__name__}: {error}"
-            if fault(error) in (Fault.OOM, Fault.EXHAUSTED):
-                # Stop this diagnostic before the ordinary pure-site/SDXL tiling retry.
-                raise RuntimeError(
-                    "VAE convolution diagnostic stopped before capacity retry"
-                ) from error
-            raise
-        row["output"] = _numeric_tensor(output)
-        return output
+            scalars[argument.name] = list(value)
+    row = {"stage": graph._diagnostic_stage, "graph": record["graph_index"],
+           "graph_steps": graph.steps, "graph_op_index": graph.ops, "op": str(func),
+           "tensors": tensors, "scalars": scalars}
+    if schema.name == "aten::_fused_sdp_choice":
+        # This is the already-computed CPU selector result; never call .item() or the selector.
+        row["selector_result"] = result if type(result) is int else None
+        row["selector_result_type"] = type(result).__name__
+    record["attention"].append(row)
 
 
 def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], phase: Any) -> None:
@@ -334,30 +272,20 @@ class Loops:
             ROWS.setdefault(request.id, []).append(row)
         # The loop records its own programs: component region graphs neither replay nor learn
         # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        from cozy_runtime.internal.execution import catch
+
         diagnostic = None
         if isinstance(key, tuple) and key and key[0] == "sdxl.euler":
-            if len(state) != 2 or len(carried) != 2:
-                raise RuntimeError(
-                    "SDXL diagnostic expected latents/image state and prompt/pooled carried tensors"
-                )
-            diagnostic = {"schema": "xs138.sdxl.boundary-bytes/1", "diagnostic_only": True,
-                          "state_count": len(state), "carried_count": len(carried), "phases": {}}
-            row["numeric_boundaries"] = diagnostic
-        probe = _NUMERIC_DIAGNOSTIC.set(diagnostic)
+            diagnostic = {"schema": "xs138.capture-metadata/1", "diagnostic_only": True,
+                          "stage": "", "graph_index": -1, "attention": [], "cuts": []}
+            row["capture_metadata"] = diagnostic
+        probe = catch._CAPTURE_METADATA.set(diagnostic)
         bypass = graphs.BYPASS.set(True)
         try:
-            # SDXL image/prompt/pooled are empty slots here; do not read uninitialized bytes.
-            _numeric_snapshot(
-                "original_inputs", state + carried + inputs,
-                (0, *range(len(state) + len(carried), len(state) + len(carried) + len(inputs))),
-            )
             self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
-            _numeric_snapshot(
-                "returned_latents_and_decode", state + carried + inputs, range(len(state))
-            )
         finally:
             graphs.BYPASS.reset(bypass)
-            _NUMERIC_DIAGNOSTIC.reset(probe)
+            catch._CAPTURE_METADATA.reset(probe)
             row["at_ms"]["returned"] = _now()
 
     def _run(
@@ -379,10 +307,6 @@ class Loops:
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
-            if _NUMERIC_DIAGNOSTIC.get() is not None:
-                row["eager"] = "xs138 VAE diagnostic: eager only; no capture/idle recording"
-                loop.eager_all(tensors, ctx)
-                return
             scope, why = _eligible(ctx, steps, tensors)
             if why:
                 row["refusals"].append(why)
@@ -643,13 +567,7 @@ class _Loop:
             if ctx is not None:
                 ctx.raise_if_cancelled()
             index.fill_(i)
-            diagnostic = _NUMERIC_DIAGNOSTIC.get()
-            if diagnostic is not None and i == self.steps.start:
-                _numeric_snapshot("first_eager_step_inputs", tensors,
-                                  (0, *range(diagnostic["state_count"], len(tensors))))
             _call(self.step, index, tensors, self.phase(i))
-            if diagnostic is not None and i == self.steps.start:
-                _numeric_snapshot("first_eager_step_output", tensors, (0,))
             if self.on_step is not None:
                 self.on_step(i)
         if index.is_cuda:
@@ -658,18 +576,7 @@ class _Loop:
     def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
         _once(self.before, tensors)
         self.eager(self.steps, tensors, ctx)
-        diagnostic = _NUMERIC_DIAGNOSTIC.get()
-        if diagnostic is None:
-            _once(self.after, tensors)
-            return
-        _numeric_snapshot("vae_input_latents", tensors, (0,))
-        trace = _VaeConvolutionTrace(diagnostic)
-        with trace:
-            _once(self.after, tensors)
-        if not trace.rows or any("error" in row for row in trace.rows):
-            raise RuntimeError(
-                "VAE diagnostic requires successful observed convolutions; inspect its trace"
-            )
+        _once(self.after, tensors)
 
 
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
@@ -1293,12 +1200,14 @@ def _record_resident(
                 prefix = suffix = None
                 if loop.after is not None and post is not None:
                     suffix = _Graph(recording, state, 1, owners)
+                    suffix._diagnostic_stage = "after"
                     provisional.append(suffix)
                     suffix.record(lambda: loop.after(*tensors))  # type: ignore[misc]
                     _lap("record_after")
                     _yield_point()
                 if again and loop.before is not None and pre is not None:
                     prefix = _Graph(recording, state, 1, owners)
+                    prefix._diagnostic_stage = "before"
                     provisional.append(prefix)
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
                     _lap("record_before")
@@ -1491,6 +1400,7 @@ class _Graph:
         undeclared: tuple[tuple[Any, int, int], ...] = (),
     ) -> None:
         self.recording, self.state, self.steps, self.bindings = recording, state, steps, bindings
+        self._diagnostic_stage = "step"
         self.device = state[0].device
         self.domain = recording._domain
         self.ranges = tuple(
@@ -1709,6 +1619,12 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
     def __init__(self, graph: _Graph) -> None:
         super().__init__()
         self.g = graph
+        from cozy_runtime.internal.execution import catch
+
+        self._metadata = catch._CAPTURE_METADATA.get()
+        if self._metadata is not None:
+            self._metadata["stage"] = graph._diagnostic_stage
+            self._metadata["graph_index"] += 1
 
     def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
         g, kwargs = self.g, kwargs or {}
@@ -1743,6 +1659,8 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
                     g.held[id(tensor)] = tensor
                 inputs.add((tensor.device, tensor.untyped_storage().data_ptr()))
         result = func(*args, **kwargs)
+        if self._metadata is not None:
+            _capture_attention_metadata(self._metadata, g, func, args, kwargs, result)
         g.ops += 1
         for tensor in tree_leaves(result):
             if isinstance(tensor, torch.Tensor):
