@@ -15,7 +15,6 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
 
 import msgspec
 import torch
@@ -32,10 +31,6 @@ type Kwargs = Mapping[str, object]
 
 #: the request being served (`serving`): its pure cut sites size from its local room
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
-# Temporary xs-138 observer; capture choices stay separate from executed eager counters.
-_CAPTURE_METADATA: ContextVar[dict[str, Any] | None] = ContextVar(
-    "xs138_capture_metadata", default=None,
-)
 
 
 class Cut(msgspec.Struct, frozen=True, kw_only=True):
@@ -224,13 +219,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     try:
         if _capturing():
             available = request.room()
-            level = sizing.choose(finest, need, available)[0]
-            if (metadata := _CAPTURE_METADATA.get()) is not None:
-                metadata["cuts"].append({
-                    "stage": metadata["stage"], "graph": metadata["graph_index"],
-                    "site": site, "level": level,
-                })
-            return whole(level)
+            return whole(sizing.choose(finest, need, available)[0])
         try:
             result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
         except Exception as exc:
