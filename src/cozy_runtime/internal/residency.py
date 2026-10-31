@@ -81,6 +81,14 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
 #: the next one being read. The read takes the oldest completed block's room (Varena evicts it on
 #: its last-consumer events, never waiting), so it overlaps compute instead of following it.
 _STREAMED = 3
+
+
+def yields() -> bool:
+    """Whether this TensorFS can hold the process to a room (`varena.make_room`, TensorFS 0.17.16
+    on): an older one cannot, and the executor's hello says so (version skew degrades)."""
+    return callable(getattr(varena, "make_room", None)) and callable(
+        getattr(varena, "no_capture", None)
+    )
 #: Re-plans of one phase's activation budget (`Memory._replan`): its first, and tightenings by
 #: a pass's overshoot.
 _PLANS = 3
@@ -1341,6 +1349,7 @@ class Memory:
         #: What the machine leaves this process of the GPU while another program needs it
         #: (`make_room`): its weight pages plus Torch's reserved bytes; None for no limit.
         self.room_limit: int | None = None
+        self._room_unsupported = False  # a room ask came to a TensorFS that cannot hold one: told once
         #: the machine's last target for this process's driver bytes (None: none, or lifted)
         self.room_target: int | None = None
         #: a raised room (or none) for the running call, taken at its next pass (`_take_room`)
@@ -1475,6 +1484,16 @@ class Memory:
         thread (or an idle executor's turn): no Memory lock."""
         if not self.cuda:
             return
+        if not yields():
+            if not self._room_unsupported:
+                self._room_unsupported = True
+                print(
+                    "residency: TensorFS has no make_room (older than 0.17.16): room asks are"
+                    " ignored, this process does not yield",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
         accounted = self._figures()[1]
         if limit is not None and max(limit, self._floor()) < accounted:
             # A call's cache is its working set: emptied, another program takes it at once and
@@ -1522,6 +1541,8 @@ class Memory:
 
     def _release_cache(self) -> None:
         """Torch's unused cache back to the driver, no capture beginning meanwhile."""
+        if not yields():
+            return
         try:
             with varena.no_capture(self.device.index or 0):
                 torch.cuda.empty_cache()
