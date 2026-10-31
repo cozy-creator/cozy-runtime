@@ -3280,7 +3280,7 @@ class Executor:
             memory.room_target = None if target is None else int(target)
             limit = memory.room_for(memory.room_target, held)
             memory.make_room(limit)
-            if limit is not None and not memory.requests and limit < memory.held() and self.order:
+            if limit is not None and not memory.calls() and limit < memory.held() and self.order:
                 ticket = self.order.ticket(True, "room")
                 threading.Thread(
                     target=self._idle_room, args=(memory, limit, ticket), name="room", daemon=True
@@ -3296,7 +3296,7 @@ class Executor:
         assert self.order is not None
         try:
             with self.order.turn(ticket):
-                if not memory.requests and limit < memory.held():
+                if not memory.calls() and limit < memory.held():
                     accel.synchronize(self.torch, self.device_kind)
                     self._release_programs()
                     memory.make_room(limit)

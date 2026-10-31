@@ -1475,6 +1475,11 @@ class Memory:
             return None
         return max(target - max(held - self._figures()[1], 0), 0)
 
+    def calls(self) -> list[Request]:
+        """The requests a call runs: an idle one (a capture or a recording at idle, which fills free
+        bytes only and never evicts) leaves the process idle for its room."""
+        return [request for request in list(self.requests) if not request.idle]
+
     def make_room(self, limit: int | None) -> None:
         """What the machine leaves this process of the GPU (design/vram-yield.md; `room_for`),
         None for no limit. Lower than it holds, it gives at once: idle, Torch's unused cache, then
@@ -1498,14 +1503,14 @@ class Memory:
         if limit is not None and max(limit, self._floor()) < accounted:
             # A call's cache is its working set: emptied, another program takes it at once and
             # the call's next step finds the card full (sieg 23082: out of memory mid-step).
-            if not self.requests:
+            if not self.calls():
                 self._release_cache()
             limit = max(limit, self._floor())
         elif limit is not None and limit < accounted:
             limit = max(limit, self._floor())  # at its floor already: nothing more to give
         else:
             raised = limit is None or (self.room_limit is not None and limit > self.room_limit)
-            if raised and self.requests:
+            if raised and self.calls():
                 self._room_pending = (limit,)
                 return
         self._room_pending = None
@@ -1524,7 +1529,7 @@ class Memory:
         native = self.native.stats() if self.native is not None else {}
         pinned = int(native.get("pinned_bytes", 0))
         allocated, reserved, _ = _torch_bytes(self.device)
-        requests = list(self.requests)
+        requests = self.calls()
         if not requests:
             return allocated + pinned
         peak = max(request.torch_peak for request in requests)
