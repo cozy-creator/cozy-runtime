@@ -3273,15 +3273,22 @@ class Executor:
         release their pins, in its command order. A group's followers serve their own GPUs: rank
         0 takes only its own."""
         memory = self.host.memory
-        if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
-            return
         target = frame.get("target")
+        if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
+            why = "no memory" if memory is None else "not cuda" if not memory.cuda else "device"
+            print(f"room: target {target} not taken: {why}", file=sys.stderr, flush=True)
+            return
         try:
             held = int(frame.get("held", 0))
             memory.room_target = None if target is None else int(target)
             limit = memory.room_for(memory.room_target, held)
             before = memory.held()
             memory.make_room(limit)
+            print(
+                f"room: target {target} limit {limit} held {before} -> {memory.held()}",
+                file=sys.stderr,
+                flush=True,
+            )
             self._room_kept(memory, limit, before)
             if limit is not None and not memory.calls() and limit < memory.held() and self.order:
                 ticket = self.order.ticket(True, "room")
