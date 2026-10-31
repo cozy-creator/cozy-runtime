@@ -1332,6 +1332,10 @@ class Memory:
         self.device = torch.device(device)
         self.cuda: bool = self.device.type == "cuda"
         self.budget_bytes = budget_bytes
+        #: What the machine leaves this process of the GPU while another program needs it
+        #: (`make_room`): its weight pages plus Torch's reserved bytes; None for no limit.
+        self.room_limit: int | None = None
+        self.last_room: dict[str, object] | None = None
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
@@ -1430,6 +1434,43 @@ class Memory:
             return used, int(torch.mps.driver_allocated_memory()), used
         return 0, 0, 0
 
+    def make_room(self, *, give: int = 0, grow: int = 0, lift: bool = False) -> None:
+        """Another program needs this GPU (`give`: hold that many bytes less, now), or has given
+        some back (`grow`, `lift`) (design/vram-yield.md). Torch's unused cache goes first, then
+        weight pages in Varena's reclaim order; never below what the running call holds and has
+        needed (its pinned pages and Torch's peak), so a run streams and is never ended for it.
+        Growth is taken at the next fill. Called on the seam's reading thread: no Memory lock."""
+        if not self.cuda:
+            return
+        index = self.device.index or 0
+        if lift:
+            limit = None
+        elif grow:
+            if self.room_limit is None:
+                return
+            limit = self.room_limit + grow
+        elif give:
+            native = self.native.stats() if self.native is not None else {}
+            pinned = int(native.get("pinned_bytes", 0))
+            allocated, _, peak = _torch_bytes(self.device)
+            held = self._figures()[1]
+            # A call keeps what it has needed so far; an idle executor, what it holds now.
+            floor = (peak if self.requests else allocated) + pinned
+            room = held if self.room_limit is None else min(held, self.room_limit)
+            limit = max(room - give, floor)
+            try:
+                with varena.no_capture(index):
+                    torch.cuda.empty_cache()
+            except RuntimeError:
+                pass  # a capture is in progress: the room bounds its next allocations instead
+        else:
+            return
+        self.room_limit = limit
+        make_room = getattr(varena, "make_room", None)
+        reclaimed = make_room(index, limit) if callable(make_room) else 0
+        self.last_room = {"limit": limit, "give": give, "grow": grow, "lift": lift,
+                          "reclaimed": reclaimed, "at_ns": time.time_ns()}
+
     def room(self, current: Collection[str] = ()) -> Room:
         if self.cuda:
             free, total = torch.cuda.mem_get_info(self.device)
@@ -1443,6 +1484,8 @@ class Memory:
                 # headroom for an eager allocation.
                 card = max(free - (int(total) - self.budget_bytes), 0)
                 free = min(card, max(self.budget_bytes - self._figures()[1], 0))
+            if self.room_limit is not None:
+                free = min(free, max(self.room_limit - self._figures()[1], 0))
         elif self.device.type == "mps":
             figures = allocation(torch, "mps")
             free, reserved = figures["driver_free_bytes"], figures["reserved_bytes"]

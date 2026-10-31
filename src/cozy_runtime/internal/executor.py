@@ -66,6 +66,7 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import tensorfs
+import tensorfs.varena
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
@@ -806,7 +807,7 @@ class Executor:
         self.mux: Mux = (
             host.mux
             if host is not None
-            else Mux(channel, functools.partial(_supplied, self.bearers), self._discard)
+            else Mux(channel, functools.partial(_supplied, self.bearers), self._discard, self._room)
         )
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
         #: the construction key this generation was loaded under; "" on the host
@@ -1011,6 +1012,8 @@ class Executor:
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
+            # `room` read at once, a running call's included (`_room`), where TensorFS can hold one.
+            "room": callable(getattr(tensorfs.varena, "make_room", None)),
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -3235,6 +3238,23 @@ class Executor:
         IDLE_WAITED.pop(request_id, None)
         if self.order is not None:
             self.order.wake()  # an idle period may open now (`awaiting_invoke`)
+
+    def _room(self, frame: Frame) -> None:
+        """TensorD's `room` (design/vram-yield.md): another program needs this GPU, or has given
+        it back. Taken on the thread that read it, a running call's included. A group's
+        followers serve their own GPUs: rank 0 takes only its own."""
+        memory = self.host.memory
+        if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
+            return
+        try:
+            memory.make_room(
+                give=int(frame.get("give", 0)),
+                grow=int(frame.get("grow", 0)),
+                lift=bool(frame.get("lift", False)),
+            )
+        except Exception:  # the seam outlives a refused room; the next reading asks again
+            traceback.print_exc()
+            sys.stderr.flush()
 
     def awaiting_invoke(self) -> bool:
         """A prepared request waits for its invoke, which comes next (TensorD's lookahead or its
