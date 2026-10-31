@@ -1,0 +1,1 @@
+An optional asset field of a result (`File | None`, an optional list or struct of assets) is a declared output (cr-235): returned or published, it is delivered when present, as TensorD's schema walk now reads it (cozy-creator, same issue). Before, it stayed an unpublished attempt file and `Outputs.publish` dropped it as undeclared.
