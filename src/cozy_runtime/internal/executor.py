@@ -3247,11 +3247,7 @@ class Executor:
         if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
             return
         try:
-            memory.make_room(
-                give=int(frame.get("give", 0)),
-                grow=int(frame.get("grow", 0)),
-                lift=bool(frame.get("lift", False)),
-            )
+            memory.make_room(give=int(frame.get("give", 0)), lift=bool(frame.get("lift", False)))
         except Exception:  # the seam outlives a refused room; the next reading asks again
             traceback.print_exc()
             sys.stderr.flush()

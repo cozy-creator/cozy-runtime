@@ -1434,21 +1434,17 @@ class Memory:
             return used, int(torch.mps.driver_allocated_memory()), used
         return 0, 0, 0
 
-    def make_room(self, *, give: int = 0, grow: int = 0, lift: bool = False) -> None:
+    def make_room(self, *, give: int = 0, lift: bool = False) -> None:
         """Another program needs this GPU (`give`: hold that many bytes less, now), or has given
-        some back (`grow`, `lift`) (design/vram-yield.md). Torch's unused cache goes first, then
-        weight pages in Varena's reclaim order; never below what the running call holds and has
-        needed (its pinned pages and Torch's peak), so a run streams and is never ended for it.
-        Growth is taken at the next fill. Called on the seam's reading thread: no Memory lock."""
+        it back (`lift`) (design/vram-yield.md). Torch's unused cache goes first, then weight
+        pages in Varena's reclaim order; never below what the running call holds and has needed
+        (its pinned pages and Torch's peak), so a run streams and is never ended for it. Lifted,
+        it grows back at its next fills. Called on the seam's reading thread: no Memory lock."""
         if not self.cuda:
             return
         index = self.device.index or 0
         if lift:
             limit = None
-        elif grow:
-            if self.room_limit is None:
-                return
-            limit = self.room_limit + grow
         elif give:
             native = self.native.stats() if self.native is not None else {}
             pinned = int(native.get("pinned_bytes", 0))
@@ -1469,7 +1465,7 @@ class Memory:
         self.room_limit = limit
         make_room = getattr(varena, "make_room", None)
         reclaimed = make_room(index, limit) if callable(make_room) else 0
-        self.last_room = {"limit": limit, "give": give, "grow": grow, "lift": lift,
+        self.last_room = {"limit": limit, "give": give, "lift": lift,
                           "reclaimed": reclaimed, "at_ns": time.time_ns()}
 
     def room(self, current: Collection[str] = ()) -> Room:
