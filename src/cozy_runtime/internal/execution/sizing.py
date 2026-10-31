@@ -42,9 +42,6 @@ class Room(Protocol):
     @property
     def cached(self) -> int: ...
 
-    @property
-    def budget(self) -> int | None: ...
-
 
 def pieces(units: int, level: int) -> int:
     """Units a piece holds at `level` (2^level pieces, the last one short)."""
@@ -67,20 +64,21 @@ _FLOOR_SHARE = 64
 
 
 def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
-    """The coarsest level of 0..`finest` that fits beside every weight the running phase holds:
-    within free, Torch-cached and other phases' idle bytes ("cold"), and within the activation
-    budget a re-planned phase sets (`Memory._replan`). Else ("floor") the coarsest within 1/64 of
-    the finest's bytes, the only level that may evict the running phase's own weights. A split is
-    exact, so finer pieces cost launches, never output; a coarse piece that evicted the phase's
-    weights cost their refill every pass (H3 15 s on a 24 GB card: an 11 GB whole attention call
-    left the 21 GB DiT 9 GB resident). Driver-free bytes alone made every site cut to its floor
-    once Torch held the card (RTX 3070, h3-8gb sessions 40463894354 and 40471655517)."""
-    room_bytes = room.free + room.cached + room.cold
-    if room.budget is not None:
-        room_bytes = min(room_bytes, room.budget)
-    level = next((n for n in range(finest + 1) if need(n, room.granularity) <= room_bytes), None)
-    if level is not None:
-        return level, "cold"
+    """The coarsest level of 0..`finest` that fits, and its tier: within free, Torch-cached and
+    cold bytes ("cold": no weight of the step evicted), else within everything revocable less the
+    streaming floor ("warm"), else ("floor") the coarsest within 1/64 of the finest's bytes, where
+    only the physical floor refuses. Driver-free bytes alone made every site cut to its floor once
+    Torch held the card: H3 15 s's norms and FFNs a token or three a piece (RTX 3070, h3-8gb
+    sessions 40463894354 and 40471655517), SDXL at 6 GB an hour on a warm step 1."""
+    for tier, room_bytes in (
+        ("cold", room.free + room.cached + room.cold),
+        ("warm", room.free + room.cached + room.cold + room.warm - room.floor),
+    ):
+        level = next(
+            (n for n in range(finest + 1) if need(n, room.granularity) <= room_bytes), None
+        )
+        if level is not None:
+            return level, tier
     least = need(finest, room.granularity)
     knee = least + least // _FLOOR_SHARE
     return next(n for n in range(finest + 1) if need(n, room.granularity) <= knee), "floor"

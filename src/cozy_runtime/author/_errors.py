@@ -207,8 +207,8 @@ def fault(exc: BaseException) -> Fault:
     `AcceleratorError` by its CUDA code (2: out of memory; sticky codes; any other), a CUDA
     library's alloc-failed status, the prefixes of the libraries that give no code (Triton's
     launch, MPS's allocator), NCCL's `DistBackendError` (out of memory by the CUDA code it
-    reports, else a device error), varena's `Exhausted` and device errors (out of memory
-    by their CUDA code), and TensorFS's `DeviceMemoryError`."""
+    reports, else a device error), and varena's `Exhausted` and device errors (out of memory
+    by their CUDA code)."""
     kind, module = type(exc).__name__, type(exc).__module__
     if module.partition(".")[0] == "torch":
         if kind == "OutOfMemoryError":
@@ -220,8 +220,6 @@ def fault(exc: BaseException) -> Fault:
             return Fault.STICKY if code in _STICKY else Fault.DEVICE
         if kind == "DistBackendError":
             return Fault.OOM if _NCCL_OOM in str(exc) else Fault.DEVICE
-    if module.partition(".")[0] == "tensorfs" and getattr(exc, "code", "") == "device_memory":
-        return Fault.OOM  # a TensorFS CUDA call out of GPU memory (`tensorfs.DeviceMemoryError`)
     if module.partition(".")[0] == "tensorfs" and hasattr(exc, "sticky"):  # varena's errors
         if exc.sticky:
             return Fault.STICKY  # includes allocator ownership faults; never cut or reuse
