@@ -53,7 +53,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import accel, kernel_ready
+from cozy_runtime.internal import kernel_ready
 from cozy_runtime.internal.accel import ResidencyError
 from cozy_runtime.internal.prepared import (
     PreparedRepeat,
@@ -1423,7 +1423,6 @@ class _Graph:
             self._contexts.enter_context(pause() if pause is not None else nullcontext())
             self._contexts.enter_context(kernel_ready.recording())
             self._contexts.enter_context(varena.capture(self.device.index))
-            self._contexts.enter_context(accel.capture_allocation(torch))
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
             torch.cuda.set_stream(control)
