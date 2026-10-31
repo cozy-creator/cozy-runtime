@@ -1406,7 +1406,7 @@ class _Graph:
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
             reserve = domain.working_peak(self.device.index or 0)
-            if (laps := _LAPS.get()) is not None:
+            if (laps := _LAPS.get()) is not None and len(laps) == 3:
                 # Diagnostic only: observe the failing preparation before CUDA capture starts.
                 stats = vt.stats(self.device.index or 0)
                 laps[2].append({
