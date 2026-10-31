@@ -1500,14 +1500,14 @@ class Memory:
                 )
             return
         accounted = self._figures()[1]
-        if limit is not None and max(limit, self._floor()) < accounted:
+        if limit is not None and max(limit, self._room_floor()) < accounted:
             # A call's cache is its working set: emptied, another program takes it at once and
             # the call's next step finds the card full (sieg 23082: out of memory mid-step).
             if not self.calls():
                 self._release_cache()
-            limit = max(limit, self._floor())
+            limit = max(limit, self._room_floor())
         elif limit is not None and limit < accounted:
-            limit = max(limit, self._floor())  # at its floor already: nothing more to give
+            limit = max(limit, self._room_floor())  # at its floor already: nothing more to give
         else:
             raised = limit is None or (self.room_limit is not None and limit > self.room_limit)
             if raised and self.calls():
@@ -1528,7 +1528,7 @@ class Memory:
             "limit": limit,
             "held_before": before,
             "held": reserved + resident,
-            "floor": self._floor(),
+            "floor": self._room_floor(),
             "calls": len(self.calls()),
             "idle_requests": len(self.requests) - len(self.calls()),
             "torch_allocated": allocated,
@@ -1543,7 +1543,7 @@ class Memory:
         """Torch's reserve plus this process's weight pages: what a room limits."""
         return self._figures()[1]
 
-    def _floor(self) -> int:
+    def _room_floor(self) -> int:
         """What this process must keep to go on: its call's working set as it has peaked (across
         cut resets) or Torch's reserve, whichever is more, its pinned pages, and the streamed
         blocks in flight of the models of its phase (running, or the last entered, between
@@ -3594,7 +3594,7 @@ class Request:
         self.phase_changes: list[dict[str, Any]] = []
         self.peak = 0
         #: Torch's own allocated peak over the whole request, kept across cut-site resets: the
-        #: least room its call runs in (`Memory._floor`)
+        #: least room its call runs in (`Memory._room_floor`)
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
