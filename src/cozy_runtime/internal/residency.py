@@ -1363,6 +1363,8 @@ class Memory:
         #: as it began, and its output (`Request.note_split`), over `_notes` splits; `_replan`
         #: plans no budget below it, and none before a split has run.
         self._floor, self._notes, self._flooring = 0, 0, True
+        #: Entries of the active phase before any of its splits ran, by their caller (`_replan`)
+        self._early: dict[str, int] = {}
         self._forward_depth = 0
         #: (set, block, fill identity, overlay) -> a refilled block's baked bytes in host RAM:
         #: its next refill copies them back, with no store read, factor read or bake
@@ -2389,6 +2391,7 @@ class Memory:
             self._phase_names, self._phase_request = names, request_id
             self._split_budget, self._plans = None, 0
             self._floor, self._notes, self._flooring = 0, 0, True
+            self._early = {}
             self._plan_phase(request)
 
     def _replan(self, request: Request | None) -> None:
@@ -2405,6 +2408,11 @@ class Memory:
         if not self._notes:
             # A phase's activation before any of its splits ran (a loop preparing its loads
             # enters the phase ahead of its first forward): its first pass has not happened.
+            frames = (sys._getframe(2), sys._getframe(3))  # _activate_phase's caller, and its
+            site = " <- ".join(
+                f"{f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_code.co_name}" for f in frames
+            )
+            self._early[site] = self._early.get(site, 0) + 1
             return
         self._flooring = False  # the first pass is over
         if self._plans >= _PLANS or not self.cuda:
@@ -2444,6 +2452,7 @@ class Memory:
         }
         floor = max(allocated, self._floor)
         replan["floor_bytes"], replan["floor_splits"] = floor, self._notes
+        replan["early_entries"] = dict(self._early)
         if budget < 2 * floor:
             if planned is None:
                 if request is not None:
