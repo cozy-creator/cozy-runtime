@@ -1474,64 +1474,6 @@ class _Graph:
         probe.close()
 
 
-class _Probe:
-    """DIAGNOSTIC (cr-228, never merged): what freed device memory inside a capture."""
-
-    def __init__(self, device: Any) -> None:
-        from cozy_runtime.internal import accel
-
-        self.device, self.accel = device, accel
-        self.gcs: list[str] = []
-        self.free, self.total = torch.cuda.mem_get_info(device)
-        self.allocated = torch.cuda.memory_allocated(device)
-        self.reserved = torch.cuda.memory_reserved(device)
-        self.stats = dict(torch.cuda.memory_stats(device))
-        self.released = {k: list(v) for k, v in accel.RELEASED.items()}
-        self.began = time.time() * 1e6
-        gc.callbacks.append(self._gc)
-        torch.cuda.memory._record_memory_history(max_entries=200000, stacks="python")
-
-    def _gc(self, phase: str, info: dict[str, Any]) -> None:
-        if phase == "start":
-            self.gcs.append(f"gen{info.get('generation')}")
-
-    def close(self) -> str:
-        with suppress(ValueError):
-            gc.callbacks.remove(self._gc)
-        try:
-            snap = torch.cuda.memory._snapshot()
-        finally:
-            torch.cuda.memory._record_memory_history(enabled=None)
-        index = self.device.index or 0
-        traces = snap.get("device_traces", [])
-        events = []
-        for row in traces[index] if index < len(traces) else []:
-            if row.get("time_us", 0) < self.began:
-                continue
-            if row.get("action") in ("segment_free", "segment_unmap", "oom", "segment_alloc"):
-                frames = [
-                    f"{f.get('filename', '').rpartition('/')[2]}:{f.get('line')}:{f.get('name')}"
-                    for f in row.get("frames", [])
-                    if "torch/" not in f.get("filename", "") or "cozy" in f.get("filename", "")
-                ][:7]
-                events.append(f"{row['action']} {row.get('size', 0) >> 20}MiB {frames}")
-        stats = torch.cuda.memory_stats(self.device)
-        moved = {
-            k: stats.get(k, 0) - self.stats.get(k, 0)
-            for k in ("num_device_free", "num_device_alloc", "num_alloc_retries", "num_ooms")
-        }
-        released = {
-            k: v[0] - self.released.get(k, [0, 0])[0]
-            for k, v in self.accel.RELEASED.items()
-            if v[0] != self.released.get(k, [0, 0])[0]
-        }
-        return (
-            f"before: free {self.free >> 20} of {self.total >> 20} MiB, torch allocated "
-            f"{self.allocated >> 20} reserved {self.reserved >> 20} MiB; inside: torch {moved}, "
-            f"release_cached {released}, gc {self.gcs[:12]} ({len(self.gcs)}), "
-            f"segment events {len(events)}: {events[:6]}"
-        )[:3000]
-
     def external(self) -> dict[int, Any]:
         """What the recorded operations read from outside this graph and its pass's scratch."""
         inside = _Spans((*self.scratch, *((d, b, e) for _, _, d, b, e in self.generated.values())))
@@ -1861,3 +1803,62 @@ def _binding(model: Model, blocks: list[Any]) -> Binding:
 
 def install() -> None:
     _loop.install(Loops())
+
+
+class _Probe:
+    """DIAGNOSTIC (cr-228, never merged): what freed device memory inside a capture."""
+
+    def __init__(self, device: Any) -> None:
+        from cozy_runtime.internal import accel
+
+        self.device, self.accel = device, accel
+        self.gcs: list[str] = []
+        self.free, self.total = torch.cuda.mem_get_info(device)
+        self.allocated = torch.cuda.memory_allocated(device)
+        self.reserved = torch.cuda.memory_reserved(device)
+        self.stats = dict(torch.cuda.memory_stats(device))
+        self.released = {k: list(v) for k, v in accel.RELEASED.items()}
+        self.began = time.time() * 1e6
+        gc.callbacks.append(self._gc)
+        torch.cuda.memory._record_memory_history(max_entries=200000, stacks="python")
+
+    def _gc(self, phase: str, info: dict[str, Any]) -> None:
+        if phase == "start":
+            self.gcs.append(f"gen{info.get('generation')}")
+
+    def close(self) -> str:
+        with suppress(ValueError):
+            gc.callbacks.remove(self._gc)
+        try:
+            snap = torch.cuda.memory._snapshot()
+        finally:
+            torch.cuda.memory._record_memory_history(enabled=None)
+        index = self.device.index or 0
+        traces = snap.get("device_traces", [])
+        events = []
+        for row in traces[index] if index < len(traces) else []:
+            if row.get("time_us", 0) < self.began:
+                continue
+            if row.get("action") in ("segment_free", "segment_unmap", "oom", "segment_alloc"):
+                frames = [
+                    f"{f.get('filename', '').rpartition('/')[2]}:{f.get('line')}:{f.get('name')}"
+                    for f in row.get("frames", [])
+                    if "torch/" not in f.get("filename", "") or "cozy" in f.get("filename", "")
+                ][:7]
+                events.append(f"{row['action']} {row.get('size', 0) >> 20}MiB {frames}")
+        stats = torch.cuda.memory_stats(self.device)
+        moved = {
+            k: stats.get(k, 0) - self.stats.get(k, 0)
+            for k in ("num_device_free", "num_device_alloc", "num_alloc_retries", "num_ooms")
+        }
+        released = {
+            k: v[0] - self.released.get(k, [0, 0])[0]
+            for k, v in self.accel.RELEASED.items()
+            if v[0] != self.released.get(k, [0, 0])[0]
+        }
+        return (
+            f"before: free {self.free >> 20} of {self.total >> 20} MiB, torch allocated "
+            f"{self.allocated >> 20} reserved {self.reserved >> 20} MiB; inside: torch {moved}, "
+            f"release_cached {released}, gc {self.gcs[:12]} ({len(self.gcs)}), "
+            f"segment events {len(events)}: {events[:6]}"
+        )[:3000]
