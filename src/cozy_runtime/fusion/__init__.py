@@ -604,7 +604,12 @@ def _attend(launch: Launch, site: _Site, q: Any, k: Any, v: Any, arguments: Any)
 def _head_norm_forward(self: Any, hidden_states: Any) -> Any:
     rope = self._cozy_rope
     # fp16 rows: the fp16 projection, or a processor's fp32 upcast of it.
-    if rope is None or hidden_states.dim() != 4 or not _fusable(rope[3], hidden_states):
+    if (
+        rope is None
+        or hidden_states.dim() != 4
+        or not _fusable(rope[3], hidden_states)
+        or _kernels.rope_rows(hidden_states) is None
+    ):
         return self._cozy_eager(hidden_states)
     launch, entry, tables, layout = rope
     return _kernels.head_norm_rope(
@@ -956,6 +961,8 @@ class HeadNormRope:
             return None
         seq, heads = int(x.shape[-3]), int(x.shape[-2])
         rows = x.reshape(-1, seq, heads, self.head_dim)
+        if _kernels.rope_rows(rows) is None:  # a layout the kernel cannot address: eager
+            return None
         eps = site.eps
         out = _kernels.head_norm_rope(launch, self.entry, rows, weight, eps, tables, self.dtype)
         return out.view(x.shape)

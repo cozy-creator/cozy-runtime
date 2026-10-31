@@ -180,6 +180,7 @@ if not TRITON_ABSENT:
         sin_ptr,
         seq,
         heads,
+        stride_row,
         stride_token,
         stride_channel,
         eps,
@@ -207,7 +208,8 @@ if not TRITON_ABSENT:
         head = tl.program_id(1) * HEADS + tl.arange(0, HEADS)[:, None]
         chan = tl.arange(0, HEAD_DIM)[None, :]
         mask = head < heads
-        base = (row * heads + head) * HEAD_DIM
+        # x's rows are `stride_row` apart (a view of a packed qkv), its heads dense; out is dense.
+        base = row * stride_row + head * HEAD_DIM
         x = tl.load(x_ptr + base + chan, mask=mask, other=0.0).to(tl.float32)
         inv = tl.math.rsqrt(tl.sum(x * x, axis=1)[:, None] / HEAD_DIM + eps)
         weight = tl.load(weight_ptr + chan).to(tl.float32) + OFFSET if WEIGHT else inv
@@ -235,7 +237,8 @@ if not TRITON_ABSENT:
         else:
             turned = _round(normed * cos + paired * sin, ROUND)
         out = tl.where(rotating, turned, normed)
-        tl.store(out_ptr + base + chan, out.to(out_ptr.dtype.element_ty), mask=mask)
+        dense = (row * heads + head) * HEAD_DIM
+        tl.store(out_ptr + dense + chan, out.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _next_pow2(n: int) -> int:
@@ -457,8 +460,14 @@ def head_norm_rope(
     """Per-head RMSNorm of `[batch, seq, heads, head_dim]` `x`, then `entry`'s RoPE by
     `tables` (`rope_tables`), in `dtype`."""
     batch, seq, heads, head_dim = (int(d) for d in x.shape)
-    flat = _aligned(x.reshape(batch * seq, heads * head_dim))
-    out = torch.empty(flat.shape, dtype=dtype, device=flat.device)
+    stride_row = rope_rows(x)
+    if stride_row is None:
+        raise ValueError(
+            f"head_norm_rope: rows {tuple(x.shape)} at strides {x.stride()} are not addressable "
+            "(dense heads, rows one fixed stride apart, a 16-byte aligned base)"
+        )
+    flat = x
+    out = torch.empty((batch * seq, heads * head_dim), dtype=dtype, device=x.device)
     cos, sin, stride_token, stride_channel = tables
     c = {**entry.constexprs, "X32": int(x.dtype is torch.float32)}
     launch(
@@ -471,12 +480,28 @@ def head_norm_rope(
         sin,
         seq,
         heads,
+        stride_row,
         stride_token,
         stride_channel,
         float(eps),
         *(c[k] for k in ROPE_CONSTEXPRS),
     )
     return out.view(batch, seq, heads, head_dim)
+
+
+def rope_rows(x: Any) -> int | None:
+    """The row stride `head_norm_rope_kernel` reads `[batch, seq, heads, head_dim]` `x` at, or
+    None when it cannot address x: heads dense, every row one fixed stride apart across batch and
+    seq (a packed qkv's q or k view qualifies), a 16-byte aligned base and row stride."""
+    batch, seq, heads, head_dim = (int(d) for d in x.shape)
+    if x.stride(-1) != 1 or (heads > 1 and x.stride(-2) != head_dim):
+        return None
+    row = int(x.stride(1)) if seq > 1 else heads * head_dim
+    if batch > 1 and int(x.stride(0)) != seq * row:
+        return None
+    if x.data_ptr() % 16 or (row * x.element_size()) % 16 or row < heads * head_dim:
+        return None
+    return row
 
 
 def rope_tables(value: Any, *, interleaved: bool, rotary: int) -> tuple[Any, Any, int, int]:
