@@ -3795,7 +3795,7 @@ def _allocator(memory: Memory) -> dict[str, int]:
         key: int(stats[key])
         for key in (
             "allocations", "frees", "ooms", "driver_memory_calls",
-            "event_queries", "event_records", "event_waits",
+            "event_queries", "event_records", "event_waits", "context_joins",
         )
     }
 
