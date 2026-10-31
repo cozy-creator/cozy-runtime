@@ -39,6 +39,14 @@ except ModuleNotFoundError:  # Linux aarch64 (cr-200), Windows (cr-201) and the 
     NO_SAGE3 = "this cozy-runtime wheel carries no SageAttention3"
 except ImportError as broken:
     NO_SAGE3 = f"this cozy-runtime wheel's SageAttention3 does not load ({broken})"
+try:
+    import cozy_runtime._kernels._attn4 as _attn4
+
+    NO_ATTN4 = ""
+except ModuleNotFoundError:  # the pure wheel
+    NO_ATTN4 = "this cozy-runtime wheel carries no INT4 Q·Kᵀ attention"
+except ImportError as broken:
+    NO_ATTN4 = f"this cozy-runtime wheel's INT4 Q·Kᵀ attention does not load ({broken})"
 
 #: The CUDA toolkit the kernels are built with, and the oldest driver that runs it, per
 #: `sys.platform`. cozy's `platform::gpu` holds the same floor for TensorD's startup check.
@@ -76,6 +84,8 @@ ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
     "_fa3": {"cubin": ("sm_90a",), "ptx": ()},
     # SageAttention3's forward runs on RTX 50 and DGX Spark only (block-scaled FP4 mma.sync, TMA).
     "_sage3": {"cubin": ("sm_120a", "sm_121a"), "ptx": ()},
+    # INT4 Q·Kᵀ attention runs on the cards with s4 tensor cores: Ampere (8.0's serves 8.7) and Ada.
+    "_attn4": {"cubin": ("sm_80", "sm_86", "sm_89"), "ptx": ()},
     "_norm": {
         "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
         "ptx": ("compute_80",),
@@ -133,4 +143,4 @@ def rms_rope_split_half(
 
 
 # The modules are `internal.prebuilt`'s to call; `rms_rope_split_half` is `author.kernels`'.
-__all__ = ["_fa3", "_gemm", "_norm", "_sage3", "rms_rope_split_half"]
+__all__ = ["_attn4", "_fa3", "_gemm", "_norm", "_sage3", "rms_rope_split_half"]

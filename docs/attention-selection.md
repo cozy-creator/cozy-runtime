@@ -21,6 +21,11 @@ class H3(Model[object], attention_bits={"fl2va_dit": 4, "ref2va_dit": 4}): ...
 class Klein(Model[object], attention_bits={"transformer.single_transformer_blocks.": 8}): ...
 ```
 
+INT4 Q·Kᵀ on the int4 rows (Ampere, Ada) is in no cell until the owner rules on its quality
+(10-31): `kitchen-int4qk` (Kitchen INT8 attention with Q and K in int4) and its Sol form
+`kitchen-sol-int4qk` (dense steps int4-QK, sparse steps and exact paths Kitchen INT8) serve only
+a pin, `--attention-kernel=[component=]kitchen-int4qk`.
+
 `attention_bits` is 16, 8 or 4, or a mapping from component-qualified module prefixes to them
 (the longest prefix wins, unlisted sites 16). It is the model's tolerance, independent of its
 weight lane. A kernel skipped because it is absent, compiling or failed is one run warning
