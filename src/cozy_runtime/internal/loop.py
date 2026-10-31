@@ -1392,6 +1392,7 @@ class _Graph:
     ) -> None:
         self.recording, self.state, self.steps, self.bindings = recording, state, steps, bindings
         self._diagnostic_stage = "step"
+        self._diagnostic_allocator_before: dict[str, Any] | None = None
         self.device = state[0].device
         self.domain = recording._domain
         self.ranges = tuple(
@@ -1435,6 +1436,14 @@ class _Graph:
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
         context = CURRENT.get()
         pause = context._pause_stall_watch if context is not None else None
+        if self._diagnostic_stage == "after":
+            from cozy_runtime.internal.execution import catch
+
+            if catch._CAPTURE_METADATA.get() is not None:
+                stats = torch.cuda.memory_stats(self.device)
+                self._diagnostic_allocator_before = {
+                    key: stats.get(key) for key in ("num_ooms", "num_alloc_retries")
+                }
         try:
             self._contexts.enter_context(pause() if pause is not None else nullcontext())
             self._contexts.enter_context(kernel_ready.recording())
@@ -1492,6 +1501,13 @@ class _Graph:
                 from cozy_runtime.internal.capture_kernel_metadata import snapshot
 
                 metadata = snapshot(self.graph.raw_cuda_graph())
+                stats = torch.cuda.memory_stats(self.device)
+                metadata["allocator"] = {
+                    "before": self._diagnostic_allocator_before,
+                    "after": {
+                        key: stats.get(key) for key in ("num_ooms", "num_alloc_retries")
+                    },
+                }
                 metadata.update(stage="after", graph=record["graph_index"])
                 record.setdefault("kernel_metadata", []).append(metadata)
 
