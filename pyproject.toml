@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.36.13"
+version = "0.36.14"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
