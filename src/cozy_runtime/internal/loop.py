@@ -37,7 +37,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Hashable, Iterable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -1448,9 +1448,19 @@ class _Graph:
 
     def abort(self, error: BaseException | None = None) -> None:
         """End a failed capture with its error so the owner cannot publish a partial graph."""
-        with suppress(BaseException):
+        try:
             self.end(error)
-        self.reset()
+        except BaseException as failure:
+            if failure is error:
+                self.reset()
+                return
+            try:
+                self.reset()
+            except BaseException as reset_error:
+                failure.add_note(f"Graph reset also failed: {reset_error!r}")
+            raise
+        else:
+            self.reset()
 
     def nodes(self) -> int:
         """The recorded graph's node count: what it launches, whatever launched it."""
@@ -1782,15 +1792,17 @@ class _Cutter:
 
     def _abort(self, error: BaseException | None = None) -> None:
         graph, self.graph = self.graph, None
-        if graph is not None:
-            graph.abort(error)
-        if self._declared is not None:
-            _CAPTURE_BLOCKS.reset(self._declared)
-            self._declared = None
-        self._preparing.close()
-        if self.binding is not None:
-            self.binding.close()
-        self.block = self.binding = self.load = None
+        binding, self.binding = self.binding, None
+        self.block = self.load = None
+        with ExitStack() as cleanup:
+            if binding is not None:
+                cleanup.callback(binding.close)
+            cleanup.callback(self._preparing.close)
+            if self._declared is not None:
+                declared, self._declared = self._declared, None
+                cleanup.callback(_CAPTURE_BLOCKS.reset, declared)
+            if graph is not None:
+                graph.abort(error)
 
 
 def _binding(model: Model, blocks: list[Any]) -> Binding:
