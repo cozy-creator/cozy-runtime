@@ -3368,6 +3368,7 @@ class Request:
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
         self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
         self.prefetch_released = 0
+        self.allocator = _allocator(memory)
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
@@ -3549,6 +3550,13 @@ class Request:
                     "fallback_blocks": sum(b.aliases is None for b in groups),
                     "native_prefetch": self.memory.prefetch_supported,
                 },
+                # This request's cudaMalloc hook counters: `cache_refusals` are refused
+                # activation allocations Torch answered by freeing its whole cache.
+                allocator={
+                    k: v - self.allocator.get(k, 0)
+                    for k, v in _allocator(self.memory).items()
+                    if k not in ("torch_reserved_bytes", "activation_admission_limit")
+                },
                 prefetch={
                     "started": self.prefetch_started,
                     "completed": self.prefetch_completed,
@@ -3564,6 +3572,13 @@ class Request:
         elif self.memory.device.type == "mps":
             out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
         return out
+
+
+def _allocator(memory: Memory) -> dict[str, int]:
+    """The process's cudaMalloc hook counters on this device (TensorFS `allocator_stats`)."""
+    if not memory.cuda or memory.native is None:
+        return {}
+    return dict(varena.allocator_stats(memory.device.index or 0))
 
 
 def _resident_bytes(block: _Block) -> int:
