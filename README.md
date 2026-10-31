@@ -422,24 +422,23 @@ assets merely because they have unusual dimensions; an explicit valid output rat
 such a reference. Packages that preserve a reference canvas directly must still resolve it
 through `ImageRequest.target()` before choosing output dimensions.
 
-A prompt names its production assets (characters, props, environments) as `<name>` when a
-package opts into the author library's assets (xs-135): `assets: list[PictureAsset]` (or an
-`Asset` subclass with its own media and fields), and `render(prompt, assets, label)` puts each
-mention in the model's own words, the label being how the model refers to the Nth asset
-(`lambda n, asset: f"Picture {n}"`). Names match in any case with `_`, `-` and space alike; a
-mention of no asset stays as written with a warning. `ImageRequest.assets` takes these, and its
-first asset sets the default canvas. Nothing below the author library knows the convention: a
-package may declare any input shape. Attached files are `File`, `ImageFile`, `VideoFile` and
-`AudioFile`; Runtime 0.36.0 renamed them from `*Asset`, and a package importing an old name
-fails at import with a remedy.
+A prompt names the files guiding it as `<name>` when a package opts into the author library's
+references (xs-135, xs-139): `pictures: list[Picture]` (or a `Reference` subclass with its own
+media and fields), and `render(prompt, references, label)` puts each mention in the model's own
+words, the label being how the model refers to the Nth reference (`lambda n, picture: f"Picture
+{n}"`). Names match in any case with `_`, `-` and space alike; a mention of no reference stays as
+written with a warning. `ImageRequest.pictures` takes these, and its first picture sets the default
+canvas. Nothing below the author library knows the convention: a package may declare any input
+shape. Attached files are `File`, `ImageFile`, `VideoFile` and `AudioFile`.
 
-Shots and upscales have shared interfaces too (xs-136), so a project swaps one renderer for
-another: `ShotRequest`/`ShotResult` (`video/shot`: a shot of any length with `beats`, `assets`,
-`world_state` and `writes`) and `UpscaleRequest`/`UpscaleResult` (`video/upscale`). A package
-subclasses them for its own knobs and declares what it implements on the entrypoint:
-`app.entrypoint(shot, implements=Implements("video/shot", max_piece_s=15))`. The interface
-document carries it as `implements`, so a caller flags a shot longer than `max_piece_s` with
-no beats before anything runs.
+Shots and upscales share a contract too (xs-139), so a project compiles a shot into any package's
+call: `ShotRequest`/`ShotResult` (`prompt`, `duration_s`, `beats`, `style`, `soundscape`,
+`references` tagged on `kind`, `plate`, `first_frame`/`last_frame`, `continue_from`,
+`aspect_ratio`, `preset`; the result's `video` and `latents`) and `UpscaleRequest`/`UpscaleResult`.
+A package subclasses them, narrows `references` to the kinds its model takes and adds its own
+fields. Nothing declares the contract: the project reads each function's request schema and sends
+the fields it declares, and a `duration_s` schema extra (`max_piece_s`, `min_piece_s`) states its
+piece limits.
 
 Image inputs can separately opt into preparation on a field or an `Files` argument:
 
@@ -513,7 +512,7 @@ model — and it is what the end-to-end suite builds, installs and runs.
 one only its own package's calls run ([docs/child-tasks.md](docs/child-tasks.md)). Both take
 `weights=`, `publishes=`/`emits_media=`, `accelerator=` (False: CPU only; True or absent: the
 machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`, `components=` and
-`memoize=`; `entrypoint` adds `hidden=` and `implements=`. A writer (`weights=`, `publishes=`,
+`memoize=`; `entrypoint` adds `hidden=`. A writer (`weights=`, `publishes=`,
 `emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
 repeat.
 

@@ -1,22 +1,20 @@
-"""xs-136 — the `video/shot` and `video/upscale` interfaces: one request and one result for every
-shot renderer and every upscaler, so a project swaps one package for another and keeps its
-requests. Opt-in, like the image interface: a package subclasses these structs to add its own
-knobs, and declares `implements=Implements(...)` on its entrypoint so a caller can plan by it.
+"""xs-139 — the shot and upscale contract: the field names and shapes a project sends to whatever
+function renders a shot or upscales one, so another package can replace any of them. Opt-in, like
+the image interface: a package subclasses these structs, narrows `references` to the kinds its model
+takes and adds its own fields. The project matches fields by name against the function's request
+schema; nothing here is a registry, and Runtime core never reads it.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Literal, get_args
+from typing import Annotated, Literal
 
 import msgspec
 
-from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._files import File, ImageFile, VideoFile
-from cozy_runtime.author._image import PictureAsset, Seed
+from cozy_runtime.author._files import AudioFile, File, ImageFile, VideoFile
+from cozy_runtime.author._image import AspectRatio, Seed
 from cozy_runtime.author._markers import FileBound
-
-#: The interfaces a caller knows: stills (`ImageRequest`), shots and upscales.
-Interface = Literal["image", "video/shot", "video/upscale"]
+from cozy_runtime.author._references import Reference
 
 Frame = Annotated[
     ImageFile,
@@ -27,31 +25,18 @@ Frame = Annotated[
     ),
 ]
 Video = Annotated[VideoFile, FileBound(max_bytes=1 << 30, max_decoded_bytes=2 << 30)]
-#: A shot's own latents, in its renderer's format and opaque to the caller: an upscaler of the same
-#: model starts from them instead of re-encoding the video (the shot's real latent, not a decode's).
+Sound = Annotated[AudioFile, FileBound(max_bytes=256 << 20)]
+#: A shot's own latents, in its renderer's format and opaque to the caller: a later call of the same
+#: package continues from them, and its upscaler starts from them instead of re-encoding the video.
 Latents = Annotated[File, FileBound(max_bytes=1 << 30, media_types=("application/octet-stream",))]
 #: Speed against fidelity, as a video encoder's presets: `quality` the slowest and closest to the
 #: model's reference, `fast` the quickest; each renderer or upscaler maps them to its own recipes.
 Preset = Literal["quality", "balanced", "fast"]
-
-
-class Implements(msgspec.Struct, frozen=True, omit_defaults=True):
-    """The interface an entrypoint implements, with the facts a caller plans by. `max_piece_s`
-    is the longest piece a `video/shot` renderer makes at once: a longer shot needs beats."""
-
-    interface: Interface
-    max_piece_s: Annotated[float, msgspec.Meta(gt=0)] | None = None
-
-    def __post_init__(self) -> None:
-        # A constructor checks no types: the declaration is checked here, once, at import and by
-        # the static reader alike.
-        if self.interface not in get_args(Interface):
-            known = ", ".join(get_args(Interface))
-            raise ConformanceError(f"implements names {self.interface!r}: one of {known}")
-        if self.max_piece_s is not None and (
-            self.interface != "video/shot" or not self.max_piece_s > 0
-        ):
-            raise ConformanceError("max_piece_s is a video/shot's positive number of seconds")
+#: How strictly an image reference guides: `exact` keeps it as pictured, `loose` keeps its
+#: arrangement and positions, not its frame (a world state, a place's layout).
+Follow = Literal["exact", "loose"]
+#: An output's short edge: `1080p`, `1440p`, `2160p`.
+Resolution = Annotated[str, msgspec.Meta(pattern=r"^[1-9][0-9]*p$")]
 
 
 class Beat(msgspec.Struct, kw_only=True):
@@ -61,53 +46,102 @@ class Beat(msgspec.Struct, kw_only=True):
     prompt: str
 
 
-class ShotAsset(PictureAsset, kw_only=True):
-    """A character, prop or environment in the shot; the environment's picture is its setup
-    plate. Every one is used, named in the text or not."""
-
-    description: str = ""
+class ShotReference(Reference, tag_field="kind", kw_only=True):
+    """A file guiding the shot, named for the prompt's `<name>`; `kind` says what it is."""
 
 
-class WorldState(msgspec.Struct, kw_only=True):
-    """How the set stands as the shot begins: a picture, and `layout`, who and what is where."""
+class CharacterReference(ShotReference, tag="character", kw_only=True):
+    """A person. `voice` is their voice's timbre."""
 
-    name: str
     image: Frame
-    layout: str = ""
+    description: str = ""
+    follow: Follow = "exact"
+    voice: Sound | None = None
+
+
+class PropReference(ShotReference, tag="prop", kw_only=True):
+    image: Frame
+    description: str = ""
+    follow: Follow = "exact"
+
+
+class EnvironmentReference(ShotReference, tag="environment", kw_only=True):
+    """A place: an environment's picture from the shot's camera, or a world state (`loose`)."""
+
+    image: Frame
+    description: str = ""
+    follow: Follow = "exact"
+
+
+class VideoReference(ShotReference, tag="video", kw_only=True):
+    """A motion and camera guide, second for second with the shot; its sound only with
+    `use_audio`."""
+
+    video: Video
+    use_audio: bool = False
+
+
+class AudioReference(ShotReference, tag="audio", kw_only=True):
+    """Sound the soundtrack reuses."""
+
+    audio: Sound
+
+
+ShotReferences = (
+    CharacterReference | PropReference | EnvironmentReference | VideoReference | AudioReference
+)
+
+
+class Plate(msgspec.Struct, kw_only=True):
+    """The video being edited: the shot keeps its frames, framing and timing, and the prompt (or an
+    edit LoRA) decides what changes. It sets the frame size and spans the shot's timeline."""
+
+    video: Video
+    use_audio: bool = False
+
+
+class ContinueFrom(msgspec.Struct, kw_only=True):
+    """A video the shot begins with, and its `latents` from the same package: the request then
+    runs on that video's timeline, resumes at its end and returns the whole video."""
+
+    video: Video
+    latents: Latents | None = None
 
 
 class ShotRequest(msgspec.Struct, kw_only=True):
     """One continuous shot of any length. `prompt` applies throughout, with its `<Name>`
-    mentions; each beat holds until the next. `writes` asks for frames of it: `first`, `last` or
-    seconds in."""
+    mentions; each beat holds until the next. `references` are in the order its model numbers
+    them."""
 
     prompt: str
     duration_s: Annotated[float, msgspec.Meta(gt=0)]
     beats: list[Beat] = msgspec.field(default_factory=list)
-    seed: Seed | None = None
     style: str = ""
-    assets: list[ShotAsset] = msgspec.field(default_factory=list)
-    world_state: list[WorldState] = msgspec.field(default_factory=list)
-    writes: list[Literal["first", "last"] | Annotated[float, msgspec.Meta(ge=0)]] = msgspec.field(
-        default_factory=list
-    )
+    soundscape: str = ""
+    references: list[ShotReferences] = msgspec.field(default_factory=list)
+    plate: Plate | None = None
+    first_frame: Frame | None = None
+    last_frame: Frame | None = None
+    continue_from: ContinueFrom | None = None
+    aspect_ratio: AspectRatio | None = None
+    seed: Seed | None = None
     preset: Preset = "balanced"
 
 
 class ShotResult(msgspec.Struct):
     video: Annotated[VideoFile, FileBound(max_bytes=1 << 30, media_types=("video/mp4",))]
-    #: One per `writes` entry, in order.
-    frames: list[Frame]
     warnings: list[str]
-    #: The shot's latents, when its renderer keeps them; a project keeps them with the video.
+    #: The shot's latents, when its renderer keeps them: a project keeps them with the video, for
+    #: `continue_from` and the upscale.
     latents: Latents | None = None
 
 
 class UpscaleRequest(msgspec.Struct, kw_only=True):
-    """A whole shot at a higher resolution; `prompt` is the text it was made from, for an
-    upscaler that re-renders."""
+    """A whole shot at `resolution` (its short edge), in the shot's own aspect; `prompt` is the
+    text it was made from, for an upscaler that re-renders."""
 
     video: Video
+    resolution: Resolution
     prompt: str = ""
     seed: Seed | None = None
     #: The `latents` the shot came with. An upscaler that reads them starts from them; without
