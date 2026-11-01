@@ -28,7 +28,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
-from tensorfs import varena
+import tensorfs.varena.torch as vt
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
@@ -515,14 +515,6 @@ def drain(torch: Any, kind: str) -> None:
         torch.cuda.current_stream().synchronize()
 
 
-#: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
-#: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
-#: Every cached block splits: an unsplit block serves only a request within 20 MiB of its size,
-#: so a 1 GiB limit left H3's attention segments cached beside each pass's peak and cudaMalloc'd
-#: new ones (Turbo 15 s on a 4090: 13.3 s slower, first step 6.2 s, xs-089 runs 23416/23457).
-#: A limit also makes a refused cudaMalloc free oversize blocks, which ends a capture (cr-228).
-#: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
-ALLOCATOR = "backend:native,expandable_segments:False"
 #: torch `_native`'s DSLs that compile at an op's first call.
 JIT_DSLS = ("triton", "cutedsl", "helion")
 
@@ -544,13 +536,12 @@ def initialize(torch: Any, kind: str) -> None:
         native = getattr(torch, "_native", None)
         if native is not None:
             native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
-        torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         try:
-            varena.install_allocator()
+            vt.install()
         except (ImportError, AttributeError, RuntimeError) as exc:
             if fault(exc) is not Fault.OTHER:
                 raise
-            raise ResidencyError(f"native CUDA allocation recovery is unavailable: {exc}") from exc
+            raise ResidencyError(f"native CUDA allocator is unavailable: {exc}") from exc
         torch.cuda.init()
 
 
@@ -592,7 +583,7 @@ def oom_error(torch: Any, kind: str) -> type[BaseException]:
 
 def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) -> dict[str, int]:
     """The allocator's live numbers plus the driver's own view — the only number that sees
-    other processes. CUDA figures include native weight backing beside stock Torch. On unified
+    other processes. CUDA figures include working allocations and native weight backing. On unified
     memory the device is this process's
     budget (`unified_budget`) and the driver's figure counts this process's Metal buffers only.
     A CPU's device memory is the host's RAM, and no allocator of ours holds any of it."""
@@ -614,9 +605,10 @@ def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) ->
         }
     free, total = torch.cuda.mem_get_info(device)
     weights = _weight_bytes(memory)
+    working = vt.stats(device)
     return {
-        "allocated_bytes": int(torch.cuda.memory_allocated(device)) + weights,
-        "reserved_bytes": int(torch.cuda.memory_reserved(device)) + weights,
+        "allocated_bytes": int(working["allocated_bytes"]) + weights,
+        "reserved_bytes": int(working["mapped_bytes"]) + weights,
         "driver_free_bytes": int(free),
         "driver_total_bytes": int(total),
     }
@@ -633,7 +625,7 @@ def allocated(torch: Any, kind: str, memory: Any = None) -> int:
         return int(torch.mps.current_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(torch.cuda.memory_allocated(getattr(memory, "device", None))) + _weight_bytes(memory)
+    return int(vt.stats(getattr(memory, "device", None))["allocated_bytes"]) + _weight_bytes(memory)
 
 
 def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
@@ -642,7 +634,7 @@ def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
         return int(torch.mps.driver_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(torch.cuda.memory_reserved(getattr(memory, "device", None))) + _weight_bytes(memory)
+    return int(vt.stats(getattr(memory, "device", None))["mapped_bytes"]) + _weight_bytes(memory)
 
 
 def allocator_peak(memory: Any, request: str | None = None) -> int:
@@ -666,9 +658,13 @@ def release_cached(torch: Any, kind: str) -> None:
     """Return unused allocator blocks to the driver; live tensors remain owned."""
     if kind not in ("cuda", "mps"):
         return
-    before = reserved(torch, kind)
-    (torch.cuda if kind == "cuda" else torch.mps).empty_cache()
-    if (freed := before - reserved(torch, kind)) > 0:
+    if kind == "cuda":
+        freed = int(vt.trim(torch.cuda.current_device()))
+    else:
+        before = reserved(torch, kind)
+        torch.mps.empty_cache()
+        freed = before - reserved(torch, kind)
+    if freed > 0:
         row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
         row[0] += 1
         row[1] += freed
