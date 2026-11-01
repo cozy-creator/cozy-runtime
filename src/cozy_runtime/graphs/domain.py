@@ -24,6 +24,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+import tensorfs.varena.torch as vt
 from tensorfs import varena
 
 from cozy_runtime.author._context import device as placed_device
@@ -42,12 +43,28 @@ def unsupported(torch: Any) -> str:
     )
 
 
+def working_peak(device: int) -> int:
+    """Measured working demand, including eager peaks retained across split-site resets."""
+    from cozy_runtime.internal.execution import catch
+    from cozy_runtime.internal.residency import _REQUEST
+
+    peak = int(vt.stats(device)["allocated_peak"])
+    # Capture preparation may open an idle request inside the still-active serving request.
+    for request in (catch.CURRENT.get(), _REQUEST.get()):
+        if (
+            request is not None
+            and request.memory.cuda
+            and (request.memory.device.index or 0) == device
+        ):
+            peak = max(peak, request.torch_peak)
+    return peak
+
+
 @dataclass(eq=False, slots=True)
 class Pool:
-    """A stock Torch graph-pool token. Graphs and their static tensors own its allocations.
+    """A Varena-backed graph-pool token; graphs, tensors and completion fences own backing.
 
-    Runtime retires every graph and waits for its readers before dropping those tensors.
-    The native weight manager does not own this activation/scratch pool.
+    Runtime retires every graph and joins its readers before dropping those tensors.
     """
 
     handle: tuple[int, int]
@@ -126,12 +143,8 @@ class Domain:
                 self.owner = self.torch.cuda.CUDAGraph()
                 # No library work or allocation inside this owner graph. Recording an event makes
                 # its capture stream explicit; reset later clears only this stream.
-                with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
-                    self.owner.capture_begin(capture_error_mode="thread_local")
-                    try:
-                        self.join.record(self.stream)
-                    finally:
-                        self.owner.capture_end()
+                with vt.graph(self.owner, stream=self.stream, reserve_bytes=0):
+                    self.join.record(self.stream)
                 self.config = self.configuration()
             except BaseException:
                 self.finish()
@@ -191,6 +204,9 @@ class Domain:
                 self.owner = None
             for stream in (self.stream, self.control):
                 if stream is not None:
+                    # Graph reset may enqueue allocator retirement events.
+                    stream.synchronize()
+                    vt.retire_stream(stream, device=self.device)
                     self.torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
