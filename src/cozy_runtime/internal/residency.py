@@ -525,56 +525,25 @@ class _Prefetch:
     identity: str
     request: Request | None
     queued: QueuedPrefetch | None = None
-    #: the fill overlay its page holds, and whether it fills the final (cast) region
+    #: The immutable RAW source's overlay identity, verified again at settlement.
     overlay: Hashable = None
-    final: bool = False
-    #: one DMA from a host-tier page (`_host_read`), not a store read
-    host: bool = False
 
 
 class _HostPage:
     """A page's bytes in host RAM, registered with CUDA (pinned) so its refill is one DMA, and
-    unregistered when the page goes, after its last copy (`event`) completed. Registered once
+    unregistered when the page goes. Demand copies are synchronous. Registered once
     filled: registering touched memory runs at about twice the rate of untouched memory."""
 
-    __slots__ = ("event", "tensor")
+    __slots__ = ("tensor",)
 
     def __init__(self, tensor: Tensor) -> None:
         self.tensor = tensor
-        self.event: Any = None
         code = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.numel(), 0)
         if int(code) != 0:
             raise RuntimeError(f"cudaHostRegister returned {code}")
 
     def release(self) -> None:
-        if self.event is not None:
-            self.event.synchronize()
         torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr())
-
-
-class _HostRead:
-    """A prefetch from a host page: one DMA on the copy stream. Its fill commits only once the
-    copy completed, so nothing that pins the region ready can read it early."""
-
-    def __init__(self, use: Any, event: Any, nbytes: int) -> None:
-        self.use, self.event, self.nbytes, self.canceled = use, event, nbytes, False
-
-    def start(self) -> None:
-        pass
-
-    def poll(self) -> dict[str, bool]:
-        return {"done": bool(self.event.query())}
-
-    def cancel(self) -> None:
-        self.canceled = True
-
-    def wait(self) -> dict[str, Any]:
-        self.event.synchronize()
-        use, self.use = self.use, None
-        if use is not None and not self.canceled:
-            use.commit()
-        nbytes = 0 if self.canceled else self.nbytes
-        return {"canceled": self.canceled, "bytes": nbytes, "host": True}
 
 
 class Model:
@@ -1423,7 +1392,6 @@ class Memory:
         self._rate: dict[tuple[object, ...], int] = {}
         #: stored pages whose store read completed: a resident block's page is wanted on its second
         self._read_once: set[tuple[object, ...]] = set()
-        self._h2d_stream: Any = None
         self._host_looked = 0.0
         admission = inspect.signature(varena.Region.prepare).parameters
         self._host_prepare = "evict_completed" in admission  # TensorFS 0.17.4
@@ -1435,6 +1403,7 @@ class Memory:
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = bool(
                     callable(getattr(varena, "replay", None))
+                    and callable(getattr(varena.Region, "prepare_prefetch", None))
                     and getattr(varena, "supports_prefetch", lambda: False)()
                 )
                 self.phase_supported = bool(getattr(varena, "supports_phases", lambda: False)())
@@ -2214,31 +2183,6 @@ class Memory:
         self._baked_once = {page for page in self._baked_once if page[0] != model.name}
         self._plain = {page for page in self._plain if page[0] != model.name}
 
-    def _host_read(
-        self, region: Any, kept: _HostPage, *, evict_completed: bool
-    ) -> _HostRead | None:
-        """A refill from a host page: the region's fill under the native prefetch's admission,
-        one async DMA; None when the region is resident already. The copy stream exists before
-        admission, and a fill admitted here that fails is released before its error leaves: a
-        traceback holding it kept the region `already being filled` for the retry (cr-225)."""
-        if self._h2d_stream is None:
-            self._h2d_stream = torch.cuda.Stream(self.device)
-        stream = self._h2d_stream
-        use = region.prepare(reclaim=False, evict_completed=evict_completed)
-        if not use.needs_fill:
-            return None
-        try:
-            use.consume_on(stream.cuda_stream)  # its release fences on the copy
-            with torch.cuda.stream(stream):
-                use.tensor.copy_(kept.tensor, non_blocking=True)
-                event = torch.cuda.Event()
-                event.record(stream)
-        except BaseException:
-            use = None  # the fill and its tensor go now, not with the traceback
-            raise
-        kept.event = event
-        return _HostRead(use, event, kept.tensor.numel())
-
     def _switch_overlay(self, block: _Block, overlay: Hashable) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
         a LoRA forward, or the reverse). As for a changed fill, its model's holds go first. A
@@ -2843,12 +2787,13 @@ class Memory:
         request: Request | None,
         *,
         queued: QueuedPrefetch | None = None,
-        released: bool = False,
     ) -> None:
-        """Admit one immutable read, without eviction or Python fill callbacks: a page the host
-        tier keeps (stored, baked or cast) by one DMA, else the stored bytes, and for a hooked
-        block only when its fill writes nothing under the overlay this forward arms. A cast block
-        the tier keeps cast (`_host_final`) prefetches only its kept final bytes."""
+        """Offer one immutable stored RAW source to native measured admission.
+
+        Unknown keys and physical shortfalls decline without IO or Python recovery.
+        Host-kept/final/transformed sources await their own native source contract;
+        ordinary demand retains the existing host-tier and fill paths.
+        """
         if (
             not self.prefetch_supported
             or self.capturing()
@@ -2858,16 +2803,23 @@ class Memory:
             or block.gathered is not None
         ):
             return
+        identity = block.model.identity
+        if identity is None:
+            if request is not None:
+                counts = request.prefetch_unsupported
+                counts["source_identity"] = counts.get("source_identity", 0) + 1
+            return
         overlay = None
         if block.model.fill is not None:
             if queued is not None:
+                if request is not None:
+                    counts = request.prefetch_unsupported
+                    counts["queued_overlay"] = counts.get("queued_overlay", 0) + 1
                 return  # another request's hooks are armed by its own code, not yet run
             overlay = block.model.fill.overlay(block.path, block.parts)
             if overlay != block.overlay:
                 return  # demand parks or refills a page of another overlay (`_switch_overlay`)
-        final = _host_final(block)
-        page = _page(block, block.model.identity, overlay, final=final)
-        size = block.final_bytes if final else block.storage_bytes
+        page = _page(block, identity, overlay)
         with self.lock:
             if (
                 self._prefetch is not None
@@ -2877,29 +2829,18 @@ class Memory:
                 or block.cached()
             ):
                 return
-            if block.finals and not final and block.region is not None and block.region.resident:
+            if _host_final(block) or (block.model.fill is not None and page not in self._plain):
+                if request is not None:
+                    counts = request.prefetch_unsupported
+                    counts["transform"] = counts.get("transform", 0) + 1
+                return
+            if block.finals and block.region is not None and block.region.resident:
                 return  # its stored bytes are resident; demand writes the final ones
             kept = self._baked.get(page) if self._host_prepare else None
-            if kept is not None and kept.tensor.numel() != size:
-                kept = None
-            hooked = block.model.fill is not None and page not in self._plain
-            if kept is None and (final or hooked):
-                return  # only a kept page, or a hooked one whose fill writes nothing, is read
-            # A queued request's read is admitted only into free room. Demand's next block may
-            # also take the room of the oldest streamed block whose consumers completed: Varena
-            # evicts it on its last-consumer events and refuses rather than wait or join.
-            needed = block.allocation_bytes + self.window_bytes
-            if queued is not None and needed > self.room().free:
+            if kept is not None and kept.tensor.numel() == block.storage_bytes:
                 if request is not None:
-                    request.prefetch_skipped += 1
-                    if queued is not None:
-                        request.queued_prefetch.append(
-                            {
-                                "request": queued.request_id,
-                                "state": "capacity_skip",
-                                "bytes": needed,
-                            }
-                        )
+                    counts = request.prefetch_unsupported
+                    counts["kept_host"] = counts.get("kept_host", 0) + 1
                 return
             offset = 0
             parts = []
@@ -2908,53 +2849,23 @@ class Memory:
                     name = f"{block.model.component}/{key}#{part.role or 'value'}"
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
-            retry = False
             try:
-                region = self._native_region(block, final=final, speculative=True)
-                # Outgoing cached weights may already fill the nonpreferred window even
-                # when the active phase has ample resident-prefix room. Admit its next
-                # block under that same soft preference without growing a cut prefix.
-                preferred = bool(region.preferred)
-                provisional = (
-                    queued is None
-                    and self.phase_supported
-                    and not preferred
-                    and block.model.prefix is None
-                    and block.allocation_bytes + self._headroom() <= self.room().free
-                )
-                try:
-                    if provisional:
-                        region.set_preferred(True)  # native end-of-prefix watermark still wins
-                    if kept is not None:
-                        read = self._host_read(region, kept, evict_completed=queued is None)
-                        if read is None:
-                            return  # resident already
-                    else:
-                        read = region.prepare_read(
-                            block.model.source.ck,
-                            parts,
-                            reclaim=False,
-                            evict_completed=queued is None,
-                        )
-                finally:
-                    if provisional:
-                        # The prepared Fill owns its pin. Only demand may assign a lasting
-                        # preference, so cancellation/failure cannot leave this one behind.
-                        region.set_preferred(preferred)
+                region = self._native_region(block, speculative=True)
+                read = region.prepare_prefetch(block.model.source.ck, parts)
+                if read is None:
+                    if request is not None:
+                        request.prefetch_declined += 1
+                        if queued is not None:
+                            request.queued_prefetch.append(
+                                {"request": queued.request_id, "state": "declined_native"}
+                            )
+                    return
             except (torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) is not Fault.OOM:
                     raise
-                free = int(torch.cuda.mem_get_info(self.device)[0])
-                allocated, reserved, _ = _torch_bytes(self.device)
-                retry = (
-                    not released
-                    and queued is None
-                    and free < block.allocation_bytes <= (free + reserved - allocated)
-                )
-                if not retry:
-                    if request is not None:
-                        request.prefetch_skipped += 1
-                    return
+                if request is not None:
+                    request.prefetch_declined += 1
+                return
             except tensorfs.Error as error:
                 if fault(error) is not Fault.OTHER:
                     raise
@@ -2967,17 +2878,6 @@ class Memory:
                 if request is not None:
                     request.prefetch_failed += 1
                 return
-            if retry:
-                # Demand's next read takes Torch's idle cache before it is refused. Refused, it
-                # is read on the request path instead (Qwen-Image int8 on 8 GB: the last streamed
-                # block, every step, 9 s per request). Out of the handler, so nothing the refused
-                # attempt admitted lives on in its traceback (cr-225).
-                release_cached(torch, self.device.type)
-                if request is not None:
-                    request.prefetch_released += 1
-                return self._prefetch_block(block, request, released=True)
-            identity = block.model.identity
-            assert identity is not None  # eligibility excludes mutable/undeclared fills
             self._prefetch = _Prefetch(
                 block,
                 region,
@@ -2986,8 +2886,6 @@ class Memory:
                 request,
                 queued,
                 overlay=overlay,
-                final=final,
-                host=kept is not None,
             )
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
@@ -3016,7 +2914,7 @@ class Memory:
                             "state": "started",
                             "set": block.model.name,
                             "block": block.index,
-                            "bytes": block.allocation_bytes,
+                            "bytes": block.storage_bytes,
                             "at_ns": time.time_ns(),
                         }
                     )
@@ -3086,13 +2984,11 @@ class Memory:
                             0,
                             int(row.get("bytes", 0)),
                             speculative=True,
-                            origin="baked" if row.get("host") else "store",
                         )
                 if complete:
-                    page = _page(block, pending.identity, pending.overlay, final=pending.final)
+                    page = _page(block, pending.identity, pending.overlay)
                     self._refills[page] = self._refills.get(page, 0) + 1
-                    if not row.get("host"):
-                        self._want(block, page)
+                    self._want(block, page)
             except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
@@ -3103,9 +2999,8 @@ class Memory:
             finally:
                 if request is not None:
                     request.prefetch_wait_ns += time.perf_counter_ns() - began
-                field = "final_region" if pending.final else "region"
-                if not complete and getattr(block, field) is pending.region:
-                    setattr(block, field, None)
+                if not complete and block.region is pending.region:
+                    block.region = None
                     block.preferred = False
                     block.preference_set = False
                 self._prefetch = None
@@ -3152,12 +3047,9 @@ class Memory:
         try:
             with self.lock:
                 if self._prefetch is not None:
-                    # A host-tier prefetch is one DMA already issued: it completes in milliseconds,
-                    # so another block's demand waits for it rather than discarding it. H3 Turbo
-                    # on an RTX 4090 canceled every DiT prefetch at its LoRA block's demand and
-                    # copied each page twice: 24 GB a step for 12 GB of pages.
-                    pending = self._prefetch
-                    self._settle_prefetch(cancel=pending.block is not block and not pending.host)
+                    # Demand consumes its own RAW read; another block's speculation is
+                    # canceled and drained before demand admission, as for RAW sources before.
+                    self._settle_prefetch(cancel=self._prefetch.block is not block)
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:
@@ -3648,8 +3540,8 @@ class Request:
         #: table lookups served on the host (`Memory._gather`)
         self.gathered = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
-        self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
-        self.prefetch_released = 0
+        self.prefetch_declined = self.prefetch_failed = self.prefetch_wait_ns = 0
+        self.prefetch_unsupported: dict[str, int] = {}
         self.allocator = _allocator(memory)
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
@@ -3866,11 +3758,13 @@ class Request:
                     "started": self.prefetch_started,
                     "completed": self.prefetch_completed,
                     "canceled": self.prefetch_canceled,
-                    "skipped_capacity": self.prefetch_skipped,
-                    "released_cache": self.prefetch_released,
+                    "declined_native": self.prefetch_declined,
+                    "unsupported_sources": dict(self.prefetch_unsupported),
                     "failed": self.prefetch_failed,
                     "wait_ns": self.prefetch_wait_ns,
-                    "scope": "one exact raw block; current demand precedes queued speculation",
+                    "scope": (
+                        "immutable stored RAW; native measured admission; unknown keys decline"
+                    ),
                     "queued": list(self.queued_prefetch),
                 },
             )
