@@ -1382,7 +1382,6 @@ class Memory:
         #: The active phase's weights all fit beside the other phases' idle ones: nothing of it
         #: streams, so its blocks reserve no streaming window (`_activate_phase`).
         self._fits = False
-        self._stage_window_owner: object | None = None
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
         self.phase_supported = False
@@ -2789,54 +2788,6 @@ class Memory:
             if not self.reclaim(needed, current={model.name}):
                 raise
             return region.prepare()
-
-    def _stage_prefetch_window(
-        self, required: int, missing: int, request: Request | None, owner: object
-    ) -> Callable[[], None] | None:
-        """Admit bounded next-source speculation after actual graph/readout allocations.
-
-        The streaming limit bounds idle nonpreferred cache, not active physical residency.
-        Existing useful cache may remain beyond the current/next source pair. This never
-        reclaims. Driver free and the request budget already exclude Torch
-        reservations (including graph scratch and boundary slots) and native residency.
-        The speculative native allocation independently rechecks pressure at read time.
-        """
-        if self.native is None or request is None or request.memory is not self or request.idle:
-            return None
-        with self.lock:
-            native_limit = self.native.stats().get("streaming_limit_bytes")
-            if (
-                native_limit is None
-                or native_limit != self.window_bytes
-                or self._stage_window_owner is not None
-                or self._prefetch is not None
-                or self._active_beside(request)
-                or missing > self.room().free
-            ):
-                return None
-            previous = self.window_bytes
-            admitted = max(previous, required)
-            phase = self._phase_names, self._phase_request
-            self.native.set_streaming_limit(admitted)
-            self.window_bytes = admitted
-            self._stage_window_owner = owner
-
-        def restore() -> None:
-            # Called only after checked whole-program completion, including canceled or
-            # unconsumed prefetch. Never overwrite a later phase's independently changed policy.
-            with self.lock:
-                if self._stage_window_owner is not owner:
-                    return
-                if (
-                    self.window_bytes == admitted
-                    and (self._phase_names, self._phase_request) == phase
-                    and self.native.stats().get("streaming_limit_bytes") == admitted
-                ):
-                    self.native.set_streaming_limit(previous)
-                    self.window_bytes = previous
-                self._stage_window_owner = None
-
-        return restore
 
     def _prefetch_next(self, current: _Block) -> None:
         """Demand's own next block takes priority over queued-request speculation."""

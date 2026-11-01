@@ -42,7 +42,7 @@ refusal of private decode work remains. Quantized arrays can still be raw source
 bytes when the graph consumes those arrays directly; this does not enable a
 speculative decoder or its scratch allocation.
 
-The planned link carries actual sequence adjacency, the current stage's semantic
+The link carries actual sequence adjacency, the current stage's semantic
 execution key and its ordered graph-definition tokens, with no Runtime byte
 ceiling. Native lookahead matches that identity to the active replay before
 consulting its last successful measurement. Unknown, invalidated or retired
@@ -54,10 +54,15 @@ driver/managed capacity and uncovered measured demand, without reclaim or a
 streaming-limit change. Locks are released before IO. The existing source job
 continues to own pins, pending DMA, cancellation, rearm and checked cleanup.
 
-Once the paired native API is available, this path replaces the Python
-`_stage_prefetch_window` byte/window calculation and restore lease. Eager queued
-prefetch and the broader split/reclaim policy remain separate work. Until that
-cutover is implemented, activation and admission are not declared complete.
+This path replaces the Python `_stage_prefetch_window` byte/window calculation,
+`_stage_window_owner`, restore lease and `max_prefetch_bytes` argument. Runtime no
+longer sums current/next source reservations, missing bytes or a maximum pair
+window to authorize these reads. A linked edge is only a declaration; native
+admission may still decline it at actual read time.
+
+Eager queued prefetch and the broader split/reclaim policy remain separate work.
+This source cutover requires the paired native raw-stage admission API and real
+GPU qualification before it is accepted. It has no legacy stage-budget fallback.
 
 ## Required proof
 

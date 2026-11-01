@@ -961,7 +961,6 @@ class _SequenceExecution(Execution):
         # Source-backed stages keep their existing separate current-stage lookahead policy.
         self._queued_eligible = context is not None and not reads
         self._phase_controllers = phases or {}
-        self._prefetch_cleanup = ExitStack()
         self._prefetch_admission: list[dict[str, object]] = []
         self._working_phases_recorded = False
 
@@ -969,15 +968,14 @@ class _SequenceExecution(Execution):
         if not self.plan.prefetch:
             self._prefetch_admission.append({"state": "disabled_by_author"})
             return
-        request = self._load_request
-        candidates: dict[Any, list[tuple[Any, ...]]] = {}
         for current, following in zip(self._stage_reads, self._stage_reads[1:], strict=False):
             index, job, bindings = current
             next_index, next_job, next_bindings = following
-            # Resident stages between two reading stages run while the next one's bytes arrive.
+            # Declare actual sequence order. A suffix follows a repeated interval only on
+            # its last pass; the existing bounded link does not describe that conditional edge.
             repeat = self.plan._repeat
             if repeat is not None and repeat[2] > 1 and next_index == repeat[1]:
-                continue  # the suffix is next only on the final pass
+                continue
             if (
                 not bindings
                 or not next_bindings
@@ -986,62 +984,21 @@ class _SequenceExecution(Execution):
                 or not callable(getattr(job, "link_next", None))
             ):
                 continue
-            memories = {binding.model.memory for binding in (*bindings, *next_bindings)}
-            if len(memories) != 1:
-                continue
-            memory = next(iter(memories))
-            regions = {
-                id(region): region
-                for binding in (*bindings, *next_bindings)
-                for _, region in binding._stage_regions
-            }
-            current_bytes = sum(
-                int(region.allocated_bytes)
-                for binding in bindings
-                for _, region in binding._stage_regions
-            )
-            next_bytes = sum(
-                int(region.allocated_bytes)
-                for binding in next_bindings
-                for _, region in binding._stage_regions
-            )
-            # Native reports the same actual reservations. Refuse skew or hidden inputs;
-            # do not use Python logical tensor sizes as allocation admission.
-            if (
-                not regions
-                or int(job.reservation_bytes) != current_bytes
-                or int(next_job.reservation_bytes) != next_bytes
-            ):
-                continue
-            required = sum(int(region.allocated_bytes) for region in regions.values())
-            missing = sum(
-                int(region.allocated_bytes) for region in regions.values() if not region.resident
-            )
-            candidates.setdefault(memory, []).append(
-                (index, next_index, job, next_job, required, missing, next_bytes)
-            )
-        for memory, pairs in candidates.items():
-            required = max(pair[4] for pair in pairs)
-            missing = max(pair[5] for pair in pairs)
-            restore = memory._stage_prefetch_window(required, missing, request, self)
-            if restore is None:
-                self._prefetch_admission.append({"state": "capacity_skip", "pair_bytes": required})
-                continue
-            self._prefetch_cleanup.callback(restore)
-            for index, next_index, job, next_job, pair_bytes, _, next_bytes in pairs:
-                linked = bool(job.link_next(next_job, max_prefetch_bytes=next_bytes))
-                self._prefetch_admission.append(
-                    {
-                        "from_stage": index,
-                        "to_stage": next_index,
-                        "pair_bytes": pair_bytes,
-                        "state": "linked" if linked else "native_refusal",
-                    }
-                )
+            current_stage = self.plan.stages[index]
+            # Identity/order are the declaration. Native admission checks the active replay,
+            # its same-definition measurement and actual raw-source capacity at read time.
+            linked = bool(job.link_next(
+                next_job, execution_key=current_stage._execution_key,
+                footprints=current_stage._footprints,
+            ))
+            self._prefetch_admission.append({
+                "from_stage": index, "to_stage": next_index,
+                "state": "linked" if linked else "native_refusal",
+            })
 
     def _release_models(self) -> None:
         # Base execution calls this only after checked native completion/readout. If the
-        # drain is unproven, owners and this window lease remain retained for retirement.
+        # drain is unproven, source/graph owners remain retained for retirement.
         if not self._working_phases_recorded:
             request = self._load_request
             if request is not None:
@@ -1050,7 +1007,6 @@ class _SequenceExecution(Execution):
                         dict(record) for record in controller.facts()["observations"]
                     )
             self._working_phases_recorded = True
-        self._prefetch_cleanup.close()
         # Native phase entry changed preferences without a Python callback. After every
         # source/prefetch/consumer is checked, invalidate only our stale eager-policy cache;
         # the next ordinary phase recomputes it. Preserve another live request's policy.
