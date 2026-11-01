@@ -21,7 +21,10 @@ successful eager watermark.
 
 Native `peak_bytes` measures phase-owned newly allocated charged block capacity,
 including its unsafe pending frees. `total_peak_bytes` separately reports total
-charged holdings. Pre-existing input/model/other buffers remain physical charges;
+charged holdings. `backing_peak_bytes` measures the distinct physical segments
+containing phase-owned live/pending blocks; native admission uses that measured
+backing requirement, with credit only for exclusively phase-owned eager segments
+and wholly completed free eager segments. Pre-existing input/model/other buffers remain physical charges;
 Runtime does not subtract them from a guessed global peak. Global peak resets used
 by the existing sizing code do not reset the native phase accumulator.
 `Request.working_phases` carries these observations into the normal memory record.
