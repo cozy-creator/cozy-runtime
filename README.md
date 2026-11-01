@@ -241,8 +241,8 @@ the launch and invocation facts with current readers. It carries no Runtime-glob
 inventory, diagnostics, config UI metadata, or tensor requirements, and
 `_fixed_point` proves over the built document that no release digest, build timestamp,
 machine path or mutable selection reached it. The document has one `entrypoints` list; an entry
-writes `publishes`, `internal` and `weights_outputs` when set and `accelerator` only as
-`false`, and its memo flag rides `invocable.memoize`. A slot is `{path, class, component_use,
+writes `publishes`, `internal` (a child task) and `weights_outputs` when set and `accelerator`
+only as `false`, and its memo flag rides `invocable.memoize`. A slot is `{path, class, component_use,
 encoded_leaves}`, plus `default`, `min_bits` and `phase` when declared and `weights: true` for a
 `Weights[M]` argument. `descriptor_id` (sha256 of
 one entry) is derived by `cozy-runtime describe <function>`, never stored. Deleted members are simply unknown fields; there is no legacy decoder or
@@ -508,10 +508,11 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 `examples/marco-polo` is the weightless reference package — two functions, one CPU-only, no
 model — and it is what the end-to-end suite builds, installs and runs.
 
-**One registration (xs-040).** `@app.entrypoint` is the only registration and every keyword
-works on every function: `weights=`, `publishes=`/`emits_media=`, `accelerator=` (False: CPU only;
-True or absent: the machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`,
-`components=`, `memoize=`, `hidden=`, `internal=`. A writer (`weights=`, `publishes=`,
+**Registration (xs-040).** `@app.entrypoint` registers a public function and `@app.child_task`
+one only its own package's calls run ([docs/child-tasks.md](docs/child-tasks.md)). Both take
+`weights=`, `publishes=`/`emits_media=`, `accelerator=` (False: CPU only; True or absent: the
+machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`, `components=` and
+`memoize=`; `entrypoint` adds `hidden=` and `implements=`. A writer (`weights=`, `publishes=`,
 `emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
 repeat.
 

@@ -182,6 +182,9 @@ def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
                     del _SLOTS[name]
             raise
         except Exception as exc:
+            from cozy_runtime.internal.execution import phase
+
+            phase.invalidate("dispatch_retry")
             _ended(name, slot, exc)
             if is_capacity(exc):
                 raise  # the memory manager's to answer

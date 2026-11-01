@@ -31,8 +31,8 @@ SYSTEM = re.compile(
 RUST_FLOOR = re.compile(
     r'DRIVER_FLOOR: &str = if cfg!\(windows\) \{ "([\d.]+)" \} else \{ "([\d.]+)" \}'
 )
-#: A module on a machine without a GPU: one gemv returns CUDA's error, a bad family is refused,
-#: FA3 and SageAttention3 refuse a head dim they have no kernel for.
+#: A module on a machine without a GPU: one gemv and one INT4 attention return CUDA's error, a bad
+#: family is refused, FA3 and SageAttention3 refuse a head dim they have no kernel for.
 CALL = """
 import importlib.util, pathlib, sys
 def load(name):
@@ -61,6 +61,8 @@ if "_sage3" not in sys.argv[2:]:
     assert _sage3.quant(0, 0, 0, 0, 0, True, 1, 2, 128, 96, (0, 0, 0), (0, 0, 0), (0, 0, 0), 0) == (
         _sage3.NOT_SUPPORTED
     )
+_attn4 = load("_attn4")
+assert _attn4.attention(0, *(0,) * 11, 1, 2, 2, 128, 128, 128, True, 1.0, *((0, 0, 0),) * 4, 0) != 0
 print(f"{sys.version.split()[0]}: gemv without a GPU -> {code} {_gemm.error_name(code)}")
 """
 
