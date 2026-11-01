@@ -114,3 +114,6 @@ def svdq_gemm(
     R: int,
     stream: int,
 ) -> int: ...
+
+
+def int8_plan(device: int, out_half: bool, M: int, N: int, K: int, ldo: int) -> dict[str, int]: ...
