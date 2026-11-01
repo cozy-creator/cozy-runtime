@@ -13,7 +13,14 @@ from torch import Tensor
 from cozy_runtime import _kernels, lora
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._split import Cut
-from cozy_runtime.author.kernels import _LINEAR_SPLIT, _RECENT, _SHARED, INT8_CONVROT, read
+from cozy_runtime.author.kernels import (
+    _LINEAR_SPLIT,
+    _RECENT,
+    _SHARED,
+    INT8_CONVROT,
+    SingleUseProjection,
+    read,
+)
 from cozy_runtime.internal import int8_linear, prebuilt
 from cozy_runtime.internal.execution import catch, phase
 from cozy_runtime.internal.residency import _REQUEST
@@ -107,6 +114,7 @@ class _Plan:
     key: str
     geometry: _Geometry
     selection: dict[str, Any]
+    ownership: str = "learned_or_inference"
 
     def run(self, x: Tensor, operand: object, out: Tensor | None) -> Tensor:
         """Entered by the exact module's ordinary forward, with its hooks still installed."""
@@ -121,6 +129,7 @@ class _Plan:
             self.key, {"site": "int8-linear-rows", "key": self.key, "selections": 0},
         )
         record.update(selection=self.selection, row_chunk=geometry.rows,
+                      input_ownership=self.ownership,
                       dispatch={"full": vars(geometry.full), "tail": vars(geometry.tail)},
                       workspace_bytes=geometry.workspace)
         record["selections"] += 1
@@ -173,10 +182,23 @@ class _Plan:
 
 
 def split_declared(module: Any, value: object, cuts: tuple[Cut, ...]) -> Tensor | None:
-    """Claim only the actual standalone NativeLinear call, before legacy outer sizing.
+    """Generic calls retain actual learned/inference ownership eligibility."""
+    return _split_declared(module, value, cuts, declared_single_use=False)
 
-    None is a pre-execution capability/layout exclusion, never recovery from a real failure.
-    """
+
+def split_single_use_projection(
+    intent: SingleUseProjection, out: Any, cuts: tuple[Cut, ...],
+) -> Tensor | None:
+    """An actual producer may declare its fresh one-consumer output before learning."""
+    if type(intent) is not SingleUseProjection or not intent.exclusive_input or out is not None:
+        return None
+    return _split_declared(intent.module, intent.hidden, cuts, declared_single_use=True)
+
+
+def _split_declared(
+    module: Any, value: object, cuts: tuple[Cut, ...], *, declared_single_use: bool,
+) -> Tensor | None:
+    """None is capability exclusion before selection, never recovery from real failure."""
     if type(value) is not Tensor:
         return None
     x: Any = value
@@ -210,13 +232,18 @@ def split_declared(module: Any, value: object, cuts: tuple[Cut, ...]) -> Tensor 
                for hook in leaf._forward_hooks.values())
     ):
         return None
-    # Explicit sharing and a live/learned sibling group keep their existing operand owner.
-    # A normal tensor qualifies only after this real leaf has learned it is single-use.
+    # A declaration covers only a fresh producer-owned value. Live shared ownership and
+    # an observed multi-consumer group still refuse; generic calls must actually learn.
     held = getattr(_RECENT, "held", None)
+    last = getattr(_RECENT, "last", None)
+    group = getattr(leaf, "_cozy_siblings", None)
     if (
         any(shared.tensor is x for shared in _SHARED.get())
         or (held is not None and held.tensor is not None and held.tensor() is x)
-        or (not x.is_inference() and getattr(leaf, "_cozy_siblings", None) != 1)
+        or (declared_single_use and last is not None and last[0]() is x)
+        or (declared_single_use and group not in (None, 1))
+        or (not x.is_inference() and group != 1
+            and not (declared_single_use and group is None))
     ):
         return None
     device = x.device.index or 0
@@ -288,7 +315,8 @@ def split_declared(module: Any, value: object, cuts: tuple[Cut, ...]) -> Tensor 
     selection = vt.split_select(device, key, choices, preferred=choices[0][0],
                                 stream=int(stream.cuda_stream))
     plan = _Plan(leaf, x, data, scale, bias, library, request, stream, key,
-                 geometry[str(selection["choice_id"])], dict(selection))
+                 geometry[str(selection["choice_id"])], dict(selection),
+                 "declared_single_use" if declared_single_use else "learned_or_inference")
     owner = _LINEAR_SPLIT.set(plan)
     try:
         return leaf(x)

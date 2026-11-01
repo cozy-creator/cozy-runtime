@@ -166,6 +166,21 @@ class PreQuantized:
 
 
 @dataclass(frozen=True, slots=True)
+class SingleUseProjection:
+    """One producer-owned input consumed by exactly this projection.
+
+    The producer promises that no sibling projection consumes this value and it is not
+    part of a shared quantization scope. Runtime still rejects live/shared operands and
+    a previously observed multi-consumer group. This declares first-use ownership; it
+    does not manufacture learned module state or supply a memory budget/row count.
+    """
+
+    module: Any
+    hidden: Any
+    exclusive_input: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ResidualFFN:
     """One row-local residual/norm/SwiGLU tail, written into an exclusive caller output.
 
@@ -462,6 +477,7 @@ __all__ = [
     "Plan",
     "PreQuantized",
     "ResidualFFN",
+    "SingleUseProjection",
     "TritonEntry",
     "TritonKernels",
     "int8_rows",

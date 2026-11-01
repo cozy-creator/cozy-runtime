@@ -297,6 +297,10 @@ def _norm(site: str, module: nn.Module, forward: Callable[..., object]) -> Calla
             or x.dim() <= dims
         ):
             return forward(x, *args, **kwargs)
+        from cozy_runtime.internal.execution.native_rms_norm import rms_norm
+
+        if (declared := rms_norm(site, module, x)) is not None:
+            return declared
         row = math.prod(int(n) for n in x.shape[-dims:])
         tokens = x.numel() // max(row, 1)
         if tokens < 2:
