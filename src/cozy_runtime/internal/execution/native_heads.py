@@ -673,5 +673,5 @@ def prepare_projected_heads(
 def split_projected_heads(
     intent: ProjectedHeads, output: Any, cuts: tuple[Cut, ...]
 ) -> Tensor | None:
-    plan = prepare_projected_heads(intent, output, cuts)
-    return None if plan is None else plan.run()
+    """Matched API-only control: leave the new package on its original callable."""
+    return None
