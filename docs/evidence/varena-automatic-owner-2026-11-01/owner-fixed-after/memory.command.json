@@ -1,0 +1,18 @@
+{
+  "command": [
+    "/home/fidika/.local/bin/cozy",
+    "machine",
+    "logs",
+    "columbina",
+    "memory",
+    "--lines",
+    "0",
+    "--json"
+  ],
+  "finished_unix_ms": 1793531319703,
+  "returncode": 0,
+  "started_unix_ms": 1793531319635,
+  "stderr_bytes": 0,
+  "stdout_bytes": 23540,
+  "stdout_sha256": "2ca18373bde6d593d9b91bcc1ec5d5fc306d74934ece9e8d930c74c2cab3adc5"
+}

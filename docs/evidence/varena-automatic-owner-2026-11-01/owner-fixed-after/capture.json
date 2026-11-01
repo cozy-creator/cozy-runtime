@@ -1,0 +1,1668 @@
+{
+  "cli": "/home/fidika/.local/bin/cozy",
+  "cli_sha256": "d435989222075edb004fce0ffabf243a35c43747226026d372b78bc8ff33f17a",
+  "errors": [],
+  "machine": "columbina",
+  "memory": {
+    "lines": [
+      "1793527974.953 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":0}",
+      "1793527974.953 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793527975.356 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793528023.498 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":0}",
+      "1793528023.498 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793528023.908 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793528050.044 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-24677b9c4be68570a5eff3c7ea2452219331cb290215ad73630e989d219486e2\",\"running_on\":[]}",
+      "1793528054.624 {\"event\":\"driver_pids\",\"executors\":[372],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[372],\"unattributed\":null}",
+      "1793528054.676 {\"calls\":[{\"anon\":969494528,\"peak\":null,\"pid\":372,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793528065.874 {\"changed\":[{\"Request\":{\"bytes\":33223216,\"key\":\"plan-24677b9c4be68570a5eff3c7ea2452219331cb290215ad73630e989d219486e2|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793528092.596 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":1}",
+      "1793528092.596 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793528092.674 {\"event\":\"import_installed\",\"generation\":\"f7630516efdd0549ce71f072ddb0aefc\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793528093.060 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793528102.461 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-79cecac54cabea467835d8ded99ac746615628e6ef1d0d9b6d558b14b6086010\",\"running_on\":[]}",
+      "1793528107.408 {\"event\":\"driver_pids\",\"executors\":[600],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[600],\"unattributed\":null}",
+      "1793528107.458 {\"calls\":[{\"anon\":979632128,\"peak\":null,\"pid\":600,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793528115.825 {\"changed\":[{\"Request\":{\"bytes\":33223216,\"key\":\"plan-79cecac54cabea467835d8ded99ac746615628e6ef1d0d9b6d558b14b6086010|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793528116.350 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793528116.353 {\"calls\":[{\"anon\":1335902208,\"peak\":null,\"pid\":600,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793528123.084 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793528156.757 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":2}",
+      "1793528156.757 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793528157.219 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793528157.315 {\"event\":\"import_installed\",\"generation\":\"89f5b8c5289cb0b8f31b518696ecf1d2\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793528192.117 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064\",\"running_on\":[]}",
+      "1793528195.865 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":false,\"sample_gap_ms\":502.025269,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793528196.367 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":501.897848,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793528197.120 {\"event\":\"driver_pids\",\"executors\":[863],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[863],\"unattributed\":null}",
+      "1793528197.175 {\"calls\":[{\"anon\":968392704,\"peak\":null,\"pid\":863,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793528199.702 {\"changed\":[{\"Request\":{\"bytes\":33223216,\"key\":\"plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793528202.688 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3\",\"running_on\":[]}",
+      "1793528202.690 {\"event\":\"offload_begin\",\"for\":\"plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3\",\"free_before\":24616108032,\"need\":null,\"pid\":863,\"plan\":\"plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064\"}",
+      "1793528202.697 {\"ack_ms\":7.652341,\"event\":\"offload\",\"failed\":\"\",\"for\":\"plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3\",\"free_after\":24712577024,\"free_before\":24616108032,\"need\":null,\"pid\":863,\"plan\":\"plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064\"}",
+      "1793528202.698 {\"constructions\":[\"plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064\"],\"event\":\"end_idle\",\"gpus\":{\"end\":1,\"start\":0},\"plan\":\"plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064\"}",
+      "1793528202.930 {\"ended\":\"plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064\",\"event\":\"ended_for_room\",\"for\":\"plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3\",\"free\":25248727040,\"need\":null}",
+      "1793528206.066 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793528207.375 {\"event\":\"driver_pids\",\"executors\":[1018],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[1018],\"unattributed\":null}",
+      "1793528209.738 {\"calls\":[{\"anon\":1426468864,\"peak\":null,\"pid\":1018,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793528209.740 {\"changed\":[{\"Request\":{\"bytes\":79953928,\"key\":\"plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793528265.870 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":4}",
+      "1793528265.870 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793528266.333 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793528266.430 {\"event\":\"import_installed\",\"generation\":\"76fbdedec0508a4bb84cd53caddf0372\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793528266.431 {\"event\":\"import_installed\",\"generation\":\"df9a24684dd0bd9e29b03f4cfce4a790\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793528485.186 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"gpu-4cb834405d404ece2fe1685e73f0d166d49fcd870a306430cd04e701c68d2815\",\"running_on\":[]}",
+      "1793528486.536 {\"event\":\"driver_pids\",\"executors\":[1594],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[1594],\"unattributed\":null}",
+      "1793528492.705 {\"calls\":[{\"anon\":1864421376,\"peak\":null,\"pid\":1594,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793529492.106 {\"changed\":[{\"Request\":{\"bytes\":23943347972,\"key\":\"gpu-4cb834405d404ece2fe1685e73f0d166d49fcd870a306430cd04e701c68d2815|frames=362,steps=30\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793529492.400 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793529522.357 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":5}",
+      "1793529522.357 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793529522.467 {\"available\":41819049984,\"event\":\"import_installed\",\"stopped\":\"77880a91c395b1fd94db6ffe308984cc\"}",
+      "1793529522.821 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793529557.722 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"gpu-52bb604a8aaa428f5810b82dffb22e65087b574093b9c50979825bd685daffab\",\"running_on\":[]}",
+      "1793529559.087 {\"event\":\"driver_pids\",\"executors\":[104064],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[104064],\"unattributed\":null}",
+      "1793529564.555 {\"calls\":[{\"anon\":1861939200,\"peak\":null,\"pid\":104064,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530576.546 {\"changed\":[{\"Request\":{\"bytes\":24659554932,\"key\":\"gpu-52bb604a8aaa428f5810b82dffb22e65087b574093b9c50979825bd685daffab|frames=362,steps=30\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793530576.729 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793530628.170 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":6}",
+      "1793530628.170 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793530628.271 {\"available\":31464484864,\"event\":\"import_installed\",\"stopped\":\"3e90afa27e3d4b64705b27274232cf27\"}",
+      "1793530628.632 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793530641.826 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-2bc9275f58fc6d14f1b70829d8f7d4163f3d60b1090dbd0c91ca7976800ff520\",\"running_on\":[]}",
+      "1793530646.830 {\"event\":\"driver_pids\",\"executors\":[190325],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[190325],\"unattributed\":null}",
+      "1793530646.893 {\"calls\":[{\"anon\":967995392,\"peak\":null,\"pid\":190325,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530655.345 {\"changed\":[{\"Request\":{\"bytes\":33223216,\"key\":\"plan-2bc9275f58fc6d14f1b70829d8f7d4163f3d60b1090dbd0c91ca7976800ff520|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793530655.659 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793530655.664 {\"calls\":[{\"anon\":1337397248,\"peak\":null,\"pid\":190325,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530662.514 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793530664.781 {\"calls\":[{\"anon\":1337647104,\"peak\":null,\"pid\":190325,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530722.841 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":7}",
+      "1793530722.841 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793530723.305 {\"event\":\"gpu_pressure_observation\",\"gpu\":\"0\",\"known\":true,\"sample_gap_ms\":null,\"scope\":\"driver_attributed_process_bytes\"}",
+      "1793530723.433 {\"event\":\"import_installed\",\"generation\":\"e2f188a0a594e8c83846c1c575ffece1\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793530729.962 {\"event\":\"import_installed\",\"generation\":\"3e90afa27e3d4b64705b27274232cf27\",\"why\":\"\"}",
+      "1793530729.964 {\"event\":\"import_installed\",\"generation\":\"76fbdedec0508a4bb84cd53caddf0372\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793530741.972 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948\",\"running_on\":[]}",
+      "1793530747.152 {\"event\":\"driver_pids\",\"executors\":[190641],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[190641],\"unattributed\":null}",
+      "1793530751.533 {\"calls\":[{\"anon\":1457672192,\"peak\":null,\"pid\":190641,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530767.064 {\"changed\":[{\"Request\":{\"bytes\":7503256628,\"key\":\"plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793530789.913 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793530789.961 {\"calls\":[{\"anon\":1477160960,\"peak\":null,\"pid\":190641,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530792.592 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159\",\"running_on\":[]}",
+      "1793530792.594 {\"event\":\"offload_begin\",\"for\":\"plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159\",\"free_before\":24712577024,\"need\":null,\"pid\":190641,\"plan\":\"plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948\"}",
+      "1793530792.596 {\"ack_ms\":1.5078369999999999,\"event\":\"offload\",\"failed\":\"\",\"for\":\"plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159\",\"free_after\":24712577024,\"free_before\":24712577024,\"need\":null,\"pid\":190641,\"plan\":\"plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948\"}",
+      "1793530792.596 {\"constructions\":[\"plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948\"],\"event\":\"end_idle\",\"gpus\":{\"end\":1,\"start\":0},\"plan\":\"plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948\"}",
+      "1793530792.915 {\"ended\":\"plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948\",\"event\":\"ended_for_room\",\"for\":\"plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159\",\"free\":25248727040,\"need\":null}",
+      "1793530796.174 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793530797.534 {\"event\":\"driver_pids\",\"executors\":[190806],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[190806],\"unattributed\":null}",
+      "1793530805.030 {\"calls\":[{\"anon\":1388265472,\"peak\":null,\"pid\":190806,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530805.031 {\"changed\":[{\"Request\":{\"bytes\":353457180,\"key\":\"plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793530805.393 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793530805.438 {\"calls\":[{\"anon\":1388265472,\"peak\":null,\"pid\":190806,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793530833.774 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":9}",
+      "1793530833.774 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793530834.357 {\"event\":\"import_installed\",\"generation\":\"c199bd2c8a1e379bbb7be8f20bf64a92\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793530834.358 {\"event\":\"import_installed\",\"generation\":\"63535b08881204efcedca8175857f79f\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793530834.360 {\"event\":\"import_installed\",\"generation\":\"e2f188a0a594e8c83846c1c575ffece1\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793530840.893 {\"event\":\"import_installed\",\"generation\":\"3e90afa27e3d4b64705b27274232cf27\",\"why\":\"\"}",
+      "1793530840.895 {\"event\":\"import_installed\",\"generation\":\"76fbdedec0508a4bb84cd53caddf0372\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793530881.021 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-70d9039645a21e4fdadf076fac2dab043ee021ad13802ed897a74d337a07f30f\",\"running_on\":[]}",
+      "1793530884.322 {\"event\":\"gpu_memory_policy\",\"gpus\":[0],\"mode\":\"Cooperative\",\"pid\":191019}",
+      "1793530885.738 {\"event\":\"driver_pids\",\"executors\":[191019],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[191019],\"unattributed\":null}",
+      "1793531242.502 {\"event\":\"peaks_restored\",\"model\":\"NVIDIA GeForce RTX 4090\",\"peaks\":9}",
+      "1793531242.502 {\"event\":\"memory_mode\",\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"mode\":\"executor_owned\",\"tensorD_gpu_bytes\":0}",
+      "1793531243.080 {\"event\":\"import_installed\",\"generation\":\"e0f3ad946c7f205fd84301d7736a414b\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793531243.082 {\"event\":\"import_installed\",\"generation\":\"c199bd2c8a1e379bbb7be8f20bf64a92\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793531243.083 {\"event\":\"import_installed\",\"generation\":\"63535b08881204efcedca8175857f79f\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793531243.084 {\"event\":\"import_installed\",\"generation\":\"e2f188a0a594e8c83846c1c575ffece1\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793531249.618 {\"event\":\"import_installed\",\"generation\":\"3e90afa27e3d4b64705b27274232cf27\",\"why\":\"\"}",
+      "1793531249.621 {\"event\":\"import_installed\",\"generation\":\"76fbdedec0508a4bb84cd53caddf0372\",\"why\":\"this machine imports nothing ahead for it (no fork, or it binds no model)\"}",
+      "1793531274.558 {\"event\":\"place\",\"gpus\":\"0\",\"plan\":\"plan-a33c3c007e8f3bbc25eae74b395f5f48e62ad5c7245cec130db83c4362175c8d\",\"running_on\":[]}",
+      "1793531278.211 {\"event\":\"gpu_memory_policy\",\"gpus\":[0],\"mode\":\"Cooperative\",\"pid\":191228}",
+      "1793531279.560 {\"event\":\"driver_pids\",\"executors\":[191228],\"gpu\":\"GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89\",\"ours\":[191228],\"unattributed\":null}",
+      "1793531283.726 {\"calls\":[{\"anon\":1338347520,\"peak\":null,\"pid\":191228,\"running\":1}],\"event\":\"host_calls\"}",
+      "1793531283.727 {\"changed\":[{\"Request\":{\"bytes\":58982400,\"key\":\"plan-a33c3c007e8f3bbc25eae74b395f5f48e62ad5c7245cec130db83c4362175c8d|-\"}}],\"event\":\"peaks_saved\",\"model\":\"NVIDIA GeForce RTX 4090\"}",
+      "1793531307.415 {\"calls\":[],\"event\":\"host_calls\"}",
+      "1793531307.460 {\"calls\":[{\"anon\":1370030080,\"peak\":null,\"pid\":191228,\"running\":1}],\"event\":\"host_calls\"}"
+    ],
+    "parse_errors": [],
+    "records": [
+      {
+        "at_ms": 1793527974953,
+        "line": 0,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 0
+        }
+      },
+      {
+        "at_ms": 1793527974953,
+        "line": 1,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793527975356,
+        "line": 2,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793528023498,
+        "line": 3,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 0
+        }
+      },
+      {
+        "at_ms": 1793528023498,
+        "line": 4,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793528023908,
+        "line": 5,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793528050044,
+        "line": 6,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-24677b9c4be68570a5eff3c7ea2452219331cb290215ad73630e989d219486e2",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793528054624,
+        "line": 7,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            372
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            372
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793528054676,
+        "line": 8,
+        "note": {
+          "calls": [
+            {
+              "anon": 969494528,
+              "peak": null,
+              "pid": 372,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528065874,
+        "line": 9,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 33223216,
+                "key": "plan-24677b9c4be68570a5eff3c7ea2452219331cb290215ad73630e989d219486e2|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793528092596,
+        "line": 10,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 1
+        }
+      },
+      {
+        "at_ms": 1793528092596,
+        "line": 11,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793528092674,
+        "line": 12,
+        "note": {
+          "event": "import_installed",
+          "generation": "f7630516efdd0549ce71f072ddb0aefc",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793528093060,
+        "line": 13,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793528102461,
+        "line": 14,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-79cecac54cabea467835d8ded99ac746615628e6ef1d0d9b6d558b14b6086010",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793528107408,
+        "line": 15,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            600
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            600
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793528107458,
+        "line": 16,
+        "note": {
+          "calls": [
+            {
+              "anon": 979632128,
+              "peak": null,
+              "pid": 600,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528115825,
+        "line": 17,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 33223216,
+                "key": "plan-79cecac54cabea467835d8ded99ac746615628e6ef1d0d9b6d558b14b6086010|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793528116350,
+        "line": 18,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528116353,
+        "line": 19,
+        "note": {
+          "calls": [
+            {
+              "anon": 1335902208,
+              "peak": null,
+              "pid": 600,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528123084,
+        "line": 20,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528156757,
+        "line": 21,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 2
+        }
+      },
+      {
+        "at_ms": 1793528156757,
+        "line": 22,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793528157219,
+        "line": 23,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793528157315,
+        "line": 24,
+        "note": {
+          "event": "import_installed",
+          "generation": "89f5b8c5289cb0b8f31b518696ecf1d2",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793528192117,
+        "line": 25,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793528195865,
+        "line": 26,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": false,
+          "sample_gap_ms": 502.025269,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793528196367,
+        "line": 27,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": 501.897848,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793528197120,
+        "line": 28,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            863
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            863
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793528197175,
+        "line": 29,
+        "note": {
+          "calls": [
+            {
+              "anon": 968392704,
+              "peak": null,
+              "pid": 863,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528199702,
+        "line": 30,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 33223216,
+                "key": "plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793528202688,
+        "line": 31,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793528202690,
+        "line": 32,
+        "note": {
+          "event": "offload_begin",
+          "for": "plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3",
+          "free_before": 24616108032,
+          "need": null,
+          "pid": 863,
+          "plan": "plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064"
+        }
+      },
+      {
+        "at_ms": 1793528202697,
+        "line": 33,
+        "note": {
+          "ack_ms": 7.652341,
+          "event": "offload",
+          "failed": "",
+          "for": "plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3",
+          "free_after": 24712577024,
+          "free_before": 24616108032,
+          "need": null,
+          "pid": 863,
+          "plan": "plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064"
+        }
+      },
+      {
+        "at_ms": 1793528202698,
+        "line": 34,
+        "note": {
+          "constructions": [
+            "plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064"
+          ],
+          "event": "end_idle",
+          "gpus": {
+            "end": 1,
+            "start": 0
+          },
+          "plan": "plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064"
+        }
+      },
+      {
+        "at_ms": 1793528202930,
+        "line": 35,
+        "note": {
+          "ended": "plan-076705daeff82dcd58914a0c6cd98233a62e9a0b028487476925eaad29b7b064",
+          "event": "ended_for_room",
+          "for": "plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3",
+          "free": 25248727040,
+          "need": null
+        }
+      },
+      {
+        "at_ms": 1793528206066,
+        "line": 36,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528207375,
+        "line": 37,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            1018
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            1018
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793528209738,
+        "line": 38,
+        "note": {
+          "calls": [
+            {
+              "anon": 1426468864,
+              "peak": null,
+              "pid": 1018,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793528209740,
+        "line": 39,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 79953928,
+                "key": "plan-e934baf8eee46ee3e1d557eb0f6ce9f514ddda7966244a02ced4238dab7be2a3|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793528265870,
+        "line": 40,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 4
+        }
+      },
+      {
+        "at_ms": 1793528265870,
+        "line": 41,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793528266333,
+        "line": 42,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793528266430,
+        "line": 43,
+        "note": {
+          "event": "import_installed",
+          "generation": "76fbdedec0508a4bb84cd53caddf0372",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793528266431,
+        "line": 44,
+        "note": {
+          "event": "import_installed",
+          "generation": "df9a24684dd0bd9e29b03f4cfce4a790",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793528485186,
+        "line": 45,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "gpu-4cb834405d404ece2fe1685e73f0d166d49fcd870a306430cd04e701c68d2815",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793528486536,
+        "line": 46,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            1594
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            1594
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793528492705,
+        "line": 47,
+        "note": {
+          "calls": [
+            {
+              "anon": 1864421376,
+              "peak": null,
+              "pid": 1594,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793529492106,
+        "line": 48,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 23943347972,
+                "key": "gpu-4cb834405d404ece2fe1685e73f0d166d49fcd870a306430cd04e701c68d2815|frames=362,steps=30"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793529492400,
+        "line": 49,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793529522357,
+        "line": 50,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 5
+        }
+      },
+      {
+        "at_ms": 1793529522357,
+        "line": 51,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793529522467,
+        "line": 52,
+        "note": {
+          "available": 41819049984,
+          "event": "import_installed",
+          "stopped": "77880a91c395b1fd94db6ffe308984cc"
+        }
+      },
+      {
+        "at_ms": 1793529522821,
+        "line": 53,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793529557722,
+        "line": 54,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "gpu-52bb604a8aaa428f5810b82dffb22e65087b574093b9c50979825bd685daffab",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793529559087,
+        "line": 55,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            104064
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            104064
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793529564555,
+        "line": 56,
+        "note": {
+          "calls": [
+            {
+              "anon": 1861939200,
+              "peak": null,
+              "pid": 104064,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530576546,
+        "line": 57,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 24659554932,
+                "key": "gpu-52bb604a8aaa428f5810b82dffb22e65087b574093b9c50979825bd685daffab|frames=362,steps=30"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793530576729,
+        "line": 58,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530628170,
+        "line": 59,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 6
+        }
+      },
+      {
+        "at_ms": 1793530628170,
+        "line": 60,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793530628271,
+        "line": 61,
+        "note": {
+          "available": 31464484864,
+          "event": "import_installed",
+          "stopped": "3e90afa27e3d4b64705b27274232cf27"
+        }
+      },
+      {
+        "at_ms": 1793530628632,
+        "line": 62,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793530641826,
+        "line": 63,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-2bc9275f58fc6d14f1b70829d8f7d4163f3d60b1090dbd0c91ca7976800ff520",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793530646830,
+        "line": 64,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            190325
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            190325
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793530646893,
+        "line": 65,
+        "note": {
+          "calls": [
+            {
+              "anon": 967995392,
+              "peak": null,
+              "pid": 190325,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530655345,
+        "line": 66,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 33223216,
+                "key": "plan-2bc9275f58fc6d14f1b70829d8f7d4163f3d60b1090dbd0c91ca7976800ff520|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793530655659,
+        "line": 67,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530655664,
+        "line": 68,
+        "note": {
+          "calls": [
+            {
+              "anon": 1337397248,
+              "peak": null,
+              "pid": 190325,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530662514,
+        "line": 69,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530664781,
+        "line": 70,
+        "note": {
+          "calls": [
+            {
+              "anon": 1337647104,
+              "peak": null,
+              "pid": 190325,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530722841,
+        "line": 71,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 7
+        }
+      },
+      {
+        "at_ms": 1793530722841,
+        "line": 72,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793530723305,
+        "line": 73,
+        "note": {
+          "event": "gpu_pressure_observation",
+          "gpu": "0",
+          "known": true,
+          "sample_gap_ms": null,
+          "scope": "driver_attributed_process_bytes"
+        }
+      },
+      {
+        "at_ms": 1793530723433,
+        "line": 74,
+        "note": {
+          "event": "import_installed",
+          "generation": "e2f188a0a594e8c83846c1c575ffece1",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793530729962,
+        "line": 75,
+        "note": {
+          "event": "import_installed",
+          "generation": "3e90afa27e3d4b64705b27274232cf27",
+          "why": ""
+        }
+      },
+      {
+        "at_ms": 1793530729964,
+        "line": 76,
+        "note": {
+          "event": "import_installed",
+          "generation": "76fbdedec0508a4bb84cd53caddf0372",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793530741972,
+        "line": 77,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793530747152,
+        "line": 78,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            190641
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            190641
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793530751533,
+        "line": 79,
+        "note": {
+          "calls": [
+            {
+              "anon": 1457672192,
+              "peak": null,
+              "pid": 190641,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530767064,
+        "line": 80,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 7503256628,
+                "key": "plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793530789913,
+        "line": 81,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530789961,
+        "line": 82,
+        "note": {
+          "calls": [
+            {
+              "anon": 1477160960,
+              "peak": null,
+              "pid": 190641,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530792592,
+        "line": 83,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793530792594,
+        "line": 84,
+        "note": {
+          "event": "offload_begin",
+          "for": "plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159",
+          "free_before": 24712577024,
+          "need": null,
+          "pid": 190641,
+          "plan": "plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948"
+        }
+      },
+      {
+        "at_ms": 1793530792596,
+        "line": 85,
+        "note": {
+          "ack_ms": 1.5078369999999999,
+          "event": "offload",
+          "failed": "",
+          "for": "plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159",
+          "free_after": 24712577024,
+          "free_before": 24712577024,
+          "need": null,
+          "pid": 190641,
+          "plan": "plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948"
+        }
+      },
+      {
+        "at_ms": 1793530792596,
+        "line": 86,
+        "note": {
+          "constructions": [
+            "plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948"
+          ],
+          "event": "end_idle",
+          "gpus": {
+            "end": 1,
+            "start": 0
+          },
+          "plan": "plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948"
+        }
+      },
+      {
+        "at_ms": 1793530792915,
+        "line": 87,
+        "note": {
+          "ended": "plan-2546c73feece58401a341139e125278d98192f7b7feaa49536287019a1e2b948",
+          "event": "ended_for_room",
+          "for": "plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159",
+          "free": 25248727040,
+          "need": null
+        }
+      },
+      {
+        "at_ms": 1793530796174,
+        "line": 88,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530797534,
+        "line": 89,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            190806
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            190806
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793530805030,
+        "line": 90,
+        "note": {
+          "calls": [
+            {
+              "anon": 1388265472,
+              "peak": null,
+              "pid": 190806,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530805031,
+        "line": 91,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 353457180,
+                "key": "plan-f2ccc9d67cf44b577bd24012d1806ded7669d2644b52edf584b0e52b14cb7159|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793530805393,
+        "line": 92,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530805438,
+        "line": 93,
+        "note": {
+          "calls": [
+            {
+              "anon": 1388265472,
+              "peak": null,
+              "pid": 190806,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793530833774,
+        "line": 94,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 9
+        }
+      },
+      {
+        "at_ms": 1793530833774,
+        "line": 95,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793530834357,
+        "line": 96,
+        "note": {
+          "event": "import_installed",
+          "generation": "c199bd2c8a1e379bbb7be8f20bf64a92",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793530834358,
+        "line": 97,
+        "note": {
+          "event": "import_installed",
+          "generation": "63535b08881204efcedca8175857f79f",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793530834360,
+        "line": 98,
+        "note": {
+          "event": "import_installed",
+          "generation": "e2f188a0a594e8c83846c1c575ffece1",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793530840893,
+        "line": 99,
+        "note": {
+          "event": "import_installed",
+          "generation": "3e90afa27e3d4b64705b27274232cf27",
+          "why": ""
+        }
+      },
+      {
+        "at_ms": 1793530840895,
+        "line": 100,
+        "note": {
+          "event": "import_installed",
+          "generation": "76fbdedec0508a4bb84cd53caddf0372",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793530881021,
+        "line": 101,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-70d9039645a21e4fdadf076fac2dab043ee021ad13802ed897a74d337a07f30f",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793530884322,
+        "line": 102,
+        "note": {
+          "event": "gpu_memory_policy",
+          "gpus": [
+            0
+          ],
+          "mode": "Cooperative",
+          "pid": 191019
+        }
+      },
+      {
+        "at_ms": 1793530885738,
+        "line": 103,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            191019
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            191019
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793531242502,
+        "line": 104,
+        "note": {
+          "event": "peaks_restored",
+          "model": "NVIDIA GeForce RTX 4090",
+          "peaks": 9
+        }
+      },
+      {
+        "at_ms": 1793531242502,
+        "line": 105,
+        "note": {
+          "event": "memory_mode",
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "mode": "executor_owned",
+          "tensorD_gpu_bytes": 0
+        }
+      },
+      {
+        "at_ms": 1793531243080,
+        "line": 106,
+        "note": {
+          "event": "import_installed",
+          "generation": "e0f3ad946c7f205fd84301d7736a414b",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793531243082,
+        "line": 107,
+        "note": {
+          "event": "import_installed",
+          "generation": "c199bd2c8a1e379bbb7be8f20bf64a92",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793531243083,
+        "line": 108,
+        "note": {
+          "event": "import_installed",
+          "generation": "63535b08881204efcedca8175857f79f",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793531243084,
+        "line": 109,
+        "note": {
+          "event": "import_installed",
+          "generation": "e2f188a0a594e8c83846c1c575ffece1",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793531249618,
+        "line": 110,
+        "note": {
+          "event": "import_installed",
+          "generation": "3e90afa27e3d4b64705b27274232cf27",
+          "why": ""
+        }
+      },
+      {
+        "at_ms": 1793531249621,
+        "line": 111,
+        "note": {
+          "event": "import_installed",
+          "generation": "76fbdedec0508a4bb84cd53caddf0372",
+          "why": "this machine imports nothing ahead for it (no fork, or it binds no model)"
+        }
+      },
+      {
+        "at_ms": 1793531274558,
+        "line": 112,
+        "note": {
+          "event": "place",
+          "gpus": "0",
+          "plan": "plan-a33c3c007e8f3bbc25eae74b395f5f48e62ad5c7245cec130db83c4362175c8d",
+          "running_on": []
+        }
+      },
+      {
+        "at_ms": 1793531278211,
+        "line": 113,
+        "note": {
+          "event": "gpu_memory_policy",
+          "gpus": [
+            0
+          ],
+          "mode": "Cooperative",
+          "pid": 191228
+        }
+      },
+      {
+        "at_ms": 1793531279560,
+        "line": 114,
+        "note": {
+          "event": "driver_pids",
+          "executors": [
+            191228
+          ],
+          "gpu": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+          "ours": [
+            191228
+          ],
+          "unattributed": null
+        }
+      },
+      {
+        "at_ms": 1793531283726,
+        "line": 115,
+        "note": {
+          "calls": [
+            {
+              "anon": 1338347520,
+              "peak": null,
+              "pid": 191228,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793531283727,
+        "line": 116,
+        "note": {
+          "changed": [
+            {
+              "Request": {
+                "bytes": 58982400,
+                "key": "plan-a33c3c007e8f3bbc25eae74b395f5f48e62ad5c7245cec130db83c4362175c8d|-"
+              }
+            }
+          ],
+          "event": "peaks_saved",
+          "model": "NVIDIA GeForce RTX 4090"
+        }
+      },
+      {
+        "at_ms": 1793531307415,
+        "line": 117,
+        "note": {
+          "calls": [],
+          "event": "host_calls"
+        }
+      },
+      {
+        "at_ms": 1793531307460,
+        "line": 118,
+        "note": {
+          "calls": [
+            {
+              "anon": 1370030080,
+              "peak": null,
+              "pid": 191228,
+              "running": 1
+            }
+          ],
+          "event": "host_calls"
+        }
+      }
+    ],
+    "retained_text_bytes": 16234
+  },
+  "memory_read": {
+    "command": [
+      "/home/fidika/.local/bin/cozy",
+      "machine",
+      "logs",
+      "columbina",
+      "memory",
+      "--lines",
+      "0",
+      "--json"
+    ],
+    "finished_unix_ms": 1793531319703,
+    "returncode": 0,
+    "started_unix_ms": 1793531319635,
+    "stderr_bytes": 0,
+    "stdout_bytes": 23540,
+    "stdout_sha256": "2ca18373bde6d593d9b91bcc1ec5d5fc306d74934ece9e8d930c74c2cab3adc5"
+  },
+  "query_boundary": "all retained current + prior memory files; no CLI line cap and no timestamp prefilter",
+  "read_commands_succeeded": true,
+  "rental_id": "pr-8e889cf05e11deab444a",
+  "worker": {
+    "address": "203.57.40.151:10012",
+    "alias": "rent-9c570401",
+    "fingerprint": "sha256:9abc6851198ca6db9f24a543c550caa577cf080006b17ac03d02eaf0fa3c9f72",
+    "hub": "https://tensorhub.com",
+    "kind": "rental",
+    "name": "columbina",
+    "queued": 0,
+    "recorded": true,
+    "rental": {
+      "accelerator": "NVIDIA GeForce RTX 4090",
+      "base_worker_image_digest": "sha256:ab9f3e9ff2c04e5fc0a9b471e810ce30f10286114b3567039b5b08aae9f85027",
+      "disk_gb": 100,
+      "gpus": 1,
+      "rented_at_ms": 1793527869576,
+      "sku": "rtx-4090",
+      "spend_basis": "unmetered",
+      "spend_usd_micros": 1386429,
+      "ssh": "203.57.40.151:10013",
+      "usd_micros_per_hour": 1502000
+    },
+    "rental_id": "pr-8e889cf05e11deab444a",
+    "running": 0,
+    "state": "ready",
+    "status": {
+      "commit": "afa6f9229153d1a7e93bbf72fc86f5543a4ac21c",
+      "dev": true,
+      "disk_free_bytes": 42604781568,
+      "disk_total_bytes": 107374182400,
+      "driver_floor": "580.65.06",
+      "environments": [
+        {
+          "hub": "",
+          "installation": "local-a18258b2c9039d36186e3f1f7bf10369",
+          "level": "installed",
+          "package": "local/ci-varena-linear-consumer",
+          "release": "0.1.0",
+          "warning": ""
+        },
+        {
+          "hub": "",
+          "installation": "local-caf91fc05847a7ffecbcad83be322049",
+          "level": "installed",
+          "package": "local/ci-varena-native-retention",
+          "release": "0.1.0",
+          "warning": ""
+        },
+        {
+          "hub": "",
+          "installation": "local-689e604dc8b0a5bc0a90a45ff8ceb62f",
+          "level": "gpu",
+          "package": "local/ci-varena-owner",
+          "release": "0.1.0",
+          "warning": ""
+        },
+        {
+          "hub": "",
+          "installation": "local-68ebd42a9c51db91ba31c47221306d82",
+          "level": "installed",
+          "package": "local/ci-varena-p0",
+          "release": "0.1.0",
+          "warning": ""
+        },
+        {
+          "hub": "",
+          "installation": "local-a966c745d086725aadae4bb18d81360d",
+          "level": "installed",
+          "package": "local/ci-varena-residual-ffn",
+          "release": "0.1.0",
+          "warning": ""
+        },
+        {
+          "hub": "",
+          "installation": "local-08075ccbe223bd22eaef9fe4748adaeb",
+          "level": "imported",
+          "package": "local/minimax-h3",
+          "release": "0.2.3",
+          "warning": ""
+        }
+      ],
+      "gpus": [
+        {
+          "driver": "595.91.07",
+          "family": "sm89",
+          "index": 0,
+          "memory_bytes": 25757220864,
+          "memory_class": "discrete",
+          "name": "NVIDIA GeForce RTX 4090"
+        }
+      ],
+      "idle_deadline_ms": 1793532213541,
+      "mode": "dedicated",
+      "models": [
+        {
+          "checkpoints": [
+            {
+              "lane": "pdd8",
+              "manifest": "sha256:030ec3859fae0a1b599184d84690b77b922d8697887b24191cb71e12ba1aac98",
+              "precision": "bf16",
+              "release": ""
+            }
+          ],
+          "repository": "alibaba-pai/minimax-h3-turbo-lora",
+          "total_bytes": 798221574,
+          "unique_bytes": 798221574
+        },
+        {
+          "checkpoints": [
+            {
+              "lane": "int8",
+              "manifest": "sha256:b80c5e41b487e5e8ede4638c4b00688c1763b48c8141d955845dd26268b865be",
+              "precision": "int8",
+              "release": ""
+            }
+          ],
+          "repository": "minimaxai/minimax-h3",
+          "total_bytes": 52017031887,
+          "unique_bytes": 52017031887
+        }
+      ],
+      "models_bytes": 52815253461,
+      "phase": "ready",
+      "platform": "linux/x86_64",
+      "runs": [],
+      "runtime": "0.36.21+dev.gb206015b",
+      "started_at_ms": 1793531242387,
+      "tensorfs": "0.17.16+dev.gafa6f922",
+      "toolchain": {
+        "detail": "",
+        "host_compiler": "c++ (Debian 12.2.0-14+deb12u1) 12.2.0",
+        "install": "",
+        "missing": [],
+        "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+        "state": "ready"
+      },
+      "version": "0.15.4+dev.gafa6f922",
+      "warm": [],
+      "worker_id": "ra-108a4d7d2011a1cbf2f8"
+    },
+    "unverified": false
+  }
+}

@@ -1,0 +1,58 @@
+{
+  "passed": true,
+  "scope": "actual CPU-only executor Hello/Shutdown socket, no Start or GPU work",
+  "command": [
+    "/home/fidika/cozy_v2/cozy-runtime/.venv/bin/python",
+    "-I",
+    "-B",
+    "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/child.py",
+    "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/installed",
+    "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/source/src",
+    "/dev/shm/vr-hello-ckutunyt/executor.sock",
+    "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/owner-hello-8_j8bt2_",
+    "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/child-result.json"
+  ],
+  "hello": {
+    "cooperative_owner": true,
+    "memory_backend": "rust-local",
+    "memory_protocol": 0,
+    "ok": true,
+    "pgid": 1223234,
+    "pid": 1223240,
+    "ppid": 1223239,
+    "rank": 0,
+    "reply": "hello",
+    "request_lookahead": true,
+    "room": true,
+    "runtime_version": "0.36.21",
+    "sealed": {},
+    "tensorfs_version": "0.17.16+dev.gafa6f922",
+    "world": 1
+  },
+  "shutdown": {
+    "ok": true,
+    "reply": "shutdown"
+  },
+  "child": {
+    "exit_code": 0,
+    "torch_imported": false,
+    "cuda_initialized": false,
+    "driver_loaded": false,
+    "cooperation_capability": 1,
+    "extension": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/installed/tensorfs/_ext.abi3.so",
+    "native_version": "0.17.16+dev.gafa6f922",
+    "runtime_executor_source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/source/src/cozy_runtime/internal/executor.py",
+    "runtime_executor_sha256": "25eb59e5315af27cc8a1581d0865fe4065ef29973e0a6204f87bcc51eead13aa",
+    "runtime_owner_sha256": "b0862bc40e6282aa33031e883b0a01c2d418b7f924d0e80940862205286add1f",
+    "threads": [
+      "MainThread"
+    ]
+  },
+  "pre_cuda_invalid_start": {
+    "code": "cooperation_unsupported",
+    "detail": "cooperation requires the negotiated single-GPU native owner capability; no legacy fallback",
+    "ok": false,
+    "reply": "start"
+  },
+  "extension_sha256": "80855283c5995d90c558fd023f8cbc370e12e66a2cbafc12faa75d8bd810f3b1"
+}

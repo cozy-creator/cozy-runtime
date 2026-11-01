@@ -38,3 +38,13 @@ The preceding explicit native mechanism's run24919 stays bound to its original
 allocator-shortage asks, cache/graph owner retirement, foreign pressure, game
 coexistence, full container domains and the final deletion/default transition
 remain required. Do not merge/release this draft as full P3 acceptance.
+
+## GPU checkpoint after the actual receiver fix
+
+Creatorafa6f9229 plus Runtimeb206015ba pass actual automatic-owner25106 and
+same-PID/incarnation25107. Runtime88fd alone failed25090 because its separate
+msgspec Start decoder dropped the native cooperation settings. The fix preserves
+that typed field; initialization timing and the strict active acknowledgement
+are unchanged. Full raw evidence and the scoped 48 MiB release / 32 MiB allocation
+proof are in `evidence/varena-automatic-owner-2026-11-01/`. Complete P3
+shortage/cache/foreign-pressure and shared-machine/game qualification remain open.

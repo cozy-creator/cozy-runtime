@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "native_sender_preserves": true,
+  "actual_runtime_receiver_preserves": true,
+  "old_start_defaults_none": true,
+  "runtime_decoder": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-p3-owner-start/src/cozy_runtime/internal/executor_commands.py",
+  "runtime_decoder_sha256": "0503c6f8764fac75f1bc056865eeeb9cd61b03e24ef9e25d7b88e139bca89b5c",
+  "cuda_imported": false,
+  "strict_active_ack_unchanged": true
+}

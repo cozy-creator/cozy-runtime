@@ -1,0 +1,35 @@
+{
+  "passed": false,
+  "native_sender_preserves_cooperation": true,
+  "receiver_type": "cozy_runtime.internal.executor_commands.Start",
+  "receiver_fields": [
+    "devices",
+    "sequence_parallel_degree",
+    "application",
+    "package_interface",
+    "import_only",
+    "memo",
+    "call_interfaces",
+    "model_choices",
+    "constructions",
+    "gpu_memory_limit"
+  ],
+  "receiver_cooperation": null,
+  "effective_config": "None",
+  "frame": {
+    "cmd": "start",
+    "devices": "0",
+    "application": "fixture",
+    "package_interface": "/not-opened",
+    "sequence_parallel_degree": 1,
+    "cooperation": {
+      "uuid": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+      "directory": "/dev/shm/cozy-varena-0",
+      "shared": false,
+      "priority": 0
+    }
+  },
+  "runtime_decoder": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/paired-hello/src/cozy_runtime/internal/executor_commands.py",
+  "runtime_decoder_sha256": "c298402a454a48eeffae935b282f3b512b8e5176f1cb4ea13bd892affbf41ef8",
+  "cuda_imported": false
+}

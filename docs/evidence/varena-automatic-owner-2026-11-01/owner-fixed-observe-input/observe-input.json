@@ -1,0 +1,13 @@
+{
+  "expected_pid": 191228,
+  "extension_sha256": "80855283c5995d90c558fd023f8cbc370e12e66a2cbafc12faa75d8bd810f3b1",
+  "gpu_uuid": "GPU-74f2ac0a-1c52-2e52-a7a6-b207f1db7a89",
+  "owner_row": {
+    "incarnation": 1,
+    "slot": 0
+  },
+  "runtime_owner_sha256": "b0862bc40e6282aa33031e883b0a01c2d418b7f924d0e80940862205286add1f",
+  "runtime_version": "0.36.21+dev.gb206015b",
+  "shim_sha256": "09684b61d0b909c39d56c7d129432e906ddb0a57f1b4b916b20bb2c4c8d7716e",
+  "tensorfs_version": "0.17.16+dev.gafa6f922"
+}
