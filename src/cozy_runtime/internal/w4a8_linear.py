@@ -32,6 +32,18 @@ def native(torch: ModuleType, index: int) -> prebuilt.Prebuilt | None:
     return kernel_ready.serve(f"{OP} cuda:{index}", partial(_verified, torch, index), capturing)
 
 
+def prime(torch: ModuleType, index: int) -> None:
+    """Opens this card's w4a8 GEMM at device init (`kernel_ready.prime`), once the 8-bit library
+    it is part of serves here."""
+    kernel_ready.prime(f"{OP} cuda:{index}", partial(_after_library, torch, index))
+
+
+def _after_library(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
+    if int8_linear.native(torch, index) is None:  # it waits for the library's own prime
+        raise RuntimeError("the 8-bit library does not serve this card")
+    return _verified(torch, index, wait)
+
+
 def _verified(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
     sm, probe = int8_linear.capability(torch, index), partial(prebuilt.probe_w4a8, torch)
     return kernel_ready.verified(

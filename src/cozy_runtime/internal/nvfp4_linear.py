@@ -289,8 +289,12 @@ def _launcher(torch: ModuleType, device: Device, capturing: bool) -> Launch | No
     (`kernel_ready.serve`), else None: the caller then decodes eagerly."""
     if TRITON_ABSENT or not kernel_ready.TRITON:
         return None
-    opener = partial(kernel_ready.TRITON[0], KERNELS, partial(probe, torch, device), device=device)
-    return kernel_ready.serve(f"{KERNELS.name} cuda:{device.index or 0}", opener, capturing)
+    name = f"{KERNELS.name} cuda:{device.index or 0}"
+    return kernel_ready.serve(name, _opener(torch, device), capturing)
+
+
+def _opener(torch: ModuleType, device: Device) -> kernel_ready.Opener[Launch]:
+    return partial(kernel_ready.TRITON[0], KERNELS, partial(probe, torch, device), device=device)
 
 
 def kitchen(torch: ModuleType, index: int, capturing: bool) -> ModuleType | None:
@@ -298,6 +302,16 @@ def kitchen(torch: ModuleType, index: int, capturing: bool) -> ModuleType | None
     asked only where the card's row has FP4 tensor cores."""
     name = f"{KITCHEN} cuda:{index}"
     return kernel_ready.serve(name, partial(_kitchen, torch, index), capturing)
+
+
+def prime(torch: ModuleType, index: int) -> None:
+    """Opens this card's nvfp4 kernels at device init (`kernel_ready.prime`): the Triton launcher
+    on every row, comfy-kitchen's W4A4 where the row has FP4 tensor cores."""
+    if not TRITON_ABSENT and kernel_ready.TRITON:
+        device = torch.device("cuda", index)
+        kernel_ready.prime(f"{KERNELS.name} cuda:{index}", _opener(torch, device))
+    if fp4(torch, index):
+        kernel_ready.prime(f"{KITCHEN} cuda:{index}", partial(_kitchen, torch, index))
 
 
 def _kitchen(torch: ModuleType, index: int, wait: bool) -> ModuleType | None:

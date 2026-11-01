@@ -307,6 +307,19 @@ def _launcher(torch: ModuleType, device: Device, capturing: bool) -> Launch | No
     return kernel_ready.serve(f"{KERNELS.name} cuda:{index}", opener, capturing)
 
 
+def prime(torch: ModuleType, index: int) -> None:
+    """Opens this card's SVDQuant kernels at device init (`kernel_ready.prime`), where its row has
+    FP4 tensor cores: the Triton launcher, and the prebuilt GEMM where `tiled` can hold."""
+    row = arch.row(int8_linear.capability(torch, index))
+    if not row.fp4:
+        return
+    if not TRITON_ABSENT and kernel_ready.TRITON:
+        opener = partial(_opened, torch, torch.device("cuda", index))
+        kernel_ready.prime(f"{KERNELS.name} cuda:{index}", opener)
+    if not _kernels.ABSENT and row.family == arch.MMA_SYNC:
+        kernel_ready.prime(f"{NATIVE} cuda:{index}", partial(_native_opened, torch, index))
+
+
 def _opened(torch: ModuleType, device: Device, wait: bool) -> Launch | None:
     try:
         return kernel_ready.TRITON[0](KERNELS, partial(probe, torch, device), wait, device=device)
