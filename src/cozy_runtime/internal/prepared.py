@@ -954,6 +954,8 @@ class _SharedDomain:
 
 
 class _SequenceExecution(Execution):
+    plan: PreparedSequence
+
     def __init__(self, plan, context, outputs, readout, models, native, reads, phases=None):
         super().__init__(plan, context, 0, outputs, readout, models, native)
         self._stage_reads = reads
