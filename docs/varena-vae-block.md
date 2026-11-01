@@ -156,3 +156,24 @@ immutable for root-owned build/qualification. The next seam is an explicit packa
 hooks, with only the current block bound, one invocation, and all actual buffers checked
 before the first write. Existing row/RoPE/SwiGLU kernel entries will gain caller outputs
 without changing their numerical bodies or cache identities.
+
+
+## Remaining outer decoder policy
+
+The actual package wraps `_decode_tiles` in legacy `split(..., Cut(0))` before reaching
+any `_BlockRows`. `catch.uncommitted_scope()` is true for every active legacy Scope,
+so preserving that guard prevents the new closed block from adopting under this parent.
+The observed outer wrapper had21 calls (20 whole,1 split); replacing it with a fixed
+whole call would discard an actually used capacity fallback.
+
+The bounded block proof remains useful but is not full-H3 adoption. The outer operation
+contains post-quant Conv3d, proj-in/register assembly,36 blocks, final norm/proj-out and
+layout copies. Its actual allocation/choice contract must be migrated separately, or
+an explicit irrevocable parent-choice transition must be reviewed with its changed
+failure semantics. Do not clear the scope flag, infer closure from a successful trace,
+or opt in the whole decoder through the block declaration.
+
+The declaration now names the two actual direct layer-scale parameter slots; no
+opaque modulation callback runs inside the admitted body. Optional row/RoPE/SwiGLU
+outputs preserve every original JIT body, definition line and the imported VAE kernel
+identity. The native block executor and package adoption are still pending.

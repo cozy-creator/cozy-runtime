@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from cozy_runtime.author.kernels import (
+    _BLOCK_SPLIT,
     KernelsUnavailable,
     Launch,
     Plan,
@@ -426,6 +427,9 @@ def _fusable(layout: DiTBlock, x: Any) -> bool:
 
 
 def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+    declared = _BLOCK_SPLIT.get()
+    if declared is not None and declared.module is self:
+        return declared.run(*args, **kwargs)
     site: _Site = self._cozy_dit
     layout, launch = site.layout, site.switch.launch
     if launch is None:
