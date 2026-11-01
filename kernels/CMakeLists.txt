@@ -224,7 +224,13 @@ endfunction()
 # Prepared host-side Lt descriptors; the installed CUDA library owns its kernels.
 # No Torch headers/linkage and no architecture compilation unit.
 kernel_module(_dense dense.cpp)
-target_link_libraries(_dense PRIVATE CUDA::cublasLt CUDA::cuda_driver)
+find_path(CUBLASLT_INCLUDE_DIR cublasLt.h HINTS ${CUDAToolkit_INCLUDE_DIRS} REQUIRED)
+target_include_directories(_dense PRIVATE ${CUBLASLT_INCLUDE_DIR})
+set_target_properties(_dense PROPERTIES SKIP_BUILD_RPATH TRUE INSTALL_RPATH ""
+                      INSTALL_RPATH_USE_LINK_PATH FALSE)
+# Driver and cuBLASLt use the same lazy vendor-loader boundary as Varena. They are
+# not ELF/PE import dependencies, and no build-tree/vendor RUNPATH is installed.
+# cuda_runtime_api/cublasLt headers remain build inputs; cudart_static is linked above.
 
 kernel_module(_gemm gemm.cpp ${units})
 target_include_directories(_gemm PRIVATE "${INT8}")

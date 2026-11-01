@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Prepared, caller-buffer FP16 biased linears. Query is outside compute; execute never
 // selects an algorithm, allocates workspace, or retries. See research/varena-vae-dense-contract.md.
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#endif
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/shared_ptr.h>
 
@@ -20,14 +28,106 @@
 
 #ifdef _WIN32
 #include <process.h>
+#include <windows.h>
 #else
 #include <unistd.h>
+#include <dlfcn.h>
 #endif
 
 namespace nb = nanobind;
 using namespace nb::literals;
 
 namespace {
+
+// As in Varena's CUDA loader, vendor code stays loaded for the process lifetime:
+// CUDA registers exit handlers and live opaque objects may outlast module teardown.
+// Merely importing this extension resolves no driver/Lt symbol and initializes no CUDA.
+class Library {
+  public:
+    explicit Library(const char* name) : name_(name) {
+#ifdef _WIN32
+        handle_ = LoadLibraryExA(name, nullptr, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (!handle_) throw std::runtime_error(std::string("prepared dense cannot load ") +
+                                               name + " (Windows " + std::to_string(GetLastError()) + ")");
+#else
+        handle_ = dlopen(name, RTLD_NOW | RTLD_LOCAL);
+        if (!handle_) {
+            const char* detail = dlerror();
+            throw std::runtime_error(std::string("prepared dense cannot load ") + name +
+                                     ": " + (detail ? detail : "unknown loader error"));
+        }
+#endif
+    }
+    template <typename Function>
+    Function symbol(const char* name) const {
+#ifdef _WIN32
+        auto found = GetProcAddress(handle_, name);
+#else
+        auto found = dlsym(handle_, name);
+#endif
+        if (!found) throw std::runtime_error(std::string("prepared dense missing ") +
+                                             name + " in " + name_);
+        return reinterpret_cast<Function>(found);
+    }
+    // Deliberately no FreeLibrary/dlclose: this is the native vendor lifetime, not
+    // ownership of any CUDA context, selected descriptor, or working allocation.
+  private:
+    const char* name_;
+#ifdef _WIN32
+    HMODULE handle_;
+#else
+    void* handle_;
+#endif
+};
+
+struct Driver {
+#ifdef _WIN32
+    Library library{"nvcuda.dll"};
+#else
+    Library library{"libcuda.so.1"};
+#endif
+    decltype(&::cuCtxGetCurrent) current = library.symbol<decltype(current)>("cuCtxGetCurrent");
+    decltype(&::cuCtxPushCurrent) push = library.symbol<decltype(push)>("cuCtxPushCurrent_v2");
+    decltype(&::cuCtxPopCurrent) pop = library.symbol<decltype(pop)>("cuCtxPopCurrent_v2");
+};
+const Driver& driver_api() {
+    static const Driver api;
+    return api;
+}
+
+#define DENSE_LT_SYMBOLS(X) \
+    X(cublasLtCreate) \
+    X(cublasLtDestroy) \
+    X(cublasLtMatmulDescCreate) \
+    X(cublasLtMatmulDescDestroy) \
+    X(cublasLtMatmulDescSetAttribute) \
+    X(cublasLtMatrixLayoutCreate) \
+    X(cublasLtMatrixLayoutDestroy) \
+    X(cublasLtMatmulPreferenceCreate) \
+    X(cublasLtMatmulPreferenceDestroy) \
+    X(cublasLtMatmulPreferenceSetAttribute) \
+    X(cublasLtMatmulAlgoGetHeuristic) \
+    X(cublasLtMatmulAlgoCheck) \
+    X(cublasLtMatmul) \
+    X(cublasLtMatmulAlgoConfigGetAttribute) \
+    X(cublasLtGetVersion)
+
+struct Lt {
+#ifdef _WIN32
+    Library library{"cublasLt64_13.dll"};
+#else
+    Library library{"libcublasLt.so.13"};
+#endif
+#define DENSE_LT_LOAD(name) decltype(&::name) name = library.symbol<decltype(name)>(#name);
+    DENSE_LT_SYMBOLS(DENSE_LT_LOAD)
+#undef DENSE_LT_LOAD
+};
+#undef DENSE_LT_SYMBOLS
+const Lt& lt() {
+    static const Lt api;
+    return api;
+}
+
 uint64_t process() {
 #ifdef _WIN32
     return static_cast<uint64_t>(_getpid());
@@ -81,12 +181,12 @@ struct Context {
         int actual = -1;
         cuda(cudaGetDevice(&actual));
         require(actual == device, "prepared dense requires the caller's current device");
-        driver(cuCtxGetCurrent(&context));
+        driver(driver_api().current(&context));
         require(context != nullptr, "prepared dense requires an initialized caller context");
         not_capturing(stream);
         cuda(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device));
         cuda(cudaDeviceGetAttribute(&sm_major, cudaDevAttrComputeCapabilityMajor, device));
-        blas(cublasLtCreate(&handle));
+        blas(lt().cublasLtCreate(&handle));
     }
     Context(const Context&) = delete;
     Context& operator=(const Context&) = delete;
@@ -95,7 +195,7 @@ struct Context {
         require(pid == process(), "prepared dense context belongs to another process");
         require(handle != nullptr, "prepared dense context is closed");
         CUcontext actual = nullptr;
-        driver(cuCtxGetCurrent(&actual));
+        driver(driver_api().current(&actual));
         require(actual == context, "prepared dense CUDA context changed");
         not_capturing(stream);
     }
@@ -106,17 +206,17 @@ struct Context {
         require(plans == 0, "prepared dense context still has retained plans");
         // cublasLtDestroy synchronizes. Runtime calls this only at the device owner's
         // already-drained final teardown, never per projection or variant.
-        blas(cublasLtDestroy(handle));
+        blas(lt().cublasLtDestroy(handle));
         handle = nullptr;
     }
     ~Context() {
         if (!handle || pid != process()) return;
         // A Python owner may be released with another device current. Restore the
         // caller's context; if ours was already destroyed, its device resources are gone.
-        if (cuCtxPushCurrent(context) != CUDA_SUCCESS) return;
-        cublasLtDestroy(handle);
+        if (driver_api().push(context) != CUDA_SUCCESS) return;
+        lt().cublasLtDestroy(handle);
         CUcontext restored = nullptr;
-        cuCtxPopCurrent(&restored);
+        driver_api().pop(&restored);
     }
 };
 
@@ -147,11 +247,11 @@ size_t matrix_bytes(int rows, int columns) {
 
 template <typename T>
 void attribute(cublasLtMatmulDesc_t desc, cublasLtMatmulDescAttributes_t key, T value) {
-    blas(cublasLtMatmulDescSetAttribute(desc, key, &value, sizeof(value)));
+    blas(lt().cublasLtMatmulDescSetAttribute(desc, key, &value, sizeof(value)));
 }
 template <typename T>
 void preference(cublasLtMatmulPreference_t desc, cublasLtMatmulPreferenceAttributes_t key, T value) {
-    blas(cublasLtMatmulPreferenceSetAttribute(desc, key, &value, sizeof(value)));
+    blas(lt().cublasLtMatmulPreferenceSetAttribute(desc, key, &value, sizeof(value)));
 }
 
 struct Plan {
@@ -182,11 +282,11 @@ struct Plan {
     ~Plan() {
         // Reject inherited objects before even entering vendor metadata destruction.
         if (owner->pid == process()) {
-            if (prefs) cublasLtMatmulPreferenceDestroy(prefs);
-            if (result) cublasLtMatrixLayoutDestroy(result);
-            if (b) cublasLtMatrixLayoutDestroy(b);
-            if (a) cublasLtMatrixLayoutDestroy(a);
-            if (operation) cublasLtMatmulDescDestroy(operation);
+            if (prefs) lt().cublasLtMatmulPreferenceDestroy(prefs);
+            if (result) lt().cublasLtMatrixLayoutDestroy(result);
+            if (b) lt().cublasLtMatrixLayoutDestroy(b);
+            if (a) lt().cublasLtMatrixLayoutDestroy(a);
+            if (operation) lt().cublasLtMatmulDescDestroy(operation);
         }
         --owner->plans;
     }
@@ -199,7 +299,7 @@ struct Plan {
         require(!half_accumulation || owner->sm_major >= 7, "FP16 accumulation needs SM70+");
         const auto compute = half_accumulation ? CUBLAS_COMPUTE_16F : CUBLAS_COMPUTE_32F;
         const auto scalar = half_accumulation ? CUDA_R_16F : CUDA_R_32F;
-        blas(cublasLtMatmulDescCreate(&operation, compute, scalar));
+        blas(lt().cublasLtMatmulDescCreate(&operation, compute, scalar));
         attribute(operation, CUBLASLT_MATMUL_DESC_TRANSA, CUBLAS_OP_T);
         attribute(operation, CUBLASLT_MATMUL_DESC_TRANSB, CUBLAS_OP_N);
         attribute(operation, CUBLASLT_MATMUL_DESC_EPILOGUE, CUBLASLT_EPILOGUE_BIAS);
@@ -207,10 +307,10 @@ struct Plan {
         if (sm_target) attribute(operation, CUBLASLT_MATMUL_DESC_SM_COUNT_TARGET, sm_target);
         // Torch's contiguous row-major linear is Y.T = W @ X.T + bias. Physical
         // column-major A is [K,N] transposed; B is [K,M]; C and D share [N,M].
-        blas(cublasLtMatrixLayoutCreate(&a, CUDA_R_16F, inputs, outputs, inputs));
-        blas(cublasLtMatrixLayoutCreate(&b, CUDA_R_16F, inputs, rows, inputs));
-        blas(cublasLtMatrixLayoutCreate(&result, CUDA_R_16F, outputs, rows, outputs));
-        blas(cublasLtMatmulPreferenceCreate(&prefs));
+        blas(lt().cublasLtMatrixLayoutCreate(&a, CUDA_R_16F, inputs, outputs, inputs));
+        blas(lt().cublasLtMatrixLayoutCreate(&b, CUDA_R_16F, inputs, rows, inputs));
+        blas(lt().cublasLtMatrixLayoutCreate(&result, CUDA_R_16F, outputs, rows, outputs));
+        blas(lt().cublasLtMatmulPreferenceCreate(&prefs));
         preference(prefs, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, workspace_limit);
         for (auto key : {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES,
                          CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
@@ -226,14 +326,14 @@ struct Plan {
         }
         cublasLtMatmulHeuristicResult_t found{};
         int count = 0;
-        blas(cublasLtMatmulAlgoGetHeuristic(owner->handle, operation, a, b, result, result,
+        blas(lt().cublasLtMatmulAlgoGetHeuristic(owner->handle, operation, a, b, result, result,
                                            prefs, 1, &found, &count));
         if (count != 1) blas(CUBLAS_STATUS_NOT_SUPPORTED);
         blas(found.state);
         algorithm = found.algo;
         heuristic_workspace = found.workspaceSize;
         cublasLtMatmulHeuristicResult_t checked{};
-        blas(cublasLtMatmulAlgoCheck(owner->handle, operation, a, b, result, result,
+        blas(lt().cublasLtMatmulAlgoCheck(owner->handle, operation, a, b, result, result,
                                     &algorithm, &checked));
         blas(checked.state);
         checked_workspace = checked.workspaceSize;
@@ -265,7 +365,7 @@ struct Plan {
         const void* beta = half_accumulation ? static_cast<const void*>(&half_zero) : &zero;
         // No heuristic, descriptor mutation, allocation or fallback here. The caller
         // retains all owners through completion; every vendor failure preserves its status.
-        blas(cublasLtMatmul(owner->handle, operation, alpha, reinterpret_cast<void*>(weight),
+        blas(lt().cublasLtMatmul(owner->handle, operation, alpha, reinterpret_cast<void*>(weight),
                               a, reinterpret_cast<void*>(x), b, beta,
                               reinterpret_cast<void*>(output), result,
                               reinterpret_cast<void*>(output), result, &algorithm,
@@ -286,7 +386,7 @@ struct Plan {
         info["bias_address"] = bias;
         info["half_accumulation"] = half_accumulation;
         info["reduction"] = reduction; info["sm_target"] = sm_target;
-        info["library_version"] = cublasLtGetVersion();
+        info["library_version"] = lt().cublasLtGetVersion();
         info["header_version"] = CUBLAS_VERSION;
         nb::dict config;
         for (auto item : {std::pair{"id", CUBLASLT_ALGO_CONFIG_ID},
@@ -298,7 +398,7 @@ struct Plan {
                           std::pair{"stages", CUBLASLT_ALGO_CONFIG_STAGES_ID}}) {
             int value = 0;
             size_t written = 0;
-            blas(cublasLtMatmulAlgoConfigGetAttribute(&algorithm, item.second, &value,
+            blas(lt().cublasLtMatmulAlgoConfigGetAttribute(&algorithm, item.second, &value,
                                                       sizeof(value), &written));
             require(written == sizeof(value), "unexpected dense algorithm metadata size");
             config[nb::str(item.first)] = value;
