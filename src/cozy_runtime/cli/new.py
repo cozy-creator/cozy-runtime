@@ -36,7 +36,7 @@ default = "{pkg}:app"
 
 [project.optional-dependencies]
 # CUDA-extras torch convention: hosts install the one admitted CUDA generation.
-cu130 = ["torch>=2.13,<3"]
+cu130 = ["torch>=2.10,<3"]
 
 [tool.uv.sources]
 {_local_pin()}torch = [{{ index = "pytorch-cu130", extra = "cu130" }}]

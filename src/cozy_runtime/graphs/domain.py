@@ -27,7 +27,7 @@ from typing import Any
 from tensorfs import varena
 
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.internal import accel, kernel_ready
+from cozy_runtime.internal import accel, floors, kernel_ready
 
 
 class Unavailable(RuntimeError):
@@ -35,11 +35,9 @@ class Unavailable(RuntimeError):
 
 
 def unsupported(torch: Any) -> str:
-    return (
-        ""
-        if torch.__version__.split(".")[:2] == ["2", "14"]
-        else ("library-workspace graph lifetime is qualified only on Torch 2.14")
-    )
+    """Why CUDA graphs are off on `torch`: older than `floors.GRAPHS`, the first torch with the
+    workspace sizes `configuration` reads."""
+    return floors.older("torch", str(torch.__version__), floors.GRAPHS)
 
 
 @dataclass(eq=False, slots=True)

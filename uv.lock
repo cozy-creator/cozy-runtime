@@ -454,8 +454,8 @@ requires-dist = [
     { name = "tensorfs", specifier = ">=0.17.13,<0.18" },
     { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.17.13,<0.18" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
-    { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.14" },
-    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.14" },
+    { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.10" },
+    { name = "torch", marker = "extra == 'derive'", specifier = ">=2.10" },
     { name = "transformers", marker = "extra == 'adapters'", specifier = ">=5.16.1" },
 ]
 provides-extras = ["assessment", "derive", "media", "model-execution", "adapters"]
@@ -471,8 +471,8 @@ diffusers = [
     { name = "peft", specifier = ">=0.20,<0.21" },
     { name = "safetensors", specifier = ">=0.8.0" },
     { name = "tokenizers", specifier = ">=0.23.1" },
-    { name = "torch", specifier = ">=2.14" },
-    { name = "torchvision", specifier = ">=0.28" },
+    { name = "torch", specifier = ">=2.10" },
+    { name = "torchvision", specifier = ">=0.25" },
     { name = "transformers", specifier = ">=5.16.1" },
 ]
 

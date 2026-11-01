@@ -145,6 +145,7 @@ from cozy_runtime.internal import (
     effect_interfaces,
     execution_evidence,
     executor_commands,
+    floors,
     fp8_linear,
     int8_linear,
     interface_wheel,
@@ -1051,6 +1052,8 @@ class Executor:
             owner._startup_reported = True
         if self._device_ready:
             return None
+        if refused := floors.start(torch, self.device_kind):
+            return {"ok": False, "code": "torch_unsupported", "detail": refused}
         if accel.initialized(torch, self.device_kind):
             return {
                 "ok": False,
@@ -3733,6 +3736,8 @@ class Executor:
                 record.emit(
                     "log", f"{feature} unavailable on {self.device_kind}", "warn", instead=instead
                 )
+            for capability, found in floors.OFF.items():
+                record.emit("confession", "capability.off", capability, **found)
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
             if (waited := IDLE_WAITED.pop(command.request_id, 0.0)) >= 1:
