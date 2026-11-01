@@ -1399,7 +1399,7 @@ class ModelRegistry:
                     object.__setattr__(model, "_cozy_ready", False)
                     object.__setattr__(model, "_cozy_loading", False)
                 for cache in model._cozy_caches:
-                    cache.drop()
+                    cache._close()
             self._generations.clear()
             self._by_path.clear()
 
