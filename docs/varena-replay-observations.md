@@ -34,6 +34,14 @@ position. A repeat key combines its ordered prefix/body/suffix identities and
 repeat count. It excludes addresses, Python object IDs and refill generations.
 Unknown or changed configurations do not publish reusable observations.
 
+Opaque cuDNN/cuBLAS engine identity is fixed by the captured graph but is not
+fully represented by Runtime's high-level backend metadata. Native replay records
+must therefore also be scoped to the ordered immutable graph-definition tokens.
+A fresh capture with the same declared shape/key cannot borrow another definition's
+record merely because it shares a pool. This still permits repeated observations
+of one definition; cross-definition reuse needs a separately qualified actual
+dispatch signature. Definition retirement removes that native record scope.
+
 The existing weight-preference key remains separate; it is allowed to identify a
 particular submitted residency generation. It cannot double as the execution key.
 
