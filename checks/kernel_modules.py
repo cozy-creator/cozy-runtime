@@ -8,8 +8,10 @@ Each loads on every Python given, and a call on a machine without a GPU returns 
 rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`, the
 Rust source TensorD checks at startup). Rust execution may use the OS libgcc unwinder.
 Each exports `PyInit_*` alone (nm, dumpbin): an exported libstdc++
-symbol binds process-wide and crashed torch imported after it. With `--torch-python`, each module
-loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
+symbol binds process-wide and crashed torch imported after it. With `--torch-python` instead, one
+interpreter per torch worker images serve (torch-triton.txt), only this: each module loads before
+that torch in a fresh interpreter. No torch is part of the modules' cache key, so kernels.yaml runs
+it on every build, cached modules too. Any failure is named, and the run exits 1.
 """
 
 from __future__ import annotations
@@ -129,20 +131,25 @@ def exported(module: Path) -> list[str]:
     return [line.split()[-1] for line in out.stdout.splitlines() if line.strip()]
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("modules", type=Path, help="the install prefix: <it>/cozy_runtime/_kernels")
-    parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
-    parser.add_argument("--platform-floor", type=Path, help="cozy's crates/platform/src/gpu/mod.rs")
-    parser.add_argument("--torch-python", help="an interpreter with torch: each module before it")
-    parser.add_argument(
-        "--without",
-        action="append",
-        default=[],
-        help="a module this target omits, or `tma`: CUTLASS's TMA GEMMs (_gemm's `sm_*a` cubins)",
-    )
-    options = parser.parse_args()
-    package: Path = options.modules / "cozy_runtime" / "_kernels"
+def before_torch(package: Path, pythons: list[str]) -> list[str]:
+    """Each module, then torch, in a fresh interpreter of each of `pythons`."""
+    failed: list[str] = []
+    for python in pythons:
+        for module in sorted(p for p in package.iterdir() if p.suffix in (".so", ".pyd")):
+            name = module.name.split(".")[0]
+            call = [python, "-I", "-c", BEFORE_TORCH, name, str(module)]
+            run = subprocess.run(call, capture_output=True, text=True)
+            print(run.stdout.strip())
+            if run.returncode != 0:
+                failed.append(
+                    f"{name} before {python}'s torch exits {run.returncode}: "
+                    f"{run.stderr.strip()[-400:]}"
+                )
+    return failed
+
+
+def formed(package: Path, options: argparse.Namespace) -> list[str]:
+    """Everything but `before_torch`."""
     failed: list[str] = []
     archs = declared("ARCHS")
     stray = [p.name for p in package.iterdir() if p.name.split(".")[0] not in archs]
@@ -190,20 +197,36 @@ def main() -> int:
             failed.append(
                 f"{name} exports {len(exports)} symbols, not PyInit_{name} alone: {exports[:5]}"
             )
-        if options.torch_python:
-            call = [options.torch_python, "-I", "-c", BEFORE_TORCH, name, str(module)]
-            run = subprocess.run(call, capture_output=True, text=True)
-            print(run.stdout.strip())
-            if run.returncode != 0:
-                failed.append(
-                    f"{name} before torch exits {run.returncode}: {run.stderr.strip()[-400:]}"
-                )
     for python in options.python:
         call = [python, "-I", "-c", CALL, str(package), *options.without]
         run = subprocess.run(call, capture_output=True, text=True)
         print(run.stdout.strip())
         if run.returncode != 0:
             failed.append(f"{python}: {run.stderr.strip()[-600:]}")
+    return failed
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("modules", type=Path, help="the install prefix: <it>/cozy_runtime/_kernels")
+    parser.add_argument("--python", action="append", default=[], help="an interpreter to import on")
+    parser.add_argument("--platform-floor", type=Path, help="cozy's crates/platform/src/gpu/mod.rs")
+    parser.add_argument(
+        "--torch-python",
+        action="append",
+        default=[],
+        help="an interpreter with a served torch: only that each module loads before it",
+    )
+    parser.add_argument(
+        "--without",
+        action="append",
+        default=[],
+        help="a module this target omits, or `tma`: CUTLASS's TMA GEMMs (_gemm's `sm_*a` cubins)",
+    )
+    options = parser.parse_args()
+    package: Path = options.modules / "cozy_runtime" / "_kernels"
+    pythons: list[str] = options.torch_python
+    failed = before_torch(package, pythons) if pythons else formed(package, options)
     for line in failed:
         print(f"FAILED {line}", flush=True)
         print(f"::error title=kernel modules::{line}", flush=True)

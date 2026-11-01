@@ -9,7 +9,8 @@ name: kernels
 # (sources, flags, targets, toolchain.env's pins), the catalog and checker they are held to, the
 # target, Windows' exact compiler and this recipe's revision (`kernels-r1`; bump it when a build
 # step below changes). Only that exact key is ever restored: a miss compiles. Master's runs warm
-# the cache releases read.
+# the cache releases read. The torch releases served (torch-triton.txt) are no part of the key:
+# every run, cached modules too, loads each module before each of them.
 on:
   workflow_dispatch:
     inputs:
@@ -114,16 +115,13 @@ jobs:
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.91.1
               export PATH="$HOME/.cargo/bin:$PATH" COZY_CUDA_TOOLKIT=/usr/local/cuda-13.0 CARGO_BUILD_JOBS="$JOBS"
               bash scripts/build-execution-native.sh modules
-              # CPU torch, which each module must load before: none may export what it binds.
-              python -m pip install -q --root-user-action ignore "torch==$TORCH" --index-url https://download.pytorch.org/whl/cpu
               python checks/kernel_modules.py modules --python python \
                 --python /opt/python/cp313-cp313/bin/python --python /opt/python/cp314-cp314/bin/python \
-                --platform-floor platform-gpu.rs --torch-python python $(for w in $WITHOUT; do echo --without $w; done)
+                --platform-floor platform-gpu.rs $(for w in $WITHOUT; do echo --without $w; done)
               chown -R "$HOST_OWNER" modules
             ' 2>&1 | tee build.log
           exit "${PIPESTATUS[0]}"
-      - if: steps.cache.outputs.cache-hit != 'true'
-        uses: astral-sh/setup-uv@v7
+      - uses: astral-sh/setup-uv@v7
       - name: Stable ABI only
         if: steps.cache.outputs.cache-hit != 'true'
         run: uvx abi3audit==0.0.26 --strict --report --assume-minimum-abi3 3.12 modules/cozy_runtime/_kernels/*.so
@@ -132,12 +130,23 @@ jobs:
         with:
           path: modules
           key: ${{ steps.key.outputs.key }}
+      # Each module loads before each CPU torch served: none may export what it binds.
+      - name: Each module before each served torch
+        run: |
+          checks=()
+          for torch in $(grep -o '^torch==[^ ]*' torch-triton.txt); do
+            uv venv -q --python 3.12 "$RUNNER_TEMP/$torch"
+            uv pip install -q --python "$RUNNER_TEMP/$torch" "$torch" --index-url https://download.pytorch.org/whl/cpu
+            checks+=(--torch-python "$RUNNER_TEMP/$torch/bin/python")
+          done
+          python3 checks/kernel_modules.py modules "${checks[@]}"
       - if: always()
         run: |
           echo "${{ steps.key.outputs.key }}: ${{ steps.cache.outputs.cache-hit == 'true' && 'cached' || 'built' }}" >> "$GITHUB_STEP_SUMMARY"
           grep -E '^(_gemm|_fa3|_norm|FAILED|real)' build.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
       # Triton's launcher modules for the Runtime's prebuilt Triton sets (`triton_prebuild`), at the
-      # wheels' C library floor: the locked Triton's, so never cached with the modules.
+      # wheels' C library floor: each served Triton's (torch-triton.txt), so never cached with the
+      # modules.
       - name: Triton's launcher modules
         run: |
           docker run --rm -v "$PWD:/src" -w /src -e HOST_OWNER="$(id -u):$(id -g)" \
@@ -217,11 +226,10 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --install "$env:RUNNER_TEMP\build" --prefix modules
           "built in $(((Get-Date) - $began).TotalMinutes) min"
-          & $py -m pip install -q "torch==$env:TORCH" --index-url https://download.pytorch.org/whl/cpu
           # MSVC builds neither CUTLASS's TMA GEMMs nor FA3 (cr-201).
           & $py checks/kernel_modules.py modules --without tma --without _fa3 --without _sage3 --without _execution --python $py `
             --python "${{ steps.py313.outputs.python-path }}" --python "${{ steps.py314.outputs.python-path }}" `
-            --platform-floor platform-gpu.rs --torch-python $py
+            --platform-floor platform-gpu.rs
           exit $LASTEXITCODE
       - if: steps.cache.outputs.cache-hit != 'true'
         uses: astral-sh/setup-uv@v7
@@ -234,6 +242,21 @@ jobs:
         with:
           path: modules
           key: ${{ steps.key.outputs.key }}
+      # Each module loads before each CPU torch served: none may export what it binds.
+      - name: Each module before each served torch
+        shell: pwsh
+        run: |
+          $py = "${{ steps.py312.outputs.python-path }}"
+          $checks = @()
+          foreach ($torch in (Select-String -Path torch-triton.txt -Pattern '^torch==\S+').Matches.Value) {
+            $venv = "$env:RUNNER_TEMP\$($torch -replace '==', '-')"
+            & $py -m venv $venv
+            & "$venv\Scripts\python.exe" -m pip install -q $torch --index-url https://download.pytorch.org/whl/cpu
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+            $checks += "--torch-python", "$venv\Scripts\python.exe"
+          }
+          & $py checks/kernel_modules.py modules @checks
+          exit $LASTEXITCODE
       - if: always()
         shell: bash
         run: |
