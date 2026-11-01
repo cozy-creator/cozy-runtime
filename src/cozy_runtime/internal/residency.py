@@ -1484,7 +1484,7 @@ class Memory:
         if owner is not None:
             if check:
                 owner.check()
-            owner.wake(used=used)
+            owner.wake(used=used, check=check)
 
     def close_cooperation(self) -> None:
         if self.cooperation is not None:

@@ -87,9 +87,16 @@ class Owner:
             self._failed(error)
         return error
 
-    def wake(self, *, used: bool = False) -> None:
-        self.check()
-        self._peer.wake(used=used)
+    def wake(self, *, used: bool = False, check: bool = True) -> None:
+        self._process()
+        if self._closed:
+            return
+        try:
+            self._peer.wake(used=used)
+        except Exception as cause:
+            error = self._failure(str(cause))
+            if check:
+                raise error from cause
 
     def facts(self) -> dict[str, Any]:
         self._process()
@@ -99,8 +106,8 @@ class Owner:
         self._process()
         if self._closed:
             return
+        self._closed = True
         with suppress(varena.CooperationDeferredError):
             # Detaches the GIL; no Memory/Order/native lock is held. The native worker owns
             # final retirement and retains its intact Peer if capture currently excludes it.
             self._peer.close()
-        self._closed = True
