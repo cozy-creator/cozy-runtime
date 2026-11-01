@@ -3761,6 +3761,8 @@ class Executor:
             sparse_kernels = attention.sparse_names(served_attention.totals())
             if sparse_kernels:
                 sparse_name = "+".join(sparse_kernels)
+                # The counts that happened: all six beside these three overrun an observation's
+                # eight fields, which dropped the last (xs-142).
                 record.emit(
                     "confession",
                     "attention.sol.calls",
@@ -3768,7 +3770,7 @@ class Executor:
                     rank=0,
                     world=self.world,
                     dense_reference=_dense(sparse_kernels),
-                    **sol_counts,
+                    **{kind: n for kind, n in sol_counts.items() if n},
                 )
                 for rank, counts in sorted(sol_rank_counts.items()):
                     record.emit(
@@ -3777,7 +3779,7 @@ class Executor:
                         sparse_name,
                         rank=rank,
                         world=self.world,
-                        **counts,
+                        **{kind: n for kind, n in counts.items() if n},
                     )
             # Where this request's Sol kernel came from (h3a-087): loaded from the machine
             # store, waited for behind a builder, or compiled here, and how long each took.
