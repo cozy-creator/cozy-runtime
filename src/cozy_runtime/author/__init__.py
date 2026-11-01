@@ -19,15 +19,6 @@ from cozy_runtime import canonical_json
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice, ObjectRef
-from cozy_runtime.author._assets import (
-    MENTION,
-    Asset,
-    Mention,
-    mentions,
-    name_key,
-    name_label,
-    render,
-)
 from cozy_runtime.author._attention import (
     AttentionProducer,
     ProducerCall,
@@ -103,7 +94,7 @@ from cozy_runtime.author._image import (
     Box,
     ImageRequest,
     ImageResult,
-    PictureAsset,
+    Picture,
     Region,
     Seed,
     Sizes,
@@ -169,6 +160,15 @@ from cozy_runtime.author._recipes import (
     Recipe,
     SelectionPlan,
 )
+from cozy_runtime.author._references import (
+    MENTION,
+    Mention,
+    Reference,
+    mentions,
+    name_key,
+    name_label,
+    render,
+)
 from cozy_runtime.author._services import (
     AdjustmentRow,
     AdjustmentRows,
@@ -188,14 +188,23 @@ from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._split import Cut, split
 from cozy_runtime.author._spread import spread
 from cozy_runtime.author._video import (
+    AudioReference,
     Beat,
-    Implements,
-    ShotAsset,
+    CharacterReference,
+    ContinueFrom,
+    EnvironmentReference,
+    Follow,
+    Latents,
+    Plate,
+    Preset,
+    PropReference,
+    ShotReference,
+    ShotReferences,
     ShotRequest,
     ShotResult,
     UpscaleRequest,
     UpscaleResult,
-    WorldState,
+    VideoReference,
 )
 from cozy_runtime.author._weights import (
     MAX_WEIGHTS_NEW_BYTES,
@@ -226,12 +235,12 @@ __all__ = [
     "Artifact",
     "AspectRatio",
     "AssessmentRef",
-    "Asset",
     "AttentionLayout",
     "AttentionProducer",
     "AudioFile",
     "AudioPreparation",
     "AudioProbe",
+    "AudioReference",
     "AuthorError",
     "Backend",
     "Beat",
@@ -239,6 +248,7 @@ __all__ = [
     "Box",
     "Cancelled",
     "CapabilityError",
+    "CharacterReference",
     "CheckpointRef",
     "CheckpointUnnormalized",
     "ChildCallError",
@@ -247,6 +257,7 @@ __all__ = [
     "ConstructionIdentity",
     "ConstructionRecord",
     "Context",
+    "ContinueFrom",
     "Cut",
     "DeadlineExceeded",
     "DecodeLimits",
@@ -267,12 +278,14 @@ __all__ = [
     "Egress",
     "EgressResponse",
     "EncodingRule",
+    "EnvironmentReference",
     "File",
     "FileBound",
     "FileInfo",
     "FileLimits",
     "Files",
     "Fit",
+    "Follow",
     "Image",
     "ImageFile",
     "ImageFrame",
@@ -280,10 +293,10 @@ __all__ = [
     "ImageProbe",
     "ImageRequest",
     "ImageResult",
-    "Implements",
     "InvalidRequest",
     "Invocation",
     "InvocationResult",
+    "Latents",
     "Loader",
     "Lora",
     "MediaDecodeError",
@@ -307,14 +320,18 @@ __all__ = [
     "Outputs",
     "Overlay",
     "PendingCall",
-    "PictureAsset",
+    "Picture",
+    "Plate",
     "Preflight",
     "PreflightViolation",
     "PreparedRequest",
+    "Preset",
     "ProducerCall",
     "ProducerSite",
+    "PropReference",
     "QuantizationPlan",
     "Recipe",
+    "Reference",
     "Region",
     "Registration",
     "RegistrationError",
@@ -330,7 +347,8 @@ __all__ = [
     "SelectionPlan",
     "Settings",
     "Shape",
-    "ShotAsset",
+    "ShotReference",
+    "ShotReferences",
     "ShotRequest",
     "ShotResult",
     "Sizes",
@@ -347,9 +365,9 @@ __all__ = [
     "VideoJoin",
     "VideoPreparation",
     "VideoProbe",
+    "VideoReference",
     "Weights",
     "WeightsOutput",
-    "WorldState",
     "active_attention_layout",
     "assert_declaration_shape",
     "attach_assessment",
@@ -389,27 +407,34 @@ __all__ = [
     "uses_components",
 ]
 
-#: Names Runtime 0.36.0 removed (xs-135: an asset is a production element, a file is a file). A
-#: package built for an older Runtime imports one of them and fails here, never decoding a request
-#: with a name that now means something else.
+#: Names a Runtime removed, the release that removed them, and what replaces each. A package built
+#: for an older Runtime imports one of them and fails here, never decoding a request with a name
+#: that now means something else.
 _REMOVED = {
-    "ImageAsset": "ImageFile",
-    "VideoAsset": "VideoFile",
-    "AudioAsset": "AudioFile",
-    "FileAsset": "File",
-    "Assets": "Files",
-    "AssetBound": "FileBound",
-    "AssetLimits": "FileLimits",
-    "AssetInfo": "FileInfo",
-    "ReferenceImages": "PictureAsset",
+    "ImageAsset": ("0.36.0", "ImageFile"),
+    "VideoAsset": ("0.36.0", "VideoFile"),
+    "AudioAsset": ("0.36.0", "AudioFile"),
+    "FileAsset": ("0.36.0", "File"),
+    "Assets": ("0.36.0", "Files"),
+    "AssetBound": ("0.36.0", "FileBound"),
+    "AssetLimits": ("0.36.0", "FileLimits"),
+    "AssetInfo": ("0.36.0", "FileInfo"),
+    "ReferenceImages": ("0.36.0", "Picture"),
+    "Asset": ("0.37.0", "Reference"),
+    "PictureAsset": ("0.37.0", "Picture"),
+    "ShotAsset": ("0.37.0", "CharacterReference, PropReference or EnvironmentReference"),
+    "WorldState": ("0.37.0", "an EnvironmentReference with follow: loose"),
+    "Implements": ("0.37.0", "nothing: a project reads a function's request schema"),
 }
 
 
 def __getattr__(name: str) -> object:
     if name in _REMOVED:
+        release, instead = _REMOVED[name]
         raise ImportError(
-            f"cozy_runtime.author.{name} is gone in Runtime 0.36.0 ({_REMOVED[name]} replaces it): "
-            "this package was built for Runtime < 0.36; use its newest release",
+            f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): "
+            f"this package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest "
+            "release",
             name=name,
         )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

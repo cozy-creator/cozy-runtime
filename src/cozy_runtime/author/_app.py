@@ -35,7 +35,6 @@ from cozy_runtime.author._model_defaults import (
     model_prepared_use,
 )
 from cozy_runtime.author._signature import Surface, analyze
-from cozy_runtime.author._video import Implements
 from cozy_runtime.author._weights import WeightsOutput
 
 P = ParamSpec("P")
@@ -92,8 +91,6 @@ class Registration:
     """Called by this installed package revision's own code only; never a root request."""
     accelerator: bool = True
     """False: CPU only. True (the default): the machine's GPU when it has one."""
-    implements: Implements | None = None
-    """The interface it implements, as declared."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
     is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
@@ -123,7 +120,6 @@ class Registration:
                 model_on_demand=self.model_on_demand,
                 model_prepared_use=self.model_prepared_use,
                 model_classes=self.model_classes,
-                implements=self.implements,
             )
             self._surface = surface
         return self._surface
@@ -143,7 +139,6 @@ class App:
         /,
         *,
         hidden: bool = False,
-        implements: Implements | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R]: ...
@@ -154,7 +149,6 @@ class App:
         /,
         *,
         hidden: bool = False,
-        implements: Implements | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
@@ -165,7 +159,6 @@ class App:
         /,
         *,
         hidden: bool = False,
-        implements: Implements | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
@@ -185,13 +178,8 @@ class App:
         fetched, when the function first reads it. `model_classes` names a model argument's class
         in place of its annotation (the Runtime's own generic functions). `phases=` declares
         immutable component groups in execution order, available to queued preparation before
-        handler entry; it has the same residency meaning as the handler's `ctx.plan` hints.
-        `implements=Implements("video/shot", max_piece_s=15)` names the interface it
-        implements (`ImageRequest`, `ShotRequest`, `UpscaleRequest`) and the facts a caller
-        plans by."""
-        return self._register(
-            fn, False, hidden=hidden, implements=implements, model_classes=model_classes, **options
-        )
+        handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
+        return self._register(fn, False, hidden=hidden, model_classes=model_classes, **options)
 
     @overload
     def child_task(
@@ -207,7 +195,7 @@ class App:
         self, fn: Callable[P, R] | None = None, /, **options: Unpack[RegistrationOptions]
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a function only this package's own calls run: never a root request or
-        another package's call. It takes `entrypoint`'s options except `hidden`, `implements` and
+        another package's call. It takes `entrypoint`'s options except `hidden` and
         `model_classes`. `prepared_use={"model": "use"}` (a child task's only) names the typed
         field that describes its fixed repeated weight use before construction."""
         return self._register(fn, True, **options)
@@ -219,7 +207,6 @@ class App:
         /,
         *,
         hidden: bool = False,
-        implements: Implements | None = None,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
@@ -240,15 +227,13 @@ class App:
         # Immutable CPU metadata; the source reader uses the same closed validator.
         declared_phases = model_phases(phases)
         policy = memo_policy(memoize)
-        if child_task and (hidden or implements is not None or model_classes):
-            raise RegistrationError("child_task takes no hidden=, implements= or model_classes=")
+        if child_task and (hidden or model_classes):
+            raise RegistrationError("child_task takes no hidden= or model_classes=")
         if accelerator is not None and type(accelerator) is not bool:
             raise RegistrationError(
                 "accelerator is True or False: a function gets the machine's GPU unless it "
                 "declares accelerator=False"
             )
-        if implements is not None and not isinstance(implements, Implements):
-            raise RegistrationError("implements is an Implements(interface, ...)")
         declared_defaults = model_defaults(defaults)
         declared_components = model_components(components)
         declared_on_demand = model_on_demand(on_demand)
@@ -301,7 +286,6 @@ class App:
                 hidden=hidden,
                 child_task=child_task,
                 accelerator=accelerator is not False,
-                implements=implements,
             )
             return target
 
