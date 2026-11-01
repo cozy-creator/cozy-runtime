@@ -1,0 +1,8 @@
+{
+  "owner": "/root/explicit_stream_owner",
+  "purpose": "Runtime explicit non-blocking CUDA execution stream hard cut",
+  "branch": "codex/xs138-explicit-stream-owner",
+  "origin_master_base": "cb6c66bf343d15637eaeb4af35731a37fc56d61c",
+  "integration_base": "61fe32331968f89a1585d25263924ef15cc04a39",
+  "gpu_authority": "none; root owns all GPU execution and heavy builds"
+}
