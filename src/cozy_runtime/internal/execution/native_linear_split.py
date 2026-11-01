@@ -85,6 +85,7 @@ class _Plan:
                       dispatch={"full": vars(geometry.full), "tail": vars(geometry.tail)},
                       workspace_bytes=geometry.workspace)
         record["selections"] += 1
+        phase.choice(("native-split", self.key, geometry.identity))
         observation_id = vt.split_begin(
             device, self.key, geometry.identity, stream=stream_id,
             completion_owner=phase.completion_owner(device, stream_id),

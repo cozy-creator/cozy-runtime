@@ -117,6 +117,7 @@ def channel_norm(
     record["selections"] += 1
     from cozy_runtime.fusion import _kernels
 
+    phase.choice(("native-split", key, choice_id))
     observation_id = vt.split_begin(
         device, key, choice_id, stream=stream_id,
         completion_owner=phase.completion_owner(device, stream_id),

@@ -48,7 +48,9 @@ buffer; an undeclared size is an error, not a new allocation.
 Native select/begin receive the exact stream and complete menu. The key binds
 input/weight/bias layouts, dtype/alignment, module provider/encoding, native module
 artifact, full/tail geometry/config/workspace, output contract and participating
-model identities. One request owns componentless records. Matching eager-phase
+model identities. The selected native choice also enters the enclosing eager phase's
+actual dispatch fingerprint, including the previously introduced norm adapter.
+One request owns componentless records. Matching eager-phase
 completion publishes submitted samples; without that owner, execution is only
 declaration-qualified. Failure after writes aborts the sample and propagates the
 original error with the no-retry OOM marker. Unsupported capability returns to its
