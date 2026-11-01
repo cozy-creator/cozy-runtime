@@ -1,0 +1,413 @@
+{
+  "run": 25499,
+  "raw_path": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p3-lifecycle-sparse-leg16-plan/attempt-002/candidate-executed/model-switch-show.json",
+  "raw_sha256": "0bd9dabb9858631b069695fbd1519014e059396939e935ace5dddd358aea4641",
+  "scope": "completed historical full H3 trace, not the new combined Runtime",
+  "legacy_levels": {
+    "norm_out.norm:tokens": [
+      150
+    ],
+    "post_quant_conv:bands": [
+      22
+    ],
+    "split:TileBatchedVideoVAE._decode_tiles(-1, 24, 7, 16, 16):torch.float32": [
+      20,
+      1
+    ],
+    "split:_BlockRows(-1, 1797, 2048):torch.float16": [
+      21,
+      1
+    ],
+    "split:_BlockRows(-1, 1797, 2048):torch.float16/attention#1": [
+      23
+    ],
+    "split:_BlockRows(-1, 1797, 2048):torch.float32": [
+      769,
+      1
+    ],
+    "split:_BlockRows(-1, 1797, 2048):torch.float32/attention#1": [
+      771
+    ],
+    "split:_Heads(1, 109123, -1, 128):torch.bfloat16": [
+      899,
+      1
+    ],
+    "split:_native_leaf_class.<locals>.NativeLinear(1, -1, 7168):torch.bfloat16": [
+      48,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1,
+      1
+    ],
+    "token_refiner.final_norm:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0.attn.norm_k:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0.attn.norm_q:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0.ff.net.0:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0.ff:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0.norm1:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0.norm2:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0/attention#1": [
+      1
+    ],
+    "token_refiner.refiner_blocks.0/attention#1/attention#1": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1.attn.norm_k:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1.attn.norm_q:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1.ff.net.0:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1.ff:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1.norm1:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1.norm2:tokens": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1/attention#1": [
+      1
+    ],
+    "token_refiner.refiner_blocks.1/attention#1/attention#1": [
+      1
+    ]
+  },
+  "legacy_calls": {
+    "norm_out.norm:tokens": 150,
+    "post_quant_conv:bands": 22,
+    "split:TileBatchedVideoVAE._decode_tiles(-1, 24, 7, 16, 16):torch.float32": 21,
+    "split:_BlockRows(-1, 1797, 2048):torch.float16": 22,
+    "split:_BlockRows(-1, 1797, 2048):torch.float16/attention#1": 23,
+    "split:_BlockRows(-1, 1797, 2048):torch.float32": 770,
+    "split:_BlockRows(-1, 1797, 2048):torch.float32/attention#1": 771,
+    "split:_Heads(1, 109123, -1, 128):torch.bfloat16": 900,
+    "split:_native_leaf_class.<locals>.NativeLinear(1, -1, 7168):torch.bfloat16": 50,
+    "token_refiner.final_norm:tokens": 1,
+    "token_refiner.refiner_blocks.0.attn.norm_k:tokens": 1,
+    "token_refiner.refiner_blocks.0.attn.norm_q:tokens": 1,
+    "token_refiner.refiner_blocks.0.ff.net.0:tokens": 1,
+    "token_refiner.refiner_blocks.0.ff:tokens": 1,
+    "token_refiner.refiner_blocks.0.norm1:tokens": 1,
+    "token_refiner.refiner_blocks.0.norm2:tokens": 1,
+    "token_refiner.refiner_blocks.0/attention#1": 1,
+    "token_refiner.refiner_blocks.0/attention#1/attention#1": 1,
+    "token_refiner.refiner_blocks.1.attn.norm_k:tokens": 1,
+    "token_refiner.refiner_blocks.1.attn.norm_q:tokens": 1,
+    "token_refiner.refiner_blocks.1.ff.net.0:tokens": 1,
+    "token_refiner.refiner_blocks.1.ff:tokens": 1,
+    "token_refiner.refiner_blocks.1.norm1:tokens": 1,
+    "token_refiner.refiner_blocks.1.norm2:tokens": 1,
+    "token_refiner.refiner_blocks.1/attention#1": 1,
+    "token_refiner.refiner_blocks.1/attention#1/attention#1": 1
+  },
+  "legacy_sites": [
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 2623488,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0.norm1:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3497984,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0.attn.norm_q:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3497984,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0.attn.norm_k:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3511648,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0/attention#1/attention#1",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3511648,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0/attention#1",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 2623488,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0.norm2:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 8744960,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0.ff.net.0:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 7651840,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.0.ff:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 2623488,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1.norm1:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3497984,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1.attn.norm_q:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3497984,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1.attn.norm_k:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3511648,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1/attention#1/attention#1",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 3511648,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1/attention#1",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 2623488,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1.norm2:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 8744960,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1.ff.net.0:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 7651840,
+      "retries": 0,
+      "site": "token_refiner.refiner_blocks.1.ff:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 2623488,
+      "retries": 0,
+      "site": "token_refiner.final_norm:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 10,
+      "need": 0,
+      "retries": 0,
+      "site": "split:_native_leaf_class.<locals>.NativeLinear(1, -1, 7168):torch.bfloat16",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 1409286144,
+      "retries": 0,
+      "site": "norm_out.norm:tokens",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 1,
+      "need": 0,
+      "retries": 0,
+      "site": "split:_Heads(1, 109123, -1, 128):torch.bfloat16",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 4816896,
+      "retries": 0,
+      "site": "post_quant_conv:bands",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 207704448,
+      "retries": 0,
+      "site": "split:_BlockRows(-1, 1797, 2048):torch.float16/attention#1",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 1,
+      "need": 0,
+      "retries": 0,
+      "site": "split:_BlockRows(-1, 1797, 2048):torch.float16",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 0,
+      "need": 207704448,
+      "retries": 0,
+      "site": "split:_BlockRows(-1, 1797, 2048):torch.float32/attention#1",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 1,
+      "need": 0,
+      "retries": 0,
+      "site": "split:_BlockRows(-1, 1797, 2048):torch.float32",
+      "tier": "cold"
+    },
+    {
+      "descent": 0,
+      "level": 1,
+      "need": 0,
+      "retries": 0,
+      "site": "split:TileBatchedVideoVAE._decode_tiles(-1, 24, 7, 16, 16):torch.float32",
+      "tier": "cold"
+    }
+  ],
+  "oom_floor": 0,
+  "selected_attention": {
+    "impl": "kitchen-int4qk:cozy _attn4 (int4 Q\u00b7K\u1d40, Kitchen int8 P\u00b7V),kitchen-int8:comfy_kitchen.int8_attention,kitchen-sol-producer-int4qk-shared-qkv:comfy_kitchen.sol_attn_chunked(int8, stats=kmean=previous-step,vscale=current-call, vmargin=1.1, prefix=int8, qkv=one-operand,v=once)+dense=cozy _attn4(int4 Q\u00b7K\u1d40); sparse=comfy_kitchen.sol_attn(int8)",
+    "kernels": [
+      {
+        "kernel": "kitchen-int4qk",
+        "line": "ready",
+        "served": false,
+        "state": "ready"
+      },
+      {
+        "detail": "the wheel's FlashAttention-3 runs on sm90, not sm89",
+        "kernel": "kitchen-int4qk prebuilt",
+        "line": "failed: the wheel's FlashAttention-3 runs on sm90, not sm89",
+        "served": false,
+        "state": "failed"
+      },
+      {
+        "compile_ms": 912.1,
+        "kernel": "kitchen-int8",
+        "line": "ready (compiled in 0.9 s)",
+        "served": true,
+        "state": "ready"
+      },
+      {
+        "compile_ms": 912.1,
+        "kernel": "kitchen-sol-int4qk",
+        "line": "ready (compiled in 0.9 s)",
+        "served": false,
+        "state": "ready"
+      },
+      {
+        "kernel": "kitchen-sol-producer-int4qk-shared-qkv",
+        "line": "ready",
+        "served": true,
+        "state": "ready"
+      },
+      {
+        "kernel": "sdpa",
+        "line": "ready",
+        "served": true,
+        "state": "ready"
+      }
+    ],
+    "observed": "audio_vae=sdpa,transformer=kitchen-sol-producer-int4qk-shared-qkv,vae=kitchen-int8",
+    "requested": ""
+  },
+  "plan_reports": {
+    "fl2va_piece.models.base_model": {
+      "fused.minimaxh3videotransformerblock.85ec19d8887d": {
+        "applied": true,
+        "block": "MiniMaxH3VideoTransformerBlock",
+        "blocks": 36
+      },
+      "minimax-h3-glue": {
+        "applied": true,
+        "code": "",
+        "fp8_sites": 0,
+        "identity": "sha256:c62b5e46d7834bae184f1ab8592a30e60eefc7ec37451b4f22cf0becfa9fc719",
+        "reason": "",
+        "sites": 300,
+        "substitutions": {
+          "H3AttnProcessor->FusedMiniMaxH3AttnProcessor": 100,
+          "MiniMaxH3TransformerBlock->FusedMiniMaxH3TransformerBlock": 100,
+          "SwiGLU->FusedSwiGLU": 100
+        },
+        "warm_ms": 23.5
+      },
+      "stepcache.minimaxh3transformer3dmodel": {
+        "applied": true,
+        "blocks": 50
+      }
+    },
+    "fl2va_piece.models.turbo_lora": {}
+  }
+}
