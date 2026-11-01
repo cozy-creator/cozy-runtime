@@ -144,6 +144,31 @@ int gemm(int device, int family, bool fp8, uintptr_t q, uintptr_t scales, uintpt
                          out_half, M, N, K, sms, config, {&allocate, &scratch}, on(stream));
 }
 
+
+nb::dict int8_plan(int device, bool out_half, int M, int N, int K, int64_t ldo) {
+    int config = -1;
+    int kind = 0;  // 0: quantize + GEMM; 1: the automatic one-launch GEMV
+    size_t bytes = 0;
+    cudaError_t error = cudaErrorInvalidValue;
+    if (M > 0 && N > 0 && fits(false, K) && ldo >= N && ldo % 8 == 0) {
+        const OnDevice guard(device);
+        error = guard.error();
+        if (error == cudaSuccess) {
+            if (ldo == N && cozy_int8::gemv_supported(M, K, out_half, out_half))
+                kind = 1;
+            else
+                error = cozy_int8::mma_sync::query(out_half, ldo, M, N, K, sm_count(device),
+                                                   config, bytes);
+        }
+    }
+    nb::dict result;
+    result["status"] = int(error);
+    result["kind"] = kind;
+    result["config"] = config;
+    result["workspace_bytes"] = bytes;
+    return result;
+}
+
 int w4a8_gemm(int device, uintptr_t q, uintptr_t scales, uintptr_t w, uintptr_t s,
               uintptr_t codebook, uintptr_t w_scale, uintptr_t bias, uintptr_t out, bool out_half,
               int M, int N, int K, int config, uintptr_t stream) {
@@ -216,6 +241,8 @@ NB_MODULE(_gemm, m) {
     m.def("svdq_gemm", &svdq_gemm, "device"_a, "act"_a, "ascales"_a, "w"_a, "wscales"_a, "gx"_a,
           "gw"_a, "c"_a, "la"_a, "up"_a, "bias"_a, "out"_a, "out_half"_a, "M"_a, "N"_a, "K"_a,
           "R"_a, "stream"_a);
+    m.def("int8_plan", &int8_plan, "device"_a, "out_half"_a, "M"_a, "N"_a, "K"_a,
+          "ldo"_a);
     m.def("gemm", &gemm, "device"_a, "family"_a, "fp8"_a, "q"_a, "scales"_a, "w"_a, "w_scale"_a,
           "bias"_a, "out"_a, "ldo"_a, "out_half"_a, "M"_a, "N"_a, "K"_a, "config"_a,
           "allocate"_a.none(), "stream"_a);
