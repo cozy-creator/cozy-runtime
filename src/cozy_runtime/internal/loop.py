@@ -37,23 +37,24 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Hashable, Iterable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext, suppress
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import tensorfs.varena.torch as vt
 import torch
 from tensorfs import varena
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
-from cozy_runtime import graphs
+from cozy_runtime import graphs, stepcache
 from cozy_runtime.author import _loop
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import accel, kernel_ready
+from cozy_runtime.internal import kernel_ready
 from cozy_runtime.internal.accel import ResidencyError
 from cozy_runtime.internal.prepared import (
     PreparedRepeat,
@@ -222,6 +223,7 @@ class Loops:
         on_step: Callable[[int], object] | None,
         before: Callable[..., object] | None,
         after: Callable[..., object] | None,
+        cache: stepcache.Policy | None = None,
     ) -> None:
         row: dict[str, Any] = {
             "steps": len(steps),
@@ -236,29 +238,52 @@ class Loops:
             ROWS.setdefault(request.id, []).append(row)
         # The loop records its own programs: component region graphs neither replay nor learn
         # its calls (a replayed step enters no blocks, and its graph holds their weights).
+        if cache is not None and _ranks() > 1:  # each rank's verdict would differ
+            row["refusals"].append("step cache: off across ranks (its sums are not all-reduced)")
+            cache = None
         bypass = graphs.BYPASS.set(True)
         try:
-            self._run(step, steps, state, carried, inputs, phases, key, on_step, before, after, row)
+            loop = _Loop(step, steps, phases, on_step, before, after)
+            if cache is None:
+                self._run(loop, state, carried, inputs, key, row)
+            else:
+                self._cached(loop, state + carried, inputs, cache, row)
         finally:
             graphs.BYPASS.reset(bypass)
             row["at_ms"]["returned"] = _now()
 
+    def _cached(
+        self,
+        loop: _Loop,
+        mutable: tuple[Any, ...],
+        inputs: tuple[Any, ...],
+        cache: stepcache.Policy,
+        row: dict[str, Any],
+    ) -> None:
+        """A call under a step cache, eagerly: each forward's verdict is read on the host."""
+        row["refusals"].append("step cache: eager")
+        with (
+            torch.inference_mode(False),
+            torch.no_grad(),
+            _owned(mutable) as work,
+            stepcache.running(cache, len(loop.steps)) as run,
+        ):
+            try:
+                loop.eager_all(work + inputs, CURRENT.get())
+            finally:
+                row["cache"] = run.document()
+
     def _run(
         self,
-        step: Callable[..., object],
-        steps: range,
+        loop: _Loop,
         state: tuple[Any, ...],
         carried: tuple[Any, ...],
         inputs: tuple[Any, ...],
-        phases: tuple[Hashable, ...] | None,
         key: Hashable | None,
-        on_step: Callable[[int], object] | None,
-        before: Callable[..., object] | None,
-        after: Callable[..., object] | None,
         row: dict[str, Any],
     ) -> None:
         ctx = CURRENT.get()
-        loop = _Loop(step, steps, phases, on_step, before, after)
+        step, steps, phases = loop.step, loop.steps, loop.phases
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
@@ -522,6 +547,8 @@ class _Loop:
             if ctx is not None:
                 ctx.raise_if_cancelled()
             index.fill_(i)
+            if (cached := stepcache._RUN.get()) is not None:
+                cached.begin(i - self.steps.start)
             _call(self.step, index, tensors, self.phase(i))
             if self.on_step is not None:
                 self.on_step(i)
@@ -532,6 +559,11 @@ class _Loop:
         _once(self.before, tensors)
         self.eager(self.steps, tensors, ctx)
         _once(self.after, tensors)
+
+
+def _ranks() -> int:
+    dist = torch.distributed
+    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
 
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
@@ -608,7 +640,7 @@ def _record_first(
                     loading.callback(hold.release)  # the recording's bindings retain them
             _lap("load")
             recording._prepare((*mutable, counter))
-            torch.cuda.empty_cache()
+            vt.trim(torch.cuda.current_device())
             _lap("prepare")
             with recording.capturing():
                 parts, blocks = _record_resident(
@@ -623,9 +655,9 @@ def _record_first(
     if failure is not None:
         unwind(failure)
         _drop_stages(recording)
-        gc.collect()
-        torch.cuda.empty_cache()
         recording.close()
+        gc.collect()
+        vt.trim(torch.cuda.current_device())
         if (why := _refusal(failure)) is None:
             raise failure
         return None, why
@@ -661,7 +693,7 @@ def _record(
         why = None
         try:
             recording._prepare((*mutable, counter))
-            torch.cuda.empty_cache()
+            vt.trim(torch.cuda.current_device())
             _lap("prepare")
             began = time.perf_counter()
             ctx.raise_if_cancelled()
@@ -681,8 +713,9 @@ def _record(
             # pool returns before the eager rest.
             row["refusals"].append(f"resident: {why}")
             _drop_stages(recording)
+            recording.close()
             gc.collect()
-            torch.cuda.empty_cache()
+            vt.trim(torch.cuda.current_device())
             _back(work, tensors)  # the eager rest runs on the caller's tensors
             loop.eager(rest, work + tensors[len(work) :], ctx)
             _once(loop.after, work + tensors[len(work) :])
@@ -735,7 +768,7 @@ def _record_whole(
     failure: BaseException | None = None
     try:
         recording._prepare((*mutable, counter))
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         _lap("prepare")
         _yield_point()
         with recording.capturing():
@@ -765,9 +798,9 @@ def _record_whole(
     if failure is not None:
         unwind(failure)
         _drop_stages(recording)
-        gc.collect()
-        torch.cuda.empty_cache()
         recording.close()
+        gc.collect()
+        vt.trim(torch.cuda.current_device())
         raise failure
     stages = parts[0][1] - parts[0][0]
     return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
@@ -1117,6 +1150,7 @@ def _record_resident(
     held = tuple(paths)
     state = (*mutable, counter)
     bindings: list[Binding] = []
+    provisional: list[_Graph] = []
     try:
         with ExitStack() as preparing:
             idle: set[int] = set()
@@ -1145,6 +1179,7 @@ def _record_resident(
                         counter.add_(1)
 
                     graph = _Graph(recording, state, count, owners)
+                    provisional.append(graph)
                     graph.record(advance)
                     graphs_.append((graph, first, count))
                     _lap("record_step")
@@ -1152,11 +1187,13 @@ def _record_resident(
                 prefix = suffix = None
                 if loop.after is not None and post is not None:
                     suffix = _Graph(recording, state, 1, owners)
+                    provisional.append(suffix)
                     suffix.record(lambda: loop.after(*tensors))  # type: ignore[misc]
                     _lap("record_after")
                     _yield_point()
                 if again and loop.before is not None and pre is not None:
                     prefix = _Graph(recording, state, 1, owners)
+                    provisional.append(prefix)
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
                     _lap("record_before")
             _lap("record")
@@ -1177,6 +1214,9 @@ def _record_resident(
                     done.done()
             _lap("plan")
     except BaseException:
+        # A later part can fail before any native stage owns the earlier captures.
+        for graph in reversed(provisional):
+            graph.reset()
         for binding in bindings:
             binding.close()
         raise
@@ -1391,20 +1431,20 @@ class _Graph:
         try:
             self._contexts.enter_context(pause() if pause is not None else nullcontext())
             self._contexts.enter_context(kernel_ready.recording())
-            self._contexts.enter_context(varena.capture(self.device.index))
-            self._contexts.enter_context(accel.capture_allocation(torch))
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
-            torch.cuda.set_stream(control)
-            try:
-                self.graph.capture_begin(
-                    pool=self.recording._pool.handle, capture_error_mode="global"
-                )
-            finally:
-                torch.cuda.set_stream(stream)
-        except BaseException:
+            if self.recording._working_bytes is None:
+                # Later capture peaks include the eager snapshots still held outside this
+                # pool. They must not feed back into the next stage's reservation.
+                self.recording._working_bytes = domain.working_peak(self.device.index or 0)
+            self._contexts.enter_context(vt.graph(
+                self.graph, pool=self.recording._pool.handle, stream=control,
+                reserve_bytes=self.recording._working_bytes,
+            ))
+            torch.cuda.set_stream(stream)
+        except BaseException as error:
             torch.cuda.set_stream(self._caller)
-            self._contexts.close()
+            self._contexts.__exit__(type(error), error, error.__traceback__)
             self.graph = None
             raise
         self.domain.fork.record(control)
@@ -1412,37 +1452,50 @@ class _Graph:
         self._mode = _Owners(self)
         self._mode.__enter__()
 
-    def end(self) -> None:
+    def end(self, error: BaseException | None = None) -> None:
         stream, control = self.domain.stream, self.domain.control
         if self.graph is None:
             return
         try:
             if self._mode is not None:
                 mode, self._mode = self._mode, None
-                mode.__exit__(None, None, None)
+                mode.__exit__(
+                    None if error is None else type(error), error,
+                    None if error is None else error.__traceback__,
+                )
         finally:
             try:
-                try:
-                    self.domain.join.record(stream)
-                    control.wait_event(self.domain.join)
-                finally:
-                    # An invalidated capture refuses the join; only its end takes both streams
-                    # out of capture, so the caller's next CUDA call is not inside it (cr-227).
-                    torch.cuda.set_stream(control)
-                    try:
-                        self.graph.capture_end()
-                    finally:
-                        torch.cuda.set_stream(self._caller)
+                self.domain.join.record(stream)
+                control.wait_event(self.domain.join)
             finally:
-                self._contexts.close()
+                try:
+                    # The owner ends actual CUDA capture even when the join was invalidated,
+                    # then completes routing and the Varena capture exclusion exactly once.
+                    self._contexts.__exit__(
+                        None if error is None else type(error), error,
+                        None if error is None else error.__traceback__,
+                    )
+                finally:
+                    torch.cuda.set_stream(self._caller)
         control.synchronize()
-        self.domain.graphs.add(self.graph)
+        if error is None:
+            self.domain.graphs.add(self.graph)
 
-    def abort(self) -> None:
-        """After a failure inside the recorded region: end the capture, keep nothing."""
-        with suppress(BaseException):
-            self.end()
-        self.reset()
+    def abort(self, error: BaseException | None = None) -> None:
+        """End a failed capture with its error so the owner cannot publish a partial graph."""
+        try:
+            self.end(error)
+        except BaseException as failure:
+            if failure is error:
+                self.reset()
+                return
+            try:
+                self.reset()
+            except BaseException as reset_error:
+                failure.add_note(f"Graph reset also failed: {reset_error!r}")
+            raise
+        else:
+            self.reset()
 
     def nodes(self) -> int:
         """The recorded graph's node count: what it launches, whatever launched it."""
@@ -1463,8 +1516,8 @@ class _Graph:
         self.begin()
         try:
             body()
-        except BaseException:
-            self.abort()
+        except BaseException as error:
+            self.abort(error)
             raise
         self.end()
 
@@ -1642,9 +1695,9 @@ class _Cutter:
             self._open(None)
             try:
                 body()
-            except BaseException:
+            except BaseException as error:
                 self.failed = True
-                self._abort()
+                self._abort(error)
                 raise
             self._close()
         if self.blocks == 0:
@@ -1668,9 +1721,9 @@ class _Cutter:
     def exit(self, block: Any) -> None:
         if self.failed or block.model is not self.model:
             return
-        if sys.exc_info()[1] is not None:  # the forward failed: unwind, record nothing more
+        if (error := sys.exc_info()[1]) is not None:  # unwind the failed forward
             self.failed = True
-            self._abort()
+            self._abort(error)
             return
         if block is not self.block:
             raise CapabilityError(
@@ -1715,8 +1768,8 @@ class _Cutter:
             )
             self._declared = _CAPTURE_BLOCKS.set(frozenset(id(b) for b in groups))
             self.graph.begin()
-        except BaseException:
-            self._abort()
+        except BaseException as error:
+            self._abort(error)
             raise
 
     def _close(self) -> None:
@@ -1772,17 +1825,19 @@ class _Cutter:
         _own(plan, (binding,), self.recording, cleanup)
         self.blocks += block is not None
 
-    def _abort(self) -> None:
+    def _abort(self, error: BaseException | None = None) -> None:
         graph, self.graph = self.graph, None
-        if graph is not None:
-            graph.abort()
-        if self._declared is not None:
-            _CAPTURE_BLOCKS.reset(self._declared)
-            self._declared = None
-        self._preparing.close()
-        if self.binding is not None:
-            self.binding.close()
-        self.block = self.binding = self.load = None
+        binding, self.binding = self.binding, None
+        self.block = self.load = None
+        with ExitStack() as cleanup:
+            if binding is not None:
+                cleanup.callback(binding.close)
+            cleanup.callback(self._preparing.close)
+            if self._declared is not None:
+                declared, self._declared = self._declared, None
+                cleanup.callback(_CAPTURE_BLOCKS.reset, declared)
+            if graph is not None:
+                graph.abort(error)
 
 
 def _binding(model: Model, blocks: list[Any]) -> Binding:
