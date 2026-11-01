@@ -1,0 +1,15 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ci-runtime-explicit-streams"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = ["cozy-runtime>=0.36.23,<0.37", "torch==2.14.0", "msgspec>=0.19"]
+
+[project.entry-points."cozy.application"]
+default = "explicit_stream_probe:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["explicit_stream_probe"]

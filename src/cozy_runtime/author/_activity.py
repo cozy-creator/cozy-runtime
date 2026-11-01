@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor as PythonThreadPoolExecutor
+from contextlib import AbstractContextManager
 from contextvars import ContextVar
 
 _WAITED = threading.local()
@@ -21,6 +22,9 @@ _ASIDE: ContextVar[Callable[[str, float], None] | None] = ContextVar(
 )
 #: Waits for the device work this process queued; none without a device.
 _SETTLE: Callable[[], None] | None = None
+#: Bound only after Runtime initializes its device. Called on the submitting thread to
+#: capture its actual CUDA stream, including a deliberately selected graph/external stream.
+WORKER_CONTEXT: Callable[[], AbstractContextManager[object]] = contextlib.nullcontext
 
 
 @contextlib.contextmanager
@@ -81,4 +85,10 @@ class ThreadPoolExecutor(PythonThreadPoolExecutor):
     its call), so pools can survive and serve many invocations."""
 
     def submit[**P, T](self, fn: Callable[P, T], /, *args: P.args, **kwargs: P.kwargs) -> Future[T]:
-        return super().submit(contextvars.copy_context().run, fn, *args, **kwargs)
+        context, device = contextvars.copy_context(), WORKER_CONTEXT()
+
+        def run() -> T:
+            with device:
+                return fn(*args, **kwargs)
+
+        return super().submit(context.run, run)
