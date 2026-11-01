@@ -16,6 +16,15 @@ chunk. Native code applies its actual size classes and slab/backing rules, choos
 one entry, and revalidates that exact choice at begin. No Python Room, byte budget,
 fit or capacity fallback participates in the migrated path.
 
+Select and begin receive the same saved CUstream handle used for every chunk.
+Native admission matches unique exact-class reusable blocks, including safe
+in-order pending reuse on that stream. It does not credit global pending bytes,
+other-stream work, live/unjoined storage or graph pools, and begin preserves the
+compatible cache it matched. Learned choices retain a per-class measured envelope;
+scalar peak bytes alone cannot determine which cached geometry can satisfy them.
+For example, a pending default-stream 8 MiB block plus 32 MiB of free capacity can
+serve the declared 32 MiB output and 8 MiB scratch without a false refusal.
+
 For BF16 `[4,64,256,256]` in channels-last storage, the output is 32 MiB and batch
 choices 4/2/1 have 32/16/8 MiB copies: declared simultaneous backing is 64/48/40 MiB
 before any existing allocator reuse. This is a real shrinking-copy menu, not an

@@ -104,7 +104,10 @@ def channel_norm(
     # retain their exact records even when the enclosing phase key itself is unknown.
     request.memory.remember_working_phase(key, models or (request,))
     stream = torch.cuda.current_stream(device)
-    choice = vt.split_select(device, key, choices, preferred=f"batch:{batch}")
+    stream_id = int(stream.cuda_stream)
+    choice = vt.split_select(
+        device, key, choices, preferred=f"batch:{batch}", stream=stream_id,
+    )
     choice_id = str(choice["choice_id"])
     chunk = geometry[choice_id]
     record: dict[str, Any] = request.working_splits.setdefault(
@@ -115,8 +118,8 @@ def channel_norm(
     from cozy_runtime.fusion import _kernels
 
     observation_id = vt.split_begin(
-        device, key, choice_id,
-        completion_owner=phase.completion_owner(device, int(stream.cuda_stream)),
+        device, key, choice_id, stream=stream_id,
+        completion_owner=phase.completion_owner(device, stream_id),
     )
     try:
         with torch.cuda.device(device), torch.cuda.stream(stream):
