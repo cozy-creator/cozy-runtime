@@ -35,7 +35,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import CapabilityError, Fault, fault
-from cozy_runtime.internal import proctree
+from cozy_runtime.internal import cooperation, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -707,6 +707,7 @@ class Model:
                 self.memory._discard(block, forget=True)
             self.memory._forget_baked(self)
             self.memory.models.pop(self.module, None)
+        self.memory.cooperation_boundary(check=False)
 
 
 class Hold:
@@ -1338,6 +1339,7 @@ class Memory:
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
         self.native: Any = None
+        self.cooperation: cooperation.Owner | None = None
         self.granularity = 512
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
@@ -1421,6 +1423,34 @@ class Memory:
             _MEMORIES[str(device)] = memory
             return memory
 
+    def attach_cooperation(
+        self, config: cooperation.Config, failed: Callable[[BaseException], None]
+    ) -> None:
+        """Exclusive device Start only, after Memory.open released its initialization lock."""
+        if self.cooperation is not None:
+            if self.cooperation.config != config:
+                raise cooperation.Failure(
+                    "an active Memory cannot change cooperation configuration"
+                )
+            return
+        if (
+            not self.cuda or self.requests or self.models
+            or self.room_limit is not None or self._room_pending is not None
+        ):
+            raise cooperation.Failure("cooperation must bind at a fresh CUDA Memory start")
+        self.cooperation = cooperation.Owner(self.device.index or 0, config, failed)
+
+    def cooperation_boundary(self, *, used: bool = False, check: bool = True) -> None:
+        owner = self.cooperation
+        if owner is not None:
+            if check:
+                owner.check()
+            owner.wake(used=used, check=check)
+
+    def close_cooperation(self) -> None:
+        if self.cooperation is not None:
+            self.cooperation.close()
+
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
 
@@ -1460,6 +1490,8 @@ class Memory:
         thread (or an idle executor's turn): no Memory lock."""
         if not self.cuda:
             return
+        if self.cooperation is not None:
+            raise cooperation.Failure("legacy room cannot control a cooperative Memory")
         if not yields():
             if not self._room_unsupported:
                 self._room_unsupported = True
@@ -2539,6 +2571,7 @@ class Memory:
         Resetting preference metadata marks prior idle backing as standby. Native reclaim
         orders that cache LRU and this phase's touched pages MRU, without a Python budget.
         """
+        self.cooperation_boundary(used=True)
         request = _REQUEST.get()
         if not self.phase_supported or self.capturing() or (request is not None and request.idle):
             return
@@ -3299,6 +3332,7 @@ class Memory:
     ) -> Iterator[Request]:
         """`others`: the process's other constructions' sets, whose cached weights are not this
         request's working set (`Request.sample`)."""
+        self.cooperation_boundary(used=not idle)
         request = Request(self, id, idle, others)
         request.plan(plan)
         with self.lock:
@@ -3340,6 +3374,7 @@ class Memory:
                     # (sieg: SDXL's decode cache left its next denoise nothing to give)
                     self._release_cache()
                 _REQUEST.reset(token)
+                self.cooperation_boundary(check=False)
 
     def stats(self) -> dict[str, Any] | None:
         return self.last
@@ -3548,6 +3583,9 @@ class Request:
             "phases": list(self.phase_changes),
             "working_phases": list(self.working_phases),
             "working_splits": list(self.working_splits.values()),
+            "cooperation": (
+                self.memory.cooperation.facts() if self.memory.cooperation is not None else None
+            ),
             "phase_policy_supported": self.memory.phase_supported,
             "room_first_pass": self.room_first,
             "gathered": self.gathered,
