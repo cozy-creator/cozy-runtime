@@ -42,6 +42,7 @@ from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from functools import partial
 from typing import Any
 
 import tensorfs.varena.torch as vt
@@ -1080,6 +1081,25 @@ def _phase_configuration(
     ))
 
 
+def _graph_configuration(
+    loop: _Loop,
+    indices: range,
+    tensors: tuple[Any, ...],
+    models: tuple[Model, ...],
+    role: str,
+    site: tuple[str, int] | None = None,
+) -> str | None:
+    configuration = _phase_configuration(loop, indices, tensors, models)
+    callback = {"before": loop.before, "after": loop.after}.get(role, loop.step)
+    code = getattr(callback, "__code__", None)
+    if configuration is None or code is None:
+        return None
+    return working_phase.configuration((
+        "graph-stage/1", configuration, role, site,
+        callback.__module__, callback.__qualname__, hashlib.sha256(marshal.dumps(code)).hexdigest(),
+    ))
+
+
 def _eligible(
     ctx: Context | None, steps: range, tensors: tuple[Any, ...]
 ) -> tuple[tuple[Model, ...], str]:
@@ -1140,22 +1160,7 @@ def _submit(
     row: dict[str, Any],
 ) -> None:
     """One native submission covering `indices`; no fallback once it is accepted."""
-    request = _REQUEST.get()
-    with working_phase.observing(
-        program.tensors[0].device.index if request is not None else None, "replay",
-        request.working_phases if request is not None else None,
-    ):
-        _submit_native(program, sequence, indices, loop, ctx, row)
-
-
-def _submit_native(
-    program: _Program,
-    sequence: PreparedSequence,
-    indices: range,
-    loop: _Loop,
-    ctx: Context,
-    row: dict[str, Any],
-) -> None:
+    # Native stage wrappers own replay observations; an outer device phase would overlap them.
     with torch.no_grad():
         program.counter.fill_(indices.start)
     row["at_ms"].setdefault("submitted", _now())
@@ -1269,7 +1274,13 @@ def _record_resident(
                         _call(loop.step, counter, tensors, phase)
                         counter.add_(1)
 
-                    graph = _Graph(recording, state, count, owners)
+                    graph = _Graph(
+                        recording, state, count, owners,
+                        configuration=partial(
+                            _graph_configuration, loop, range(first, first + count),
+                            tensors, held, "step",
+                        ),
+                    )
                     provisional.append(graph)
                     graph.record(advance)
                     graphs_.append((graph, first, count))
@@ -1277,13 +1288,23 @@ def _record_resident(
                     _yield_point()
                 prefix = suffix = None
                 if loop.after is not None and post is not None:
-                    suffix = _Graph(recording, state, 1, owners)
+                    suffix = _Graph(
+                        recording, state, 1, owners,
+                        configuration=partial(
+                            _graph_configuration, loop, loop.steps, tensors, held, "after",
+                        ),
+                    )
                     provisional.append(suffix)
                     suffix.record(lambda: loop.after(*tensors))  # type: ignore[misc]
                     _lap("record_after")
                     _yield_point()
                 if again and loop.before is not None and pre is not None:
-                    prefix = _Graph(recording, state, 1, owners)
+                    prefix = _Graph(
+                        recording, state, 1, owners,
+                        configuration=partial(
+                            _graph_configuration, loop, loop.steps, tensors, held, "before",
+                        ),
+                    )
                     provisional.append(prefix)
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
                     _lap("record_before")
@@ -1345,7 +1366,12 @@ def _record_streamed(
             counter.add_(1)
 
         begin = len(recording.stages)
-        cutter = _Cutter(recording, model, (*mutable, counter))
+        cutter = _Cutter(
+            recording, model, (*mutable, counter),
+            configuration=partial(
+                _graph_configuration, loop, range(first, first + count), tensors, models, "block",
+            ),
+        )
         cutter.record(body)
         parts.append((begin, len(recording.stages), count, first, count))
         blocks = max(blocks, cutter.blocks)
@@ -1474,6 +1500,7 @@ class _Graph:
         scratch: list[tuple[Any, int, int]] | None = None,
         unbound: frozenset[int] = frozenset(),
         undeclared: tuple[tuple[Any, int, int], ...] = (),
+        configuration: Callable[[], str | None] | None = None,
     ) -> None:
         self.recording, self.state, self.steps, self.bindings = recording, state, steps, bindings
         self.device = state[0].device
@@ -1497,6 +1524,11 @@ class _Graph:
         self._contexts = ExitStack()
         self._mode: Any = None
         self._caller: Any = None
+        self._configuration = configuration
+        self._configuration_before: str | None = None
+        self._observation: working_phase.Observation | None = None
+        self._footprint: Any = None
+        self._replay_key: str | None = None
 
     def _overlaps(self, tensor: Any, areas: Any) -> bool:
         if not isinstance(tensor, torch.Tensor):
@@ -1517,11 +1549,13 @@ class _Graph:
         self.index = torch.zeros(1, dtype=torch.int64, device=self.device)
         self.held[id(self.index)] = self.index
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
+        self._configuration_before = None if self._configuration is None else self._configuration()
+        self._footprint = vt.capture_footprint(self.device.index, self.recording._pool.handle)
         context = CURRENT.get()
         pause = context._pause_stall_watch if context is not None else None
         try:
             request = _REQUEST.get()
-            self._contexts.enter_context(working_phase.observing(
+            self._observation = self._contexts.enter_context(working_phase.observing(
                 self.device.index if request is not None else None, "capture",
                 request.working_phases if request is not None else None,
             ))
@@ -1536,6 +1570,7 @@ class _Graph:
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
                 reserve_bytes=self.recording._working_bytes,
+                footprint=self._footprint,
             ))
             torch.cuda.set_stream(stream)
         except BaseException as error:
@@ -1576,6 +1611,14 @@ class _Graph:
         control.synchronize()
         if error is None:
             self.domain.graphs.add(self.graph)
+            actual = None if self._configuration is None else self._configuration()
+            observation = self._observation
+            if (
+                observation is not None and observation.result is not None
+                and not observation.result.get("invalidated", True)
+                and actual is not None and actual == self._configuration_before
+            ):
+                self._replay_key = observation.key_for(actual, "runtime.graph/1")
 
     def abort(self, error: BaseException | None = None) -> None:
         """End a failed capture with its error so the owner cannot publish a partial graph."""
@@ -1607,6 +1650,9 @@ class _Graph:
             self.graph.reset()
             self.graph = None
         self.held.clear()
+        self._footprint = None
+        self._replay_key = None
+        self._configuration = None
 
     def record(self, body: Callable[[], object]) -> None:
         self.begin()
@@ -1686,11 +1732,20 @@ class _Graph:
             native, self.state, self.device.index, steps, dependencies, identities, landed
         )
         plan._capture_cache = {"recorded_ops": self.ops}
+        parts = tuple(graph for graph in (prefix, self, suffix) if graph is not None)
+        plan._footprints = tuple(graph._footprint for graph in parts)
+        if all(graph._replay_key is not None for graph in parts):
+            key = working_phase.configuration((
+                "prepared-repeat/1", steps, tuple(graph._replay_key for graph in parts),
+            ))
+            assert key is not None
+            plan._execution_key = "runtime.replay/1:" + hashlib.sha256(key.encode()).hexdigest()
         return plan
 
     def done(self) -> None:
         """Every native owner is made: drop this graph's Python references to what it read."""
         self.held.clear()
+        self._configuration = None
 
 
 class _Owners(TorchDispatchMode):  # type: ignore[misc]
@@ -1760,7 +1815,10 @@ class _Cutter:
     across a cut, a derived layout) refuses the whole pass.
     """
 
-    def __init__(self, recording: _SequenceCapture, model: Model, state: tuple[Any, ...]) -> None:
+    def __init__(
+        self, recording: _SequenceCapture, model: Model, state: tuple[Any, ...],
+        *, configuration: Callable[[tuple[str, int]], str | None] | None = None,
+    ) -> None:
         self.recording, self.model, self.state = recording, model, state
         self.common = [model.common] if model.common is not None else []
         self.graph: _Graph | None = None
@@ -1774,6 +1832,8 @@ class _Cutter:
         self.immutable: frozenset[int] = frozenset()
         self._preparing = ExitStack()
         self._declared: Any = None
+        self._configuration = configuration
+        self._stage_number = 0
 
     def record(self, body: Callable[[], object]) -> None:
         _checked(self.model)
@@ -1861,7 +1921,11 @@ class _Cutter:
                 unbound=self.immutable
                 - (frozenset() if binding is None else binding.immutable_buffer_ids(selected=True)),
                 undeclared=() if binding is None else binding.undeclared_input_ranges(),
+                configuration=None if self._configuration is None else partial(
+                    self._configuration, ("" if block is None else block.path, self._stage_number),
+                ),
             )
+            self._stage_number += 1
             self._declared = _CAPTURE_BLOCKS.set(frozenset(id(b) for b in groups))
             self.graph.begin()
         except BaseException as error:

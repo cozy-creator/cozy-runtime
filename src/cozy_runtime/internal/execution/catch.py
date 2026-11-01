@@ -230,7 +230,10 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     try:
         if _capturing():
             available = request.room()
-            return whole(sizing.choose(finest, need, available)[0])
+            level = sizing.choose(finest, need, available)[0]
+            result = whole(level)
+            working_phase.choice((site, level, active_attention_layout()))
+            return result
         try:
             result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
         except Exception as exc:

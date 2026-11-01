@@ -75,19 +75,23 @@ class Observation:
             return
         self._cuts.update(encoded + b"\n")
 
-    def complete(self, configuration: object | None) -> None:
-        self.completed = True
+    def key_for(self, configuration: object | None, namespace: str) -> str | None:
+        """A sealed dispatch fingerprint; making a key alone never publishes a sample."""
         if configuration is None:
-            self.invalidate("unrepresented_configuration")
-            return
+            return None
         try:
             encoded = _encoded(_semantic(configuration))
         except (TypeError, ValueError):
-            self.invalidate("unrepresented_configuration")
-            return
-        self.key = "runtime.eager/1:" + hashlib.sha256(
+            return None
+        return namespace + ":" + hashlib.sha256(
             encoded + b"\n" + self._cuts.digest()
         ).hexdigest()
+
+    def complete(self, configuration: object | None) -> None:
+        self.completed = True
+        self.key = self.key_for(configuration, "runtime.eager/1")
+        if self.key is None:
+            self.invalidate("unrepresented_configuration")
 
 
 _ACTIVE: ContextVar[Observation | None] = ContextVar("cozy_working_phase", default=None)
