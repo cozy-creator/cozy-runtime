@@ -26,6 +26,7 @@ class Loops(Protocol):
         on_step: Callable[[int], object] | None,
         before: Callable[..., object] | None,
         after: Callable[..., object] | None,
+        cache: Any = None,
     ) -> None: ...
 
 
@@ -49,6 +50,7 @@ def denoise_loop(
     on_step: Callable[[int], object] | None = None,
     before: Callable[..., object] | None = None,
     after: Callable[..., object] | None = None,
+    cache: Any = None,
 ) -> None:
     """Run `step` once per index in `steps`; `state` and `carried` advance in place.
 
@@ -74,6 +76,8 @@ def denoise_loop(
       called like the step without its index (`before(*state, *carried, *inputs)`): a text
       encoder writing carried conditioning, a decoder writing an image held in `state`. The
       Runtime records them into the program when their components stay on the device too.
+    - `cache`: a `stepcache` policy for the transformers whose stacks the package installed
+      (`stepcache.install`): approximate, for a preset that asks for it, never a default.
 
     A step that runs components is called inside a `@uses_components` method, whose components
     they are. A step of tensor work alone may run outside one; it records resident too.
@@ -92,4 +96,4 @@ def denoise_loop(
     runtime = _RUNTIME
     if runtime is None:
         raise RuntimeError("denoise_loop runs inside a Runtime executor")
-    runtime.run(step, steps, state, carried, inputs, phases, key, on_step, before, after)
+    runtime.run(step, steps, state, carried, inputs, phases, key, on_step, before, after, cache)

@@ -53,6 +53,7 @@ import importlib.util
 import json
 import math
 import os
+import signal
 import socket
 import sys
 import threading
@@ -70,7 +71,7 @@ import tensorfs.varena
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime import graphs, weights_store
+from cozy_runtime import graphs, stepcache, weights_store
 from cozy_runtime.author import ModelRegistry, _split, describe
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
@@ -1972,7 +1973,7 @@ class Executor:
             for name, report in list(reports.items())
             if report.get("applied")
         }
-        return " ".join(sorted(applied)) or "eager"
+        return " ".join([*sorted(applied), stepcache.verdict()]).strip() or "eager"
 
     def _model_classes(self) -> list[type[Model[Any]]]:
         """The classes the package's constructed Model slots declare, wherever they are
@@ -3283,8 +3284,11 @@ class Executor:
                     target=self._idle_room, args=(memory, limit, ticket), name="room", daemon=True
                 ).start()
                 return
+            before = memory.held()
             memory.make_room(limit)
-        except Exception:  # the seam outlives a refused room; the next reading asks again
+            self._room_kept(memory, limit, before)
+        except Exception as exc:  # the seam outlives a refused room; the next reading asks again
+            self._room_kept(memory, None, 0, exc)
             traceback.print_exc()
             sys.stderr.flush()
 
@@ -3295,14 +3299,33 @@ class Executor:
         assert self.order is not None
         try:
             with self.order.turn(ticket):
+                before = memory.held()
                 memory.make_room(limit)
                 if not memory.requests and limit < memory.held():
                     accel.synchronize(self.torch, self.device_kind)
                     self._release_programs()
                     memory.make_room(limit)
-        except Exception:
+                self._room_kept(memory, limit, before)
+        except Exception as exc:
+            self._room_kept(memory, limit, 0, exc)
             traceback.print_exc()
             sys.stderr.flush()
+
+    def _room_kept(
+        self, memory: Memory, limit: int | None, before: int, error: Exception | None = None
+    ) -> None:
+        """What this process holds after a room, and why, in `room.json` in its root, where the
+        machine reads it when a give moved less than asked; a room that raised says so, gave 0."""
+        reading: dict[str, Any] = {"at": time.time(), "gave": 0, "error": repr(error)}
+        if error is None:
+            reading = memory.room_reading(limit, before)
+        reading["order"] = self.order.holders() if self.order is not None else []
+        path = self.root / "room.json"
+        try:
+            path.with_suffix(".tmp").write_text(json.dumps(reading))
+            path.with_suffix(".tmp").replace(path)
+        except (OSError, TypeError, ValueError):
+            pass  # the report is evidence only
 
     def _release_programs(self, constructions: Iterable[Executor] | None = None) -> None:
         """Every slot's decoders, graphs and holds go: what pins weight pages besides a call."""
@@ -5187,6 +5210,8 @@ def _remember_distributions() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     faulthandler.enable(all_threads=True)
+    if hasattr(signal, "SIGUSR1"):  # every thread's Python stack to stderr, the process lives on
+        faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
     parser = argparse.ArgumentParser(description="cozy-runtime device executor")
     parser.add_argument("--socket", default="")
     parser.add_argument("--root", required=True)
@@ -5361,6 +5386,11 @@ class _Order:
                     self._waited[came] = (now - at) * 1e3
                 self._arrived.clear()
                 self._changed.notify_all()
+
+    def holders(self) -> list[str]:
+        """What holds or waits for the order now (`room.json`)."""
+        with self._changed:
+            return [what for _, what in self._open.values()]
 
     def waiting(self) -> bool:
         """A command arrived beside the idle holder."""

@@ -25,6 +25,8 @@ class Row:
     int8: bool = False
     fp8: bool = False
     fp4: bool = False
+    #: s4 integer MMA (mma.sync m16n8k64): Ampere and Ada; Hopper and Blackwell have none
+    int4: bool = False
     inherited: bool = False
 
     def formats(self) -> frozenset[str]:
@@ -36,6 +38,7 @@ class Row:
                 ("int8", self.int8),
                 ("fp8", self.fp8),
                 ("fp4", self.fp4),
+                ("int4", self.int4),
                 ("mxfp8", self.fp8 and self.fp4),
             )
             if on
@@ -43,13 +46,13 @@ class Row:
 
 
 NONE = Row("none", "")
-_AMPERE = Row("Ampere", MMA_SYNC, int8=True)
+_AMPERE = Row("Ampere", MMA_SYNC, int8=True, int4=True)
 _RTX = Row("Blackwell RTX", MMA_SYNC, int8=True, fp8=True, fp4=True)  # block-scaled mma.sync
 ROWS: dict[int, Row] = {
     80: _AMPERE,
     86: _AMPERE,
     87: _AMPERE,
-    89: Row("Ada", MMA_SYNC, int8=True, fp8=True),
+    89: Row("Ada", MMA_SYNC, int8=True, fp8=True, int4=True),
     90: Row("Hopper", WGMMA, int8=True, fp8=True),
     100: Row("Blackwell", TCGEN05, int8=True, fp8=True, fp4=True),
     103: Row("Blackwell Ultra", TCGEN05, fp8=True, fp4=True),
@@ -104,6 +107,7 @@ def common(rows: Iterable[Row]) -> Row:
         int8=all(r.int8 for r in found),
         fp8=all(r.fp8 for r in found),
         fp4=all(r.fp4 for r in found),
+        int4=all(r.int4 for r in found),
         inherited=any(r.inherited for r in found),
     )
 

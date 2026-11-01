@@ -149,9 +149,9 @@ def _models(declared: Declaration) -> None:
     check_model_arguments(declared.model_components, slots, what="components")
     check_model_arguments(declared.model_prepared_use, constructed, what="prepared_use")
     if declared.model_prepared_use:
-        if not declared.internal or not declared.accelerator:
+        if not declared.child_task or not declared.accelerator:
             raise ConformanceError(
-                "prepared_use belongs to an internal GPU program, not public request knobs",
+                "prepared_use belongs to a child task's GPU program, not public request knobs",
                 code="model_prepared_use",
             )
         nodes = {node.path: node for node in walk(declared.payload_type)}
