@@ -21,7 +21,7 @@ from cozy_runtime.internal import int8_linear, prebuilt
 from cozy_runtime.internal.encoding.leaves import _native_leaf_class
 from cozy_runtime.internal.execution import catch, phase
 from cozy_runtime.internal.execution.native_linear_split import _chunks, _Dispatch, _Geometry, _Plan
-from cozy_runtime.internal.residency import _REQUEST, Model, _Block
+from cozy_runtime.internal.residency import _REQUEST, Model, Placeholder, _Block
 
 
 class Unsupported(ValueError):
@@ -50,8 +50,9 @@ def _hooks(model: Model, module: Any) -> tuple[Any, ...]:
             or module._backward_hooks or module._backward_pre_hooks):
         raise Unsupported("closed linear phases cannot contain opaque module hooks")
     pre, post = tuple(module._forward_pre_hooks.values()), tuple(module._forward_hooks.values())
-    if (any(hook not in model.source_hooks for hook in pre)
-            or any(hook not in model.source_hooks
+    owned = {id(hook) for hook in model.source_hooks}
+    if (any(id(hook) not in owned for hook in pre)
+            or any(id(hook) not in owned
                    and not (type(hook) is lora.Hook and hook._cozy_baked) for hook in post)):
         raise Unsupported("closed linear phases accept only their source and baked identity hooks")
     return pre, post
@@ -64,6 +65,8 @@ def _slots(model: Model, module: Any) -> tuple[tuple[str, str, object], ...]:
         if value is None:
             result.append((role, "", None))
             continue
+        if type(value) not in (Tensor, torch.nn.Parameter, Placeholder):
+            raise Unsupported("a projection source slot has an opaque tensor implementation")
         names = sorted(
             name for name, sites in model.sites.items()
             if any(site.table is module._buffers and site.name == role for site in sites)
@@ -90,10 +93,12 @@ def _bound(model: Model, module: Any, role: str, tensor: Any) -> bool:
 
 
 def _environment(model: Model, module: Any, x: Tensor) -> Any:
+    if type(x) is not Tensor:
+        raise Unsupported("closed linear execution requires a plain input tensor")
     request = _REQUEST.get()
     if (request is None or request.idle or request.memory is not model.memory
             or not request.memory.cuda or x.device != model.memory.device
-            or not x.is_cuda or type(x) is not Tensor or not x.is_contiguous()
+            or not x.is_cuda or not x.is_contiguous()
             or x.layout is not torch.strided or x.dim() not in (2, 3)
             or (x.dim() == 3 and x.shape[0] != 1) or not x.numel() or x.data_ptr() % 16
             or x.dtype not in (torch.float16, torch.bfloat16)
