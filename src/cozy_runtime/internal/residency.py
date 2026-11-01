@@ -3374,7 +3374,9 @@ class Memory:
         token = _REQUEST.set(request)
         observed = False
         try:
-            if self.cooperation is not None and not idle:
+            # Preparation is real device-owner activity too; the native boundary tracks
+            # overlap and rejects uncertain measurements without a Python byte formula.
+            if self.cooperation is not None:
                 self.cooperation.request_boundary(begin=True)
                 observed = True
             yield request
