@@ -165,6 +165,40 @@ class PreQuantized:
     provider: str = ROWWISE_FP8
 
 
+@dataclass(frozen=True, slots=True)
+class ResidualFFN:
+    """One row-local residual/norm/SwiGLU tail, written into an exclusive caller output.
+
+    Declares ``hidden = residual + gate_msa[index] * out``, modulated RMSNorm,
+    packed value/gate ``up``, BF16 SwiGLU, ``down``, then
+    ``out = hidden + gate_mlp[index] * ffn``. Each supplied TritonEntry is the
+    package's existing compiled operation, with its documented explicit round points.
+    No memory budget, chunk size or allocating Python callback is supplied.
+
+    ``exclusive_out`` is the author's ownership promise: no other consumer may read
+    or write that output during this operation. Runtime rejects overlap with the
+    declared read-only tensors. Unsupported providers/layouts may use the original
+    split callable before execution; an accepted native operation never retries.
+    This first contract is BF16, one CUDA device, and a materialized SwiGLU result.
+    """
+
+    up: Any
+    down: Any
+    launch: Launch
+    norm_mod: TritonEntry
+    swiglu: TritonEntry
+    gate_add: TritonEntry
+    residual: Any
+    index: Any
+    norm_weight: Any
+    gate_msa: Any
+    scale_mlp: Any
+    shift_mlp: Any
+    gate_mlp: Any
+    eps: float
+    exclusive_out: bool
+
+
 class _Shared:
     __slots__ = ("operands", "tensor")
 
@@ -370,6 +404,7 @@ __all__ = [
     "Launch",
     "Plan",
     "PreQuantized",
+    "ResidualFFN",
     "TritonEntry",
     "TritonKernels",
     "int8_rows",
