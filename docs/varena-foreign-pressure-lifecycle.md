@@ -1,7 +1,8 @@
 # Foreign pressure: Runtime lifecycle boundary
 
-Audit checkpoint only. This branch combines fresh Runtime640193706 with the
-qualified4d5844f0 native-owner adapter; product behavior is unchanged.
+This branch combines fresh Runtime640193706 with the qualified4d5844f0 native-owner
+adapter. The sampler checkpoint now forwards actual request begin/end to the native
+owner; it adds no Python memory formula or sampler.
 
 Native Varena owns the byte policy. Runtime supplies the machine's categorical
 sharing/priority configuration, actual activity/pass boundaries, owner retirement
@@ -11,12 +12,18 @@ Current seams:
 
 - `Cooperation.Config` arrives through typed Start and binds at fresh CUDA Memory
   creation. CPU Hello must stay free of Torch/CUDA/NVML/owner-thread initialization.
-- `Memory.cooperation_boundary` already marks use and checks native faults. Extend
-  only its lifecycle facts; do not put a sampler or deficit computation back here.
+- `Memory.cooperation_boundary` marks use and checks native faults. Non-idle requests
+  additionally send native begin/end notifications outside Memory locks. End is in
+  the unconditional cleanup path and uses unchecked fault reporting, preserving the
+  original handler error. Failed begin never emits a matching end.
 - `Memory._open`'s outer-forward boundary and request begin/end currently call
-  `_take_room`. Preserve these safe points for native regrowth notification while
-  removing `_room_pending`, byte conversion, `_room_floor` and Room targets from the
-  Cooperative path.
+  `_take_room`. Native `working::phase_enter` now owns the actual regrowth latch.
+  Removing `_room_pending`, byte conversion, `_room_floor` and legacy Room targets
+  remains part of the later controller retirement.
+- The additive native `PRESSURE_PROTOCOL` is separate from the existing owner service
+  capability. An older owner cohort keeps its negotiated allocation/recovery service
+  without inventing pressure support; a new cohort exposes sampled pressure facts.
+  This does not change an active Memory into Legacy mode or install a Python fallback.
 - Native/graph owners retain their own safety conditions. A queued shrink request
   never means bytes were released. The Cache owner lane is implementing the narrow
   async queue and actual physical-release completion facts separately.
@@ -41,3 +48,10 @@ coexistence above the measured live/pinned floor, clean below-floor exhaustion,
 actual release latency and foreign allocation failures, safe pass-boundary
 regrowth, and unknown attribution that does not train H. No such new GPU proof is
 claimed by this document.
+
+The current paired CPU source checks preserve the baseline findings (mypy 13→13,
+Ruff 12→12, no new findings), and the changed lifecycle module passes Ruff. Native
+control and real-ledger CPU proofs live in the Creator release gate. Actual Runtime
+request-window sampling, CPU Hello on the final built wheel, shared-machine startup,
+and the existing deliberate error-cleanup GPU cell still require the final paired
+artifact; source checks do not qualify those behaviors.
