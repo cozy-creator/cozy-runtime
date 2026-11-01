@@ -21,8 +21,8 @@ it. So a machine with no C compiler, which Triton needs for its launcher, still 
 whose package and Runtime ship it whole is copied in the process that asks (`_copy`), so it is
 built before its first request and never served eager meanwhile (`ready`).
 
-Executor-only: torch and Triton are imported at the top, guarded; their absence is
-`kernels_absent`.
+Executor-only: torch and Triton are imported at the top, guarded; their absence, or a Triton older
+than `floors.TRITON_SETS`, is `kernels_absent`, and the eager paths serve.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
-from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_ready, tools, verify
+from cozy_runtime.internal import floors, kernel_cache, kernel_compile, kernel_ready, tools, verify
 
 try:
     import torch
@@ -73,6 +73,10 @@ except ImportError as _absent:  # pragma: no cover - exercised by the typed refu
     TRITON_ABSENT = f"torch and triton do not import ({_absent})"
 else:
     TRITON_ABSENT = ""
+#: The Triton imported, if any: below `floors.TRITON_SETS` its sets are off whatever imported.
+_FOUND = str(getattr(sys.modules.get("triton"), "__version__", ""))
+if _FOUND and (_older := floors.older("Triton", _FOUND, floors.TRITON_SETS)):
+    TRITON_ABSENT = _older
 
 WARP_SIZE = 32
 

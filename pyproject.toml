@@ -34,8 +34,8 @@ diffusers = [
     "peft>=0.20,<0.21",
     "diffusers>=0.40.0",
     "transformers>=5.16.1",
-    "torch>=2.14",
-    "torchvision>=0.28",
+    "torch>=2.10",
+    "torchvision>=0.25",
     "numpy>=1.26",
     "safetensors>=0.8.0",
     "tokenizers>=0.23.1",
@@ -111,7 +111,7 @@ warn_unused_ignores = false
 [project.optional-dependencies]
 assessment = ["cozy-eval>=0.7"]
 # The derivation harness and the serving executor.
-derive = ["torch>=2.14"]
+derive = ["torch>=2.10"]
 media = [
     "av>=19.0.1",
 ]
@@ -122,7 +122,7 @@ model-execution = ["tensorfs>=0.17.13,<0.18"]
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
     "peft>=0.20,<0.21",
-    "torch>=2.14",
+    "torch>=2.10",
     "transformers>=5.16.1",
     "tokenizers>=0.23.1",
 ]
