@@ -1987,7 +1987,7 @@ class Memory:
         if not streams and page not in self._baked_once:
             self._baked_once.add(page)
             return
-        if not self._host_room(tensor.numel()):
+        if not self._admit(page, tensor.numel()):
             return
         kept = self._pin(torch.zeros(tensor.numel(), dtype=torch.uint8))
         if kept is not None:
@@ -2056,12 +2056,12 @@ class Memory:
                 # The page refilled most often per request first: it saves the most bytes per
                 # byte of host RAM (an H3 DiT block refilled 8 times a call before a text
                 # encoder's read once).
-                page = max(self._wanted, key=lambda p: self._rate.get(p, 1))
+                page = max(self._wanted, key=self._worth)
                 block = self._wanted.pop(page)
             model = block.model
             if page in self._baked or model.closed or model.identity != page[2]:
                 continue
-            if not self._host_room(block.storage_bytes) and not self._displace(page, block):
+            if not self._admit(page, block.storage_bytes):
                 continue  # kept pages are worth at least as much; a smaller wanted one may fit
             tensors = model.source.ck.components[model.source.component].tensors
             # Its reads touch it window by window, each a point a command can take over; only
@@ -2109,25 +2109,45 @@ class Memory:
                 kept.release()
         return True
 
-    def _displace(self, page: tuple[object, ...], block: _Block) -> bool:
-        """Room for `page` from kept pages refilled less often per request, least often and then
-        least recently used first; none go unless together they make the room. The tier follows
-        use, not arrival: a pod's first construction no longer keeps its pages while a later
-        one's most refilled blocks stream from the store (H3 LoRA'd calls on an RTX PRO 4000:
-        177 against 216 s by load order, cl-683)."""
-        rate = self._rate.get(page, 1)
+    def _worth(self, page: tuple[object, ...]) -> int:
+        """`page`'s refills per request: the last request's, or the running one's once more. A
+        page this request refills again outranks pages read once a request before the request
+        ends and its rate is written (se-091)."""
+        return max(self._rate.get(page, 1), self._refills.get(page, 0))
+
+    def _admit(self, page: tuple[object, ...], nbytes: int) -> bool:
+        """Whether `page`, `nbytes` of host RAM, enters the tier: process lifetime, never on disk,
+        each page once, within half of the host's RAM and beyond the headroom. Every page enters
+        by this one rule, a stored page pinned when idle and a baked page at its bake alike.
+        Where there is no room it displaces kept pages worth less (`_displace`), never one worth
+        as much: blocks refill in a fixed order, so replacing the least recently used of equals
+        would miss every refill. A busy machine's tier had kept a text encoder's and the earlier
+        cells' pages, read once a request, while H3's baked DiT pages, refilled 8 times, re-read
+        from disk at 1 GB/s: 3.3 s a step (se-091)."""
+        if not self._host_tier or not self.cuda or self.capturing():
+            return False
+        now = time.monotonic()
+        if now - self._host_looked >= 1.0:  # host RAM is re-read at most once a second
+            self._host_looked = now
+            self._trim_baked()
+        return self._host_fits(nbytes) or self._displace(page, nbytes)
+
+    def _displace(self, page: tuple[object, ...], nbytes: int) -> bool:
+        """Room for `page`'s `nbytes` from kept pages worth less (`_worth`), least first and then
+        least recently used; none go unless together they make the room. The tier follows use,
+        not arrival: a pod's first construction no longer keeps its pages while a later one's
+        most refilled blocks stream from the store (H3 LoRA'd calls on an RTX PRO 4000: 177
+        against 216 s by load order, cl-683)."""
+        worth = self._worth(page)
         with self.lock:
-            cheaper = sorted(
-                (p for p in self._baked if self._rate.get(p, 1) < rate),
-                key=lambda p: self._rate.get(p, 1),
-            )
+            cheaper = sorted((p for p in self._baked if self._worth(p) < worth), key=self._worth)
             freed, chosen = 0, []
             for kept in cheaper:
-                if self._host_fits(block.storage_bytes - freed):
+                if self._host_fits(nbytes - freed):
                     break
                 chosen.append(kept)
                 freed += self._baked[kept].tensor.numel()
-            if not self._host_fits(block.storage_bytes - freed):
+            if not self._host_fits(nbytes - freed):
                 return False
             for kept in chosen:
                 gone = self._baked.pop(kept)
@@ -2137,24 +2157,11 @@ class Memory:
         return True
 
     def _host_fits(self, nbytes: int) -> bool:
-        """Whether `nbytes` more fit the tier as last measured (`_host_room` measures)."""
+        """Whether `nbytes` more fit the tier as last measured (`_admit` measures)."""
         return (
             self._baked_bytes + nbytes <= self._host_cap
             and self._baked_room - nbytes >= _BAKED_HEADROOM
         )
-
-    def _host_room(self, nbytes: int) -> bool:
-        """Whether a host page of `nbytes` fits the tier: process lifetime, never on disk, each
-        page once. Only into room beyond the headroom and within half of the host's RAM, evicting
-        nothing for it: blocks refill in a fixed order, so replacing the least recently used
-        would miss every refill."""
-        if not self._host_tier or not self.cuda or self.capturing():
-            return False
-        now = time.monotonic()
-        if now - self._host_looked >= 1.0:  # host RAM is re-read at most once a second
-            self._host_looked = now
-            self._trim_baked()
-        return self._host_fits(nbytes)
 
     def _pin(self, tensor: Tensor) -> _HostPage | None:
         """`tensor` registered as a host page; a failed pin turns the tier off, with a warning."""
@@ -2178,7 +2185,7 @@ class Memory:
         )
         if room >= _BAKED_HEADROOM or not self._baked:
             return room
-        for key in sorted(self._baked, key=lambda p: self._rate.get(p, 1)):
+        for key in sorted(self._baked, key=self._worth):
             page = self._baked.pop(key)
             self._baked_bytes -= page.tensor.numel()
             page.release()
