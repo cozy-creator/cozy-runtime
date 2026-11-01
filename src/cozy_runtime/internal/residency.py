@@ -3331,7 +3331,13 @@ class Memory:
             self.requests.add(request)
         self._take_room()  # a raise or lift that came between calls binds this one from its start
         token = _REQUEST.set(request)
+        observed = False
         try:
+            # Preparation is real device-owner activity too; the native boundary tracks
+            # overlap and rejects uncertain measurements without a Python byte formula.
+            if self.cooperation is not None:
+                self.cooperation.request_boundary(begin=True)
+                observed = True
             yield request
         finally:
             try:
@@ -3350,17 +3356,21 @@ class Memory:
                 request.ended = request.stats()
                 self.last = request.ended
             finally:
-                with self.lock:
-                    self.requests.discard(request)
-                    alone = not self.requests
-                if alone:
-                    self._take_room()  # one that came in the call's last forward
-                if alone and self.room_limit is not None:
-                    # Held to a room, the next call starts with its own cache, not this one's
-                    # (sieg: SDXL's decode cache left its next denoise nothing to give)
-                    self._release_cache()
-                _REQUEST.reset(token)
-                self.cooperation_boundary(check=False)
+                try:
+                    with self.lock:
+                        self.requests.discard(request)
+                        alone = not self.requests
+                    if alone:
+                        self._take_room()  # one that came in the call's last forward
+                    if alone and self.room_limit is not None:
+                        # Held to a room, the next call starts with its own cache, not this one's
+                        # (sieg: SDXL's decode cache left its next denoise nothing to give)
+                        self._release_cache()
+                finally:
+                    _REQUEST.reset(token)
+                    if observed and self.cooperation is not None:
+                        self.cooperation.request_boundary(begin=False, check=False)
+                    self.cooperation_boundary(check=False)
 
     def stats(self) -> dict[str, Any] | None:
         return self.last
