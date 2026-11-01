@@ -641,11 +641,21 @@ class DerivedCache:
         self._entries.clear()
         self._bytes = 0
 
+    def _try_drop(self) -> bool:
+        # The Region claims its own lock and checks every active component pin before
+        # calling this owner. No byte target or replacement policy belongs in this hook.
+        if self._pins:
+            return False
+        self.drop()
+        return True
+
     def _made(self) -> _Region | None:
         """Its region, made with its first entry on a placed model (None unplaced)."""
         residency = self._owner._cozy_residency
         if self._region is None and residency is not None:
-            self._region = residency.region(f"cache:{self.name}", "latent", (), release=self.drop)
+            self._region = residency.region(
+                f"cache:{self.name}", "latent", (), release=self.drop, shrink=self._try_drop
+            )
         return self._region
 
     def enter(self) -> None:
@@ -695,7 +705,8 @@ class _Region(Protocol):
 
 class _Residency(Protocol):
     def region(
-        self, owner: str, kind: str, sets: object, *, release: Callable[[], None] | None = None
+        self, owner: str, kind: str, sets: object, *, release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> _Region: ...
 
 
