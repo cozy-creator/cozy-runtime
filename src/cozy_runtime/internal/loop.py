@@ -568,7 +568,11 @@ class _Loop:
                     cached.begin(i - self.steps.start)
                 _call(self.step, index, tensors, self.phase(i))
                 if self.on_step is not None:
-                    self.on_step(i)
+                    if observation is None:
+                        self.on_step(i)
+                    else:
+                        with vt.external_callback(index.device.index):
+                            self.on_step(i)
             if index.is_cuda:
                 torch.cuda.current_stream(index.device).synchronize()
             if observation is not None and mode == "eager":
@@ -1091,6 +1095,8 @@ def _graph_configuration(
 ) -> str | None:
     configuration = _phase_configuration(loop, indices, tensors, models)
     callback = {"before": loop.before, "after": loop.after}.get(role, loop.step)
+    if callback is None:
+        return None
     code = getattr(callback, "__code__", None)
     if configuration is None or code is None:
         return None
@@ -1180,7 +1186,8 @@ def _submit(
         )
         if on_step is not None:
             for i in indices[reported:done]:
-                on_step(i)
+                with vt.external_callback(program.tensors[0].device.index):
+                    on_step(i)
         reported = max(reported, done)
         if progress.done:
             break
@@ -1197,7 +1204,8 @@ def _submit(
         )
     if on_step is not None:
         for i in indices[reported:]:
-            on_step(i)
+            with vt.external_callback(program.tensors[0].device.index):
+                on_step(i)
     row["native_steps"] = row.get("native_steps", 0) + done
     row["host_graph_launches"] = row.get("host_graph_launches", 0) + int(
         facts["host_graph_launches"]

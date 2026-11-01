@@ -60,6 +60,17 @@ with an empty region list keeps the existing intentional-clear meaning. The
 Runtime's weight-policy cache is invalidated only if a controller actually changed
 preferences.
 
+Progress callbacks are not part of the declared execution key. A bounded native
+`external_callback` scope surrounds each callback. Entering or leaving this scope
+does not invalidate anything; an actual allocation/free while it is active
+invalidates the current observation before mutating allocator state. This covers
+a callback interval spanning native stage completion/rearm, without a late rollback
+of already published samples. Allocation-free CPU telemetry remains measurable.
+The guard is metadata-only and adds no synchronization or Python allocator hook.
+Concurrent native allocation during the interval conservatively invalidates that
+sample too. Work launched without joining after the callback returns remains
+outside this bounded callback contract.
+
 The former outer Python replay scope would overlap these native scopes, so it is
 removed. There is no new per-step Python scheduler or continuation ABI. Native
 observations enter the request's normal record once after checked completion and
@@ -74,6 +85,9 @@ while another graph retains the pool; changed capture cuts; a failed capture;
 cancellation and incomplete replay; reused stages; and a weightless inter-block
 stage whose observation does not clear the preference plan. Require no allocator
 driver/event work during capture and no stale token acceptance.
+Also cross a native observe/rearm boundary while one callback scope is active:
+every allocation/free must invalidate its current observation before publication,
+while a callback interval with no allocator transitions leaves it publishable.
 
 Existing full-model/stream/alias checks remain necessary. H3's explicit input key
 does not permit cross-call reuse of its request-local derived caches. Production
