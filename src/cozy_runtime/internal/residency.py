@@ -557,6 +557,8 @@ class Model:
         self.retire_graphs: Callable[[], None] | None = None
         self.sites = _sites(module)
         self.handles: list[Any] = []
+        # Exact source-lifecycle callbacks accepted by explicit closed producers.
+        self.source_hooks: set[Callable[..., Any]] = set()
         self.holds: list[Hold] = []
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
@@ -703,6 +705,7 @@ class Model:
             for handle in self.handles:
                 handle.remove()
             self.handles.clear()
+            self.source_hooks.clear()
             for block in self.groups():
                 self.memory._discard(block, forget=True)
             self.memory._forget_baked(self)
@@ -3958,7 +3961,7 @@ def _hooks(model: Model) -> None:
             )
             memory._open(model, key, executing=True)
 
-        model.handles.extend(_paired(sub, opened, lambda: memory._close(model, executing=True)))
+        model.handles.extend(_paired(sub, opened, lambda: memory._close(model, executing=True), model))
     for block in model.blocks.values():
         sub = model.module.get_submodule(block.path)
 
@@ -3987,7 +3990,7 @@ def _hooks(model: Model) -> None:
             if (cut := CUTTER.get()) is not None:
                 cut.exit(b)
 
-        model.handles.extend(_paired(sub, entered, exited))
+        model.handles.extend(_paired(sub, entered, exited, model))
         if block.table:
             model.handles.extend(_gathering(sub, memory))
 
@@ -4027,7 +4030,9 @@ def _gathering(module: nn.Module, memory: Memory) -> list[Any]:
     ]
 
 
-def _paired(module: nn.Module, enter: Callable[..., None], leave: Callable[[], None]) -> list[Any]:
+def _paired(
+    module: nn.Module, enter: Callable[..., None], leave: Callable[[], None], owner: Model,
+) -> list[Any]:
     owed = threading.local()
 
     def pre(_: nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
@@ -4039,6 +4044,7 @@ def _paired(module: nn.Module, enter: Callable[..., None], leave: Callable[[], N
             owed.count -= 1
             leave()
 
+    owner.source_hooks.update((pre, post))
     return [
         module.register_forward_pre_hook(pre, with_kwargs=True),
         module.register_forward_hook(post, always_call=True),

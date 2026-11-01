@@ -80,3 +80,24 @@ linear fallback calls, VAE band/tile/block-attention calls and refiner norms/FFN
 The frozen sparse candidate is GPU-pending, so its 900 calls are not yet retired in
 qualification evidence. Host-tier cache displacement is host-source policy, not a CUDA
 workspace selector; fresh master se-091 changes are preserved separately.
+
+## First source checkpoint
+
+`execution.committed_linear.inventory(model, leaf, input, next_block=...)` is an
+explicit internal producer API. Its current support is raw stored INT8 data, FP32
+scales and optional matching output-dtype bias, with established source-site layouts.
+Fill/bind callbacks, overlays and final-layout transforms explicitly refuse. Exact
+Runtime source-hook identities and existing baked no-op LoRA hooks are permitted;
+opaque hooks refuse. No ordinary H3 caller is opted in.
+
+The returned phase performs one ordinary module invocation. Its interceptor reads the
+real operands before native commit, then checks their layouts and actual raw Region
+addresses against the declared source slots. It consumes one fixed native choice and
+runs the existing projection body exactly once. The whole explicit phase is fenced,
+and optional raw prefetch is finalized after compute measurement. Failed or changed
+bindings cannot write an output; post-acceptance errors never enter legacy retry.
+
+Source syntax, Ruff and targeted mypy checks pass. The owned native token and Python
+binding compile. Actual one-call, unknown/known prefetch, allocation census, refusal,
+source-error and lifetime behavior still require the genuine CUDA fixture; this is
+not GPU qualification or a whole-model adoption claim.
