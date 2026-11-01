@@ -228,7 +228,7 @@ struct Plan {
         int count = 0;
         blas(cublasLtMatmulAlgoGetHeuristic(owner->handle, operation, a, b, result, result,
                                            prefs, 1, &found, &count));
-        require(count == 1, "prepared dense has no compatible selected algorithm");
+        if (count != 1) blas(CUBLAS_STATUS_NOT_SUPPORTED);
         blas(found.state);
         algorithm = found.algo;
         heuristic_workspace = found.workspaceSize;
@@ -324,6 +324,7 @@ std::shared_ptr<Plan> query(std::shared_ptr<Context> context, int rows, int inpu
 
 NB_MODULE(_dense, m) {
     m.attr("API") = 1;
+    m.attr("NOT_SUPPORTED") = static_cast<int>(CUBLAS_STATUS_NOT_SUPPORTED);
     nb::exception<VendorError> error(m, "Error", PyExc_RuntimeError);
     nb::register_exception_translator(
         [](const std::exception_ptr& pointer, void* payload) {

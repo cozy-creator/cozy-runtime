@@ -98,6 +98,9 @@ def split(
             if x is not intent.hidden:
                 raise ValueError("layer-scale block intent must name this exact input")
             declared_intent = getattr(runtime, "split_layer_scale_block", None)
+            if runtime is not None and not callable(declared_intent):
+                raise RuntimeError(
+                    "installed execution requires the declared layer-scale block API")
         elif type(intent) is SingleUseProjection:
             if fn is not intent.module or x is not intent.hidden:
                 raise ValueError("single-use projection intent must name this exact call")
