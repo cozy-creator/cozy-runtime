@@ -7,7 +7,10 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
+
+if TYPE_CHECKING:
+    from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN, SparseProjectedHeads
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +52,8 @@ def install(runtime: Pieces | None) -> None:
 
 
 def split(
-    fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None
+    fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None,
+    intent: ResidualFFN | ProjectedHeads | SparseProjectedHeads | None = None,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -61,8 +65,32 @@ def split(
 
     With `most`, the windows are the fewest of at most `most` elements, on every device and
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
-    cut's (an `overlap`) does. Without it such a layout follows free memory."""
+    cut's (an `overlap`) does. Without it such a layout follows free memory.
+
+    ``intent`` declares a complete supported operation. Runtime may decline it before
+    execution and use ``fn`` normally; after native acceptance there is no operation retry.
+    A Runtime without that native executor still serves the original callable.
+    """
     runtime = _RUNTIME
+    if intent is not None:
+        from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN, SparseProjectedHeads
+
+        if type(intent) is ResidualFFN:
+            declared_intent = getattr(runtime, "split_residual_ffn", None)
+        elif type(intent) is ProjectedHeads:
+            declared_intent = getattr(runtime, "split_projected_heads", None)
+        elif type(intent) is SparseProjectedHeads:
+            declared_intent = getattr(runtime, "split_sparse_projected_heads", None)
+        else:
+            raise TypeError("split intent must declare a supported complete operation")
+        if most is None and callable(declared_intent):
+            result = declared_intent(intent, out, cuts)
+            if result is not None:
+                return result
+    if runtime is not None and most is None and out is None:
+        declared = getattr(runtime, "split_declared", None)
+        if declared is not None and (result := declared(fn, x, cuts)) is not None:
+            return result
     shape = tuple(int(n) for n in x.shape)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")

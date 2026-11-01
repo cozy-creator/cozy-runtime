@@ -1,0 +1,1 @@
+Add the negotiated single-GPU native cooperation owner: CPU-only capability discovery, one Memory participant, typed transient outcomes and automatic donor service. The paired TensorD isolates Legacy and Cooperative byte policies. GPU consumer qualification and the remaining P3 shortage/cache/foreign-pressure policy are still required.
