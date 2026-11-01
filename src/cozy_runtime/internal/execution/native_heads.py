@@ -441,6 +441,7 @@ class _Plan:
             head_chunk=geometry.heads,
             backend=self.route.backend,
             implementation=self.route.implementation,
+            route_reason=self.route.reason,
             attention_api=self.attention.identity[0],
             attention_identity=self.attention.identity,
             choices=self.choices,
@@ -448,12 +449,12 @@ class _Plan:
         )
         record["selections"] += 1
         phase.choice(("native-split", self.key, geometry.identity))
-        observation = vt.split_begin(
+        observation = phase.begin_split(
             device,
             self.key,
             geometry.identity,
+            selection,
             stream=stream,
-            completion_owner=phase.completion_owner(device, stream),
         )
         submitted = False
         try:
