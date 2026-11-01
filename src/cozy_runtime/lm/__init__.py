@@ -49,6 +49,8 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from typing import Any, NamedTuple
 
+import tensorfs.varena.torch as vt
+
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, is_capacity
@@ -1945,7 +1947,7 @@ class _Engine:
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
-            graph.replay()
+            vt.replay(graph)
         if graph is not None:
             self.replayed += 1
         else:
