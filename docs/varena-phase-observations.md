@@ -62,6 +62,50 @@ Runtime. No extra CUDA synchronization is added to eager execution. Broader
 watermark-driven sizing, unified reclaim, committed split choice, H3 integration
 and legacy policy deletion remain open and require real CLI qualification.
 
+## Next replay integration seam
+
+`PreparedSequence.submit` already wraps each stage's continuation with TensorFS'
+`PhaseController` before starting the native worker. Its native `Phase.start`
+runs before input/graph work, `Phase.observe` receives checked completion, and
+`rearm` separates successive executions of a reusable stage. This is the stage
+policy seam; the Runtime continuation ABI need not grow a Python callback.
+
+The missing input is an allocator-owned capture-footprint token for that graph,
+covering the actual captured allocation offsets and backing segments, including
+scratch logically freed while recording. `_Graph.begin/end` can bracket its
+construction, and the resulting `PreparedRepeat` must retain it with the actual
+graph/pool owner. It adds no separate physical pin. A reservation size or current
+`pools_bytes` is not that token: they include unused capacity and other graphs
+sharing the pool.
+
+Only a successful, complete execution may qualify this footprint for its full
+committed stage key. Native stage cancellation, failure, or rearm after an
+incomplete execution cannot publish it. Stage start can then use the previously
+qualified footprint for the same key; the live graph's already retained backing
+must be credited once, not reserved again as future working allocation. Other
+live inputs, outputs, native decode scratch and outside allocations keep their
+own charges. `Execution._finish` still proves the final output copies complete.
+
+This contract is the next implementation step, not functionality delivered by
+the current measurement checkpoint. H3's explicit-input/key migration must keep
+its existing refusal of cross-call whole-graph reuse until request-local derived
+caches have an explicit rebinding contract.
+
+## Upstream retry lifetime correction
+
+This branch also carries the narrow Python correction from Runtime #1982:
+a successful cut retry clears its saved exception before returning, so the
+exception's traceback cannot retain the active caller frames and their tensors.
+The P2 invalidation still runs before retry cleanup. The corrected body otherwise
+matches upstream exactly. The real 8 GB refused-then-successful path remains a
+qualification requirement; source equivalence is not GPU evidence.
+
+The lifecycle foundation is Runtime 0.36.15 / `fb5dfa19c`, including #1977's
+room reporting, signal handling and embedding gather plus #1974's weight-reclaim
+correction. Stock-Torch allocator-setting revert #1981 is inapplicable to the
+Varena allocator path. The later INT4 native kernel addition is not imported by
+this checkpoint, so its original native binary reuse boundary stays explicit.
+
 ## Proof required before merge
 
 Use paired Creator P2 APIs through the ordinary Cozy release gate. Verify that a
