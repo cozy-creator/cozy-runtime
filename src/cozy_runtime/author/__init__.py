@@ -432,8 +432,9 @@ def __getattr__(name: str) -> object:
     if name in _REMOVED:
         release, instead = _REMOVED[name]
         raise ImportError(
-            f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): this "
-            f"package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest release",
+            f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): "
+            f"this package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest "
+            "release",
             name=name,
         )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
