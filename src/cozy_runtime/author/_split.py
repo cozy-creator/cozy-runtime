@@ -48,37 +48,49 @@ def install(runtime: Pieces | None) -> None:
     _RUNTIME = runtime
 
 
-def split(fn: Callable[[Any], Any], x: Any, *cuts: Cut, most: int | None = None) -> Any:
+def split(
+    fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None
+) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
+
+    With `out`, `fn(window, out_window)` writes each window's result into the same window of
+    `out`, which `split` returns: nothing whole is allocated beside it, so an op may write its
+    input's rows in place (H3's block tail into its attention output). Its cuts keep their
+    extent: no scale and no overlap.
 
     With `most`, the windows are the fewest of at most `most` elements, on every device and
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
     cut's (an `overlap`) does. Without it such a layout follows free memory."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
+    if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
+        raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
     if most is not None and cuts:
         windows = _windows(shape, cuts, most)
         if runtime is None:
-            return _run(fn, x, cuts, windows, lambda: None)
+            return _run(fn, x, cuts, windows, lambda: None, out)
         # One level: a refusal reclaims and runs the same windows again, never finer ones.
         return runtime.split(
             _name(fn),
             _key(fn, shape, cuts, x.dtype),
             most,
             most,
-            int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size()),
-            lambda _: _run(fn, x, cuts, windows, runtime.piece),
+            0 if out is not None else _bytes(shape, cuts, x),
+            lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
         )
     if runtime is None or not cuts:
-        return fn(x)
+        if out is None:
+            return fn(x)
+        fn(x, out)
+        return out
     return runtime.split(
         _name(fn),
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
-        int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size()),
-        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece),
+        0 if out is not None else _bytes(shape, cuts, x),
+        lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
     )
 
 
@@ -92,6 +104,11 @@ def _key(
     cut = {c.dim % len(shape) for c in cuts}
     rest = tuple(n if i not in cut else -1 for i, n in enumerate(shape))
     return f"{_name(fn)}{rest}:{dtype}"
+
+
+def _bytes(shape: tuple[int, ...], cuts: tuple[Cut, ...], x: Any) -> int:
+    """The whole output's bytes, which `split` allocates beside its windows."""
+    return int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size())
 
 
 def _name(fn: Callable[[Any], Any]) -> str:
@@ -160,16 +177,25 @@ def _largest(shape: tuple[int, ...], cuts: tuple[Cut, ...], longest: Sequence[in
 
 
 def _run(
-    fn: Callable[[Any], Any],
+    fn: Callable[..., Any],
     x: Any,
     cuts: tuple[Cut, ...],
     windows: list[Window],
     piece: Callable[[], None],
+    into: Any = None,
 ) -> Any:
-    if len(windows) == 1:
-        return fn(x)
     ndim = x.dim()
     dims = [c.dim % ndim for c in cuts]
+    if into is not None:  # each window writes its own rows of `into` (`split(out=)`)
+        for window in windows:
+            index = [slice(None)] * ndim
+            for d, (a, b) in zip(dims, window, strict=True):
+                index[d] = slice(a, b)
+            piece()
+            fn(x[tuple(index)], into[tuple(index)])
+        return into
+    if len(windows) == 1:
+        return fn(x)
     blend = any(c.overlap for c in cuts)
     out: Any = None
     total: Any = None

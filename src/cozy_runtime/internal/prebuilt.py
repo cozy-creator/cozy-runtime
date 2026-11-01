@@ -507,6 +507,7 @@ ATTENTION = {
         ),
         "_sage3",
     ),
+    "kitchen-int4qk": "_attn4",
 }
 
 
@@ -519,6 +520,14 @@ def serves(kernel: str, sm: int) -> bool:
         and bool(artifact(module))
         and any(target.rstrip("af") == f"sm_{sm}" for target in ARCHS[module]["cubin"])
     )
+
+
+def missing(kernel: str, sm: int) -> str:
+    """Why the installed wheel does not serve `kernel` on this card (`serves` is false)."""
+    module = ATTENTION[kernel]
+    if not artifact(module):
+        return ABSENT or getattr(_kernels, f"NO_{module.strip('_').upper()}", f"no {module}")
+    return f"the wheel's {module} carries no sm_{sm} kernel ({' '.join(ARCHS[module]['cubin'])})"
 
 
 def lost(f: str, sm: int) -> str:

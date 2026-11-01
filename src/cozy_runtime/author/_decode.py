@@ -20,6 +20,7 @@ from collections.abc import Callable, Generator, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from dataclasses import dataclass, replace
 from fractions import Fraction
+from itertools import chain
 from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
@@ -339,8 +340,10 @@ class _AudioStreamDecoder:
 
     With `end`, samples at or after `origin + end` are never converted: the frame that
     crosses it is validated whole and cut to the exact sample, and the caller stops reading.
-    `origin` defaults to the stream's own first presentation time. The total-sample ceiling
-    applies to a retained read; a stream holds one chunk at a time.
+    With `start`, samples before `origin + start` are decoded and validated but never kept:
+    the first kept chunk begins at the exact sample, its time to the nearest tick. `origin`
+    defaults to the stream's own first presentation time. The total-sample ceiling applies
+    to a retained read; a stream holds one chunk at a time.
     """
 
     def __init__(
@@ -350,6 +353,7 @@ class _AudioStreamDecoder:
         limits: DecodeLimits,
         budget: _Budget,
         *,
+        start: Fraction | None = None,
         end: Fraction | None = None,
         origin: Fraction | None = None,
         retained: bool = True,
@@ -357,10 +361,13 @@ class _AudioStreamDecoder:
         self._av = av
         self._limits = limits
         self._budget = budget
+        self._start = start
         self._end = end
         self._origin = origin
         self._retained = retained
+        self._skip = 0
         self._keep: int | None = None
+        self._decoded = 0
         self._resampler: Any | None = None
         self._last_presentation_time: Fraction | None = None
         self._time_base: Fraction | None = None
@@ -389,7 +396,7 @@ class _AudioStreamDecoder:
     @property
     def done(self) -> bool:
         """Whether every sample before `end` is already read."""
-        return self._keep is not None and self.sample_count >= self._keep
+        return self._keep is not None and self._decoded >= self._keep
 
     def _lock_format(self, frame: Any) -> None:
         self.channels = len(frame.layout.channels)
@@ -452,12 +459,15 @@ class _AudioStreamDecoder:
             raise MediaDecodeError("audio PTS is not strictly monotone", code="media_clock")
         if self._start_time is None:
             self._start_time = presentation_time
+            origin = presentation_time if self._origin is None else self._origin
+            if self._start is not None:
+                skip = (origin + self._start - presentation_time) * self.sample_rate
+                self._skip = max(0, _half_up(skip))
             if self._end is not None:
-                origin = presentation_time if self._origin is None else self._origin
                 cut = (origin + self._end - presentation_time) * self.sample_rate
                 self._keep = max(0, _half_up(cut))
         else:
-            expected = self._start_time + Fraction(self.sample_count, self.sample_rate)
+            expected = self._start_time + Fraction(self._decoded, self.sample_rate)
             if abs(presentation_time - expected) > time_base / 2:
                 raise MediaDecodeError(
                     f"audio presentation is discontinuous: expected {expected}, got "
@@ -465,11 +475,12 @@ class _AudioStreamDecoder:
                     code="audio_discontinuity",
                 )
         self._last_presentation_time = presentation_time
-        take = (
-            valid_samples
-            if self._keep is None
-            else min(valid_samples, self._keep - self.sample_count)
+        first = max(0, self._skip - self._decoded)
+        stop = (
+            valid_samples if self._keep is None else min(valid_samples, self._keep - self._decoded)
         )
+        self._decoded += valid_samples
+        take = stop - first
         if take <= 0:
             return None
         if self._retained and self.sample_count + take > self._limits.max_audio_samples:
@@ -488,21 +499,24 @@ class _AudioStreamDecoder:
             )
         chunks = [bytearray() for _ in range(self.channels)]
         remaining = take
+        offset = first
         for out in converted:
             if str(out.format.name) != "fltp" or len(out.planes) != self.channels:
                 raise MediaDecodeError(
                     "audio conversion returned a non-planar float frame", code="audio_format"
                 )
-            part = min(remaining, int(out.samples))
+            skipped = min(offset, int(out.samples))
+            offset -= skipped
+            part = min(remaining, int(out.samples) - skipped)
             if part:
                 for channel, plane in enumerate(out.planes):
                     raw = memoryview(plane)
-                    size = part * 4
-                    if len(raw) < size:
+                    lo, hi = skipped * 4, (skipped + part) * 4
+                    if len(raw) < hi:
                         raise MediaDecodeError(
                             "audio plane is shorter than its sample count", code="media_geometry"
                         )
-                    chunk = bytes(raw[:size])
+                    chunk = bytes(raw[lo:hi])
                     _require_finite_f32(chunk)
                     chunks[channel] += chunk
                 remaining -= part
@@ -519,13 +533,15 @@ class _AudioStreamDecoder:
             channel_layout=self.channel_layout,
             channel_names=self.channel_names,
             pcm_f32le=tuple(bytes(chunk) for chunk in chunks),
-            pts=int(frame.pts),
+            pts=int(frame.pts) + _half_up(Fraction(first, self.sample_rate) / time_base),
             time_base=time_base,
         )
 
     def finish(self) -> None:
-        if self._keep == 0:
-            return  # `end` precedes the first sample: an empty selection, not an empty stream
+        if self._keep == 0 or (
+            self.sample_count == 0 and self._decoded and self._decoded <= self._skip
+        ):
+            return  # the selection ends before the first sample or starts after the last
         if self.sample_count == 0 or self._resampler is None or self._start_time is None:
             raise MediaDecodeError("audio stream decoded no samples", code="media_empty")
         if self._resampler.resample(None):
@@ -537,9 +553,8 @@ class _AudioStreamDecoder:
         """Decode until EOF or `end`; the demux stops at the cut."""
         for frame in frames:
             chunk = self.decode(frame)
-            if chunk is None:
-                break
-            yield chunk
+            if chunk is not None:
+                yield chunk
             if self.done:
                 break
         self.finish()
@@ -598,14 +613,27 @@ class _VideoClock:
     frame uses its own. Time running backwards refuses. With `end` (seconds after the first
     frame), the first frame starting at or after it ends the decode: only its start is
     read, it is never validated or converted, and the demux stops there. The last kept
-    frame's duration is clipped to `end`. The declared frame count is checked only when
-    the decode reached the end of the stream.
+    frame's duration is clipped to `end`. With `start` (seconds after `origin`, the first
+    frame's time), the frames that end at or before it are decoded but never validated or
+    converted, and the first kept frame begins at it. The declared frame count is checked
+    only when the decode read the whole stream.
     """
 
-    def __init__(self, av: Any, stream: Any, limits: DecodeLimits, end: Fraction | None) -> None:
+    def __init__(
+        self,
+        av: Any,
+        stream: Any,
+        limits: DecodeLimits,
+        end: Fraction | None,
+        *,
+        start: Fraction | None = None,
+        origin: Fraction | None = None,
+    ) -> None:
         self._limits = limits
         self._av = av
         self._end = end
+        self._start = start
+        self._origin_time = origin
         self._reformatter = av.video.reformatter.VideoReformatter()
         self._declared_frames = int(stream.frames or 0)
         self._last_pts: int | None = None
@@ -685,7 +713,9 @@ class _VideoClock:
                 "video color facts change between frames", code="media_color_change"
             )
         if self.origin is None:
-            self.origin = pts
+            self.origin = (
+                pts if self._origin_time is None else _half_up(self._origin_time / time_base)
+            )
         self._last_pts = pts
         self._seen += 1
         return _Picture(self, frame, pts, duration, color_facts)
@@ -705,20 +735,53 @@ class _VideoClock:
         pending.duration = pts - pending.pts
         return True
 
+    def _from_start(self, frames: Iterator[Any]) -> Iterator[Any]:
+        """The frames from the one showing at `start`; those before it are only decoded."""
+        assert self._start is not None and self._origin_time is not None
+        target = self._origin_time + self._start
+        previous = None
+        for frame in frames:
+            known = frame.pts is not None and frame.time_base is not None
+            if known and frame.pts * Fraction(frame.time_base) <= target:
+                previous = frame
+                continue
+            if previous is not None:
+                yield previous
+            yield frame
+            yield from frames
+            return
+        if previous is not None:
+            yield previous
+
     def pictures(self, frames: Iterator[Any]) -> Iterator[_Picture]:
         pending: _Picture | None = None
+        if self._start is not None:
+            frames = self._from_start(frames)
         for frame in frames:
             if pending is not None and self._ends(frame, pending):
                 self.stopped = True
                 break
             current = self._check(frame)
+            if self._start is not None and pending is None:
+                assert self._origin_time is not None and self.time_base is not None
+                begin = math.floor((self._origin_time + self._start) / self.time_base)
+                if current.pts < begin:
+                    current.duration -= begin - current.pts
+                    current.pts = begin
             if pending is not None:
                 pending.duration = current.pts - pending.pts
                 yield pending
             pending = current
         if pending is None:
             raise MediaDecodeError("video stream decoded no frames", code="media_empty")
-        if not self.stopped and self._declared_frames and self._seen != self._declared_frames:
+        if self._start is not None and self._seen == 1 and pending.duration <= 0:
+            raise MediaDecodeError("video ends at or before the read's start", code="media_empty")
+        if (
+            self._start is None
+            and not self.stopped
+            and self._declared_frames
+            and self._seen != self._declared_frames
+        ):
             raise MediaDecodeError(
                 f"video decoded {self._seen} of {self._declared_frames} declared frames",
                 code="media_truncated",
@@ -787,10 +850,11 @@ def _audio_events(
     end: Fraction | None,
     origin: Fraction | None,
     retained: bool,
+    start: Fraction | None = None,
 ) -> Iterator[_Event]:
     audio_format = _stream_audio_format(stream, limits)
     decoder = _AudioStreamDecoder(
-        av, stream, limits, budget, end=end, origin=origin, retained=retained
+        av, stream, limits, budget, start=start, end=end, origin=origin, retained=retained
     )
     yield DecodedMediaHeader(video=None, audio=audio_format)
     yield from decoder.chunks(iter(container.decode(stream)))
@@ -805,14 +869,17 @@ def _media_events(
     *,
     end: Fraction | None,
     retained: bool,
+    start: Fraction | None = None,
     audio: bool = True,
     pictures: bool = True,
 ) -> Generator[_Event]:
-    """The time-ordered header, pictures and PCM of one input, bounded by `end`.
+    """The time-ordered header, pictures and PCM of one input, from `start` to `end`.
 
     The soundtrack reads through its own container, so neither track's demux runs past
-    `end`. A soundtrack is cut at the first decoded video frame's time plus `end`, with or
-    without its pictures.
+    `end`. A soundtrack is cut at the first decoded video frame's time plus `start` and
+    `end`, with or without its pictures. With `start`, the pictures decode from the keyframe
+    at or before it (`_seek`), else from the first; the soundtrack always decodes from its
+    first sample, so its cut is exact.
     """
     with ExitStack() as stack:
         source = stack.enter_context(path.open("rb"))
@@ -820,22 +887,33 @@ def _media_events(
         if kind == "audio":
             stream = _one_stream(list(container.streams.audio), "audio")
             yield from _audio_events(
-                av, container, stream, limits, budget, end=end, origin=None, retained=retained
-            )
+                av, container, stream, limits, budget,
+                start=start, end=end, origin=None, retained=retained,
+            )  # fmt: skip
             return
         _one_stream(list(container.streams.video), "video")
         soundtrack = _soundtrack(container)
         if not pictures:
             if soundtrack is None:
                 _required_stream("audio", 0)
-            origin = None if end is None else _first_picture_time(av, path)
+            origin = None if start is None and end is None else _first_picture_time(av, path)
             yield from _audio_events(
-                av, container, soundtrack, limits, budget, end=end, origin=origin, retained=retained
-            )
+                av, container, soundtrack, limits, budget,
+                start=start, end=end, origin=origin, retained=retained,
+            )  # fmt: skip
             return
         video_stream = container.streams.video[0]
-        clock = _VideoClock(av, video_stream, limits, end)
-        video = clock.pictures(iter(container.decode(video_stream)))
+        origin = None if start is None else _first_picture_time(av, path)
+        clock = _VideoClock(av, video_stream, limits, end, start=start, origin=origin)
+        frames = None
+        if origin is not None and start is not None:
+            frames = _seek(av, container, video_stream, origin + start)
+            if frames is None:
+                source = stack.enter_context(path.open("rb"))
+                container = stack.enter_context(av.open(source, mode="r"))
+                video_stream = container.streams.video[0]
+                clock = _VideoClock(av, video_stream, limits, end, start=start, origin=origin)
+        video = clock.pictures(frames or iter(container.decode(video_stream)))
         next_video: _Picture | None = next(video)
         assert next_video is not None and clock.time_base is not None
 
@@ -852,6 +930,7 @@ def _media_events(
                 audio_stream,
                 limits,
                 budget,
+                start=start,
                 end=end,
                 origin=clock.origin_time,
                 retained=retained,
@@ -884,6 +963,29 @@ def _media_events(
             else:
                 yield next_audio
                 next_audio = next(sound, None)
+
+
+def _seek(av: Any, container: Any, stream: Any, target: Fraction) -> Iterator[Any] | None:
+    """The stream's frames from the keyframe at or before `target` seconds, or None when a
+    seek does not reach one that starts by then and decodes."""
+    if stream.time_base is None:
+        return None
+    at = target
+    for _ in range(2):
+        container.seek(math.floor(at / stream.time_base), stream=stream, backward=True)
+        frames = iter(container.decode(stream))
+        try:
+            first = next(frames, None)
+        except av.FFmpegError:
+            return None
+        if first is None or first.pts is None or first.time_base is None:
+            return None
+        begins = first.pts * Fraction(first.time_base)
+        if begins <= target:
+            return chain([first], frames)
+        # A container indexes keyframes by decode time, so a reordered one can start after it.
+        at = min(at, begins) - 1
+    return None
 
 
 def _first_picture_time(av: Any, path: Path) -> Fraction:
@@ -1071,13 +1173,24 @@ class MediaReads:
         # EXIF, ICC) reaches the package.
         return pil_frombytes(mode, prepared.size, prepared.tobytes())
 
-    def video(self, asset: VideoFile, *, end: object, fps: object, audio: bool) -> DecodedVideo:
+    def video(
+        self, asset: VideoFile, *, start: object, end: object, fps: object, audio: bool
+    ) -> DecodedVideo:
         cut = _effective_end(end, asset._end)
+        begin = _window_start(start, cut)
         rate = None if fps is None else _rate(fps)
         budget, path = self._start(asset, "VideoFile.read")
         av = _av()
         events = _media_events(
-            av, path, "video", self._limits, budget, end=cut, retained=True, audio=audio
+            av,
+            path,
+            "video",
+            self._limits,
+            budget,
+            start=begin,
+            end=cut,
+            retained=True,
+            audio=audio,
         )
         try:
             with _reading(asset, av, "video"):
@@ -1108,9 +1221,16 @@ class MediaReads:
             events.close()
 
     def stream(
-        self, asset: VideoFile | AudioFile, *, end: object, audio: bool, pictures: bool
+        self,
+        asset: VideoFile | AudioFile,
+        *,
+        end: object,
+        audio: bool,
+        pictures: bool,
+        start: object = None,
     ) -> DecodedMediaStream:
         cut = _effective_end(end, asset._end)
+        begin = _window_start(start, cut)
         if not (audio or pictures):
             raise ValueError("a stream needs pictures, audio or both")
         budget, path = self._start(asset, f"{type(asset).__name__}.stream", retained=False)
@@ -1126,6 +1246,7 @@ class MediaReads:
                 asset.kind,
                 self._limits,
                 budget,
+                start=begin,
                 end=cut,
                 retained=False,
                 audio=audio,
@@ -1224,6 +1345,21 @@ def _effective_end(end: object, prepared: Fraction | None) -> Fraction | None:
     except ValueError as exc:
         raise ValueError(f"end must be a positive number of seconds: {exc}") from None
     return requested if prepared is None else min(requested, prepared)
+
+
+def _window_start(start: object, end: Fraction | None) -> Fraction | None:
+    """A read's `start`: None for the first frame, else seconds before its `end`."""
+    if start is None or (not isinstance(start, bool) and start == 0):
+        return None
+    try:
+        begin = seconds(start)
+    except ValueError as exc:
+        raise ValueError(f"start must be a non-negative number of seconds: {exc}") from None
+    if end is not None and begin >= end:
+        raise ValueError(
+            f"start ({float(begin):g} s) must come before the read's end ({float(end):g} s)"
+        )
+    return begin
 
 
 def _rate(fps: object) -> Fraction:
