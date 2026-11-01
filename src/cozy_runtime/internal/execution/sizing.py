@@ -75,15 +75,19 @@ def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
     weights cost their refill every pass (H3 15 s on a 24 GB card: an 11 GB whole attention call
     left the 21 GB DiT 9 GB resident). Driver-free bytes alone made every site cut to its floor
     once Torch held the card (RTX 3070, h3-8gb sessions 40463894354 and 40471655517)."""
-    room_bytes = room.free + room.cached + room.cold
-    if room.budget is not None:
-        room_bytes = min(room_bytes, room.budget)
+    room_bytes = capacity(room)
     level = next((n for n in range(finest + 1) if need(n, room.granularity) <= room_bytes), None)
     if level is not None:
         return level, "cold"
     least = need(finest, room.granularity)
     knee = least + least // _FLOOR_SHARE
     return next(n for n in range(finest + 1) if need(n, room.granularity) <= knee), "floor"
+
+
+def capacity(room: Room) -> int:
+    """What a level may need and run beside every weight the running phase holds (`choose`)."""
+    room_bytes = room.free + room.cached + room.cold
+    return room_bytes if room.budget is None else min(room_bytes, room.budget)
 
 
 def descend[T](

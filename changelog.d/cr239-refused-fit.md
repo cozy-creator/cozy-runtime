@@ -1,0 +1,1 @@
+A package `split` whose fitted window the device refuses, though the fit said it fits, drops that fit and measures the op again: H3's sparse attention under its dense steps' fit was refused on every layer of every sparse step (cr-239, run 25003: 46 retries and 138 floor refusals a step).
