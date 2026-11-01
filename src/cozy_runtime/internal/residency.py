@@ -2602,10 +2602,8 @@ class Memory:
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         region = self._native_region(block, final=final)
         needed = int(region.allocated_bytes)
-        if not reclaim and not region.resident and needed > self.room().free:
-            raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
         try:
-            return region.prepare()
+            return region.prepare(reclaim=reclaim)
         except torch.OutOfMemoryError:
             if not reclaim:
                 raise
