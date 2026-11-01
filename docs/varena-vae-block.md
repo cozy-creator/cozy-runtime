@@ -147,3 +147,19 @@ The initial source now implements the prepared provider and status bridge, but n
 consumer is enabled. The real meta-device block/layout check passes with CUDA
 uninitialized (docs/evidence/vae-block-source). Native compilation, dense execution and
 the complete admitted fused consumer remain pending.
+
+
+## Lazy vendor loading after the first native build
+
+Root built exact5948028be successfully, but its CPU-only import before Torch failed
+because a direct `libcuda.so.1` dependency requires a driver at import. The prototype
+also carried a `/cublas/lib` build-tree RUNPATH. That artifact and failure remain
+preserved under outputs/xs138-p2-vae-block/native-5948028be.
+
+This successor follows Varena's existing dynamic CUDA loader: import creates no
+driver/Lt handle and resolves no vendor symbol. GPU preparation loads the real installed
+CUDA driver and cuBLASLt13 by their runtime library names; all calls retain their exact
+typed vendor statuses. Libraries stay loaded for their registered exit handlers and
+opaque borrowers. Context/descriptor/workspace ownership is unchanged. No driver stub
+is bundled and the native target has no direct vendor-library link or build-tree RUNPATH.
+Actual link/import verification is still required; source syntax is not that proof.
