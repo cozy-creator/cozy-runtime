@@ -75,10 +75,10 @@ THREAD = "kernel-ready: "
 #: bound by `triton_kernels` when the executor imports it past its device boundary (the
 #: families that open one import no torch).
 TRITON: list[Callable[..., Launch | None]] = []
-#: This executor's CUDA device, current for every opener on any thread: a new thread starts on
-#: device 0, where a group follower's probes failed against tensors on its own GPU (run 19454).
-#: Bound by the executor past its device boundary.
-DEVICE: list[Callable[[], AbstractContextManager[object]]] = [nullcontext]
+#: The executor's actual device AND execution stream for every opener on any thread.
+#: CUDA current-stream state is thread-local; selecting a device alone leaves probes on
+#: that thread's default stream. Bound after allocator/device/stream initialization.
+EXECUTION: list[Callable[[], AbstractContextManager[object]]] = [nullcontext]
 
 
 class Refused(RuntimeError):
@@ -112,7 +112,7 @@ def _opening(name: str) -> Iterator[None]:
             raise Building(name)
         _OPENERS += 1
     try:
-        with DEVICE[0]():
+        with EXECUTION[0]():
             yield
     finally:
         with _LOCK:

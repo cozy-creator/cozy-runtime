@@ -24,6 +24,7 @@ import sys
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
@@ -512,7 +513,7 @@ def drain(torch: Any, kind: str) -> None:
     if kind == "mps":
         torch.mps.synchronize()
     elif kind == "cuda":
-        torch.cuda.current_stream().synchronize()
+        completion_event(torch, kind).synchronize()
 
 
 #: torch `_native`'s DSLs that compile at an op's first call.
@@ -545,6 +546,56 @@ def initialize(torch: Any, kind: str) -> None:
         torch.cuda.init()
 
 
+@cache
+def _stream_driver() -> Any:
+    """The installed CUDA driver, loaded only after the executor's device boundary.
+
+    Torch 2.14 exposes only blocking cudaStreamCreate through its cudart Python shim.
+    Driver streams are the same handles accepted by Torch's ExternalStream and events.
+    """
+    if sys.platform == "win32":
+        driver = ctypes.WinDLL("nvcuda.dll")
+    else:
+        driver = ctypes.CDLL("libcuda.so.1")
+    driver.cuStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+    driver.cuStreamCreate.restype = ctypes.c_int
+    driver.cuStreamDestroy_v2.argtypes = [ctypes.c_void_p]
+    driver.cuStreamDestroy_v2.restype = ctypes.c_int
+    return driver
+
+
+def nonblocking_stream(torch: Any, device: int) -> Any:
+    """A unique Runtime-owned CU_STREAM_NON_BLOCKING stream.
+
+    The caller owns destruction after all library handles, tensors and events using it
+    have retired. Executor streams live until process exit; graph domains close theirs.
+    """
+    pointer = ctypes.c_void_p()
+    with torch.cuda.device(device):
+        code = _stream_driver().cuStreamCreate(ctypes.byref(pointer), 1)
+        if code:
+            error = torch.AcceleratorError(
+                f"cuStreamCreate(CU_STREAM_NON_BLOCKING) failed with CUDA error {code}"
+            )
+            error.error_code = code
+            raise error
+        try:
+            return torch.cuda.ExternalStream(pointer.value, device=device)
+        except BaseException:
+            _stream_driver().cuStreamDestroy_v2(pointer)
+            raise
+
+
+def destroy_stream(torch: Any, stream: Any) -> None:
+    """Destroy an owned stream only after its owner retires and joins every consumer."""
+    with torch.cuda.device(stream.device):
+        code = _stream_driver().cuStreamDestroy_v2(stream.cuda_stream)
+    if code:
+        error = torch.AcceleratorError(f"cuStreamDestroy failed with CUDA error {code}")
+        error.error_code = code
+        raise error
+
+
 def first_launches(torch: ModuleType, kind: str) -> None:
     """Create the GPU libraries' handles, workspaces and first kernels while the device has
     room. cuBLAS and cuDNN take device memory for themselves at a first launch, and inside a
@@ -561,7 +612,7 @@ def first_launches(torch: ModuleType, kind: str) -> None:
                 torch.mm(a, a)
                 conv.conv2d(a.view(1, 1, 8, 8), kernel.reshape(1, 1, 3, 3))
                 conv.conv3d(a.view(1, 1, 1, 8, 8), kernel.reshape(1, 1, 1, 3, 3))
-        torch.cuda.synchronize()
+        completion_event(torch, kind).synchronize()
 
 
 def initialized(torch: Any, kind: str) -> bool:
@@ -683,9 +734,12 @@ def completion_event(torch: Any, kind: str) -> Any:
     return event
 
 
-def streams_idle(torch: Any, kind: str) -> bool:
-    """Whether the device has nothing outstanding. The device's OWN answer to quiescence,
-    which is why a terminal may be recorded on it rather than on a timer. Host code is done."""
+def streams_idle(torch: Any, kind: str, *, stream: Any) -> bool:
+    """Whether the execution stream and its explicitly joined producers are complete.
+
+    The caller supplies its owned stream; another thread's current/default stream cannot
+    prove completion. Consumers on other streams must join before the terminal boundary.
+    """
     if kind == "cpu":
         return True
     if kind == "mps":
@@ -693,7 +747,7 @@ def streams_idle(torch: Any, kind: str) -> bool:
         # These completion boundaries need the MPS queue fence, not a fresh poll marker.
         synchronize(torch, kind)
         return True
-    return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
+    return bool(stream.query())
 
 
 def present(torch: Any, kind: str) -> bool:
