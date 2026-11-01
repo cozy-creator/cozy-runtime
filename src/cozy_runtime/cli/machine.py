@@ -20,6 +20,7 @@ from pathlib import Path
 
 import msgspec
 
+from cozy_runtime.author import ConformanceError
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
 from cozy_runtime.internal import static_interface
 from cozy_runtime.internal.installed import record_digest
@@ -52,6 +53,8 @@ class DescribeEnvironment(msgspec.Struct, tag="describe_environment", tag_field=
     packages: dict[str, str] = {}
     #: also the root's own installed interface, in the same process
     interface: bool = False
+    #: also the root's memoized callables' code closures
+    closures: bool = False
 
 
 class Callee(msgspec.Struct, frozen=True):
@@ -68,6 +71,8 @@ class Callee(msgspec.Struct, frozen=True):
 
 class Described(msgspec.Struct, tag="described", tag_field="kind"):
     interface: msgspec.Raw
+    #: each memoized callable's code closure (`module:export` -> identity), where it has one
+    closures: dict[str, str] = {}
 
 
 class DescribedEnvironment(msgspec.Struct, tag="described_environment", tag_field="kind"):
@@ -75,6 +80,8 @@ class DescribedEnvironment(msgspec.Struct, tag="described_environment", tag_fiel
     callees: list[Callee]
     #: the root's interface document as JSON text, when asked for
     interface: str = ""
+    #: the root's memoized callables' code closures, when asked for (as `Described.closures`)
+    closures: dict[str, str] = {}
 
 
 class DescribeFailed(msgspec.Struct, tag="describe_failed", tag_field="kind"):
@@ -150,12 +157,23 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
             )
         )
     own = ""
+    closures: dict[str, str] = {}
     if request.interface:
         built = static_interface.build_installed(
-            request.root, environment_python=Path(sys.executable)
+            request.root, environment_python=Path(sys.executable), closures=closures
         )
         own = msgspec.json.encode(built).decode()
-    return DescribedEnvironment(record_digest(found.get(_normalized(request.root))), callees, own)
+    elif request.closures:
+        # Closures only narrow memo keys: a root they cannot be read for keys on its whole source.
+        try:
+            static_interface.build_installed(
+                request.root, environment_python=Path(sys.executable), closures=closures
+            )
+        except ConformanceError:
+            closures = {}
+    return DescribedEnvironment(
+        record_digest(found.get(_normalized(request.root))), callees, own, closures
+    )
 
 
 def describe() -> int:
@@ -174,8 +192,11 @@ def describe() -> int:
             reply = Described(msgspec.Raw(msgspec.json.encode(document)))
         else:
             python = Path(request.environment_python) if request.environment_python else None
-            document = static_interface.build(Path(request.project), environment_python=python)
-            reply = Described(msgspec.Raw(msgspec.json.encode(document)))
+            closures: dict[str, str] = {}
+            document = static_interface.build(
+                Path(request.project), environment_python=python, closures=closures
+            )
+            reply = Described(msgspec.Raw(msgspec.json.encode(document)), closures)
     except Exception as exc:
         reply = DescribeFailed(getattr(exc, "code", type(exc).__name__), str(exc))
     sys.stdout.buffer.write(msgspec.json.encode(reply))

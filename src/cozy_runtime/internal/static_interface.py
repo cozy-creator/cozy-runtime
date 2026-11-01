@@ -1522,8 +1522,14 @@ class StaticRecipe:
         return canonical(self.plan)
 
 
-def build(project: Path, *, environment_python: Path | None = None) -> dict[str, Json]:
-    """The package interface from source alone. Executes nothing of the package."""
+def build(
+    project: Path,
+    *,
+    environment_python: Path | None = None,
+    closures: dict[str, str] | None = None,
+) -> dict[str, Json]:
+    """The package interface from source alone. Executes nothing of the package. `closures`, when
+    given, gets each memoized callable's code closure (`_code_closure`)."""
     project = project.resolve()
     application = read_application(project)
     # A callee package is read as source too: a local one from the directory the project's
@@ -1531,7 +1537,7 @@ def build(project: Path, *, environment_python: Path | None = None) -> dict[str,
     pinned = locked.read(project)
     roots = (*environment_roots(environment_python, project=project), *pinned.roots)
     reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels)
-    return _build(reader, application)
+    return _build(reader, application, closures=closures)
 
 
 def build_builtin(name: str) -> dict[str, Json]:
@@ -1547,8 +1553,11 @@ def build_builtin(name: str) -> dict[str, Json]:
     return _build(reader, application)
 
 
-def build_installed(distribution: str, *, environment_python: Path) -> dict[str, Json]:
-    """Describe one explicitly selected wheel using only its metadata and source bytes."""
+def build_installed(
+    distribution: str, *, environment_python: Path, closures: dict[str, str] | None = None
+) -> dict[str, Json]:
+    """Describe one explicitly selected wheel using only its metadata and source bytes; `closures`
+    as `build`'s."""
 
     def normalize(name: str) -> str:
         return re.sub(r"[-_.]+", "-", name).lower()
@@ -1630,10 +1639,16 @@ def build_installed(distribution: str, *, environment_python: Path) -> dict[str,
         raise StaticRefusal(
             "installed App source is not owned by its wheel", code="static_distribution"
         )
-    return _build(reader, application, installed=True)
+    return _build(reader, application, installed=True, closures=closures)
 
 
-def _build(reader: Reader, application: str, *, installed: bool = False) -> dict[str, Json]:
+def _build(
+    reader: Reader,
+    application: str,
+    *,
+    installed: bool = False,
+    closures: dict[str, str] | None = None,
+) -> dict[str, Json]:
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
     app = reader.lookup(entry, attribute, entry.tree)
@@ -1662,6 +1677,10 @@ def _build(reader: Reader, application: str, *, installed: bool = False) -> dict
             identity = _operation_identity(reader, registration)
             if identity is not None:
                 row = replace(row, identity={"operation_identity": identity})
+        if closures is not None and registration.memoize:
+            closure = _code_closure(reader, registration)
+            if closure is not None:
+                closures[f"{registration.module.name}:{registration.fn.name}"] = closure
         declared[registration.name] = row
     return package_interface.assemble(
         application, list(declared.values()), installed=installed, recipes=recipes
@@ -1743,6 +1762,116 @@ def _operation_identity(reader: Reader, registration: Registration) -> str | Non
     """A memoized callable's operation identity read from installed source alone: the same key
     `memo_implementation.describe` computes by import. None when any part of its declaration
     cannot be read statically; its machine then keys the memo by its package's files."""
+    fn = registration.fn
+    own = (f"{registration.module.name}.{fn.name}", memo_identity.normalized_definition(fn))
+    return _declared_identity(reader, registration, [own])
+
+
+#: What reads a package's code or files other than by its imports.
+_UNBOUNDED_NAMES = frozenset(
+    {"__import__", "__file__", "__path__", "__spec__", "__loader__", "exec", "eval"}
+)
+_UNBOUNDED_MODULES = frozenset({"importlib", "pkgutil", "runpy"})
+
+
+class _Unbounded(Exception):
+    """A closure its module-scope imports do not bound."""
+
+
+def _code_closure(reader: Reader, registration: Registration) -> str | None:
+    """A memoized callable of the package's own code keyed on that code: its module and every
+    module of its package that module imports at module scope, transitively, each with the
+    package `__init__`s Python runs first, plus its declared memo version and dependencies. An
+    edit to any other file leaves it unchanged. None when those imports do not bound what it runs
+    (an import elsewhere, a dynamic import or a read of its files, a module that is not Python
+    source); its machine then keys the memo by the package's whole source."""
+    if registration.module.trusted:
+        return None
+    seen: dict[str, Module] = {}
+    parts = registration.module.name.split(".")
+    pending = [".".join(parts[: depth + 1]) for depth in range(len(parts))]
+    try:
+        while pending:
+            name = pending.pop()
+            if name in seen:
+                continue
+            module = _closure_module(reader, name)
+            if module is None:
+                continue
+            seen[name] = module
+            pending += _closure_imports(reader, module)
+    except _Unbounded:
+        return None
+    definitions = [(name, memo_identity.normalized(seen[name].source)) for name in sorted(seen)]
+    return _declared_identity(reader, registration, definitions)
+
+
+def _closure_module(reader: Reader, name: str) -> Module | None:
+    """The package's module `name`, read for its closure; None for a namespace package."""
+    try:
+        module = reader.module(name)
+    except StaticRefusal:
+        if _directories(reader, name):
+            return None
+        raise _Unbounded from None
+    scope = {id(stmt) for stmt in _module_scope(module.tree.body)}
+    for node in ast.walk(module.tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and id(node) not in scope:
+            raise _Unbounded
+        if isinstance(node, ast.Name) and node.id in _UNBOUNDED_NAMES:
+            raise _Unbounded
+    return module
+
+
+def _closure_imports(reader: Reader, module: Module) -> list[str]:
+    """The package's own modules `module` imports at module scope, with every package each one
+    is in. A name imported from one of its packages counts when it is a module there."""
+    found: list[str] = []
+    for stmt in _module_scope(module.tree.body):
+        names: list[str] = []
+        if isinstance(stmt, ast.Import):
+            names = [alias.name for alias in stmt.names]
+        elif isinstance(stmt, ast.ImportFrom):
+            base = reader._import_base(module, stmt)
+            if base is None:
+                raise _Unbounded
+            names = [base]
+            for alias in stmt.names if reader._own(base.split(".")[0]) else ():
+                if alias.name == "*" and _directories(reader, base):
+                    raise _Unbounded
+                if alias.name != "*" and _submodule(reader, base, alias.name):
+                    names.append(f"{base}.{alias.name}")
+        for name in names:
+            parts = name.split(".")
+            if parts[0] in _UNBOUNDED_MODULES:
+                raise _Unbounded
+            if reader._own(parts[0]):
+                found += [".".join(parts[: depth + 1]) for depth in range(len(parts))]
+    return found
+
+
+def _directories(reader: Reader, package: str) -> list[Path]:
+    """The directories that hold the package's `package`: none for a module."""
+    parts = package.split(".")
+    return [root.joinpath(*parts) for root in reader.roots if root.joinpath(*parts).is_dir()]
+
+
+def _submodule(reader: Reader, package: str, name: str) -> bool:
+    """Whether `from package import name` imports a module, not a name `package` binds. One that
+    is not Python source is refused."""
+    for directory in _directories(reader, package):
+        if (directory / f"{name}.py").is_file() or (directory / name).is_dir():
+            return True
+        if any(path.suffix in (".so", ".pyd") for path in directory.glob(f"{name}.*")):
+            raise _Unbounded
+    return False
+
+
+def _declared_identity(
+    reader: Reader, registration: Registration, definitions: list[tuple[str, str]]
+) -> str | None:
+    """`definitions` with the registration's declared memo version and dependencies, as one
+    identity; None when any of its declaration cannot be read statically."""
     version: object = ""
     dependencies: list[tuple[Module, ast.expr]] = []
     try:
@@ -1755,10 +1884,7 @@ def _operation_identity(reader: Reader, registration: Registration) -> str | Non
                 return None
         if not isinstance(version, str):
             return None
-        fn = registration.fn
-        definitions = [
-            (f"{registration.module.name}.{fn.name}", memo_identity.normalized_definition(fn))
-        ]
+        definitions = list(definitions)
         for module, node in dependencies:
             definition = _memo_dependency(reader, module, node)
             if definition is None:
