@@ -120,6 +120,8 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
+#: inside a block's fill (`Memory._ensure`): the blocks it reads prefetch nothing
+_FILLING: ContextVar[bool] = ContextVar("cozy_residency_filling", default=False)
 # During authored stage preparation, undeclared model reads must not page in sibling blocks.
 _CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
 #: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
@@ -2847,8 +2849,12 @@ class Memory:
         return restore
 
     def _prefetch_next(self, current: _Block) -> None:
-        """Demand's own next block takes priority over queued-request speculation."""
-        if current.next is None or current.retained:
+        """Demand's own next block takes priority over queued-request speculation. A block a fill
+        reads (a hook's LoRA factors, read while its layer's block bakes) prefetches nothing: its
+        successor would take the one slot from the baking model's next block, whose read then
+        waits on demand (H3 Turbo on a cold RTX 5090: 52 of 53 DiT prefetches lost to the Turbo
+        LoRA's 1.6 MB blocks, cr-242)."""
+        if current.next is None or current.retained or _FILLING.get():
             return
         with self.lock:
             if self._prefetch is not None and self._prefetch.queued is not None:
@@ -3300,7 +3306,11 @@ class Memory:
             if block.model.fill is not None and (use is None or use.needs_fill or prefetched):
                 # `overlay` was read on this thread just before; no package code ran since.
                 baking = Bake.begin(self.stream()) if kept is None else None
-                changed = kept is None and block.model.fill(block.path, data)
+                filling = _FILLING.set(True)
+                try:
+                    changed = kept is None and block.model.fill(block.path, data)
+                finally:
+                    _FILLING.reset(filling)
                 bake = baking.end(self.stream()) if changed and baking is not None else None
                 if changed and page is not None and use is not None:
                     self._keep_baked(page, use.tensor, streams=not block.preferred)
