@@ -17,6 +17,9 @@ from cozy_runtime.internal.execution import agree, catch, cuts
 from cozy_runtime.internal.execution.agree import agreed, sizes
 from cozy_runtime.internal.execution.catch import cut_rows, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, split
+from cozy_runtime.internal.execution.native_heads import split_projected_heads
+from cozy_runtime.internal.execution.native_linear_split import split_declared
+from cozy_runtime.internal.execution.native_residual_ffn import split_residual_ffn
 from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
 from cozy_runtime.internal.residency import Request, blocks_of
 
@@ -31,6 +34,9 @@ __all__ = [
     "serving",
     "sizes",
     "split",
+    "split_declared",
+    "split_projected_heads",
+    "split_residual_ffn",
 ]
 
 
