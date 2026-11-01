@@ -928,11 +928,8 @@ class Binding:
                     if memory._prefetch is not None:
                         memory._settle_prefetch(cancel=True)
                 groups = []
-                needed = 0
                 for block in self.groups:
                     region = memory._native_region(block)
-                    if not region.resident:
-                        needed += int(region.allocated_bytes)
                     offset = 0
                     parts = []
                     for key, roles in block.parts.items():
@@ -946,12 +943,6 @@ class Binding:
                             )
                             offset += (part.nbytes + 255) // 256 * 256
                     groups.append((region, parts))
-                if memory.budget_bytes is not None and needed > memory.room().free:
-                    memory.reclaim(needed, current={model.name})
-                    if needed > memory.room().free:
-                        raise torch.OutOfMemoryError(
-                            "native component inputs exceed local capacity"
-                        )
                 if stage and not getattr(varena.LoadSlot, "supports_ready_stage", False):
                     raise StaleBinding("TensorFS lacks ready-input model stage preparation")
                 slot = (
@@ -1405,6 +1396,8 @@ class Memory:
         self._host_prepare = "evict_completed" in admission  # TensorFS 0.17.4
         if self.cuda:
             try:
+                if not cache_owners.supported():
+                    raise ResidencyError("native CUDA recovery requires the CacheOwner capability")
                 if budget_bytes is not None:
                     vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
@@ -2315,39 +2308,15 @@ class Memory:
     def reclaim(
         self, need: int = 0, *, current: Collection[str] = (), activations: bool = False
     ) -> int:
-        """Discard idle local owners at a preparation boundary; never inside an allocator.
-        `activations`: the room is for Torch allocations (a pure site's), else for weight pages."""
-        if self.capturing():
+        """Non-CUDA owner recovery; native CUDA allocation owns its bounded recovery."""
+        del activations  # CUDA's activation/weight distinction no longer selects Python victims.
+        if self.cuda:
             return 0
         before_allocated, before_reserved, _ = self._figures()
-        before_free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
-        # A running phase's working cache is its own activations: a pure site of it
-        # counts that cache as room and takes the rest from weights. Returning it was a device
-        # sync per release and its segments malloc'd back, and the step reserve then held their
-        # high-water free of speculation for the rest of the phase (H3 30-step on a 4090). A
-        # weight block's pages are no Torch allocation: for them the cache goes first (a warm H3
-        # executor's Regenerate refine was refused a 406 MB block beside it, run 23827).
-        keep = bool(
-            need
-            and activations
-            and self.phase_supported
-            and set(current) & set(self._phase_names or ())
-        )
-
-        def room_now() -> int:
-            room = self.room(current).free
-            if keep and self.cuda:
-                allocated, reserved, _ = _torch_bytes(self.device)
-                room += max(reserved - allocated, 0)
-            return room
-
-        available = room_now() if need else 0
-        if need and available < need and not keep:
-            # Return actual unused activation storage before sacrificing reusable weights.
-            # Private graph pools and live tensors may remain; measure instead of crediting
-            # reserved-minus-allocated bytes as available memory.
+        available = self.room(current).free if need else 0
+        if need and available < need:
             release_cached(torch, self.device.type)
-            available = room_now()
+            available = self.room(current).free
         dropped = 0
 
         def enough(released: int = 0, *, flush: bool = False) -> bool:
@@ -2356,15 +2325,10 @@ class Memory:
                 return False
             dropped += released
             if flush or dropped >= max(need - available, 1):
-                # Dropped owner bytes only trigger a batch flush. Aliases, allocator
-                # fragmentation and graph pools can keep them resident; measure again.
-                available = room_now()
-                if available < need and not keep:
+                available = self.room(current).free
+                if available < need:
                     release_cached(torch, self.device.type)
-                    available = room_now()
-                if self.native is not None and available < need:
-                    self.native.reclaim(need - available)
-                    available = room_now()
+                    available = self.room(current).free
                 dropped = 0
             return available >= need
 
@@ -2378,11 +2342,6 @@ class Memory:
             ]
         for hold in holds:
             hold.shed()
-        if self.native is not None:
-            self.native.reclaim(
-                max(need - available, 0) if need else int(self.native.stats()["resident_bytes"])
-            )
-            available = room_now() if need else 0
         with self.lock:
             blocks = sorted(
                 (b for m in self.models.values() for b in m.groups()),
@@ -2392,7 +2351,6 @@ class Memory:
             if enough():
                 break
             enough(self._discard(block))
-        # Return public allocator cache before escalating to graph retirement.
         if not enough(flush=True):
             for model in sorted(list(self.models.values()), key=lambda m: m.name in current):
                 if enough():
@@ -2405,8 +2363,6 @@ class Memory:
                             break
                         enough(self._discard(block))
                     enough(flush=True)
-        # A callback may discard graph owners or decoded caches. It runs outside metadata
-        # locks, and a pinned/locked region is skipped rather than waited on.
         if not enough(flush=True):
             for region in sorted(list(self.regions), key=lambda r: r.last):
                 if enough():
@@ -2414,12 +2370,9 @@ class Memory:
                 if region.discard():
                     enough(flush=True)
         if not need:
-            if self.native is not None:
-                self.native.reclaim(int(self.native.stats()["resident_bytes"]))
             release_cached(torch, self.device.type)
         allocated, reserved, _ = self._figures()
-        free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
-        return max(before_allocated - allocated, before_reserved - reserved, free - before_free, 0)
+        return max(before_allocated - allocated, before_reserved - reserved, 0)
 
     def trim(self) -> int:
         """Idle offload: release eligible owners and return actual reserved-byte reduction.
@@ -2433,7 +2386,19 @@ class Memory:
         before = self._figures()[1]
         for model in list(self.models.values()):
             self._retire(model)
-        self.reclaim()
+        if self.cuda:
+            # Explicit offload discards every eligible owner; it is not a byte-target
+            # victim selector or a retry of a failed allocation. Live pins still refuse.
+            for region in list(self.regions):
+                region.discard()
+            for model in list(self.models.values()):
+                for block in model.groups():
+                    self._discard(block)
+            if self.native is not None:
+                self.native.reclaim(int(self.native.stats()["resident_bytes"]))
+            release_cached(torch, self.device.type)
+        else:
+            self.reclaim()
         with self.lock:
             pages = list(self._baked.values())
             self._baked.clear()
@@ -2460,6 +2425,8 @@ class Memory:
         return region
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
+        if self.cuda:
+            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
         if self.device.type == "mps" and reclaim:
             # TensorFS reads into bounded host staging; account for that transient beside
             # the retained MPS part before asking Torch for its destination allocation.
@@ -2624,19 +2591,10 @@ class Memory:
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         region = self._native_region(block, final=final)
-        needed = int(region.allocated_bytes)
-        try:
-            return region.prepare(reclaim=reclaim)
-        except torch.OutOfMemoryError:
-            if not reclaim:
-                raise
-            # Native demand has tried its eligible working/weight backing. Python still
-            # owns disposable graphs/caches; retire eligible owners only after this miss.
-            # No read, transform or forward ran. Retry only this refused allocation when
-            # the owner adapter actually returned capacity; never replay package code.
-            if not self.reclaim(needed, current={block.model.name}):
-                raise
-            return region.prepare()
+        # Native demand owns all finite allocation recovery, including owner requests.
+        # Its terminal refusal is not a reason to select Python victims and retry again.
+        # Free-only preparation must remain free-only even if physical room changes now.
+        return region.prepare(reclaim=reclaim)
 
     def _prefetch_next(self, current: _Block) -> None:
         """Demand's own next block takes priority over queued-request speculation."""
@@ -3513,12 +3471,14 @@ class Request:
         return replace(room, cached=max(int(working["mapped_bytes"]) - allocated, 0))
 
     def reclaim(self, need: int = 0) -> int:
-        """A known pure cut may shed the step's speculative whole-model hold.
+        """Legacy non-CUDA cuts may shed their step's speculative whole-model hold.
 
-        Its currently executing block/common hooks retain their own uses. Explicit holds and
-        graph-owned storage stay pinned. This never retries a package or changes graph backing.
+        CUDA allocation already owns recovery. This compatibility hook does not migrate
+        the remaining legacy operation sizing/split contract or retry package execution.
         """
-        if self.idle or self.memory.capturing():
+        if self.memory.cuda or self.idle or self.memory.capturing():
+            # The allocating native call has already attempted its finite owner recovery.
+            # The remaining legacy split contract must not run a second victim policy.
             return 0
         with self.memory.lock:
             holds = [
