@@ -7,14 +7,16 @@ projection with it where its consumer reads output features apart (attention's h
 
 A row reads only its own weights and scale under a plain `nn.Linear` and under the per-row-scaled
 encoded leaves (int8.convrot, fp8.rowwise): a window is the whole's arithmetic in a narrower GEMM
-(whose kernel may round differently). An overlay's LoRA (`lora.Hook`) adds its rows of `up`.
-Anything else (a tensor-global scale, an unknown hook) does not cut: `rows` is None and the
-caller computes the whole."""
+(whose kernel may round differently). An overlay's LoRA (`lora.Hook`) adds its rows of `up`, and
+a user LoRA's layer (`lora_composition`) its base's rows and each adapter's rows of `lora_B`;
+baked, the base's rows alone. Anything else (a tensor-global scale, an unknown hook, another
+PEFT layer) does not cut: `rows` is None and the caller computes the whole."""
 
 from __future__ import annotations
 
 import copy
-from typing import Protocol
+import sys
+from typing import Any, Protocol
 
 from torch import Tensor, nn
 from torch.nn import functional as F
@@ -22,10 +24,12 @@ from torch.nn import functional as F
 from cozy_runtime import lora
 from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8, PreQuantized, readable
 
+
 class Rows(Protocol):
     def __call__(
         self, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None = None
     ) -> Tensor: ...
+
 
 #: Encoded leaves whose weight scale is one per output row.
 _ROWWISE = frozenset({INT8_CONVROT, ROWWISE_FP8})
@@ -36,6 +40,13 @@ def rows(linear: nn.Module) -> Rows | None:
     hooks = linear._forward_hooks.values()
     if linear._forward_pre_hooks or any(not isinstance(h, lora.Hook) for h in hooks):
         return None
+    if _composed(linear):
+        # A user LoRA's layer: its base's rows, and each adapter's rows of `lora_B` until the
+        # weight plane bakes them in. Refusing it ran every adapted H3 call whole (run 24886).
+        base = rows(linear.base_layer)
+        if base is None:
+            return None
+        return lambda x, a, b, out=None: _adapted(linear, x, base(x, a, b, out), a, b)
     if type(linear) is nn.Linear:
         return lambda x, a, b, out=None: _hooked(linear, x, _plain(linear, x, a, b, out), a, b)
     if getattr(linear, "provider", None) in _ROWWISE and set(linear.roles()) == {"weight", "scale"}:
@@ -78,6 +89,27 @@ def _leaf(
     if out is None:
         return found
     out.copy_(found)
+    return out
+
+
+def _composed(linear: nn.Module) -> bool:
+    """A layer `lora_composition` built: PEFT's linear with the Runtime's forward (`_cozy_baked`),
+    whose update is `lora.accumulate` per active adapter. Another PEFT layer's forward (dropout,
+    DoRA) is not known to cut."""
+    peft = getattr(sys.modules.get("peft.tuners.lora.layer"), "Linear", None)
+    return peft is not None and isinstance(linear, peft) and hasattr(type(linear), "_cozy_baked")
+
+
+def _adapted(layer: Any, x: Tensor | PreQuantized, out: Tensor, start: int, stop: int) -> Tensor:
+    """A composed layer's update over rows [start, stop): each active adapter's rows of `lora_B`
+    (`lora.accumulate`, as its forward adds the whole's); none once baked."""
+    if layer._cozy_baked:
+        return out
+    if not isinstance(x, Tensor):
+        raise ValueError("an unbaked LoRA update needs the float input, not its operand")
+    for name in layer.active_adapters:
+        up = layer.lora_B[name].weight
+        lora.accumulate(x, out, layer.lora_A[name].weight, up[start:stop], layer.scaling[name])
     return out
 
 

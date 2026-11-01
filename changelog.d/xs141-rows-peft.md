@@ -1,0 +1,1 @@
+`rows()` cuts a user LoRA's layer (`lora_composition`): its base's rows plus each active adapter's rows of `lora_B`, the base's alone once baked. Refusing the PEFT wrapper by type ran every adapted call whole, so an H3 shot with a user LoRA lost its head split (run 24886).
