@@ -1767,11 +1767,14 @@ def _operation_identity(reader: Reader, registration: Registration) -> str | Non
     return _declared_identity(reader, registration, [own])
 
 
-#: What reads a package's code or files other than by its imports.
-_UNBOUNDED_NAMES = frozenset(
-    {"__import__", "__file__", "__path__", "__spec__", "__loader__", "exec", "eval"}
-)
+#: What runs code other than by its imports.
+_UNBOUNDED_NAMES = frozenset({"__import__", "exec", "eval"})
+#: What finds a module's own files: bounded by its package's data files, which its closure holds;
+#: a top-level module has no package of its own, so its files are anywhere beside it.
+_FILE_NAMES = frozenset({"__file__", "__path__", "__spec__", "__loader__"})
 _UNBOUNDED_MODULES = frozenset({"importlib", "pkgutil", "runpy"})
+#: Of those, what reads a package's data files (which its closure holds) or installed metadata.
+_DATA_MODULES = frozenset({"importlib.resources", "importlib.metadata"})
 
 
 class _Unbounded(Exception):
@@ -1781,10 +1784,12 @@ class _Unbounded(Exception):
 def _code_closure(reader: Reader, registration: Registration) -> str | None:
     """A memoized callable of the package's own code keyed on that code: its module and every
     module of its package that module imports at module scope, transitively, each with the
-    package `__init__`s Python runs first, plus its declared memo version and dependencies. An
-    edit to any other file leaves it unchanged. None when those imports do not bound what it runs
-    (an import elsewhere, a dynamic import or a read of its files, a module that is not Python
-    source); its machine then keys the memo by the package's whole source."""
+    package `__init__`s Python runs first; every file of those modules' packages that is not
+    Python source (what a module reads beside itself); and its declared memo version and
+    dependencies. An edit to any other file leaves it unchanged. None when those do not bound
+    what it runs (an import elsewhere, a dynamic import, `exec`/`eval`, a top-level module's own
+    path, a module that is not Python source); its machine then keys the memo by the package's
+    whole source."""
     if registration.module.trusted:
         return None
     seen: dict[str, Module] = {}
@@ -1803,7 +1808,22 @@ def _code_closure(reader: Reader, registration: Registration) -> str | None:
     except _Unbounded:
         return None
     definitions = [(name, memo_identity.normalized(seen[name].source)) for name in sorted(seen)]
+    definitions += _data_files(reader, {name.split(".")[0] for name in seen})
     return _declared_identity(reader, registration, definitions)
+
+
+def _data_files(reader: Reader, packages: Set[str]) -> list[tuple[str, str]]:
+    """Every file under the directories of the top-level `packages` that is not Python source,
+    by its path there and its content."""
+    found: dict[str, str] = {}
+    directories = {d.resolve(): d for package in packages for d in _directories(reader, package)}
+    for directory in directories.values():
+        for path in directory.rglob("*"):
+            if "__pycache__" in path.parts or path.suffix in (".py", ".pyc") or not path.is_file():
+                continue
+            name = path.relative_to(directory.parent).as_posix()
+            found.setdefault(name, hashlib.sha256(path.read_bytes()).hexdigest())
+    return [(f"data:{name}", digest) for name, digest in sorted(found.items())]
 
 
 def _closure_module(reader: Reader, name: str) -> Module | None:
@@ -1815,10 +1835,13 @@ def _closure_module(reader: Reader, name: str) -> Module | None:
             return None
         raise _Unbounded from None
     scope = {id(stmt) for stmt in _module_scope(module.tree.body)}
+    top_level = "." not in name and not module.is_package
     for node in ast.walk(module.tree):
         if isinstance(node, (ast.Import, ast.ImportFrom)) and id(node) not in scope:
             raise _Unbounded
-        if isinstance(node, ast.Name) and node.id in _UNBOUNDED_NAMES:
+        if isinstance(node, ast.Name) and (
+            node.id in _UNBOUNDED_NAMES or (top_level and node.id in _FILE_NAMES)
+        ):
             raise _Unbounded
     return module
 
@@ -1835,7 +1858,7 @@ def _closure_imports(reader: Reader, module: Module) -> list[str]:
             base = reader._import_base(module, stmt)
             if base is None:
                 raise _Unbounded
-            names = [base]
+            names = [base] if base != "importlib" else [f"importlib.{a.name}" for a in stmt.names]
             for alias in stmt.names if reader._own(base.split(".")[0]) else ():
                 if alias.name == "*" and _directories(reader, base):
                     raise _Unbounded
@@ -1843,7 +1866,7 @@ def _closure_imports(reader: Reader, module: Module) -> list[str]:
                     names.append(f"{base}.{alias.name}")
         for name in names:
             parts = name.split(".")
-            if parts[0] in _UNBOUNDED_MODULES:
+            if parts[0] in _UNBOUNDED_MODULES and ".".join(parts[:2]) not in _DATA_MODULES:
                 raise _Unbounded
             if reader._own(parts[0]):
                 found += [".".join(parts[: depth + 1]) for depth in range(len(parts))]
@@ -1880,6 +1903,11 @@ def _declared_identity(
                 version = reader.fold(module, node)
             elif isinstance(node, (ast.Tuple, ast.List)):
                 dependencies.extend((module, element) for element in node.elts)
+            elif isinstance(found := reader.resolve(module, node), Assigned) and isinstance(
+                found.value, (ast.Tuple, ast.List)
+            ):
+                # A name bound to the tuple at module scope (`_MEMO = ("pkg", "pkg.model")`).
+                dependencies.extend((found.module, element) for element in found.value.elts)
             else:
                 return None
         if not isinstance(version, str):
