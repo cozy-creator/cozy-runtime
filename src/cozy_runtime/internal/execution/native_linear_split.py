@@ -182,7 +182,8 @@ def split_declared(module: Any, value: object, cuts: tuple[Cut, ...]) -> Tensor 
     leaf: Any = module
     if (
         leaf.provider != INT8_CONVROT or leaf.out_dtype != x.dtype
-        or "forward" in vars(leaf) or leaf._forward_pre_hooks
+        or "forward" in vars(leaf) or "linear" in vars(leaf)
+        or leaf._compiled_call_impl is not None or leaf._forward_pre_hooks
         or torch.nn.modules.module._global_forward_pre_hooks
         or torch.nn.modules.module._global_forward_hooks
         or any(type(hook) is not lora.Hook or not hook._cozy_baked
