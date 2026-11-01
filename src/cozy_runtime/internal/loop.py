@@ -32,6 +32,8 @@ from __future__ import annotations
 import bisect
 import ctypes
 import gc
+import hashlib
+import marshal
 import sys
 import threading
 import time
@@ -56,6 +58,7 @@ from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import kernel_ready
 from cozy_runtime.internal.accel import ResidencyError
+from cozy_runtime.internal.execution import phase as working_phase
 from cozy_runtime.internal.prepared import (
     PreparedRepeat,
     PreparedSequence,
@@ -243,7 +246,7 @@ class Loops:
             cache = None
         bypass = graphs.BYPASS.set(True)
         try:
-            loop = _Loop(step, steps, phases, on_step, before, after)
+            loop = _Loop(step, steps, phases, on_step, before, after, key)
             if cache is None:
                 self._run(loop, state, carried, inputs, key, row)
             else:
@@ -532,6 +535,7 @@ class _Loop:
     on_step: Callable[[int], object] | None
     before: Callable[..., object] | None
     after: Callable[..., object] | None
+    key: Hashable | None = None
 
     def phase(self, i: int) -> Any:
         return _NONE if self.phases is None else self.phases[i - self.steps.start]
@@ -542,18 +546,44 @@ class _Loop:
         next stage (Qwen-Image's last 0.9 s step into its decode)."""
         if not len(indices):
             return
-        index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-        for i in indices:
-            if ctx is not None:
-                ctx.raise_if_cancelled()
-            index.fill_(i)
-            if (cached := stepcache._RUN.get()) is not None:
-                cached.begin(i - self.steps.start)
-            _call(self.step, index, tensors, self.phase(i))
-            if self.on_step is not None:
-                self.on_step(i)
-        if index.is_cuda:
-            torch.cuda.current_stream(index.device).synchronize()
+        request = _REQUEST.get()
+        measured = request is not None and tensors[0].is_cuda
+        models = _phase_models() if measured else ()
+        mode: working_phase.Mode = (
+            "preparation" if request is not None and request.idle else "eager"
+        )
+        configuration = _phase_configuration(self, indices, tensors, models) if measured else None
+        epoch = LANDED[0]
+        with working_phase.observing(
+            tensors[0].device.index if measured else None, mode,
+            request.working_phases if measured and request is not None else None,
+        ) as observation:
+            index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+            for i in indices:
+                if ctx is not None:
+                    ctx.raise_if_cancelled()
+                index.fill_(i)
+                if (cached := stepcache._RUN.get()) is not None:
+                    cached.begin(i - self.steps.start)
+                _call(self.step, index, tensors, self.phase(i))
+                if self.on_step is not None:
+                    self.on_step(i)
+            if index.is_cuda:
+                torch.cuda.current_stream(index.device).synchronize()
+            if observation is not None and mode == "eager":
+                if ctx is not None and ctx.cancelled:
+                    observation.invalidate("cancelled")
+                else:
+                    actual = _phase_configuration(self, indices, tensors, models)
+                    if epoch != LANDED[0] or actual != configuration:
+                        observation.invalidate("dispatch_changed")
+                    observation.complete(actual)
+        if (
+            observation is not None and observation.result is not None
+            and (key := observation.result.get("key")) is not None
+            and request is not None and models
+        ):
+            request.memory.remember_working_phase(str(key), models)
 
     def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
         _once(self.before, tensors)
@@ -1005,6 +1035,51 @@ def _layouts(tensors: tuple[Any, ...]) -> tuple[Any, ...]:
     return tuple((tuple(t.shape), tuple(t.stride()), t.dtype, t.device) for t in tensors)
 
 
+def _phase_models() -> tuple[Model, ...]:
+    scopes = _LOCAL_SCOPES.get()
+    if not scopes:
+        return ()
+    owner, _, components = scopes[-1]
+    placement: Any = owner._cozy_residency
+    return tuple(
+        placement.models[name]
+        for name in components
+        if placement is not None and name in placement.models
+    )
+
+
+def _phase_configuration(
+    loop: _Loop, indices: range, tensors: tuple[Any, ...], models: tuple[Model, ...]
+) -> str | None:
+    # The loop key declares its non-tensor inputs; unknown closures cannot train a reusable key.
+    code = getattr(loop.step, "__code__", None)
+    if loop.key is None or code is None or not models or stepcache._RUN.get() is not None:
+        return None
+    identities = tuple((model.content, model.wanted_identity()) for model in models)
+    if any(identity is None for _, identity in identities):
+        return None
+    from cozy_runtime.internal import attention
+
+    roots = {model.content: model.module for model in models}
+    selected = attention.chosen(roots)
+    artifacts = attention.observed(roots).artifacts or {}
+    return working_phase.configuration((
+        "denoise_loop", loop.step.__module__, loop.step.__qualname__,
+        hashlib.sha256(marshal.dumps(code)).hexdigest(), loop.key, identities,
+        tuple((tuple(t.shape), tuple(t.stride()), str(t.dtype), str(t.device),
+               t.storage_offset()) for t in tensors),
+        (indices.start, indices.stop, indices.step), tuple(loop.phase(i) for i in indices)
+        if loop.phases is not None else None,
+        selected.sites, selected.dense, selected.exact,
+        tuple((name, row.get("artifact"), row.get("key"))
+              for name, row in sorted(artifacts.items())),
+        str(torch.get_default_dtype()), torch.is_autocast_enabled("cuda"),
+        str(torch.get_autocast_dtype("cuda")), torch.get_float32_matmul_precision(),
+        torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.allow_tf32, torch.are_deterministic_algorithms_enabled(),
+    ))
+
+
 def _eligible(
     ctx: Context | None, steps: range, tensors: tuple[Any, ...]
 ) -> tuple[tuple[Model, ...], str]:
@@ -1065,6 +1140,22 @@ def _submit(
     row: dict[str, Any],
 ) -> None:
     """One native submission covering `indices`; no fallback once it is accepted."""
+    request = _REQUEST.get()
+    with working_phase.observing(
+        program.tensors[0].device.index if request is not None else None, "replay",
+        request.working_phases if request is not None else None,
+    ):
+        _submit_native(program, sequence, indices, loop, ctx, row)
+
+
+def _submit_native(
+    program: _Program,
+    sequence: PreparedSequence,
+    indices: range,
+    loop: _Loop,
+    ctx: Context,
+    row: dict[str, Any],
+) -> None:
     with torch.no_grad():
         program.counter.fill_(indices.start)
     row["at_ms"].setdefault("submitted", _now())
@@ -1429,6 +1520,11 @@ class _Graph:
         context = CURRENT.get()
         pause = context._pause_stall_watch if context is not None else None
         try:
+            request = _REQUEST.get()
+            self._contexts.enter_context(working_phase.observing(
+                self.device.index if request is not None else None, "capture",
+                request.working_phases if request is not None else None,
+            ))
             self._contexts.enter_context(pause() if pause is not None else nullcontext())
             self._contexts.enter_context(kernel_ready.recording())
             stream.wait_stream(self._caller)

@@ -601,6 +601,7 @@ class Model:
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
         self.closed = False
+        self.working_phase_keys: set[str] = set()
         # Once a block streams, later blocks cannot grow the resident prefix again.
         self.prefix: int | None = None
         #: the block entered last, whose successor in execution order `_enter` records (`next`)
@@ -738,6 +739,7 @@ class Model:
                 return
             if self.users or any(b.count or b.retained for b in self.groups()):
                 raise ResidencyError("retire graph bindings and active model uses before unload")
+            self.memory.forget_working_phases(self)
             self.closed = True
             for handle in self.handles:
                 handle.remove()
@@ -1370,6 +1372,7 @@ class Memory:
         self.last_room: dict[str, object] | None = None
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
+        self._working_phase_owners: dict[str, set[Model]] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
@@ -1552,6 +1555,29 @@ class Memory:
     def held(self) -> int:
         """Torch's reserve plus this process's weight pages: what a room limits."""
         return self._figures()[1]
+
+    def remember_working_phase(self, key: str, models: tuple[Model, ...]) -> None:
+        """A semantic observation lives only while its participating model owners do."""
+        with self.lock:
+            owners = self._working_phase_owners.setdefault(key, set())
+            for model in models:
+                owners.add(model)
+                model.working_phase_keys.add(key)
+
+    def forget_working_phases(self, model: Model) -> None:
+        """Model close runs after its execution; native retirement is metadata-only."""
+        with self.lock:
+            # If another scope is active, a refused retirement retains the ownership request.
+            for key in model.working_phase_keys:
+                if self._working_phase_owners[key] == {model}:
+                    vt.phase_forget(self.device.index or 0, key)
+            for key in tuple(model.working_phase_keys):
+                owners = self._working_phase_owners[key]
+                if owners == {model}:
+                    del self._working_phase_owners[key]
+                else:
+                    owners.remove(model)
+                model.working_phase_keys.remove(key)
 
     def _room_floor(self) -> int:
         """What this process must keep to go on: its call's working set as it has peaked (across
@@ -3656,6 +3682,7 @@ class Request:
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
+        self.working_phases: list[dict[str, Any]] = []
         self.peak = 0
         #: Working allocation peak over the whole request, kept across cut-site resets: the
         #: least room its call runs in (`Memory._room_floor`)
@@ -3838,6 +3865,7 @@ class Request:
             "trace": list(self.trace),
             "trace_scope": "fills",
             "phases": list(self.phase_changes),
+            "working_phases": list(self.working_phases),
             "phase_policy_supported": self.memory.phase_supported,
             "room_first_pass": self.room_first,
             "gathered": self.gathered,

@@ -1,0 +1,1 @@
+Record native working-demand observations for completed, explicitly keyed eager loops. Failed or retried work, preparation, capture and replay cannot train successful records. Production sizing and prefetch remain unchanged pending qualified native decisions.
