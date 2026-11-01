@@ -10,6 +10,7 @@ from __future__ import annotations
 import enum
 import inspect
 import math
+import re
 import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence, Set
@@ -302,6 +303,11 @@ class Slot:
     weights: bool = False
 
 
+def described(docstring: str | None) -> str:
+    """A docstring's first paragraph on one line: what `cozy run <package>` lists."""
+    return " ".join(re.split(r"\n\s*\n", (docstring or "").strip(), maxsplit=1)[0].split())
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Declaration:
     """One callable as a reader found it: by import (a `Surface`) or from source alone.
@@ -314,6 +320,8 @@ class Declaration:
     export: str
     payload_type: object
     result_type: object
+    description: str = ""
+    """The first paragraph of its docstring, whitespace collapsed (`described`)."""
     contexts: tuple[str, ...] = ()
     services: tuple[str, ...] = ()
     """Each injected service's capability, as often as the signature names it."""
@@ -670,6 +678,7 @@ def analyze(
         name=name,
         module=fn.__module__,
         export=fn.__name__,
+        description=described(fn.__doc__),
         fn=fn,
         is_async=inspect.iscoroutinefunction(fn),
         params=tuple(params),

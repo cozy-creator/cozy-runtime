@@ -161,6 +161,8 @@ class WeightsOutputDeclaration(msgspec.Struct, frozen=True, kw_only=True):
 
 class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     name: str
+    #: Its docstring's first paragraph, for people choosing a function.
+    description: str = ""
     request: JsonValue
     result: JsonValue
     #: A child task (`app.child_task`): cozy and TensorD refuse it as a root request.
@@ -257,6 +259,8 @@ def entry(declared: Declaration) -> dict[str, Json]:
         "request": schema.request(payload),
         "result": schema.render(result, decoded_bounds=True),
     }
+    if declared.description:
+        doc["description"] = declared.description
     if declared.child_task:
         doc["internal"] = True
     if declared.slots:
