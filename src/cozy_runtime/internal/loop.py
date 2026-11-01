@@ -366,8 +366,32 @@ class Loops:
         with _laps(row):
             pre, body = _warm(loop, tensors, scope, ctx)
             program, refused, began = None, "", time.perf_counter()
+            recording_kind = "whole call"
             if not _unkept(known, loop, ident, shape, body):
                 program, refused = _record_first(loop, tensors, len(work), scope, pre, body, ident)
+            elif (
+                len(scope) == 1 and scope[0].blocks
+                and any(_unresident(model, paths) for model, paths in body.items())
+                and _phase_configuration(loop, loop.steps[1:], tensors, scope) is not None
+            ):
+                recording_kind = "same-request streamed call"
+                program, refused = _record_first_streamed(loop, tensors, len(work), scope, ctx)
+        if program is not None and program.mode == "streamed":
+            row.update(
+                mode="streamed", stages=program.stages, blocks=program.blocks,
+                same_request=True, reused=False,
+                capture_ms=round((time.perf_counter() - began) * 1000, 3),
+            )
+            # These definitions belong only to this request. Native stages own weight pins
+            # while they execute; retaining a whole resident binding would defeat streaming.
+            try:
+                for sequence, first, count in program.first:
+                    _submit(program, sequence, range(first, first + count), loop, ctx, row)
+            finally:
+                program.close()
+            _after(loop, tensors, scope, known, shape)
+            _back(work, program.tensors)
+            return
         if program is not None:
             row.update(
                 mode=program.mode,
@@ -391,7 +415,7 @@ class Loops:
                     return
             row["dropped"] = "released"
         if refused:
-            row["refusals"].append(f"whole call on its first call: {refused}")
+            row["refusals"].append(f"{recording_kind} on its first call: {refused}")
             if refused.startswith(_UNRECORDABLE):
                 # Its idle recording would meet the same error and keep the next call waiting
                 # on it (an RTX 3060's SDXL w1 559 ms, then its own doomed recording).
@@ -771,6 +795,56 @@ def _record(
     finally:
         if not recording._finished:
             recording.close()
+
+
+def _record_first_streamed(
+    loop: _Loop,
+    tensors: tuple[Any, ...],
+    nwork: int,
+    scope: tuple[Model, ...],
+    ctx: Context,
+) -> tuple[_Program | None, str]:
+    """Record only the remaining steps on this request's already advanced state.
+
+    The first eager step is never repeated. A preparation refusal closes every partial
+    definition before the existing eager remainder; accepted native execution never retries.
+    No program is kept for another call or queued to record at idle.
+    """
+    mutable = tensors[:nwork]
+    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+    recording = PreparedSequence.record()
+    recording.__enter__()
+    failure: BaseException | None = None
+    try:
+        ctx.raise_if_cancelled()
+        recording._prepare((*mutable, counter))
+        vt.trim(torch.cuda.current_device())
+        _lap("prepare")
+        with recording.capturing():
+            parts, blocks = _record_streamed(
+                recording, loop, loop.steps[1:], tensors, mutable, counter, scope,
+            )
+        made = recording.finish_parts(
+            outputs=mutable, parts=[(begin, end, passes) for begin, end, passes, _, _ in parts],
+        )
+        _lap("finish")
+    except BaseException as error:
+        failure = error
+    if failure is not None:
+        unwind(failure)
+        _drop_stages(recording)
+        recording.close()
+        gc.collect()
+        vt.trim(torch.cuda.current_device())
+        if (why := _refusal(failure)) is None:
+            raise failure
+        return None, why
+    first = tuple(
+        (sequence, start, count)
+        for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
+    )
+    stages = sum(end - begin for begin, end, _, _, _ in parts)
+    return _Program(first, None, "streamed", tensors, counter, None, stages, blocks), ""
 
 
 def _yield_point() -> None:

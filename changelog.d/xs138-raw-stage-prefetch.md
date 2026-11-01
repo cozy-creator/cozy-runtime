@@ -1,0 +1,1 @@
+Record explicitly keyed single-component nonresident denoise loops as same-request native stages after their eager first step. Resident execution and cross-call graph-retention restrictions remain unchanged; native raw-prefetch admission and full-model timing/H2D qualification are required before accepting the cutover.
