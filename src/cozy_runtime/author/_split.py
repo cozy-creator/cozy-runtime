@@ -9,7 +9,6 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
-
 if TYPE_CHECKING:
     from cozy_runtime.author.kernels import ResidualFFN
 

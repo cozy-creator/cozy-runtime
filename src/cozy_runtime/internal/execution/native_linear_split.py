@@ -55,6 +55,40 @@ class _Geometry:
                 f"/tail:{self.tail.rows}:{self.tail.kind}:{self.tail.config}")
 
 
+def launch_projection(
+    library: prebuilt.Prebuilt, data: Tensor, scale: Tensor, bias: Tensor | None,
+    part: Tensor, target: Tensor, dispatch: _Dispatch,
+    q: Tensor | None, scales: Tensor | None, scratch: Any, stream_id: int,
+) -> None:
+    """Execute one already-selected projection into supplied storage; no allocation/policy."""
+    device = part.device.index or 0
+    half = part.dtype == torch.float16
+    width, channels = part.shape[-1], data.shape[0]
+    count = part.numel() // width
+    native = _kernels._gemm
+    bias_ptr = 0 if bias is None else bias.data_ptr()
+    if dispatch.kind == 1:
+        code = native.gemv(
+            device, part.data_ptr(), half, data.data_ptr(), scale.data_ptr(),
+            bias_ptr, target.data_ptr(), half, count, channels, width, stream_id,
+        )
+    else:
+        assert q is not None and scales is not None
+        code = native.quantize(
+            device, False, part.data_ptr(), half, q.data_ptr(), scales.data_ptr(),
+            count, width, 0, 0, 0, 0, 1, 0, 0.0, 0, 0, stream_id,
+        )
+        library._check(code, "the committed quantization")
+        code = native.gemm(
+            device, 0, False, q.data_ptr(), scales.data_ptr(), data.data_ptr(),
+            scale.data_ptr(), bias_ptr, target.data_ptr(), channels, half,
+            count, channels, width, dispatch.config, scratch, stream_id,
+        )
+    # A refusal ends this operation. It cannot choose another kernel or replay
+    # already-written output rows through the legacy catch policy.
+    library._check(code, "the committed projection")
+
+
 @dataclass
 class _Plan:
     module: Any
@@ -106,10 +140,7 @@ class _Plan:
         x, geometry = self.x, self.geometry
         device = x.device.index or 0
         rows, width, channels = x.numel() // x.shape[-1], x.shape[-1], self.data.shape[0]
-        half = x.dtype == torch.float16
         stream_id = int(self.stream.cuda_stream)
-        native = _kernels._gemm
-        bias_ptr = 0 if self.bias is None else self.bias.data_ptr()
         with torch.cuda.device(device), torch.cuda.stream(self.stream):
             result = torch.empty((*x.shape[:-1], channels), dtype=x.dtype, device=x.device)
             flat, output = x.view(rows, width), result.view(rows, channels)
@@ -130,26 +161,10 @@ class _Plan:
                 count = min(geometry.rows, rows - at)
                 dispatch = geometry.full if count == geometry.rows else geometry.tail
                 part, target = flat.narrow(0, at, count), output.narrow(0, at, count)
-                if dispatch.kind == 1:
-                    code = native.gemv(
-                        device, part.data_ptr(), half, self.data.data_ptr(), self.scale.data_ptr(),
-                        bias_ptr, target.data_ptr(), half, count, channels, width, stream_id,
-                    )
-                else:
-                    assert q is not None and scales is not None
-                    code = native.quantize(
-                        device, False, part.data_ptr(), half, q.data_ptr(), scales.data_ptr(),
-                        count, width, 0, 0, 0, 0, 1, 0, 0.0, 0, 0, stream_id,
-                    )
-                    self.library._check(code, "the committed quantization")
-                    code = native.gemm(
-                        device, 0, False, q.data_ptr(), scales.data_ptr(), self.data.data_ptr(),
-                        self.scale.data_ptr(), bias_ptr, target.data_ptr(), channels, half,
-                        count, channels, width, dispatch.config, scratch, stream_id,
-                    )
-                # A refusal ends this operation. It cannot choose another kernel or replay
-                # already-written output rows through the legacy catch policy.
-                self.library._check(code, "the committed projection")
+                launch_projection(
+                    self.library, self.data, self.scale, self.bias, part, target,
+                    dispatch, q, scales, scratch, stream_id,
+                )
             return result
 
 
