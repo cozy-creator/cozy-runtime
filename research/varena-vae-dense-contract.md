@@ -143,3 +143,40 @@ Concrete unknowns before implementation/qualification:
 4. Any actual biasless projection or effective disabled-Lt/TunableOp route prevents this narrow provider from closing all six projections. Handle it as a separate researched contract, not a hidden fallback.
 
 This proposal requires review before native implementation. It preserves the previous source findings and changes no Runtime behavior.
+
+## Query before matrix-buffer allocation: revised boundary
+
+This addendum supersedes the proposal's requirement to know every matrix address at query time and its per-operation handle option. The caller now guarantees that every planned A/B/C/D binding is at least 256-byte aligned. NVIDIA exposes minimum-alignment preferences for those four matrices; Torch caps its actual-pointer preference at 256. Therefore this exact VAE can query matrix geometry with all four preferences set to 256, then validate actual bindings before the block writes. Neither the heuristic API nor `AlgoCheck` takes A/B/C/D data pointers. No activation, matrix-cast, output, or workspace variant needs to exist merely to supply those four addresses. This is an inference from the explicit preference contract under the caller's alignment guarantee. [NVIDIA alignment preferences](https://docs.nvidia.com/cuda/archive/13.1.0/cublas/index.html#cublasltmatmulpreferenceattributes-t), [Torch capped alignment](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/cuda/detail/CublasLtUtils.h#L283-L291).
+
+**Bias is different.** The supplied SDK's NVIDIA `cublasLt.h`, lines 1323–1340, explicitly says that non-dereferencing routines such as `cublasLtMatmulAlgoGetHeuristic` use `BIAS_POINTER`'s value to determine expected alignment. There is no reviewed `MIN_ALIGNMENT_BIAS_BYTES` preference. The default pointer is NULL, but that default does not document NULL as valid for a BIAS-epilogue heuristic/check, or equivalent to a later aligned bias address. Do not infer that `AlgoCheck` removes this dependency or that it validates actual memory alignment. [Installed primary header](/home/fidika/cozy/.worktrees/cozy-creator/xs138-p0-torch/.task/torch-sdk/2.14.0+cu130-08187d9e/site-packages/nvidia/cu13/include/cublasLt.h:1323).
+
+The header comes from installed `nvidia-cublas 13.1.1.3`, despite Torch's `+cu130` suffix; its SHA-256 is `8be43fbf48625b98b8562d7df394e6af0d7ee1c05beeb5333577d5e33182fa3e`. Earlier CUDA 13.0 documentation remains supporting API evidence, but this exact installed header is the authoritative bias-pointer evidence. Actual loaded-library version still needs root-owned verification during qualification.
+
+Official NVIDIA implementations do not establish a null-bias planning shortcut: TransformerEngine sets the real bias pointer before querying; nvmath's stateful bias example supplies bias to `plan`, then permits compatible operand/bias replacement for later execution. Replacement after a valid plan is different from initially querying without a valid bias contract. [TransformerEngine source](https://github.com/NVIDIA/TransformerEngine/blob/63451d6b868af0db6dd879cf5dd6a3f9bf14e1f9/transformer_engine/common/gemm/cublaslt_gemm.cu#L695-L807), [nvmath bias plan/reset example](https://github.com/NVIDIA/nvmath-python/blob/bb27be436099b36559bae15a307c94d76b12e902/examples/linalg/advanced/matmul/example13_epilog_stateful_reset.py#L23-L45).
+
+The smallest source-supported alternative is to admit one **actual execution bias-cast buffer** before querying. For this VAE's largest output width, its payload is exactly `16384 * sizeof(fp16) = 32768` bytes, with 256-byte-aligned base. Every supported biased projection may reuse its prefix after preceding consumers complete. Set that real, retained address as `BIAS_POINTER` for each query/check and leave it unchanged during execution; the committed phase copies each projection's FP32 bias into this same buffer before its GEMM. No dummy address, null-as-alignment fiction, or surrogate buffer is involved. No tensor values need to be written before query, because the heuristic does not dereference the bias pointer. This is a proposed buffer-lifetime schedule, not a measured implementation.
+
+A concrete sequence is:
+
+```text
+obtain shared device Lt context
+admit/retain the actual 32 KiB bias-cast buffer
+query each geometry using real bias pointer and A/B/C/D alignment=256
+    -> selected algorithm and checked workspace bytes per geometry
+select variant and admit its complete remaining working storage
+bind/validate actual X/W/Y/workspace, policy, shapes, and alignment
+commit phase
+    cast bias into retained buffer; execute selected operation
+    repeat for the next sequential projection
+release working leases only after consuming streams/graphs drain
+```
+
+If preparation cannot admit even this actual bias destination before choosing a variant, the source-only result is **not yet closed**. A fully pointer-free biased query needs an explicit vendor guarantee or a changed API; a successful experimental null query alone would not establish that guarantee. Reserving only an unmapped virtual address is also not proposed here: the reviewed contract calls it a device-memory pointer, and no source was found that promises arbitrary unbacked VAs are accepted.
+
+### One shared Lt context per device owner
+
+Use one independently owned Lt context for the existing Runtime CUDA device/context owner, shared by all matrix plans and variants. `query(context, shape, policy, real_bias_ptr, alignments)` returns a plan retaining that context; it does not call `cublasLtCreate`. Plan release destroys only its operation/layout/preference resources. The context has one final teardown after every plan, pending launch, and graph borrower drains. It should be initialized once at the existing preparation boundary, not created/destroyed during variant enumeration. This corrects the earlier per-plan handle option: NVIDIA documents that creation allocates internal resources and destruction implicitly synchronizes the device. [NVIDIA context lifecycle](https://docs.nvidia.com/cuda/archive/13.1.0/cublas/index.html#cublasltcreate).
+
+The shared context owns the Lt handle; each active phase/graph retains its actual bias and workspace storage separately. Share one bias/workspace only under existing Domain serialization and completion fences; concurrent phases need separate storage or must serialize. Retiring one plan or graph must not destroy the shared handle, clear another plan's buffers, or invoke Torch workspace-map clears. Domain's current control/library streams and never-replayed owner graph remain responsible for its stock-library resources; the new context is an independent retained resource under the same final drain ordering. Preparation and execution still require the correct CUDA device/context, but no Torch thread-local handle lookup or stock workspace borrowing is involved.
+
+Status: matrix shape-plus-alignment planning is supported under the stated 256-byte contract; planning without a bias pointer remains unproven. The revised proposal needs only one real 32 KiB bias destination before querying, rather than preallocating every variant. No code, build, CUDA call, or numerical qualification was performed for this addendum.
