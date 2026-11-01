@@ -829,6 +829,14 @@ def backend(device: Device | int) -> str:
 SOL = Local(sol_attention, lambda query, *_: backend(query.device))
 
 
+def policy(layout: AttentionLayout, site: Site) -> tuple[bool, bool]:
+    """The model's dense/exact paths, shared by ordinary and closed native execution."""
+    def on(paths: tuple[str, ...]) -> bool:
+        return any(site.path == p or site.path.startswith(p + ".") for p in paths)
+
+    return on(layout.dense_paths), on(layout.exact_paths) or outlier_keys(site.keys)
+
+
 def _execute(
     query: Tensor,
     key: Tensor,
@@ -849,11 +857,8 @@ def _execute(
     key gain has outlier channels (`outlier_keys`) is an exact path too."""
     import torch
 
-    def on(paths: tuple[str, ...]) -> bool:
-        return any(site.path == p or site.path.startswith(p + ".") for p in paths)
-
-    dense_path = on(layout.dense_paths)
-    if on(layout.exact_paths) or outlier_keys(site.keys):
+    dense_path, exact_path = policy(layout, site)
+    if exact_path:
         said = _SAID.get()
         if said is not None and "exact:" + site.path not in said:
             said["exact:" + site.path] = "exact"
