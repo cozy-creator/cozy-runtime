@@ -58,7 +58,7 @@ existing path only before native selection/execution.
 
 ## Qualification boundary
 
-Source and native formation checks passed; this checkpoint has no GPU result.
+Source, native formation and the closed SM89 operator GPU checks passed.
 The new GEMM was built from `ebc25419a` with the pinned manylinux/CUDA/CUTLASS
 inputs. Its SHA256 is
 `9523c5070bd1646f43b505e0ce0bb05670d7b39f8d7e4be3a52846e2b7a81d3e`.
@@ -75,14 +75,45 @@ A CPU smoke check imports the actual Runtime/fixture, verifies unbaked Hook adds
 its delta, baked Hook skips the getter, fill factor reads remain active, and leaves
 CUDA uninitialized. These checks do not substitute for GPU operation evidence.
 
-Creator's `linear-consumer` fixture (draft PR2365) supplies the real caller proof. Qualification must use a normal GPU app with an actual
-NativeLinear plus public `author.split` inside a real Request/eager phase, not a
-mocked context. Require multiple selected chunks including a ragged tail, exact
-query-versus-execution scratch, baked/unbaked hook behavior, minimum refusal before
-output allocation, dtype-appropriate numerical agreement, and same-process
-request/key cleanup. Full H3 is a later performance/quality gate.
+Creator's actual `linear-consumer` passed runs **24925** and **24926** in
+PID **1694** on an RTX 4090. Tested Runtime was `b2225f7f0`, TensorFS `0e05a2539`,
+and fixture `55759abf0`. [Creator PR2365](https://github.com/cozy-creator/cozy-creator/pull/2365)
+contains `linear-consumer/evidence/2026-11-01.json` with the complete records and
+exact artifact hashes.
 
-The changed `_gemm` binary requires a new targeted build. Its old binary cannot be
-reused. Other native modules and Triton artifacts may be reused only after exact
-source/toolchain/catalog/checker identity checks; all qualified 977 artifacts stay
-immutable. A fresh durable CMake cache is a first partial rebuild, not a cache hit.
+| Query rows | Actual automatic dispatch | Query and actual workspace request |
+| --- | --- | ---: |
+| 8193 | GEMM config 5 (Stream-K) | 33,554,944 bytes |
+| 4097 | GEMM config 1 | 0 |
+| 3 | GEMV | 0 |
+
+The real public split selected **8193 / 4097 / 2049** rows, including tails
+**8193 / 4096 / 2046**. Each exact leaf published after the existing eager stream
+completion, and each parent recorded one native choice. Observed leaf backing
+was **180 / 118 / 104 MiB**. The half-size selection needed 116 MiB of new backing,
+reusing a 24,576-byte slot in an already-backed 2 MiB slab. Outputs all matched
+the ordinary whole native result exactly, with relative L2 zero; the existing
+prebuilt acceptance budget remains 0.01 rather than a required byte-identity gate.
+
+At one byte below the legal minimum, the operation refused before any output or
+scratch allocation: **90,177,536 required / 90,177,535 available** bytes. The
+no-retry error was caught by the fixture, but the parent was correctly invalidated
+with `split_select_error` and no sample published. A real baked zero-delta LoRA
+hook performed no factor lookup and used the closed adapter; unbaked execution
+looked up factors three times, performed its update through the existing path,
+and published no closed leaf sample. Both output checks had relative L2 zero.
+
+Live allocation bytes returned exactly to the **17,039,360-byte** executor baseline,
+with two library owners, no pending bytes and no graph pools. The next request in
+the same PID confirmed that both prior request keys were already retired.
+
+Failed run **24923** remains preserved. The fixture called `phase_forget` inside
+an active unknown-key parent, which correctly refused retirement. Moving only
+fixture capacity-menu cleanup after `denoise_loop` closed the phase fixed the
+rerun; neither product binary nor any numerical/lifetime assertion changed.
+
+This is the closed operator proof. The parent was componentless, unknown and
+unpublished; it does not establish reusable named-model parent identity or full
+H3 quality/performance. Those remain real-model gates before broader migration.
+The qualified 977 cohort and b222 binaries/receipts remain immutable. Only the new
+GEMM was rebuilt; other modules and Triton artifacts retained their checked bytes.
