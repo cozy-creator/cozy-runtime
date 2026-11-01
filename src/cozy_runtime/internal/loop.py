@@ -1,4 +1,4 @@
-"""`author.denoise_loop` in the Runtime: eager, or one resident captured program.
+"""`author.denoise_loop`: eager, resident reuse, or same-request streamed stages.
 
 A call runs its site's kept program natively from start to end, else eagerly, for real, on the
 caller's stream (only recorded regions run on the recording's streams, which end with the program).
@@ -16,11 +16,12 @@ yet, or preempted) records the whole call before running any of it and runs it n
 start: one plan and no eager step. No idle period
 opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so a call queued behind
 another never waits for idle work. One that does not fit, or whose code cannot run outside its
-request, is not tried again for that layout, and the calls say why. A program that no call keeps is
-not recorded: the call runs eagerly. Resident, it costs no more per step than native execution saves
-(SDXL, Qwen-Image measured). Streamed (its blocks do not all stay on the device), its replay pays
-for neither its recording nor the extra reads the next request makes (Qwen-Image int8 1 MP on an RTX
-3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
+request, is not tried again for that layout, and the calls say why. An explicitly keyed loop of
+one nonresident component can instead record the remaining steps as same-request streamed stages,
+closed before its eager `after`; no call keeps that program. Other non-kept component loops stay
+eager. This streamed path needs new policy/performance qualification: the historical path did not
+repay recording and extra reads (Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s, native
+49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
 
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
 `before` and the first step run eagerly, then the rest natively. A refusal before submission drops
