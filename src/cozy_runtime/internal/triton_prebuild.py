@@ -2,7 +2,7 @@
 (`triton_kernels.shipped`): `python -m cozy_runtime.internal.triton_prebuild OUT [--launchers DIR]`,
 OUT being `cozy_runtime/_triton`, or `... OUT --package NAME`, OUT being `<NAME>/_triton`. It writes
 `OUT/<this Triton release>/`: run once per Triton served, each in its own environment
-(`scripts/prebuild-triton.sh`, `torch-triton.txt`), and the releases sit side by side.
+(`scripts/prebuild-triton.sh`, `cozy_runtime/torch-triton.txt`), and the releases sit side by side.
 
 The Runtime's: every set a card row runs (`machine_kernels.triton_sets`, the LoRA bake set, LM
 decode, MoE experts, tcgen05's Sol merge). A package's: every set its import declares (its fused

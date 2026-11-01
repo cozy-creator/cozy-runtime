@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Triton's CUDA launcher module (`cuda_utils`) for the Runtime's prebuilt Triton sets
 # (`python -m cozy_runtime.internal.triton_prebuild OUT --launchers DIR`): each served Triton's
-# (torch-triton.txt) driver.c, into DIR/<Triton release>/, built by Triton's own builder at this
+# (cozy_runtime/torch-triton.txt) driver.c, into DIR/<Triton release>/, built by Triton's own builder at this
 # host's C library floor, once per Python given, against an empty libcuda stub (a machine's driver
 # supplies the real one). Each module's driver.c digest goes beside it, so a launcher of another
 # Triton is never shipped.
@@ -10,7 +10,7 @@ destination=${1:?Usage: build-triton-launchers.sh DIR PYTHON...}; shift
 root=$(cd "$(dirname "$0")/.." && pwd)
 stub=$(mktemp -d)
 echo 'void cozy_libcuda_stub(void) {}' | "${CC:-cc}" -shared -x c -o "$stub/libcuda.so.1" -
-for triton in $(grep -o '^torch==[^ ]* triton==[^ ]*' "$root/torch-triton.txt" | cut -d' ' -f2); do
+for triton in $(grep -o '^torch==[^ ]* triton==[^ ]*' "$root/src/cozy_runtime/torch-triton.txt" | cut -d' ' -f2); do
   mkdir -p "$destination/${triton#triton==}"
   for python in "$@"; do
     "$python" -m pip install -q --root-user-action ignore "$triton"

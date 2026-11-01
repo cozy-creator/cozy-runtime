@@ -1,6 +1,7 @@
 # The torch releases worker images serve and the Triton each carries: the Hub's current image's and the
 # next image's, at most two (a third replaces the oldest). The Runtime wheel ships its prebuilt Triton
 # sets and launcher modules for each Triton (scripts/prebuild-triton.sh); kernels.yaml loads every
-# kernel module before each torch, on every run: this file is no part of the modules' cache key.
+# kernel module before each torch, on every run: this file is no part of the modules' cache key. It
+# ships in the wheel, so a package's release prebuilds its sets for the pairs of the Runtime it locks.
 torch==2.14.0 triton==3.8.0
 torch==2.15.0 triton==3.9.0

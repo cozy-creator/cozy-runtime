@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The Runtime's prebuilt Triton sets (`triton_prebuild`) for each Triton worker images serve
-# (torch-triton.txt, at most two): each in its own CPU environment, that pair's CPU torch and Triton
+# (cozy_runtime/torch-triton.txt, at most two): each in its own CPU environment, that pair's CPU torch and Triton
 # plus this source and its locked dependencies, into OUT/<Triton release>/ with
 # LAUNCHERS/<Triton release>/'s launcher modules. Triton's keys need a libcuda: an empty stub.
 set -euo pipefail
 out=${1:?Usage: prebuild-triton.sh OUT LAUNCHERS}; launchers=${2:?Usage: prebuild-triton.sh OUT LAUNCHERS}
 root=$(cd "$(dirname "$0")/.." && pwd)
-pairs=$(grep -o '^torch==[^ ]* triton==[^ ]*' "$root/torch-triton.txt")
+pairs=$(grep -o '^torch==[^ ]* triton==[^ ]*' "$root/src/cozy_runtime/torch-triton.txt")
 [ "$(wc -l <<< "$pairs")" -le 2 ] || { echo "torch-triton.txt serves at most two Tritons" >&2; exit 1; }
 scratch=$(mktemp -d); trap 'rm -rf "$scratch"' EXIT
 mkdir "$scratch/stub"

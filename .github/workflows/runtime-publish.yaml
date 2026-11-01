@@ -118,7 +118,7 @@ jobs:
           pattern: kernels-*
           path: kernels-out
       # The Runtime's own Triton sets compiled for every card row, CPU-only, for each Triton served
-      # (torch-triton.txt), with the kernels job's launcher modules (`triton_prebuild`).
+      # (cozy_runtime/torch-triton.txt), with the kernels job's launcher modules (`triton_prebuild`).
       - name: The Runtime's Triton sets, prebuilt
         working-directory: source
         run: bash scripts/prebuild-triton.sh "$GITHUB_WORKSPACE/kernels-out/kernels-linux-x86_64/cozy_runtime/_triton" "$GITHUB_WORKSPACE/kernels-out/kernels-linux-x86_64/triton-launchers"
@@ -200,7 +200,7 @@ jobs:
           name: kernels-linux-aarch64
           path: kernels-out
       # The Runtime's own Triton sets compiled for every card row, CPU-only, for each Triton served
-      # (torch-triton.txt), with the kernels job's launcher modules (`triton_prebuild`).
+      # (cozy_runtime/torch-triton.txt), with the kernels job's launcher modules (`triton_prebuild`).
       - name: The Runtime's Triton sets, prebuilt
         working-directory: source
         run: bash scripts/prebuild-triton.sh "$GITHUB_WORKSPACE/kernels-out/cozy_runtime/_triton" "$GITHUB_WORKSPACE/kernels-out/triton-launchers"

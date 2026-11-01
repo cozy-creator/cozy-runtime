@@ -85,7 +85,7 @@ jobs:
           path: kernels-out
           merge-multiple: true
       # The Runtime's own Triton sets compiled for every card row, CPU-only, for each Triton served
-      # (torch-triton.txt), with the kernels job's launcher modules (`triton_prebuild`).
+      # (cozy_runtime/torch-triton.txt), with the kernels job's launcher modules (`triton_prebuild`).
       - name: The Runtime's Triton sets, prebuilt
         if: env.WHEELS == 'true'
         working-directory: source
@@ -141,7 +141,7 @@ jobs:
           CARGO_NET_OFFLINE=true bash scripts/build-execution-native.sh modules
           python checks/kernel_modules.py modules --without _gemm --without _norm --without _fa3
           checks=()
-          for torch in $(grep -o '^torch==[^ ]*' torch-triton.txt); do
+          for torch in $(grep -o '^torch==[^ ]*' src/cozy_runtime/torch-triton.txt); do
             python -m venv "/tmp/$torch"
             "/tmp/$torch/bin/python" -m pip install -q "$torch" --index-url https://download.pytorch.org/whl/cpu
             checks+=(--torch-python "/tmp/$torch/bin/python")
@@ -174,7 +174,7 @@ jobs:
           floor = max((tuple(map(int, m.split("."))) for m in re.findall(r"GLIBC_([0-9.]+)", versions)), default=(0,))
           assert floor <= (2, 28), floor
           paths = sorted(p for p in Path("native/execution").rglob("*") if p.is_file() and "target" not in p.parts)
-          paths += [Path("scripts/build-execution-native.sh"), Path("kernels/toolchain.env"), Path("torch-triton.txt"), Path("checks/kernel_modules.py"), Path("src/cozy_runtime/_kernels/__init__.py"), Path(".github/workflows/dev-build.yaml")]
+          paths += [Path("scripts/build-execution-native.sh"), Path("kernels/toolchain.env"), Path("src/cozy_runtime/torch-triton.txt"), Path("checks/kernel_modules.py"), Path("src/cozy_runtime/_kernels/__init__.py"), Path(".github/workflows/dev-build.yaml")]
           digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
           receipt = {
               "source_commit": subprocess.check_output(["git", "-c", "safe.directory=/src", "rev-parse", "HEAD"], text=True).strip(),
