@@ -42,9 +42,6 @@ class Room(Protocol):
     @property
     def cached(self) -> int: ...
 
-    @property
-    def budget(self) -> int | None: ...
-
 
 def pieces(units: int, level: int) -> int:
     """Units a piece holds at `level` (2^level pieces, the last one short)."""
@@ -68,16 +65,14 @@ _FLOOR_SHARE = 64
 
 def choose(finest: int, need: Need, room: Room) -> tuple[int, str]:
     """The coarsest level of 0..`finest` that fits beside every weight the running phase holds:
-    within free, Torch-cached and other phases' idle bytes ("cold"), and within the activation
-    budget a re-planned phase sets (`Memory._replan`). Else ("floor") the coarsest within 1/64 of
-    the finest's bytes, the only level that may evict the running phase's own weights. A split is
+    within driver-free, working-cache and other phases' idle bytes ("cold"). Else ("floor")
+    the coarsest within 1/64 of the finest's bytes, the only level that may evict the running
+    phase's own weights. A split is
     exact, so finer pieces cost launches, never output; a coarse piece that evicted the phase's
     weights cost their refill every pass (H3 15 s on a 24 GB card: an 11 GB whole attention call
     left the 21 GB DiT 9 GB resident). Driver-free bytes alone made every site cut to its floor
     once Torch held the card (RTX 3070, h3-8gb sessions 40463894354 and 40471655517)."""
     room_bytes = room.free + room.cached + room.cold
-    if room.budget is not None:
-        room_bytes = min(room_bytes, room.budget)
     level = next((n for n in range(finest + 1) if need(n, room.granularity) <= room_bytes), None)
     if level is not None:
         return level, "cold"

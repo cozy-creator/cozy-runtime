@@ -1,0 +1,1 @@
+Pass the norm operation's actual saved CUDA stream to native split selection and begin, allowing exact-class in-order cache reuse without crediting unrelated pending memory or trimming matched cache. Execution geometry, completion ownership and retry behavior are unchanged; paired native and GPU qualification remain required.
