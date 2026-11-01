@@ -599,7 +599,16 @@ class _Loop:
                         with vt.external_callback(index.device.index):
                             self.on_step(i)
             if index.is_cuda:
-                torch.cuda.current_stream(index.device).synchronize()
+                stream = torch.cuda.current_stream(index.device)
+                stream.synchronize()
+                if (
+                    observation is not None and mode == "eager"
+                    and (
+                        observation.completion_stream is None
+                        or int(observation.completion_stream.cuda_stream) != int(stream.cuda_stream)
+                    )
+                ):
+                    observation.invalidate("completion_stream_changed")
             if observation is not None and mode == "eager":
                 if ctx is not None and ctx.cancelled:
                     observation.invalidate("cancelled")

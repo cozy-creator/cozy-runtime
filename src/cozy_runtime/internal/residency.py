@@ -1372,7 +1372,7 @@ class Memory:
         self.last_room: dict[str, object] | None = None
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
-        self._working_phase_owners: dict[str, set[Model]] = {}
+        self._working_phase_owners: dict[str, set[Model | Request]] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
@@ -1555,16 +1555,16 @@ class Memory:
         """Torch's reserve plus this process's weight pages: what a room limits."""
         return self._figures()[1]
 
-    def remember_working_phase(self, key: str, models: tuple[Model, ...]) -> None:
-        """A semantic observation lives only while its participating model owners do."""
+    def remember_working_phase(self, key: str, models: tuple[Model | Request, ...]) -> None:
+        """A semantic observation lives with its model owners, or its componentless request."""
         with self.lock:
             owners = self._working_phase_owners.setdefault(key, set())
             for model in models:
                 owners.add(model)
                 model.working_phase_keys.add(key)
 
-    def forget_working_phases(self, model: Model) -> None:
-        """Model close runs after its execution; native retirement is metadata-only."""
+    def forget_working_phases(self, model: Model | Request) -> None:
+        """Owner close runs after its execution; native retirement is metadata-only."""
         with self.lock:
             # If another scope is active, a refused retirement retains the ownership request.
             for key in model.working_phase_keys:
@@ -3586,6 +3586,7 @@ class Memory:
                 with self.lock:
                     self._rate.update(self._refills)  # the pages this request refilled
                     self._refills.clear()
+                self.forget_working_phases(request)
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
@@ -3634,6 +3635,8 @@ class Request:
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
         self.working_phases: list[dict[str, Any]] = []
+        self.working_phase_keys: set[str] = set()
+        self.working_splits: dict[str, dict[str, Any]] = {}
         self.peak = 0
         #: Working allocation peak over the whole request, kept across cut-site resets: the
         #: least room its call runs in (`Memory._room_floor`)
@@ -3817,6 +3820,7 @@ class Request:
             "trace_scope": "fills",
             "phases": list(self.phase_changes),
             "working_phases": list(self.working_phases),
+            "working_splits": list(self.working_splits.values()),
             "phase_policy_supported": self.memory.phase_supported,
             "room_first_pass": self.room_first,
             "gathered": self.gathered,

@@ -422,13 +422,20 @@ def swiglu(launch: Launch, entry: TritonEntry, gate: Any, up: Any) -> Any:
 
 
 def channel_norm(
-    launch: Launch, entry: TritonEntry, x: Any, weight: Any, bias: Any, scale: float, eps: float
+    launch: Launch, entry: TritonEntry, x: Any, weight: Any, bias: Any, scale: float, eps: float,
+    *, out: Any = None,
 ) -> Any:
     """`entry`'s channel norm of `[batch, channels, ...]` `x` (weights `[channels, 1, ...]`)."""
     batch, channels = int(x.shape[0]), int(x.shape[1])
     plane = x.numel() // max(batch * channels, 1)
     x = _aligned(x.contiguous())
-    out = torch.empty_like(x)
+    if out is None:
+        out = torch.empty_like(x)
+    elif (
+        out.shape != x.shape or out.dtype != x.dtype or out.device != x.device
+        or not out.is_contiguous() or out.data_ptr() % 16
+    ):
+        raise ValueError("channel norm output must match the contiguous aligned input layout")
     launch(
         channel_norm_kernel,
         (triton.cdiv(plane, CHANNEL_BLOCK), batch, 1),

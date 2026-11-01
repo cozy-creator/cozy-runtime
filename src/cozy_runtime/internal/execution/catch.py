@@ -117,6 +117,11 @@ def piece() -> None:
         _local.scopes[-1].ordinals.clear()
 
 
+def uncommitted_scope() -> bool:
+    """Legacy outer cuts can still change geometry after a refusal; they are not native menus."""
+    return bool(_local.scopes)
+
+
 def checkpoint() -> None:
     """Stop at an owned eager boundary; group cancellation stays with mirrored calls.
 
@@ -133,7 +138,10 @@ def checkpoint() -> None:
 
 def short(exc: BaseException) -> bool:
     """A pure site's allocation refusal outside capture."""
-    return fault(exc) is Fault.OOM and not _capturing()
+    return (
+        not getattr(exc, "varena_no_retry", False)
+        and fault(exc) is Fault.OOM and not _capturing()
+    )
 
 
 def _clear(exc: BaseException) -> None:

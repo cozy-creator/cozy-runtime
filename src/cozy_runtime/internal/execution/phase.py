@@ -55,8 +55,9 @@ def configuration(value: object) -> str | None:
 
 
 class Observation:
-    def __init__(self, device: int, token: int) -> None:
+    def __init__(self, device: int, token: int, completion_stream: Any = None) -> None:
         self.device, self.token = device, token
+        self.completion_stream = completion_stream
         self.key: str | None = None
         self.result: dict[str, Any] | None = None
         self.completed = False
@@ -90,8 +91,8 @@ class Observation:
     def complete(self, configuration: object | None) -> None:
         self.completed = True
         self.key = self.key_for(configuration, "runtime.eager/1")
-        if self.key is None:
-            self.invalidate("unrepresented_configuration")
+        # Unknown phase identity prevents its watermark from publishing, but does not erase
+        # a valid completion proof for fully represented leaf sites on the same stream.
 
 
 _ACTIVE: ContextVar[Observation | None] = ContextVar("cozy_working_phase", default=None)
@@ -107,6 +108,17 @@ def choice(value: object) -> None:
         active.choice(value)
 
 
+def completion_owner(device: int, stream: int) -> int | None:
+    """Only the eager owner's actual synchronized stream can qualify a submitted leaf."""
+    active = _ACTIVE.get()
+    if (
+        active is not None and active.device == device and active.completion_stream is not None
+        and int(active.completion_stream.cuda_stream) == stream
+    ):
+        return active.token
+    return None
+
+
 @contextmanager
 def observing(
     device: int | None, mode: Mode, records: list[dict[str, Any]] | None
@@ -115,7 +127,10 @@ def observing(
         yield None
         return
     # Actual adaptive cuts are unknown at entry; no preceding pass is a promise about this one.
-    observation = Observation(device, vt.phase_enter(device, None, mode=mode))
+    observation = Observation(
+        device, vt.phase_enter(device, None, mode=mode),
+        torch.cuda.current_stream(device) if mode == "eager" else None,
+    )
     token = _ACTIVE.set(observation)
     succeeded = False
     try:
