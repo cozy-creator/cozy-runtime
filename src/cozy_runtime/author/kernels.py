@@ -181,6 +181,24 @@ class SingleUseProjection:
 
 
 @dataclass(frozen=True, slots=True)
+class LayerScaleBlock:
+    """One installed fused layer-scale block, with the complete batch-local operation.
+
+    The producer names its actual module/input/rotary operands and the two direct
+    parameter slots providing the layer scales. Its declared fused layout supplies
+    the norms, six biased dense projections, value-first SwiGLU and selected attention.
+    No allocating callback, byte budget or window size is supplied. Runtime may
+    decline before invocation; after acceptance the original body is never replayed.
+    """
+
+    module: Any
+    hidden: Any
+    rotary: Any
+    gate_msa: str
+    gate_mlp: str
+
+
+@dataclass(frozen=True, slots=True)
 class ResidualFFN:
     """One row-local residual/norm/SwiGLU tail, written into an exclusive caller output.
 
@@ -283,6 +301,7 @@ _SHARED: ContextVar[tuple[_Shared, ...]] = ContextVar("cozy_quantize_once", defa
 
 # A closed Runtime row menu owns one normal module invocation, never sibling operands.
 _LINEAR_SPLIT: ContextVar[Any | None] = ContextVar("cozy_native_linear_split", default=None)
+_BLOCK_SPLIT: ContextVar[Any | None] = ContextVar("cozy_native_block_split", default=None)
 
 
 @contextmanager
@@ -474,6 +493,7 @@ __all__ = [
     "ROWWISE_FP8",
     "KernelsUnavailable",
     "Launch",
+    "LayerScaleBlock",
     "Plan",
     "PreQuantized",
     "ResidualFFN",

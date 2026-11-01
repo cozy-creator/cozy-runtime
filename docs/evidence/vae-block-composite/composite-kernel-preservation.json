@@ -1,0 +1,17 @@
+{
+  "passed": true,
+  "base": "5948028be94883423bf2b7c850171613998597e2",
+  "unchanged_jit_bodies_and_definition_lines": [
+    "_normed",
+    "_rb",
+    "_rh",
+    "_round",
+    "channel_norm_kernel",
+    "head_norm_rope_kernel",
+    "norm_modulate_kernel",
+    "swiglu_kernel"
+  ],
+  "kernel_identity": "sha256:cc66a3347c9e0b8cfe30ed32cfe70974e806866ca4ccfdd99415ac0ac76eaea8",
+  "current_source_sha256": "8b843977f667d18b9d05f6fb7c663a45e7ddb7e22dc5c4a9c8f38d661ed960bb",
+  "scope": "exact kernel AST/definition-line and actual imported VAE kernel identity; not GPU numeric qualification"
+}

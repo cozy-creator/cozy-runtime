@@ -143,7 +143,66 @@ compare complete outputs under the established numerical budget. Source and meta
 checks do not qualify CUDA execution or full-model performance.
 
 
-The initial source now implements the prepared provider and status bridge, but no VAE
-consumer is enabled. The real meta-device block/layout check passes with CUDA
-uninitialized (docs/evidence/vae-block-source). Native compilation, dense execution and
-the complete admitted fused consumer remain pending.
+The source now implements the prepared provider, status bridge and standalone complete
+fused consumer. The real meta-device block/layout check passes with CUDA uninitialized
+(docs/evidence/vae-block-source). Dense and fused CUDA execution remain unqualified.
+
+
+The complete consumer continues on `codex/xs138-p2-vae-composite` from fresh mastercb6
+plus the frozen provider5948028be. Provider source and the31-case dense fixture remain
+immutable for root-owned build/qualification. The implementation uses an explicit package
+`_BlockRows` intent intercepted at the installed fused forward after its ordinary source
+hooks, with only the current block bound, one invocation, and all actual buffers checked
+before the first write. Existing row/RoPE/SwiGLU kernel entries accept caller outputs
+without changing their numerical bodies or cache identities.
+
+
+## Remaining outer decoder policy
+
+The actual package wraps `_decode_tiles` in legacy `split(..., Cut(0))` before reaching
+any `_BlockRows`. `catch.uncommitted_scope()` is true for every active legacy Scope,
+so preserving that guard prevents the new closed block from adopting under this parent.
+The observed outer wrapper had21 calls (20 whole,1 split); replacing it with a fixed
+whole call would discard an actually used capacity fallback.
+
+The bounded block proof remains useful but is not full-H3 adoption. The outer operation
+contains post-quant Conv3d, proj-in/register assembly,36 blocks, final norm/proj-out and
+layout copies. Its actual allocation/choice contract must be migrated separately, or
+an explicit irrevocable parent-choice transition must be reviewed with its changed
+failure semantics. Do not clear the scope flag, infer closure from a successful trace,
+or opt in the whole decoder through the block declaration.
+
+The declaration now names the two actual direct layer-scale parameter slots; no
+opaque modulation callback runs inside the admitted body. Optional row/RoPE/SwiGLU
+outputs preserve every original JIT body, definition line and the imported VAE kernel
+identity. The native block executor and real package declaration are implemented;
+full-H3 adoption remains blocked by the outer decoder policy described above.
+
+
+## Lazy vendor loading after the first native build
+
+Root built exact5948028be successfully, but its CPU-only import before Torch failed
+because a direct `libcuda.so.1` dependency requires a driver at import. The prototype
+also carried a `/cublas/lib` build-tree RUNPATH. That artifact and failure remain
+preserved under outputs/xs138-p2-vae-block/native-5948028be.
+
+This successor follows Varena's existing dynamic CUDA loader: import creates no
+driver/Lt handle and resolves no vendor symbol. GPU preparation loads the real installed
+CUDA driver and cuBLASLt13 by their runtime library names; all calls retain their exact
+typed vendor statuses. Libraries stay loaded for their registered exit handlers and
+opaque borrowers. Context/descriptor/workspace ownership is unchanged. No driver stub
+is bundled and the native target has no direct vendor-library link or build-tree RUNPATH.
+Root built exact2a78 and verified581 native members (580 preserved plus `_dense`),
+Python3.12/3.13/3.14 CPU-only imports and controlled no-driver errors, with no vendor
+DT_NEEDED and no build RUNPATH. Those checks do not automatically qualify a later
+composite binary; GPU/numerical/library-allocation proof remains separate.
+
+
+The pre-launch consumer requires the current declaration/prepared-dense API rather
+than an old-Varena compatibility fallback. Unsupported live execution routes still
+remain migration work. Queries use only actual slot metadata and the retained bias
+destination before the sole module invocation; a genuine unsupported Lt query can
+decline before source hooks or numerical work. The body then reads and revalidates
+only its current block, chooses the native menu and validates all full/tail buffers
+before writes. It uses the actual framework stream explicitly and adds no per-operation
+synchronization. Shared context destruction is final-owner teardown.

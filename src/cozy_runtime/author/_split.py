@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
     from cozy_runtime.author.kernels import (
+        LayerScaleBlock,
         ProjectedHeads,
         ResidualFFN,
         SingleUseProjection,
@@ -58,7 +59,8 @@ def install(runtime: Pieces | None) -> None:
 
 def split(
     fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None,
-    intent: ResidualFFN | ProjectedHeads | SparseProjectedHeads | SingleUseProjection | None = None,
+    intent: (ResidualFFN | ProjectedHeads | SparseProjectedHeads
+             | SingleUseProjection | LayerScaleBlock | None) = None,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -79,6 +81,7 @@ def split(
     runtime = _RUNTIME
     if intent is not None:
         from cozy_runtime.author.kernels import (
+            LayerScaleBlock,
             ProjectedHeads,
             ResidualFFN,
             SingleUseProjection,
@@ -91,6 +94,13 @@ def split(
             declared_intent = getattr(runtime, "split_projected_heads", None)
         elif type(intent) is SparseProjectedHeads:
             declared_intent = getattr(runtime, "split_sparse_projected_heads", None)
+        elif type(intent) is LayerScaleBlock:
+            if x is not intent.hidden:
+                raise ValueError("layer-scale block intent must name this exact input")
+            declared_intent = getattr(runtime, "split_layer_scale_block", None)
+            if runtime is not None and not callable(declared_intent):
+                raise RuntimeError(
+                    "installed execution requires the declared layer-scale block API")
         elif type(intent) is SingleUseProjection:
             if fn is not intent.module or x is not intent.hidden:
                 raise ValueError("single-use projection intent must name this exact call")

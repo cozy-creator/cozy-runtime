@@ -2,6 +2,7 @@
 from typing import Any
 
 API: int
+NOT_SUPPORTED: int
 
 class Error(RuntimeError):
     domain: str

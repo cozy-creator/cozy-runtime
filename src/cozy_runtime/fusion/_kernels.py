@@ -347,6 +347,14 @@ def _tables(*tables: Any) -> list[Any]:
     return found
 
 
+def _target(value: Any, shape: Any, dtype: Any, device: Any) -> Any:
+    """A preallocated kernel output, checked without allocating or changing its layout."""
+    if (tuple(value.shape) != tuple(shape) or value.dtype is not dtype or value.device != device
+            or not value.is_contiguous() or value.data_ptr() % 16):
+        raise ValueError("fused output must match the contiguous aligned shape/dtype/device")
+    return value
+
+
 def norm_modulate(
     launch: Launch,
     entry: TritonEntry,
@@ -360,6 +368,8 @@ def norm_modulate(
     branch: Any = None,
     other: Any = None,
     gate: Any = None,
+    hidden_out: Any = None,
+    norm_out: Any = None,
 ) -> tuple[Any, Any]:
     """`entry`'s chain over rows of `x`: `(hidden, out)`. `hidden` is `x + act(gate) * (branch
     [+ other])` (or `x` without a residual); `out` the [modulated] norm (None for a residual
@@ -369,9 +379,17 @@ def norm_modulate(
     n = int(rows.shape[0])
     c = {**entry.constexprs, "X16": int(entry.constexprs["F16"] and x.dtype is torch.float16)}
     residual, row = (torch.float32, torch.float16) if c["F16"] else (rows.dtype, rows.dtype)
-    hidden = rows.new_empty(rows.shape, dtype=residual) if c["BRANCHES"] else rows
     normed = c["NORM"] != NONE
-    out = rows.new_empty(rows.shape, dtype=row) if normed else hidden
+    if (hidden_out is not None and not c["BRANCHES"]) or (norm_out is not None and not normed):
+        raise ValueError("a fused caller output must name a residual or normalized result")
+    if hidden_out is not None:
+        hidden = _target(hidden_out, rows.shape, residual, rows.device)
+    else:
+        hidden = rows.new_empty(rows.shape, dtype=residual) if c["BRANCHES"] else rows
+    if norm_out is not None:
+        out = _target(norm_out, rows.shape, row, rows.device)
+    else:
+        out = rows.new_empty(rows.shape, dtype=row) if normed else hidden
     branch = _dense(branch, width) if c["BRANCHES"] else rows
     other = _dense(other, width) if c["BRANCHES"] == 2 else branch
     tables = iter(_tables(gate, scale, shift))
@@ -399,12 +417,13 @@ def norm_modulate(
     return hidden.view_as(x), out.view_as(x) if normed else None
 
 
-def swiglu(launch: Launch, entry: TritonEntry, gate: Any, up: Any) -> Any:
+def swiglu(launch: Launch, entry: TritonEntry, gate: Any, up: Any, *, out: Any = None) -> Any:
     """`silu(gate) * up`, one read of each and one write."""
     width = int(gate.shape[-1])
     gate_rows, up_rows = _rows(gate, width), _rows(up, width)
     n = int(gate_rows.shape[0])
-    out = torch.empty(n, width, dtype=gate.dtype, device=gate.device)
+    out = (torch.empty(n, width, dtype=gate.dtype, device=gate.device) if out is None
+           else _target(out, (n, width), gate.dtype, gate.device))
     launch(
         swiglu_kernel,
         (n, triton.cdiv(width, SWIGLU_BLOCK), 1),
@@ -460,12 +479,14 @@ def head_norm_rope(
     eps: float,
     tables: Any,
     dtype: Any,
+    *, out: Any = None,
 ) -> Any:
     """Per-head RMSNorm of `[batch, seq, heads, head_dim]` `x`, then `entry`'s RoPE by
     `tables` (`rope_tables`), in `dtype`."""
     batch, seq, heads, head_dim = (int(d) for d in x.shape)
     flat = _aligned(x.reshape(batch * seq, heads * head_dim))
-    out = torch.empty(flat.shape, dtype=dtype, device=flat.device)
+    out = (torch.empty(flat.shape, dtype=dtype, device=flat.device) if out is None
+           else _target(out, flat.shape, dtype, flat.device))
     cos, sin, stride_token, stride_channel = tables
     c = {**entry.constexprs, "X32": int(x.dtype is torch.float32)}
     launch(
