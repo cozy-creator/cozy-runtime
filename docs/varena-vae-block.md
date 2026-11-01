@@ -147,3 +147,12 @@ The initial source now implements the prepared provider and status bridge, but n
 consumer is enabled. The real meta-device block/layout check passes with CUDA
 uninitialized (docs/evidence/vae-block-source). Native compilation, dense execution and
 the complete admitted fused consumer remain pending.
+
+
+The complete consumer continues on `codex/xs138-p2-vae-composite` from fresh mastercb6
+plus the frozen provider5948028be. Provider source and the31-case dense fixture remain
+immutable for root-owned build/qualification. The next seam is an explicit package
+`_BlockRows` intent intercepted at the installed fused forward after its ordinary source
+hooks, with only the current block bound, one invocation, and all actual buffers checked
+before the first write. Existing row/RoPE/SwiGLU kernel entries will gain caller outputs
+without changing their numerical bodies or cache identities.
