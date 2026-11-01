@@ -567,6 +567,7 @@ class Model:
         self.sites = _sites(module)
         self.handles: list[Any] = []
         self.holds: list[Hold] = []
+        self.bindings: weakref.WeakSet[Binding] = weakref.WeakSet()
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
         self.closed = False
@@ -800,6 +801,7 @@ class Binding:
         self._load_storage: dict[_Block, int] = {}
         self._load_source: Weights | None = None
         self._load_target_strides: list[tuple[_Site, tuple[int, ...]]] = []
+        model.bindings.add(self)
 
     def valid(self) -> bool:
         return not self._invalid()
@@ -893,6 +895,14 @@ class Binding:
         return ""
 
     def prepare_load(self, *, stage: bool = False) -> Any:
+        from cozy_runtime.internal.execution import ownership
+
+        memory = self.model.memory
+        guard = ownership.preparing(memory.device.index or 0, "prepared input load")
+        with guard if memory.cuda else nullcontext():
+            return self._prepare_load_owned(stage=stage)
+
+    def _prepare_load_owned(self, *, stage: bool = False) -> Any:
         """Create capture-private views for immutable raw blocks, without reading weights.
 
         Ordinary block data is never changed here. The native slot atomically retains ready
@@ -1101,6 +1111,15 @@ class Binding:
 
     @contextmanager
     def prepare(self, stream: Any = None) -> Iterator[Binding]:
+        from cozy_runtime.internal.execution import ownership
+
+        memory = self.model.memory
+        guard = ownership.preparing(memory.device.index or 0, "prepared weight binding")
+        with (guard if memory.cuda else nullcontext()), self._prepare_owned(stream) as held:
+            yield held
+
+    @contextmanager
+    def _prepare_owned(self, stream: Any = None) -> Iterator[Binding]:
         memory = self.model.memory
         if memory.capturing():
             raise ResidencyError("prepare graph weights before capture")
@@ -2413,9 +2432,13 @@ class Memory:
         release: Callable[[], None] | None = None,
     ) -> Region:
         del kind, sets, spill  # Cache semantics belong to its explicit owner, not an allocator.
-        region = Region(self, owner, release)
-        self.regions.add(region)
-        return region
+        from cozy_runtime.internal.execution import ownership
+
+        guard = ownership.preparing(self.device.index or 0, "Runtime cache registration")
+        with guard if self.cuda else nullcontext():
+            region = Region(self, owner, release)
+            self.regions.add(region)
+            return region
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
         if self.device.type == "mps" and reclaim:
@@ -3455,15 +3478,19 @@ class Memory:
     ) -> Iterator[Request]:
         """`others`: the process's other constructions' sets, whose cached weights are not this
         request's working set (`Request.sample`)."""
-        request = Request(self, id, idle, others)
-        request.plan(plan)
-        with self.lock:
-            if not idle and any(not other.idle for other in self.requests):
-                request.overlap = True
-                for other in self.requests:
-                    if not other.idle:
-                        other.overlap = True
-            self.requests.add(request)
+        from cozy_runtime.internal.execution import ownership
+
+        guard = ownership.preparing(self.device.index or 0, "request registration")
+        with guard if self.cuda else nullcontext():
+            request = Request(self, id, idle, others)
+            request.plan(plan)
+            with self.lock:
+                if not idle and any(not other.idle for other in self.requests):
+                    request.overlap = True
+                    for other in self.requests:
+                        if not other.idle:
+                            other.overlap = True
+                self.requests.add(request)
         self._take_room()  # a raise or lift that came between calls binds this one from its start
         token = _REQUEST.set(request)
         try:

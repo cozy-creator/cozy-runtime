@@ -15,6 +15,8 @@ from typing import Any, Literal
 import tensorfs.varena.torch as vt
 import torch
 
+from cozy_runtime.internal.execution import ownership
+
 Mode = Literal["eager", "capture", "replay", "preparation"]
 
 
@@ -61,6 +63,8 @@ class Observation:
         self.key: str | None = None
         self.result: dict[str, Any] | None = None
         self.completed = False
+        self.completion_proven = False  # Set only after the actual owning stream synchronizes.
+        self.eager_commit: ownership.EagerCommit | None = None
         self.choices = 0
         self._cuts = hashlib.sha256()
 
@@ -121,16 +125,22 @@ def completion_owner(device: int, stream: int) -> int | None:
 
 @contextmanager
 def observing(
-    device: int | None, mode: Mode, records: list[dict[str, Any]] | None
+    device: int | None, mode: Mode, records: list[dict[str, Any]] | None,
+    *, committed_eager: tuple[Any, str] | None = None,
 ) -> Iterator[Observation | None]:
     if device is None or records is None:
         yield None
         return
+    if committed_eager is not None and mode != "eager":
+        raise RuntimeError("only eager execution can issue an eager ownership commit")
     # Actual adaptive cuts are unknown at entry; no preceding pass is a promise about this one.
     observation = Observation(
         device, vt.phase_enter(device, None, mode=mode),
         torch.cuda.current_stream(device) if mode == "eager" else None,
     )
+    if committed_eager is not None:
+        request, reason = committed_eager
+        observation.eager_commit = ownership.EagerCommit.issue(request, observation, reason)
     token = _ACTIVE.set(observation)
     succeeded = False
     try:

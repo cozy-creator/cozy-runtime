@@ -32,3 +32,24 @@ Required gates are real native clear/retention behavior at two capacities, actua
 Runtime cohort ownership, common/explicit/escaped Pins, source failure and clean
 exhaustion, followed by separately named full H3 and SDXL validation. No retention
 benefit or GPU result is claimed at this checkpoint.
+
+## Preserved ownership experiment, 2026-11-01
+
+This checkpoint remains a policy-neutral experiment. Production does not acquire
+`ownership.eager`, and no cache-window or retention formula is removed here.
+The guard records actual Runtime resource births and Loop-issued observations;
+its completion proof is separate from numerical/sample completion. An aborted or
+changed-stream execution must join outstanding work before retiring the claim.
+
+Source review subsequently established a smaller path for the requested window
+removal: it only removes early eviction, while native pin/loading/fence, actual
+capacity and graph-pool rules remain in force. The minimal retention cutover is
+therefore developed independently of this guard. This branch and its genuine
+Request/Loop fixture are preserved; neither is GPU-qualified or enabled.
+
+Validation at preservation: AST wrapper comparison retains the old function
+bodies after removing ownership claims; retention functions are unchanged.
+Targeted new-module Ruff/mypy pass. Full paired typing/lint results are recorded
+under `.task`; existing findings are not fixed opportunistically. The fixture
+uses actual Request/Loop, graph domains, cache/binding owners and queued GPU work,
+but no GPU run is claimed.

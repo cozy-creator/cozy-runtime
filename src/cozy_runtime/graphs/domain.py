@@ -88,6 +88,7 @@ class Domain:
         self.config: Any = None
         self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
+        _LIVE.add(self)
 
     def _stream(self) -> Any:
         pointer = ctypes.c_void_p()
@@ -125,6 +126,12 @@ class Domain:
         return guard(self.device)
 
     def initialize(self) -> None:
+        from cozy_runtime.internal.execution import ownership
+
+        with ownership.preparing(self.device, "graph domain initialization"):
+            self._initialize_owned()
+
+    def _initialize_owned(self) -> None:
         """Preparation, including the never-replayed owner, uses the admitted budget."""
         if why := self.refusal():
             raise Unavailable(why)
@@ -211,6 +218,8 @@ class Domain:
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
 
+
+_LIVE: weakref.WeakSet[Domain] = weakref.WeakSet()
 
 _LOCK = threading.RLock()
 _OWNERS: weakref.WeakKeyDictionary[Any, Domain] = weakref.WeakKeyDictionary()

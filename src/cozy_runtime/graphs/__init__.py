@@ -76,55 +76,60 @@ def capture(
     Bindings and outputs remain caller-owned. The measured eager working peak seeds pool
     capacity; a larger actual capture refuses cleanly instead of mapping inside capture.
     """
-    graph = torch.cuda.CUDAGraph()
-    current = torch.cuda.current_stream()
-    stream, work = owner.control, owner.stream
-    stream.wait_stream(current)
-    stream.wait_stream(work)
-    failure: BaseException | None = None
-    try:
-        with (
-            kernel_ready.recording(),
-            torch.utils._python_dispatch._disable_current_modes(),
-            vt.graph(
-                graph, pool=pool.handle, stream=stream,
-                reserve_bytes=domain.working_peak(owner.device),
-            ),
-        ):
-            owner.fork.record(stream)
-            work.wait_event(owner.fork)
-            with torch.cuda.stream(work):
-                try:
-                    step()
-                finally:
-                    owner.join.record(work)
-                    stream.wait_event(owner.join)
-    except Exception as exc:
-        failure = exc
-    current.wait_stream(stream)
-    current.wait_stream(work)
-    if failure is not None:
+    from cozy_runtime.internal.execution import ownership
+
+    with ownership.preparing(owner.device, "CUDA graph capture"):
+        graph = torch.cuda.CUDAGraph()
+        current = torch.cuda.current_stream()
+        stream, work = owner.control, owner.stream
+        stream.wait_stream(current)
+        stream.wait_stream(work)
+        failure: BaseException | None = None
         try:
-            graph.reset()
-        except Exception as cleanup:
+            with (
+                kernel_ready.recording(),
+                torch.utils._python_dispatch._disable_current_modes(),
+                vt.graph(
+                    graph,
+                    pool=pool.handle,
+                    stream=stream,
+                    reserve_bytes=domain.working_peak(owner.device),
+                ),
+            ):
+                owner.fork.record(stream)
+                work.wait_event(owner.fork)
+                with torch.cuda.stream(work):
+                    try:
+                        step()
+                    finally:
+                        owner.join.record(work)
+                        stream.wait_event(owner.join)
+        except Exception as exc:
+            failure = exc
+        current.wait_stream(stream)
+        current.wait_stream(work)
+        if failure is not None:
+            try:
+                graph.reset()
+            except Exception as cleanup:
+                if fault(failure) in (Fault.STICKY, Fault.DEVICE):
+                    failure.add_note(f"discarding its failed capture also failed: {cleanup}")
+                    raise failure from None
+                error = torch.AcceleratorError(
+                    f"failed capture could not be discarded safely: {cleanup}"
+                )
+                error.error_code = 999
+                raise error from failure
+        if isinstance(failure, Building | Yielded):
+            raise failure
+        if failure is not None:
             if fault(failure) in (Fault.STICKY, Fault.DEVICE):
-                failure.add_note(f"discarding its failed capture also failed: {cleanup}")
-                raise failure from None
-            error = torch.AcceleratorError(
-                f"failed capture could not be discarded safely: {cleanup}"
-            )
-            error.error_code = 999
-            raise error from failure
-    if isinstance(failure, Building | Yielded):
-        raise failure
-    if failure is not None:
-        if fault(failure) in (Fault.STICKY, Fault.DEVICE):
-            code = getattr(failure, "error_code", None)
-            if code not in (900, 901):
-                raise failure
-        return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
-    owner.graphs.add(graph)
-    return graph, ""
+                code = getattr(failure, "error_code", None)
+                if code not in (900, 901):
+                    raise failure
+            return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
+        owner.graphs.add(graph)
+        return graph, ""
 
 
 class _Recording:
@@ -496,44 +501,53 @@ class _Idle:
     def run(self, stop: Callable[[], bool]) -> bool:
         """Each queued job once, while `stop()` stays false; False when it turned true (the job
         it interrupted goes first next period)."""
-        self.stop, self.last, later = stop, time.perf_counter(), []
-        self.periods += 1
-        torch = sys.modules.get("torch")  # a job's ops yield only where torch runs them
-        token = _IDLE.set(self)
-        try:
-            while True:
-                with self.lock:
-                    if not self.jobs:
-                        return True
-                    job = self.jobs.popleft()
-                try:
-                    self.check()
-                    # A job that yields only at its own boundaries runs without the per-op
-                    # check: every torch call under a Python mode pays its dispatch.
-                    ops = torch is not None and getattr(job, "yields_per_op", True)
-                    with _yielding(torch)() if ops else nullcontext():
-                        done = job()
-                    if not done:
-                        later.append(job)
-                except Yielded:
-                    self.yields += 1
+        from cozy_runtime.internal.execution import ownership
+
+        with ownership.preparing(
+            placed_device().index or 0, "idle graph preparation", optional=True
+        ) as admitted:
+            if not admitted:
+                return False
+            self.stop, self.last, later = stop, time.perf_counter(), []
+            self.periods += 1
+            torch = sys.modules.get("torch")  # a job's ops yield only where torch runs them
+            token = _IDLE.set(self)
+            try:
+                while True:
                     with self.lock:
-                        self.jobs.appendleft(job)
-                    return False
-                except Exception as exc:  # one job's failure never ends the period (v16)
-                    if fault(exc) in (Fault.STICKY, Fault.DEVICE):
-                        raise  # the device itself failed: the executor ends (`_idle`)
-                    self.failures += 1
-                    say(
-                        f"idle:{type(exc).__name__}:{exc}",
-                        f"[graphs] an idle job failed and goes: {type(exc).__name__}: {exc}"[:400],
-                    )
-        finally:
-            _IDLE.reset(token)
-            self.queued.clear()
-            self.longest_ms = max(self.longest_ms, (time.perf_counter() - self.last) * 1e3)
-            with self.lock:
-                self.jobs.extend(later)
+                        if not self.jobs:
+                            return True
+                        job = self.jobs.popleft()
+                    try:
+                        self.check()
+                        # A job that yields only at its own boundaries runs without the per-op
+                        # check: every torch call under a Python mode pays its dispatch.
+                        ops = torch is not None and getattr(job, "yields_per_op", True)
+                        with _yielding(torch)() if ops else nullcontext():
+                            done = job()
+                        if not done:
+                            later.append(job)
+                    except Yielded:
+                        self.yields += 1
+                        with self.lock:
+                            self.jobs.appendleft(job)
+                        return False
+                    except Exception as exc:  # one job's failure never ends the period (v16)
+                        if fault(exc) in (Fault.STICKY, Fault.DEVICE):
+                            raise  # the device itself failed: the executor ends (`_idle`)
+                        self.failures += 1
+                        say(
+                            f"idle:{type(exc).__name__}:{exc}",
+                            f"[graphs] an idle job failed and goes: {type(exc).__name__}: {exc}"[
+                                :400
+                            ],
+                        )
+            finally:
+                _IDLE.reset(token)
+                self.queued.clear()
+                self.longest_ms = max(self.longest_ms, (time.perf_counter() - self.last) * 1e3)
+                with self.lock:
+                    self.jobs.extend(later)
 
     def document(self) -> dict[str, Any]:
         return {
@@ -940,23 +954,32 @@ def _queue(
     placed: Any,
 ) -> None:
     """A new signature waits for an idle period to record it (`capture_idle`)."""
-    layout = [
-        _Leaf(tuple(v.shape), v.stride(), v.dtype, v.device) if isinstance(v, torch.Tensor) else v
-        for v in leaves
-    ]
-    with recorder.lock:
-        if recorder.domain is None:
-            recorder.domain = (
-                placed[0].graph_domain(placed[1])
-                if placed is not None
-                else capture_domain(torch, module)
-            )
-        if key in recorder.queued or key in recorder.failed or key in recorder.judged:
+    from cozy_runtime.internal.execution import ownership
+
+    with ownership.preparing(
+        placed_device().index or 0, "graph signature queue", optional=True
+    ) as admitted:
+        if not admitted:
             return
-        pending = recorder.queued[key] = _Pending(
-            torch, weakref.ref(module), call, key, spec, layout
-        )
-    IDLE.add(pending)
+        layout = [
+            _Leaf(tuple(v.shape), v.stride(), v.dtype, v.device)
+            if isinstance(v, torch.Tensor)
+            else v
+            for v in leaves
+        ]
+        with recorder.lock:
+            if recorder.domain is None:
+                recorder.domain = (
+                    placed[0].graph_domain(placed[1])
+                    if placed is not None
+                    else capture_domain(torch, module)
+                )
+            if key in recorder.queued or key in recorder.failed or key in recorder.judged:
+                return
+            pending = recorder.queued[key] = _Pending(
+                torch, weakref.ref(module), call, key, spec, layout
+            )
+        IDLE.add(pending)
 
 
 #: `_replay`'s answer when the call runs as written

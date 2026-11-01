@@ -71,6 +71,9 @@ def _native_error(error: Exception) -> NoReturn:
     raise error
 
 
+_OWNERS: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
 class PreparedRepeat:
     """One recorded graph, repeated natively `steps` times: a stage of a PreparedSequence.
 
@@ -88,22 +91,26 @@ class PreparedRepeat:
         bindings: tuple[Any, ...],
         landed: int,
     ) -> None:
-        self._native, self.state, self.device, self.steps = native, state, device, steps
-        self._active: Execution | None = None
-        self._submission = threading.RLock()
-        self._dependencies, self._bindings = dependencies, bindings
-        self._closed = False
-        self._owned_bindings: tuple[Any, ...] = ()
-        self._binding_cleanup = ExitStack()
-        self._load: Any = None
-        self._capture_cache: dict[str, int] = {}
-        self._load_ordering_requested = "checked"
-        self._sequence_owner: Any = None
-        self._load_ordering = "checked"
-        self._landed = landed
-        # Native immutable capture traces add metadata ownership, never extra physical pins.
-        self._footprints: tuple[Any, ...] = ()
-        self._execution_key: str | None = None
+        from cozy_runtime.internal.execution import ownership
+
+        with ownership.preparing(device, "prepared definition registration"):
+            self._native, self.state, self.device, self.steps = native, state, device, steps
+            self._active: Execution | None = None
+            self._submission = threading.RLock()
+            self._dependencies, self._bindings = dependencies, bindings
+            self._closed = False
+            self._owned_bindings: tuple[Any, ...] = ()
+            self._binding_cleanup = ExitStack()
+            self._load: Any = None
+            self._capture_cache: dict[str, int] = {}
+            self._load_ordering_requested = "checked"
+            self._sequence_owner: Any = None
+            self._load_ordering = "checked"
+            self._landed = landed
+            # Native immutable capture traces add metadata ownership, never extra physical pins.
+            self._footprints: tuple[Any, ...] = ()
+            self._execution_key: str | None = None
+            _OWNERS.add(self)
 
     @staticmethod
     def _layout(tensor: Any) -> tuple[Any, ...]:
@@ -421,6 +428,24 @@ class PreparedSequence:
         repeat: tuple[int, int, int] | None = None,
         prefetch: bool = True,
     ) -> None:
+        from cozy_runtime.internal.execution import ownership
+
+        stages = tuple(stages)
+        if not stages or not isinstance(stages[0], PreparedRepeat):
+            self._initialize_owned(stages, outputs=outputs, repeat=repeat, prefetch=prefetch)
+            return
+        with ownership.preparing(stages[0].device, "prepared sequence construction"):
+            self._initialize_owned(stages, outputs=outputs, repeat=repeat, prefetch=prefetch)
+            _OWNERS.add(self)
+
+    def _initialize_owned(
+        self,
+        stages: Sequence[PreparedRepeat],
+        *,
+        outputs: Sequence[Any] | None = None,
+        repeat: tuple[int, int, int] | None = None,
+        prefetch: bool = True,
+    ) -> None:
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
@@ -540,6 +565,12 @@ class PreparedSequence:
         }
 
     def submit(self, context: Context | None = None) -> Execution:
+        from cozy_runtime.internal.execution import ownership
+
+        with ownership.preparing(self.device, "prepared sequence submission"):
+            return self._submit_owned(context)
+
+    def _submit_owned(self, context: Context | None = None) -> Execution:
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"

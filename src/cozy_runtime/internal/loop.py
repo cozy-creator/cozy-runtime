@@ -295,7 +295,7 @@ class Loops:
             scope, why = _eligible(ctx, steps, tensors)
             if why:
                 row["refusals"].append(why)
-                loop.eager_all(tensors, ctx)
+                loop.eager_all(tensors, ctx, committed_reason=why if _ranks() == 1 else None)
                 return
             assert ctx is not None
             site = (step.__code__, tuple(id(model) for model in scope))
@@ -423,7 +423,9 @@ class Loops:
                 with self._lock:
                     known.unfit.add(shape)
                     known.why[shape] = refused[:400]
-        loop.eager(loop.steps[1:], tensors, ctx)
+        loop.eager(
+            loop.steps[1:], tensors, ctx, committed_reason="no prepared program for this call"
+        )
         _after(loop, tensors, scope, known, shape)
         row["eager"] = self._queue(
             site, known, loop, tensors, len(work), scope, pre, body, ident, shape
@@ -495,28 +497,35 @@ class Loops:
         shape: Hashable,
     ) -> str:
         """Why the call ran eagerly: its whole call queued to record at idle, or why none does."""
-        if why := _unkept(known, loop, ident, shape, body):
-            return why
-        with self._lock:
-            if ident not in known.pending:
-                job = _IdleRecording(
-                    self,
-                    site,
-                    known,
-                    replace(loop, on_step=None),  # the call's progress hook stays with the call
-                    tuple(value.clone() for value in tensors),  # the program's own copies
-                    nwork,
-                    scope,
-                    pre,
-                    body,
-                    known.after.get(shape, {}),
-                    ident,
-                    _LOCAL_SCOPES.get()[-1],
-                    tuple(model.wanted_identity() for model in scope),
-                )
-                known.pending[ident] = job
-                graphs.IDLE.add(job)
-        return "resident: the whole call records at idle"
+        from cozy_runtime.internal.execution import ownership
+
+        with ownership.preparing(
+            scope[0].memory.device.index or 0, "idle loop program", optional=True
+        ) as admitted:
+            if not admitted:
+                return "eager retention owns this execution device"
+            if why := _unkept(known, loop, ident, shape, body):
+                return why
+            with self._lock:
+                if ident not in known.pending:
+                    job = _IdleRecording(
+                        self,
+                        site,
+                        known,
+                        replace(loop, on_step=None),  # the call's progress hook stays with the call
+                        tuple(value.clone() for value in tensors),  # the program's own copies
+                        nwork,
+                        scope,
+                        pre,
+                        body,
+                        known.after.get(shape, {}),
+                        ident,
+                        _LOCAL_SCOPES.get()[-1],
+                        tuple(model.wanted_identity() for model in scope),
+                    )
+                    known.pending[ident] = job
+                    graphs.IDLE.add(job)
+            return "resident: the whole call records at idle"
 
     def _install(self, site: Hashable, program: _Program, memory: Any) -> None:
         program.region = memory.region("denoise_loop", "program", release=program.close)
@@ -566,7 +575,14 @@ class _Loop:
     def phase(self, i: int) -> Any:
         return _NONE if self.phases is None else self.phases[i - self.steps.start]
 
-    def eager(self, indices: range, tensors: tuple[Any, ...], ctx: Context | None) -> None:
+    def eager(
+        self,
+        indices: range,
+        tensors: tuple[Any, ...],
+        ctx: Context | None,
+        *,
+        committed_reason: str | None = None,
+    ) -> None:
         """The steps in order, each reported (`on_step(i)`) once queued; the call returns once the
         last has run on the device. Returning with it still queued put its time into the caller's
         next stage (Qwen-Image's last 0.9 s step into its decode)."""
@@ -581,8 +597,12 @@ class _Loop:
         configuration = _phase_configuration(self, indices, tensors, models) if measured else None
         epoch = LANDED[0]
         with working_phase.observing(
-            tensors[0].device.index if measured else None, mode,
+            tensors[0].device.index if measured else None,
+            mode,
             request.working_phases if measured and request is not None else None,
+            committed_eager=(request, committed_reason)
+            if request is not None and mode == "eager" and committed_reason is not None
+            else None,
         ) as observation:
             index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
             for i in indices:
@@ -602,13 +622,16 @@ class _Loop:
                 stream = torch.cuda.current_stream(index.device)
                 stream.synchronize()
                 if (
-                    observation is not None and mode == "eager"
+                    observation is not None
+                    and mode == "eager"
                     and (
                         observation.completion_stream is None
                         or int(observation.completion_stream.cuda_stream) != int(stream.cuda_stream)
                     )
                 ):
                     observation.invalidate("completion_stream_changed")
+                elif observation is not None and mode == "eager":
+                    observation.completion_proven = True
             if observation is not None and mode == "eager":
                 if ctx is not None and ctx.cancelled:
                     observation.invalidate("cancelled")
@@ -618,15 +641,23 @@ class _Loop:
                         observation.invalidate("dispatch_changed")
                     observation.complete(actual)
         if (
-            observation is not None and observation.result is not None
+            observation is not None
+            and observation.result is not None
             and (key := observation.result.get("key")) is not None
-            and request is not None and models
+            and request is not None
+            and models
         ):
             request.memory.remember_working_phase(str(key), models)
 
-    def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
+    def eager_all(
+        self,
+        tensors: tuple[Any, ...],
+        ctx: Context | None,
+        *,
+        committed_reason: str | None = None,
+    ) -> None:
         _once(self.before, tensors)
-        self.eager(self.steps, tensors, ctx)
+        self.eager(self.steps, tensors, ctx, committed_reason=committed_reason)
         _once(self.after, tensors)
 
 
@@ -695,45 +726,57 @@ def _record_first(
     `first` runs its rest (from its second step, `after` included), `again` a later call. Its
     `after` has not run, so every scope model is held, and loaded first; (None, why) when
     refused, its attempt gone."""
-    own = tuple(value.clone() for value in tensors)
-    mutable = own[:nwork]
-    counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
-    every: dict[Model, tuple[str, ...]] = {model: ("",) for model in scope}
-    recording = PreparedSequence.record()
-    recording.__enter__()
-    failure: BaseException | None = None
-    try:
-        with ExitStack() as loading:
-            for model in scope:
-                if _unresident(model) and (hold := model.hold()) is not None:
-                    loading.callback(hold.release)  # the recording's bindings retain them
-            _lap("load")
-            recording._prepare((*mutable, counter))
-            vt.trim(torch.cuda.current_device())
-            _lap("prepare")
-            with recording.capturing():
-                parts, blocks = _record_resident(
-                    recording, loop, loop.steps[1:], own, mutable, counter, body, pre, every, True
+    from cozy_runtime.internal.execution import ownership
+
+    with ownership.preparing(tensors[0].device.index or 0, "denoise program recording"):
+        own = tuple(value.clone() for value in tensors)
+        mutable = own[:nwork]
+        counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
+        every: dict[Model, tuple[str, ...]] = {model: ("",) for model in scope}
+        recording = PreparedSequence.record()
+        recording.__enter__()
+        failure: BaseException | None = None
+        try:
+            with ExitStack() as loading:
+                for model in scope:
+                    if _unresident(model) and (hold := model.hold()) is not None:
+                        loading.callback(hold.release)  # the recording's bindings retain them
+                _lap("load")
+                recording._prepare((*mutable, counter))
+                vt.trim(torch.cuda.current_device())
+                _lap("prepare")
+                with recording.capturing():
+                    parts, blocks = _record_resident(
+                        recording,
+                        loop,
+                        loop.steps[1:],
+                        own,
+                        mutable,
+                        counter,
+                        body,
+                        pre,
+                        every,
+                        True,
+                    )
+                made = recording.finish_parts(
+                    outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
                 )
-            made = recording.finish_parts(
-                outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
-            )
-        _lap("finish")
-    except BaseException as error:
-        failure = error
-    if failure is not None:
-        unwind(failure)
-        _drop_stages(recording)
-        recording.close()
-        gc.collect()
-        vt.trim(torch.cuda.current_device())
-        if (why := _refusal(failure)) is None:
-            raise failure
-        return None, why
-    rest, again = made  # one pass of equal steps (no phases): its rest, then the reuse program
-    begin, end, _, first, count = parts[0]
-    first_part = ((rest, first, count),)
-    return _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks), ""
+            _lap("finish")
+        except BaseException as error:
+            failure = error
+        if failure is not None:
+            unwind(failure)
+            _drop_stages(recording)
+            recording.close()
+            gc.collect()
+            vt.trim(torch.cuda.current_device())
+            if (why := _refusal(failure)) is None:
+                raise failure
+            return None, why
+        rest, again = made  # one pass of equal steps (no phases): its rest, then the reuse program
+        begin, end, _, first, count = parts[0]
+        first_part = ((rest, first, count),)
+        return _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks), ""
 
 
 def _record(
@@ -746,65 +789,68 @@ def _record(
 ) -> _Program | None:
     """A componentless loop: `before` and the first step eagerly, then the rest recorded; None
     when the recording was refused, after the loop ran eagerly to its end."""
-    if key is not None:  # the program owns copies; this call's values go in and out
-        tensors = tuple(value.clone() for value in tensors)
-    mutable = tensors[: len(work)]
-    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    steps = loop.steps
-    _once(loop.before, tensors)
-    _lap("before")
-    loop.eager(steps[:1], tensors, ctx)
-    _lap("first_step")
-    rest = steps[1:]
-    recording = PreparedSequence.record()
-    recording.__enter__()
-    try:
-        why = None
+    from cozy_runtime.internal.execution import ownership
+
+    with ownership.preparing(tensors[0].device.index or 0, "denoise program recording"):
+        if key is not None:  # the program owns copies; this call's values go in and out
+            tensors = tuple(value.clone() for value in tensors)
+        mutable = tensors[: len(work)]
+        counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+        steps = loop.steps
+        _once(loop.before, tensors)
+        _lap("before")
+        loop.eager(steps[:1], tensors, ctx)
+        _lap("first_step")
+        rest = steps[1:]
+        recording = PreparedSequence.record()
+        recording.__enter__()
         try:
-            recording._prepare((*mutable, counter))
-            vt.trim(torch.cuda.current_device())
-            _lap("prepare")
-            began = time.perf_counter()
-            ctx.raise_if_cancelled()
-            with recording.capturing():
-                parts, blocks = _record_resident(
-                    recording, loop, rest, tensors, mutable, counter, {}, None, None, False
+            why = None
+            try:
+                recording._prepare((*mutable, counter))
+                vt.trim(torch.cuda.current_device())
+                _lap("prepare")
+                began = time.perf_counter()
+                ctx.raise_if_cancelled()
+                with recording.capturing():
+                    parts, blocks = _record_resident(
+                        recording, loop, rest, tensors, mutable, counter, {}, None, None, False
+                    )
+                made = recording.finish_parts(
+                    outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
                 )
-            made = recording.finish_parts(
-                outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
+                _lap("finish")
+            except BaseException as error:
+                if (why := _refusal(error)) is None:
+                    raise
+            if why is not None:
+                # Outside the handler: its traceback no longer holds the attempt's graphs, so their
+                # pool returns before the eager rest.
+                row["refusals"].append(f"resident: {why}")
+                _drop_stages(recording)
+                recording.close()
+                gc.collect()
+                vt.trim(torch.cuda.current_device())
+                _back(work, tensors)  # the eager rest runs on the caller's tensors
+                loop.eager(rest, work + tensors[len(work) :], ctx)
+                _once(loop.after, work + tensors[len(work) :])
+                return None
+            first = tuple(
+                (sequence, start, count)
+                for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
             )
-            _lap("finish")
-        except BaseException as error:
-            if (why := _refusal(error)) is None:
-                raise
-        if why is not None:
-            # Outside the handler: its traceback no longer holds the attempt's graphs, so their
-            # pool returns before the eager rest.
-            row["refusals"].append(f"resident: {why}")
-            _drop_stages(recording)
-            recording.close()
-            gc.collect()
-            vt.trim(torch.cuda.current_device())
-            _back(work, tensors)  # the eager rest runs on the caller's tensors
-            loop.eager(rest, work + tensors[len(work) :], ctx)
-            _once(loop.after, work + tensors[len(work) :])
-            return None
-        first = tuple(
-            (sequence, start, count)
-            for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
-        )
-        stages = sum(end - begin for begin, end, _, _, _ in parts)
-        row.update(
-            mode="resident",
-            stages=stages,
-            blocks=blocks,
-            capture_ms=round((time.perf_counter() - began) * 1000, 3),
-            after_native=False,
-        )
-        return _Program(first, None, "resident", tensors, counter, None, stages, blocks)
-    finally:
-        if not recording._finished:
-            recording.close()
+            stages = sum(end - begin for begin, end, _, _, _ in parts)
+            row.update(
+                mode="resident",
+                stages=stages,
+                blocks=blocks,
+                capture_ms=round((time.perf_counter() - began) * 1000, 3),
+                after_native=False,
+            )
+            return _Program(first, None, "resident", tensors, counter, None, stages, blocks)
+        finally:
+            if not recording._finished:
+                recording.close()
 
 
 def _record_first_streamed(
@@ -820,41 +866,51 @@ def _record_first_streamed(
     definition before the existing eager remainder; accepted native execution never retries.
     No program is kept for another call or queued to record at idle.
     """
-    mutable = tensors[:nwork]
-    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    recording = PreparedSequence.record()
-    recording.__enter__()
-    failure: BaseException | None = None
-    try:
-        ctx.raise_if_cancelled()
-        recording._prepare((*mutable, counter))
-        vt.trim(torch.cuda.current_device())
-        _lap("prepare")
-        with recording.capturing():
-            parts, blocks = _record_streamed(
-                recording, loop, loop.steps[1:], tensors, mutable, counter, scope,
+    from cozy_runtime.internal.execution import ownership
+
+    with ownership.preparing(tensors[0].device.index or 0, "denoise program recording"):
+        mutable = tensors[:nwork]
+        counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+        recording = PreparedSequence.record()
+        recording.__enter__()
+        failure: BaseException | None = None
+        try:
+            ctx.raise_if_cancelled()
+            recording._prepare((*mutable, counter))
+            vt.trim(torch.cuda.current_device())
+            _lap("prepare")
+            with recording.capturing():
+                parts, blocks = _record_streamed(
+                    recording,
+                    loop,
+                    loop.steps[1:],
+                    tensors,
+                    mutable,
+                    counter,
+                    scope,
+                )
+            made = recording.finish_parts(
+                outputs=mutable,
+                parts=[(begin, end, passes) for begin, end, passes, _, _ in parts],
             )
-        made = recording.finish_parts(
-            outputs=mutable, parts=[(begin, end, passes) for begin, end, passes, _, _ in parts],
+            _lap("finish")
+        except BaseException as error:
+            failure = error
+        if failure is not None:
+            unwind(failure)
+            _drop_stages(recording)
+            recording.close()
+            gc.collect()
+            vt.trim(torch.cuda.current_device())
+            if (why := _refusal(failure)) is None:
+                raise failure
+            return None, why
+        first = tuple(
+            (sequence, start, count)
+            for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
         )
-        _lap("finish")
-    except BaseException as error:
-        failure = error
-    if failure is not None:
-        unwind(failure)
-        _drop_stages(recording)
-        recording.close()
-        gc.collect()
-        vt.trim(torch.cuda.current_device())
-        if (why := _refusal(failure)) is None:
-            raise failure
-        return None, why
-    first = tuple(
-        (sequence, start, count)
-        for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
-    )
-    stages = sum(end - begin for begin, end, _, _, _ in parts)
-    return _Program(first, None, "streamed", tensors, counter, None, stages, blocks), ""
+        stages = sum(end - begin for begin, end, _, _, _ in parts)
+        return _Program(first, None, "streamed", tensors, counter, None, stages, blocks), ""
 
 
 def _yield_point() -> None:
@@ -880,49 +936,53 @@ def _record_whole(
     failed or preempted attempt goes as a refused one does: its frames first, then its stages and
     the tensors of its pool, then its domain (a preemption that closed the domain under its live
     frames crashed the executor)."""
-    mutable = tensors[:nwork]
-    counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    recording = PreparedSequence.record()
-    recording.__enter__()
-    failure: BaseException | None = None
-    try:
-        recording._prepare((*mutable, counter))
-        vt.trim(torch.cuda.current_device())
-        _lap("prepare")
-        _yield_point()
-        with recording.capturing():
-            parts, blocks = _record_resident(
-                recording,
-                loop,
-                loop.steps[1:],
-                tensors,
-                mutable,
-                counter,
-                body,
-                pre,
-                post,
-                True,
-                remaining=False,
+    from cozy_runtime.internal.execution import ownership
+
+    with ownership.preparing(tensors[0].device.index or 0, "whole denoise program recording"):
+        mutable = tensors[:nwork]
+        counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+        recording = PreparedSequence.record()
+        recording.__enter__()
+        failure: BaseException | None = None
+        try:
+            recording._prepare((*mutable, counter))
+            vt.trim(torch.cuda.current_device())
+            _lap("prepare")
+            _yield_point()
+            with recording.capturing():
+                parts, blocks = _record_resident(
+                    recording,
+                    loop,
+                    loop.steps[1:],
+                    tensors,
+                    mutable,
+                    counter,
+                    body,
+                    pre,
+                    post,
+                    True,
+                    remaining=False,
+                )
+            if len(parts) != 1:
+                raise CapabilityError(
+                    "the whole call is not one pass of equal steps",
+            code="prepared_graph_ineligible",
+                )
+            (again,) = recording.finish_parts(
+                outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
             )
-        if len(parts) != 1:
-            raise CapabilityError(
-                "the whole call is not one pass of equal steps", code="prepared_graph_ineligible"
-            )
-        (again,) = recording.finish_parts(
-            outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
-        )
-        _lap("finish")
-    except BaseException as error:
-        failure = error
-    if failure is not None:
-        unwind(failure)
-        _drop_stages(recording)
-        recording.close()
-        gc.collect()
-        vt.trim(torch.cuda.current_device())
-        raise failure
-    stages = parts[0][1] - parts[0][0]
-    return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
+            _lap("finish")
+        except BaseException as error:
+            failure = error
+        if failure is not None:
+            unwind(failure)
+            _drop_stages(recording)
+            recording.close()
+            gc.collect()
+            vt.trim(torch.cuda.current_device())
+            raise failure
+        stages = parts[0][1] - parts[0][0]
+        return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
 
 
 @dataclass(eq=False)
