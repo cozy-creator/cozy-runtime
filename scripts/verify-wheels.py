@@ -39,6 +39,7 @@ def main() -> None:
     kernels: dict[str, tuple[str, ...]] = {
         "py3-none-any": (),
         linux: (
+            "_dense.abi3.so",
             "_gemm.abi3.so",
             "_norm.abi3.so",
             "_execution.abi3.so",
@@ -47,7 +48,7 @@ def main() -> None:
         ),
     }
     if arch == "x86_64" and any(w.name.endswith(f"-{WINDOWS}.whl") for w in wheels):
-        kernels[WINDOWS] = ("_gemm.pyd", "_norm.pyd", "_attn4.pyd")
+        kernels[WINDOWS] = ("_dense.pyd", "_gemm.pyd", "_norm.pyd", "_attn4.pyd")
     assert {w.name for w in wheels} == {f"cozy_runtime-{version}-{tag}.whl" for tag in kernels}, (
         "missing or unexpected platform wheels"
     )
