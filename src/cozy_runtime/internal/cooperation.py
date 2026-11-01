@@ -102,6 +102,19 @@ class Owner:
         self._process()
         return self._peer.facts()
 
+    def request_boundary(self, *, begin: bool, check: bool = True) -> None:
+        self._process()
+        # Older native owner cohorts retain their negotiated allocator/recovery policy;
+        # the additive sampled-pressure extension is separately observable in owner facts.
+        if self._closed or getattr(self._peer, "pressure_capability", lambda: 0)() != 1:
+            return
+        try:
+            self._peer.request_boundary(begin=begin)
+        except Exception as cause:
+            error = self._failure(str(cause))
+            if check:
+                raise error from cause
+
     def close(self) -> None:
         self._process()
         if self._closed:
