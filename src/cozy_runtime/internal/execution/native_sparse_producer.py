@@ -655,5 +655,5 @@ def split_sparse_projected_heads(
     output: Any,
     cuts: tuple[Cut, ...],
 ) -> Tensor | None:
-    plan = prepare_sparse_projected_heads(intent, output, cuts)
-    return None if plan is None else plan.run()
+    """Matched sparse control: decline before native admission or execution."""
+    return None
