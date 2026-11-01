@@ -40,6 +40,7 @@ from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, quantize_once
 from cozy_runtime.internal import (
     arch,
+    attention_int4,
     attention_kitchen_sol,
     attention_sage2_fixed,
     attention_sol,
@@ -187,7 +188,7 @@ class Candidate:
 
 _GPU = frozenset({arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05})
 _MMA, _WGMMA, _TCGEN05 = (frozenset({f}) for f in (arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05))
-_FP8, _FP4 = frozenset({"fp8"}), frozenset({"fp4"})
+_FP8, _FP4, _INT4 = frozenset({"fp8"}), frozenset({"fp4"}), frozenset({"int4"})
 _HALF, _BF16, _D128 = frozenset({"bfloat16", "float16"}), frozenset({"bfloat16"}), frozenset({128})
 _D64_128 = frozenset({64, 128})
 #: What the wheel's FA3 serves (`prebuilt.FlashAttention3`); `flash-attn3-full` serves more.
@@ -197,6 +198,8 @@ _PY, _KITCHEN, _SAGE3 = kernel_sources.PYTHON, "comfy-kitchen", "sageattn3"
 #: candidate's Triton set); the source build's is `sageattn3.api`.
 _SAGE3_WHEEL = "cozy_runtime.internal.sage3"
 _E4M3 = "cozy_runtime.internal.attention_fp8"
+#: A kernel the Runtime wheel alone carries (`prebuilt.ATTENTION`): no source recipe builds it.
+PREBUILT = "prebuilt"
 #: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
 _SOL: dict[str, Any] = dict(
     sparse=True, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False, gqa=False,
@@ -263,6 +266,11 @@ KERNELS: tuple[Candidate, ...] = (
         artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
     ),
     Candidate(
+        "kitchen-int4qk", "_cozy_kitchen_int4qk", attention_int4.KITCHEN_INT4QK, _MMA, _INT4,
+        level=4, dtypes=_HALF, head_dims=_D128, max_head_dim=128, causal=False,
+        artifact=PREBUILT, import_name="cozy_runtime._kernels._attn4",
+    ),
+    Candidate(
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
         _WGMMA, level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
         gqa=False, batches=False, artifact="sageattention", import_name="sageattention",
@@ -288,6 +296,11 @@ KERNELS: tuple[Candidate, ...] = (
         **_SOL,
     ),
     Candidate(
+        "kitchen-sol-int4qk", "_cozy_kitchen_sol_int4qk", attention_kitchen_sol.KITCHEN_SOL_INT4QK,
+        _MMA, _INT4, level=4, artifact=_KITCHEN, import_name="comfy_kitchen",
+        dense=("kitchen-int4qk", "kitchen-int8"), **_SOL,
+    ),
+    Candidate(
         "kitchen-sol-fp4-fixed-means", "_cozy_kitchen_sol_fp4_fixed_means",
         attention_kitchen_sol.KITCHEN_SOL_FP4_FIXED_MEANS, _MMA, _FP4, level=4, artifact=_KITCHEN,
         import_name="comfy_kitchen", dense=("sageattention3-fp4-fixed-means", "kitchen-int8"),
@@ -302,7 +315,7 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.MMA_SYNC: {
         16: ("sdpa",),
         8: ("kitchen-int8", "sageattention"),
-        4: ("sageattention3-fp4",),
+        4: ("sageattention3-fp4", "kitchen-int4qk"),
     },
     arch.WGMMA: {16: ("flash-attn3",), 8: ("sageattention",)},
     arch.TCGEN05: {16: ("cudnn",), 8: ("flash-attn4-fp8",)},
@@ -313,12 +326,14 @@ DENSE: dict[str, dict[int, tuple[str, ...]]] = {
 #: tiles take its dense rows' precision (`attention_sol_fa4`), so its 8-bit cell is empty and a
 #: site steps up to it. mma.sync's 8-bit cell is Kitchen's INT8 Sol: INT8 runs 2x BF16 there, 4x
 #: on GeForce (half-rate FP32 accumulation), and BF16 Sol's exact blocks alone outlast Kitchen's
-#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak).
+#: whole sparse step (H3 15 s, RTX 4090: 23 s at peak). Its 4-bit cell is FP4 on FP4 rows, else INT4
+#: Q·Kᵀ on int4 rows (owner, 10-31: no difference he can see from 8-bit; H3 Turbo 15 s on an RTX
+#: 4090 1.10x end to end).
 SPARSE: dict[str, dict[int, tuple[str, ...]]] = {
     arch.MMA_SYNC: {
         16: ("sol-attn",),
         8: ("kitchen-sol",),
-        4: ("kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem"),
+        4: ("kitchen-sol-fp4-fixed-means", "kitchen-sol-fp4-lowmem", "kitchen-sol-int4qk"),
     },
     arch.WGMMA: {16: ("sol-attn",), 8: ("sol-attn-sage2-fixed-kmean",)},
     arch.TCGEN05: {16: ("sol-attn",)},
@@ -605,6 +620,13 @@ def _compiled(candidate: Candidate, device: DeviceFacts, wait: bool) -> dict[str
     wheel = _wheel(candidate, device)
     if wheel is not None:
         return wheel
+    if candidate.artifact == PREBUILT:
+        why = (
+            "its prebuilt kernel failed its check on this card"
+            if candidate.name in _WHEEL_REFUSED
+            else prebuilt.missing(candidate.name, device.sm)
+        )
+        raise AttentionRefusal("attention_kernel_absent", f"{candidate.name}: {why}")
     _build(candidate)  # another build imported here refuses before any store or compile
     store = kernel_cache.configured()
     found = util.find_spec(candidate.import_name.split(".")[0])
@@ -821,7 +843,8 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
         artifact = _compiled(candidate, device, wait) if candidate.artifact else None
     wheel = (artifact or {}).get("artifact") == "prebuilt"
     if wheel:
-        upstream.bind_sage3(import_module(_SAGE3_WHEEL), f"prebuilt {(artifact or {})['key']}")
+        if candidate.import_name == _SAGE3:
+            upstream.bind_sage3(import_module(_SAGE3_WHEEL), f"prebuilt {(artifact or {})['key']}")
         _STATES[candidate.name] = kernel_compile.State("prebuilt", "ready")
     elif candidate.import_name:
         module = _import(candidate)
