@@ -498,12 +498,12 @@ def split_residual_ffn(intent: ResidualFFN, output: Any, cuts: tuple[Cut, ...]) 
     )
     record["selections"] += 1
     phase.choice(("native-split", key, geometry.identity))
-    observation_id = vt.split_begin(
+    observation_id = phase.begin_split(
         device,
         key,
         geometry.identity,
+        selection,
         stream=int(stream.cuda_stream),
-        completion_owner=phase.completion_owner(device, int(stream.cuda_stream)),
     )
     submitted = False
     try:
