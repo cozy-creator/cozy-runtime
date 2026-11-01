@@ -1,0 +1,1 @@
+Runtime's cooperative GPU owner delegates automatic donation to the native Varena service, so donor progress does not require Python's GIL. Runtime retains configuration, lifecycle wakes and fault reporting; allocation-driven peer requests remain separately gated.

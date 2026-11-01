@@ -63,6 +63,10 @@ def split(
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
     cut's (an `overlap`) does. Without it such a layout follows free memory."""
     runtime = _RUNTIME
+    if runtime is not None and most is None and out is None:
+        declared = getattr(runtime, "split_declared", None)
+        if declared is not None and (result := declared(fn, x, cuts)) is not None:
+            return result
     shape = tuple(int(n) for n in x.shape)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
