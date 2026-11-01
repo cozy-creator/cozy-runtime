@@ -49,6 +49,8 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from typing import Any, NamedTuple
 
+import tensorfs.varena.torch as vt
+
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, is_capacity
@@ -1289,7 +1291,8 @@ class _Engine:
                 # bindings below may be replaced while this driver owns live rows.
                 if self.region is None and (placed := PLACED.get(self.model)) is not None:
                     self.region = placed[0].region(
-                        f"lm:{type(self.model).__name__}", "kv", self.model, release=self._drop
+                        f"lm:{type(self.model).__name__}", "kv", self.model,
+                        release=self._drop, shrink=self._try_drop,
                     )
                 if (
                     not held_region
@@ -1945,7 +1948,7 @@ class _Engine:
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
-            graph.replay()
+            vt.replay(graph)
         if graph is not None:
             self.replayed += 1
         else:
@@ -2161,6 +2164,35 @@ class _Engine:
         self.flag[:size].copy_(done, non_blocking=True)
 
     # ------------------------------------------------------------------ memory
+
+    def _try_drop(self) -> bool:
+        from cozy_runtime.internal import cache_owners
+
+        with cache_owners.try_locks([_PLANE, self.cond]) as claimed:
+            if not claimed or self.driver is not None or self.pending or self._occupied():
+                return False
+            # _PLANE fixes the driver's binding inventory before its locks are claimed.
+            bindings = tuple(self.addresses.values())
+            locks = [self.domain.lock] if self.domain is not None else []
+            locks.extend(binding.lock for binding in bindings)
+            locks.extend(binding.model.memory.lock for binding in bindings)
+            with cache_owners.try_locks(locks) as claimed:
+                if not claimed:
+                    return False
+                if self.unfenced or any(not event.query() for event in self.completions.values()):
+                    return False
+                if any(binding.completion_lost or (
+                    binding.last is not None and not binding.last.query()
+                ) for binding in bindings):
+                    return False
+                self._drop()
+                # Retired graphs no longer need their weight Pins. Keeping these bindings
+                # in addresses would hide idle weights from native reclamation.
+                for binding in bindings:
+                    binding.close()
+                self.addresses.clear()
+                self.where = ()
+                return True
 
     def _drop(self) -> None:
         if self.cache_device is not None and self.cache_device.type == "cuda":
