@@ -1,0 +1,12 @@
+{
+  "script": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/qualification/collect.py",
+  "sha256": "c4979daa84efab41af471f96ec27e18f1732132a86971e2601794bd83712f002",
+  "syntax_passed": true,
+  "remote_calls_executed": false,
+  "frozen_product_sources_unchanged": true,
+  "read_only_commands": [
+    "cozy machine show",
+    "cozy machine logs memory --lines 0 --json",
+    "cozy run show --once --json"
+  ]
+}

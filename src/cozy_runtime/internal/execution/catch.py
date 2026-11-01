@@ -21,9 +21,11 @@ import torch
 from torch import Tensor, nn
 
 import cozy_runtime.internal.execution.sizing as sizing
+from cozy_runtime.author._attention_scope import active_attention_layout
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import TRANSPARENT
+from cozy_runtime.internal.execution import phase as working_phase
 from cozy_runtime.internal.residency import Request
 
 type Args = Sequence[object]
@@ -115,6 +117,11 @@ def piece() -> None:
         _local.scopes[-1].ordinals.clear()
 
 
+def uncommitted_scope() -> bool:
+    """Legacy outer cuts can still change geometry after a refusal; they are not native menus."""
+    return bool(_local.scopes)
+
+
 def checkpoint() -> None:
     """Stop at an owned eager boundary; group cancellation stays with mirrored calls.
 
@@ -131,7 +138,10 @@ def checkpoint() -> None:
 
 def short(exc: BaseException) -> bool:
     """A pure site's allocation refusal outside capture."""
-    return fault(exc) is Fault.OOM and not _capturing()
+    return (
+        not getattr(exc, "varena_no_retry", False)
+        and fault(exc) is Fault.OOM and not _capturing()
+    )
 
 
 def _clear(exc: BaseException) -> None:
@@ -193,6 +203,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         except Exception as exc:
             if not short(exc):
                 raise
+            working_phase.invalidate("cut_retry")
             _clear(exc)
             failure: BaseException | None = exc
         # A failed allocation can reveal pressure the shape estimate cannot predict.
@@ -227,7 +238,10 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     try:
         if _capturing():
             available = request.room()
-            return whole(sizing.choose(finest, need, available)[0])
+            level = sizing.choose(finest, need, available)[0]
+            result = whole(level)
+            working_phase.choice((site, level, active_attention_layout()))
+            return result
         try:
             result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
         except Exception as exc:
@@ -238,6 +252,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         row = Cut(
             site=site, level=level, need=need(level, 1), tier=tier, descent=steps, retries=retries
         )
+        working_phase.choice((site, level, active_attention_layout()))
         with _ROWS_LOCK:
             rows = _ROWS.setdefault(id(request), Cuts())
             calls = rows.levels.setdefault(site, [])

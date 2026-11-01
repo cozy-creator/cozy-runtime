@@ -1,0 +1,1 @@
+Preserve typed cooperation settings through the actual Runtime Start decoder. The native sender previously supplied them, but Runtime's separate schema dropped the field and the worker correctly refused the inactive owner acknowledgement. The corrected automatic-owner cohort passes25106/25107; complete P3 policy qualification remains separate.

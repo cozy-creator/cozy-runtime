@@ -1,0 +1,15 @@
+{
+  "exit_code": 0,
+  "torch_imported": false,
+  "cuda_initialized": false,
+  "driver_loaded": false,
+  "cooperation_capability": 1,
+  "extension": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/installed/tensorfs/_ext.abi3.so",
+  "native_version": "0.17.16+dev.gafa6f922",
+  "runtime_executor_source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/source/src/cozy_runtime/internal/executor.py",
+  "runtime_executor_sha256": "25eb59e5315af27cc8a1581d0865fe4065ef29973e0a6204f87bcc51eead13aa",
+  "runtime_owner_sha256": "b0862bc40e6282aa33031e883b0a01c2d418b7f924d0e80940862205286add1f",
+  "threads": [
+    "MainThread"
+  ]
+}

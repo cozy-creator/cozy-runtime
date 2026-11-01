@@ -1,0 +1,132 @@
+{"type":"run.created","sequence_number":1,"run":{"id":"run-37e324d708952af43d36d5a0","number":25088,"kind":"update","target":"runtime 0.36.18+dev.g88fd6cba (dev), tensorfs 0.17.16+dev.gafa6f922 (dev), tensord cozy-linux-x86_64 (dev)","hub":"https://tensorhub.com","machine":"columbina","status":"queued","cancel_requested":false,"output":[],"created_at_ms":1793530829001}}
+{"type":"run.waiting","reason":"sending to columbina"}
+{"type":"run.waiting","reason":"uploading runtime: 0 B/33.2 MiB"}
+{"type":"run.waiting","reason":"uploading runtime: 0 B/33.2 MiB at 0 B/s"}
+{"type":"run.waiting","reason":"uploading runtime: 1.0 MiB/33.2 MiB at 2.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 2.0 MiB/33.2 MiB at 2.8 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 3.0 MiB/33.2 MiB at 3.9 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 4.0 MiB/33.2 MiB at 4.8 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 5.0 MiB/33.2 MiB at 5.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 6.0 MiB/33.2 MiB at 6.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 7.1 MiB/33.2 MiB at 7.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 8.1 MiB/33.2 MiB at 7.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 9.1 MiB/33.2 MiB at 8.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 10.1 MiB/33.2 MiB at 8.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 11.1 MiB/33.2 MiB at 9.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 12.1 MiB/33.2 MiB at 9.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 13.1 MiB/33.2 MiB at 10.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 14.1 MiB/33.2 MiB at 10.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 15.1 MiB/33.2 MiB at 10.9 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 16.2 MiB/33.2 MiB at 11.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 17.2 MiB/33.2 MiB at 11.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 18.2 MiB/33.2 MiB at 11.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 19.2 MiB/33.2 MiB at 11.9 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 20.2 MiB/33.2 MiB at 12.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 21.2 MiB/33.2 MiB at 12.4 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 22.2 MiB/33.2 MiB at 12.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 23.2 MiB/33.2 MiB at 13.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 24.2 MiB/33.2 MiB at 13.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 25.2 MiB/33.2 MiB at 13.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 26.2 MiB/33.2 MiB at 13.9 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 27.2 MiB/33.2 MiB at 14.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 28.3 MiB/33.2 MiB at 14.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 29.3 MiB/33.2 MiB at 14.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 30.3 MiB/33.2 MiB at 14.4 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 31.3 MiB/33.2 MiB at 14.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 32.3 MiB/33.2 MiB at 14.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 33.2 MiB/33.2 MiB at 14.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading runtime: 33.2 MiB/33.2 MiB at 14.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 0 B/14.5 MiB"}
+{"type":"run.waiting","reason":"uploading tensorfs: 96.0 KiB/14.5 MiB at 2.8 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 1.1 MiB/14.5 MiB at 17.4 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 2.1 MiB/14.5 MiB at 25.9 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 3.1 MiB/14.5 MiB at 27.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 4.1 MiB/14.5 MiB at 31.4 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 5.1 MiB/14.5 MiB at 34.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 6.1 MiB/14.5 MiB at 36.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 7.1 MiB/14.5 MiB at 37.9 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 8.1 MiB/14.5 MiB at 38.8 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 9.1 MiB/14.5 MiB at 40.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 10.1 MiB/14.5 MiB at 42.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 11.1 MiB/14.5 MiB at 43.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 12.2 MiB/14.5 MiB at 45.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 13.2 MiB/14.5 MiB at 43.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 14.2 MiB/14.5 MiB at 42.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 14.5 MiB/14.5 MiB at 42.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensorfs: 14.5 MiB/14.5 MiB at 37.9 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 0 B/49.0 MiB"}
+{"type":"run.waiting","reason":"uploading tensord: 0 B/49.0 MiB at 0 B/s"}
+{"type":"run.waiting","reason":"uploading tensord: 1.0 MiB/49.0 MiB at 23.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 2.0 MiB/49.0 MiB at 36.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 3.0 MiB/49.0 MiB at 39.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 4.0 MiB/49.0 MiB at 43.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 5.0 MiB/49.0 MiB at 47.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 6.0 MiB/49.0 MiB at 51.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 7.1 MiB/49.0 MiB at 52.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 8.1 MiB/49.0 MiB at 55.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 9.1 MiB/49.0 MiB at 55.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 10.1 MiB/49.0 MiB at 56.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 11.1 MiB/49.0 MiB at 58.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 12.1 MiB/49.0 MiB at 58.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 13.1 MiB/49.0 MiB at 60.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 14.1 MiB/49.0 MiB at 60.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 15.1 MiB/49.0 MiB at 60.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 16.1 MiB/49.0 MiB at 62.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 17.1 MiB/49.0 MiB at 63.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 18.1 MiB/49.0 MiB at 64.8 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 19.2 MiB/49.0 MiB at 64.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 20.2 MiB/49.0 MiB at 63.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 21.2 MiB/49.0 MiB at 65.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 22.2 MiB/49.0 MiB at 65.4 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 23.2 MiB/49.0 MiB at 66.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 24.2 MiB/49.0 MiB at 65.8 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 25.3 MiB/49.0 MiB at 66.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 26.3 MiB/49.0 MiB at 66.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 27.3 MiB/49.0 MiB at 67.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 28.3 MiB/49.0 MiB at 68.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 29.3 MiB/49.0 MiB at 68.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 30.3 MiB/49.0 MiB at 68.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 31.3 MiB/49.0 MiB at 69.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 32.4 MiB/49.0 MiB at 69.1 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 33.4 MiB/49.0 MiB at 69.2 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 34.4 MiB/49.0 MiB at 70.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 35.4 MiB/49.0 MiB at 70.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 36.4 MiB/49.0 MiB at 70.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 37.4 MiB/49.0 MiB at 71.8 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 38.4 MiB/49.0 MiB at 71.3 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 39.4 MiB/49.0 MiB at 72.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 40.5 MiB/49.0 MiB at 71.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 41.5 MiB/49.0 MiB at 72.7 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 42.5 MiB/49.0 MiB at 72.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 43.5 MiB/49.0 MiB at 73.5 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 44.5 MiB/49.0 MiB at 73.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 45.5 MiB/49.0 MiB at 73.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 46.5 MiB/49.0 MiB at 74.0 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 47.6 MiB/49.0 MiB at 73.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 48.6 MiB/49.0 MiB at 72.4 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 49.0 MiB/49.0 MiB at 71.6 MiB/s"}
+{"type":"run.waiting","reason":"uploading tensord: 49.0 MiB/49.0 MiB at 64.1 MiB/s"}
+{"type":"run.in_progress","sequence_number":2,"run":{"id":"run-37e324d708952af43d36d5a0","number":25088,"kind":"update","target":"runtime 0.36.18+dev.g88fd6cba (dev), tensorfs 0.17.16+dev.gafa6f922 (dev), tensord cozy-linux-x86_64 (dev)","hub":"https://tensorhub.com","machine":"columbina","status":"in_progress","cancel_requested":false,"machine_state":"queued","output":[],"created_at_ms":1793530829001,"accepted_at_ms":1793530832741}}
+{"type":"run.progress","progress":{"stage":"waiting","completed":0,"total":0,"bytes_done":0,"bytes_total":0,"step_ms":0.0,"step_avg_ms":0.0,"at_ms":1793530832725}}
+{"type":"run.log","sequence_number":3,"at_ms":1793530832725,"level":"stage","text":"waiting"}
+{"type":"run.progress","progress":{"stage":"preparing","completed":0,"total":0,"bytes_done":0,"bytes_total":0,"step_ms":0.0,"step_avg_ms":0.0,"at_ms":1793530832776}}
+{"type":"run.log","sequence_number":4,"at_ms":1793530832776,"level":"stage","text":"preparing"}
+{"type":"run.waiting","reason":"columbina is unreachable: error sending request for url (https://203.57.40.151:10012/v1/runs/run-37e324d708952af43d36d5a0/events): client error (Connect): tcp connect error: Connection refused (os error 111)"}
+{"type":"run.waiting","reason":"no answer from columbina yet (0s): machine_booting: the machine is starting; ask again once it serves"}
+{"type":"run.waiting","reason":""}
+{"type":"run.progress","progress":{"stage":"waiting","completed":0,"total":0,"bytes_done":0,"bytes_total":0,"step_ms":0.0,"step_avg_ms":0.0,"at_ms":1793530832725}}
+{"type":"run.progress","progress":{"stage":"preparing","completed":0,"total":0,"bytes_done":0,"bytes_total":0,"step_ms":0.0,"step_avg_ms":0.0,"at_ms":1793530832776}}
+{"type":"run.progress","progress":{"stage":"installing","completed":0,"total":0,"bytes_done":0,"bytes_total":0,"step_ms":0.0,"step_avg_ms":0.0,"at_ms":1793530833650}}
+{"type":"run.progress","progress":{"stage":"starting","completed":0,"total":0,"bytes_done":0,"bytes_total":0,"step_ms":0.0,"step_avg_ms":0.0,"at_ms":1793530833654}}
+{"type":"run.log","sequence_number":5,"at_ms":1793530832725,"level":"stage","text":"waiting"}
+{"type":"run.log","sequence_number":6,"at_ms":1793530832776,"level":"stage","text":"preparing"}
+{"type":"run.log","sequence_number":7,"at_ms":1793530833650,"level":"stage","text":"installing"}
+{"type":"run.log","sequence_number":8,"at_ms":1793530833654,"level":"stage","text":"starting"}
+{"type":"run.in_progress","sequence_number":9,"run":{"id":"run-37e324d708952af43d36d5a0","number":25088,"kind":"update","target":"runtime 0.36.18+dev.g88fd6cba (dev), tensorfs 0.17.16+dev.gafa6f922 (dev), tensord cozy-linux-x86_64 (dev)","hub":"https://tensorhub.com","machine":"columbina","status":"in_progress","cancel_requested":false,"machine_state":"running","output":[],"created_at_ms":1793530829001,"accepted_at_ms":1793530832741}}
+{"type":"run.completed","sequence_number":10,"run":{"id":"run-37e324d708952af43d36d5a0","number":25088,"kind":"update","target":"runtime 0.36.18+dev.g88fd6cba (dev), tensorfs 0.17.16+dev.gafa6f922 (dev), tensord cozy-linux-x86_64 (dev)","hub":"https://tensorhub.com","machine":"columbina","status":"completed","cancel_requested":false,"machine_state":"running","output":[],"created_at_ms":1793530829001,"accepted_at_ms":1793530832741,"settled_at_ms":1793530835365,"result":{"from":{"cozy":"0.15.4","runtime":"0.36.20+dev.gfe5a783d","runtime_sha256":"898f7db864d76605972bc2cb139affc3820885990d12ab182694f3ab754b3ef8","tensorfs":"0.17.16+dev.g9ccb36a2","tensorfs_sha256":"1b9cda025bd01382d4307890d639a7e7a79507ad9ddae2ec09e79571318f1cdd"},"to":{"cozy":"0.15.4+dev.gafa6f922","runtime":"0.36.18+dev.g88fd6cba","runtime_sha256":"34e0aec40b31719c6efb2d366e966e93d683a8634905c6c57f15379c237b36dc","tensorfs":"0.17.16+dev.gafa6f922","tensorfs_sha256":"c99fc381e80ccb7aeba1f56d68c9a7ef141462bed6ac57b1b9f29a59ef2b4c25"}}}}
+{
+  "machine": "columbina",
+  "runtime": "0.36.18+dev.g88fd6cba",
+  "tensord": "0.15.4+dev.gafa6f922",
+  "tensorfs": "0.17.16+dev.gafa6f922"
+}

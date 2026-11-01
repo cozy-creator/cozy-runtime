@@ -1,0 +1,54 @@
+{
+  "passed": true,
+  "gpu_run": 25106,
+  "observe_run": 25107,
+  "creator_source": "afa6f9229153d1a7e93bbf72fc86f5543a4ac21c",
+  "runtime_source": "b206015ba708658853a2e543d1c6be02d4f14a06",
+  "pid": 191228,
+  "row": {
+    "incarnation": 1,
+    "slot": 0
+  },
+  "released_bytes": 50331648,
+  "actual_driver_used_drop": 50331648,
+  "requester_allocated_and_touched": 33554432,
+  "actual_driver_used_rise": 33554432,
+  "donor_live_working_preserved": 8388608,
+  "donor_pinned_weights_preserved": 8388608,
+  "live_baseline": 17039360,
+  "mapped_baseline": 20971520,
+  "requester_final_zero": true,
+  "capture_and_replay_native_driver_deltas": 0,
+  "duplicate_ask_same_round_no_extra_credit": true,
+  "same_pid_incarnation_followup": true,
+  "observed_sample_interval_ms": 502.980508,
+  "latency_boundary": "driver sample before ask to driver sample after observed completion; includes polling, not exact CUDA unmap duration or a general latency guarantee",
+  "start_shared": false,
+  "temporary_owner_shared_opt_in_restored": true,
+  "mode_note": {
+    "at_ms": 1793531278211,
+    "line": 113,
+    "note": {
+      "event": "gpu_memory_policy",
+      "gpus": [
+        0
+      ],
+      "mode": "Cooperative",
+      "pid": 191228
+    }
+  },
+  "bounded_log_window_ms": [
+    1793531278211,
+    1793531307458.4
+  ],
+  "anchored_memory_log_records": 32,
+  "legacy_actions_in_anchored_window": [],
+  "policy_scope": "singleGPU sameUID/user/PID/mountnamespace automatic donor service, not completeP3/cache/shortage/foreign/game/shared-machine propagation",
+  "startup_failure": {
+    "run": 25090,
+    "cause": "native sender preserved cooperation; actual Runtime msgspec Start omitted and dropped it; strict active acknowledgement rejected before fixture",
+    "not_cause": "lazyCUDA or missing native API",
+    "decoder_red": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/red.json",
+    "decoder_green": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/green.json"
+  }
+}

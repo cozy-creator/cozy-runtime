@@ -175,6 +175,9 @@ class _Shared:
 
 _SHARED: ContextVar[tuple[_Shared, ...]] = ContextVar("cozy_quantize_once", default=())
 
+# A closed Runtime row menu owns one normal module invocation, never sibling operands.
+_LINEAR_SPLIT: ContextVar[Any | None] = ContextVar("cozy_native_linear_split", default=None)
+
 
 @contextmanager
 def quantize_once(*tensors: Any) -> Iterator[None]:

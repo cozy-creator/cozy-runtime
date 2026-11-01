@@ -1,0 +1,271 @@
+{
+  "tested_creator": "afa6f9229153d1a7e93bbf72fc86f5543a4ac21c",
+  "tested_runtime": "b206015ba708658853a2e543d1c6be02d4f14a06",
+  "fixture_source": "afa6f9229153d1a7e93bbf72fc86f5543a4ac21c",
+  "files": {
+    "automatic-owner-25090.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-25090.json",
+      "sha256": "e340ea1ba96a5e03ac2c7135362c48240ee47f480b4dfc8bd414ccc44ef1d2dd"
+    },
+    "automatic-owner.ndjson": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner.ndjson",
+      "sha256": "a8f0d41f81d8b444ba4541509b6305543de0c1c508be25c4822d4bde8d527d28"
+    },
+    "automatic-owner.err": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner.err",
+      "sha256": "2e8af703f2ae7ac41f9a4d3ed9d52ca6c8de0394a60056fc0db92a0c2688308c"
+    },
+    "automatic-owner-invocation.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-invocation.json",
+      "sha256": "368430ad416943a262663dc7936c45e16ecd64eb1b6de4e0f207fd313d50841c"
+    },
+    "automatic-owner-fixed-25106.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-fixed-25106.json",
+      "sha256": "5725a16b3fb447dc49a325f0c51f32b6e28dab3d67ca0b757a926bbdd2141985"
+    },
+    "automatic-owner-fixed.ndjson": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-fixed.ndjson",
+      "sha256": "f0910940ca90e9850329086635001daf71e23c3db0a54dbf2bcfb0e96ab383df"
+    },
+    "automatic-owner-fixed.err": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-fixed.err",
+      "sha256": "229f5884baf0c65fafda7d6d98660e97ccb0a071cd57e688c27aabb22f4c4774"
+    },
+    "automatic-owner-fixed-invocation.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-fixed-invocation.json",
+      "sha256": "3633364c7ca028011d348f8a6c9d86178ccdec64986b8425027bb93f135ed301"
+    },
+    "automatic-owner-fixed-result.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-fixed-result.json",
+      "sha256": "6c0233c47330bc769c07fbb4a35dd36328d9ad97ffb6e5ac1d1b995a10d47282"
+    },
+    "automatic-owner-observe-25107.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-observe-25107.json",
+      "sha256": "84d2e234cb0e054b84057ae2226993976410b3205687c342bb2a874f7271fe2a"
+    },
+    "automatic-owner-observe.ndjson": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-observe.ndjson",
+      "sha256": "324561e05d0be45532c461c56c0cc3dafbabdf1136093a2041b2ce5e33a029a8"
+    },
+    "automatic-owner-observe.err": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-observe.err",
+      "sha256": "229f5884baf0c65fafda7d6d98660e97ccb0a071cd57e688c27aabb22f4c4774"
+    },
+    "automatic-owner-observe-invocation.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-observe-invocation.json",
+      "sha256": "ea2b66b8da72cb7e54eea7dbda760c179ff8ea3ae2fbde8738fd7a94adfbb71a"
+    },
+    "automatic-owner-observe-result.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/automatic-owner-observe-result.json",
+      "sha256": "5116e4e4de15335e288912a2d7781b1d11ba77d152625372d65d3a3ee7102fe5"
+    },
+    "owner-fixed-before/memory.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-before/memory.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "owner-fixed-before/machine.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-before/machine.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "owner-fixed-before/memory.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-before/memory.command.json",
+      "sha256": "e48df90a1463cddc560b56d658e8b408b2e15069148384a23b876919608204f8"
+    },
+    "owner-fixed-before/machine.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-before/machine.command.json",
+      "sha256": "0685acd25fefa2f1e0d75f797204707be98cb4933092d75f7066d2ebf3149abd"
+    },
+    "owner-fixed-before/capture.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-before/capture.json",
+      "sha256": "fbf76fbb621b096c5fce43fc9fc032d4cbdbfb8604caf0a5658aa1295868e9fc"
+    },
+    "owner-fixed-before/machine.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-before/machine.stdout",
+      "sha256": "5c100b775be1fa8768f0c8c445a5e2f8e68f3e319432b53fe636878bb489e7ad"
+    },
+    "owner-fixed-before/memory.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-before/memory.stdout",
+      "sha256": "0de953fd085e91d0c211616bf1efdffa6d5d30f4081c1dcd5e87d0950170bb58"
+    },
+    "owner-fixed-after/gpu-run.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/gpu-run.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "owner-fixed-after/memory.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/memory.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "owner-fixed-after/qualification.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/qualification.json",
+      "sha256": "7afa4a8ab05f5f0d00a9ff5a73545cced8ba08c39fdb1381383871472aa476c0"
+    },
+    "owner-fixed-after/observe-run.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/observe-run.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "owner-fixed-after/machine.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/machine.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "owner-fixed-after/observe-run.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/observe-run.stdout",
+      "sha256": "84d2e234cb0e054b84057ae2226993976410b3205687c342bb2a874f7271fe2a"
+    },
+    "owner-fixed-after/memory.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/memory.command.json",
+      "sha256": "479f8a05f5981bcca391e43586656184962050ba3cc0f13769ad63021009164c"
+    },
+    "owner-fixed-after/gpu-run.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/gpu-run.json",
+      "sha256": "2dc3fd86901b578b813912e759264403aed185e20e99f7b9e49897728bec4ddf"
+    },
+    "owner-fixed-after/gpu-run.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/gpu-run.command.json",
+      "sha256": "cd84f0130fc1e57136e68f46dd292d4a08bd007c4ab362456074ebb6ea25cfed"
+    },
+    "owner-fixed-after/gpu-run.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/gpu-run.stdout",
+      "sha256": "5725a16b3fb447dc49a325f0c51f32b6e28dab3d67ca0b757a926bbdd2141985"
+    },
+    "owner-fixed-after/machine.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/machine.command.json",
+      "sha256": "b34732ce063d47c7d259076d1e45d6256a13a93a8fc7dd76f9dfa8087b53edeb"
+    },
+    "owner-fixed-after/capture.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/capture.json",
+      "sha256": "ed984ec0f46ace31607354ae28a3d32fe8d1901618d8d96d08c8267feb9e110e"
+    },
+    "owner-fixed-after/machine.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/machine.stdout",
+      "sha256": "d115143cfc2c6a4cc241d64918672235046b0568aa41e964ce4e9c9f27816071"
+    },
+    "owner-fixed-after/memory.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/memory.stdout",
+      "sha256": "2ca18373bde6d593d9b91bcc1ec5d5fc306d74934ece9e8d930c74c2cab3adc5"
+    },
+    "owner-fixed-after/observe-run.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/observe-run.json",
+      "sha256": "f6868cd59f134c1087c379a9dc0ee323ca75cc1e643da39097933e71f3aecea0"
+    },
+    "owner-fixed-after/observe-run.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-after/observe-run.command.json",
+      "sha256": "85f81b7aa9764b29fad7657db4fbdabb94c59de9682372a3f9b361ee27a39601"
+    },
+    "owner-fixed-observe-input/gpu-run.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-observe-input/gpu-run.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "owner-fixed-observe-input/validation.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-observe-input/validation.json",
+      "sha256": "b1c520a694db3c0ec535b2dd4aa1bf6f78ec5356bc4d24cd76993ee7b54cfe64"
+    },
+    "owner-fixed-observe-input/gpu-run.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-observe-input/gpu-run.json",
+      "sha256": "2dc3fd86901b578b813912e759264403aed185e20e99f7b9e49897728bec4ddf"
+    },
+    "owner-fixed-observe-input/gpu-run.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-observe-input/gpu-run.command.json",
+      "sha256": "f9f315941ce184325e9bb2e85f25f1eb67515488eae15752201ab4522bd99ff1"
+    },
+    "owner-fixed-observe-input/gpu-run.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-observe-input/gpu-run.stdout",
+      "sha256": "5725a16b3fb447dc49a325f0c51f32b6e28dab3d67ca0b757a926bbdd2141985"
+    },
+    "owner-fixed-observe-input/observe-input.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-fixed-observe-input/observe-input.json",
+      "sha256": "a20e8d7bbb328777436fe470a31703eef8f048850e7e504495a19c5946dc7107"
+    },
+    "codec/red.json": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/red.json",
+      "sha256": "a252e33d1e647fb6c138f8aca7780762fbf9a442e79d858fef4bf5f5ad3caf06"
+    },
+    "codec/green.json": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/green.json",
+      "sha256": "b9880acfdfd10b7116e5fdd3b39088328964132b97f880ace78d4160aa94d232"
+    },
+    "codec/socket-codec.py": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-codec.py",
+      "sha256": "c04785c285817e6d5c61ac6776c3cbfe39ce705a57b8656459992487ac96f281"
+    },
+    "codec/gpu-independent-review.json": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/gpu-independent-review.json",
+      "sha256": "4b1a9815476b17ee37d708a6e827883992c7278d7b831a818b34794d0dd1ef76"
+    },
+    "codec/socket-green/report.json": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/report.json",
+      "sha256": "5eb47359d1424a08a785259b50bf8d232cc9acc1344a944ff16d623b943a2fec"
+    },
+    "codec/socket-green/child-result.json": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/child-result.json",
+      "sha256": "3c8524dc4a36d6f1f3a7a2666dd0271eff3acd305012a30a96f34ebdc495cacd"
+    },
+    "codec/socket-green/child.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/child.stdout",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "codec/socket-green/child.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/child.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "codec/socket-green/child.py": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-start-decode/socket-green/child.py",
+      "sha256": "8422d891a0afe4446b10cea71a29ba1d3c4d472031678ac933de36e62b619009"
+    },
+    "collector/collect.py": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/qualification/collect.py",
+      "sha256": "c4979daa84efab41af471f96ec27e18f1732132a86971e2601794bd83712f002"
+    },
+    "collector/README.md": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/qualification/README.md",
+      "sha256": "9fe9608bd0a7afb9e222dd3061fec4c48518680a8c0e94273b51829e894224c9"
+    },
+    "collector/prepared.json": {
+      "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/qualification/prepared.json",
+      "sha256": "40f72e6eabd3915be25f59060d814a678e3adfea6292bb01784d72c8c89aaed7"
+    },
+    "install-auto-owner.ndjson": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-auto-owner.ndjson",
+      "sha256": "f8cb1b5a8422348ae1e6d6ba83fa53a099b7cec8cda0bb583025343ecdc19d7d"
+    },
+    "install-auto-owner.err": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-auto-owner.err",
+      "sha256": "229f5884baf0c65fafda7d6d98660e97ccb0a071cd57e688c27aabb22f4c4774"
+    },
+    "install-owner-decode-fix.ndjson": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-owner-decode-fix.ndjson",
+      "sha256": "b7995a16f8c273fb57d3b744db9e297b3a3f0b901aa12f09bd5bb7020f58d0a7"
+    },
+    "install-owner-decode-fix.err": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-owner-decode-fix.err",
+      "sha256": "229f5884baf0c65fafda7d6d98660e97ccb0a071cd57e688c27aabb22f4c4774"
+    },
+    "failed-start-before/memory.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/memory.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "failed-start-before/machine.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/machine.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "failed-start-before/memory.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/memory.command.json",
+      "sha256": "8d6bc3380ab1889a2b0f259d53e47b4f0b319fad828ec3e527870c792ab2357a"
+    },
+    "failed-start-before/machine.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/machine.command.json",
+      "sha256": "15660d9b6d2c58d96a109665473eb3dd46bea458c8bf9951a4adaa48b9d8570a"
+    },
+    "failed-start-before/capture.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/capture.json",
+      "sha256": "91a46a6bbb9d42a9bebb1ab0a2c590aeefcdd1168380824a4e8392dcb119e5b4"
+    },
+    "failed-start-before/machine.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/machine.stdout",
+      "sha256": "adb299edfeb058b9cb06e4878f2d8ac711bd5b78bcd349e7df44aae9dd3a4edd"
+    },
+    "failed-start-before/memory.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/memory.stdout",
+      "sha256": "5dba2b042eee3e4e32c911a31ff1fc4b75e1924784e0ec2989462569c016e701"
+    }
+  }
+}

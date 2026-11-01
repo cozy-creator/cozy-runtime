@@ -1,0 +1,141 @@
+{
+  "name": "columbina",
+  "kind": "rental",
+  "state": "ready",
+  "hub": "https://tensorhub.com",
+  "rental_id": "pr-8e889cf05e11deab444a",
+  "alias": "rent-9c570401",
+  "address": "203.57.40.151:10012",
+  "fingerprint": "sha256:9abc6851198ca6db9f24a543c550caa577cf080006b17ac03d02eaf0fa3c9f72",
+  "rental": {
+    "sku": "rtx-4090",
+    "accelerator": "NVIDIA GeForce RTX 4090",
+    "gpus": 1,
+    "usd_micros_per_hour": 1502000,
+    "spend_usd_micros": 1363065,
+    "spend_basis": "unmetered",
+    "rented_at_ms": 1793527869576,
+    "disk_gb": 100,
+    "base_worker_image_digest": "sha256:ab9f3e9ff2c04e5fc0a9b471e810ce30f10286114b3567039b5b08aae9f85027",
+    "ssh": "203.57.40.151:10013"
+  },
+  "status": {
+    "worker_id": "ra-108a4d7d2011a1cbf2f8",
+    "version": "0.15.4+dev.gafa6f922",
+    "commit": "afa6f9229153d1a7e93bbf72fc86f5543a4ac21c",
+    "dev": true,
+    "platform": "linux/x86_64",
+    "phase": "ready",
+    "runtime": "0.36.21+dev.gb206015b",
+    "tensorfs": "0.17.16+dev.gafa6f922",
+    "started_at_ms": 1793531242387,
+    "idle_deadline_ms": 1793532143133,
+    "gpus": [
+      {
+        "index": 0,
+        "name": "NVIDIA GeForce RTX 4090",
+        "memory_bytes": 25757220864,
+        "driver": "595.91.07",
+        "family": "sm89",
+        "memory_class": "discrete"
+      }
+    ],
+    "disk_total_bytes": 107374182400,
+    "disk_free_bytes": 42745622528,
+    "runs": [],
+    "models": [
+      {
+        "repository": "alibaba-pai/minimax-h3-turbo-lora",
+        "total_bytes": 798221574,
+        "unique_bytes": 798221574,
+        "checkpoints": [
+          {
+            "release": "",
+            "lane": "pdd8",
+            "precision": "bf16",
+            "manifest": "sha256:030ec3859fae0a1b599184d84690b77b922d8697887b24191cb71e12ba1aac98"
+          }
+        ]
+      },
+      {
+        "repository": "minimaxai/minimax-h3",
+        "total_bytes": 52017031887,
+        "unique_bytes": 52017031887,
+        "checkpoints": [
+          {
+            "release": "",
+            "lane": "int8",
+            "precision": "int8",
+            "manifest": "sha256:b80c5e41b487e5e8ede4638c4b00688c1763b48c8141d955845dd26268b865be"
+          }
+        ]
+      }
+    ],
+    "models_bytes": 52815253461,
+    "environments": [
+      {
+        "installation": "local-a18258b2c9039d36186e3f1f7bf10369",
+        "package": "local/ci-varena-linear-consumer",
+        "release": "0.1.0",
+        "hub": "",
+        "level": "installed",
+        "warning": ""
+      },
+      {
+        "installation": "local-caf91fc05847a7ffecbcad83be322049",
+        "package": "local/ci-varena-native-retention",
+        "release": "0.1.0",
+        "hub": "",
+        "level": "installed",
+        "warning": ""
+      },
+      {
+        "installation": "local-57c1cd40be4913239ab9ccfce6b8694c",
+        "package": "local/ci-varena-owner",
+        "release": "0.1.0",
+        "hub": "",
+        "level": "installed",
+        "warning": ""
+      },
+      {
+        "installation": "local-68ebd42a9c51db91ba31c47221306d82",
+        "package": "local/ci-varena-p0",
+        "release": "0.1.0",
+        "hub": "",
+        "level": "installed",
+        "warning": ""
+      },
+      {
+        "installation": "local-a966c745d086725aadae4bb18d81360d",
+        "package": "local/ci-varena-residual-ffn",
+        "release": "0.1.0",
+        "hub": "",
+        "level": "installed",
+        "warning": ""
+      },
+      {
+        "installation": "local-08075ccbe223bd22eaef9fe4748adaeb",
+        "package": "local/minimax-h3",
+        "release": "0.2.3",
+        "hub": "",
+        "level": "imported",
+        "warning": ""
+      }
+    ],
+    "warm": [],
+    "mode": "dedicated",
+    "driver_floor": "580.65.06",
+    "toolchain": {
+      "state": "ready",
+      "nvcc": "Cuda compilation tools, release 13.0, V13.0.88",
+      "host_compiler": "c++ (Debian 12.2.0-14+deb12u1) 12.2.0",
+      "missing": [],
+      "install": "",
+      "detail": ""
+    }
+  },
+  "running": 0,
+  "queued": 0,
+  "recorded": true,
+  "unverified": false
+}
