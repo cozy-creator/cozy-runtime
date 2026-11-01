@@ -326,7 +326,8 @@ class Residency(Protocol):
         ...
 
     def region(
-        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None
+        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> Any:
         """An explicitly owned cache, released only while it has no active user."""
         ...
