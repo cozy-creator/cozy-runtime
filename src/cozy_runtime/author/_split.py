@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN
+    from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN, SparseProjectedHeads
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +53,7 @@ def install(runtime: Pieces | None) -> None:
 
 def split(
     fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None,
-    intent: ResidualFFN | ProjectedHeads | None = None,
+    intent: ResidualFFN | ProjectedHeads | SparseProjectedHeads | None = None,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -73,12 +73,14 @@ def split(
     """
     runtime = _RUNTIME
     if intent is not None:
-        from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN
+        from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN, SparseProjectedHeads
 
         if type(intent) is ResidualFFN:
             declared_intent = getattr(runtime, "split_residual_ffn", None)
         elif type(intent) is ProjectedHeads:
             declared_intent = getattr(runtime, "split_projected_heads", None)
+        elif type(intent) is SparseProjectedHeads:
+            declared_intent = getattr(runtime, "split_sparse_projected_heads", None)
         else:
             raise TypeError("split intent must declare a supported complete operation")
         if most is None and callable(declared_intent):

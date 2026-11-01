@@ -66,9 +66,12 @@ def launch_projection(
     half = part.dtype == torch.float16
     width, channels = part.shape[-1], data.shape[0]
     count = part.numel() // width
+    output_stride = target.stride(-2)
     native = _kernels._gemm
     bias_ptr = 0 if bias is None else bias.data_ptr()
     if dispatch.kind == 1:
+        if output_stride != channels:
+            raise RuntimeError("a committed GEMV requires contiguous output rows")
         code = native.gemv(
             device, part.data_ptr(), half, data.data_ptr(), scale.data_ptr(),
             bias_ptr, target.data_ptr(), half, count, channels, width, stream_id,
@@ -83,7 +86,7 @@ def launch_projection(
             library._check(code, "the committed quantization")
         code = native.gemm(
             device, 0, False, q.data_ptr(), scales.data_ptr(), data.data_ptr(),
-            scale.data_ptr(), bias_ptr, target.data_ptr(), channels, half,
+            scale.data_ptr(), bias_ptr, target.data_ptr(), output_stride, half,
             count, channels, width, dispatch.config, scratch, stream_id,
         )
     # A refusal ends this operation. It cannot choose another kernel or replay

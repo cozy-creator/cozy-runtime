@@ -227,6 +227,35 @@ class ProjectedHeads:
     seed: Any = None
 
 
+@dataclass(frozen=True, slots=True)
+class SparseProjectedHeads:
+    """Complete single-device Kitchen producer with caller-owned carried key means.
+
+    The selected producer's fixed token chunks, fused norm/RoPE and routing remain
+    authoritative. ``prior_mean`` is read-only; ``next_mean`` receives the complete
+    private result only after every head window succeeds. No byte estimate or memory
+    window is supplied. The initial contract is BF16 with baked INT8 projections.
+    """
+
+    hidden: Any
+    query: Any
+    key: Any
+    value: Any
+    heads: int
+    backend: object
+    launch: Launch
+    value_absmax: TritonEntry
+    key_sum: TritonEntry
+    norm_q: Any
+    norm_k: Any
+    eps: float
+    rotary: Any
+    prior_mean: Any
+    next_mean: Any
+    protected_prefix: int
+    tau: float
+
+
 class _Shared:
     __slots__ = ("operands", "tensor")
 
