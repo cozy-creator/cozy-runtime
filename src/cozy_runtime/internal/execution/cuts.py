@@ -509,8 +509,6 @@ def split[T](
         points = sorted(_MEASURED.get(key, ()))
         refused = key in _REFUSED
     request = catch.CURRENT.get()
-    if request is not None:
-        request.note_split(out_bytes)
     measured: tuple[int, int] | None = None
 
     def at(level: int) -> T:

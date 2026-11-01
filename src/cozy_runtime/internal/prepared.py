@@ -1017,8 +1017,8 @@ class _SequenceExecution(Execution):
                     )
             self._working_phases_recorded = True
         # Native phase entry changed preferences without a Python callback. After every
-        # source/prefetch/consumer is checked, invalidate only our stale eager-policy cache;
-        # the next ordinary phase recomputes it. Preserve another live request's policy.
+        # source/prefetch/consumer is checked, invalidate our stale eager phase identity;
+        # the next ordinary boundary refreshes native intent. Preserve another live request.
         for memory, controller in self._phase_controllers.items():
             if not controller.facts()["transitions"]:
                 continue  # measurement-only wrappers did not change weight preferences
