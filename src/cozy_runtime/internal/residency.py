@@ -35,7 +35,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import CapabilityError, Fault, fault
-from cozy_runtime.internal import cooperation, proctree
+from cozy_runtime.internal import cache_owners, cooperation, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -1302,20 +1302,27 @@ class Binding:
 class Region:
     """An explicit owner's disposable cache; it never intercepts or remaps Torch storage."""
 
-    def __init__(self, memory: Memory, owner: str, release: Callable[[], None] | None) -> None:
+    def __init__(self, memory: Memory, owner: str, release: Callable[[], None] | None,
+                 shrink: Callable[[], bool] | None = None) -> None:
         self.memory, self.owner, self.release = memory, owner, release
+        self.shrink = shrink
         self.lock = threading.RLock()
         self.pins = 0
         self.fresh = False
         self.closed = False
         self.reclaiming = False
         self.last = time.monotonic_ns()
+        # Only typed owners with an explicit nonblocking shrink path enter background reclaim.
+        self._cache_owner = (cache_owners.register(memory.device, self, "discard")
+                             if shrink is not None else None)
 
     @contextmanager
     def pin(self) -> Iterator[bool]:
         with self.lock:
             if self.closed or self.reclaiming:
                 raise ResidencyError(f"cache {self.owner!r} is closed or being reclaimed")
+            if self._cache_owner is not None:
+                self._cache_owner.check()
             self.pins += 1
             fresh, self.fresh = self.fresh, False
         try:
@@ -1324,6 +1331,8 @@ class Region:
             with self.lock:
                 self.pins -= 1
                 self.last = time.monotonic_ns()
+                if self._cache_owner is not None:
+                    self._cache_owner.touch()
 
     allocating = pin
 
@@ -1336,8 +1345,13 @@ class Region:
             self.reclaiming = True
             # No Memory metadata lock is held. The owner releases its ordinary tensors and
             # joins any exceptional consumers or cached graph outputs before dropping them.
-            self.release()
+            if self.shrink is None:
+                self.release()
+            elif not self.shrink():
+                return False
             self.fresh = True
+            if self._cache_owner is not None:
+                self._cache_owner.suspend()
             return True
         finally:
             self.reclaiming = False
@@ -1350,9 +1364,14 @@ class Region:
             if self.pins:
                 raise ResidencyError(f"cache {self.owner!r} is still in use")
             self.closed = True
+            if self._cache_owner is not None:
+                self._cache_owner.stop()
             release, self.release = self.release, None
+            self.shrink = None
             if release is not None and not self.reclaiming:
                 release()
+        if self._cache_owner is not None:
+            self._cache_owner.close()  # drains only after releasing the Region lock
 
 
 class Memory:
@@ -2499,9 +2518,10 @@ class Memory:
         spill: bool = False,
         *,
         release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> Region:
         del kind, sets, spill  # Cache semantics belong to its explicit owner, not an allocator.
-        region = Region(self, owner, release)
+        region = Region(self, owner, release, shrink)
         self.regions.add(region)
         return region
 
