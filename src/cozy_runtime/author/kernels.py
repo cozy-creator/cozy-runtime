@@ -199,6 +199,34 @@ class ResidualFFN:
     exclusive_out: bool
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectedHeads:
+    """One complete projection/norm/rotary/head-local attention operation.
+
+    The selected backend remains authoritative. The first executor supports dense
+    INT4QK on one CUDA device, with actual encoded Q/K/V modules and compiled in-place
+    norm/rotary entries. ``seed`` optionally receives post-rotary F32 key means.
+    No byte budget, head-window size, or allocating Python callback is supplied.
+    """
+
+    hidden: Any
+    query: Any
+    key: Any
+    value: Any
+    heads: int
+    backend: object
+    launch: Launch
+    rope: TritonEntry
+    key_sum: TritonEntry
+    norm_q: Any
+    norm_k: Any
+    eps_q: float
+    eps_k: float
+    cos: Any
+    sin: Any
+    seed: Any = None
+
+
 class _Shared:
     __slots__ = ("operands", "tensor")
 

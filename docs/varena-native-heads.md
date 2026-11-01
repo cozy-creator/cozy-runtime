@@ -2,7 +2,10 @@
 
 The first implementation should claim the actual H3 `_Heads` operation **before** its outer legacy `split` begins. It can close the dense INT4QK route using the existing raw-pointer `_attn4` ABI, without a C++ change. Adding an allocator menu only inside `attention_ulysses._call` is insufficient: actual H3 arrives there inside `_Heads`' retryable legacy scope, and `catch.uncommitted_scope()` correctly makes current native consumers ineligible. Removing that exclusion would reintroduce nested policy/retry ownership.
 
-This is a source plan, not an implemented or qualified operation. Bounded-trim qualification takes priority. Product branches remain untouched during this review.
+This draft implements that bounded consumer. Actual CPU construction, the baked Rows hook,
+unchanged GLUE identities, and targeted static checks pass. GPU qualification is pending;
+no full-model performance claim follows from source checks. The accompanying Creator fixture
+uses actual package Heads, encoded projections, compiled kernels and real allocator refusals.
 
 ## Actual selected paths
 
@@ -58,7 +61,7 @@ Let T be live tokens, H full heads, h a candidate head window, D=128, input widt
 
 The output plus seven INT4 scratch allocations are the existing eight ABI buffers from `attention_int4.py`. Q/K/V are normalized and rotated in place with the existing GLUE kernel. Contiguous rotary/norm representations must be materialized before admission and included as outside live holdings. No hidden `.contiguous()` or dtype conversion may occur inside the accepted interval. All workspace is allocated before output/seed writes.
 
-The native split menu charges individually rounded real allocations, not their unrounded sum. Full/tail GEMM configuration and head geometry are part of choice identity; source/model/selected-backend identity is part of the reusable semantic key. Publication follows the current enclosing phase's completion proof, not Python return.
+The native split menu charges individually rounded real allocations, not their unrounded sum. Full/tail GEMM configuration and head geometry are part of choice identity; source/model/selected-backend identity is part of the reusable semantic key. Publication follows the current enclosing phase's completion proof, not Python return. Descriptor preparation is separate from execution, but currently binds and holds the actual call's weights. A future whole-phase inventory must extract metadata without binding every model block up front.
 
 ## Projection and hook seam that must remain real
 

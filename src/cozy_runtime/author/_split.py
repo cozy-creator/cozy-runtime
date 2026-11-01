@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
-    from cozy_runtime.author.kernels import ResidualFFN
+    from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +53,7 @@ def install(runtime: Pieces | None) -> None:
 
 def split(
     fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None,
-    intent: ResidualFFN | None = None,
+    intent: ResidualFFN | ProjectedHeads | None = None,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -73,13 +73,16 @@ def split(
     """
     runtime = _RUNTIME
     if intent is not None:
-        from cozy_runtime.author.kernels import ResidualFFN
+        from cozy_runtime.author.kernels import ProjectedHeads, ResidualFFN
 
-        if type(intent) is not ResidualFFN:
-            raise TypeError("split intent must be a ResidualFFN declaration")
-        declared_tail = getattr(runtime, "split_residual_ffn", None)
-        if most is None and callable(declared_tail):
-            result = declared_tail(intent, out, cuts)
+        if type(intent) is ResidualFFN:
+            declared_intent = getattr(runtime, "split_residual_ffn", None)
+        elif type(intent) is ProjectedHeads:
+            declared_intent = getattr(runtime, "split_projected_heads", None)
+        else:
+            raise TypeError("split intent must declare a supported complete operation")
+        if most is None and callable(declared_intent):
+            result = declared_intent(intent, out, cuts)
             if result is not None:
                 return result
     if runtime is not None and most is None and out is None:

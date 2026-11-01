@@ -59,6 +59,7 @@ def launch_projection(
     library: prebuilt.Prebuilt, data: Tensor, scale: Tensor, bias: Tensor | None,
     part: Tensor, target: Tensor, dispatch: _Dispatch,
     q: Tensor | None, scales: Tensor | None, scratch: Any, stream_id: int,
+    *, quantized: bool = False,
 ) -> None:
     """Execute one already-selected projection into supplied storage; no allocation/policy."""
     device = part.device.index or 0
@@ -74,11 +75,12 @@ def launch_projection(
         )
     else:
         assert q is not None and scales is not None
-        code = native.quantize(
-            device, False, part.data_ptr(), half, q.data_ptr(), scales.data_ptr(),
-            count, width, 0, 0, 0, 0, 1, 0, 0.0, 0, 0, stream_id,
-        )
-        library._check(code, "the committed quantization")
+        if not quantized:
+            code = native.quantize(
+                device, False, part.data_ptr(), half, q.data_ptr(), scales.data_ptr(),
+                count, width, 0, 0, 0, 0, 1, 0, 0.0, 0, 0, stream_id,
+            )
+            library._check(code, "the committed quantization")
         code = native.gemm(
             device, 0, False, q.data_ptr(), scales.data_ptr(), data.data_ptr(),
             scale.data_ptr(), bias_ptr, target.data_ptr(), channels, half,
