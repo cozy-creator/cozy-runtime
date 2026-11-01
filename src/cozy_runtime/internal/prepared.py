@@ -981,10 +981,17 @@ class _SequenceExecution(Execution):
             if (
                 not bindings
                 or not next_bindings
-                or not getattr(job, "supports_native_lookahead", False)
-                or not getattr(next_job, "supports_native_lookahead", False)
                 or not callable(getattr(job, "link_next", None))
             ):
+                continue
+            if not all(
+                getattr(source, "supports_measured_lookahead", False)
+                for source in (job, next_job)
+            ):
+                self._prefetch_admission.append({
+                    "from_stage": index, "to_stage": next_index,
+                    "state": "unsupported_native_admission",
+                })
                 continue
             current_stage = self.plan.stages[index]
             # Identity/order are the declaration. Native admission checks the active replay,

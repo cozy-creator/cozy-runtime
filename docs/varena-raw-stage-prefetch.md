@@ -59,6 +59,9 @@ This path replaces the Python `_stage_prefetch_window` byte/window calculation,
 longer sums current/next source reservations, missing bytes or a maximum pair
 window to authorize these reads. A linked edge is only a declaration; native
 admission may still decline it at actual read time.
+The native `supports_measured_lookahead` marker distinguishes this API from the
+older max-byte link. If absent, optional speculation is explicitly reported as
+unsupported and ordinary demand loading remains; the old budget path is not used.
 
 Eager queued prefetch and the broader split/reclaim policy remain separate work.
 This source cutover requires the paired native raw-stage admission API and real
@@ -71,6 +74,8 @@ same semantic key, wrong active-stage identity, pressure changing after linking,
 partial source-group failure, canceled/failed reads and pending-DMA cleanup.
 Weightless inter-block stages must preserve preferences; encoded private scratch
 must remain ineligible. A repeated interval must not prefetch its suffix early.
+Require actual admitted/started prefetch counters: linking or streamed completion
+alone cannot prove this optional path executed.
 
 Full H3 proof is 15 s, 362 frames, 1344×768, 30 steps and audio, with actual native
 mode/step counts and preserved quality. Compare capture, denoise and H2D against
