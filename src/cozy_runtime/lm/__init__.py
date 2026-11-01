@@ -1291,7 +1291,8 @@ class _Engine:
                 # bindings below may be replaced while this driver owns live rows.
                 if self.region is None and (placed := PLACED.get(self.model)) is not None:
                     self.region = placed[0].region(
-                        f"lm:{type(self.model).__name__}", "kv", self.model, release=self._drop
+                        f"lm:{type(self.model).__name__}", "kv", self.model,
+                        release=self._drop, shrink=self._try_drop,
                     )
                 if (
                     not held_region
@@ -2163,6 +2164,20 @@ class _Engine:
         self.flag[:size].copy_(done, non_blocking=True)
 
     # ------------------------------------------------------------------ memory
+
+    def _try_drop(self) -> bool:
+        from cozy_runtime.internal import cache_owners
+
+        locks = [_PLANE, self.cond]
+        if self.domain is not None:
+            locks.append(self.domain.lock)
+        with cache_owners.try_locks(locks) as claimed:
+            if not claimed or self.driver is not None or self.pending or self._occupied():
+                return False
+            if self.unfenced or any(not event.query() for event in self.completions.values()):
+                return False
+            self._drop()
+            return True
 
     def _drop(self) -> None:
         if self.cache_device is not None and self.cache_device.type == "cuda":
