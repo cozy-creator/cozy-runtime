@@ -1,0 +1,1 @@
+`VideoFile.read` and `VideoFile.stream` take `start=` (se-086): seconds from the first frame, like `end`. The decode seeks to the keyframe at or before it; frames that end before it are decoded but never converted; the first kept frame begins at it (the tick at or before), and the soundtrack at the exact sample. A shot package reads each piece's own window of a long clip.
