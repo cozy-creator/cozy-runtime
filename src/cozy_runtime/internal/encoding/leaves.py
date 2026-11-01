@@ -71,6 +71,7 @@ SVDQ = "cozy.svdq-nvfp4.native-leaf/1"
 
 class _Serving(Protocol):
     def serving(self, index: int) -> str: ...
+    def prime(self, torch: Any, index: int) -> None: ...
 
 
 class _ScaledMm:
@@ -79,6 +80,10 @@ class _ScaledMm:
     @staticmethod
     def serving(index: int) -> str:
         return "torch._scaled_mm"
+
+    @staticmethod
+    def prime(torch: Any, index: int) -> None:
+        return None
 
 
 #: Each leaf provider's lane format, as a run's `gemm.selected` names it.
@@ -106,6 +111,15 @@ OPERANDS = {INT8_CONVROT: INT8_CONVROT, ROWWISE_FP8: ROWWISE_FP8, W4A8: INT8_CON
 def serving(provider: str, index: int) -> str:
     """The kernel `provider`'s leaves on this card serve now: read once a run, never per call."""
     return str(_MODULES[provider].serving(index))
+
+
+def prime(torch: Any, index: int) -> None:
+    """Opens every kernel the encoded leaves serve on cuda:`index`, each on its own thread, at
+    device init beside the weight fill (`kernel_ready.prime`): a first ask waits for its kernel
+    rather than serve a fallback through a request's first step (cr-241: H3's nvfp4 step 1 on an
+    RTX 5090, 79 s against 29 s)."""
+    for module in dict.fromkeys(_MODULES.values()):
+        module.prime(torch, index)
 
 
 def sites(leaves: Mapping[str, tuple[Any, ...]]) -> Counter[tuple[str, str]]:

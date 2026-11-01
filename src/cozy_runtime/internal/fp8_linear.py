@@ -31,6 +31,10 @@ SCALED_MM = "torch._scaled_mm"
 _OPS: dict[int, int8_linear.Op] = {}
 
 
+#: Its op is the 8-bit library's: opening that opens it.
+prime = int8_linear.prime
+
+
 def native(torch: ModuleType, index: int) -> int8_linear.Op | None:
     """The library's fp8 linear on this card, or None while the library builds."""
     op = _OPS.get(index)
