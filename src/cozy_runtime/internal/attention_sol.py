@@ -96,7 +96,7 @@ _KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
 #: This request's word on each object it asked for, by key digest: building, served or failed.
 _SAID: ContextVar[dict[str, str] | None] = ContextVar("cozy_sol_said", default=None)
 #: What a step serves in place of a sparse one, by count.
-COUNTS = ("sparse", "dense_step", "dense_building", "dense_path", "dense_prefix")
+COUNTS = ("sparse", "dense_step", "dense_building", "dense_path", "dense_prefix", "prefix_heavy")
 
 
 @contextmanager
@@ -878,6 +878,11 @@ def _execute(
     fa4 = sparse is None and card is not None and route(card) == FA4
     loaded: object = None
     instead = "dense_path" if dense_path else "dense_step"
+    if not dense_path and layout.step >= layout.dense_until_step and not layout.sparse:
+        # Its prefix leaves this step no cheaper sparse (`AttentionLayout.sparse`): the protected
+        # rows' kernel serves every row, so those rows come out as a sparse step makes them, and
+        # the rest exact where they would have been routed.
+        dense, instead = prefix_dense or dense, "prefix_heavy"
     if not dense_path and sparse is None:
         # The first sight of this length starts its kernels opening off the request (a CuTe
         # route's object, upstream's preprocess), and the dense steps run while they build.
@@ -885,9 +890,9 @@ def _execute(
         ready, waiting = (FA4, "") if fa4 else _ready(layout.live_tokens, query.device, layout.step)
         if ready is not None and unbuilt:
             ready, waiting = None, unbuilt
-        if layout.step >= layout.dense_until_step:
+        if layout.sparse:
             loaded, instead = ready, waiting
-    if dense_path or layout.step < layout.dense_until_step or (sparse is None and loaded is None):
+    if dense_path or not layout.sparse or (sparse is None and loaded is None):
         # A dense step, a dense path, or a sparse step whose variant is not ready: the dense
         # reference serves it.
         live_output = dense(query=q, key=k, value=v, scale=scale)

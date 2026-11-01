@@ -22,8 +22,8 @@ class AttentionLayout:
     (`attention_sol.outlier_keys`), so a model names only the rest. Step indices are
     zero-based. `tau` is the sparse steps' block-selection threshold (Sol-Attn's: higher
     keeps fewer key blocks; NVIDIA's Regenerate presets run 1.0 and 1.75), read by every
-    sparse route. This describes inference only; it does not authorize a backend or
-    select a kernel.
+    sparse route. `sparse` says which steps those are. This describes inference only; it
+    does not authorize a backend or select a kernel.
     """
 
     live_tokens: int
@@ -50,6 +50,17 @@ class AttentionLayout:
                 for path in paths
             ):
                 raise ValueError(f"{name} must be a tuple of nonempty module prefixes")
+
+    @property
+    def sparse(self) -> bool:
+        """Whether this step attends sparsely: past the dense steps, unless the protected prefix
+        leaves half the score matrix exact (its rows against every key, every other row against
+        its keys: a prefix of 29% or more). That half alone costs a dense step on 8-bit kernels,
+        and routing costs more: an H3 plate shot (prefix 51%) ran its Sol steps 1.7x its dense
+        ones on an RTX 4090 (xs-142). Such a step runs dense, on the kernel its route gives the
+        protected rows."""
+        n, p = self.live_tokens, self.protected_prefix
+        return self.step >= self.dense_until_step and 2 * (2 * n * p - p * p) < n * n
 
 
 _ACTIVE_LAYOUT: ContextVar[AttentionLayout | None] = ContextVar(

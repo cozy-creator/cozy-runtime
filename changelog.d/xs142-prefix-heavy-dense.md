@@ -1,0 +1,1 @@
+A sparse step whose protected prefix leaves half its score matrix exact (a prefix of 29% or more, as an H3 plate shot's 51%) runs dense on the kernel its route gives the protected rows (`AttentionLayout.sparse`): every row attending the prefix's keys exactly made Sol 1.7x slower than a dense step, so the plate's sparse steps were its slowest.
