@@ -164,6 +164,10 @@ def _entries(intent: SparseProjectedHeads, device: int) -> tuple[Any, ...] | Non
 
 
 def _capsule(value: Tensor) -> Any:
+    # Preparation already rejects grad-enabled execution. Match the pinned Kitchen
+    # inference boundary: Parameter metadata may still require grad under no_grad.
+    if value.requires_grad:
+        value = value.detach()  # owning storage alias, no copy or original-flag mutation
     return value.__dlpack__(stream=-1)
 
 
