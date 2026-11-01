@@ -194,27 +194,35 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
             if not short(exc):
                 raise
             _clear(exc)
-            # A failed allocation can reveal pressure the shape estimate cannot predict.
-            # This also runs at the finest level, which sizing.descend cannot make smaller.
-            # First release a bounded amount, now that failed-frame pins are gone. An
-            # underestimated workspace still gets the existing full-reclaim last chance.
-            fresh = request.room()
-            target = max(need(level, fresh.granularity), fresh.free + fresh.granularity)
-            failure = exc
-            for wanted in (target, 0):
-                if request.reclaim(wanted) <= 0:
-                    continue
-                retries += 1
-                checkpoint()
-                scope.ordinals.clear()
-                try:
-                    return run(level)
-                except Exception as retry_error:
-                    if not short(retry_error):
-                        raise
-                    _clear(retry_error)
-                    failure = retry_error
-            raise failure from None
+            failure: BaseException | None = exc
+        # A failed allocation can reveal pressure the shape estimate cannot predict.
+        # This also runs at the finest level, which sizing.descend cannot make smaller.
+        # First release a bounded amount, now that failed-frame pins are gone. An
+        # underestimated workspace still gets the existing full-reclaim last chance.
+        fresh = request.room()
+        target = max(need(level, fresh.granularity), fresh.free + fresh.granularity)
+        for wanted in (target, 0):
+            if request.reclaim(wanted) <= 0:
+                continue
+            retries += 1
+            checkpoint()
+            scope.ordinals.clear()
+            try:
+                result = run(level)
+            except Exception as retry_error:
+                if not short(retry_error):
+                    raise
+                _clear(retry_error)
+                failure = retry_error
+                continue
+            # The kept failure's traceback holds this frame, and through each caller's
+            # frame every tensor their locals name, until the cyclic collector runs: a
+            # split's whole output and its input (2.5 GB at H3 15 s) outlived the call
+            # that retried and made an 8 GB card refuse the next block (xs-141, run 24683).
+            failure = None
+            return result
+        assert failure is not None
+        raise failure from None
 
     try:
         if _capturing():
