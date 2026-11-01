@@ -1,0 +1,1 @@
+A pure site's retry after a refused allocation keeps no exception once it succeeds: the exception's traceback held the retrying frame and, through its callers' frames, every tensor they named (an H3 15 s split's head output and its input, 2.5 GB) until the cyclic collector ran.
