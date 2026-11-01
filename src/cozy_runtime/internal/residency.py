@@ -3224,12 +3224,17 @@ class Memory:
         bake: Bake | None = None
         try:
             with self.lock:
-                if self._prefetch is not None:
+                pending = self._prefetch
+                if pending is not None and (
+                    pending.block is block or pending.host or pending.block.model is block.model
+                ):
                     # A host-tier prefetch is one DMA already issued: it completes in milliseconds,
                     # so another block's demand waits for it rather than discarding it. H3 Turbo
                     # on an RTX 4090 canceled every DiT prefetch at its LoRA block's demand and
-                    # copied each page twice: 24 GB a step for 12 GB of pages.
-                    pending = self._prefetch
+                    # copied each page twice: 24 GB a step for 12 GB of pages. Another model's
+                    # block (a LoRA's factors, read for the overlay and the bake of the block in
+                    # flight) leaves a store read in flight too: canceled, 52 of H3's 53 cold DiT
+                    # blocks read on demand on an RTX 5090 (cr-242).
                     self._settle_prefetch(cancel=pending.block is not block and not pending.host)
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
