@@ -407,27 +407,33 @@ __all__ = [
     "uses_components",
 ]
 
-#: Names Runtime 0.36.0 removed (xs-135: an asset is a production element, a file is a file). A
-#: package built for an older Runtime imports one of them and fails here, never decoding a request
-#: with a name that now means something else.
+#: Names a Runtime removed, the release that removed them, and what replaces each. A package built
+#: for an older Runtime imports one of them and fails here, never decoding a request with a name
+#: that now means something else.
 _REMOVED = {
-    "ImageAsset": "ImageFile",
-    "VideoAsset": "VideoFile",
-    "AudioAsset": "AudioFile",
-    "FileAsset": "File",
-    "Assets": "Files",
-    "AssetBound": "FileBound",
-    "AssetLimits": "FileLimits",
-    "AssetInfo": "FileInfo",
-    "ReferenceImages": "Picture",
+    "ImageAsset": ("0.36.0", "ImageFile"),
+    "VideoAsset": ("0.36.0", "VideoFile"),
+    "AudioAsset": ("0.36.0", "AudioFile"),
+    "FileAsset": ("0.36.0", "File"),
+    "Assets": ("0.36.0", "Files"),
+    "AssetBound": ("0.36.0", "FileBound"),
+    "AssetLimits": ("0.36.0", "FileLimits"),
+    "AssetInfo": ("0.36.0", "FileInfo"),
+    "ReferenceImages": ("0.36.0", "Picture"),
+    "Asset": ("0.37.0", "Reference"),
+    "PictureAsset": ("0.37.0", "Picture"),
+    "ShotAsset": ("0.37.0", "CharacterReference, PropReference or EnvironmentReference"),
+    "WorldState": ("0.37.0", "an EnvironmentReference with follow: loose"),
+    "Implements": ("0.37.0", "nothing: a project reads a function's request schema"),
 }
 
 
 def __getattr__(name: str) -> object:
     if name in _REMOVED:
+        release, instead = _REMOVED[name]
         raise ImportError(
-            f"cozy_runtime.author.{name} is gone in Runtime 0.36.0 ({_REMOVED[name]} replaces it): "
-            "this package was built for Runtime < 0.36; use its newest release",
+            f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): this "
+            f"package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest release",
             name=name,
         )
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
