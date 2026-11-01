@@ -25,6 +25,7 @@ from itertools import pairwise
 from typing import Any, Protocol
 
 import tensorfs
+import tensorfs.varena.torch as vt
 import torch
 from tensorfs import varena
 from tensorfs.raw import parts as stored_parts
@@ -69,12 +70,9 @@ _RESERVE = 512 << 20
 
 
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
-    """Torch's allocated, reserved and peak allocated CUDA bytes in one allocator read.
-    `torch.cuda.memory_allocated` and its siblings each flatten the allocator's whole statistics
-    dict (0.1 ms); a cut site read them three to five times, 5 s of each SDXL request at 3 GB."""
-    stats = torch.cuda.memory_stats_as_nested_dict(device)
-    allocated, reserved = stats["allocated_bytes"]["all"], stats["reserved_bytes"]["all"]
-    return int(allocated["current"]), int(reserved["current"]), int(allocated["peak"])
+    """Working allocation demand/backing/peak; native weight bytes are counted separately."""
+    stats = vt.stats(device.index or 0)
+    return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), int(stats["allocated_peak"])
 
 
 #: Streamed (non-preferred) blocks resident at once: the one the GPU runs, the one entering, and
@@ -84,11 +82,8 @@ _STREAMED = 3
 
 
 def yields() -> bool:
-    """Whether this TensorFS can hold the process to a room (`varena.make_room`, TensorFS 0.17.16
-    on): an older one cannot, and the executor's hello says so (version skew degrades)."""
-    return callable(getattr(varena, "make_room", None)) and callable(
-        getattr(varena, "no_capture", None)
-    )
+    """Whether the native allocator accepts TensorD's process room; lifecycle stays in TensorD."""
+    return callable(getattr(varena, "make_room", None))
 #: Re-plans of one phase's activation budget (`Memory._replan`): its first, and tightenings by
 #: a pass's overshoot.
 _PLANS = 3
@@ -144,8 +139,8 @@ class Room:
     warm: int
     granularity: int = 512
     floor: int = 0
-    #: Torch's reserved, unallocated bytes: a cut's level and its pre-reclaim count them (its
-    #: activations reuse them first); a reclaim returns them before weights.
+    #: Existing sizing policy's unallocated working backing. P2 replaces this aggregate
+    #: with stream/pool-aware capacity; it is not a physical-reclamation guarantee.
     cached: int = 0
     #: What a re-planned phase leaves its activations beyond those live now (`Memory._replan`);
     #: None while the phase has no plan.
@@ -606,6 +601,7 @@ class Model:
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
         self.closed = False
+        self.working_phase_keys: set[str] = set()
         # Once a block streams, later blocks cannot grow the resident prefix again.
         self.prefix: int | None = None
         #: the block entered last, whose successor in execution order `_enter` records (`next`)
@@ -743,6 +739,7 @@ class Model:
                 return
             if self.users or any(b.count or b.retained for b in self.groups()):
                 raise ResidencyError("retire graph bindings and active model uses before unload")
+            self.memory.forget_working_phases(self)
             self.closed = True
             for handle in self.handles:
                 handle.remove()
@@ -1375,6 +1372,7 @@ class Memory:
         self.last_room: dict[str, object] | None = None
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
+        self._working_phase_owners: dict[str, set[Model]] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
@@ -1384,7 +1382,6 @@ class Memory:
         #: The active phase's weights all fit beside the other phases' idle ones: nothing of it
         #: streams, so its blocks reserve no streaming window (`_activate_phase`).
         self._fits = False
-        self._stage_window_owner: object | None = None
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
         self.phase_supported = False
@@ -1433,7 +1430,7 @@ class Memory:
         if self.cuda:
             try:
                 if budget_bytes is not None:
-                    varena.set_activation_limit(self.device.index or 0, budget_bytes)
+                    vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = bool(
@@ -1472,7 +1469,7 @@ class Memory:
         )
 
     def _reading(self) -> tuple[int, int, int, int]:
-        """Torch's allocated, reserved and peak bytes and the weight pages, each read once."""
+        """Native working demand/backing/peak and weight pages, each read once."""
         if self.cuda and torch.cuda.is_initialized():
             resident = int(self.native.stats()["resident_bytes"]) if self.native is not None else 0
             return (*_torch_bytes(self.device), resident)
@@ -1495,7 +1492,7 @@ class Memory:
 
     def make_room(self, limit: int | None) -> None:
         """What the machine leaves this process of the GPU (design/vram-yield.md; `room_for`),
-        None for no limit. Lower than it holds, it gives at once: idle, Torch's unused cache, then
+        None for no limit. Lower than it holds, it gives at once: idle working backing, then
         weight pages in Varena's reclaim order; in a call, pages only, never below what the call
         has needed and runs on, so a run streams and is never ended for it. Higher, the running
         call takes it at its next pass (`_take_room`); idle, at once. Called on the seam's reading
@@ -1558,12 +1555,35 @@ class Memory:
         """Torch's reserve plus this process's weight pages: what a room limits."""
         return self._figures()[1]
 
+    def remember_working_phase(self, key: str, models: tuple[Model, ...]) -> None:
+        """A semantic observation lives only while its participating model owners do."""
+        with self.lock:
+            owners = self._working_phase_owners.setdefault(key, set())
+            for model in models:
+                owners.add(model)
+                model.working_phase_keys.add(key)
+
+    def forget_working_phases(self, model: Model) -> None:
+        """Model close runs after its execution; native retirement is metadata-only."""
+        with self.lock:
+            # If another scope is active, a refused retirement retains the ownership request.
+            for key in model.working_phase_keys:
+                if self._working_phase_owners[key] == {model}:
+                    vt.phase_forget(self.device.index or 0, key)
+            for key in tuple(model.working_phase_keys):
+                owners = self._working_phase_owners[key]
+                if owners == {model}:
+                    del self._working_phase_owners[key]
+                else:
+                    owners.remove(model)
+                model.working_phase_keys.remove(key)
+
     def _room_floor(self) -> int:
         """What this process must keep to go on: its call's working set as it has peaked (across
-        cut resets) or Torch's reserve, whichever is more, its pinned pages, and the streamed
+        cut resets) or mapped working backing, whichever is more, its pinned pages and streamed
         blocks in flight of the models of its phase (running, or the last entered, between
-        forwards); idle, what Torch still holds. A later phase that needs more (a decode) takes
-        it from the call's weight pages through the allocation hook."""
+        forwards); idle, what remains live. A later phase that needs more (a decode) takes
+        it from the call's weight pages through the native allocator."""
         native = self.native.stats() if self.native is not None else {}
         pinned = int(native.get("pinned_bytes", 0))
         allocated, reserved, _ = _torch_bytes(self.device)
@@ -1584,14 +1604,10 @@ class Memory:
         return max(peak, reserved) + pinned + _STREAMED * max(blocks, default=0)
 
     def _release_cache(self) -> None:
-        """Torch's unused cache back to the driver, no capture beginning meanwhile."""
+        """Return idle working backing; native trim owns capture exclusion."""
         if not yields():
             return
-        try:
-            with varena.no_capture(self.device.index or 0):
-                torch.cuda.empty_cache()
-        except RuntimeError:
-            pass  # a capture is in progress: the room bounds its next allocations
+        vt.trim(self.device.index or 0)
 
     def _apply_room(self, limit: int | None) -> None:
         self.room_limit = limit
@@ -2654,13 +2670,8 @@ class Memory:
         demand; a streaming window unless its missing bytes fit. Caller holds the lock."""
         names = self._phase_names or frozenset()
         self._settle_prefetch(cancel=True)
-        # The phase that ends here: Torch's high-water in it and the speculative fills that
-        # high-water refused (TensorFS's step reserve; absent on an older native wheel).
-        ended = {
-            k: v
-            for k, v in self.native.stats().items()
-            if k in ("torch_high_bytes", "torch_reserved_bytes", "reserve_refusals")
-        }
+        # Boundary observation, not a completed-phase watermark (P2 owns that measurement).
+        working_before = vt.stats(self.device.index or 0)
         self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
         incoming = [m for m in self.models.values() if m.name in names]
         # An unrelated registered model must not enlarge this phase's streaming
@@ -2691,10 +2702,9 @@ class Memory:
         allocated, before, _ = _torch_bytes(self.device)
         unused = max(before - allocated, 0)
         if unused:
-            # The previous phase's inactive Torch segments are neither weight capacity nor
-            # this phase's activations. Returned once here, not by Torch inside the first op
-            # of this phase that does not fit (Krea 2's 2048² decode: 1.1 s, not 1.3 s).
-            torch.cuda.empty_cache()
+            # Ask once at the phase boundary. Native trim excludes live/private graph backing
+            # and pending consumers; unoccupied bytes are not a promise of reclaimable bytes.
+            vt.trim(self.device.index or 0)
         returned = max(before - _torch_bytes(self.device)[1], 0)
         # Protect the incoming cached bytes above; only other phases' idle backing may go.
         # A phase whose missing bytes then fit streams nothing and reserves no window: a
@@ -2710,12 +2720,12 @@ class Memory:
                 {
                     "models": sorted(names),
                     **({"replan": replan} if replan is not None else {}),
-                    "ended_phase": ended,
+                    "working_allocator_before": working_before,
                     "window_bytes": self.window_bytes,
                     "fits": self._fits,
                     "missing_bytes": missing,
-                    "torch_unused_bytes": unused,
-                    "torch_returned_bytes": returned,
+                    "working_unoccupied_bytes": unused,
+                    "working_returned_bytes": returned,
                     "native_reclaimed_bytes": reclaimed,
                     # Cumulative snapshot; an older native wheel has no reason counters.
                     "native_reclaimed_by_reason": self.native.stats().get(
@@ -2778,54 +2788,6 @@ class Memory:
             if not self.reclaim(needed, current={model.name}):
                 raise
             return region.prepare()
-
-    def _stage_prefetch_window(
-        self, required: int, missing: int, request: Request | None, owner: object
-    ) -> Callable[[], None] | None:
-        """Admit bounded next-source speculation after actual graph/readout allocations.
-
-        The streaming limit bounds idle nonpreferred cache, not active physical residency.
-        Existing useful cache may remain beyond the current/next source pair. This never
-        reclaims. Driver free and the request budget already exclude Torch
-        reservations (including graph scratch and boundary slots) and native residency.
-        The speculative native allocation independently rechecks pressure at read time.
-        """
-        if self.native is None or request is None or request.memory is not self or request.idle:
-            return None
-        with self.lock:
-            native_limit = self.native.stats().get("streaming_limit_bytes")
-            if (
-                native_limit is None
-                or native_limit != self.window_bytes
-                or self._stage_window_owner is not None
-                or self._prefetch is not None
-                or self._active_beside(request)
-                or missing > self.room().free
-            ):
-                return None
-            previous = self.window_bytes
-            admitted = max(previous, required)
-            phase = self._phase_names, self._phase_request
-            self.native.set_streaming_limit(admitted)
-            self.window_bytes = admitted
-            self._stage_window_owner = owner
-
-        def restore() -> None:
-            # Called only after checked whole-program completion, including canceled or
-            # unconsumed prefetch. Never overwrite a later phase's independently changed policy.
-            with self.lock:
-                if self._stage_window_owner is not owner:
-                    return
-                if (
-                    self.window_bytes == admitted
-                    and (self._phase_names, self._phase_request) == phase
-                    and self.native.stats().get("streaming_limit_bytes") == admitted
-                ):
-                    self.native.set_streaming_limit(previous)
-                    self.window_bytes = previous
-                self._stage_window_owner = None
-
-        return restore
 
     def _prefetch_next(self, current: _Block) -> None:
         """Demand's own next block takes priority over queued-request speculation."""
@@ -3671,8 +3633,9 @@ class Request:
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
+        self.working_phases: list[dict[str, Any]] = []
         self.peak = 0
-        #: Torch's own allocated peak over the whole request, kept across cut-site resets: the
+        #: Working allocation peak over the whole request, kept across cut-site resets: the
         #: least room its call runs in (`Memory._room_floor`)
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
@@ -3690,9 +3653,9 @@ class Request:
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
         self.queued_prefetch: list[dict[str, Any]] = []
         if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
-            # Torch's peak is the process's since its last reset: alone, a request starts its own,
+            # The working peak is process-wide since its reset: alone, a request starts its own,
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
-            torch.cuda.reset_peak_memory_stats(memory.device)
+            vt.reset_peak(memory.device.index or 0)
         self.sample()
 
     def prefetch_queued(self) -> str | None:
@@ -3740,10 +3703,11 @@ class Request:
         room = self.memory.room(current)
         if not self.memory.cuda or not torch.cuda.is_initialized():
             return room
-        allocated, reserved, _ = _torch_bytes(self.memory.device)
+        working = vt.stats(self.memory.device.index or 0)
+        allocated = int(working["allocated_bytes"])
         planned = self.memory._split_budget
         budget = None if planned is None else max(planned - allocated, 0)
-        return replace(room, cached=max(reserved - allocated, 0), budget=budget)
+        return replace(room, cached=max(int(working["mapped_bytes"]) - allocated, 0), budget=budget)
 
     def reclaim(self, need: int = 0) -> int:
         """A known pure cut may shed the step's speculative whole-model hold.
@@ -3792,7 +3756,7 @@ class Request:
         self.sample()
         _, _, peak = self.memory._figures()
         if self.memory.cuda and len(self.memory.requests) == 1:
-            torch.cuda.reset_peak_memory_stats(self.memory.device)
+            vt.reset_peak(self.memory.device.index or 0)
         return peak
 
     def read(
@@ -3852,6 +3816,7 @@ class Request:
             "trace": list(self.trace),
             "trace_scope": "fills",
             "phases": list(self.phase_changes),
+            "working_phases": list(self.working_phases),
             "phase_policy_supported": self.memory.phase_supported,
             "room_first_pass": self.room_first,
             "gathered": self.gathered,
@@ -3863,8 +3828,11 @@ class Request:
                 peak=self.peak,
                 allocated=allocated,
                 reserved=reserved,
-                peak_window="Torch high-water plus sampled native backing, carried across resets; "
-                "other constructions' resident sets left out",
+                working_allocator=vt.stats(self.memory.device.index or 0),
+                peak_window=(
+                    "Working high-water plus sampled native backing, carried across resets; "
+                    "other constructions' resident sets left out"
+                ),
                 weight_residency=(
                     self.memory.native.stats() if self.memory.native is not None else None
                 ),
@@ -3885,12 +3853,10 @@ class Request:
                     "fallback_blocks": sum(b.aliases is None for b in groups),
                     "native_prefetch": self.memory.prefetch_supported,
                 },
-                # This request's cudaMalloc hook counters: `cache_refusals` are refused
-                # activation allocations Torch answered by freeing its whole cache.
+                # Cumulative native working counters sampled over this request.
                 allocator={
                     k: v - self.allocator.get(k, 0)
                     for k, v in _allocator(self.memory).items()
-                    if k not in ("torch_reserved_bytes", "activation_admission_limit")
                 },
                 prefetch={
                     "started": self.prefetch_started,
@@ -3910,10 +3876,17 @@ class Request:
 
 
 def _allocator(memory: Memory) -> dict[str, int]:
-    """The process's cudaMalloc hook counters on this device (TensorFS `allocator_stats`)."""
+    """Cumulative native working-allocator counters; live/backing gauges are separate."""
     if not memory.cuda or memory.native is None:
         return {}
-    return dict(varena.allocator_stats(memory.device.index or 0))
+    stats = vt.stats(memory.device.index or 0)
+    return {
+        key: int(stats[key])
+        for key in (
+            "allocations", "frees", "ooms", "driver_memory_calls",
+            "event_queries", "event_records", "event_waits", "context_joins",
+        )
+    }
 
 
 def _resident_bytes(block: _Block) -> int:

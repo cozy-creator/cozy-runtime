@@ -21,9 +21,11 @@ import torch
 from torch import Tensor, nn
 
 import cozy_runtime.internal.execution.sizing as sizing
+from cozy_runtime.author._attention_scope import active_attention_layout
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import TRANSPARENT
+from cozy_runtime.internal.execution import phase as working_phase
 from cozy_runtime.internal.residency import Request
 
 type Args = Sequence[object]
@@ -193,6 +195,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         except Exception as exc:
             if not short(exc):
                 raise
+            working_phase.invalidate("cut_retry")
             _clear(exc)
             failure: BaseException | None = exc
         # A failed allocation can reveal pressure the shape estimate cannot predict.
@@ -227,7 +230,10 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
     try:
         if _capturing():
             available = request.room()
-            return whole(sizing.choose(finest, need, available)[0])
+            level = sizing.choose(finest, need, available)[0]
+            result = whole(level)
+            working_phase.choice((site, level, active_attention_layout()))
+            return result
         try:
             result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
         except Exception as exc:
@@ -238,6 +244,7 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         row = Cut(
             site=site, level=level, need=need(level, 1), tier=tier, descent=steps, retries=retries
         )
+        working_phase.choice((site, level, active_attention_layout()))
         with _ROWS_LOCK:
             rows = _ROWS.setdefault(id(request), Cuts())
             calls = rows.levels.setdefault(site, [])
