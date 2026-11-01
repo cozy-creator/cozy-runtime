@@ -72,3 +72,74 @@ Runtime already handles this trap in `graphs/domain.py`: region captures use a c
 Keeping stock ownership requires coordination that forbids clears/replacement while borrowers exist; alternatively the prepared provider must own its actual workspace independently. A short map mutex lock protects lookup, not execution/replay. Prepare on the executing host thread/device/stream, retain stable bindings/alignment, serialize sharing or give concurrent streams distinct owners, and release streams after consumers. Changed sizes, cleared maps, or another host thread invalidate the prepared stock identity. These are concrete lifetime dependencies, not a recommendation to add global workspace accounting.
 
 Implementation handoff: proceed only with the tensor/cast portion as a bounded source change until the dense backend exposes preparation before writes and retained workspace ownership. Preserve existing kernel/module configuration and source storage. No successful VAE output, allocator closure, or release qualification is claimed here.
+
+## Proposed prepared Lt adapter (source proposal; not implemented)
+
+The smallest useful contract is one opaque prepared operation with fixed bindings and three calls. A native implementation needs CUDA/cuBLASLt headers and libraries, not ATen, tensors, or libTorch symbols. Python supplies reviewed Torch policy and retains the tensor/Varena owners. This is a proposed integration boundary inferred from the direct NVIDIA interfaces, not a claim that an adapter exists.
+
+```text
+prepare_fp16_bias_linear(
+    device, M, K, N,
+    x_ptr, weight_ptr, bias_ptr, output_ptr,
+    allow_fp16_accumulation,
+    reduction_policy, optional_sm_count_target,
+    torch_lt_workspace_limit_bytes
+) -> {opaque_plan, required_workspace_bytes, workspace_alignment=256}
+
+execute(opaque_plan, workspace_ptr, workspace_capacity_bytes, stream_ptr) -> status
+close(opaque_plan)  # only after all eager/graph borrowers drain
+```
+
+The prepared object owns its independent Lt handle, operation/matrix descriptors, selected algorithm, fixed bindings, host scalars, device/context identity, and reviewed policy. It does **not** allocate tensor storage or workspace. It may allocate library/descriptor resources in `prepare`, before admission closes. The caller must make final addresses available before query but need not populate numerical values. The narrow initial contract fixes addresses; mutable rebinding and a global plan cache are unnecessary. One operation per signature is the simplest unit; if six operations share one block-owned handle, their records must retain that owner and final destruction must occur once after all users drain. [NVIDIA handle creation](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#cublasltcreate), [Lt execution API](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#cublasltmatmul).
+
+### Exact descriptor mapping
+
+For contiguous row-major FP16 `X[M,K]`, `W[N,K]`, bias `[N]`, and `Y[M,N]`, mirror Torch's transformed column-major operation `Y.T = W @ X.T + bias`. Do not switch to a superficially equivalent row-major descriptor: that can alter algorithm selection. Torch's common-argument transform gives `m=N`, `n=M`, `k=K`, `transa=T`, `transb=N`, `lda=ldb=K`, and `ldc=N`. [Common-argument transform](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/native/cuda/cuBlasCommonArgs.h#L95-L143).
+
+| Lt object | Exact setting |
+| --- | --- |
+| A | `weight_ptr`, `CUDA_R_16F`, column-major physical rows `K`, columns `N`, leading dimension `K`; `TRANSA=T` |
+| B | `x_ptr`, `CUDA_R_16F`, column-major physical rows `K`, columns `M`, leading dimension `K`; `TRANSB=N` |
+| C and D | Both `output_ptr`; one shared layout `CUDA_R_16F`, column-major rows `N`, columns `M`, leading dimension `N` |
+| Batch | Default single matrix; `M` already flattens tile batch and tokens |
+| Bias/epilogue | `CUBLASLT_EPILOGUE_BIAS`; set `BIAS_POINTER=bias_ptr`; leave bias dtype default, which is FP16 here; no activation, auxiliary output, or separate C operand |
+| Scalars | Host pointer mode; `alpha=1`, `beta=0`, since bias is handled by the epilogue; output contents need not be initialized for C |
+| Compute/scalar types | Normally `CUBLAS_COMPUTE_32F` and `CUDA_R_32F`; with effective FP16 accumulation enabled on SM major >=7, use `CUBLAS_COMPUTE_16F` and `CUDA_R_16F`, including FP16 host scalars |
+| SM target | Leave unset when Torch carveout is absent; otherwise set `SM_COUNT_TARGET = device.multiProcessorCount - carveout`, exactly as Torch does |
+
+Leave all other descriptor defaults unchanged; do not add TF32, fast-accumulation, or pedantic modes to FP16 operands. The FP32 source weights/biases must already have been cast into the declared FP16 buffers. [Torch operation construction](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/cuda/CUDABlas.cpp#L1495-L1624), [FP16 type policy](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/cuda/detail/CublasLtUtils.h#L294-L355).
+
+### Exact preference, query, and execute split
+
+Create a fresh default Lt preference and set the same attributes Torch sets:
+
+- `MAX_WORKSPACE_BYTES` is the effective Torch Lt limit, **not** the algorithm's required bytes and not a guessed constant.
+- For A/B/C/D respectively, `MIN_ALIGNMENT_*_BYTES` is the largest power of two no greater than 256 dividing the **final** weight/input/output/output address. Bias is not one of these four preference attributes. Reject incompatible binding changes before any block write.
+- Reduced precision with split-K allowed: leave reduction mask at its default. Reduced precision forbidden but split-K allowed: set `COMPUTE_TYPE | NONE`. Both forbidden: set `NONE`. Reduced precision allowed with split-K forbidden is not a valid Torch setting. No additional heuristic tuning.
+
+Call `cublasLtMatmulAlgoGetHeuristic(..., requestedAlgoCount=1, ...)`. Require a successful call, one result and successful result state, retain its exact `algo`, and call `cublasLtMatmulAlgoCheck` against the same descriptors. Return its checked workspace requirement; retain both reported requirements in diagnostic metadata. Refuse failed/incompatible selection before numerical writes. This is selection, not benchmarking. After the caller admits/allocates the reported workspace, `execute` validates the fixed binding, device/context and capacity, then calls only `cublasLtMatmul` with the retained **non-null** algorithm and explicit stream/workspace. No query, descriptor creation, tensor allocation, fallback, or retry occurs there. A launch/runtime error after writes is a failed execution, not permission to restart the block. [Torch query/execute site](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/cuda/CUDABlas.cpp#L1556-L1676), [alignment helper](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/cuda/detail/CublasLtUtils.h#L283-L291), [reduction enum mapping](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/Context.cpp#L681-L695).
+
+NVIDIA defines the heuristic result's `workspaceSize` as the actual required workspace and recommends querying once and reusing the result. A zero requirement permits a zero-capacity workspace contract; nonzero storage must be 256-byte aligned. The required size belongs to the selected algorithm and these descriptors, not every possible algorithm. [Heuristic result](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#cublasltmatmulheuristicresult-t), [query reuse](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#heuristics-cache), [algorithm check](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#cublasltmatmulalgocheck).
+
+### Python policy and unsupported routes
+
+The pinned Python SDK can supply `torch.backends.cuda.cublaslt_workspace_size()`, `matmul.allow_fp16_accumulation`, `matmul.allow_fp16_reduced_precision_reduction`, `matmul.allow_fp16_reduced_precision_reduction_split_k`, `preferred_blas_library()`, `torch.cuda.tunable.is_enabled()`, and the private version-pinned `_C._get_sm_carveout_experimental()`. The Lt size getter delegates to the effective C++ size getter, including the unified-workspace cap. No Torch C++ linkage is needed to forward these values. Snapshot them before preparation and validate they still describe the block before admission closes. [Python backend getters](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/torch/backends/cuda/__init__.py#L158-L185), [workspace getter](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/torch/csrc/cuda/Module.cpp#L1723-L1728), [carveout getter](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/torch/csrc/Module.cpp#L3127-L3129), [TunableOp getter](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/torch/cuda/tunable.py#L231-L235).
+
+The initial provider refuses missing bias, non-FP16 execution operands/output, non-contiguous or overlapping storage, wrong shapes/device, tensor subclasses or opaque hooks, unsupported SM/math policy, enabled TunableOp, disabled Lt, unsupported query/check outcomes, and any need for Torch's fallback. In particular, absent bias means ordinary matmul/mm semantics: do not fabricate a zero-bias tensor merely to reach this provider. Actual six-projection bias presence must be checked before claiming the whole VAE block is covered.
+
+**Preferred BLAS nuance:** on CUDA the eligible biased `addmm` Lt path does not consult preferred BLAS; ordinary `Cublas` and `Cublaslt` preferences can both reach it. Record the preference without changing it. Unsupported alternative backends and changed policy remain out of scope; the preference matters to GEMM/fallback routes this provider excludes. `DISABLE_ADDMM_CUDA_LT` is cached at first ATen use and has no reviewed effective-state getter. A current environment read is insufficient if it changed mid-process: the caller must establish its fixed initial value. [Actual CUDA eligibility](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/native/cuda/Blas.cpp#L119-L229), [fallback](https://github.com/pytorch/pytorch/blob/08187d9e0fba026dc8217405802ab5381dc88d90/aten/src/ATen/native/cuda/Blas.cpp#L596-L619).
+
+### Ownership, Domain coexistence, and remaining unknowns
+
+An own `cublasLtCreate` handle plus caller-owned workspace avoids Torch's `(handle,stream)` maps altogether. Torch graph reset cannot erase that workspace through its stock clear routine. Keep using existing Domain serialization/completion fences when executing inside its library stream; do not alter the never-replayed owner graph or its cleanup. A captured graph must retain this provider and caller buffer leases independently until it is reset and its final use drains. The new provider is then retired before its CUDA context/streams disappear. No stock workspace needs to be borrowed, replaced, cleared, or shrunk.
+
+The handle is device-bound, so the correct current CUDA device/context is required on every call. Own-handle use removes Torch's thread-local handle lookup constraint; the narrow proposal still serializes one owner and does not introduce cross-thread concurrent mutation. Workspace can be shared among the six sequential linears at the **maximum queried requirement**, with no concurrent borrower; separate graphs need retained ownership and ordering. CUDA completion, not return from the host launch, releases each borrow. Lt handle destruction synchronizes the device, so it belongs at final owner teardown, never per projection or per graph retirement while another borrower lives. [NVIDIA create/destroy](https://docs.nvidia.com/cuda/archive/13.0.0/cublas/index.html#cublasltcreate), [existing Runtime Domain](../src/cozy_runtime/graphs/domain.py#L126-L217).
+
+Concrete unknowns before implementation/qualification:
+
+1. `cublasLtCreate` allocates internal host/device resources; heuristic query can load kernels. Neither is covered by the reported algorithm workspace bytes. Sources still do not guarantee that prepare has loaded **every** execution resource. The owner/resource admission boundary must state this honestly; a warm trace is not proof of closure.
+2. The same descriptors/preferences and library/device are the intended Torch-equivalent recipe, but source review does not prove the independent handle selects the same algorithm or yields bitwise-equivalent H3 results. Root must compare actual selected algorithm configuration, actual cuBLASLt version, numerical outputs, and complete-block behavior under the unchanged policy. Do not serialize opaque algorithm bytes across devices/library versions.
+3. Stable final addresses must exist before selection to reproduce alignment preferences and fix the bias descriptor. If current phase preparation cannot supply them before admission, it needs an explicit reservation/binding step; changing alignments afterward is not a shape-only cache hit.
+4. Any actual biasless projection or effective disabled-Lt/TunableOp route prevents this narrow provider from closing all six projections. Handle it as a separate researched contract, not a hidden fallback.
+
+This proposal requires review before native implementation. It preserves the previous source findings and changes no Runtime behavior.
