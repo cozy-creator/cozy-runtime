@@ -452,6 +452,9 @@ class _Block:
     next: _Block | None = None
     #: the fill overlay (`Filling.overlay`) its page was written with
     overlay: Hashable = None
+    #: its region holds its stored bytes, prefetched for `overlay`'s forward and not yet baked:
+    #: its demand bakes them in place, and nothing else serves or parks them
+    raw: bool = False
     #: native pages of other overlays, parked for reuse (`_switch_overlay`): (raw, final) regions
     parked: dict[Hashable, tuple[Any, Any]] = field(default_factory=dict)
     #: an `nn.Embedding`'s table: one that does not fit the room gathers its rows on the host
@@ -535,6 +538,8 @@ class _Prefetch:
     final: bool = False
     #: one DMA from a host-tier page (`_host_read`), not a store read
     host: bool = False
+    #: a hooked block's stored bytes, which its demand bakes (`_Block.raw`)
+    raw: bool = False
 
 
 class _HostPage:
@@ -2247,6 +2252,13 @@ class Memory:
             return
         self._discard(block)
         current = (block.region, block.final_region)
+        if block.raw:
+            # Stored bytes read for another forward's bake are no page of any overlay.
+            block.raw = False
+            for region in current:
+                if region is not None:
+                    region.set_preferred(False)
+            current = (None, None)
         if current != (None, None):
             for region in current:
                 if region is not None:
@@ -2891,9 +2903,11 @@ class Memory:
         released: bool = False,
     ) -> None:
         """Admit one immutable read, without eviction or Python fill callbacks: a page the host
-        tier keeps (stored, baked or cast) by one DMA, else the stored bytes, and for a hooked
-        block only when its fill writes nothing under the overlay this forward arms. A cast block
-        the tier keeps cast (`_host_final`) prefetches only its kept final bytes."""
+        tier keeps (stored, baked or cast) by one DMA, else the stored bytes. A hooked block's
+        stored bytes are read raw, for its demand to bake in place under the overlay this forward
+        arms (`_Block.raw`): read on demand, each LoRA'd H3 block's 255 MB waited serially in
+        step 1 (2.9 s on a cold RTX 5090, cr-242). A cast block the tier keeps cast
+        (`_host_final`) prefetches its kept final bytes, else its stored ones."""
         if (
             not self.prefetch_supported
             or self.capturing()
@@ -2908,7 +2922,7 @@ class Memory:
             if queued is not None:
                 return  # another request's hooks are armed by its own code, not yet run
             overlay = block.model.fill.overlay(block.path, block.parts)
-            if overlay != block.overlay:
+            if overlay != block.overlay and (block.paged() or block.parked):
                 return  # demand parks or refills a page of another overlay (`_switch_overlay`)
         final = _host_final(block)
         page = _page(block, block.model.identity, overlay, final=final)
@@ -2922,14 +2936,16 @@ class Memory:
                 or block.cached()
             ):
                 return
-            if block.finals and not final and block.region is not None and block.region.resident:
-                return  # its stored bytes are resident; demand writes the final ones
             kept = self._baked.get(page) if self._host_prepare else None
             if kept is not None and kept.tensor.numel() != size:
                 kept = None
-            hooked = block.model.fill is not None and page not in self._plain
-            if kept is None and (final or hooked):
-                return  # only a kept page, or a hooked one whose fill writes nothing, is read
+            if kept is None and final:
+                # No kept cast page: its stored bytes, which demand casts as after its own read.
+                final, size = False, block.storage_bytes
+                page = _page(block, block.model.identity, overlay)
+            if block.finals and not final and block.region is not None and block.region.resident:
+                return  # its stored bytes are resident; demand writes the final ones
+            raw = kept is None and block.model.fill is not None and page not in self._plain
             # A queued request's read is admitted only into free room. Demand's next block may
             # also take the room of the oldest streamed block whose consumers completed: Varena
             # evicts it on its last-consumer events and refuses rather than wait or join.
@@ -3033,6 +3049,7 @@ class Memory:
                 overlay=overlay,
                 final=final,
                 host=kept is not None,
+                raw=raw,
             )
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
@@ -3134,6 +3151,10 @@ class Memory:
                             origin="baked" if row.get("host") else "store",
                         )
                 if complete:
+                    block.overlay = pending.overlay  # a cold block's first page is this forward's
+                if complete and pending.raw:
+                    block.raw = True  # its page is the baked bytes demand writes: that counts it
+                elif complete:
                     page = _page(block, pending.identity, pending.overlay, final=pending.final)
                     self._refills[page] = self._refills.get(page, 0) + 1
                     if not row.get("host"):
@@ -3234,6 +3255,12 @@ class Memory:
                 block.native_use = use
                 block.native_storage = int(use.tensor.untyped_storage().data_ptr())
             page: tuple[object, ...] | None = None
+            # A prefetch read its stored bytes (`_Block.raw`): no store read, the bake below.
+            prefetched = block.raw and use is not None and not use.needs_fill
+            block.raw = False
+            if prefetched:
+                page = _page(block, block.model.identity, overlay)
+                self._refills[page] = self._refills.get(page, 0) + 1
             if use is not None and use.needs_fill:
                 page = _page(block, block.model.identity, overlay)
                 self._refills[page] = self._refills.get(page, 0) + 1
@@ -3270,7 +3297,7 @@ class Memory:
                         read_bytes += part.nbytes
                     views[role] = _view(key, role, part, raw)
             changed = False
-            if block.model.fill is not None and (use is None or use.needs_fill):
+            if block.model.fill is not None and (use is None or use.needs_fill or prefetched):
                 # `overlay` was read on this thread just before; no package code ran since.
                 baking = Bake.begin(self.stream()) if kept is None else None
                 changed = kept is None and block.model.fill(block.path, data)
@@ -3305,6 +3332,8 @@ class Memory:
             request = _REQUEST.get()
             if request is not None and read_bytes:
                 request.read(block, read_ns, read_bytes, bake=bake)
+            elif request is not None and bake is not None:
+                request.read(block, 0, 0, origin="prefetched", bake=bake)
             if request is not None and kept is not None:
                 request.read(block, kept_ns, kept.numel(), origin="baked")
             with self.lock:
@@ -3849,13 +3878,14 @@ class Request:
         origin: str = "store",
         bake: Bake | None = None,
     ) -> None:
-        """A block filled: from the store, or (`baked`) from its kept baked bytes; `bake` when its
-        bytes were baked here after the read. A demand fill's entry carries its read's host time
-        and when it ended, so a step's fills and bakes are told apart (cr-242)."""
+        """A block filled: from the store, from its kept baked bytes (`baked`), or by baking the
+        stored bytes a prefetch read (`prefetched`, counted at that read); `bake` when its bytes
+        were baked here. A demand fill's entry carries its read's host time and when it ended,
+        so a step's fills and bakes are told apart (cr-242)."""
         if origin == "store":
             self.moved += nbytes
             self.read_ns += ns
-        else:
+        elif origin == "baked":
             self.baked_hits += 1
             self.baked_bytes += nbytes
             self.baked_ns += ns
