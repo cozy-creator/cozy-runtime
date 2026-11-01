@@ -142,6 +142,7 @@ from cozy_runtime.internal import (
     call_types,
     canonical,
     child_env,
+    cooperation,
     effect_interfaces,
     execution_evidence,
     executor_commands,
@@ -820,6 +821,7 @@ class Executor:
         self.memory: Memory | None = None
         #: HOST ONLY: Start's development GPU memory limit, the memory's budget (the card's size)
         self.gpu_memory_limit: int | None = None
+        self.cooperation_config: cooperation.Config | None = None
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -1013,6 +1015,7 @@ class Executor:
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
+            "cooperative_owner": cooperation.capable(),
             # `room` read at once, a running call's included (`_room`), where TensorFS can hold one
             # (`residency.yields`: imported here, residency would bring Torch in before the hello).
             "room": all(
@@ -1093,15 +1096,28 @@ class Executor:
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        host.memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
-        host.execution = execution
+        # A transient native join refusal must not publish a partially initialized Memory.
+        # Memory.open may retain its fresh singleton, but no executor can observe it as ready
+        # until all helpers and the selected participant have been installed successfully.
+        memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         PLANS[:] = [host.serving]
         _split.install(execution)
         attention_ulysses.install(execution)
         loop.install()
+        if host.cooperation_config is not None:
+            memory.attach_cooperation(host.cooperation_config, host._cooperation_failed)
+        host.execution = execution
         host.loops = loop.ROWS
+        host.memory = memory
+
+    def _cooperation_failed(self, error: BaseException) -> None:
+        # Called outside the pump/native/shared locks. Do not cancel a running request for
+        # pressure; preserve an actual coordination fault for its next boundary/reply.
+        self.poisoned = self.poisoned or f"native memory cooperation failed: {error}"[:300]
+        traceback.print_exception(error)
+        sys.stderr.flush()
 
     def _rank_identity(self) -> dict[str, Any]:
         owner = self.host
@@ -1651,6 +1667,21 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        selected = cooperation.Config.from_wire(getattr(command, "cooperation", None))
+        if selected is not None and (
+            command.import_only or not command.devices
+            or command.sequence_parallel_degree != 1 or not cooperation.capable()
+        ):
+            return {"ok": False, "code": "cooperation_unsupported",
+                    "detail": "cooperation requires the negotiated single-GPU native owner "
+                              "capability; no legacy fallback"}
+        if (
+            (self.started or self.host.memory is not None)
+            and selected != self.host.cooperation_config
+        ):
+            return {"ok": False, "code": "cooperation_changed",
+                    "detail": "an active executor cannot change its negotiated memory policy"}
+        self.host.cooperation_config = selected
         self.host.gpu_memory_limit = command.gpu_memory_limit
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
@@ -1943,6 +1974,8 @@ class Executor:
         compiles: str = "",
     ) -> dict[str, Any]:
         total = free = -1
+        if self.host.memory is not None:
+            self.host.memory.cooperation_boundary()
         if self.torch is not None and accel.present(self.torch, self.device_kind):
             memory = accel.allocation(self.torch, self.device_kind, self.host.memory)
             total, free = memory["driver_total_bytes"], memory["driver_free_bytes"]
@@ -1960,6 +1993,10 @@ class Executor:
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
+            "cooperation_active": bool(
+                self.host.memory is not None and self.host.memory.cooperation is not None
+                and self.host.memory.cooperation.facts()["active"]
+            ),
         }
 
     def serving(self) -> str:
@@ -3270,6 +3307,9 @@ class Executor:
         it, a running call's included. Idle and asked to give, its kept programs (graphs,
         decoders, holds) go first, in its command order. A group's followers serve their own
         GPUs: rank 0 takes only its own."""
+        if self.host.cooperation_config is not None:
+            self.poisoned = self.poisoned or "legacy room reached a cooperative executor"
+            raise cooperation.Failure(self.poisoned)
         memory = self.host.memory
         if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
             return
@@ -5211,6 +5251,7 @@ def _remember_distributions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    cooperation.initialize()  # metadata only, before any fork-producing Runtime threads
     faulthandler.enable(all_threads=True)
     if hasattr(signal, "SIGUSR1"):  # every thread's Python stack to stderr, the process lives on
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
@@ -5478,6 +5519,8 @@ def serve(executor: Executor, channel: Channel) -> int:
 
 
 def _shut(executor: Executor, channel: Channel) -> int:
+    if executor.host.memory is not None:
+        executor.host.memory.close_cooperation()
     if executor.group is not None:
         executor.group.close()
     channel.send({"reply": "shutdown", "ok": True})
