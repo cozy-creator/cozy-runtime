@@ -189,10 +189,8 @@ def split_declared(module: Any, value: object, cuts: tuple[Cut, ...]) -> Tensor 
 def split_single_use_projection(
     intent: SingleUseProjection, out: Any, cuts: tuple[Cut, ...],
 ) -> Tensor | None:
-    """An actual producer may declare its fresh one-consumer output before learning."""
-    if type(intent) is not SingleUseProjection or not intent.exclusive_input or out is not None:
-        return None
-    return _split_declared(intent.module, intent.hidden, cuts, declared_single_use=True)
+    """Matched API-only control: decline before native admission or execution."""
+    return None
 
 
 def _split_declared(
