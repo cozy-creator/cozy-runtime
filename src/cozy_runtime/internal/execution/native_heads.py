@@ -666,6 +666,8 @@ def prepare_projected_heads(
     ):
         return None
     route = _route(intent.backend, tokens)
+    if route is not None and route.implementation == "kitchen-int8":
+        return None  # Matched control: the ordinary selected INT8 path serves this call.
     kernel_identity = _entries(intent, device)
     attention_kernel = None if route is None else _attention(route, device)
     library = int8_linear.library(device)
