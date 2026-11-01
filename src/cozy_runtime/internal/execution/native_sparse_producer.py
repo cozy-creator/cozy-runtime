@@ -651,5 +651,4 @@ def split_sparse_projected_heads(
     output: Any,
     cuts: tuple[Cut, ...],
 ) -> Tensor | None:
-    plan = prepare_sparse_projected_heads(intent, output, cuts)
-    return None if plan is None else plan.run()
+    return None  # Matched control: ordinary producer execution before native admission.
