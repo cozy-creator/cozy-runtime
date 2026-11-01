@@ -118,10 +118,7 @@ def channel_norm(
     from cozy_runtime.fusion import _kernels
 
     phase.choice(("native-split", key, choice_id))
-    observation_id = vt.split_begin(
-        device, key, choice_id, stream=stream_id,
-        completion_owner=phase.completion_owner(device, stream_id),
-    )
+    observation_id = phase.begin_split(device, key, choice_id, choice, stream=stream_id)
     try:
         with torch.cuda.device(device), torch.cuda.stream(stream):
             out = torch.empty(tuple(x.shape), dtype=x.dtype, device=x.device)

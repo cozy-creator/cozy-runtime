@@ -119,6 +119,20 @@ def completion_owner(device: int, stream: int) -> int | None:
     return None
 
 
+def begin_split(
+    device: int, key: str, choice: str, selection: dict[str, Any], *, stream: int,
+) -> int:
+    """Forward selection identity, never infer it from mutable last-site state.
+
+    Older no-plan native cohorts omit the field. Their original call remains valid;
+    a native Plan cohort requires the exact opaque generation it returned.
+    """
+    options: dict[str, Any] = {"completion_owner": completion_owner(device, stream)}
+    if "plan_generation" in selection:
+        options["plan_generation"] = selection["plan_generation"]
+    return vt.split_begin(device, key, choice, stream=stream, **options)
+
+
 @contextmanager
 def observing(
     device: int | None, mode: Mode, records: list[dict[str, Any]] | None

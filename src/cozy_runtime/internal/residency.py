@@ -697,6 +697,7 @@ class Model:
                 return
             if self.users or any(b.count or b.retained for b in self.groups()):
                 raise ResidencyError("retire graph bindings and active model uses before unload")
+            self.memory._retire_phase_plan("model_closed", model=self)
             self.memory.forget_working_phases(self)
             self.closed = True
             for handle in self.handles:
@@ -1246,6 +1247,9 @@ class Binding:
                     for block in self.groups:
                         region = block.region
                         if region is not None and not region.resident:
+                            self.model.memory._retire_phase_plan(
+                                "binding_fill_abandoned", model=self.model,
+                            )
                             block.region = None
             self._load_data = None
             self._load_storage.clear()
@@ -1338,6 +1342,11 @@ class Memory:
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
         self.phase_supported = False
+        self.phase_plan_supported = False
+        self._phase_plan: Any = None
+        self._phase_plan_signature: tuple[Any, ...] | None = None
+        self._phase_plan_models: set[Model] = set()
+        self._phase_plan_status: tuple[object, ...] | None = None
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
         self._forward_depth = 0
@@ -1386,6 +1395,9 @@ class Memory:
                     and getattr(varena, "supports_prefetch", lambda: False)()
                 )
                 self.phase_supported = bool(getattr(varena, "supports_phases", lambda: False)())
+                self.phase_plan_supported = bool(
+                    getattr(varena, "supports_phase_plans", lambda: False)()
+                )
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
                     raise
@@ -2160,6 +2172,7 @@ class Memory:
             hold.shed()
         if block.count or block.retained or block.loading or self.capturing():
             raise StaleBinding("a weight block in use cannot change its fill overlay")
+        self._retire_phase_plan("overlay_changed", model=block.model)
         if self.native is None:
             self._discard(block, forget=True)
             if block.paged():
@@ -2194,6 +2207,7 @@ class Memory:
             forget = True
         block.final_use = block.final_data = block.final_storage = block.final_native_use = None
         if forget:
+            self._retire_phase_plan("final_representation_retired", model=block.model)
             block.final_region = None
 
     def _discard(self, block: _Block, *, forget: bool = False) -> int:
@@ -2212,6 +2226,7 @@ class Memory:
             block.native_storage = block.native_use = None
             self._drop_final(block, forget=forget)
             if forget:
+                self._retire_phase_plan("representation_retired", model=block.model)
                 # Never overwrite an old fill beneath an escaped alias. Its pin keeps
                 # the old reservation alive independently of this model's new identity.
                 block.region = None
@@ -2414,10 +2429,101 @@ class Memory:
         if request is not None and request.idle and (region is None or not region.resident):
             raise StaleBinding("idle graph preparation cannot fill native weight backing")
         if region is None:
+            self._retire_phase_plan("representation_created", model=block.model)
             size = block.final_bytes if final else block.storage_bytes
             region = self.native.reserve(size)
             setattr(block, field, region)
         return region
+
+    def _note_phase_plan(self, status: str, reason: str = "", **facts: Any) -> None:
+        request = _REQUEST.get()
+        stamp = (self._phase_request, self._phase_names, status, reason)
+        if request is not None and stamp != self._phase_plan_status:
+            request.phase_changes.append({
+                "models": sorted(self._phase_names or ()), "retention": "native_demand",
+                "region_plan": {"status": status, "reason": reason, **facts},
+            })
+        self._phase_plan_status = stamp
+
+    def _retire_phase_plan(self, reason: str, *, model: Model | None = None) -> None:
+        """Retire native intent before a represented source/region changes; no physical release."""
+        with self.lock:
+            if model is not None and model not in self._phase_plan_models:
+                return
+            if self._phase_plan is not None:
+                self._phase_plan.deactivate()
+                self._phase_plan = None
+                self._phase_plan_signature = None
+                self._phase_plan_models.clear()
+                self._note_phase_plan("unplanned", reason)
+
+    def _refresh_phase_plan(self, names: frozenset[str]) -> None:
+        """Use only actual established representations, never materialize a plan's weights.
+
+        A first pass may create raw/final handles. Until every required handle exists,
+        this phase stays unplanned; evicted-but-still-owned reservations are sufficient.
+        """
+        if not self.phase_plan_supported:
+            self._note_phase_plan("unplanned", "native_capability_missing")
+            return
+        models = [model for model in self.models.values() if model.name in names]
+        reason = ""
+        if len(models) != len(names) or {model.name for model in models} != set(names):
+            reason = "unresolved_or_ambiguous_models"
+        regions, signature = [], []
+        for model in sorted(models, key=lambda model: model.name):
+            identity = model.wanted_identity()
+            if model.closed or model.retiring or identity is None or model.identity != identity:
+                reason = "representation_identity_incomplete"
+                break
+            bindings = []
+            for block in model.groups():
+                if block.gathered is not None:
+                    reason = "host_gathered_representation"
+                    break
+                raw_needed = (
+                    block.aliases is None or any(block.aliases.values()) or not block.finals
+                )
+                for role, needed, region in (
+                    ("raw", raw_needed and bool(block.storage_bytes), block.region),
+                    ("final", bool(block.final_bytes), block.final_region),
+                ):
+                    if not needed:
+                        continue
+                    if region is None:
+                        reason = "representation_regions_incomplete"
+                        break
+                    # Native identity/size are facts, not an estimated byte reserve. The
+                    # native Plan deduplicates aliases by Region identity, not these rows.
+                    bindings.append((
+                        block.path, role, int(region.ptr), int(region.allocated_bytes),
+                    ))
+                    regions.append(region)
+                if reason:
+                    break
+            if reason:
+                break
+            signature.append((
+                model.name, model.content, identity, model.layout_identity, tuple(bindings),
+            ))
+        if reason:
+            self._retire_phase_plan(reason)
+            self._note_phase_plan("unplanned", reason)
+            return
+        represented = tuple(signature)
+        if self._phase_plan is not None and represented == self._phase_plan_signature:
+            return
+        self._retire_phase_plan("phase_inventory_changed")
+        key = "runtime.phase.regions/1:" + hashlib.sha256(repr(represented).encode()).hexdigest()
+        candidate = varena.Plan(self.native, [(key, regions)])
+        try:
+            candidate.activate(key)
+        except NotImplementedError:
+            self._note_phase_plan("unplanned", "multiple_arenas")
+            return
+        self._phase_plan, self._phase_plan_signature = candidate, represented
+        self._phase_plan_models = set(models)
+        self._note_phase_plan("active", phase=key, native=candidate.facts())
 
     def _activate_phase(self, model: Model) -> None:
         """Declare a component-phase boundary; native policy retains/evicts actual pages.
@@ -2432,16 +2538,18 @@ class Memory:
         request_id = request.id if request is not None else None
         with self.lock:
             if self._active_beside(request):
+                self._retire_phase_plan("overlapping_requests")
                 return
-            if names == self._phase_names and request_id == self._phase_request:
-                return
-            self._settle_prefetch(cancel=True)
-            self.native.reset_preferences()  # No mapping, reclaim or driver call.
-            self._phase_names, self._phase_request = names, request_id
-            if request is not None:
-                request.phase_changes.append(
-                    {"models": sorted(names), "retention": "native_demand"}
-                )
+            if names != self._phase_names or request_id != self._phase_request:
+                self._settle_prefetch(cancel=True)
+                self._retire_phase_plan("phase_boundary")
+                self.native.reset_preferences()  # No mapping, reclaim or driver call.
+                self._phase_names, self._phase_request = names, request_id
+                if request is not None:
+                    request.phase_changes.append(
+                        {"models": sorted(names), "retention": "native_demand"}
+                    )
+            self._refresh_phase_plan(names)
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         region = self._native_region(block, final=final)
@@ -2728,6 +2836,7 @@ class Memory:
                 if request is not None:
                     request.prefetch_wait_ns += time.perf_counter_ns() - began
                 if not complete and block.region is pending.region:
+                    self._retire_phase_plan("prefetch_fill_abandoned", model=block.model)
                     block.region = None
                 self._prefetch = None
 
@@ -2866,6 +2975,7 @@ class Memory:
             # A failed fill may have exported storage to a transform. Retire this region
             # identity; those exports keep their own pins, never a future fill's bytes.
             if use is not None and use.needs_fill:
+                self._retire_phase_plan("weight_fill_failed", model=block.model)
                 block.region = None
             block.native_storage = block.native_use = None
             self._drop_final(block)
@@ -2885,6 +2995,7 @@ class Memory:
         fails the call (Qwen-Image's 1.2 GB text-encoder table beside a 5 GB game on 8 GB). The
         copy is the host tier's page when it keeps one, else read once and held while the table
         gathers; each entry tries the device first."""
+        self._retire_phase_plan("host_gathered_representation", model=block.model)
         if block.gathered is None or block.gathered[0] != overlay:
             block.gathered = None
             model = block.model
@@ -3184,6 +3295,7 @@ class Memory:
         request.plan(plan)
         with self.lock:
             if not idle and any(not other.idle for other in self.requests):
+                self._retire_phase_plan("overlapping_requests")
                 request.overlap = True
                 for other in self.requests:
                     if not other.idle:
@@ -3203,6 +3315,8 @@ class Memory:
                 with self.lock:
                     self._rate.update(self._refills)  # the pages this request refilled
                     self._refills.clear()
+                    if self._phase_request == request.id:
+                        self._retire_phase_plan("request_ended")
                 self.forget_working_phases(request)
                 request.sample()
                 request.ended = request.stats()
