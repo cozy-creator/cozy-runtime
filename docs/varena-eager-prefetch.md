@@ -40,3 +40,31 @@ actual prefetch counters and cleanup against the frozen b222 cohort. Run 24883's
 completed 1,476 and waited 20.994 s; removing that overlap may regress performance.
 Unknown-key declines demonstrate the declared policy, not restored prefetch value.
 This does not remove the remaining demand/residency/split policy or finish P2.
+
+## Runtime IO qualification
+
+Run **24961** passed all seven cases on the RTX 4090, PID **47629**, using Runtime
+`c05c3ac32`, TensorFS `0e05a2539`, and fixture `d6c3b91eb`.
+[Fixture PR2369](https://github.com/cozy-creator/cozy-creator/pull/2369) contains the
+complete `eager-prefetch/evidence/2026-11-01.json` receipt.
+
+- The actual unknown-entry denoise loop made one native attempt/decline, admitted
+  and started zero prefetches, and read the correct 8 MiB through demand. Its
+  parent remained unknown and unpublished.
+- The explicitly fixed program's first pass published an 8 MiB working sample
+  without prefetching. Its second pass admitted, started and completed one real
+  next-block read; total source bytes remained 8 MiB, including demand reuse.
+- Queued invalidation canceled one admitted Fill before start: zero new source
+  bytes and zero started reads. Subsequent demand returned correct output.
+- Kept-host speculation made no native attempt; ordinary demand used 8 MiB of
+  retained host bytes with no store-byte growth. A transforming source likewise
+  made no native attempt, then its real fill ran twice during demand.
+- Model close had already retired the named phase key. Live working bytes
+  returned exactly to 17,039,360 with two executor library allocations, pending
+  bytes and graph pools zero. Correct outputs and zero resident weight pages are
+  mandatory assertions in the successful fixture, not separately serialized fields.
+
+This qualifies the Runtime read/admission/ownership route. The known key belongs
+to the fixture's fully specified program, not adaptive H3 execution. The separately
+named full H3 performance/quality/transfer arm remains the acceptance gate for this
+policy change; no performance improvement is inferred from these counters.
