@@ -759,6 +759,7 @@ class _NormSite:
     silu: bool
     scale: float
     eps: float
+    path: str
 
 
 def _channel_norm_forward(self: Any, x: Any) -> Any:
@@ -774,6 +775,11 @@ def _channel_norm_forward(self: Any, x: Any) -> Any:
         y = self._cozy_eager(x)
         return torch.nn.functional.silu(y) if site.silu else y
     entry = layout.entries[int(site.silu)]
+    from cozy_runtime.internal.execution.native_split import channel_norm
+
+    split = channel_norm(site.path, launch, entry, x, self.gamma, bias, site.scale, site.eps)
+    if split is not None:
+        return split
     return _kernels.channel_norm(launch, entry, x, self.gamma, bias, site.scale, site.eps)
 
 
@@ -791,7 +797,7 @@ def _norm_site(norm: Any, layout: ChannelNorm, switch: _Switch, silu: bool, path
         raise _Mismatch(f"{path}: {'no ' if layout.bias else ''}bias, not as declared")
     if not isinstance(norm.bias, torch.Tensor) and norm.bias != 0.0:
         raise _Mismatch(f"{path}: a constant bias {norm.bias}")
-    return _NormSite(layout, switch, silu, channels**0.5, 1e-12)
+    return _NormSite(layout, switch, silu, channels**0.5, 1e-12, path)
 
 
 def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
