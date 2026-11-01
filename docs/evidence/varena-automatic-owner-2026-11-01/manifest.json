@@ -222,6 +222,50 @@
     "collector/prepared.json": {
       "source": "/home/fidika/cozy_v2/outputs/xs138-p3-owner-candidate-afa6f9229/qualification/prepared.json",
       "sha256": "40f72e6eabd3915be25f59060d814a678e3adfea6292bb01784d72c8c89aaed7"
+    },
+    "install-auto-owner.ndjson": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-auto-owner.ndjson",
+      "sha256": "f8cb1b5a8422348ae1e6d6ba83fa53a099b7cec8cda0bb583025343ecdc19d7d"
+    },
+    "install-auto-owner.err": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-auto-owner.err",
+      "sha256": "229f5884baf0c65fafda7d6d98660e97ccb0a071cd57e688c27aabb22f4c4774"
+    },
+    "install-owner-decode-fix.ndjson": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-owner-decode-fix.ndjson",
+      "sha256": "b7995a16f8c273fb57d3b744db9e297b3a3f0b901aa12f09bd5bb7020f58d0a7"
+    },
+    "install-owner-decode-fix.err": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/install-owner-decode-fix.err",
+      "sha256": "229f5884baf0c65fafda7d6d98660e97ccb0a071cd57e688c27aabb22f4c4774"
+    },
+    "failed-start-before/memory.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/memory.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "failed-start-before/machine.stderr": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/machine.stderr",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "failed-start-before/memory.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/memory.command.json",
+      "sha256": "8d6bc3380ab1889a2b0f259d53e47b4f0b319fad828ec3e527870c792ab2357a"
+    },
+    "failed-start-before/machine.command.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/machine.command.json",
+      "sha256": "15660d9b6d2c58d96a109665473eb3dd46bea458c8bf9951a4adaa48b9d8570a"
+    },
+    "failed-start-before/capture.json": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/capture.json",
+      "sha256": "91a46a6bbb9d42a9bebb1ab0a2c590aeefcdd1168380824a4e8392dcb119e5b4"
+    },
+    "failed-start-before/machine.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/machine.stdout",
+      "sha256": "adb299edfeb058b9cb06e4878f2d8ac711bd5b78bcd349e7df44aae9dd3a4edd"
+    },
+    "failed-start-before/memory.stdout": {
+      "source": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/p2-fork-guard-leg12-plan/attempt-003/owner-before/memory.stdout",
+      "sha256": "5dba2b042eee3e4e32c911a31ff1fc4b75e1924784e0ec2989462569c016e701"
     }
   }
 }
