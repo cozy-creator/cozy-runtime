@@ -58,8 +58,24 @@ existing path only before native selection/execution.
 
 ## Qualification boundary
 
-Source implementation and focused static checks are in progress. This checkpoint
-has no GPU result. Qualification must use a normal GPU app with an actual
+Source and native formation checks passed; this checkpoint has no GPU result.
+The new GEMM was built from `ebc25419a` with the pinned manylinux/CUDA/CUTLASS
+inputs. Its SHA256 is
+`9523c5070bd1646f43b505e0ce0bb05670d7b39f8d7e4be3a52846e2b7a81d3e`.
+The full unchanged module checker passes with all six modules present, exact
+cubin/PTX coverage, dependency/export checks, Python 3.12/3.13/3.14 no-GPU
+loads/calls, imports before Torch, and ABI3 audit at baseline 3.12. Maximum required
+glibc is 2.17. Exactly the GEMM changed; 579 other native/Triton files remain
+byte-identical to the previously qualified prefix. The first target build's Ninja
+command span was 664.386 seconds on one CPU; its CMake object cache is durable.
+
+Focused AST/Ruff and adapter mypy pass. Paired broader mypy reports the same four
+inherited findings in both the 977 foundation and this source, with zero new.
+A CPU smoke check imports the actual Runtime/fixture, verifies unbaked Hook adds
+its delta, baked Hook skips the getter, fill factor reads remain active, and leaves
+CUDA uninitialized. These checks do not substitute for GPU operation evidence.
+
+Creator's `linear-consumer` fixture (draft PR2365) supplies the real caller proof. Qualification must use a normal GPU app with an actual
 NativeLinear plus public `author.split` inside a real Request/eager phase, not a
 mocked context. Require multiple selected chunks including a ragged tail, exact
 query-versus-execution scratch, baked/unbaked hook behavior, minimum refusal before
