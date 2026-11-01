@@ -181,14 +181,59 @@ class _Program:
     region: Any = None
     #: its idle recording's parts and total (ms)
     recorded: dict[str, float] | None = None
+    closed: bool = False
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
         rest = () if self.again is None else (self.again,)
         return (*(sequence for sequence, _, _ in self.first), *rest)
 
     def close(self) -> None:
+        if self.closed:
+            return
         for sequence in self.sequences():
             sequence.close()
+        self.closed = True
+        # Closed definitions must not keep their Python static tensors/outputs alive merely
+        # because the cache dictionary has not yet removed this stale program.
+        self.first, self.again, self.tensors, self.counter = (), None, (), None
+
+    def try_close(self) -> bool:
+        from cozy_runtime.internal import cache_owners
+
+        sequences = self.sequences()
+        stages = tuple(stage for sequence in sequences for stage in sequence.stages)
+        bindings = {id(binding): binding for stage in stages for binding in stage._owned_bindings}
+        for stage in stages:
+            for reference, _ in stage._bindings:
+                if (binding := reference()) is not None:
+                    bindings[id(binding)] = binding
+        domains = {
+            id(shared.domain): shared.domain for sequence in sequences
+            if (shared := sequence._capture_domain) is not None and shared.domain is not None
+        }
+        locks = [
+            self.lock, *(sequence._submission for sequence in sequences),
+            *(stage._submission for stage in stages), *(owner.lock for owner in domains.values()),
+            *(binding.lock for binding in bindings.values()),
+            *(binding.model.memory.lock for binding in bindings.values()),
+        ]
+        with cache_owners.try_locks(locks) as claimed:
+            if not claimed:
+                return False
+            for definition in (*sequences, *stages):
+                active = definition._active
+                if active is not None and active._finished is None and not active.poll().done:
+                    return False
+            for owner in domains.values():
+                if not owner.fenced or (owner.done is not None and not owner.done.query()):
+                    return False
+            for binding in bindings.values():
+                if binding.completion_lost or (
+                    binding.last is not None and not binding.last.query()
+                ):
+                    return False
+            self.close()
+            return True
 
     def release(self) -> None:
         if self.region is None:
@@ -519,7 +564,8 @@ class Loops:
         return "resident: the whole call records at idle"
 
     def _install(self, site: Hashable, program: _Program, memory: Any) -> None:
-        program.region = memory.region("denoise_loop", "program", release=program.close)
+        program.region = memory.region("denoise_loop", "program", release=program.close,
+                                       shrink=program.try_close)
         with self._lock:
             previous = self._kept.pop(site, None)
             self._kept[site] = program
@@ -1089,6 +1135,8 @@ def _taken(lock: threading.Lock, ctx: Context) -> Iterator[None]:
 def _stale(program: _Program, ident: Hashable, *, checked: bool = False) -> str:
     """Why a kept program cannot serve this call ("" when it can). `checked`: also the
     definition a later call runs (`again`), an O(weights) walk, once per call after pinning."""
+    if program.closed:
+        return "released"
     if ident is None or program.ident != ident:
         return "another key or layout"
     for sequence in program.sequences():
