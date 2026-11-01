@@ -2168,16 +2168,31 @@ class _Engine:
     def _try_drop(self) -> bool:
         from cozy_runtime.internal import cache_owners
 
-        locks = [_PLANE, self.cond]
-        if self.domain is not None:
-            locks.append(self.domain.lock)
-        with cache_owners.try_locks(locks) as claimed:
+        with cache_owners.try_locks([_PLANE, self.cond]) as claimed:
             if not claimed or self.driver is not None or self.pending or self._occupied():
                 return False
-            if self.unfenced or any(not event.query() for event in self.completions.values()):
-                return False
-            self._drop()
-            return True
+            # _PLANE fixes the driver's binding inventory before its locks are claimed.
+            bindings = tuple(self.addresses.values())
+            locks = [self.domain.lock] if self.domain is not None else []
+            locks.extend(binding.lock for binding in bindings)
+            locks.extend(binding.model.memory.lock for binding in bindings)
+            with cache_owners.try_locks(locks) as claimed:
+                if not claimed:
+                    return False
+                if self.unfenced or any(not event.query() for event in self.completions.values()):
+                    return False
+                if any(binding.completion_lost or (
+                    binding.last is not None and not binding.last.query()
+                ) for binding in bindings):
+                    return False
+                self._drop()
+                # Retired graphs no longer need their weight Pins. Keeping these bindings
+                # in addresses would hide idle weights from native reclamation.
+                for binding in bindings:
+                    binding.close()
+                self.addresses.clear()
+                self.where = ()
+                return True
 
     def _drop(self) -> None:
         if self.cache_device is not None and self.cache_device.type == "cuda":
