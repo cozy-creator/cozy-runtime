@@ -766,6 +766,7 @@ class _SequenceCapture:
         self.stages: list[PreparedRepeat] = []
         self._domain: Any = None
         self._pool: Any = None
+        self._working_bytes: int | None = None
         self._areas: list[tuple[Any, int, int]] = []
         self._submission = threading.RLock()
         self._closing = False

@@ -35,14 +35,21 @@ LOG2E = 1.4426950408889634
 
 
 def sparse(
-    query: Tensor, key: Tensor, value: Tensor, scale: float | None, sink_tokens: int, *, fp8: bool
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    scale: float | None,
+    sink_tokens: int,
+    tau: float,
+    *,
+    fp8: bool,
 ) -> Tensor:
     """One BF16 BTHD document; every row, the protected prefix's included. `fp8` runs the exact
     tiles in e4m3 with Hadamard-rotated Q/K, as the dense rows' FA4 FP8 does."""
     scale = query.shape[-1] ** -0.5 if scale is None else float(scale)
     attention_sol._pin_preprocess()
     kc, vc, threshold = import_module("sol_attn.preprocess").prepare(
-        query, key, value, scale=scale, tau=1.0, thresh_type="exact"
+        query, key, value, scale=scale, tau=tau, thresh_type="exact"
     )
     return _routed(query, key, value, kc, vc, threshold, scale, sink_tokens, fp8=fp8)
 
