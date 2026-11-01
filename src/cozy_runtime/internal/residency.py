@@ -2588,12 +2588,10 @@ class Memory:
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
         region = self._native_region(block, final=final)
-        needed = int(region.allocated_bytes)
-        if not reclaim and not region.resident and needed > self.room().free:
-            raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
         # Native demand owns all finite allocation recovery, including owner requests.
         # Its terminal refusal is not a reason to select Python victims and retry again.
-        return region.prepare()
+        # Free-only preparation must remain free-only even if physical room changes now.
+        return region.prepare(reclaim=reclaim)
 
     def _prefetch_next(self, current: _Block) -> None:
         """Demand's own next block takes priority over queued-request speculation."""

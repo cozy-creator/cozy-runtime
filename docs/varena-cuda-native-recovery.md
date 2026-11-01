@@ -18,7 +18,8 @@ an SDK missing that capability before changing limits or creating its Arena.
 CUDA no longer sorts Python cache/weight owners after a failed allocation, retries
 `torch.empty` or `Region.prepare` in Python, or performs a second `room()`-based reclaim
 before grouped native input admission. The installed native managed limit remains the
-physical admission boundary. The existing free-only native preparation precheck remains.
+physical admission boundary. Free-only preparation forwards `reclaim=False` to native
+admission; no stale Python free-byte snapshot can silently become a reclaiming call.
 
 `Memory.reclaim` retains the existing non-CUDA owner order and measurement behavior.
 Explicit CUDA `Memory.trim` is a lifecycle discard-all request: retire eligible graph
@@ -34,3 +35,8 @@ qualified work, not conclusions inferred from the five componentless parent fixt
 
 Source checks and independent review precede packaging. The previously passing control
 artifacts remain immutable; the cut itself still needs matched runtime/model qualification.
+
+Independent review identified the pre-existing free-only coupling in4bea: the Python room
+check could pass before pressure changed, then the default native prepare could reclaim.
+The follow-up forwards the exact reclaim intent, matching the already tested committed
+consumer lane. The4bea snapshot is preserved as an earlier source checkpoint.
