@@ -165,6 +165,68 @@ class PreQuantized:
     provider: str = ROWWISE_FP8
 
 
+@dataclass(frozen=True, slots=True)
+class ResidualFFN:
+    """One row-local residual/norm/SwiGLU tail, written into an exclusive caller output.
+
+    Declares ``hidden = residual + gate_msa[index] * out``, modulated RMSNorm,
+    packed value/gate ``up``, BF16 SwiGLU, ``down``, then
+    ``out = hidden + gate_mlp[index] * ffn``. Each supplied TritonEntry is the
+    package's existing compiled operation, with its documented explicit round points.
+    No memory budget, chunk size or allocating Python callback is supplied.
+
+    ``exclusive_out`` is the author's ownership promise: no other consumer may read
+    or write that output during this operation. Runtime rejects overlap with the
+    declared read-only tensors. Unsupported providers/layouts may use the original
+    split callable before execution; an accepted native operation never retries.
+    This first contract is BF16, one CUDA device, and a materialized SwiGLU result.
+    """
+
+    up: Any
+    down: Any
+    launch: Launch
+    norm_mod: TritonEntry
+    swiglu: TritonEntry
+    gate_add: TritonEntry
+    residual: Any
+    index: Any
+    norm_weight: Any
+    gate_msa: Any
+    scale_mlp: Any
+    shift_mlp: Any
+    gate_mlp: Any
+    eps: float
+    exclusive_out: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedHeads:
+    """One complete projection/norm/rotary/head-local attention operation.
+
+    The selected backend remains authoritative. The first executor supports dense
+    INT4QK on one CUDA device, with actual encoded Q/K/V modules and compiled in-place
+    norm/rotary entries. ``seed`` optionally receives post-rotary F32 key means.
+    No byte budget, head-window size, or allocating Python callback is supplied.
+    """
+
+    hidden: Any
+    query: Any
+    key: Any
+    value: Any
+    heads: int
+    backend: object
+    launch: Launch
+    rope: TritonEntry
+    key_sum: TritonEntry
+    norm_q: Any
+    norm_k: Any
+    eps_q: float
+    eps_k: float
+    cos: Any
+    sin: Any
+    seed: Any = None
+
+
 class _Shared:
     __slots__ = ("operands", "tensor")
 
@@ -174,6 +236,9 @@ class _Shared:
 
 
 _SHARED: ContextVar[tuple[_Shared, ...]] = ContextVar("cozy_quantize_once", default=())
+
+# A closed Runtime row menu owns one normal module invocation, never sibling operands.
+_LINEAR_SPLIT: ContextVar[Any | None] = ContextVar("cozy_native_linear_split", default=None)
 
 
 @contextmanager
@@ -367,6 +432,7 @@ __all__ = [
     "Launch",
     "Plan",
     "PreQuantized",
+    "ResidualFFN",
     "TritonEntry",
     "TritonKernels",
     "int8_rows",
