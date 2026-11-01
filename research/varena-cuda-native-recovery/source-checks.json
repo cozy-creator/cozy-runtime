@@ -1,0 +1,12 @@
+{
+  "baseline": "2626e3f48bc147f1f3d46b19bd385356e628680c",
+  "native": "dfb912042f60fd99a0bbe404b9927665e9b39715",
+  "source_syntax": true,
+  "new_ruff_findings": 0,
+  "native_kernel_execution_graph_owner_source_unchanged": true,
+  "actual_cpu_source_reclaim_control_equals_cut": true,
+  "actual_old_sdk_refuses_before_cuda_initialized": true,
+  "gpu_cut_qualification": false,
+  "mps_hardware_tested": false,
+  "p2_legacy_sizing_split_changed": false
+}
