@@ -1,0 +1,1 @@
+A room ask gives again: the room's floor is `Memory._room_floor()` (#1953's `Memory._floor` int shadowed it, so every ask raised and nothing was given). Each room writes what stayed and why to `room.json` in the executor's root, and SIGUSR1 writes every thread's stack.

@@ -101,6 +101,9 @@ class PreparedRepeat:
         self._sequence_owner: Any = None
         self._load_ordering = "checked"
         self._landed = landed
+        # Native immutable capture traces add metadata ownership, never extra physical pins.
+        self._footprints: tuple[Any, ...] = ()
+        self._execution_key: str | None = None
 
     @staticmethod
     def _layout(tensor: Any) -> tuple[Any, ...]:
@@ -193,6 +196,8 @@ class PreparedRepeat:
             except Exception as error:
                 _native_error(error)
             self._closed = True
+            self._footprints = ()
+            self._execution_key = None
             self._release_owned_bindings()
             self._load = None
             if settled_error is not None:
@@ -209,6 +214,8 @@ class PreparedRepeat:
             "capture_cache": dict(self._capture_cache),
             "load_ordering_requested": self._load_ordering_requested,
             "load_ordering": self._load_ordering,
+            "working_execution_key": self._execution_key,
+            "capture_footprints": [dict(footprint.facts()) for footprint in self._footprints],
         }
 
 class Execution:
@@ -651,7 +658,42 @@ class PreparedSequence:
                                 if controller is None:
                                     controller = phase_type(memory.native)
                                     phase_controllers[memory] = controller
-                                capsule = controller.wrap(capsule, *definition)
+                                capsule = controller.wrap(
+                                    capsule, *definition,
+                                    footprints=stage._footprints,
+                                    execution_key=stage._execution_key,
+                                )
+                                if stage._execution_key is not None:
+                                    memory.remember_working_phase(
+                                        stage._execution_key,
+                                        tuple(model for model in claimed if model.memory is memory),
+                                    )
+                    elif callable(phase_type) and request is not None and stage._footprints:
+                        # An inter-block graph can own scratch without a weight binding.
+                        # Observe it through the sequence's one memory owner, leaving the
+                        # current preference plan untouched (None is not an empty plan).
+                        memories = {model.memory for model in claimed}
+                        if len(memories) == 1:
+                            memory = next(iter(memories))
+                            with memory.lock:
+                                exclusive = (
+                                    request.memory is memory
+                                    and not request.idle
+                                    and not memory._active_beside(request)
+                                )
+                            if exclusive and memory.native is not None:
+                                controller = phase_controllers.get(memory)
+                                if controller is None:
+                                    controller = phase_type(memory.native)
+                                    phase_controllers[memory] = controller
+                                capsule = controller.wrap(
+                                    capsule, None, (), footprints=stage._footprints,
+                                    execution_key=stage._execution_key,
+                                )
+                                if stage._execution_key is not None:
+                                    memory.remember_working_phase(
+                                        stage._execution_key, tuple(claimed),
+                                    )
                     capsules.append(capsule)
                 native = (
                     _execution.NativeSequence(capsules, self.device)
@@ -766,6 +808,7 @@ class _SequenceCapture:
         self.stages: list[PreparedRepeat] = []
         self._domain: Any = None
         self._pool: Any = None
+        self._working_bytes: int | None = None
         self._areas: list[tuple[Any, int, int]] = []
         self._submission = threading.RLock()
         self._closing = False
@@ -920,6 +963,7 @@ class _SequenceExecution(Execution):
         self._phase_controllers = phases or {}
         self._prefetch_cleanup = ExitStack()
         self._prefetch_admission: list[dict[str, object]] = []
+        self._working_phases_recorded = False
 
     def _prepare_lookahead(self) -> None:
         if not self.plan.prefetch:
@@ -998,11 +1042,21 @@ class _SequenceExecution(Execution):
     def _release_models(self) -> None:
         # Base execution calls this only after checked native completion/readout. If the
         # drain is unproven, owners and this window lease remain retained for retirement.
+        if not self._working_phases_recorded:
+            request = self._load_request
+            if request is not None:
+                for controller in self._phase_controllers.values():
+                    request.working_phases.extend(
+                        dict(record) for record in controller.facts()["observations"]
+                    )
+            self._working_phases_recorded = True
         self._prefetch_cleanup.close()
         # Native phase entry changed preferences without a Python callback. After every
         # source/prefetch/consumer is checked, invalidate only our stale eager-policy cache;
         # the next ordinary phase recomputes it. Preserve another live request's policy.
-        for memory in self._phase_controllers:
+        for memory, controller in self._phase_controllers.items():
+            if not controller.facts()["transitions"]:
+                continue  # measurement-only wrappers did not change weight preferences
             with memory.lock:
                 request = self._load_request
                 if (

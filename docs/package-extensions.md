@@ -48,6 +48,20 @@ plain pre-norm block whose gates are layer scales; with `compose` Runtime compos
 block's attention from its projections, as it does a parallel block's. qwen-image-2, flux-3-klein and MiniMax-H3's
 video VAE decoder are the users.
 
+## Step caching — `cozy_runtime.stepcache`
+
+A package declares its DiT's block stack once (`Stack`: the transformer class, the blocks' list,
+the block arguments a block's output carries) and installs it in its plan
+(`stepcache.install(plan, STACK, transformer)`). A `denoise_loop(..., cache=policy)` call then
+reuses the stack's cached residual on forwards that would change it little: `FirstBlockCache(t)`
+or `EasyCache(t, retain, cooldown, max_hits)`, NVIDIA sol-engine's formulas. It is approximate,
+so a package names a policy only for a preset that asks for it, never by default. Each verdict is
+computed on the device from fixed-order reductions (the same inputs and policy give the same bytes);
+a skipped forward runs no block after the first. The stack must run as one `for` over its list.
+A cached loop runs eagerly and is off across ranks; the loop's record carries `cache`, and each
+step's `plans` line ends `cache:compute` or `cache:skip`. MiniMax-H3's full model and Qwen-Image
+2.1 are the users.
+
 ## Attention producers — `AttentionProducer`, `register_attention`
 
 A package's own attention call, tried just before its base in a site's cell (and selectable by
