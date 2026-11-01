@@ -1345,6 +1345,7 @@ class Memory:
         self.phase_plan_supported = False
         self._phase_plan: Any = None
         self._phase_plan_signature: tuple[Any, ...] | None = None
+        self._phase_plan_key: str | None = None
         self._phase_plan_models: set[Model] = set()
         self._phase_plan_status: tuple[object, ...] | None = None
         self._phase_names: frozenset[str] | None = None
@@ -2454,6 +2455,7 @@ class Memory:
                 self._phase_plan.deactivate()
                 self._phase_plan = None
                 self._phase_plan_signature = None
+                self._phase_plan_key = None
                 self._phase_plan_models.clear()
                 self._note_phase_plan("unplanned", reason)
 
@@ -2512,6 +2514,11 @@ class Memory:
             return
         represented = tuple(signature)
         if self._phase_plan is not None and represented == self._phase_plan_signature:
+            assert self._phase_plan_key is not None
+            try:
+                self._phase_plan.activate(self._phase_plan_key)
+            except NotImplementedError:
+                self._retire_phase_plan("multiple_arenas")
             return
         self._retire_phase_plan("phase_inventory_changed")
         key = "runtime.phase.regions/1:" + hashlib.sha256(repr(represented).encode()).hexdigest()
@@ -2522,6 +2529,7 @@ class Memory:
             self._note_phase_plan("unplanned", "multiple_arenas")
             return
         self._phase_plan, self._phase_plan_signature = candidate, represented
+        self._phase_plan_key = key
         self._phase_plan_models = set(models)
         self._note_phase_plan("active", phase=key, native=candidate.facts())
 
