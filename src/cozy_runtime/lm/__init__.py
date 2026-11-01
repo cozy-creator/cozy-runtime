@@ -49,8 +49,11 @@ from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from typing import Any, NamedTuple
 
+import tensorfs.varena.torch as vt
+
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Cancelled, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
@@ -162,40 +165,50 @@ def generate(
     `progress(tokens)` is told the tokens decoded so far (a call's longest row), at most every
     `PROGRESS_S`, for display only; one that raises is dropped, with a run warning (a cancel is
     the decode's own check's to act on)."""
-    draft = draft if draft is not None else _DRAFT.get()
-    if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
-        raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
-    sampling = _Sampling(float(temperature), float(top_p), int(seed))
-    tell = _Tell(progress)
-    stops = [int(token) for token in stop]
-    filler = stops[0] if pad is None else int(pad)
-    why = ABSENT or _unsupported(model)
-    if why:
-        say(
-            type(model).__name__, f"[lm] {type(model).__name__} decodes through Transformers: {why}"
-        )
-        row = ("decode ran through Transformers' loop", {"why": why})
-        if row not in WARNINGS:
-            WARNINGS.append(row)
-        return _transformers(
-            model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell
-        )
-    with _ENGINES_LOCK:
-        engine = _ENGINES.get(model)
-        if engine is None:
-            engine = _ENGINES[model] = _Engine(model)
-    request = _Request(inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell)
-    token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
-    try:
-        with torch.inference_mode():
-            return engine.generate(request, draft)
-    finally:
-        BYPASS.reset(token)
+    from cozy_runtime.internal.execution import ownership
+
+    with ownership.preparing(placed_device().index or 0, "decoder execution/cache"):
+        draft = draft if draft is not None else _DRAFT.get()
+        if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
+            raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
+        sampling = _Sampling(float(temperature), float(top_p), int(seed))
+        tell = _Tell(progress)
+        stops = [int(token) for token in stop]
+        filler = stops[0] if pad is None else int(pad)
+        why = ABSENT or _unsupported(model)
+        if why:
+            say(
+                type(model).__name__,
+                f"[lm] {type(model).__name__} decodes through Transformers: {why}",
+            )
+            row = ("decode ran through Transformers' loop", {"why": why})
+            if row not in WARNINGS:
+                WARNINGS.append(row)
+            return _transformers(
+                model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell
+            )
+        with _ENGINES_LOCK:
+            engine = _ENGINES.get(model)
+            if engine is None:
+                engine = _ENGINES[model] = _Engine(model)
+        request = _Request(inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell)
+        token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
+        try:
+            with torch.inference_mode():
+                return engine.generate(request, draft)
+        finally:
+            BYPASS.reset(token)
 
 
 def release(model: Any) -> None:
     """Retire an idle model's decode buffers, graphs and virtual address ownership."""
-    with _PLANE, _ENGINES_LOCK:
+    from cozy_runtime.internal.execution import ownership
+
+    with (
+        ownership.preparing(placed_device().index or 0, "decoder retirement"),
+        _PLANE,
+        _ENGINES_LOCK,
+    ):
         engine = _ENGINES.pop(model, None)
         if engine is None:
             return
@@ -1945,7 +1958,7 @@ class _Engine:
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
-            graph.replay()
+            vt.replay(graph)
         if graph is not None:
             self.replayed += 1
         else:

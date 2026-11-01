@@ -71,6 +71,9 @@ def _native_error(error: Exception) -> NoReturn:
     raise error
 
 
+_OWNERS: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
 class PreparedRepeat:
     """One recorded graph, repeated natively `steps` times: a stage of a PreparedSequence.
 
@@ -88,19 +91,26 @@ class PreparedRepeat:
         bindings: tuple[Any, ...],
         landed: int,
     ) -> None:
-        self._native, self.state, self.device, self.steps = native, state, device, steps
-        self._active: Execution | None = None
-        self._submission = threading.RLock()
-        self._dependencies, self._bindings = dependencies, bindings
-        self._closed = False
-        self._owned_bindings: tuple[Any, ...] = ()
-        self._binding_cleanup = ExitStack()
-        self._load: Any = None
-        self._capture_cache: dict[str, int] = {}
-        self._load_ordering_requested = "checked"
-        self._sequence_owner: Any = None
-        self._load_ordering = "checked"
-        self._landed = landed
+        from cozy_runtime.internal.execution import ownership
+
+        with ownership.preparing(device, "prepared definition registration"):
+            self._native, self.state, self.device, self.steps = native, state, device, steps
+            self._active: Execution | None = None
+            self._submission = threading.RLock()
+            self._dependencies, self._bindings = dependencies, bindings
+            self._closed = False
+            self._owned_bindings: tuple[Any, ...] = ()
+            self._binding_cleanup = ExitStack()
+            self._load: Any = None
+            self._capture_cache: dict[str, int] = {}
+            self._load_ordering_requested = "checked"
+            self._sequence_owner: Any = None
+            self._load_ordering = "checked"
+            self._landed = landed
+            # Native immutable capture traces add metadata ownership, never extra physical pins.
+            self._footprints: tuple[Any, ...] = ()
+            self._execution_key: str | None = None
+            _OWNERS.add(self)
 
     @staticmethod
     def _layout(tensor: Any) -> tuple[Any, ...]:
@@ -193,6 +203,8 @@ class PreparedRepeat:
             except Exception as error:
                 _native_error(error)
             self._closed = True
+            self._footprints = ()
+            self._execution_key = None
             self._release_owned_bindings()
             self._load = None
             if settled_error is not None:
@@ -209,6 +221,8 @@ class PreparedRepeat:
             "capture_cache": dict(self._capture_cache),
             "load_ordering_requested": self._load_ordering_requested,
             "load_ordering": self._load_ordering,
+            "working_execution_key": self._execution_key,
+            "capture_footprints": [dict(footprint.facts()) for footprint in self._footprints],
         }
 
 class Execution:
@@ -414,6 +428,24 @@ class PreparedSequence:
         repeat: tuple[int, int, int] | None = None,
         prefetch: bool = True,
     ) -> None:
+        from cozy_runtime.internal.execution import ownership
+
+        stages = tuple(stages)
+        if not stages or not isinstance(stages[0], PreparedRepeat):
+            self._initialize_owned(stages, outputs=outputs, repeat=repeat, prefetch=prefetch)
+            return
+        with ownership.preparing(stages[0].device, "prepared sequence construction"):
+            self._initialize_owned(stages, outputs=outputs, repeat=repeat, prefetch=prefetch)
+            _OWNERS.add(self)
+
+    def _initialize_owned(
+        self,
+        stages: Sequence[PreparedRepeat],
+        *,
+        outputs: Sequence[Any] | None = None,
+        repeat: tuple[int, int, int] | None = None,
+        prefetch: bool = True,
+    ) -> None:
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
@@ -533,6 +565,12 @@ class PreparedSequence:
         }
 
     def submit(self, context: Context | None = None) -> Execution:
+        from cozy_runtime.internal.execution import ownership
+
+        with ownership.preparing(self.device, "prepared sequence submission"):
+            return self._submit_owned(context)
+
+    def _submit_owned(self, context: Context | None = None) -> Execution:
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
@@ -651,7 +689,42 @@ class PreparedSequence:
                                 if controller is None:
                                     controller = phase_type(memory.native)
                                     phase_controllers[memory] = controller
-                                capsule = controller.wrap(capsule, *definition)
+                                capsule = controller.wrap(
+                                    capsule, *definition,
+                                    footprints=stage._footprints,
+                                    execution_key=stage._execution_key,
+                                )
+                                if stage._execution_key is not None:
+                                    memory.remember_working_phase(
+                                        stage._execution_key,
+                                        tuple(model for model in claimed if model.memory is memory),
+                                    )
+                    elif callable(phase_type) and request is not None and stage._footprints:
+                        # An inter-block graph can own scratch without a weight binding.
+                        # Observe it through the sequence's one memory owner, leaving the
+                        # current preference plan untouched (None is not an empty plan).
+                        memories = {model.memory for model in claimed}
+                        if len(memories) == 1:
+                            memory = next(iter(memories))
+                            with memory.lock:
+                                exclusive = (
+                                    request.memory is memory
+                                    and not request.idle
+                                    and not memory._active_beside(request)
+                                )
+                            if exclusive and memory.native is not None:
+                                controller = phase_controllers.get(memory)
+                                if controller is None:
+                                    controller = phase_type(memory.native)
+                                    phase_controllers[memory] = controller
+                                capsule = controller.wrap(
+                                    capsule, None, (), footprints=stage._footprints,
+                                    execution_key=stage._execution_key,
+                                )
+                                if stage._execution_key is not None:
+                                    memory.remember_working_phase(
+                                        stage._execution_key, tuple(claimed),
+                                    )
                     capsules.append(capsule)
                 native = (
                     _execution.NativeSequence(capsules, self.device)
@@ -766,6 +839,7 @@ class _SequenceCapture:
         self.stages: list[PreparedRepeat] = []
         self._domain: Any = None
         self._pool: Any = None
+        self._working_bytes: int | None = None
         self._areas: list[tuple[Any, int, int]] = []
         self._submission = threading.RLock()
         self._closing = False
@@ -911,6 +985,8 @@ class _SharedDomain:
 
 
 class _SequenceExecution(Execution):
+    plan: PreparedSequence
+
     def __init__(self, plan, context, outputs, readout, models, native, reads, phases=None):
         super().__init__(plan, context, 0, outputs, readout, models, native)
         self._stage_reads = reads
@@ -918,91 +994,65 @@ class _SequenceExecution(Execution):
         # Source-backed stages keep their existing separate current-stage lookahead policy.
         self._queued_eligible = context is not None and not reads
         self._phase_controllers = phases or {}
-        self._prefetch_cleanup = ExitStack()
         self._prefetch_admission: list[dict[str, object]] = []
+        self._working_phases_recorded = False
 
     def _prepare_lookahead(self) -> None:
         if not self.plan.prefetch:
             self._prefetch_admission.append({"state": "disabled_by_author"})
             return
-        request = self._load_request
-        candidates: dict[Any, list[tuple[Any, ...]]] = {}
         for current, following in zip(self._stage_reads, self._stage_reads[1:], strict=False):
             index, job, bindings = current
             next_index, next_job, next_bindings = following
-            # Resident stages between two reading stages run while the next one's bytes arrive.
+            # Declare actual sequence order. A suffix follows a repeated interval only on
+            # its last pass; the existing bounded link does not describe that conditional edge.
             repeat = self.plan._repeat
             if repeat is not None and repeat[2] > 1 and next_index == repeat[1]:
-                continue  # the suffix is next only on the final pass
+                continue
             if (
                 not bindings
                 or not next_bindings
-                or not getattr(job, "supports_native_lookahead", False)
-                or not getattr(next_job, "supports_native_lookahead", False)
                 or not callable(getattr(job, "link_next", None))
             ):
                 continue
-            memories = {binding.model.memory for binding in (*bindings, *next_bindings)}
-            if len(memories) != 1:
-                continue
-            memory = next(iter(memories))
-            regions = {
-                id(region): region
-                for binding in (*bindings, *next_bindings)
-                for _, region in binding._stage_regions
-            }
-            current_bytes = sum(
-                int(region.allocated_bytes)
-                for binding in bindings
-                for _, region in binding._stage_regions
-            )
-            next_bytes = sum(
-                int(region.allocated_bytes)
-                for binding in next_bindings
-                for _, region in binding._stage_regions
-            )
-            # Native reports the same actual reservations. Refuse skew or hidden inputs;
-            # do not use Python logical tensor sizes as allocation admission.
-            if (
-                not regions
-                or int(job.reservation_bytes) != current_bytes
-                or int(next_job.reservation_bytes) != next_bytes
+            if not all(
+                getattr(source, "supports_measured_lookahead", False)
+                for source in (job, next_job)
             ):
+                self._prefetch_admission.append({
+                    "from_stage": index, "to_stage": next_index,
+                    "state": "unsupported_native_admission",
+                })
                 continue
-            required = sum(int(region.allocated_bytes) for region in regions.values())
-            missing = sum(
-                int(region.allocated_bytes) for region in regions.values() if not region.resident
-            )
-            candidates.setdefault(memory, []).append(
-                (index, next_index, job, next_job, required, missing, next_bytes)
-            )
-        for memory, pairs in candidates.items():
-            required = max(pair[4] for pair in pairs)
-            missing = max(pair[5] for pair in pairs)
-            restore = memory._stage_prefetch_window(required, missing, request, self)
-            if restore is None:
-                self._prefetch_admission.append({"state": "capacity_skip", "pair_bytes": required})
-                continue
-            self._prefetch_cleanup.callback(restore)
-            for index, next_index, job, next_job, pair_bytes, _, next_bytes in pairs:
-                linked = bool(job.link_next(next_job, max_prefetch_bytes=next_bytes))
-                self._prefetch_admission.append(
-                    {
-                        "from_stage": index,
-                        "to_stage": next_index,
-                        "pair_bytes": pair_bytes,
-                        "state": "linked" if linked else "native_refusal",
-                    }
-                )
+            current_stage = self.plan.stages[index]
+            # Identity/order are the declaration. Native admission checks the active replay,
+            # its same-definition measurement and actual raw-source capacity at read time.
+            linked = bool(job.link_next(
+                next_job, execution_key=current_stage._execution_key,
+                footprints=current_stage._footprints,
+            ))
+            self._prefetch_admission.append({
+                "from_stage": index, "to_stage": next_index,
+                "state": "linked" if linked else "native_refusal",
+            })
 
     def _release_models(self) -> None:
         # Base execution calls this only after checked native completion/readout. If the
-        # drain is unproven, owners and this window lease remain retained for retirement.
-        self._prefetch_cleanup.close()
+        # drain is unproven, source/graph owners remain retained for retirement.
+        if not self._working_phases_recorded:
+            request = self._load_request
+            if request is not None:
+                for controller in self._phase_controllers.values():
+                    request.working_phases.extend(
+                        dict(record) for record in controller.facts()["observations"]
+                    )
+            self._working_phases_recorded = True
         # Native phase entry changed preferences without a Python callback. After every
         # source/prefetch/consumer is checked, invalidate only our stale eager-policy cache;
         # the next ordinary phase recomputes it. Preserve another live request's policy.
-        for memory in self._phase_controllers:
+        for memory, controller in self._phase_controllers.items():
+            if not controller.facts()["transitions"]:
+                continue  # measurement-only wrappers did not change weight preferences
             with memory.lock:
                 request = self._load_request
                 if (
