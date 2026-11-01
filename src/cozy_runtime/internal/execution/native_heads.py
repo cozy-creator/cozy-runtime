@@ -1,10 +1,13 @@
-"""Complete projected H3 heads on the already-selected dense INT4QK kernel."""
+"""Complete projected H3 heads on the already-selected dense INT4QK or INT8 kernel."""
 
 from __future__ import annotations
 
 import hashlib
 import math
+import sys
 from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import tensorfs.varena.torch as vt
@@ -23,7 +26,14 @@ from cozy_runtime.author.kernels import (
     TritonEntry,
     read,
 )
-from cozy_runtime.internal import attention, attention_sol, attention_ulysses, int8_linear, prebuilt
+from cozy_runtime.internal import (
+    attention,
+    attention_sol,
+    attention_ulysses,
+    int8_linear,
+    kernel_ready,
+    prebuilt,
+)
 from cozy_runtime.internal.execution import catch, phase
 from cozy_runtime.internal.execution.native_linear_split import (
     _Dispatch,
@@ -47,6 +57,7 @@ class _Route:
     reason: str
     layout: tuple[Any, ...]
     candidate: Any
+    exact_site: Any = None
 
 
 def _route(backend: object, tokens: int) -> _Route | None:
@@ -55,8 +66,9 @@ def _route(backend: object, tokens: int) -> _Route | None:
     candidate = next((c for c in attention.known().values() if c.backend == name), None)
     if candidate is None:
         return None
-    if candidate is attention.BY_NAME["kitchen-int4qk"]:
-        return _Route(name, "kitchen-int4qk", "", (), candidate)
+    for implementation in ("kitchen-int4qk", "kitchen-int8"):
+        if candidate is attention.BY_NAME[implementation]:
+            return _Route(name, implementation, "", (), candidate)
     original = attention.BY_NAME["kitchen-sol-int4qk"]
     base = candidate.producer.base if candidate.producer is not None else candidate.name
     if (
@@ -69,9 +81,13 @@ def _route(backend: object, tokens: int) -> _Route | None:
     layout, site = _ACTIVE_LAYOUT.get(), attention_sol._SITE.get()
     if layout is None or site is None or layout.live_tokens != tokens:
         return None
-    dense_path, exact_path = attention_sol.policy(layout, site)
-    if exact_path or (not dense_path and layout.step >= layout.dense_until_step):
+    dense_path, exact_path, prefix_heavy = attention_sol.resolved_policy(
+        layout, site, quantized_sparse=True
+    )
+    if not dense_path and layout.sparse:
         return None
+    implementation = "kitchen-int8" if exact_path or prefix_heavy else "kitchen-int4qk"
+    reason = "dense_path" if dense_path else "prefix_heavy" if prefix_heavy else "dense_step"
     identity = (
         layout.live_tokens,
         layout.protected_prefix,
@@ -80,9 +96,64 @@ def _route(backend: object, tokens: int) -> _Route | None:
         layout.exact_paths,
         layout.tau,
     )
-    return _Route(
-        name, "kitchen-int4qk", "dense_path" if dense_path else "dense_step", identity, candidate
+    return _Route(name, implementation, reason, identity, candidate, site if exact_path else None)
+
+
+@lru_cache(maxsize=32)
+def _binary_identity(path: str, size: int, mtime_ns: int) -> str:
+    del size, mtime_ns  # Changes to the live artifact invalidate the cache key.
+    with Path(path).open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
+@dataclass(frozen=True)
+class _Attention:
+    implementation: str
+    identity: tuple[Any, ...]
+    extension: Any
+
+
+def _attention(route: _Route, device: int) -> _Attention | None:
+    if route.implementation == "kitchen-int4qk":
+        artifact = prebuilt.artifact("_attn4")
+        extension = getattr(_kernels, "_attn4", None)
+        if not artifact or not callable(getattr(extension, "attention", None)):
+            return None
+        return _Attention(route.implementation, ("prebuilt-int4/1", artifact), extension)
+    # Read the actual already-served kernel; never open, compile, or probe it here.
+    ready = next(
+        (
+            row
+            for row in kernel_ready.served(f"attention cuda:{device} ")
+            if isinstance(row, attention.Ready)
+            and row.candidate is attention.BY_NAME["kitchen-int8"]
+        ),
+        None,
     )
+    backend = sys.modules.get("comfy_kitchen.backends.cuda")
+    extension = getattr(backend, "_C", None)
+    filename = getattr(extension, "__file__", None)
+    if (
+        ready is None
+        or not ready.artifact
+        or not filename
+        or not all(
+            callable(getattr(extension, name, None))
+            for name in ("sage_sdpa_quantize", "sage_sdpa_prequantized")
+        )
+    ):
+        return None
+    path = Path(filename)
+    if not path.is_file():
+        return None
+    stat = path.stat()
+    identity = (
+        "kitchen-int8-split/1",
+        ready.artifact.get("artifact"),
+        ready.artifact.get("key"),
+        _binary_identity(str(path), stat.st_size, stat.st_mtime_ns),
+    )
+    return _Attention(route.implementation, identity, extension)
 
 
 def _entries(intent: ProjectedHeads, device: int) -> tuple[Any, ...] | None:
@@ -177,18 +248,77 @@ def _head_chunks(heads: int) -> tuple[int, ...]:
     return tuple(found)
 
 
-def _attention_shapes(tokens: int, heads: int) -> tuple[tuple[tuple[int, ...], Any], ...]:
+def _attention_shapes(
+    tokens: int, heads: int, implementation: str = "kitchen-int4qk"
+) -> tuple[tuple[tuple[int, ...], Any], ...]:
     tile = 128 if tokens > 1024 else 64
     blocks = (tokens + tile - 1) // tile
     return (
-        ((1, heads, tokens, 64), torch.int8),
-        ((1, heads, tokens, 64), torch.int8),
+        ((1, heads, tokens, 128 if implementation == "kitchen-int8" else 64), torch.int8),
+        ((1, heads, tokens, 128 if implementation == "kitchen-int8" else 64), torch.int8),
         ((heads * 128, blocks * tile), torch.int8),
         ((1, heads, ((tokens + 127) // 128) * 32), torch.float32),
         ((1, heads, blocks * 4), torch.float32),
-        ((heads, 128), torch.float32),
+        ((heads,), torch.int32)
+        if implementation == "kitchen-int8"
+        else ((heads, 128), torch.float32),
         ((heads, 128), torch.float32),
     )
+
+
+def _int8_attention(
+    kernel: _Attention,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    target: Tensor,
+    scratch: list[Tensor],
+    stream: int,
+) -> None:
+    """Same pinned INT8 kernels; consumed owned Q becomes the BHND output storage."""
+    _, tokens, heads, _ = q.shape
+    qi, ki, vi, qs, ks, anchor, vs = scratch
+    qi, ki, qs, ks = (value[:, :heads] for value in (qi, ki, qs, ks))
+    vi, vs, anchor = vi[: heads * 128], vs[:heads], anchor[:heads]
+    cta = 128 if tokens > 1024 else 64
+
+    def capsule(value: Tensor) -> Any:
+        # Every owner is retained here and all kernels use this same explicit stream.
+        return value.__dlpack__(stream=-1)
+
+    kernel.extension.sage_sdpa_quantize(
+        capsule(q.transpose(1, 2)),
+        capsule(k.transpose(1, 2)),
+        capsule(v.transpose(1, 2)),
+        capsule(qi),
+        capsule(qs),
+        capsule(ki),
+        capsule(ks),
+        capsule(vi),
+        capsule(vs),
+        cta,
+        2,
+        stream,
+        anchor.data_ptr(),
+    )
+    # The attention half consumes only codes/scales. Q is internal scratch, never
+    # caller-owned input; same-stream ordering permits its reuse after quantization.
+    output = q.view(1, heads, tokens, 128)
+    kernel.extension.sage_sdpa_prequantized(
+        capsule(qi),
+        capsule(ki),
+        capsule(vi),
+        capsule(output),
+        capsule(qs),
+        capsule(ks),
+        capsule(vs),
+        cta,
+        128**-0.5,
+        2,
+        stream,
+        None,
+    )
+    target.copy_(output.transpose(1, 2))
 
 
 @dataclass
@@ -282,6 +412,7 @@ class _RowInvocation:
 class _Plan:
     intent: ProjectedHeads
     route: _Route
+    attention: _Attention
     request: Any
     library: Any
     projections: tuple[_Projection, ...]
@@ -310,6 +441,8 @@ class _Plan:
             head_chunk=geometry.heads,
             backend=self.route.backend,
             implementation=self.route.implementation,
+            attention_api=self.attention.identity[0],
+            attention_identity=self.attention.identity,
             choices=self.choices,
             workspace_bytes=geometry.workspace,
         )
@@ -361,7 +494,7 @@ class _Plan:
             )
             scratch = [
                 torch.empty(shape, dtype=dtype, device=x.device)
-                for shape, dtype in _attention_shapes(tokens, count)
+                for shape, dtype in _attention_shapes(tokens, count, self.route.implementation)
             ]
             seed_work = (
                 torch.empty((count, 128), dtype=torch.float32, device=x.device)
@@ -369,6 +502,8 @@ class _Plan:
                 else None
             )
             operand = _Quantized()
+            if self.route.exact_site is not None:
+                attention_sol.note_exact(self.route.exact_site)
             # Every allocation precedes projection, normalization, output, and seed writes.
             for first in range(0, intent.heads, count):
                 catch.checkpoint()
@@ -423,47 +558,52 @@ class _Plan:
                     means.div_(tokens)
                     self.seed[first : first + heads].copy_(means)
                 target = output[:, :, first : first + heads]
-                q4, k4, v8, qs, ks, sums, vs = scratch
+                if self.route.implementation == "kitchen-int8":
+                    _int8_attention(self.attention, q, k, v, target, scratch, stream)
+                else:
+                    q4, k4, v8, qs, ks, sums, vs = scratch
 
-                def strides(value: Tensor) -> tuple[int, int, int]:
-                    return value.stride(0), value.stride(2), value.stride(1)
+                    def strides(value: Tensor) -> tuple[int, int, int]:
+                        return value.stride(0), value.stride(2), value.stride(1)
 
-                code = _kernels._attn4.attention(
-                    device,
-                    q.data_ptr(),
-                    k.data_ptr(),
-                    v.data_ptr(),
-                    target.data_ptr(),
-                    q4.data_ptr(),
-                    qs.data_ptr(),
-                    k4.data_ptr(),
-                    ks.data_ptr(),
-                    sums.data_ptr(),
-                    v8.data_ptr(),
-                    vs.data_ptr(),
-                    1,
-                    heads,
-                    heads,
-                    tokens,
-                    tokens,
-                    128 if tokens > 1024 else 64,
-                    True,
-                    128**-0.5,
-                    strides(q),
-                    strides(k),
-                    strides(v),
-                    strides(target),
-                    stream,
-                )
-                if code:
-                    raise RuntimeError(f"kitchen-int4qk: {_kernels._attn4.error_name(code)}")
+                    code = self.attention.extension.attention(
+                        device,
+                        q.data_ptr(),
+                        k.data_ptr(),
+                        v.data_ptr(),
+                        target.data_ptr(),
+                        q4.data_ptr(),
+                        qs.data_ptr(),
+                        k4.data_ptr(),
+                        ks.data_ptr(),
+                        sums.data_ptr(),
+                        v8.data_ptr(),
+                        vs.data_ptr(),
+                        1,
+                        heads,
+                        heads,
+                        tokens,
+                        tokens,
+                        128 if tokens > 1024 else 64,
+                        True,
+                        128**-0.5,
+                        strides(q),
+                        strides(k),
+                        strides(v),
+                        strides(target),
+                        stream,
+                    )
+                    if code:
+                        raise RuntimeError(
+                            f"kitchen-int4qk: {self.attention.extension.error_name(code)}"
+                        )
                 options = attention_ulysses.Options(
                     attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False
                 )
                 attention_ulysses.record(
                     self.route.backend, self.route.candidate.local.impl(q, k, v, options)
                 )
-                dense = attention.BY_NAME["kitchen-int4qk"]
+                dense = attention.BY_NAME[self.route.implementation]
                 attention_ulysses.record(dense.backend, dense.local.impl(q, k, v, options))
                 if self.route.reason:
                     attention_sol._count(self.route.reason)
@@ -526,14 +666,13 @@ def prepare_projected_heads(
         return None
     route = _route(intent.backend, tokens)
     kernel_identity = _entries(intent, device)
-    attn_identity = prebuilt.artifact("_attn4")
+    attention_kernel = None if route is None else _attention(route, device)
     library = int8_linear.library(device)
     if (
         route is None
         or kernel_identity is None
-        or not attn_identity
+        or attention_kernel is None
         or library.family != "mma.sync"
-        or not callable(getattr(getattr(_kernels, "_attn4", None), "attention", None))
     ):
         return None
     norm_q, norm_k, cos, sin, seed = (
@@ -613,7 +752,8 @@ def prepare_projected_heads(
         if geometry.workspace:
             allocations.append(geometry.workspace)
         allocations.extend(
-            math.prod(shape) * dtype.itemsize for shape, dtype in _attention_shapes(tokens, chunk)
+            math.prod(shape) * dtype.itemsize
+            for shape, dtype in _attention_shapes(tokens, chunk, route.implementation)
         )
         if seed is not None:
             allocations.append(chunk * 128 * 4)
@@ -628,7 +768,7 @@ def prepare_projected_heads(
         return None
     semantic = phase.configuration(
         (
-            "projected-heads-int4/1",
+            "projected-heads/2",
             tuple(sorted(identities)),
             tuple(_layout(value) for value in readonly),
             _layout(seed),
@@ -640,7 +780,7 @@ def prepare_projected_heads(
             route.reason,
             route.layout,
             kernel_identity,
-            attn_identity,
+            attention_kernel.identity,
             library.identity,
             library.family,
             tuple(p.module.encoding for p in projections),
@@ -655,6 +795,7 @@ def prepare_projected_heads(
     return _Plan(
         intent,
         route,
+        attention_kernel,
         request,
         library,
         tuple(projections),

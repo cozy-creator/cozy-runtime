@@ -203,8 +203,8 @@ class ResidualFFN:
 class ProjectedHeads:
     """One complete projection/norm/rotary/head-local attention operation.
 
-    The selected backend remains authoritative. The first executor supports dense
-    INT4QK on one CUDA device, with actual encoded Q/K/V modules and compiled in-place
+    The selected backend remains authoritative. The executor supports dense INT4QK
+    and Kitchen INT8 on one CUDA device, with actual encoded Q/K/V modules and compiled in-place
     norm/rotary entries. ``seed`` optionally receives post-rotary F32 key means.
     No byte budget, head-window size, or allocating Python callback is supplied.
     """

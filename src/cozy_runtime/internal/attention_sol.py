@@ -837,6 +837,24 @@ def policy(layout: AttentionLayout, site: Site) -> tuple[bool, bool]:
     return on(layout.dense_paths), on(layout.exact_paths) or outlier_keys(site.keys)
 
 
+def resolved_policy(
+    layout: AttentionLayout, site: Site, *, quantized_sparse: bool
+) -> tuple[bool, bool, bool]:
+    """Actual model route: dense path, exact path, and prefix-heavy dense substitution."""
+    dense_path, exact_path = policy(layout, site)
+    dense_path = dense_path or (exact_path and quantized_sparse)
+    prefix_heavy = not dense_path and layout.step >= layout.dense_until_step and not layout.sparse
+    return dense_path, exact_path, prefix_heavy
+
+
+def note_exact(site: Site) -> None:
+    """Keep the same exact-site receipt for ordinary and closed native execution."""
+    said = _SAID.get()
+    if said is not None and "exact:" + site.path not in said:
+        said["exact:" + site.path] = "exact"
+        _kernel_row({"source": "exact", "site": site.path})
+
+
 def _execute(
     query: Tensor,
     key: Tensor,
@@ -857,12 +875,13 @@ def _execute(
     key gain has outlier channels (`outlier_keys`) is an exact path too."""
     import torch
 
-    dense_path, exact_path = policy(layout, site)
+    dense_path, exact_path, prefix_heavy = resolved_policy(
+        layout,
+        site,
+        quantized_sparse=sparse is not None and dense is not _dense and exact is not None,
+    )
     if exact_path:
-        said = _SAID.get()
-        if said is not None and "exact:" + site.path not in said:
-            said["exact:" + site.path] = "exact"
-            _kernel_row({"source": "exact", "site": site.path})  # the receipt names each exact site
+        note_exact(site)
         if dense is _dense:
             dense = _exact
         elif exact is not None:
@@ -870,7 +889,6 @@ def _execute(
             # A quantizing sparse kernel (Kitchen's INT8) cannot carry these keys on its sparse
             # rows either: the whole call is dense on the exact kernel. H3 block 49 on an RTX 4090,
             # against FP32: Kitchen INT8 Sol 0.10-0.11 rel L2, BF16 Sol 0.05-0.08, this 0.016-0.022.
-            dense_path = dense_path or sparse is not None
     if dense_path and query.shape[1] < layout.live_tokens:
         # A refiner has its own shorter document; its explicit dense policy wins.
         output = dense(query=query, key=key, value=value, scale=scale)
@@ -883,7 +901,7 @@ def _execute(
     fa4 = sparse is None and card is not None and route(card) == FA4
     loaded: object = None
     instead = "dense_path" if dense_path else "dense_step"
-    if not dense_path and layout.step >= layout.dense_until_step and not layout.sparse:
+    if prefix_heavy:
         # Its prefix leaves this step no cheaper sparse (`AttentionLayout.sparse`): the protected
         # rows' kernel serves every row, so those rows come out as a sparse step makes them, and
         # the rest exact where they would have been routed.
