@@ -14,7 +14,9 @@ generations. A kernel epoch is checked for changes, not embedded in the key.
 Unknown entry permits measurement only. The native record is published only for
 a completed eager execution whose full immutable configuration is represented.
 Cut retries and caught dispatch failures invalidate the sample even when a smaller
-attempt later succeeds. Native allocation failures invalidate it too. Errors,
+attempt later succeeds. Progress callbacks are bracketed by native allocation/free
+counters; actual allocator transitions invalidate the eager sample, while allocation-free
+host telemetry remains measurable. This serial guard is not the later asynchronous replay guard. Native allocation failures invalidate it too. Errors,
 cancellation and changed dispatch preserve the previous successful sample.
 Preparation, capture and replay are recorded separately and never publish a
 successful eager watermark.

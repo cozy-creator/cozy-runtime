@@ -567,7 +567,15 @@ class _Loop:
                     cached.begin(i - self.steps.start)
                 _call(self.step, index, tensors, self.phase(i))
                 if self.on_step is not None:
+                    callback_before = None if observation is None else vt.stats(index.device.index)
                     self.on_step(i)
+                    if observation is not None and callback_before is not None:
+                        callback_after = vt.stats(index.device.index)
+                        if any(
+                            callback_after[key] != callback_before[key]
+                            for key in ("allocations", "frees")
+                        ):
+                            observation.invalidate("callback_allocator_activity")
             if index.is_cuda:
                 torch.cuda.current_stream(index.device).synchronize()
             if observation is not None and mode == "eager":
