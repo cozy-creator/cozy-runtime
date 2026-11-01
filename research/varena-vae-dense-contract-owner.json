@@ -1,0 +1,9 @@
+{
+  "owner": "/root/core_restart/vae_dense_research",
+  "purpose": "Source-only H3 VAE dense-linear, autocast, and cuBLAS workspace contract research",
+  "branch": "codex/xs138-p2-vae-dense-research",
+  "base": "cb6c66bf343d15637eaeb4af35731a37fc56d61c",
+  "parents": ["61fe32331968f89a1585d25263924ef15cc04a39"],
+  "scope": ["research/varena-vae-dense-contract.md", "research/varena-vae-dense-contract-owner.json"],
+  "prohibited": ["GPU execution", "builds", "rentals", "installs", "frozen integration edits"]
+}
