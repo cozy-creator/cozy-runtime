@@ -1,6 +1,8 @@
 """Triton sets prebuilt on a CPU, for the native Runtime wheel or a package release
 (`triton_kernels.shipped`): `python -m cozy_runtime.internal.triton_prebuild OUT [--launchers DIR]`,
-OUT being `cozy_runtime/_triton`, or `... OUT --package NAME`, OUT being `<NAME>/_triton`.
+OUT being `cozy_runtime/_triton`, or `... OUT --package NAME`, OUT being `<NAME>/_triton`. It writes
+`OUT/<this Triton release>/`: run once per Triton served, each in its own environment
+(`scripts/prebuild-triton.sh`, `cozy_runtime/torch-triton.txt`), and the releases sit side by side.
 
 The Runtime's: every set a card row runs (`machine_kernels.triton_sets`, the LoRA bake set, LM
 decode, MoE experts, tcgen05's Sol merge). A package's: every set its import declares (its fused
@@ -8,11 +10,10 @@ plans included), for every row of `arch.ROWS`. Each compiles as the machine's bu
 (`spec`, `compile_entries`), into a scratch Triton cache; a set that does not compile for a row is
 left out and named, and machines compile it as before. Each kernel's metadata and cubin go to
 `kernels/<key>/` (its other stages are Triton's debugging output). Triton's launcher modules come
-from `--launchers` (built where the wheel's C library floor is, kernels.yaml), else are built
-here against `TRITON_LIBCUDA_PATH`'s libcuda (a driver stub on a CPU host); a package ships none
-(the Runtime's serve it). `manifest.json` names them all with the Triton release they hold for:
-another Triton, or another Runtime's kernel source, matches nothing, and a machine compiles as
-before.
+from `--launchers`' `<this Triton release>/` (built where the wheel's C library floor is,
+kernels.yaml), else are built here against `TRITON_LIBCUDA_PATH`'s libcuda (a driver stub on a CPU
+host); a package ships none (the Runtime's serve it). `manifest.json` names them all: another
+Runtime's kernel source matches nothing, and a machine compiles as before.
 """
 
 from __future__ import annotations
@@ -113,20 +114,23 @@ def _launchers(out: Path, given: Path | None) -> dict[str, dict[str, str]]:
 
 
 def build(out: Path, launchers: Path | None, package: str = "") -> dict[str, object]:
-    """OUT, written whole: nothing when `package` declares no set."""
+    """`OUT/<this Triton release>`, written whole: nothing when `package` declares no set."""
+    out = out / triton.__version__
     with tempfile.TemporaryDirectory(prefix="cozy-triton-") as scratch:
         triton.knobs.cache.dir = scratch
         staged = Path(scratch) / "out"
         staged.mkdir()
         shipped, report = _kernels(staged, package)
         if package and not shipped:
-            return {"kernels": 0, "bytes": 0, "sets": report}
-        modules = {} if package else _launchers(staged, launchers)
-        manifest = {"triton": triton.__version__, "kernels": shipped, "launcher": modules}
+            return {"triton": triton.__version__, "kernels": 0, "bytes": 0, "sets": report}
+        given = launchers / triton.__version__ if launchers else None
+        modules = {} if package else _launchers(staged, given)
+        manifest = {"kernels": shipped, "launcher": modules}
         (staged / "manifest.json").write_text(json.dumps(manifest, indent=1, sort_keys=True))
         shutil.copytree(staged, out)
     size = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
     return {
+        "triton": triton.__version__,
         "kernels": len(shipped),
         "bytes": size,
         "launchers": sorted(modules),
@@ -136,8 +140,8 @@ def build(out: Path, launchers: Path | None, package: str = "") -> dict[str, obj
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    parser.add_argument("out", type=Path, help="the cozy_runtime/_triton directory to write")
-    parser.add_argument("--launchers", type=Path, help="prebuilt cuda_utils.*.so to ship")
+    parser.add_argument("out", type=Path, help="the _triton directory to write this Triton's into")
+    parser.add_argument("--launchers", type=Path, help="<Triton release>/cuda_utils.*.so to ship")
     parser.add_argument("--package", default="", help="a package's sets, not the Runtime's")
     arguments = parser.parse_args()
     print(json.dumps(build(arguments.out, arguments.launchers, arguments.package), indent=1))

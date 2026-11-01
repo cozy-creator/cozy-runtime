@@ -5,8 +5,9 @@ Model code lives in the model's package and the Runtime stays generic (owner rul
 them while the executor starts. Compiling fixed shipped source is permitted; consumer
 benchmarking, autotuning, torch.compile and competing implementation search are not.
 A package declares its Triton kernels once, at import, as a `TritonKernels`. Its release ships
-them compiled for every card row in `<package>/_triton` (`python -m
-cozy_runtime.internal.triton_prebuild <package>/_triton --package <package>`, on a CPU). Each
+them compiled for every card row in `<package>/_triton/<Triton release>`, once per Triton it serves
+(`python -m cozy_runtime.internal.triton_prebuild <package>/_triton --package <package>`, on a CPU,
+in an environment with that Triton). Each
 executor that imports the package submits their build for its GPUs' architectures when it starts,
 beside the weight download; the machine's compile manager copies what the package ships, else
 builds each key once, niced, out of process. `Model.execution_plan` receives a `Plan` whose `load`
