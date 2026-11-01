@@ -221,6 +221,11 @@ function(kernel_module name binding)
     install(TARGETS ${name} LIBRARY DESTINATION cozy_runtime/_kernels)
 endfunction()
 
+# Prepared host-side Lt descriptors; the installed CUDA library owns its kernels.
+# No Torch headers/linkage and no architecture compilation unit.
+kernel_module(_dense dense.cpp)
+target_link_libraries(_dense PRIVATE CUDA::cublasLt CUDA::cuda_driver)
+
 kernel_module(_gemm gemm.cpp ${units})
 target_include_directories(_gemm PRIVATE "${INT8}")
 target_compile_definitions(_gemm PRIVATE $<$<BOOL:${COZY_TMA}>:COZY_TMA>)

@@ -1,0 +1,10 @@
+{
+  "python_syntax": true,
+  "ruff": true,
+  "targeted_mypy": "Success: no issues found in 1 source file",
+  "actual_model_meta_layout": "cpu-inventory.json",
+  "native_syntax": "not established: local runtime SDK lacks the complete development header tree; logs001-003 preserved in outputs/xs138-p2-vae-block",
+  "native_link_or_cuda_execution": false,
+  "read_only_review": "descriptor/math/query and two-slot schedule reviewed; error-domain preservation and separate all-bindings validation added after concrete review",
+  "native_source_sha256": "0795d3ffced05771495bd41b9e20f43ba4ade2d8d2f03adc3184048708d26d7b"
+}
