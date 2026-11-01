@@ -217,10 +217,16 @@ class _Invocation:
         except BaseException as error:
             if fault(error) is Fault.OOM:
                 error.varena_no_retry = True  # type: ignore[attr-defined]
-            aborted = execution.abort()
-            if aborted is not None:
-                self.request.working_phases.append(aborted)
-                record["phase"] = aborted
+            try:
+                # A partially submitted operation still owns its actual stream. Normal
+                # failure drains this whole phase before dropping the capture exclusion;
+                # a device completion error takes precedence and retires through Runtime.
+                inv.stream.synchronize()
+            finally:
+                aborted = execution.abort()
+                if aborted is not None:
+                    self.request.working_phases.append(aborted)
+                    record["phase"] = aborted
             raise
         # The optional source reader has its own checked completion, outside compute.
         # Finalize while this Model owner is still open; ordinary close otherwise cancels.
