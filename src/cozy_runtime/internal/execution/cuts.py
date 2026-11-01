@@ -530,7 +530,16 @@ def split[T](
         def need(level: int, granularity: int) -> int:
             return sizing.peak(granularity, out_bytes, (fit(window(level)),))
 
-        return catch.cut(f"split:{key}", deepest, need, at)
+        def misfit() -> None:
+            # The device refused a window the fit said fits: an op the fit never measured (H3's
+            # sparse attention under its dense steps' fit), which every later call would repeat
+            # (cr-239). The next calls measure the op that runs.
+            with _MEASURED_LOCK:
+                if sorted(_MEASURED.get(key, ())) == points:
+                    del _MEASURED[key]
+                    _REFUSED.discard(key)
+
+        return catch.cut(f"split:{key}", deepest, need, at, misfit=misfit)
     # A whole long sequence at one token per launch is expensive even when it fits.
     # Start bounded, then measure the next larger window; where the device refused it (a short
     # axis: H3's 56 heads start at 28 a window), the next smaller. OOM still descends.

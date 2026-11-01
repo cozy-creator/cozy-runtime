@@ -156,11 +156,19 @@ def _refused(exc: BaseException) -> bool:
     return True
 
 
-def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -> T:
+def cut[T](
+    site: str,
+    finest: int,
+    need: sizing.Need,
+    run: Callable[[int], T],
+    *,
+    misfit: Callable[[], None] | None = None,
+) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
     attention pieces, a package's split, a norm's or a conv's bands), at the coarsest level
     whose `need` fits the request's room; a refusal descends. Outside a request it runs whole;
-    inside a capture at the level the room gives now (its pool was prepared for it)."""
+    inside a capture at the level the room gives now (its pool was prepared for it). `misfit`
+    hears of a refusal at a level whose `need` fit the room: the estimate was short."""
     checkpoint()
     request = CURRENT.get()
     if request is None:
@@ -195,6 +203,8 @@ def cut[T](site: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
                 raise
             _clear(exc)
             failure: BaseException | None = exc
+        if misfit is not None and need(level, available.granularity) <= sizing.capacity(available):
+            misfit()
         # A failed allocation can reveal pressure the shape estimate cannot predict.
         # This also runs at the finest level, which sizing.descend cannot make smaller.
         # First release a bounded amount, now that failed-frame pins are gone. An
