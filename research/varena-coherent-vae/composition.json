@@ -1,0 +1,50 @@
+{
+  "src/cozy_runtime/internal/cooperation.py": {
+    "matches": "be03566f3ea3ebdccadc8f2488e6bb6293f42f8d",
+    "sha256": "6e883d91206ab1bf32b50c87295a22c8c7b9fb376ef3bd01288d97959df3a5dc"
+  },
+  "src/cozy_runtime/author/_loader.py": {
+    "matches": "534023328",
+    "sha256": "7376e20b87d26f274c702e3189ccd33c35166ebb73af18a40164c55cdbab45ad"
+  },
+  "src/cozy_runtime/author/_model.py": {
+    "matches": "534023328",
+    "sha256": "d89940f5cce8bb0d302bc941ac629152ff8c627346f206b818c49901b13970d9"
+  },
+  "src/cozy_runtime/lm/__init__.py": {
+    "matches": "534023328",
+    "sha256": "f273307a3b545af03a682cbbfc1b2082fcfeb2d3b8243baa5d56f6af15e6705c"
+  },
+  "src/cozy_runtime/internal/accel.py": {
+    "matches": "13c0d73466762fa899ff61c3291f8f93f4cf160e",
+    "sha256": "56dfd82f73080aa084ec4d9b01d4e440e0c83289e6671f606353fec16c0fdce3"
+  },
+  "src/cozy_runtime/graphs/domain.py": {
+    "matches": "13c0d73466762fa899ff61c3291f8f93f4cf160e",
+    "sha256": "4086a1df82e5d5dafa2842e2e74c952c69e37cb55441f406246b428a6b954605"
+  },
+  "src/cozy_runtime/author/_activity.py": {
+    "matches": "13c0d73466762fa899ff61c3291f8f93f4cf160e",
+    "sha256": "9f970c2fb289c06feacce316a0df6f012e970db2faf0d2c39cd536dd8d6a98e5"
+  },
+  "src/cozy_runtime/internal/executor.py": {
+    "matches": "13c0d73466762fa899ff61c3291f8f93f4cf160e",
+    "sha256": "07300c8831cc6aeab913f5a818706ec02f7584f750673bdb1eb93cc1e6c01038"
+  },
+  "src/cozy_runtime/internal/kernel_ready.py": {
+    "matches": "13c0d73466762fa899ff61c3291f8f93f4cf160e",
+    "sha256": "d77747b6ed4e1d8e49fd53cb77c8d96abe88c4607a0802603d5b08d771571f5a"
+  },
+  "src/cozy_runtime/internal/parallel/mirror.py": {
+    "matches": "13c0d73466762fa899ff61c3291f8f93f4cf160e",
+    "sha256": "11606ca308fef51ddd512fedad5e5037ab45a20240d63768da5acdc069e73e2a"
+  },
+  "src/cozy_runtime/internal/execution/native_vae.py": {
+    "matches": "5ba942b79",
+    "sha256": "77194a615ab8aa0da0767ca50e93fbba114149df77f067a426daf15dbfcd2119"
+  },
+  "kernels_tree": "6a934ae82f607839a658153abdc33a9d923201b4",
+  "native_tree": "5de79ba7935ce1b62843a3a83eb92a00e35668f4",
+  "head": "02e3e9a2090283c2cbff527ecab5b4f58f44f0eb",
+  "native_reuse": "all581 exact a09 native members; no native-source difference"
+}

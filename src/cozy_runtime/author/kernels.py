@@ -165,6 +165,130 @@ class PreQuantized:
     provider: str = ROWWISE_FP8
 
 
+@dataclass(frozen=True, slots=True)
+class SingleUseProjection:
+    """One producer-owned input consumed by exactly this projection.
+
+    The producer promises that no sibling projection consumes this value and it is not
+    part of a shared quantization scope. Runtime still rejects live/shared operands and
+    a previously observed multi-consumer group. This declares first-use ownership; it
+    does not manufacture learned module state or supply a memory budget/row count.
+    """
+
+    module: Any
+    hidden: Any
+    exclusive_input: bool
+
+
+@dataclass(frozen=True, slots=True)
+class LayerScaleBlock:
+    """One installed fused layer-scale block, with the complete batch-local operation.
+
+    The producer names its actual module/input/rotary operands and the two direct
+    parameter slots providing the layer scales. Its declared fused layout supplies
+    the norms, six biased dense projections, value-first SwiGLU and selected attention.
+    No allocating callback, byte budget or window size is supplied. Runtime may
+    decline before invocation; after acceptance the original body is never replayed.
+    """
+
+    module: Any
+    hidden: Any
+    rotary: Any
+    gate_msa: str
+    gate_mlp: str
+
+
+@dataclass(frozen=True, slots=True)
+class ResidualFFN:
+    """One row-local residual/norm/SwiGLU tail, written into an exclusive caller output.
+
+    Declares ``hidden = residual + gate_msa[index] * out``, modulated RMSNorm,
+    packed value/gate ``up``, BF16 SwiGLU, ``down``, then
+    ``out = hidden + gate_mlp[index] * ffn``. Each supplied TritonEntry is the
+    package's existing compiled operation, with its documented explicit round points.
+    No memory budget, chunk size or allocating Python callback is supplied.
+
+    ``exclusive_out`` is the author's ownership promise: no other consumer may read
+    or write that output during this operation. Runtime rejects overlap with the
+    declared read-only tensors. Unsupported providers/layouts may use the original
+    split callable before execution; an accepted native operation never retries.
+    This first contract is BF16, one CUDA device, and a materialized SwiGLU result.
+    """
+
+    up: Any
+    down: Any
+    launch: Launch
+    norm_mod: TritonEntry
+    swiglu: TritonEntry
+    gate_add: TritonEntry
+    residual: Any
+    index: Any
+    norm_weight: Any
+    gate_msa: Any
+    scale_mlp: Any
+    shift_mlp: Any
+    gate_mlp: Any
+    eps: float
+    exclusive_out: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedHeads:
+    """One complete projection/norm/rotary/head-local attention operation.
+
+    The selected backend remains authoritative. The executor supports dense INT4QK
+    and Kitchen INT8 on one CUDA device, with actual encoded Q/K/V modules and compiled in-place
+    norm/rotary entries. ``seed`` optionally receives post-rotary F32 key means.
+    No byte budget, head-window size, or allocating Python callback is supplied.
+    """
+
+    hidden: Any
+    query: Any
+    key: Any
+    value: Any
+    heads: int
+    backend: object
+    launch: Launch
+    rope: TritonEntry
+    key_sum: TritonEntry
+    norm_q: Any
+    norm_k: Any
+    eps_q: float
+    eps_k: float
+    cos: Any
+    sin: Any
+    seed: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class SparseProjectedHeads:
+    """Complete single-device Kitchen producer with caller-owned carried key means.
+
+    The selected producer's fixed token chunks, fused norm/RoPE and routing remain
+    authoritative. ``prior_mean`` is read-only; ``next_mean`` receives the complete
+    private result only after every head window succeeds. No byte estimate or memory
+    window is supplied. The initial contract is BF16 with baked INT8 projections.
+    """
+
+    hidden: Any
+    query: Any
+    key: Any
+    value: Any
+    heads: int
+    backend: object
+    launch: Launch
+    value_absmax: TritonEntry
+    key_sum: TritonEntry
+    norm_q: Any
+    norm_k: Any
+    eps: float
+    rotary: Any
+    prior_mean: Any
+    next_mean: Any
+    protected_prefix: int
+    tau: float
+
+
 class _Shared:
     __slots__ = ("operands", "tensor")
 
@@ -174,6 +298,10 @@ class _Shared:
 
 
 _SHARED: ContextVar[tuple[_Shared, ...]] = ContextVar("cozy_quantize_once", default=())
+
+# A closed Runtime row menu owns one normal module invocation, never sibling operands.
+_LINEAR_SPLIT: ContextVar[Any | None] = ContextVar("cozy_native_linear_split", default=None)
+_BLOCK_SPLIT: ContextVar[Any | None] = ContextVar("cozy_native_block_split", default=None)
 
 
 @contextmanager
@@ -365,8 +493,11 @@ __all__ = [
     "ROWWISE_FP8",
     "KernelsUnavailable",
     "Launch",
+    "LayerScaleBlock",
     "Plan",
     "PreQuantized",
+    "ResidualFFN",
+    "SingleUseProjection",
     "TritonEntry",
     "TritonKernels",
     "int8_rows",

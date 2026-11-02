@@ -1,0 +1,40 @@
+[
+  {
+    "parent": "fcdebb8b4ece25d51041d1f40c0a0920431492f6",
+    "before": "fbebcd5e58d7763694c878b5c45c8773ed0dd2c9",
+    "returncode": 0,
+    "after": "30b079f5a009538edf0b7593fa9d8e1e55533eb1"
+  },
+  {
+    "parent": "167ffc828e3f84062d43641fcf53dbda54892631",
+    "before": "30b079f5a009538edf0b7593fa9d8e1e55533eb1",
+    "returncode": 0,
+    "after": "c0ac699e2755c621cd316db981d042f5638952cd"
+  },
+  {
+    "parent": "3043db98bb44472ddea03ed7c341b12d232d1569",
+    "before": "c0ac699e2755c621cd316db981d042f5638952cd",
+    "returncode": 0,
+    "after": "89519284f23268208882a92f37eec342c676e454"
+  },
+  {
+    "parent": "2626e3f48bc147f1f3d46b19bd385356e628680c",
+    "before": "89519284f23268208882a92f37eec342c676e454",
+    "returncode": 0,
+    "after": "f8b560153d5892e96d505d84b2b4ef0ff9b259df"
+  },
+  {
+    "parent": "8384bfd3d74f10d2c57800bb1a8ccb55aba46984",
+    "before": "f8b560153d5892e96d505d84b2b4ef0ff9b259df",
+    "returncode": 1,
+    "after": "ac2a7b034d49eadd6001b60bc7caa7e1671e088a",
+    "resolved": true,
+    "resolution": "Use corrected8384 direct native prepare(reclaim=reclaim); remove the superseded Python reclaim/retry, retain fcde Model source-hook ownership elsewhere."
+  },
+  {
+    "parent": "6c8122412bf502f2913c35eaba6cf9d263d314b5",
+    "before": "ac2a7b034d49eadd6001b60bc7caa7e1671e088a",
+    "returncode": 0,
+    "after": "99fb80ed55a63b9563ed626632a302ab43c851ff"
+  }
+]

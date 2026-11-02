@@ -1,0 +1,8 @@
+{
+  "passed": true,
+  "actual_cpu_file_reclaim_refill": true,
+  "old_a96_sdk_cuda_refusal": "native CUDA weight residency is unavailable: native CUDA recovery requires the CacheOwner capability",
+  "cuda_initialized": false,
+  "residency_sha256": "82567bd7a0891d7dd232df057d0f6b53a7db4433e219e718af882dd12ac9126c",
+  "scope": "CPU behavior and deliberate incompatible CUDA-capability refusal only; no combined native/GPU claim"
+}

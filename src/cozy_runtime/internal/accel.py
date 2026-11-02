@@ -22,14 +22,14 @@ import re
 import subprocess
 import sys
 import threading
-from collections.abc import Iterator
-from contextlib import contextmanager, suppress
+from contextlib import suppress
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
 
-from tensorfs import varena
+import tensorfs.varena.torch as vt
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
@@ -513,19 +513,9 @@ def drain(torch: Any, kind: str) -> None:
     if kind == "mps":
         torch.mps.synchronize()
     elif kind == "cuda":
-        torch.cuda.current_stream().synchronize()
+        completion_event(torch, kind).synchronize()
 
 
-#: Keep Torch's native caching allocator. The native size-aware recovery hook intercepts
-#: cudaMalloc; expandable segments and cudaMallocAsync bypass that allocation boundary.
-#: Blocks of 1 GiB and more are never split: a smaller tensor left inside a freed large
-#: block keeps that whole segment, which Torch's OOM path cannot return (H3 Turbo 15 s on an
-#: 8 GB card was refused 1.09 GiB beside 2.15 GiB of such remainders, gate 40822058281).
-#: An unsplit block serves only a request within 20 MiB of its size, so below this size the
-#: cache keeps splitting: at 256 MiB, Qwen-Image's 8 GB decode paid a refused cudaMalloc and
-#: Torch's synchronizing release per VAE tensor (+300 ms, session 40829742644).
-#: The machine erases every PYTORCH_ variable before Runtime configures the allocator.
-ALLOCATOR = "backend:native,expandable_segments:False,max_split_size_mb:1024"
 #: torch `_native`'s DSLs that compile at an op's first call.
 JIT_DSLS = ("triton", "cutedsl", "helion")
 
@@ -547,14 +537,63 @@ def initialize(torch: Any, kind: str) -> None:
         native = getattr(torch, "_native", None)
         if native is not None:
             native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
-        torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         try:
-            varena.install_allocator()
+            vt.install()
         except (ImportError, AttributeError, RuntimeError) as exc:
             if fault(exc) is not Fault.OTHER:
                 raise
-            raise ResidencyError(f"native CUDA allocation recovery is unavailable: {exc}") from exc
+            raise ResidencyError(f"native CUDA allocator is unavailable: {exc}") from exc
         torch.cuda.init()
+
+
+@cache
+def _stream_driver() -> Any:
+    """The installed CUDA driver, loaded only after the executor's device boundary.
+
+    Torch 2.14 exposes only blocking cudaStreamCreate through its cudart Python shim.
+    Driver streams are the same handles accepted by Torch's ExternalStream and events.
+    """
+    if sys.platform == "win32":
+        driver = ctypes.WinDLL("nvcuda.dll")
+    else:
+        driver = ctypes.CDLL("libcuda.so.1")
+    driver.cuStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
+    driver.cuStreamCreate.restype = ctypes.c_int
+    driver.cuStreamDestroy_v2.argtypes = [ctypes.c_void_p]
+    driver.cuStreamDestroy_v2.restype = ctypes.c_int
+    return driver
+
+
+def nonblocking_stream(torch: Any, device: int) -> Any:
+    """A unique Runtime-owned CU_STREAM_NON_BLOCKING stream.
+
+    The caller owns destruction after all library handles, tensors and events using it
+    have retired. Executor streams live until process exit; graph domains close theirs.
+    """
+    pointer = ctypes.c_void_p()
+    with torch.cuda.device(device):
+        code = _stream_driver().cuStreamCreate(ctypes.byref(pointer), 1)
+        if code:
+            error = torch.AcceleratorError(
+                f"cuStreamCreate(CU_STREAM_NON_BLOCKING) failed with CUDA error {code}"
+            )
+            error.error_code = code
+            raise error
+        try:
+            return torch.cuda.ExternalStream(pointer.value, device=device)
+        except BaseException:
+            _stream_driver().cuStreamDestroy_v2(pointer)
+            raise
+
+
+def destroy_stream(torch: Any, stream: Any) -> None:
+    """Destroy an owned stream only after its owner retires and joins every consumer."""
+    with torch.cuda.device(stream.device):
+        code = _stream_driver().cuStreamDestroy_v2(stream.cuda_stream)
+    if code:
+        error = torch.AcceleratorError(f"cuStreamDestroy failed with CUDA error {code}")
+        error.error_code = code
+        raise error
 
 
 def first_launches(torch: ModuleType, kind: str) -> None:
@@ -573,7 +612,7 @@ def first_launches(torch: ModuleType, kind: str) -> None:
                 torch.mm(a, a)
                 conv.conv2d(a.view(1, 1, 8, 8), kernel.reshape(1, 1, 3, 3))
                 conv.conv3d(a.view(1, 1, 1, 8, 8), kernel.reshape(1, 1, 1, 3, 3))
-        torch.cuda.synchronize()
+        completion_event(torch, kind).synchronize()
 
 
 def initialized(torch: Any, kind: str) -> bool:
@@ -595,7 +634,7 @@ def oom_error(torch: Any, kind: str) -> type[BaseException]:
 
 def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) -> dict[str, int]:
     """The allocator's live numbers plus the driver's own view — the only number that sees
-    other processes. CUDA figures include native weight backing beside stock Torch. On unified
+    other processes. CUDA figures include working allocations and native weight backing. On unified
     memory the device is this process's
     budget (`unified_budget`) and the driver's figure counts this process's Metal buffers only.
     A CPU's device memory is the host's RAM, and no allocator of ours holds any of it."""
@@ -617,9 +656,10 @@ def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) ->
         }
     free, total = torch.cuda.mem_get_info(device)
     weights = _weight_bytes(memory)
+    working = vt.stats(device)
     return {
-        "allocated_bytes": int(torch.cuda.memory_allocated(device)) + weights,
-        "reserved_bytes": int(torch.cuda.memory_reserved(device)) + weights,
+        "allocated_bytes": int(working["allocated_bytes"]) + weights,
+        "reserved_bytes": int(working["mapped_bytes"]) + weights,
         "driver_free_bytes": int(free),
         "driver_total_bytes": int(total),
     }
@@ -636,7 +676,7 @@ def allocated(torch: Any, kind: str, memory: Any = None) -> int:
         return int(torch.mps.current_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(torch.cuda.memory_allocated(getattr(memory, "device", None))) + _weight_bytes(memory)
+    return int(vt.stats(getattr(memory, "device", None))["allocated_bytes"]) + _weight_bytes(memory)
 
 
 def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
@@ -645,7 +685,7 @@ def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
         return int(torch.mps.driver_allocated_memory())
     if kind == "cpu":
         return 0
-    return int(torch.cuda.memory_reserved(getattr(memory, "device", None))) + _weight_bytes(memory)
+    return int(vt.stats(getattr(memory, "device", None))["mapped_bytes"]) + _weight_bytes(memory)
 
 
 def allocator_peak(memory: Any, request: str | None = None) -> int:
@@ -669,41 +709,16 @@ def release_cached(torch: Any, kind: str) -> None:
     """Return unused allocator blocks to the driver; live tensors remain owned."""
     if kind not in ("cuda", "mps"):
         return
-    before = reserved(torch, kind)
-    (torch.cuda if kind == "cuda" else torch.mps).empty_cache()
-    if (freed := before - reserved(torch, kind)) > 0:
+    if kind == "cuda":
+        freed = int(vt.trim(torch.cuda.current_device()))
+    else:
+        before = reserved(torch, kind)
+        torch.mps.empty_cache()
+        freed = before - reserved(torch, kind)
+    if freed > 0:
         row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
         row[0] += 1
         row[1] += freed
-
-
-#: Inside a CUDA capture Torch must not return memory: a refused cudaMalloc there first frees
-#: the capture pool's oversize cached blocks (the path `max_split_size_mb` turns on), and that
-#: cudaFree ends the capture (cr-228: 900 from cuMemFree on every SDXL whole call on an RTX
-#: 3060, one free in the capture, no GC or Runtime release). For a capture's span every block
-#: splits, so the pool serves from what it holds, and a capture that does not fit is refused as
-#: out of memory. Torch resets an unnamed size limit to none; the others keep their values.
-CAPTURE_ALLOCATOR = "expandable_segments:False"
-SPLIT_ALLOCATOR = "max_split_size_mb:1024"
-_CAPTURES = [0]
-_CAPTURES_LOCK = threading.Lock()
-
-
-@contextmanager
-def capture_allocation(torch: Any) -> Iterator[None]:
-    """Torch's allocator for a CUDA capture's span (`CAPTURE_ALLOCATOR`); nested and
-    concurrent captures share it until the last ends."""
-    with _CAPTURES_LOCK:
-        _CAPTURES[0] += 1
-        if _CAPTURES[0] == 1:
-            torch._C._accelerator_setAllocatorSettings(CAPTURE_ALLOCATOR)
-    try:
-        yield
-    finally:
-        with _CAPTURES_LOCK:
-            _CAPTURES[0] -= 1
-            if not _CAPTURES[0]:
-                torch._C._accelerator_setAllocatorSettings(SPLIT_ALLOCATOR)
 
 
 def completion_event(torch: Any, kind: str) -> Any:
@@ -719,9 +734,12 @@ def completion_event(torch: Any, kind: str) -> Any:
     return event
 
 
-def streams_idle(torch: Any, kind: str) -> bool:
-    """Whether the device has nothing outstanding. The device's OWN answer to quiescence,
-    which is why a terminal may be recorded on it rather than on a timer. Host code is done."""
+def streams_idle(torch: Any, kind: str, *, stream: Any) -> bool:
+    """Whether the execution stream and its explicitly joined producers are complete.
+
+    The caller supplies its owned stream; another thread's current/default stream cannot
+    prove completion. Consumers on other streams must join before the terminal boundary.
+    """
     if kind == "cpu":
         return True
     if kind == "mps":
@@ -729,7 +747,7 @@ def streams_idle(torch: Any, kind: str) -> bool:
         # These completion boundaries need the MPS queue fence, not a fresh poll marker.
         synchronize(torch, kind)
         return True
-    return bool(torch.cuda.current_stream().query() and torch.cuda.default_stream().query())
+    return bool(stream.query())
 
 
 def present(torch: Any, kind: str) -> bool:
