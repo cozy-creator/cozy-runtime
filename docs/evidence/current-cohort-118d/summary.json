@@ -1,0 +1,68 @@
+{
+  "passed_host_readiness": true,
+  "creator_checked_source": "118d668f0d7ec05348ff011bb8502488f210f27e",
+  "runtime_checked_source": "78e58f7e51bade1bea92c75f238ba058d59421a2",
+  "native_reference": "ebe91ad3447c668a93776cf4628b8f585e5aedd6",
+  "owner": "/root/current_cohort_restart",
+  "check_results": [
+    {
+      "name": "combined-check-002",
+      "exit": 0,
+      "seconds": 72.618
+    },
+    {
+      "name": "reduced-bindings-002",
+      "exit": 0,
+      "seconds": 50.787
+    },
+    {
+      "name": "rank-sender-002",
+      "exit": 0,
+      "seconds": 42.978
+    },
+    {
+      "name": "cozy-wrapper-002",
+      "exit": 0,
+      "seconds": 15.533
+    },
+    {
+      "name": "inventory-002",
+      "exit": 0,
+      "seconds": 4.563
+    },
+    {
+      "name": "clip-inventory-002",
+      "exit": 0,
+      "seconds": 6.087
+    },
+    {
+      "name": "runtime-ranks-002",
+      "exit": 0,
+      "seconds": 17.291
+    }
+  ],
+  "framed_startup_cases": 9,
+  "decoded_rank_selections": 7,
+  "startup_native_package": "/home/fidika/cozy_v2/outputs/xs138-native-tensor-client/path-proof-001/site",
+  "startup_extension_sha256": "9cac4131525265e02f82b2a5653d4ac59cda1bbfa1f7142ef82eab86cd99b97b",
+  "startup_native_package_is_preexisting": true,
+  "startup_scope": "current Runtime source and current Rust sender; preexisting native artifact and same CPU Torch; unchanged strict no-driver-load/no-CUDA-init assertions",
+  "new_full_native_artifact_built": false,
+  "gpu_qualified": false,
+  "explicit_trim_included": false,
+  "external_gpu_lane_blockers": [
+    "strict numerical parity failure",
+    "4.73-4.98x warm offload slowdown",
+    "weight and working accounting unresolved"
+  ],
+  "no_gpu_rental_install_merge_release": true,
+  "runtime_native_reuse": {
+    "verified_source_input_files": 65,
+    "actual_matching_triton_set_arch_pairs": 49,
+    "actual_matching_triton_keys": 285,
+    "rehashed_native_members": 581,
+    "rebuild_indicated": false,
+    "new_repack_performed": false,
+    "receipt": "Runtime docs/evidence/current-cohort-118d/runtime-native-reuse-002.json"
+  }
+}
