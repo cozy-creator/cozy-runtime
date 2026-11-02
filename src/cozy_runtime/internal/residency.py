@@ -3194,6 +3194,7 @@ class Memory:
         read_bytes = read_ns = 0
         use = kept = None
         kept_ns = 0
+        bake: Bake | None = None
         try:
             with self.lock:
                 if self._prefetch is not None:
@@ -3271,7 +3272,9 @@ class Memory:
             changed = False
             if block.model.fill is not None and (use is None or use.needs_fill):
                 # `overlay` was read on this thread just before; no package code ran since.
+                baking = Bake.begin(self.stream()) if kept is None else None
                 changed = kept is None and block.model.fill(block.path, data)
+                bake = baking.end(self.stream()) if changed and baking is not None else None
                 if changed and page is not None and use is not None:
                     self._keep_baked(page, use.tensor, streams=not block.preferred)
                 block.overlay = overlay
@@ -3301,7 +3304,7 @@ class Memory:
         finally:
             request = _REQUEST.get()
             if request is not None and read_bytes:
-                request.read(block, read_ns, read_bytes)
+                request.read(block, read_ns, read_bytes, bake=bake)
             if request is not None and kept is not None:
                 request.read(block, kept_ns, kept.numel(), origin="baked")
             with self.lock:
@@ -3661,6 +3664,38 @@ class Memory:
         }
 
 
+@dataclass(slots=True)
+class Bake:
+    """A block's bake (its model's `fill` hook) after its store read: on the host clock, and on
+    CUDA between events on the stream its kernels ran on."""
+
+    began_ns: int
+    start: Any = None
+    host_ns: int = 0
+    stop: Any = None
+
+    @classmethod
+    def begin(cls, stream: Any) -> Bake:
+        start = None
+        if stream is not None:
+            start = torch.cuda.Event(enable_timing=True)
+            start.record(stream)
+        return cls(time.perf_counter_ns(), start)
+
+    def end(self, stream: Any) -> Bake:
+        self.host_ns = time.perf_counter_ns() - self.began_ns
+        if self.start is not None:
+            self.stop = torch.cuda.Event(enable_timing=True)
+            self.stop.record(stream)
+        return self
+
+    def device_ns(self) -> int | None:
+        if self.stop is None:
+            return None
+        self.stop.synchronize()
+        return int(self.start.elapsed_time(self.stop) * 1e6)
+
+
 class Request:
     """Request context; Torch observations are process-wide, including overlapping calls. Its
     `peak` is its own working set: other constructions' resident sets are left out."""
@@ -3685,6 +3720,8 @@ class Request:
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
         self.baked_hits = self.baked_bytes = self.baked_ns = 0
+        #: each baked fill's trace entry and its bake (`Bake`), resolved when the request ends
+        self.bakes: list[tuple[dict[str, object], Bake]] = []
         self.final_fills = self.final_hits = 0
         #: table lookups served on the host (`Memory._gather`)
         self.gathered = 0
@@ -3810,8 +3847,11 @@ class Request:
         *,
         speculative: bool = False,
         origin: str = "store",
+        bake: Bake | None = None,
     ) -> None:
-        """A block filled: from the store, or (`baked`) from its kept baked bytes."""
+        """A block filled: from the store, or (`baked`) from its kept baked bytes; `bake` when its
+        bytes were baked here after the read. A demand fill's entry carries its read's host time
+        and when it ended, so a step's fills and bakes are told apart (cr-242)."""
         if origin == "store":
             self.moved += nbytes
             self.read_ns += ns
@@ -3829,7 +3869,22 @@ class Request:
                 "speculative": speculative,
             }
         )
+        if not speculative:
+            self.trace[-1].update(ns=ns, at_unix_ms=round(time.time() * 1000, 1))
+        if bake is not None:
+            self.bakes.append((self.trace[-1], bake))
         self.sample()
+
+    def _bakes(self) -> dict[str, int]:
+        """The bakes this request ran after a store read: each one's host and device time onto
+        its trace entry, and their sums."""
+        host = device = 0
+        for entry, bake in self.bakes:
+            on_device = bake.device_ns()
+            entry["bake_ns"], entry["bake_device_ns"] = bake.host_ns, on_device
+            host += bake.host_ns
+            device += on_device or 0
+        return {"blocks": len(self.bakes), "host_ns": host, "device_ns": device}
 
     def stats(self) -> dict[str, Any]:
         if self.ended is not None:
@@ -3846,6 +3901,7 @@ class Request:
             "moved": {
                 "store": {"bytes": self.moved, "ns": self.read_ns},
                 "baked": {"bytes": self.baked_bytes, "fills": self.baked_hits, "ns": self.baked_ns},
+                "bake": self._bakes(),
             },
             "baked_pages": {
                 "scope": "the host tier: every streamed page's bytes, pinned",
