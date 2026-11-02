@@ -3962,19 +3962,16 @@ class Executor:
 
     @staticmethod
     def _emit_compute(record: AuthorAttempt, member: Executor) -> None:
-        """`compute.dtype`: a CPU executor computes every component in float32, whatever lane its
-        weights are stored in (`weights._float32`), said beside the served lane so a 16-bit lane
-        is not read as 16-bit compute (BiRefNet's "served fp16" on a CI runner, cr-247)."""
+        """A CPU executor computes every component in float32, whatever lane its weights are
+        stored in (`weights._float32`): said beside the served lane, so a 16-bit lane is not read
+        as 16-bit compute (BiRefNet's "served fp16" on a CI runner, cr-247)."""
         prefix = member._prefix()
         widened = member.backend.widened if member.backend is not None else {}
         for component, stored in sorted(widened.items()):
-            if not stored:
-                continue
-            weights = "/".join({"f16": "fp16"}.get(d, d) for d in stored)
-            fields = {"component": prefix + component, "weights": weights}
-            record.emit("confession", "compute.dtype", "float32", device="cpu", **fields)
-            said = f"served {weights} weights; computes in float32 on cpu"
-            record.emit("log", said, "warn", **fields)
+            if stored:
+                weights = "/".join({"f16": "fp16"}.get(d, d) for d in stored)
+                said = f"served {weights} weights; computes in float32 on cpu"
+                record.emit("log", said, "warn", component=prefix + component, weights=weights)
 
     @staticmethod
     def _emit_gemm(record: AuthorAttempt, member: Executor) -> None:
