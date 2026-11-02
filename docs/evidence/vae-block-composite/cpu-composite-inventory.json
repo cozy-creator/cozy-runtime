@@ -1,0 +1,421 @@
+{
+  "passed": true,
+  "torch": "2.14.0+cu130",
+  "torch_git": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "cuda_initialized": false,
+  "actual_block_type": "MiniMaxH3VideoTransformerBlock",
+  "actual_fused_site": true,
+  "six_biased_plain_dense_modules": [
+    {
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_dtype": "torch.float32",
+      "bias_shape": [
+        2048
+      ],
+      "bias_dtype": "torch.float32",
+      "fp16_cast_bytes": 8388608
+    },
+    {
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_dtype": "torch.float32",
+      "bias_shape": [
+        2048
+      ],
+      "bias_dtype": "torch.float32",
+      "fp16_cast_bytes": 8388608
+    },
+    {
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_dtype": "torch.float32",
+      "bias_shape": [
+        2048
+      ],
+      "bias_dtype": "torch.float32",
+      "fp16_cast_bytes": 8388608
+    },
+    {
+      "shape": [
+        2048,
+        2048
+      ],
+      "weight_dtype": "torch.float32",
+      "bias_shape": [
+        2048
+      ],
+      "bias_dtype": "torch.float32",
+      "fp16_cast_bytes": 8388608
+    },
+    {
+      "shape": [
+        16384,
+        2048
+      ],
+      "weight_dtype": "torch.float32",
+      "bias_shape": [
+        16384
+      ],
+      "bias_dtype": "torch.float32",
+      "fp16_cast_bytes": 67108864
+    },
+    {
+      "shape": [
+        2048,
+        8192
+      ],
+      "weight_dtype": "torch.float32",
+      "bias_shape": [
+        2048
+      ],
+      "bias_dtype": "torch.float32",
+      "fp16_cast_bytes": 33554432
+    }
+  ],
+  "layout_contract": {
+    "block": "diffusers.models.autoencoders.autoencoder_kl_minimax_h3:MiniMaxH3VideoTransformerBlock",
+    "modulation": "minimax_h3.model:_layer_scales",
+    "width": 2048,
+    "head_dim": 64,
+    "norm": "rms",
+    "parallel": false,
+    "gate": "identity",
+    "scale": false,
+    "shift": false,
+    "rows": "fp16",
+    "weights": "wide",
+    "centered": false,
+    "rms_rounding": "once",
+    "qk_affine": false,
+    "composed": true,
+    "fused_up": true,
+    "value_first": true,
+    "rope": [
+      false,
+      48,
+      "product"
+    ],
+    "arguments": [
+      "rotary_emb"
+    ]
+  },
+  "kernel_identity": "sha256:cc66a3347c9e0b8cfe30ed32cfe70974e806866ca4ccfdd99415ac0ac76eaea8",
+  "geometries": [
+    {
+      "window": 1,
+      "tail": 1,
+      "a_bytes": 58884096,
+      "b_bytes": 29442048,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 3680256,
+        "k": 3680256,
+        "v": 3801088,
+        "q_scale": 61440,
+        "k_scale": 14848,
+        "v_scale": 8192,
+        "anchor": 128
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    },
+    {
+      "window": 2,
+      "tail": 1,
+      "a_bytes": 117768192,
+      "b_bytes": 58884096,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 7360512,
+        "k": 7360512,
+        "v": 7602176,
+        "q_scale": 122880,
+        "k_scale": 29696,
+        "v_scale": 16384,
+        "anchor": 256
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    },
+    {
+      "window": 3,
+      "tail": 2,
+      "a_bytes": 176652288,
+      "b_bytes": 88326144,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 11040768,
+        "k": 11040768,
+        "v": 11403264,
+        "q_scale": 184320,
+        "k_scale": 44544,
+        "v_scale": 24576,
+        "anchor": 384
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    },
+    {
+      "window": 7,
+      "tail": 1,
+      "a_bytes": 412188672,
+      "b_bytes": 206094336,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 25761792,
+        "k": 25761792,
+        "v": 26607616,
+        "q_scale": 430080,
+        "k_scale": 103936,
+        "v_scale": 57344,
+        "anchor": 896
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    },
+    {
+      "window": 14,
+      "tail": 13,
+      "a_bytes": 824377344,
+      "b_bytes": 412188672,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 51523584,
+        "k": 51523584,
+        "v": 53215232,
+        "q_scale": 860160,
+        "k_scale": 207872,
+        "v_scale": 114688,
+        "anchor": 1792
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    },
+    {
+      "window": 28,
+      "tail": 14,
+      "a_bytes": 1648754688,
+      "b_bytes": 824377344,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 103047168,
+        "k": 103047168,
+        "v": 106430464,
+        "q_scale": 1720320,
+        "k_scale": 415744,
+        "v_scale": 229376,
+        "anchor": 3584
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    },
+    {
+      "window": 28,
+      "tail": 27,
+      "a_bytes": 1648754688,
+      "b_bytes": 824377344,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 103047168,
+        "k": 103047168,
+        "v": 106430464,
+        "q_scale": 1720320,
+        "k_scale": 415744,
+        "v_scale": 229376,
+        "anchor": 3584
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    },
+    {
+      "window": 28,
+      "tail": 28,
+      "a_bytes": 1648754688,
+      "b_bytes": 824377344,
+      "full28_output_bytes": 412188672,
+      "kitchen_bytes": {
+        "q": 103047168,
+        "k": 103047168,
+        "v": 106430464,
+        "q_scale": 1720320,
+        "k_scale": 415744,
+        "v_scale": 229376,
+        "anchor": 3584
+      },
+      "float_qkv_input_stride": [
+        3680256,
+        64,
+        2048,
+        1
+      ],
+      "attention_output_stride": [
+        3680256,
+        115008,
+        64,
+        1
+      ],
+      "ragged_packed_up_stride": [
+        16384,
+        1
+      ],
+      "ragged_gate_stride": [
+        16384,
+        1
+      ],
+      "all_dense_and_kitchen_output_views_contiguous": true,
+      "matrix_slot_byte_offsets_multiple_of256": true
+    }
+  ],
+  "scope": "actual meta-device model construction and full/ragged tensor-layout inventory only; no CUDA query, execution, allocation-census, numeric or performance proof",
+  "source_sha256": {
+    "fusion": "49b3a7e6f34a30f25041ea1d1ee77ea940fc4933a45d6c8ddaf656b930347e49",
+    "package_model": "e8aa602508ccebeaecf97019512a5d3fab68e014d51c7ed16fb907bf43d96b01"
+  }
+}

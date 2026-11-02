@@ -1,0 +1,1 @@
+Runtime removes its idle weight-cache window, retained prefix and phase replanning. Native demand now decides physical retention/reclaim; actual graph/cache owner retirement remains. Host-cache eligibility follows repeated reads/bakes. Requires TensorFS's clear_streaming_limit capability; GPU qualification is pending.

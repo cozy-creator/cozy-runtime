@@ -1,0 +1,278 @@
+[
+  {
+    "file": "src/cozy_runtime/internal/execution/committed_linear.py",
+    "ref": "fcdebb8b4",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/native_sparse_producer.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/native_rms_norm.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/native_linear_split.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/native_heads.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/native_residual_ffn.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/native_split.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/phase.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/author/kernels.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/author/_split.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/__init__.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/execution/cuts.py",
+    "ref": "3043db98b",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/cooperation.py",
+    "ref": "6c8122412",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/cache_owners.py",
+    "ref": "6c8122412",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/loop.py",
+    "ref": "6c8122412",
+    "check": "byte_equal",
+    "passed": true
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory.__init__",
+    "ref": "8384bfd3d",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Binding.prepare_load",
+    "ref": "8384bfd3d",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory._prepare_native",
+    "ref": "8384bfd3d",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory.reclaim",
+    "ref": "8384bfd3d",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory._empty",
+    "ref": "8384bfd3d",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory.trim",
+    "ref": "8384bfd3d",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Request.reclaim",
+    "ref": "8384bfd3d",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Model.__init__",
+    "ref": "fcdebb8b4",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Model.close",
+    "ref": "fcdebb8b4",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "_paired",
+    "ref": "fcdebb8b4",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "_hooks",
+    "ref": "fcdebb8b4",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory.request",
+    "ref": "6c8122412",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory.attach_cooperation",
+    "ref": "6c8122412",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory.cooperation_boundary",
+    "ref": "6c8122412",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "file": "src/cozy_runtime/internal/residency.py",
+    "symbol": "Memory.close_cooperation",
+    "ref": "6c8122412",
+    "check": "AST_equal",
+    "passed": true,
+    "error": null
+  },
+  {
+    "path": "kernels/csrc",
+    "check": "native_or_kernel_tree_input",
+    "objects": {
+      "HEAD": "a59674c28f771d81c52148140c749734a9b0d984",
+      "3043db98b": "a59674c28f771d81c52148140c749734a9b0d984",
+      "ebc25419a": "a59674c28f771d81c52148140c749734a9b0d984"
+    },
+    "passed": true,
+    "same_as_native_build_base": true
+  },
+  {
+    "path": "kernels/CMakeLists.txt",
+    "check": "native_or_kernel_tree_input",
+    "objects": {
+      "HEAD": "b278a21c3fd34bfdafe26e1474dd9b6f1e4a0cdc",
+      "3043db98b": "b278a21c3fd34bfdafe26e1474dd9b6f1e4a0cdc",
+      "ebc25419a": "b278a21c3fd34bfdafe26e1474dd9b6f1e4a0cdc"
+    },
+    "passed": true,
+    "same_as_native_build_base": true
+  },
+  {
+    "path": "kernels/modules.map",
+    "check": "native_or_kernel_tree_input",
+    "objects": {
+      "HEAD": "15f5738a644d27861078842052d8f0d47ebcd367",
+      "3043db98b": "15f5738a644d27861078842052d8f0d47ebcd367",
+      "ebc25419a": "15f5738a644d27861078842052d8f0d47ebcd367"
+    },
+    "passed": true,
+    "same_as_native_build_base": true
+  },
+  {
+    "path": "kernels/toolchain.env",
+    "check": "native_or_kernel_tree_input",
+    "objects": {
+      "HEAD": "5d8eece9db96ce8e2f01962a516703cfd08ac3a2",
+      "3043db98b": "5d8eece9db96ce8e2f01962a516703cfd08ac3a2",
+      "ebc25419a": "5d8eece9db96ce8e2f01962a516703cfd08ac3a2"
+    },
+    "passed": true,
+    "same_as_native_build_base": true
+  },
+  {
+    "path": "src/cozy_runtime/_kernels",
+    "check": "native_or_kernel_tree_input",
+    "objects": {
+      "HEAD": "62d7e39a1892170067c34d2ae243c67d46a4abd0",
+      "3043db98b": "62d7e39a1892170067c34d2ae243c67d46a4abd0",
+      "ebc25419a": "62d7e39a1892170067c34d2ae243c67d46a4abd0"
+    },
+    "passed": true,
+    "same_as_native_build_base": true
+  },
+  {
+    "path": "src/cozy_runtime/fusion/_kernels.py",
+    "check": "native_or_kernel_tree_input",
+    "objects": {
+      "HEAD": "805fabc8ef3b2260da322c1169670b522b419ecc",
+      "3043db98b": "805fabc8ef3b2260da322c1169670b522b419ecc",
+      "ebc25419a": "805fabc8ef3b2260da322c1169670b522b419ecc"
+    },
+    "passed": true,
+    "same_as_native_build_base": true
+  }
+]
