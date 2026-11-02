@@ -1,0 +1,1 @@
+On a CPU executor the run record says each component's compute dtype beside its served lane: "served fp16 weights; computes in float32 on cpu". A CI runner's BiRefNet record read "served fp16" and was taken for fp16 compute; it computes in float32 (`weights._float32`, since #1738).
