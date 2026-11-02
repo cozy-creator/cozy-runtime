@@ -1,0 +1,36 @@
+diff --git a/src/cozy_runtime/internal/execution/native_vae.py b/src/cozy_runtime/internal/execution/native_vae.py
+index ce93d9207..2d13b139c 100644
+--- a/src/cozy_runtime/internal/execution/native_vae.py
++++ b/src/cozy_runtime/internal/execution/native_vae.py
+@@ -9,7 +9,7 @@ from __future__ import annotations
+ 
+ import hashlib
+ import math
+-from dataclasses import asdict, dataclass
++from dataclasses import dataclass
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+@@ -755,7 +755,7 @@ class _Call:
+             raise RuntimeError("VAE dense stream/policy changed before binding")
+         variants, cast_bytes, algorithms = self.variants, self.cast_bytes, self.algorithms
+         bias, index = self.bias, self.index
+-        choices = [(item.identity, item.allocations) for item in variants]
++        choices = tuple((item.identity, item.allocations) for item in variants)
+         semantic = phase.configuration(
+             (
+                 "layer-scale-block/1",
+@@ -767,8 +767,11 @@ class _Call:
+                 inventory.site.eps,
+                 tuple(float(norm.eps) for norm in inventory.site.qk),
+                 inventory.attention.identity,
+-                asdict(inventory.policy),
+-                algorithms,
++                inventory.policy,
++                tuple(
++                    (geometry, tuple(sorted(config.items())), workspace, library, header)
++                    for geometry, config, workspace, library, header in algorithms
++                ),
+                 choices,
+                 self.dense_identity,
+             )
