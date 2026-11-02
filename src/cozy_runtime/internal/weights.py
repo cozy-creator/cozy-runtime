@@ -1191,9 +1191,10 @@ class Placement:
         sets: Module | Sequence[Module],
         *,
         release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> Region:
         """An explicitly owned cache. Its owner releases entries at safe scope boundaries."""
-        return self.memory.region(owner, kind, sets=sets, release=release)
+        return self.memory.region(owner, kind, sets=sets, release=release, shrink=shrink)
 
     def graph_pool(self, component: str) -> graphs.domain.Pool:
         """Stock Torch owns the graph pool; the recording retains its binding and tensors."""

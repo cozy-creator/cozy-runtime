@@ -57,6 +57,9 @@ cudaError_t rotate_quantize(const void* x, bool x_half, int8_t* q, float* scales
 cudaError_t fp8_quantize(const void* x, bool x_half, void* q, float* scales, int M, int K,
                          const Prologue& prologue, cudaStream_t stream);
 
+// Metadata predicate shared by the automatic linear plan and actual GEMV dispatch.
+bool gemv_supported(int M, int K, bool x_half, bool out_half);
+
 // The whole linear for M <= kGemvRows, in one launch; cudaErrorNotSupported when K is too
 // wide for it.
 cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale, const void* bias,
@@ -94,6 +97,10 @@ cudaError_t w4a8_unpack(const uint8_t* w, const uint8_t* s, const float* codeboo
 // namespace, so one module links every family (`CMakeLists.txt`). A unit names its family by its
 // define (`COZY_FAMILY`); `gemm_sm80.cu` is always mma.sync's int8.
 namespace mma_sync {
+// Exact auto-selected SM80-family schedule, without launching or allocating workspace.
+// The caller guarantees the aligned contiguous operands required by gemm.
+cudaError_t query(bool out_half, int64_t ldo, int M, int N, int K, int sms,
+                  int& config, size_t& bytes);
 Gemm gemm;
 Fp8Gemm fp8_gemm;
 }  // namespace mma_sync

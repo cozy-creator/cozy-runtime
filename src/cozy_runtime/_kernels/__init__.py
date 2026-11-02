@@ -58,6 +58,8 @@ FAMILIES = ("mma.sync", "wgmma", "tcgen05")
 
 #: Each module's cubin targets and PTX, as the CUDA toolkit names them (`cuobjdump`).
 ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
+    # Host-only prepared descriptors: kernels belong to the loaded cuBLASLt library.
+    "_dense": {"cubin": (), "ptx": ()},
     "_execution": {
         "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
         "ptx": (),
