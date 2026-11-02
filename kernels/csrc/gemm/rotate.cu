@@ -450,14 +450,18 @@ cudaError_t fp8_quantize(const void* x, bool x_half, void* q, float* scales, int
         x, q, scales, M, K, prologue, stream);
 }
 
+bool gemv_supported(int M, int K, bool x_half, bool out_half) {
+    const size_t fixed = size_t(M) * (kGemvWarps + 1) * sizeof(float);
+    return M >= 1 && M <= kGemvRows && size_t(M) * K + fixed <= 48 * 1024
+           && x_half == out_half;
+}
+
 cudaError_t gemv(const void* x, bool x_half, const int8_t* w, const float* w_scale,
                  const void* bias, void* out, bool out_half, int M, int N, int K, int sms,
                  cudaStream_t stream) {
     // Its rows sit in shared memory beside the per-warp partial sums: within the 48 KiB a
     // launch has without opting in, or the rotation and GEMM serve the call.
-    const size_t fixed = size_t(M) * (kGemvWarps + 1) * sizeof(float);
-    if (M < 1 || M > kGemvRows || size_t(M) * K + fixed > 48 * 1024 || x_half != out_half)
-        return cudaErrorNotSupported;
+    if (!gemv_supported(M, K, x_half, out_half)) return cudaErrorNotSupported;
     if (x_half)
         return gemv_as(static_cast<const __half*>(x), w, w_scale,
                        static_cast<const __half*>(bias), static_cast<__half*>(out), M, N, K, sms,

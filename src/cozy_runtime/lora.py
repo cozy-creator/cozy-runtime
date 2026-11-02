@@ -73,8 +73,10 @@ class Hook:
         self.armed, self._cozy_baked = armed, False
 
     def __call__(self, module: Any, args: tuple[Any, ...], out: torch.Tensor) -> None:
+        if self._cozy_baked:
+            return  # Bound weights already contain the delta; the fill owns factor reads.
         factors = self.armed()
-        if factors is not None and not self._cozy_baked:
+        if factors is not None:
             factors(args[0], out)
 
     def lora_factors(self) -> tuple[object, torch.Tensor, torch.Tensor, float] | None:

@@ -25,6 +25,7 @@ from itertools import pairwise
 from typing import Any, Protocol
 
 import tensorfs
+import tensorfs.varena.torch as vt
 import torch
 from tensorfs import varena
 from tensorfs.raw import parts as stored_parts
@@ -34,7 +35,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import CapabilityError, Fault, fault
-from cozy_runtime.internal import proctree
+from cozy_runtime.internal import cache_owners, cooperation, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -69,29 +70,19 @@ _RESERVE = 512 << 20
 
 
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
-    """Torch's allocated, reserved and peak allocated CUDA bytes in one allocator read.
-    `torch.cuda.memory_allocated` and its siblings each flatten the allocator's whole statistics
-    dict (0.1 ms); a cut site read them three to five times, 5 s of each SDXL request at 3 GB."""
-    stats = torch.cuda.memory_stats_as_nested_dict(device)
-    allocated, reserved = stats["allocated_bytes"]["all"], stats["reserved_bytes"]["all"]
-    return int(allocated["current"]), int(reserved["current"]), int(allocated["peak"])
+    """Working allocation demand/backing/peak; native weight bytes are counted separately."""
+    stats = vt.stats(device.index or 0)
+    return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), int(stats["allocated_peak"])
 
 
-#: Streamed (non-preferred) blocks resident at once: the one the GPU runs, the one entering, and
-#: the next one being read. The read takes the oldest completed block's room (Varena evicts it on
-#: its last-consumer events, never waiting), so it overlaps compute instead of following it.
-_STREAMED = 3
+#: Legacy TensorD room-floor compatibility, not a native retention window. P3 replaces
+#: this external-pressure formula separately; normal demand never sizes its cache from it.
+_ROOM_BLOCKS = 3
 
 
 def yields() -> bool:
-    """Whether this TensorFS can hold the process to a room (`varena.make_room`, TensorFS 0.17.16
-    on): an older one cannot, and the executor's hello says so (version skew degrades)."""
-    return callable(getattr(varena, "make_room", None)) and callable(
-        getattr(varena, "no_capture", None)
-    )
-#: Re-plans of one phase's activation budget (`Memory._replan`): its first, and tightenings by
-#: a pass's overshoot.
-_PLANS = 3
+    """Whether the native allocator accepts TensorD's process room; lifecycle stays in TensorD."""
+    return callable(getattr(varena, "make_room", None))
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
@@ -144,12 +135,9 @@ class Room:
     warm: int
     granularity: int = 512
     floor: int = 0
-    #: Torch's reserved, unallocated bytes: a cut's level and its pre-reclaim count them (its
-    #: activations reuse them first); a reclaim returns them before weights.
+    #: Existing sizing policy's unallocated working backing. P2 replaces this aggregate
+    #: with stream/pool-aware capacity; it is not a physical-reclamation guarantee.
     cached: int = 0
-    #: What a re-planned phase leaves its activations beyond those live now (`Memory._replan`);
-    #: None while the phase has no plan.
-    budget: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -434,8 +422,6 @@ class _Block:
     last: int = 0
     ready: Any = None
     region: Any = None
-    preferred: bool = False
-    preference_set: bool = False
     native_storage: int | None = None
     #: the Varena Uses behind the raw and final views; `_used` declares their consumer streams
     native_use: Any = None
@@ -530,56 +516,25 @@ class _Prefetch:
     identity: str
     request: Request | None
     queued: QueuedPrefetch | None = None
-    #: the fill overlay its page holds, and whether it fills the final (cast) region
+    #: The immutable RAW source's overlay identity, verified again at settlement.
     overlay: Hashable = None
-    final: bool = False
-    #: one DMA from a host-tier page (`_host_read`), not a store read
-    host: bool = False
 
 
 class _HostPage:
     """A page's bytes in host RAM, registered with CUDA (pinned) so its refill is one DMA, and
-    unregistered when the page goes, after its last copy (`event`) completed. Registered once
+    unregistered when the page goes. Demand copies are synchronous. Registered once
     filled: registering touched memory runs at about twice the rate of untouched memory."""
 
-    __slots__ = ("event", "tensor")
+    __slots__ = ("tensor",)
 
     def __init__(self, tensor: Tensor) -> None:
         self.tensor = tensor
-        self.event: Any = None
         code = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.numel(), 0)
         if int(code) != 0:
             raise RuntimeError(f"cudaHostRegister returned {code}")
 
     def release(self) -> None:
-        if self.event is not None:
-            self.event.synchronize()
         torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr())
-
-
-class _HostRead:
-    """A prefetch from a host page: one DMA on the copy stream. Its fill commits only once the
-    copy completed, so nothing that pins the region ready can read it early."""
-
-    def __init__(self, use: Any, event: Any, nbytes: int) -> None:
-        self.use, self.event, self.nbytes, self.canceled = use, event, nbytes, False
-
-    def start(self) -> None:
-        pass
-
-    def poll(self) -> dict[str, bool]:
-        return {"done": bool(self.event.query())}
-
-    def cancel(self) -> None:
-        self.canceled = True
-
-    def wait(self) -> dict[str, Any]:
-        self.event.synchronize()
-        use, self.use = self.use, None
-        if use is not None and not self.canceled:
-            use.commit()
-        nbytes = 0 if self.canceled else self.nbytes
-        return {"canceled": self.canceled, "bytes": nbytes, "host": True}
 
 
 class Model:
@@ -602,12 +557,13 @@ class Model:
         self.retire_graphs: Callable[[], None] | None = None
         self.sites = _sites(module)
         self.handles: list[Any] = []
+        # Exact source-lifecycle callbacks accepted by explicit closed producers.
+        self.source_hooks: set[Callable[..., Any]] = set()
         self.holds: list[Hold] = []
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
         self.closed = False
-        # Once a block streams, later blocks cannot grow the resident prefix again.
-        self.prefix: int | None = None
+        self.working_phase_keys: set[str] = set()
         #: the block entered last, whose successor in execution order `_enter` records (`next`)
         self.entered: _Block | None = None
 
@@ -743,14 +699,18 @@ class Model:
                 return
             if self.users or any(b.count or b.retained for b in self.groups()):
                 raise ResidencyError("retire graph bindings and active model uses before unload")
+            self.memory._retire_phase_plan("model_closed", model=self)
+            self.memory.forget_working_phases(self)
             self.closed = True
             for handle in self.handles:
                 handle.remove()
             self.handles.clear()
+            self.source_hooks.clear()
             for block in self.groups():
                 self.memory._discard(block, forget=True)
             self.memory._forget_baked(self)
             self.memory.models.pop(self.module, None)
+        self.memory.cooperation_boundary(check=False)
 
 
 class Hold:
@@ -968,11 +928,8 @@ class Binding:
                     if memory._prefetch is not None:
                         memory._settle_prefetch(cancel=True)
                 groups = []
-                needed = 0
                 for block in self.groups:
                     region = memory._native_region(block)
-                    if not region.resident:
-                        needed += int(region.allocated_bytes)
                     offset = 0
                     parts = []
                     for key, roles in block.parts.items():
@@ -986,12 +943,6 @@ class Binding:
                             )
                             offset += (part.nbytes + 255) // 256 * 256
                     groups.append((region, parts))
-                if memory.budget_bytes is not None and needed > memory.room().free:
-                    memory.reclaim(needed, current={model.name})
-                    if needed > memory.room().free:
-                        raise torch.OutOfMemoryError(
-                            "native component inputs exceed local capacity"
-                        )
                 if stage and not getattr(varena.LoadSlot, "supports_ready_stage", False):
                     raise StaleBinding("TensorFS lacks ready-input model stage preparation")
                 slot = (
@@ -1291,8 +1242,10 @@ class Binding:
                     for block in self.groups:
                         region = block.region
                         if region is not None and not region.resident:
+                            self.model.memory._retire_phase_plan(
+                                "binding_fill_abandoned", model=self.model,
+                            )
                             block.region = None
-                            block.preferred = block.preference_set = False
             self._load_data = None
             self._load_storage.clear()
             self._load_source = None
@@ -1304,20 +1257,27 @@ class Binding:
 class Region:
     """An explicit owner's disposable cache; it never intercepts or remaps Torch storage."""
 
-    def __init__(self, memory: Memory, owner: str, release: Callable[[], None] | None) -> None:
+    def __init__(self, memory: Memory, owner: str, release: Callable[[], None] | None,
+                 shrink: Callable[[], bool] | None = None) -> None:
         self.memory, self.owner, self.release = memory, owner, release
+        self.shrink = shrink
         self.lock = threading.RLock()
         self.pins = 0
         self.fresh = False
         self.closed = False
         self.reclaiming = False
         self.last = time.monotonic_ns()
+        # Only typed owners with an explicit nonblocking shrink path enter background reclaim.
+        self._cache_owner = (cache_owners.register(memory.device, self, "discard")
+                             if shrink is not None else None)
 
     @contextmanager
     def pin(self) -> Iterator[bool]:
         with self.lock:
             if self.closed or self.reclaiming:
                 raise ResidencyError(f"cache {self.owner!r} is closed or being reclaimed")
+            if self._cache_owner is not None:
+                self._cache_owner.check()
             self.pins += 1
             fresh, self.fresh = self.fresh, False
         try:
@@ -1326,6 +1286,8 @@ class Region:
             with self.lock:
                 self.pins -= 1
                 self.last = time.monotonic_ns()
+                if self._cache_owner is not None:
+                    self._cache_owner.touch()
 
     allocating = pin
 
@@ -1338,8 +1300,13 @@ class Region:
             self.reclaiming = True
             # No Memory metadata lock is held. The owner releases its ordinary tensors and
             # joins any exceptional consumers or cached graph outputs before dropping them.
-            self.release()
+            if self.shrink is None:
+                self.release()
+            elif not self.shrink():
+                return False
             self.fresh = True
+            if self._cache_owner is not None:
+                self._cache_owner.suspend()
             return True
         finally:
             self.reclaiming = False
@@ -1352,9 +1319,14 @@ class Region:
             if self.pins:
                 raise ResidencyError(f"cache {self.owner!r} is still in use")
             self.closed = True
+            if self._cache_owner is not None:
+                self._cache_owner.stop()
             release, self.release = self.release, None
+            self.shrink = None
             if release is not None and not self.reclaiming:
                 release()
+        if self._cache_owner is not None:
+            self._cache_owner.close()  # drains only after releasing the Region lock
 
 
 class Memory:
@@ -1375,31 +1347,24 @@ class Memory:
         self.last_room: dict[str, object] | None = None
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
+        self._working_phase_owners: dict[str, set[Model | Request]] = {}
         self.regions: weakref.WeakSet[Region] = weakref.WeakSet()
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
         self.native: Any = None
+        self.cooperation: cooperation.Owner | None = None
         self.granularity = 512
-        self.window_bytes = 0
-        #: The active phase's weights all fit beside the other phases' idle ones: nothing of it
-        #: streams, so its blocks reserve no streaming window (`_activate_phase`).
-        self._fits = False
-        self._stage_window_owner: object | None = None
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
         self.phase_supported = False
+        self.phase_plan_supported = False
+        self._phase_plan: Any = None
+        self._phase_plan_signature: tuple[Any, ...] | None = None
+        self._phase_plan_key: str | None = None
+        self._phase_plan_models: set[Model] = set()
+        self._phase_plan_status: tuple[object, ...] | None = None
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
-        #: The active phase's activation budget once a re-plan made its weights all wanted
-        #: (`_replan`), and how many re-plans it has had.
-        self._split_budget: int | None = None
-        self._plans = 0
-        #: The most a split of the active phase's first pass had beside it: what was allocated
-        #: as it began, and its output (`Request.note_split`), over `_notes` splits; `_replan`
-        #: plans no budget below it, and none before a split has run.
-        self._floor, self._notes, self._flooring = 0, 0, True
-        #: Entries of the active phase before any of its splits ran, by their caller (`_replan`)
-        self._early: dict[str, int] = {}
         self._forward_depth = 0
         #: (set, block, fill identity, overlay) -> a refilled block's baked bytes in host RAM:
         #: its next refill copies them back, with no store read, factor read or bake
@@ -1426,21 +1391,31 @@ class Memory:
         self._rate: dict[tuple[object, ...], int] = {}
         #: stored pages whose store read completed: a resident block's page is wanted on its second
         self._read_once: set[tuple[object, ...]] = set()
-        self._h2d_stream: Any = None
         self._host_looked = 0.0
         admission = inspect.signature(varena.Region.prepare).parameters
         self._host_prepare = "evict_completed" in admission  # TensorFS 0.17.4
         if self.cuda:
             try:
+                if not cache_owners.supported():
+                    raise ResidencyError("native CUDA recovery requires the CacheOwner capability")
                 if budget_bytes is not None:
-                    varena.set_activation_limit(self.device.index or 0, budget_bytes)
+                    vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
+                if not callable(getattr(self.native, "clear_streaming_limit", None)):
+                    raise ResidencyError("native CUDA retention requires clear_streaming_limit")
+                # One policy for this Memory lifetime. Registration, phase changes and
+                # dtype rebinding never reinstall an estimated idle-cache window.
+                self.native.clear_streaming_limit()
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = bool(
                     callable(getattr(varena, "replay", None))
+                    and callable(getattr(varena.Region, "prepare_prefetch", None))
                     and getattr(varena, "supports_prefetch", lambda: False)()
                 )
                 self.phase_supported = bool(getattr(varena, "supports_phases", lambda: False)())
+                self.phase_plan_supported = bool(
+                    getattr(varena, "supports_phase_plans", lambda: False)()
+                )
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
                     raise
@@ -1463,6 +1438,34 @@ class Memory:
             _MEMORIES[str(device)] = memory
             return memory
 
+    def attach_cooperation(
+        self, config: cooperation.Config, failed: Callable[[BaseException], None]
+    ) -> None:
+        """Exclusive device Start only, after Memory.open released its initialization lock."""
+        if self.cooperation is not None:
+            if self.cooperation.config != config:
+                raise cooperation.Failure(
+                    "an active Memory cannot change cooperation configuration"
+                )
+            return
+        if (
+            not self.cuda or self.requests or self.models
+            or self.room_limit is not None or self._room_pending is not None
+        ):
+            raise cooperation.Failure("cooperation must bind at a fresh CUDA Memory start")
+        self.cooperation = cooperation.Owner(self.device.index or 0, config, failed)
+
+    def cooperation_boundary(self, *, used: bool = False, check: bool = True) -> None:
+        owner = self.cooperation
+        if owner is not None:
+            if check:
+                owner.check()
+            owner.wake(used=used, check=check)
+
+    def close_cooperation(self) -> None:
+        if self.cooperation is not None:
+            self.cooperation.close()
+
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
 
@@ -1472,7 +1475,7 @@ class Memory:
         )
 
     def _reading(self) -> tuple[int, int, int, int]:
-        """Torch's allocated, reserved and peak bytes and the weight pages, each read once."""
+        """Native working demand/backing/peak and weight pages, each read once."""
         if self.cuda and torch.cuda.is_initialized():
             resident = int(self.native.stats()["resident_bytes"]) if self.native is not None else 0
             return (*_torch_bytes(self.device), resident)
@@ -1495,13 +1498,15 @@ class Memory:
 
     def make_room(self, limit: int | None) -> None:
         """What the machine leaves this process of the GPU (design/vram-yield.md; `room_for`),
-        None for no limit. Lower than it holds, it gives at once: idle, Torch's unused cache, then
+        None for no limit. Lower than it holds, it gives at once: idle working backing, then
         weight pages in Varena's reclaim order; in a call, pages only, never below what the call
         has needed and runs on, so a run streams and is never ended for it. Higher, the running
         call takes it at its next pass (`_take_room`); idle, at once. Called on the seam's reading
         thread (or an idle executor's turn): no Memory lock."""
         if not self.cuda:
             return
+        if self.cooperation is not None:
+            raise cooperation.Failure("legacy room cannot control a cooperative Memory")
         if not yields():
             if not self._room_unsupported:
                 self._room_unsupported = True
@@ -1558,12 +1563,35 @@ class Memory:
         """Torch's reserve plus this process's weight pages: what a room limits."""
         return self._figures()[1]
 
+    def remember_working_phase(self, key: str, models: tuple[Model | Request, ...]) -> None:
+        """A semantic observation lives with its model owners, or its componentless request."""
+        with self.lock:
+            owners = self._working_phase_owners.setdefault(key, set())
+            for model in models:
+                owners.add(model)
+                model.working_phase_keys.add(key)
+
+    def forget_working_phases(self, model: Model | Request) -> None:
+        """Owner close runs after its execution; native retirement is metadata-only."""
+        with self.lock:
+            # If another scope is active, a refused retirement retains the ownership request.
+            for key in model.working_phase_keys:
+                if self._working_phase_owners[key] == {model}:
+                    vt.phase_forget(self.device.index or 0, key)
+            for key in tuple(model.working_phase_keys):
+                owners = self._working_phase_owners[key]
+                if owners == {model}:
+                    del self._working_phase_owners[key]
+                else:
+                    owners.remove(model)
+                model.working_phase_keys.remove(key)
+
     def _room_floor(self) -> int:
         """What this process must keep to go on: its call's working set as it has peaked (across
-        cut resets) or Torch's reserve, whichever is more, its pinned pages, and the streamed
+        cut resets) or mapped working backing, whichever is more, its pinned pages and streamed
         blocks in flight of the models of its phase (running, or the last entered, between
-        forwards); idle, what Torch still holds. A later phase that needs more (a decode) takes
-        it from the call's weight pages through the allocation hook."""
+        forwards); idle, what remains live. A later phase that needs more (a decode) takes
+        it from the call's weight pages through the native allocator."""
         native = self.native.stats() if self.native is not None else {}
         pinned = int(native.get("pinned_bytes", 0))
         allocated, reserved, _ = _torch_bytes(self.device)
@@ -1581,17 +1609,13 @@ class Memory:
             for b in m.groups()
             if not b.table  # one that does not fit gathers (`_gather`)
         )
-        return max(peak, reserved) + pinned + _STREAMED * max(blocks, default=0)
+        return max(peak, reserved) + pinned + _ROOM_BLOCKS * max(blocks, default=0)
 
     def _release_cache(self) -> None:
-        """Torch's unused cache back to the driver, no capture beginning meanwhile."""
+        """Return idle working backing; native trim owns capture exclusion."""
         if not yields():
             return
-        try:
-            with varena.no_capture(self.device.index or 0):
-                torch.cuda.empty_cache()
-        except RuntimeError:
-            pass  # a capture is in progress: the room bounds its next allocations
+        vt.trim(self.device.index or 0)
 
     def _apply_room(self, limit: int | None) -> None:
         self.room_limit = limit
@@ -1629,8 +1653,8 @@ class Memory:
         if self.native is not None:
             # Native pins, including escaped Torch storage aliases, are the authority.
             # Do not count an idle Python block as reclaimable merely because hooks closed.
-            # The active phase's resident prefix (preferred) is warm, as current models' blocks
-            # are below: a cut takes a finer level before it evicts the weights it runs (H3 Turbo
+            # Existing native preferences and the active phase's actual idle pages are warm:
+            # generic cuts take a finer level before evicting the weights they run (H3 Turbo
             # on a 4090: one coarser FFN cut evicted 20 transformer blocks, re-read and re-baked).
             stats = self.native.stats()
             reclaimable = int(stats["reclaimable_bytes"])
@@ -1732,13 +1756,6 @@ class Memory:
                 repr([(b.path, b.aliases, b.finals) for b in model.groups()]).encode()
             ).hexdigest()
             model.identity = model.wanted_identity()
-            self.window_bytes = max(
-                [
-                    self.window_bytes,
-                    *(_STREAMED * b.allocation_bytes for b in model.groups() if not b.table),
-                ]
-            )
-            self.native.set_streaming_limit(self.window_bytes)
         why = unpaged(module, rule, sizes)
         if why is not None:
             warnings.warn(f"{w.component}: {why}", RuntimeWarning, stacklevel=2)
@@ -1849,7 +1866,6 @@ class Memory:
             layout_identity = hashlib.sha256(
                 repr([(b.path, b.aliases, b.finals) for _, b in layouts]).encode()
             ).hexdigest()
-            window = max([self.window_bytes, *(_STREAMED * b.allocation_bytes for _, b in layouts)])
 
         def apply() -> None:
             if self.capturing():
@@ -1896,17 +1912,12 @@ class Memory:
                     identity = (
                         None if fill is None else repr((fill, layout.identity, layout_identity))
                     )
-                    # This can refuse before metadata publication. A larger temporary
-                    # streaming margin is conservative if a subsequent cache drop fails.
-                    self.native.set_streaming_limit(window)
-                    self.window_bytes = window
                     old_model = (
                         model.finals,
                         model.binding_identity,
                         model.layout_identity,
                         model.identity,
                         model.generation,
-                        model.prefix,
                     )
                     old_sites = [
                         (site, site.table[site.name])
@@ -1933,7 +1944,6 @@ class Memory:
                         model.layout_identity = layout_identity
                         model.identity = identity
                         model.generation += 1
-                        model.prefix = None
                     except BaseException:
                         for site, value in old_sites:
                             site.table[site.name] = value
@@ -1949,11 +1959,10 @@ class Memory:
                             model.layout_identity,
                             model.identity,
                             model.generation,
-                            model.prefix,
                         ) = old_model
                         raise
                     finally:
-                        # Next use recomputes headroom even if only cache retirement succeeded.
+                        # Next use refreshes native phase intent after representation changes.
                         self._phase_names = frozenset()
             finally:
                 with self.lock:
@@ -1979,12 +1988,15 @@ class Memory:
             model.identity = identity
             model.generation += 1
 
-    def _keep_baked(self, page: tuple[object, ...], tensor: Tensor, *, streams: bool) -> None:
-        """A block's baked bytes, kept in the host tier for its next refill: a streaming block's
-        from its first bake, a resident one's from its first refill."""
+    def _keep_baked(self, page: tuple[object, ...], tensor: Tensor) -> None:
+        """Keep a page after an actual repeated bake, not a predicted device-cache prefix.
+
+        The first completed bake records history; a later refill demonstrates host reuse.
+        Host-RAM capacity and the ordinary synchronous demand path remain unchanged.
+        """
         if page in self._baked:
             return
-        if not streams and page not in self._baked_once:
+        if page not in self._baked_once:
             self._baked_once.add(page)
             return
         if not self._admit(page, tensor.numel()):
@@ -2020,12 +2032,12 @@ class Memory:
             return
         page = _page(block, block.model.identity, block.overlay, final=True)
         self._refills[page] = self._refills.get(page, 0) + 1
-        self._keep_baked(page, tensor, streams=not block.preferred)
+        self._keep_baked(page, tensor)
 
     def _want(self, block: _Block, page: tuple[object, ...]) -> None:
         """A store read of `page` completed: the page is pinned once the executor is idle
-        (`pin_idle`), a streamed one's after this read, a resident one's after its second (another
-        phase's room evicted it). Pinning runs at about the copy's own rate (5.5 GiB/s on an RTX
+        (`pin_idle`) after its second completed read proves actual refill demand. Pinning
+        runs at about the copy's own rate (5.5 GiB/s on an RTX
         3070 host), so it is never on a request's path: Qwen-Image int8 at 8 GB paid 5.4 s of it
         in its first warm request (Runtime 0.35.6). A canceled or refused read does not count.
         A hooked block's page is wanted only when its fill wrote nothing (`_ensure`), and a block
@@ -2033,7 +2045,7 @@ class Memory:
         if (
             not _host_final(block)
             and page not in self._baked
-            and (not block.preferred or page in self._read_once)
+            and page in self._read_once
         ):
             self._wanted[page] = block
         self._read_once.add(page)
@@ -2205,31 +2217,6 @@ class Memory:
         self._baked_once = {page for page in self._baked_once if page[0] != model.name}
         self._plain = {page for page in self._plain if page[0] != model.name}
 
-    def _host_read(
-        self, region: Any, kept: _HostPage, *, evict_completed: bool
-    ) -> _HostRead | None:
-        """A refill from a host page: the region's fill under the native prefetch's admission,
-        one async DMA; None when the region is resident already. The copy stream exists before
-        admission, and a fill admitted here that fails is released before its error leaves: a
-        traceback holding it kept the region `already being filled` for the retry (cr-225)."""
-        if self._h2d_stream is None:
-            self._h2d_stream = torch.cuda.Stream(self.device)
-        stream = self._h2d_stream
-        use = region.prepare(reclaim=False, evict_completed=evict_completed)
-        if not use.needs_fill:
-            return None
-        try:
-            use.consume_on(stream.cuda_stream)  # its release fences on the copy
-            with torch.cuda.stream(stream):
-                use.tensor.copy_(kept.tensor, non_blocking=True)
-                event = torch.cuda.Event()
-                event.record(stream)
-        except BaseException:
-            use = None  # the fill and its tensor go now, not with the traceback
-            raise
-        kept.event = event
-        return _HostRead(use, event, kept.tensor.numel())
-
     def _switch_overlay(self, block: _Block, overlay: Hashable) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
         a LoRA forward, or the reverse). As for a changed fill, its model's holds go first. A
@@ -2240,6 +2227,7 @@ class Memory:
             hold.shed()
         if block.count or block.retained or block.loading or self.capturing():
             raise StaleBinding("a weight block in use cannot change its fill overlay")
+        self._retire_phase_plan("overlay_changed", model=block.model)
         if self.native is None:
             self._discard(block, forget=True)
             if block.paged():
@@ -2256,7 +2244,6 @@ class Memory:
             block.parked.pop(next(iter(block.parked)))
         block.region, block.final_region = block.parked.pop(overlay, (None, None))
         block.overlay = overlay
-        block.preferred = block.preference_set = False
         block.generation += 1
 
     def _idle(self, block: _Block) -> None:
@@ -2275,6 +2262,7 @@ class Memory:
             forget = True
         block.final_use = block.final_data = block.final_storage = block.final_native_use = None
         if forget:
+            self._retire_phase_plan("final_representation_retired", model=block.model)
             block.final_region = None
 
     def _discard(self, block: _Block, *, forget: bool = False) -> int:
@@ -2293,12 +2281,11 @@ class Memory:
             block.native_storage = block.native_use = None
             self._drop_final(block, forget=forget)
             if forget:
+                self._retire_phase_plan("representation_retired", model=block.model)
                 # Never overwrite an old fill beneath an escaped alias. Its pin keeps
                 # the old reservation alive independently of this model's new identity.
                 block.region = None
                 block.parked.clear()
-                block.preferred = False
-                block.preference_set = False
                 block.gathered = None
             if present or forget:
                 block.generation += 1
@@ -2321,39 +2308,15 @@ class Memory:
     def reclaim(
         self, need: int = 0, *, current: Collection[str] = (), activations: bool = False
     ) -> int:
-        """Discard idle local owners at a preparation boundary; never inside an allocator.
-        `activations`: the room is for Torch allocations (a pure site's), else for weight pages."""
-        if self.capturing():
+        """Non-CUDA owner recovery; native CUDA allocation owns its bounded recovery."""
+        del activations  # CUDA's activation/weight distinction no longer selects Python victims.
+        if self.cuda:
             return 0
         before_allocated, before_reserved, _ = self._figures()
-        before_free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
-        # A running phase's Torch cache is its own activations' (`_running`): a pure site of it
-        # counts that cache as room and takes the rest from weights. Returning it was a device
-        # sync per release and its segments malloc'd back, and the step reserve then held their
-        # high-water free of speculation for the rest of the phase (H3 30-step on a 4090). A
-        # weight block's pages are no Torch allocation: for them the cache goes first (a warm H3
-        # executor's Regenerate refine was refused a 406 MB block beside it, run 23827).
-        keep = bool(
-            need
-            and activations
-            and self.phase_supported
-            and set(current) & set(self._phase_names or ())
-        )
-
-        def room_now() -> int:
-            room = self.room(current).free
-            if keep and self.cuda:
-                allocated, reserved, _ = _torch_bytes(self.device)
-                room += max(reserved - allocated, 0)
-            return room
-
-        available = room_now() if need else 0
-        if need and available < need and not keep:
-            # Return actual unused activation storage before sacrificing reusable weights.
-            # Private graph pools and live tensors may remain; measure instead of crediting
-            # reserved-minus-allocated bytes as available memory.
+        available = self.room(current).free if need else 0
+        if need and available < need:
             release_cached(torch, self.device.type)
-            available = room_now()
+            available = self.room(current).free
         dropped = 0
 
         def enough(released: int = 0, *, flush: bool = False) -> bool:
@@ -2362,15 +2325,10 @@ class Memory:
                 return False
             dropped += released
             if flush or dropped >= max(need - available, 1):
-                # Dropped owner bytes only trigger a batch flush. Aliases, allocator
-                # fragmentation and graph pools can keep them resident; measure again.
-                available = room_now()
-                if available < need and not keep:
+                available = self.room(current).free
+                if available < need:
                     release_cached(torch, self.device.type)
-                    available = room_now()
-                if self.native is not None and available < need:
-                    self.native.reclaim(need - available)
-                    available = room_now()
+                    available = self.room(current).free
                 dropped = 0
             return available >= need
 
@@ -2384,11 +2342,6 @@ class Memory:
             ]
         for hold in holds:
             hold.shed()
-        if self.native is not None:
-            self.native.reclaim(
-                max(need - available, 0) if need else int(self.native.stats()["resident_bytes"])
-            )
-            available = room_now() if need else 0
         with self.lock:
             blocks = sorted(
                 (b for m in self.models.values() for b in m.groups()),
@@ -2398,7 +2351,6 @@ class Memory:
             if enough():
                 break
             enough(self._discard(block))
-        # Return public allocator cache before escalating to graph retirement.
         if not enough(flush=True):
             for model in sorted(list(self.models.values()), key=lambda m: m.name in current):
                 if enough():
@@ -2411,8 +2363,6 @@ class Memory:
                             break
                         enough(self._discard(block))
                     enough(flush=True)
-        # A callback may discard graph owners or decoded caches. It runs outside metadata
-        # locks, and a pinned/locked region is skipped rather than waited on.
         if not enough(flush=True):
             for region in sorted(list(self.regions), key=lambda r: r.last):
                 if enough():
@@ -2420,12 +2370,9 @@ class Memory:
                 if region.discard():
                     enough(flush=True)
         if not need:
-            if self.native is not None:
-                self.native.reclaim(int(self.native.stats()["resident_bytes"]))
             release_cached(torch, self.device.type)
         allocated, reserved, _ = self._figures()
-        free = int(torch.cuda.mem_get_info(self.device)[0]) if self.cuda else 0
-        return max(before_allocated - allocated, before_reserved - reserved, free - before_free, 0)
+        return max(before_allocated - allocated, before_reserved - reserved, 0)
 
     def trim(self) -> int:
         """Idle offload: release eligible owners and return actual reserved-byte reduction.
@@ -2439,7 +2386,19 @@ class Memory:
         before = self._figures()[1]
         for model in list(self.models.values()):
             self._retire(model)
-        self.reclaim()
+        if self.cuda:
+            # Explicit offload discards every eligible owner; it is not a byte-target
+            # victim selector or a retry of a failed allocation. Live pins still refuse.
+            for region in list(self.regions):
+                region.discard()
+            for model in list(self.models.values()):
+                for block in model.groups():
+                    self._discard(block)
+            if self.native is not None:
+                self.native.reclaim(int(self.native.stats()["resident_bytes"]))
+            release_cached(torch, self.device.type)
+        else:
+            self.reclaim()
         with self.lock:
             pages = list(self._baked.values())
             self._baked.clear()
@@ -2458,13 +2417,16 @@ class Memory:
         spill: bool = False,
         *,
         release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> Region:
         del kind, sets, spill  # Cache semantics belong to its explicit owner, not an allocator.
-        region = Region(self, owner, release)
+        region = Region(self, owner, release, shrink)
         self.regions.add(region)
         return region
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
+        if self.cuda:
+            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
         if self.device.type == "mps" and reclaim:
             # TensorFS reads into bounded host staging; account for that transient beside
             # the retained MPS part before asking Torch for its destination allocation.
@@ -2489,85 +2451,124 @@ class Memory:
         """Live request concurrency; the caller holds lock across its policy decision."""
         return any(other is not request and not other.idle for other in self.requests)
 
-    def _headroom(self) -> int:
-        """The room a preferred block leaves free beside it: the streaming window, unless the
-        active phase fits."""
-        return 0 if self._fits else self.window_bytes
-
-    def _native_region(
-        self, block: _Block, *, final: bool = False, speculative: bool = False
-    ) -> Any:
-        model = block.model
+    def _native_region(self, block: _Block, *, final: bool = False) -> Any:
+        """Reserve stable addresses only; native demand owns physical admission/reclaim."""
         field = "final_region" if final else "region"
         region = getattr(block, field)
-        size = block.final_bytes if final else block.storage_bytes
         request = _REQUEST.get()
         if request is not None and request.idle and (region is None or not region.resident):
             raise StaleBinding("idle graph preparation cannot fill native weight backing")
-        created = region is None
-        if created:
+        if region is None:
+            self._retire_phase_plan("representation_created", model=block.model)
+            size = block.final_bytes if final else block.storage_bytes
             region = self.native.reserve(size)
             setattr(block, field, region)
-        if speculative:
-            return region  # Only demand may assign or shorten the retained prefix.
-        if not block.preference_set:
-            missing = block.allocation_bytes - sum(
-                int(held.allocated_bytes)
-                for held in (block.region, block.final_region)
-                if held is not None and held.resident
-            )
-            block.preferred = model.prefix is None
-            if block.preferred and not block.cached():
-                wanted = missing + self._headroom()
-                free = self.room().free
-                if (
-                    self.phase_supported
-                    and wanted > free
-                    and not self.capturing()
-                    and not (request is not None and request.idle)
-                ):
-                    # Registration uses this same lock: another request cannot enter
-                    # between the live-concurrency check and preference reclamation.
-                    with self.lock:
-                        if not self._active_beside(request):
-                            free = self.room().free
-                            if wanted > free and not self._running(model):
-                                # Torch's idle cache goes before another phase's weights (a cold
-                                # Krea 2 DiT fill evicted its 4.3 GB text encoder beside it); the
-                                # running phase's cache is its own activations' (`_running`).
-                                release_cached(torch, self.device.type)
-                                free = self.room().free
-                            if wanted > free:
-                                self.native.reclaim_unpreferred(wanted - free)
-                                free = self.room().free
-                block.preferred = free >= wanted
-            block.preference_set = True
-            if not block.preferred:
-                _shorten(block)
-            for held, protect in (
-                (block.region, not block.final_only()),
-                (block.final_region, True),
-            ):
-                if held is not None:
-                    held.set_preferred(block.preferred and protect)
-        elif created:
-            region.set_preferred(block.preferred and (final or not block.final_only()))
-        if block.preferred and (final or not block.final_only()) and not region.preferred:
-            # Native activation recovery reduces the prefix without calling Python. Keep
-            # later unprepared blocks on the streaming side of that same watermark.
-            _shorten(block)
-            block.preferred = False
         return region
 
-    def _running(self, model: Model) -> bool:
-        """Whether `model` belongs to the active phase: Torch's cache then holds that phase's own
-        activations (`_activate_phase` returned the previous phase's), so a block of it filling
-        evicts idle weights, never the cache. Returning it per fill was a device sync and a
-        cudaMalloc back each time: H3 15 s on an RTX 4090, 16 a sparse step (100 GB), 5 s idle."""
-        return self.phase_supported and model.name in (self._phase_names or ())
+    def _note_phase_plan(self, status: str, reason: str = "", **facts: Any) -> None:
+        request = _REQUEST.get()
+        stamp = (self._phase_request, self._phase_names, status, reason)
+        if request is not None and stamp != self._phase_plan_status:
+            request.phase_changes.append({
+                "models": sorted(self._phase_names or ()), "retention": "native_demand",
+                "region_plan": {"status": status, "reason": reason, **facts},
+            })
+        self._phase_plan_status = stamp
+
+    def _retire_phase_plan(self, reason: str, *, model: Model | None = None) -> None:
+        """Retire native intent before a represented source/region changes; no physical release."""
+        with self.lock:
+            if model is not None and model not in self._phase_plan_models:
+                return
+            if self._phase_plan is not None:
+                self._phase_plan.deactivate()
+                self._phase_plan = None
+                self._phase_plan_signature = None
+                self._phase_plan_key = None
+                self._phase_plan_models.clear()
+                self._note_phase_plan("unplanned", reason)
+
+    def _refresh_phase_plan(self, names: frozenset[str]) -> None:
+        """Use only actual established representations, never materialize a plan's weights.
+
+        A first pass may create raw/final handles. Until every required handle exists,
+        this phase stays unplanned; evicted-but-still-owned reservations are sufficient.
+        """
+        if not self.phase_plan_supported:
+            self._note_phase_plan("unplanned", "native_capability_missing")
+            return
+        models = [model for model in self.models.values() if model.name in names]
+        reason = ""
+        if len(models) != len(names) or {model.name for model in models} != set(names):
+            reason = "unresolved_or_ambiguous_models"
+        regions, signature = [], []
+        for model in sorted(models, key=lambda model: model.name):
+            identity = model.wanted_identity()
+            if model.closed or model.retiring or identity is None or model.identity != identity:
+                reason = "representation_identity_incomplete"
+                break
+            bindings = []
+            for block in model.groups():
+                if block.gathered is not None:
+                    reason = "host_gathered_representation"
+                    break
+                raw_needed = (
+                    block.aliases is None or any(block.aliases.values()) or not block.finals
+                )
+                for role, needed, region in (
+                    ("raw", raw_needed and bool(block.storage_bytes), block.region),
+                    ("final", bool(block.final_bytes), block.final_region),
+                ):
+                    if not needed:
+                        continue
+                    if region is None:
+                        reason = "representation_regions_incomplete"
+                        break
+                    # Native identity/size are facts, not an estimated byte reserve. The
+                    # native Plan deduplicates aliases by Region identity, not these rows.
+                    bindings.append((
+                        block.path, role, int(region.ptr), int(region.allocated_bytes),
+                    ))
+                    regions.append(region)
+                if reason:
+                    break
+            if reason:
+                break
+            signature.append((
+                model.name, model.content, identity, model.layout_identity, tuple(bindings),
+            ))
+        if reason:
+            self._retire_phase_plan(reason)
+            self._note_phase_plan("unplanned", reason)
+            return
+        represented = tuple(signature)
+        if self._phase_plan is not None and represented == self._phase_plan_signature:
+            assert self._phase_plan_key is not None
+            try:
+                self._phase_plan.activate(self._phase_plan_key)
+            except NotImplementedError:
+                self._retire_phase_plan("multiple_arenas")
+            return
+        self._retire_phase_plan("phase_inventory_changed")
+        key = "runtime.phase.regions/1:" + hashlib.sha256(repr(represented).encode()).hexdigest()
+        candidate = varena.Plan(self.native, [(key, regions)])
+        try:
+            candidate.activate(key)
+        except NotImplementedError:
+            self._note_phase_plan("unplanned", "multiple_arenas")
+            return
+        self._phase_plan, self._phase_plan_signature = candidate, represented
+        self._phase_plan_key = key
+        self._phase_plan_models = set(models)
+        self._note_phase_plan("active", phase=key, native=candidate.facts())
 
     def _activate_phase(self, model: Model) -> None:
-        """Prioritize an actual component phase, never each repeated block/denoising call."""
+        """Declare a component-phase boundary; native policy retains/evicts actual pages.
+
+        Resetting preference metadata marks prior idle backing as standby. Native reclaim
+        orders that cache LRU and this phase's touched pages MRU, without a Python budget.
+        """
+        self.cooperation_boundary(used=True)
         request = _REQUEST.get()
         if not self.phase_supported or self.capturing() or (request is not None and request.idle):
             return
@@ -2575,264 +2576,25 @@ class Memory:
         request_id = request.id if request is not None else None
         with self.lock:
             if self._active_beside(request):
+                self._retire_phase_plan("overlapping_requests")
                 return
-            if names == self._phase_names and request_id == self._phase_request:
-                self._replan(request)  # a later pass of the active phase
-                return
-            self._phase_names, self._phase_request = names, request_id
-            self._split_budget, self._plans = None, 0
-            self._floor, self._notes, self._flooring = 0, 0, True
-            self._early = {}
-            self._plan_phase(request)
-
-    def _replan(self, request: Request | None) -> None:
-        """A later pass of the active phase. Its first pass sized each split against free and
-        cached room while the phase's weights were still arriving, so Torch reserved what the
-        coarsest levels needed and the weights streamed around it. Where the phase's weights
-        would all fit beside a smaller activation budget (the card, less what lives outside
-        Torch and weights, its weights and `_RESERVE`), splits size within that budget from here
-        and the weights are all wanted; a pass that still evicted them tightens the budget by
-        its overshoot (`_PLANS` times at most). A budget under twice what the first pass kept
-        beside its splits (`_floor`) is no plan: no exact split gets that low (H3 15 s on a
-        4090: 3.0 GB planned beside a 0.4 GB between-pass live set; the pass reserved 6.4 GB, was
-        abandoned, and its finer splits cost 16.5 s). Caller holds the lock."""
-        if not self._notes:
-            # A phase's activation before any of its splits ran (a loop preparing its loads
-            # enters the phase ahead of its first forward): its first pass has not happened.
-            frames = (sys._getframe(2), sys._getframe(3))  # _activate_phase's caller, and its
-            site = " <- ".join(
-                f"{f.f_code.co_filename.rsplit('/', 1)[-1]}:{f.f_code.co_name}" for f in frames
-            )
-            self._early[site] = self._early.get(site, 0) + 1
-            return
-        self._flooring = False  # the first pass is over
-        if self._plans >= _PLANS or not self.cuda:
-            return
-        names = self._phase_names or frozenset()
-        incoming = [m for m in self.models.values() if m.name in names]
-        g = self.granularity
-        weights = held = 0
-        for member in incoming:
-            for block in member.groups():
-                required = [(block.final_region, block.final_bytes)]
-                if not block.final_only():
-                    required.append((block.region, block.storage_bytes))
-                for region, size in required:
-                    if not size:
-                        continue
-                    weights += (size + g - 1) // g * g
-                    if region is not None and region.resident:
-                        held += (size + g - 1) // g * g
-        free, total = (int(n) for n in torch.cuda.mem_get_info(self.device))
-        allocated, reserved, _ = _torch_bytes(self.device)
-        resident = int(self.native.stats()["resident_bytes"])
-        budget = total - max(total - free - reserved - resident, 0) - weights - _RESERVE
-        planned = self._split_budget
-        if held >= weights:
-            return  # the phase is whole: nothing streams (with a plan, the plan holds)
-        if planned is not None:
-            budget = min(budget, planned - max(reserved - planned, g))
-        elif budget >= reserved:
-            return  # its activations already fit beside its weights; something else streams
-        replan = {
-            "pass_reserved_bytes": reserved,
-            "live_bytes": allocated,
-            "weights_bytes": weights,
-            "held_bytes": held,
-            "budget_bytes": budget,
-        }
-        floor = max(allocated, self._floor)
-        replan["floor_bytes"], replan["floor_splits"] = floor, self._notes
-        replan["early_entries"] = dict(self._early)
-        if budget < 2 * floor:
-            if planned is None:
+            if names != self._phase_names or request_id != self._phase_request:
+                self._settle_prefetch(cancel=True)
+                self._retire_phase_plan("phase_boundary")
+                self.native.reset_preferences()  # No mapping, reclaim or driver call.
+                self._phase_names, self._phase_request = names, request_id
                 if request is not None:
-                    request.phase_changes.append({"models": sorted(names), "replan": replan})
-                return  # no split takes activations this low: the phase streams as planned
-            self._split_budget, self._plans = None, _PLANS  # the plan failed: stream again
-            replan["abandoned"] = True
-        else:
-            self._split_budget, self._plans = budget, self._plans + 1
-        release_cached(torch, self.device.type)  # the last pass's coarse pieces' cache
-        self._plan_phase(request, replan)
-
-    def _plan_phase(self, request: Request | None, replan: dict[str, Any] | None = None) -> None:
-        """The active phase's residency: its resident blocks preferred, the rest wanted by
-        demand; a streaming window unless its missing bytes fit. Caller holds the lock."""
-        names = self._phase_names or frozenset()
-        self._settle_prefetch(cancel=True)
-        # The phase that ends here: Torch's high-water in it and the speculative fills that
-        # high-water refused (TensorFS's step reserve; absent on an older native wheel).
-        ended = {
-            k: v
-            for k, v in self.native.stats().items()
-            if k in ("torch_high_bytes", "torch_reserved_bytes", "reserve_refusals")
-        }
-        self.native.reset_preferences()  # metadata only: pins, mappings and VA stay intact
-        incoming = [m for m in self.models.values() if m.name in names]
-        # An unrelated registered model must not enlarge this phase's streaming
-        # headroom. Native admission still permits an unexpectedly larger group.
-        self.window_bytes = _STREAMED * max(
-            (b.allocation_bytes for m in incoming for b in m.groups() if not b.table), default=0
-        )
-        self.native.set_streaming_limit(self.window_bytes)
-        missing = 0
-        for member in incoming:
-            member.prefix = None
-            for block in member.groups():
-                block.preferred = block.preference_set = False
-                required = [(block.final_region, block.final_bytes)]
-                if not block.final_only():
-                    required.append((block.region, block.storage_bytes))
-                for region, size in required:
-                    if not size:
-                        continue
-                    if region is not None and region.resident:
-                        region.set_preferred(True)
-                    else:
-                        missing += (
-                            (size + self.granularity - 1) // self.granularity * self.granularity
-                        )
-                if block.cached():
-                    block.preferred = block.preference_set = True
-        allocated, before, _ = _torch_bytes(self.device)
-        unused = max(before - allocated, 0)
-        if unused:
-            # The previous phase's inactive Torch segments are neither weight capacity nor
-            # this phase's activations. Returned once here, not by Torch inside the first op
-            # of this phase that does not fit (Krea 2's 2048² decode: 1.1 s, not 1.3 s).
-            torch.cuda.empty_cache()
-        returned = max(before - _torch_bytes(self.device)[1], 0)
-        # Protect the incoming cached bytes above; only other phases' idle backing may go.
-        # A phase whose missing bytes then fit streams nothing and reserves no window: a
-        # window beside resident weights only evicts another phase's (a 4.3 GB text
-        # encoder's 13 GB window took 3.9 GB of an idle DiT every request).
-        need = missing - self.room().free
-        reclaimed = int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
-        self._fits = missing <= self.room().free
-        need = 0 if self._fits else missing + self.window_bytes - self.room().free
-        reclaimed += int(self.native.reclaim_unpreferred(need)) if need > 0 else 0
-        if request is not None:
-            request.phase_changes.append(
-                {
-                    "models": sorted(names),
-                    **({"replan": replan} if replan is not None else {}),
-                    "ended_phase": ended,
-                    "window_bytes": self.window_bytes,
-                    "fits": self._fits,
-                    "missing_bytes": missing,
-                    "torch_unused_bytes": unused,
-                    "torch_returned_bytes": returned,
-                    "native_reclaimed_bytes": reclaimed,
-                    # Cumulative snapshot; an older native wheel has no reason counters.
-                    "native_reclaimed_by_reason": self.native.stats().get(
-                        "reclaimed_by_reason"
-                    ),
-                }
-            )
+                    request.phase_changes.append(
+                        {"models": sorted(names), "retention": "native_demand"}
+                    )
+            self._refresh_phase_plan(names)
 
     def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
-        model = block.model
         region = self._native_region(block, final=final)
-        needed = int(region.allocated_bytes)
-        if (
-            reclaim
-            and self.budget_bytes is None
-            and not region.resident
-            and not self.capturing()
-            and not self._running(model)
-            and needed > self.room().free
-            and (figures := _torch_bytes(self.device))[1] > figures[0]
-        ):
-            # Common weights may bind before their model's first forward enters its phase.
-            # Return unused Torch cache first; native allocation still decides whether idle
-            # weights actually need eviction. Budgeted demand already does this in reclaim().
-            release_cached(torch, self.device.type)
-        if not region.resident and (not reclaim or self.budget_bytes is not None):
-            if reclaim and needed > self.room().free:
-                self.reclaim(needed, current={model.name})
-            if needed > self.room().free:
-                raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
-        # Converted raw bytes are working storage for an admitted preferred final block.
-        # Avoid charging that temporary Fill against the idle streaming window; native
-        # prefix reductions and real allocation pressure still apply to the preparation.
-        provisional = (
-            not final
-            and block.final_only()
-            and block.preferred
-            and block.final_region is not None
-            and block.final_region.preferred
-            and not region.preferred
-            and not region.resident
-        )
-        try:
-            try:
-                if provisional:
-                    region.set_preferred(True)
-                return region.prepare()
-            finally:
-                if provisional:
-                    region.set_preferred(False)  # the returned Fill owns its physical pin
-        except torch.OutOfMemoryError:
-            if not reclaim:
-                raise
-            # No read or transform has run. A larger block or a different model may need
-            # a smaller resident prefix. Retire eligible owners only after this miss;
-            # retry the allocation only if reclamation actually returned memory.
-            block.preferred = False
-            _shorten(block)
-            region.set_preferred(False)
-            if not self.reclaim(needed, current={model.name}):
-                raise
-            return region.prepare()
-
-    def _stage_prefetch_window(
-        self, required: int, missing: int, request: Request | None, owner: object
-    ) -> Callable[[], None] | None:
-        """Admit bounded next-source speculation after actual graph/readout allocations.
-
-        The streaming limit bounds idle nonpreferred cache, not active physical residency.
-        Existing useful cache may remain beyond the current/next source pair. This never
-        reclaims. Driver free and the request budget already exclude Torch
-        reservations (including graph scratch and boundary slots) and native residency.
-        The speculative native allocation independently rechecks pressure at read time.
-        """
-        if self.native is None or request is None or request.memory is not self or request.idle:
-            return None
-        with self.lock:
-            native_limit = self.native.stats().get("streaming_limit_bytes")
-            if (
-                native_limit is None
-                or native_limit != self.window_bytes
-                or self._stage_window_owner is not None
-                or self._prefetch is not None
-                or self._active_beside(request)
-                or missing > self.room().free
-            ):
-                return None
-            previous = self.window_bytes
-            admitted = max(previous, required)
-            phase = self._phase_names, self._phase_request
-            self.native.set_streaming_limit(admitted)
-            self.window_bytes = admitted
-            self._stage_window_owner = owner
-
-        def restore() -> None:
-            # Called only after checked whole-program completion, including canceled or
-            # unconsumed prefetch. Never overwrite a later phase's independently changed policy.
-            with self.lock:
-                if self._stage_window_owner is not owner:
-                    return
-                if (
-                    self.window_bytes == admitted
-                    and (self._phase_names, self._phase_request) == phase
-                    and self.native.stats().get("streaming_limit_bytes") == admitted
-                ):
-                    self.native.set_streaming_limit(previous)
-                    self.window_bytes = previous
-                self._stage_window_owner = None
-
-        return restore
+        # Native demand owns all finite allocation recovery, including owner requests.
+        # Its terminal refusal is not a reason to select Python victims and retry again.
+        # Free-only preparation must remain free-only even if physical room changes now.
+        return region.prepare(reclaim=reclaim)
 
     def _prefetch_next(self, current: _Block) -> None:
         """Demand's own next block takes priority over queued-request speculation."""
@@ -2888,12 +2650,13 @@ class Memory:
         request: Request | None,
         *,
         queued: QueuedPrefetch | None = None,
-        released: bool = False,
     ) -> None:
-        """Admit one immutable read, without eviction or Python fill callbacks: a page the host
-        tier keeps (stored, baked or cast) by one DMA, else the stored bytes, and for a hooked
-        block only when its fill writes nothing under the overlay this forward arms. A cast block
-        the tier keeps cast (`_host_final`) prefetches only its kept final bytes."""
+        """Offer one immutable stored RAW source to native measured admission.
+
+        Unknown keys and physical shortfalls decline without IO or Python recovery.
+        Host-kept/final/transformed sources await their own native source contract;
+        ordinary demand retains the existing host-tier and fill paths.
+        """
         if (
             not self.prefetch_supported
             or self.capturing()
@@ -2903,16 +2666,23 @@ class Memory:
             or block.gathered is not None
         ):
             return
+        identity = block.model.identity
+        if identity is None:
+            if request is not None:
+                counts = request.prefetch_unsupported
+                counts["source_identity"] = counts.get("source_identity", 0) + 1
+            return
         overlay = None
         if block.model.fill is not None:
             if queued is not None:
+                if request is not None:
+                    counts = request.prefetch_unsupported
+                    counts["queued_overlay"] = counts.get("queued_overlay", 0) + 1
                 return  # another request's hooks are armed by its own code, not yet run
             overlay = block.model.fill.overlay(block.path, block.parts)
             if overlay != block.overlay:
                 return  # demand parks or refills a page of another overlay (`_switch_overlay`)
-        final = _host_final(block)
-        page = _page(block, block.model.identity, overlay, final=final)
-        size = block.final_bytes if final else block.storage_bytes
+        page = _page(block, identity, overlay)
         with self.lock:
             if (
                 self._prefetch is not None
@@ -2922,29 +2692,18 @@ class Memory:
                 or block.cached()
             ):
                 return
-            if block.finals and not final and block.region is not None and block.region.resident:
+            if _host_final(block) or (block.model.fill is not None and page not in self._plain):
+                if request is not None:
+                    counts = request.prefetch_unsupported
+                    counts["transform"] = counts.get("transform", 0) + 1
+                return
+            if block.finals and block.region is not None and block.region.resident:
                 return  # its stored bytes are resident; demand writes the final ones
             kept = self._baked.get(page) if self._host_prepare else None
-            if kept is not None and kept.tensor.numel() != size:
-                kept = None
-            hooked = block.model.fill is not None and page not in self._plain
-            if kept is None and (final or hooked):
-                return  # only a kept page, or a hooked one whose fill writes nothing, is read
-            # A queued request's read is admitted only into free room. Demand's next block may
-            # also take the room of the oldest streamed block whose consumers completed: Varena
-            # evicts it on its last-consumer events and refuses rather than wait or join.
-            needed = block.allocation_bytes + self.window_bytes
-            if queued is not None and needed > self.room().free:
+            if kept is not None and kept.tensor.numel() == block.storage_bytes:
                 if request is not None:
-                    request.prefetch_skipped += 1
-                    if queued is not None:
-                        request.queued_prefetch.append(
-                            {
-                                "request": queued.request_id,
-                                "state": "capacity_skip",
-                                "bytes": needed,
-                            }
-                        )
+                    counts = request.prefetch_unsupported
+                    counts["kept_host"] = counts.get("kept_host", 0) + 1
                 return
             offset = 0
             parts = []
@@ -2953,53 +2712,23 @@ class Memory:
                     name = f"{block.model.component}/{key}#{part.role or 'value'}"
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
-            retry = False
             try:
-                region = self._native_region(block, final=final, speculative=True)
-                # Outgoing cached weights may already fill the nonpreferred window even
-                # when the active phase has ample resident-prefix room. Admit its next
-                # block under that same soft preference without growing a cut prefix.
-                preferred = bool(region.preferred)
-                provisional = (
-                    queued is None
-                    and self.phase_supported
-                    and not preferred
-                    and block.model.prefix is None
-                    and block.allocation_bytes + self._headroom() <= self.room().free
-                )
-                try:
-                    if provisional:
-                        region.set_preferred(True)  # native end-of-prefix watermark still wins
-                    if kept is not None:
-                        read = self._host_read(region, kept, evict_completed=queued is None)
-                        if read is None:
-                            return  # resident already
-                    else:
-                        read = region.prepare_read(
-                            block.model.source.ck,
-                            parts,
-                            reclaim=False,
-                            evict_completed=queued is None,
-                        )
-                finally:
-                    if provisional:
-                        # The prepared Fill owns its pin. Only demand may assign a lasting
-                        # preference, so cancellation/failure cannot leave this one behind.
-                        region.set_preferred(preferred)
+                region = self._native_region(block)
+                read = region.prepare_prefetch(block.model.source.ck, parts)
+                if read is None:
+                    if request is not None:
+                        request.prefetch_declined += 1
+                        if queued is not None:
+                            request.queued_prefetch.append(
+                                {"request": queued.request_id, "state": "declined_native"}
+                            )
+                    return
             except (torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) is not Fault.OOM:
                     raise
-                free = int(torch.cuda.mem_get_info(self.device)[0])
-                allocated, reserved, _ = _torch_bytes(self.device)
-                retry = (
-                    not released
-                    and queued is None
-                    and free < block.allocation_bytes <= (free + reserved - allocated)
-                )
-                if not retry:
-                    if request is not None:
-                        request.prefetch_skipped += 1
-                    return
+                if request is not None:
+                    request.prefetch_declined += 1
+                return
             except tensorfs.Error as error:
                 if fault(error) is not Fault.OTHER:
                     raise
@@ -3012,17 +2741,6 @@ class Memory:
                 if request is not None:
                     request.prefetch_failed += 1
                 return
-            if retry:
-                # Demand's next read takes Torch's idle cache before it is refused. Refused, it
-                # is read on the request path instead (Qwen-Image int8 on 8 GB: the last streamed
-                # block, every step, 9 s per request). Out of the handler, so nothing the refused
-                # attempt admitted lives on in its traceback (cr-225).
-                release_cached(torch, self.device.type)
-                if request is not None:
-                    request.prefetch_released += 1
-                return self._prefetch_block(block, request, released=True)
-            identity = block.model.identity
-            assert identity is not None  # eligibility excludes mutable/undeclared fills
             self._prefetch = _Prefetch(
                 block,
                 region,
@@ -3031,8 +2749,6 @@ class Memory:
                 request,
                 queued,
                 overlay=overlay,
-                final=final,
-                host=kept is not None,
             )
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
@@ -3061,7 +2777,7 @@ class Memory:
                             "state": "started",
                             "set": block.model.name,
                             "block": block.index,
-                            "bytes": block.allocation_bytes,
+                            "bytes": block.storage_bytes,
                             "at_ns": time.time_ns(),
                         }
                     )
@@ -3131,13 +2847,11 @@ class Memory:
                             0,
                             int(row.get("bytes", 0)),
                             speculative=True,
-                            origin="baked" if row.get("host") else "store",
                         )
                 if complete:
-                    page = _page(block, pending.identity, pending.overlay, final=pending.final)
+                    page = _page(block, pending.identity, pending.overlay)
                     self._refills[page] = self._refills.get(page, 0) + 1
-                    if not row.get("host"):
-                        self._want(block, page)
+                    self._want(block, page)
             except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
@@ -3148,11 +2862,9 @@ class Memory:
             finally:
                 if request is not None:
                     request.prefetch_wait_ns += time.perf_counter_ns() - began
-                field = "final_region" if pending.final else "region"
-                if not complete and getattr(block, field) is pending.region:
-                    setattr(block, field, None)
-                    block.preferred = False
-                    block.preference_set = False
+                if not complete and block.region is pending.region:
+                    self._retire_phase_plan("prefetch_fill_abandoned", model=block.model)
+                    block.region = None
                 self._prefetch = None
 
     def _final_views(self, block: _Block, reclaim: bool) -> None:
@@ -3197,12 +2909,9 @@ class Memory:
         try:
             with self.lock:
                 if self._prefetch is not None:
-                    # A host-tier prefetch is one DMA already issued: it completes in milliseconds,
-                    # so another block's demand waits for it rather than discarding it. H3 Turbo
-                    # on an RTX 4090 canceled every DiT prefetch at its LoRA block's demand and
-                    # copied each page twice: 24 GB a step for 12 GB of pages.
-                    pending = self._prefetch
-                    self._settle_prefetch(cancel=pending.block is not block and not pending.host)
+                    # Demand consumes its own RAW read; another block's speculation is
+                    # canceled and drained before demand admission, as for RAW sources before.
+                    self._settle_prefetch(cancel=self._prefetch.block is not block)
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:
@@ -3273,7 +2982,7 @@ class Memory:
                 # `overlay` was read on this thread just before; no package code ran since.
                 changed = kept is None and block.model.fill(block.path, data)
                 if changed and page is not None and use is not None:
-                    self._keep_baked(page, use.tensor, streams=not block.preferred)
+                    self._keep_baked(page, use.tensor)
                 block.overlay = overlay
             if page is not None and kept is None and not changed:
                 with self.lock:  # this store read completed, and its bytes are the page
@@ -3293,8 +3002,8 @@ class Memory:
             # A failed fill may have exported storage to a transform. Retire this region
             # identity; those exports keep their own pins, never a future fill's bytes.
             if use is not None and use.needs_fill:
+                self._retire_phase_plan("weight_fill_failed", model=block.model)
                 block.region = None
-                block.preferred = False
             block.native_storage = block.native_use = None
             self._drop_final(block)
             raise
@@ -3313,6 +3022,7 @@ class Memory:
         fails the call (Qwen-Image's 1.2 GB text-encoder table beside a 5 GB game on 8 GB). The
         copy is the host tier's page when it keeps one, else read once and held while the table
         gathers; each entry tries the device first."""
+        self._retire_phase_plan("host_gathered_representation", model=block.model)
         if block.gathered is None or block.gathered[0] != overlay:
             block.gathered = None
             model = block.model
@@ -3608,10 +3318,12 @@ class Memory:
     ) -> Iterator[Request]:
         """`others`: the process's other constructions' sets, whose cached weights are not this
         request's working set (`Request.sample`)."""
+        self.cooperation_boundary(used=not idle)
         request = Request(self, id, idle, others)
         request.plan(plan)
         with self.lock:
             if not idle and any(not other.idle for other in self.requests):
+                self._retire_phase_plan("overlapping_requests")
                 request.overlap = True
                 for other in self.requests:
                     if not other.idle:
@@ -3619,7 +3331,13 @@ class Memory:
             self.requests.add(request)
         self._take_room()  # a raise or lift that came between calls binds this one from its start
         token = _REQUEST.set(request)
+        observed = False
         try:
+            # Preparation is real device-owner activity too; the native boundary tracks
+            # overlap and rejects uncertain measurements without a Python byte formula.
+            if self.cooperation is not None:
+                self.cooperation.request_boundary(begin=True)
+                observed = True
             yield request
         finally:
             try:
@@ -3631,20 +3349,28 @@ class Memory:
                 with self.lock:
                     self._rate.update(self._refills)  # the pages this request refilled
                     self._refills.clear()
+                    if self._phase_request == request.id:
+                        self._retire_phase_plan("request_ended")
+                self.forget_working_phases(request)
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
             finally:
-                with self.lock:
-                    self.requests.discard(request)
-                    alone = not self.requests
-                if alone:
-                    self._take_room()  # one that came in the call's last forward
-                if alone and self.room_limit is not None:
-                    # Held to a room, the next call starts with its own cache, not this one's
-                    # (sieg: SDXL's decode cache left its next denoise nothing to give)
-                    self._release_cache()
-                _REQUEST.reset(token)
+                try:
+                    with self.lock:
+                        self.requests.discard(request)
+                        alone = not self.requests
+                    if alone:
+                        self._take_room()  # one that came in the call's last forward
+                    if alone and self.room_limit is not None:
+                        # Held to a room, the next call starts with its own cache, not this one's
+                        # (sieg: SDXL's decode cache left its next denoise nothing to give)
+                        self._release_cache()
+                finally:
+                    _REQUEST.reset(token)
+                    if observed and self.cooperation is not None:
+                        self.cooperation.request_boundary(begin=False, check=False)
+                    self.cooperation_boundary(check=False)
 
     def stats(self) -> dict[str, Any] | None:
         return self.last
@@ -3678,8 +3404,11 @@ class Request:
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
+        self.working_phases: list[dict[str, Any]] = []
+        self.working_phase_keys: set[str] = set()
+        self.working_splits: dict[str, dict[str, Any]] = {}
         self.peak = 0
-        #: Torch's own allocated peak over the whole request, kept across cut-site resets: the
+        #: Working allocation peak over the whole request, kept across cut-site resets: the
         #: least room its call runs in (`Memory._room_floor`)
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
@@ -3689,17 +3418,17 @@ class Request:
         #: table lookups served on the host (`Memory._gather`)
         self.gathered = 0
         self.prefetch_started = self.prefetch_completed = self.prefetch_canceled = 0
-        self.prefetch_skipped = self.prefetch_failed = self.prefetch_wait_ns = 0
-        self.prefetch_released = 0
+        self.prefetch_declined = self.prefetch_failed = self.prefetch_wait_ns = 0
+        self.prefetch_unsupported: dict[str, int] = {}
         self.allocator = _allocator(memory)
         self.trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         self.queued: Callable[[], QueuedPrefetch | None] | None = None
         self.queued_prefetch: list[dict[str, Any]] = []
         if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
-            # Torch's peak is the process's since its last reset: alone, a request starts its own,
+            # The working peak is process-wide since its reset: alone, a request starts its own,
             # or its floor is the largest decode the process ever ran (sieg: SDXL gave nothing)
-            torch.cuda.reset_peak_memory_stats(memory.device)
+            vt.reset_peak(memory.device.index or 0)
         self.sample()
 
     def prefetch_queued(self) -> str | None:
@@ -3747,18 +3476,19 @@ class Request:
         room = self.memory.room(current)
         if not self.memory.cuda or not torch.cuda.is_initialized():
             return room
-        allocated, reserved, _ = _torch_bytes(self.memory.device)
-        planned = self.memory._split_budget
-        budget = None if planned is None else max(planned - allocated, 0)
-        return replace(room, cached=max(reserved - allocated, 0), budget=budget)
+        working = vt.stats(self.memory.device.index or 0)
+        allocated = int(working["allocated_bytes"])
+        return replace(room, cached=max(int(working["mapped_bytes"]) - allocated, 0))
 
     def reclaim(self, need: int = 0) -> int:
-        """A known pure cut may shed the step's speculative whole-model hold.
+        """Legacy non-CUDA cuts may shed their step's speculative whole-model hold.
 
-        Its currently executing block/common hooks retain their own uses. Explicit holds and
-        graph-owned storage stay pinned. This never retries a package or changes graph backing.
+        CUDA allocation already owns recovery. This compatibility hook does not migrate
+        the remaining legacy operation sizing/split contract or retry package execution.
         """
-        if self.idle or self.memory.capturing():
+        if self.memory.cuda or self.idle or self.memory.capturing():
+            # The allocating native call has already attempted its finite owner recovery.
+            # The remaining legacy split contract must not run a second victim policy.
             return 0
         with self.memory.lock:
             holds = [
@@ -3785,21 +3515,11 @@ class Request:
         # A child wait does not prove this entire invocation is idle or release live tensors.
         yield
 
-    def note_split(self, out_bytes: int) -> None:
-        """A split beginning: what lives beside it and its output, which no window shrinks.
-        Read on the active phase's first pass only (`Memory._replan` closes it). Kept on the
-        Memory: a child call's split and its phase may see different Request objects."""
-        memory = self.memory
-        if not memory._flooring or not memory.cuda or not torch.cuda.is_initialized():
-            return
-        memory._floor = max(memory._floor, _torch_bytes(memory.device)[0] + out_bytes)
-        memory._notes += 1
-
     def reset_peak(self) -> int:
         self.sample()
         _, _, peak = self.memory._figures()
         if self.memory.cuda and len(self.memory.requests) == 1:
-            torch.cuda.reset_peak_memory_stats(self.memory.device)
+            vt.reset_peak(self.memory.device.index or 0)
         return peak
 
     def read(
@@ -3859,6 +3579,11 @@ class Request:
             "trace": list(self.trace),
             "trace_scope": "fills",
             "phases": list(self.phase_changes),
+            "working_phases": list(self.working_phases),
+            "working_splits": list(self.working_splits.values()),
+            "cooperation": (
+                self.memory.cooperation.facts() if self.memory.cooperation is not None else None
+            ),
             "phase_policy_supported": self.memory.phase_supported,
             "room_first_pass": self.room_first,
             "gathered": self.gathered,
@@ -3870,8 +3595,11 @@ class Request:
                 peak=self.peak,
                 allocated=allocated,
                 reserved=reserved,
-                peak_window="Torch high-water plus sampled native backing, carried across resets; "
-                "other constructions' resident sets left out",
+                working_allocator=vt.stats(self.memory.device.index or 0),
+                peak_window=(
+                    "Working high-water plus sampled native backing, carried across resets; "
+                    "other constructions' resident sets left out"
+                ),
                 weight_residency=(
                     self.memory.native.stats() if self.memory.native is not None else None
                 ),
@@ -3892,22 +3620,22 @@ class Request:
                     "fallback_blocks": sum(b.aliases is None for b in groups),
                     "native_prefetch": self.memory.prefetch_supported,
                 },
-                # This request's cudaMalloc hook counters: `cache_refusals` are refused
-                # activation allocations Torch answered by freeing its whole cache.
+                # Cumulative native working counters sampled over this request.
                 allocator={
                     k: v - self.allocator.get(k, 0)
                     for k, v in _allocator(self.memory).items()
-                    if k not in ("torch_reserved_bytes", "activation_admission_limit")
                 },
                 prefetch={
                     "started": self.prefetch_started,
                     "completed": self.prefetch_completed,
                     "canceled": self.prefetch_canceled,
-                    "skipped_capacity": self.prefetch_skipped,
-                    "released_cache": self.prefetch_released,
+                    "declined_native": self.prefetch_declined,
+                    "unsupported_sources": dict(self.prefetch_unsupported),
                     "failed": self.prefetch_failed,
                     "wait_ns": self.prefetch_wait_ns,
-                    "scope": "one exact raw block; current demand precedes queued speculation",
+                    "scope": (
+                        "immutable stored RAW; native measured admission; unknown keys decline"
+                    ),
                     "queued": list(self.queued_prefetch),
                 },
             )
@@ -3917,10 +3645,17 @@ class Request:
 
 
 def _allocator(memory: Memory) -> dict[str, int]:
-    """The process's cudaMalloc hook counters on this device (TensorFS `allocator_stats`)."""
+    """Cumulative native working-allocator counters; live/backing gauges are separate."""
     if not memory.cuda or memory.native is None:
         return {}
-    return dict(varena.allocator_stats(memory.device.index or 0))
+    stats = vt.stats(memory.device.index or 0)
+    return {
+        key: int(stats[key])
+        for key in (
+            "allocations", "frees", "ooms", "driver_memory_calls",
+            "event_queries", "event_records", "event_waits", "context_joins",
+        )
+    }
 
 
 def _resident_bytes(block: _Block) -> int:
@@ -3949,15 +3684,6 @@ def _sites(module: nn.Module) -> dict[str, list[_Site]]:
                 if not any(s.table is table and s.name == attr for s in sites):
                     sites.append(_Site(table, attr, parameter))
     return {name: groups[key] for name, key in names.items()}
-
-
-def _shorten(block: _Block) -> None:
-    """`block` does not stay resident: its model's resident prefix ends before it. A table's does
-    not end there: one that does not fit gathers (`Memory._gather`) and the blocks after it may
-    still stay (a 1.2 GB text-encoder table ahead of every layer streamed them all)."""
-    model = block.model
-    if not block.table:
-        model.prefix = min(model.prefix, block.index) if model.prefix is not None else block.index
 
 
 def _view(key: str, role: str, part: _Part, raw: Tensor) -> Tensor:
@@ -4225,7 +3951,7 @@ def _hooks(model: Model) -> None:
             )
             memory._open(model, key, executing=True)
 
-        model.handles.extend(_paired(sub, opened, lambda: memory._close(model, executing=True)))
+        model.handles.extend(_paired(sub, opened, lambda: memory._close(model, executing=True), model))
     for block in model.blocks.values():
         sub = model.module.get_submodule(block.path)
 
@@ -4254,7 +3980,7 @@ def _hooks(model: Model) -> None:
             if (cut := CUTTER.get()) is not None:
                 cut.exit(b)
 
-        model.handles.extend(_paired(sub, entered, exited))
+        model.handles.extend(_paired(sub, entered, exited, model))
         if block.table:
             model.handles.extend(_gathering(sub, memory))
 
@@ -4294,7 +4020,9 @@ def _gathering(module: nn.Module, memory: Memory) -> list[Any]:
     ]
 
 
-def _paired(module: nn.Module, enter: Callable[..., None], leave: Callable[[], None]) -> list[Any]:
+def _paired(
+    module: nn.Module, enter: Callable[..., None], leave: Callable[[], None], owner: Model,
+) -> list[Any]:
     owed = threading.local()
 
     def pre(_: nn.Module, args: tuple[object, ...], kwargs: dict[str, object]) -> None:
@@ -4306,6 +4034,7 @@ def _paired(module: nn.Module, enter: Callable[..., None], leave: Callable[[], N
             owed.count -= 1
             leave()
 
+    owner.source_hooks.update((pre, post))
     return [
         module.register_forward_pre_hook(pre, with_kwargs=True),
         module.register_forward_hook(post, always_call=True),

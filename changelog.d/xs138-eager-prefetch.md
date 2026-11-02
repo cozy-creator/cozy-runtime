@@ -1,0 +1,1 @@
+- Move immutable eager RAW prefetch admission to varena; unknown keys and unsupported source recipes decline without the former Python budget or cache-release retry.
