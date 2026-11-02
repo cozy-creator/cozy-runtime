@@ -1,0 +1,63 @@
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:55: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:65: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:68: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:76: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:80: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:84: error: Returning Any from function declared to return "int"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:113: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:119: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/cooperative.py:122: error: Returning Any from function declared to return "int"  [no-any-return]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/__init__.py:209: error: Function is missing a return type annotation  [no-untyped-def]
+/home/fidika/cozy_v2/outputs/xs138-p3-cache-integrated/native-dfb912042/installed/tensorfs/varena/__init__.py:209: error: Function is missing a type annotation for one or more parameters  [no-untyped-def]
+src/cozy_runtime/author/kernels.py:364: error: Item "None" of "Any | None" has no attribute "_version"  [union-attr]
+src/cozy_runtime/internal/cooperation.py:112: error: "CooperationOwner" has no attribute "request_boundary"  [attr-defined]
+src/cozy_runtime/fusion/_kernels.py:281: error: "int" has no attribute "to"  [attr-defined]
+src/cozy_runtime/fusion/_kernels.py:285: error: "int" has no attribute "to"  [attr-defined]
+src/cozy_runtime/author/_attention.py:96: error: Item "None" of "Any | None" has no attribute "component"  [union-attr]
+src/cozy_runtime/author/_attention.py:96: error: Item "None" of "Any | None" has no attribute "path"  [union-attr]
+src/cozy_runtime/author/_activity.py:84: error: Argument 1 to "submit" of "Executor" has incompatible type "Callable[[Callable[_P, _T], **_P], _T]"; expected "Callable[[Callable[P, T], **P], T]"  [arg-type]
+src/cozy_runtime/internal/prebuilt.py:310: error: Item "None" of "Any | None" has no attribute "data_ptr"  [union-attr]
+src/cozy_runtime/internal/prebuilt.py:311: error: Item "None" of "Any | None" has no attribute "stride"  [union-attr]
+src/cozy_runtime/fusion/__init__.py:521: error: Too many arguments for "_attend"  [call-arg]
+src/cozy_runtime/fusion/__init__.py:629: error: "type" has no attribute "forward"  [attr-defined]
+src/cozy_runtime/fusion/__init__.py:859: error: "object" has no attribute "_cozy_norm"  [attr-defined]
+src/cozy_runtime/fusion/__init__.py:868: error: Argument 1 to "report" has incompatible type "**dict[str, int]"; expected "str"  [arg-type]
+src/cozy_runtime/fusion/__init__.py:979: error: "object" has no attribute "_cozy_lone"  [attr-defined]
+src/cozy_runtime/internal/residency.py:869: error: Incompatible types in assignment (expression has type "list[str]", variable has type "bool | list[tuple[_Block, int]]")  [assignment]
+src/cozy_runtime/internal/residency.py:869: error: Incompatible types in assignment (expression has type "int", variable has type "bool | list[tuple[_Block, int]]")  [assignment]
+src/cozy_runtime/internal/residency.py:970: error: Incompatible types in assignment (expression has type "dict[str, _Part]", variable has type "list[tuple[str, int, int]]")  [assignment]
+src/cozy_runtime/internal/residency.py:972: error: "list[tuple[str, int, int]]" has no attribute "items"  [attr-defined]
+src/cozy_runtime/internal/residency.py:2621: error: Return value expected  [return-value]
+src/cozy_runtime/internal/residency.py:2624: error: Return value expected  [return-value]
+src/cozy_runtime/internal/residency.py:2627: error: Return value expected  [return-value]
+src/cozy_runtime/internal/residency.py:2630: error: Return value expected  [return-value]
+src/cozy_runtime/internal/residency.py:3781: error: Incompatible types in assignment (expression has type "str", variable has type "_Part | None")  [assignment]
+src/cozy_runtime/internal/residency.py:3782: error: Non-overlapping equality check (left operand type: "_Part | None", right operand type: "str")  [comparison-overlap]
+src/cozy_runtime/internal/residency.py:3783: error: Statement is unreachable  [unreachable]
+src/cozy_runtime/internal/encoding/leaves.py:195: error: Too many arguments for "linear" of "EncodedLinear"  [call-arg]
+src/cozy_runtime/internal/lora_bake.py:651: error: Statement is unreachable  [unreachable]
+src/cozy_runtime/internal/prepared.py:538: error: No overload variant of "int" matches argument type "object"  [call-overload]
+src/cozy_runtime/internal/prepared.py:538: note: Possible overload variants:
+src/cozy_runtime/internal/prepared.py:538: note:     def int(str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc = ..., /) -> int
+src/cozy_runtime/internal/prepared.py:538: note:     def int(str | bytes | bytearray, /, base: SupportsIndex) -> int
+src/cozy_runtime/internal/prepared.py:661: error: Expected iterable as variadic argument  [misc]
+src/cozy_runtime/internal/prepared.py:703: error: Call to untyped function "_SequenceExecution" in typed context  [no-untyped-call]
+src/cozy_runtime/internal/prepared.py:765: error: Statement is unreachable  [unreachable]
+src/cozy_runtime/internal/prepared.py:959: error: Function is missing a type annotation  [no-untyped-def]
+src/cozy_runtime/internal/loop.py:224: error: "object" has no attribute "_active"  [attr-defined]
+src/cozy_runtime/internal/executor.py:3314: error: No overload variant of "int" matches argument type "object"  [call-overload]
+src/cozy_runtime/internal/executor.py:3314: note: Possible overload variants:
+src/cozy_runtime/internal/executor.py:3314: note:     def int(str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc = ..., /) -> int
+src/cozy_runtime/internal/executor.py:3314: note:     def int(str | bytes | bytearray, /, base: SupportsIndex) -> int
+src/cozy_runtime/internal/executor.py:3318: error: No overload variant of "int" matches argument type "object"  [call-overload]
+src/cozy_runtime/internal/executor.py:3318: note: Possible overload variants:
+src/cozy_runtime/internal/executor.py:3318: note:     def int(str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc = ..., /) -> int
+src/cozy_runtime/internal/executor.py:3318: note:     def int(str | bytes | bytearray, /, base: SupportsIndex) -> int
+src/cozy_runtime/internal/executor.py:3319: error: No overload variant of "int" matches argument type "object"  [call-overload]
+src/cozy_runtime/internal/executor.py:3319: note: Possible overload variants:
+src/cozy_runtime/internal/executor.py:3319: note:     def int(str | Buffer | SupportsInt | SupportsIndex | SupportsTrunc = ..., /) -> int
+src/cozy_runtime/internal/executor.py:3319: note:     def int(str | bytes | bytearray, /, base: SupportsIndex) -> int
+src/cozy_runtime/internal/executor.py:3521: error: Statement is unreachable  [unreachable]
+src/cozy_runtime/internal/executor.py:5222: error: Argument 1 to "boundary" has incompatible type "object"; expected "Iterable[str] | None"  [arg-type]
+src/cozy_runtime/internal/executor.py:5465: error: Statement is unreachable  [unreachable]
+Found 50 errors in 15 files (checked 6 source files)

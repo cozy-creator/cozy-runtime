@@ -1013,6 +1013,9 @@ def _sol_dense(
             try:
                 resolved[name] = _opened(candidate, device)
             except Exception as exc:
+                from cozy_runtime.internal.execution import phase
+
+                phase.invalidate("dispatch_retry")
                 refused.setdefault(name, f"{type(exc).__name__}: {exc}"[:300])
                 continue
         if dense is not None:
@@ -1537,6 +1540,9 @@ def _first(
             try:
                 resolved[name] = _opened(candidate, device)
             except Exception as exc:
+                from cozy_runtime.internal.execution import phase
+
+                phase.invalidate("dispatch_retry")
                 # BROAD ON PURPOSE: a kernel that fails to resolve for ANY reason steps to the
                 # next, never failing a prepare that only tried to go faster. A PIN keeps its
                 # typed refusals (`pinned`).

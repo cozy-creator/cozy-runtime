@@ -1,0 +1,1 @@
+Declared projected-head attention can use one native allocation choice for supported single-GPU dense INT4QK execution, preserving the selected kernels, encoded projection hooks, norm/RoPE, and key-mean seed. Unsupported exact, sparse, and multi-rank routes retain their existing paths.

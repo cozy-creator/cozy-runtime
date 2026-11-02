@@ -1,0 +1,33 @@
+{
+  "passed": true,
+  "scope": "current Python namespace/signature/classifier over preserved P4 6ab host ABI; not the pending composed native retirement/GPU cohort",
+  "native_ext": "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-public-api/.task/review-fixes/final-host-6ab/sdk/python/tensorfs/_ext.so",
+  "native_sha256": "f82c95cd4ccc5a9666d6260ff46c0e19bdfdbbf151d002a591d86da6059ec380",
+  "source_runtime": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-p4-python-cut",
+  "source_api_sha256": "f4896b477094609ba4382d85c15608142f77af98251210b147a800ec447906a7",
+  "public_exports": [
+    "Allocation",
+    "Busy",
+    "Cache",
+    "CacheView",
+    "Capturing",
+    "Error",
+    "Exhausted",
+    "Fault",
+    "Gpu",
+    "Invalid",
+    "Plan",
+    "Region",
+    "SourceError",
+    "Unsupported",
+    "Use",
+    "core_identity",
+    "open",
+    "retirement_stats"
+  ],
+  "fault": "exhausted",
+  "terminal_cut_invocations": [
+    0
+  ],
+  "cuda_initialized": false
+}

@@ -50,6 +50,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from cozy_runtime.author.kernels import (
+    _BLOCK_SPLIT,
     KernelsUnavailable,
     Launch,
     Plan,
@@ -426,6 +427,9 @@ def _fusable(layout: DiTBlock, x: Any) -> bool:
 
 
 def _block_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+    declared = _BLOCK_SPLIT.get()
+    if declared is not None and declared.module is self:
+        return declared.run(*args, **kwargs)
     site: _Site = self._cozy_dit
     layout, launch = site.layout, site.switch.launch
     if launch is None:
@@ -759,6 +763,7 @@ class _NormSite:
     silu: bool
     scale: float
     eps: float
+    path: str
 
 
 def _channel_norm_forward(self: Any, x: Any) -> Any:
@@ -774,6 +779,11 @@ def _channel_norm_forward(self: Any, x: Any) -> Any:
         y = self._cozy_eager(x)
         return torch.nn.functional.silu(y) if site.silu else y
     entry = layout.entries[int(site.silu)]
+    from cozy_runtime.internal.execution.native_split import channel_norm
+
+    split = channel_norm(site.path, launch, entry, x, self.gamma, bias, site.scale, site.eps)
+    if split is not None:
+        return split
     return _kernels.channel_norm(launch, entry, x, self.gamma, bias, site.scale, site.eps)
 
 
@@ -791,7 +801,7 @@ def _norm_site(norm: Any, layout: ChannelNorm, switch: _Switch, silu: bool, path
         raise _Mismatch(f"{path}: {'no ' if layout.bias else ''}bias, not as declared")
     if not isinstance(norm.bias, torch.Tensor) and norm.bias != 0.0:
         raise _Mismatch(f"{path}: a constant bias {norm.bias}")
-    return _NormSite(layout, switch, silu, channels**0.5, 1e-12)
+    return _NormSite(layout, switch, silu, channels**0.5, 1e-12, path)
 
 
 def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:

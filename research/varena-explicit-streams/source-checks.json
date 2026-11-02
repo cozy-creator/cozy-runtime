@@ -1,0 +1,22 @@
+{
+  "parsed": true,
+  "ruff": "passed",
+  "gpu_executed": false,
+  "runtime_modules": {
+    "author/_activity.py": "9f970c2fb289c06feacce316a0df6f012e970db2faf0d2c39cd536dd8d6a98e5",
+    "graphs/domain.py": "4086a1df82e5d5dafa2842e2e74c952c69e37cb55441f406246b428a6b954605",
+    "internal/accel.py": "56dfd82f73080aa084ec4d9b01d4e440e0c83289e6671f606353fec16c0fdce3",
+    "internal/executor.py": "07300c8831cc6aeab913f5a818706ec02f7584f750673bdb1eb93cc1e6c01038",
+    "internal/kernel_ready.py": "d77747b6ed4e1d8e49fd53cb77c8d96abe88c4607a0802603d5b08d771571f5a",
+    "internal/parallel/mirror.py": "11606ca308fef51ddd512fedad5e5037ab45a20240d63768da5acdc069e73e2a"
+  },
+  "mypy": {
+    "baseline_errors": 50,
+    "candidate_errors": 49,
+    "added_errors": [],
+    "removed_errors": [
+      "src/cozy_runtime/author/_activity.py: error: Argument 1 to \"submit\" of \"Executor\" has incompatible type \"Callable[[Callable[_P, _T], **_P], _T]\"; expected \"Callable[[Callable[P, T], **P], T]\"  [arg-type]"
+    ],
+    "scope": "same six changed source files and same dfb SDK overlay; baseline diagnostics preserved"
+  }
+}

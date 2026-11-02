@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
 
 #include "int8.h"
 
@@ -165,9 +166,9 @@ struct Sm80Gemm {
 
     // CUTLASS's adapter, without its swallowed launch error: occupancy and the shared-memory
     // opt-in once per card, then the kernel, whose error the caller gets.
-    static cudaError_t run(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
-                           const Out* bias, Out* out, int64_t ldo, int M, int N, int K, int sms,
-                           Workspace workspace, cudaStream_t s) {
+    static cudaError_t prepare(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
+                               const Out* bias, Out* out, int64_t ldo, int M, int N, int K,
+                               int sms, std::optional<typename Kernel::Params>& prepared) {
         typename EVT::Arguments callbacks{
             {{{{}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {}},
               {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}},
@@ -205,7 +206,29 @@ struct Sm80Gemm {
                 cudaOccupancyDisableCachingOverride);
             if (e != cudaSuccess) return e;
         }
-        typename Kernel::Params params(args, sms, blocks);
+        prepared.emplace(args, sms, blocks);
+        return cudaSuccess;
+    }
+
+    static cudaError_t query(int64_t ldo, int M, int N, int K, int sms, size_t& bytes) {
+        // The qualified caller guarantees the same 16-byte pointer alignment as run.
+        // Pointer values do not affect Params' selected schedule or workspace geometry.
+        std::optional<typename Kernel::Params> prepared;
+        const auto error = prepare(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                   ldo, M, N, K, sms, prepared);
+        if (error != cudaSuccess) return error;
+        bytes = prepared->get_workspace_size();
+        return cudaSuccess;
+    }
+
+    static cudaError_t run(const int8_t* q, const int8_t* w, const float* xs, const float* ws,
+                           const Out* bias, Out* out, int64_t ldo, int M, int N, int K, int sms,
+                           Workspace workspace, cudaStream_t s) {
+        std::optional<typename Kernel::Params> prepared;
+        const auto error = prepare(q, w, xs, ws, bias, out, ldo, M, N, K, sms, prepared);
+        if (error != cudaSuccess) return error;
+        auto& params = *prepared;
+        constexpr int smem = int(sizeof(typename Kernel::SharedStorage));
         const size_t bytes = params.get_workspace_size();
         void* scratch = bytes ? workspace.allocate(bytes, workspace.context) : nullptr;
         if (params.init_workspace(scratch, s) != cutlass::Status::kSuccess) {
@@ -221,15 +244,30 @@ template <typename Out>
 using Fn = cudaError_t (*)(const int8_t*, const int8_t*, const float*, const float*, const Out*,
                            Out*, int64_t, int, int, int, int, Workspace, cudaStream_t);
 
+using Query = cudaError_t (*)(int64_t, int, int, int, int, size_t&);
+
 template <typename Out>
-const Fn<Out> kConfigs[] = {
-    &Sm80Gemm<Out, 128, 256, 64, 64, 64, 64, 3, Identity>::run,  // 0
-    &Sm80Gemm<Out, 128, 128, 64, 64, 64, 64, 4, Identity>::run,  // 1
-    &Sm80Gemm<Out, 64, 128, 64, 32, 64, 64, 4, Identity>::run,   // 2
-    &Sm80Gemm<Out, 16, 128, 64, 16, 64, 64, 4, Identity>::run,   // 3
-    &Sm80Gemm<Out, 128, 128, 64, 64, 64, 64, 4, Banded>::run,    // 4
-    &Sm80Gemm<Out, 128, 256, 64, 64, 64, 64, 3, Banded>::run,    // 5
-    &Sm80Gemm<Out, 64, 64, 128, 32, 64, 64, 5, Identity>::run,   // 6: vLLM's sm89 M64 tile
+struct Config {
+    Fn<Out> run;
+    Query query;
+};
+
+template <typename Out, int TM, int TN, int TK, int WM, int WN, int WK, int Stages,
+          typename Swizzle>
+constexpr Config<Out> config() {
+    using Impl = Sm80Gemm<Out, TM, TN, TK, WM, WN, WK, Stages, Swizzle>;
+    return {&Impl::run, &Impl::query};
+}
+
+template <typename Out>
+constexpr Config<Out> kConfigs[] = {
+    config<Out, 128, 256, 64, 64, 64, 64, 3, Identity>(),  // 0
+    config<Out, 128, 128, 64, 64, 64, 64, 4, Identity>(),  // 1
+    config<Out, 64, 128, 64, 32, 64, 64, 4, Identity>(),   // 2
+    config<Out, 16, 128, 64, 16, 64, 64, 4, Identity>(),   // 3
+    config<Out, 128, 128, 64, 64, 64, 64, 4, Banded>(),    // 4
+    config<Out, 128, 256, 64, 64, 64, 64, 3, Banded>(),    // 5
+    config<Out, 64, 64, 128, 32, 64, 64, 5, Identity>(),   // 6: vLLM's sm89 M64 tile
 };
 constexpr int kSm80Configs = 7;
 
@@ -285,11 +323,19 @@ cudaError_t run_as(const int8_t* q, const int8_t* w, const float* xs, const floa
                    int config, Workspace workspace, cudaStream_t s) {
     if (config < 0) config = choose(M, N, K, sms);
     if (config >= kSm80Configs) return cudaErrorNotSupported;
-    return kConfigs<Out>[config](q, w, xs, ws, static_cast<const Out*>(bias),
+    return kConfigs<Out>[config].run(q, w, xs, ws, static_cast<const Out*>(bias),
                                  static_cast<Out*>(out), ldo, M, N, K, sms, workspace, s);
 }
 
 }  // namespace
+
+cudaError_t query(bool out_half, int64_t ldo, int M, int N, int K, int sms,
+                  int& config, size_t& bytes) {
+    if (config < 0) config = choose(M, N, K, sms);
+    if (config >= kSm80Configs) return cudaErrorNotSupported;
+    return out_half ? kConfigs<cutlass::half_t>[config].query(ldo, M, N, K, sms, bytes)
+                    : kConfigs<cutlass::bfloat16_t>[config].query(ldo, M, N, K, sms, bytes);
+}
 
 cudaError_t gemm(const int8_t* q, const int8_t* w, const float* scales, const float* w_scale,
                  const void* bias, void* out, int64_t ldo, bool out_half, int M, int N, int K,

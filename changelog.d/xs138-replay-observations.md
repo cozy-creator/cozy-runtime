@@ -1,0 +1,1 @@
+Retain graph-specific capture footprint metadata and pass semantic replay identities through native stage continuations, preserving weight preferences for measurement-only stages. Successful checked replay can qualify the matching native footprint; production sizing and prefetch remain unchanged pending GPU proof and policy cutover.

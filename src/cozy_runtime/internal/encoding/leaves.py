@@ -28,6 +28,7 @@ from typing import Any, ClassVar, Protocol
 
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author.kernels import (
+    _LINEAR_SPLIT,
     INT8_CONVROT,
     ROWWISE_FP8,
     PreQuantized,
@@ -244,6 +245,8 @@ def _native_leaf_class(torch: ModuleType) -> type:
             prequantized: PreQuantized | None,
             out: Tensor | None = None,
         ) -> Tensor:
+            if (planned := _LINEAR_SPLIT.get()) is not None and planned.module is self:
+                return planned.run(x, prequantized, out)
             # The ops launch by pointer: a leaf run outside its model's forward (Klein's
             # modulation heads) has its weight read in (cr-208).
             ops = _NATIVE_OPS[self.provider]

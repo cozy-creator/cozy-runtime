@@ -1,0 +1,48 @@
+{
+  "creator": {
+    "reference": "956f2b6fc",
+    "head": "421f173710cd429bf499f5ca3356ebb85e550965",
+    "trees": {
+      "crates/varena": {
+        "reference": "3b6188855da572d686cd9c43b54d9acac5b068c8",
+        "head": "3b6188855da572d686cd9c43b54d9acac5b068c8",
+        "worktree_diff": [
+          "crates/varena/examples/cache_application.py",
+          "crates/varena/examples/cuda_driver.py",
+          "crates/varena/examples/python_client.py"
+        ]
+      },
+      "crates/tensorfs": {
+        "reference": "76a478d6fb17c474400aaddba8fb42e824f745c8",
+        "head": "76a478d6fb17c474400aaddba8fb42e824f745c8",
+        "worktree_diff": []
+      },
+      "crates/tensorfs-py/src": {
+        "reference": "539321f27a877bc06edf7e181bf36a7327009090",
+        "head": "539321f27a877bc06edf7e181bf36a7327009090",
+        "worktree_diff": []
+      },
+      "crates/tensorfs-py/shim": {
+        "reference": "6683e6f645bf5cc1ddba312cd389a6d826c9fa3b",
+        "head": "6683e6f645bf5cc1ddba312cd389a6d826c9fa3b",
+        "worktree_diff": []
+      }
+    }
+  },
+  "runtime": {
+    "reference": "a09601d35eb11054ed8adbfd16011ccf2a918dd7",
+    "head": "054bf49b019729cedc51967a971aaa896feb4352",
+    "trees": {
+      "kernels": {
+        "reference": "6a934ae82f607839a658153abdc33a9d923201b4",
+        "head": "6a934ae82f607839a658153abdc33a9d923201b4",
+        "worktree_diff": []
+      },
+      "src/cozy_runtime/_kernels": {
+        "reference": "9240dac7eaac718bcc9a3920bf480c4f3d11ec3a",
+        "head": "9240dac7eaac718bcc9a3920bf480c4f3d11ec3a",
+        "worktree_diff": []
+      }
+    }
+  }
+}
