@@ -69,7 +69,10 @@ class Owner:
                 or not facts["active"] or facts["closed"]
             ):
                 raise Failure("native cooperation did not retain this process's live service row")
-            if row["sharing"] != ("Shared" if config.shared else "Dedicated") or row["priority"] != config.priority:
+            if (
+                row["sharing"] != ("Shared" if config.shared else "Dedicated")
+                or row["priority"] != config.priority
+            ):
                 raise Failure(
                     "existing native cooperation configuration differs from negotiated Start: "
                     f"row={row['id']} actual={row['sharing']}/{row['priority']} "
