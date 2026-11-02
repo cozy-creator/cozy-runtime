@@ -156,6 +156,7 @@ class _Recording:
         self.torch, self.graph, self.pool, self.owner = torch, graph, pool, owner
         self.inputs, self.outputs, self.layout = inputs, outputs, layout
         self.served = [(b, i) for b, impls in served.items() for i in impls]
+        self.refused = dict(served.refused)
         #: bytes the last replay copied in and out
         self.copied = 0
         self.done: Any = None
@@ -190,6 +191,8 @@ class _Recording:
                 self.graph.replay()
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
+            for why, calls in self.refused.items():
+                attention_ulysses.refused(why, calls)
             source = torch.utils._pytree.tree_leaves(self.outputs)
             for dst, src in zip(torch.utils._pytree.tree_leaves(out), source, strict=True):
                 if isinstance(src, torch.Tensor):

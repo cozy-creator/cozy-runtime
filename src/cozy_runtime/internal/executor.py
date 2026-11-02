@@ -1117,6 +1117,7 @@ class Executor:
         end_us: int,
         impl: str = "",
         segments: Sequence[Mapping[str, Any]] = (),
+        refused: Mapping[str, int] | None = None,
     ) -> dict[str, Any]:
         """The attempt's execution record: degree, every GPU, and the setup it ran on."""
         gpus = [
@@ -1128,7 +1129,7 @@ class Executor:
                     pin,
                     execution_evidence.observed(choices.hosts) if choices else "",
                     impl,
-                    attention.evidence(choices.totals() if choices else ()),
+                    attention.evidence(choices.totals() if choices else (), refused),
                     segments,
                     choices.fallbacks if choices else (),
                 ),
@@ -1473,7 +1474,7 @@ class Executor:
                 execution_evidence.attention(
                     observed=execution_evidence.observed(self._run_held.hosts),
                     impl=attention.implementations(served),
-                    kernels=attention.evidence(self._run_held.totals()),
+                    kernels=attention.evidence(self._run_held.totals(), served.refused),
                 ),
             ),
         }
@@ -3580,7 +3581,7 @@ class Executor:
         sol_counts: dict[str, int] = {}
         sol_rank_counts: dict[int, dict[str, int]] = {}
         sol_kernels: list[dict[str, Any]] = []
-        served_impls: dict[str, set[str]] = {}
+        served_impls = attention_ulysses.Seen()
         # A kernel that finishes compiling mid-run serves from the next step or stage on
         # (`_upgrade_attention`): each selection the run served and from which step.
         segments: list[dict[str, Any]] = []
@@ -3876,6 +3877,7 @@ class Executor:
                     released_us,
                     attention.implementations(served_impls),
                     segments if len(segments) > 1 else (),
+                    served_impls.refused,
                 ),
                 "cuts": self.host.cuts.pop(
                     command.request_id, {"sites": [], "levels": {}, "oom_floor": 0}
