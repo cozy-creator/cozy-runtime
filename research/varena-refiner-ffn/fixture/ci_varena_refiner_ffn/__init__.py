@@ -92,10 +92,16 @@ def network(dtype, device):
 
 
 def profile_call(ff, x):
+    from cozy_runtime import _kernels
     from cozy_runtime.internal.execution import catch
+    from cozy_runtime.internal.execution.native_linear_split import launch_projection
     from cozy_runtime.internal.execution.native_refiner_ffn import _execute
 
-    counts = {"composites": 0, "legacy_cuts": 0}
+    native = {getattr(_kernels._gemm, name): name
+              for name in ("gemm", "gemv", "quantize", "int8_plan")}
+    counts = {"composites": 0, "legacy_cuts": 0, "native_errors": 0,
+              **{name: 0 for name in native.values()}}
+    dispatches = []
     assert sys.getprofile() is None
 
     def profile(frame, event, arg):
@@ -104,19 +110,32 @@ def profile_call(ff, x):
                 counts["composites"] += 1
             if frame.f_code is catch.cut.__code__:
                 counts["legacy_cuts"] += 1
+            if frame.f_code is launch_projection.__code__:
+                dispatches.append(dict(vars(frame.f_locals["dispatch"])))
+        elif event == "c_return" and arg in native:
+            counts[native[arg]] += 1
+        elif event == "c_exception" and arg in native:
+            counts["native_errors"] += 1
 
     sys.setprofile(profile)
     try:
         output = ff(x)
     finally:
         sys.setprofile(None)
-    assert counts == {"composites": 1, "legacy_cuts": 0}, counts
-    return output, counts
+    assert counts["composites"] == 1 and counts["legacy_cuts"] == 0, counts
+    assert counts["int8_plan"] > 0 and counts["native_errors"] == 0, counts
+    assert counts["gemm"] == sum(part["kind"] == 0 for part in dispatches), counts
+    assert counts["gemv"] == sum(part["kind"] == 1 for part in dispatches), counts
+    assert counts["quantize"] == counts["gemm"], counts
+    assert counts["gemm"] + counts["gemv"] == len(dispatches) > 0, counts
+    return output, counts, dispatches
 
 
 @app.entrypoint(accelerator=True)
 def consumer(payload: Probe, ctx: Context) -> Report:
+    from cozy_runtime.author.kernels import INT8_CONVROT
     from cozy_runtime.internal import execution, int8_linear, prebuilt, verify
+    from cozy_runtime.internal.encoding.leaves import _native_leaf_class
     from cozy_runtime.internal.execution.native_refiner_ffn import declare, split_ffn
 
     request, vt = actual(payload, ctx)
@@ -125,12 +144,22 @@ def consumer(payload: Probe, ctx: Context) -> Report:
               "torch": str(torch.__version__), "cases": [], "keys": []}
     try:
         assert int8_linear.native(torch, device) is not None
-        assert int8_linear.library(device).family == "mma.sync"
+        library = int8_linear.library(device)
+        assert library.family == "mma.sync" and int8_linear.serving(device) == int8_linear.OP
+        result["selected_library"] = {"identity": library.identity, "family": library.family,
+                                      "serving": int8_linear.serving(device)}
         assert vt.split_context(device)["eligible"]
         with torch.inference_mode():
             for dtype in (torch.bfloat16, torch.float16):
                 refiner = network(dtype, ctx.device)
                 ff = refiner.ff
+                leaves = (ff.net[0].proj, ff.net[2])
+                assert all(type(leaf) is _native_leaf_class(torch) for leaf in leaves)
+                assert all(leaf.provider == INT8_CONVROT and leaf.out_dtype == dtype
+                           for leaf in leaves)
+                providers = [{"class": type(leaf).__qualname__, "provider": leaf.provider,
+                              "encoding": leaf.encoding, "dtype": str(leaf.out_dtype),
+                              "shape": tuple(leaf.data.shape)} for leaf in leaves]
                 inputs, references = [], []
                 for rows in (5, 17, 513):
                     value = torch.randn((1, rows, 5376), dtype=dtype,
@@ -149,16 +178,30 @@ def consumer(payload: Probe, ctx: Context) -> Report:
                     after = sum(row["selections"] for row in request.working_splits.values())
                     assert after == before
                     ff.net[2].bias = old_bias
-                    output, counts = profile_call(ff, value)
+                    prior = {key: row["selections"] for key, row in request.working_splits.items()}
+                    output, counts, dispatches = profile_call(ff, value)
                     torch.cuda.synchronize(device)
                     error = verify.error(torch, output.cpu(), reference)
                     assert error <= prebuilt.BUDGET, error
                     records = {key: row for key, row in request.working_splits.items()
                                if row.get("site") == "refiner-swiglu-ffn"}
                     assert records
+                    selected = [row for key, row in records.items()
+                                if row["selections"] == prior.get(key, 0) + 1]
+                    assert len(selected) == 1
+                    active = selected[0]
+                    chunk = active["row_chunk"]
+                    expected_dispatches = []
+                    for at in range(0, value.shape[1], chunk):
+                        suffix = "" if min(chunk, value.shape[1] - at) == chunk else "_tail"
+                        expected_dispatches.extend(active["dispatch"][name + suffix]
+                                                   for name in ("up", "down"))
+                    assert dispatches == expected_dispatches
                     result["cases"].append({"dtype": str(dtype), "rows": value.shape[1],
                                             "relative_l2": error, "limit": prebuilt.BUDGET,
                                             "counts": counts,
+                                            "providers": providers,
+                                            "native_dispatches": dispatches,
                                             "records": json.loads(json.dumps(records))})
                     result["keys"].extend(key for key in records if key not in result["keys"])
                     del output

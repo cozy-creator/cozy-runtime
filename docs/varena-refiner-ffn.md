@@ -64,10 +64,21 @@ and custom-forward/hook/dropout refusals. Official H3 geometry is constructed on
 meta. CUDA remains uninitialized and libcuda unmapped. Targeted mypy and Ruff
 checks are source evidence only.
 
+`semantic_check.py` evaluates the complete production `phase.configuration`
+expression and key expression extracted from source. Real CPU tensor layouts and
+NativeLinear provider/encoding strings combine with explicitly metadata-only
+library/dispatch values. Frozen `_Geometry`/`_Dispatch` and the complete tuple
+allocation menu serialize; dispatch, layout, library, provider and menu changes
+each change the key. Nested mutable menus/dataclass dictionaries still refuse,
+and the global serializer remains strict. No native plan is queried by this test.
+
 `research/varena-refiner-ffn/fixture` is a genuine Cozy consumer app. It constructs
 the actual H3-width refiner FFN with real int8 data/scales, compares its stock
 forward to the accepted composite for BF16 and FP16 at 5/17/513 rows, profiles one
-composite and zero old cuts, records exact selected plans/allocation inventories,
+composite and zero old cuts, verifies the real NativeLinear/provider/library, and
+counts successful C-extension GEMM/GEMV/quantize/plan calls. Their counts and
+actual launch dispatches must match the newly selected record, so a successful
+fallback cannot pass. It records exact selected plans/allocation inventories,
 and checks unsupported bias before any selection. A same-PID cleanup entry checks
 request-owned key retirement. `prepare.py` freezes the fixture and derives strict
 Runtime/native/GPU identity input from supplied wheels. No model download or
