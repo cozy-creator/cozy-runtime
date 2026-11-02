@@ -72,6 +72,7 @@ def install(module: nn.Module) -> int:
             count += 1
         if any(k in _FFN for k in kinds) and "_cozy_cut" not in vars(sub):
             sub.forward = catch.transparent(_ffn(f"{path}:tokens", sub, _forward(sub)))
+            vars(sub)["_cozy_ffn_cut_forward"] = sub.forward
             vars(sub)["_cozy_cut"] = True
             count += 1
     return count
@@ -174,6 +175,9 @@ def _forward(module: nn.Module) -> Callable[..., object]:
 
 
 def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callable[..., object]:
+    from cozy_runtime.internal.execution.native_refiner_ffn import declare, split_ffn
+
+    declared = declare(module)
     whole: list[bool] = []  # a piece returned no tensor: it runs whole from then on
 
     def cut(x: object, *args: object, **kwargs: object) -> object:
@@ -192,6 +196,10 @@ def _ffn(site: str, module: nn.Module, forward: Callable[..., object]) -> Callab
         tokens = x.numel() // max(x.shape[-1], 1)
         if tokens < 2:
             return forward(x)
+        if declared is not None and x.is_cuda:
+            result = split_ffn(declared, x)
+            if result is not None:
+                return result
         shape = _ffn_shape(module, x)
         if shape is None:
             whole.append(True)
