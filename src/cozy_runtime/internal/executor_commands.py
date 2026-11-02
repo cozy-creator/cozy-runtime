@@ -220,7 +220,9 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: card of this many bytes, the executor's memory budget, to test constrained VRAM on bigger
     #: cards.
     gpu_memory_limit: int | None = None
-    cooperation: Cooperation | None = None
+    #: One native owner intent per sealed GPU, in the same order as `devices`.
+    #: Empty for CPU/MPS or an import-only parent; a CUDA start requires every rank.
+    cooperation: tuple[Cooperation, ...] = ()
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)

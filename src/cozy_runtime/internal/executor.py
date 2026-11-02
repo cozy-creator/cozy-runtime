@@ -822,6 +822,7 @@ class Executor:
         #: HOST ONLY: Start's development GPU memory limit, the memory's budget (the card's size)
         self.gpu_memory_limit: int | None = None
         self.cooperation_config: cooperation.Config | None = None
+        self.cooperation_intents: tuple[executor_commands.Cooperation, ...] = ()
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -1039,10 +1040,10 @@ class Executor:
         """
         owner = self.host
         if self.device_kind == "cuda" and (
-            owner.cooperation_config is None or self.world != 1 or not cooperation.capable()
+            owner.cooperation_config is None or not cooperation.capable()
         ):
             return {"ok": False, "code": "cooperation_required",
-                    "detail": "CUDA initialization requires explicit single-GPU native "
+                    "detail": "CUDA initialization requires explicit per-rank native "
                               "cooperation and Working custody; no standalone defaults"}
         if not owner._startup_reported:
             # Observe before the explicit boundary on every rank, including a
@@ -1079,7 +1080,8 @@ class Executor:
             if self.device_kind == "cuda":
                 assert owner.cooperation_config is not None
                 staged_owner = cooperation.Owner(
-                    0, owner.cooperation_config, owner._cooperation_failed
+                    self.rank if self.world > 1 else 0,
+                    owner.cooperation_config, owner._cooperation_failed
                 )
             accel.initialize(torch, self.device_kind)
             if self.device_kind == "cuda":
@@ -1702,21 +1704,29 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
-        selected = cooperation.Config.from_wire(getattr(command, "cooperation", None))
+        degree = command.sequence_parallel_degree or 1
+        try:
+            selected = cooperation.Config.for_rank(command.cooperation, self.rank, degree)
+        except ValueError as error:
+            return {"ok": False, "code": "cooperation_invalid", "detail": str(error)}
         if selected is not None and (
             command.import_only or not command.devices
-            or command.sequence_parallel_degree != 1 or not cooperation.capable()
+            or not cooperation.capable()
         ):
             return {"ok": False, "code": "cooperation_unsupported",
-                    "detail": "cooperation requires the negotiated single-GPU native owner "
+                    "detail": "cooperation requires the negotiated per-rank native owner "
                               "capability; no legacy fallback"}
         if (
             (self.started or self.host.memory is not None)
-            and selected != self.host.cooperation_config
+            and (
+                selected != self.host.cooperation_config
+                or command.cooperation != self.host.cooperation_intents
+            )
         ):
             return {"ok": False, "code": "cooperation_changed",
                     "detail": "an active executor cannot change its negotiated memory policy"}
         self.host.cooperation_config = selected
+        self.host.cooperation_intents = command.cooperation
         self.host.gpu_memory_limit = command.gpu_memory_limit
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
@@ -1732,7 +1742,6 @@ class Executor:
                 f"{sealed_devices!r} and the start names {command.devices!r}: "
                 "an executor serves exactly its lane's devices",
             }
-        degree = command.sequence_parallel_degree or 1
         expected = self.world if self.rank > 0 else max(degree, 1)
         if degree != expected or (degree > 1 and degree != len(_sealed_entries())):
             self.poisoned = "sequence-parallel degree mismatch"
@@ -1748,10 +1757,6 @@ class Executor:
                 return {"ok": False, "code": "cooperation_required",
                         "detail": "CUDA Start requires negotiated native cooperation and "
                                   "Working custody; standalone defaults are not Runtime policy"}
-            if degree != 1:
-                return {"ok": False, "code": "cooperation_unsupported",
-                        "detail": "multi-rank CUDA requires per-rank native configuration; "
-                                  "qualification remains open"}
             if importlib.util.find_spec("torch") is None:
                 return {"ok": False, "code": "cooperation_unsupported",
                         "detail": "CUDA Runtime startup without Torch has no qualified "
@@ -1884,6 +1889,11 @@ class Executor:
                         raise GroupRefusal(
                             f"{follower.gpu} refused the start: {reply.get('code')}: "
                             f"{reply.get('detail', '')}"[:800],
+                            code="group_unformed",
+                        )
+                    if bool(reply.get("cooperation_active")) != (selected is not None):
+                        raise GroupRefusal(
+                            f"{follower.gpu} did not acknowledge its native cooperation owner",
                             code="group_unformed",
                         )
                 if not command.import_only:

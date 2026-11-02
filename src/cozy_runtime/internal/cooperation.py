@@ -5,7 +5,7 @@ Imported by CPU-only Hello: no Torch import, CUDA query, participant or thread s
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,6 +43,21 @@ class Config:
         if not directory.is_absolute():
             raise ValueError("cooperation requires an explicit absolute shared tmpfs directory")
         return cls(value.uuid, directory, value.shared, value.priority)
+
+    @classmethod
+    def for_rank(cls, values: Sequence[Any], rank: int, degree: int) -> Config | None:
+        """Validate the complete rank inventory before any device or follower starts."""
+        if not values:
+            return None
+        if degree < 1 or len(values) != degree or not 0 <= rank < degree:
+            raise ValueError("cooperation must name exactly one owner per GPU rank")
+        configs = tuple(cls.from_wire(value) for value in values)
+        if any(config is None for config in configs):
+            raise ValueError("cooperation cannot omit a GPU rank")
+        identities = [config.uuid.casefold() for config in configs if config is not None]
+        if len(set(identities)) != degree:
+            raise ValueError("cooperation GPU identities must be distinct")
+        return configs[rank]
 
 
 class Failure(RuntimeError):
