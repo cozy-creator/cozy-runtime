@@ -67,7 +67,6 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import tensorfs
-import tensorfs.varena
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
@@ -1021,9 +1020,7 @@ class Executor:
             "cooperative_owner": cooperation.capable(),
             # `room` read at once, a running call's included (`_room`), where TensorFS can hold one
             # (`residency.yields`: imported here, residency would bring Torch in before the hello).
-            "room": all(
-                callable(getattr(tensorfs.varena, f, None)) for f in ("make_room", "no_capture")
-            ),
+            "room": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,

@@ -1948,7 +1948,7 @@ class _Engine:
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
-            vt.replay(graph)
+            vt.replay(graph, stream=torch.cuda.current_stream(self.domain.device))
         if graph is not None:
             self.replayed += 1
         else:

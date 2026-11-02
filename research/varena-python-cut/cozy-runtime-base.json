@@ -1,0 +1,9 @@
+{
+  "owner": "/root/core_restart",
+  "purpose": "P4 canonical public Python surface and private Runtime consumer migration",
+  "branch": "codex/xs138-p4-python-cut",
+  "head": "054bf49b019729cedc51967a971aaa896feb4352",
+  "base_sha": "6ac83520a595e4da4dafc31035ed588b82e8b307",
+  "integrated_parent": "a09601d35eb11054ed8adbfd16011ccf2a918dd7",
+  "upstream_contract": "a09601d35eb11054ed8adbfd16011ccf2a918dd7"
+}

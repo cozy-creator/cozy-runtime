@@ -8,7 +8,6 @@ the native manager keeps eligible backing cached. CPU and MPS use Torch-owned st
 from __future__ import annotations
 
 import hashlib
-import inspect
 import math
 import sys
 import threading
@@ -27,8 +26,8 @@ from typing import Any, Protocol
 import tensorfs
 import tensorfs.varena.torch as vt
 import torch
-from tensorfs import varena
 from tensorfs.raw import parts as stored_parts
+from tensorfs.varena import _runtime as varena
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
@@ -82,7 +81,7 @@ _ROOM_BLOCKS = 3
 
 def yields() -> bool:
     """Whether the native allocator accepts TensorD's process room; lifecycle stays in TensorD."""
-    return callable(getattr(varena, "make_room", None))
+    return True
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
@@ -897,7 +896,7 @@ class Binding:
             model._claim()
             try:
                 if why := self._load_refusal(
-                    stage, getattr(varena.LoadSlot, "supports_region_input", False)
+                    stage, varena.LoadSlot.supports_region_input
                 ):
                     raise StaleBinding(
                         f"native component loading needs idle immutable raw layouts: {why}"
@@ -943,7 +942,7 @@ class Binding:
                             )
                             offset += (part.nbytes + 255) // 256 * 256
                     groups.append((region, parts))
-                if stage and not getattr(varena.LoadSlot, "supports_ready_stage", False):
+                if stage and not varena.LoadSlot.supports_ready_stage:
                     raise StaleBinding("TensorFS lacks ready-input model stage preparation")
                 slot = (
                     varena.LoadSlot.from_regions(model.source.ck, groups, keep_ready=True)
@@ -1392,8 +1391,6 @@ class Memory:
         #: stored pages whose store read completed: a resident block's page is wanted on its second
         self._read_once: set[tuple[object, ...]] = set()
         self._host_looked = 0.0
-        admission = inspect.signature(varena.Region.prepare).parameters
-        self._host_prepare = "evict_completed" in admission  # TensorFS 0.17.4
         if self.cuda:
             try:
                 if not cache_owners.supported():
@@ -1401,21 +1398,13 @@ class Memory:
                 if budget_bytes is not None:
                     vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
-                if not callable(getattr(self.native, "clear_streaming_limit", None)):
-                    raise ResidencyError("native CUDA retention requires clear_streaming_limit")
                 # One policy for this Memory lifetime. Registration, phase changes and
                 # dtype rebinding never reinstall an estimated idle-cache window.
                 self.native.clear_streaming_limit()
                 self.granularity = int(self.native.granularity)
-                self.prefetch_supported = bool(
-                    callable(getattr(varena, "replay", None))
-                    and callable(getattr(varena.Region, "prepare_prefetch", None))
-                    and getattr(varena, "supports_prefetch", lambda: False)()
-                )
-                self.phase_supported = bool(getattr(varena, "supports_phases", lambda: False)())
-                self.phase_plan_supported = bool(
-                    getattr(varena, "supports_phase_plans", lambda: False)()
-                )
+                self.prefetch_supported = varena.supports_refill()
+                self.phase_supported = True
+                self.phase_plan_supported = True
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
                     raise
@@ -2699,7 +2688,7 @@ class Memory:
                 return
             if block.finals and block.region is not None and block.region.resident:
                 return  # its stored bytes are resident; demand writes the final ones
-            kept = self._baked.get(page) if self._host_prepare else None
+            kept = self._baked.get(page)
             if kept is not None and kept.tensor.numel() == block.storage_bytes:
                 if request is not None:
                     counts = request.prefetch_unsupported

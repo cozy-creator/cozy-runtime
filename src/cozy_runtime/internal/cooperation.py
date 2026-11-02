@@ -11,12 +11,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from tensorfs import varena
+from tensorfs.varena import _runtime as varena
 
 
 def capable() -> bool:
-    owner = getattr(varena, "CooperationOwner", None)
-    return owner is not None and getattr(owner, "capability", lambda: 0)() == 1
+    return varena.CooperationOwner.capability() == 1
 
 
 def initialize() -> None:
@@ -133,10 +132,10 @@ class Owner:
 
     def request_boundary(self, *, begin: bool, check: bool = True) -> None:
         self._process()
-        # Older native owner cohorts retain their negotiated allocator/recovery policy;
-        # the additive sampled-pressure extension is separately observable in owner facts.
-        if self._closed or getattr(self._peer, "pressure_capability", lambda: 0)() != 1:
+        if self._closed:
             return
+        if self._peer.pressure_capability() != 1:
+            raise Failure("native cooperation has an unsupported pressure protocol")
         try:
             self._peer.request_boundary(begin=begin)
         except Exception as cause:

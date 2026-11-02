@@ -6,12 +6,11 @@ from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from typing import Any
 
-from tensorfs import varena
+from tensorfs.varena import _runtime as varena
 
 
 def supported() -> bool:
-    owner = getattr(varena, "CacheOwner", None)
-    return owner is not None and getattr(owner, "capability", lambda: 0)() == 1
+    return varena.CacheOwner.capability() == 1
 
 
 @contextmanager
@@ -76,6 +75,8 @@ class Registration:
 
 
 def register(device: Any, target: Any, method: str) -> Registration | None:
-    if device.type != "cuda" or not supported():
-        return None  # supported SDK skew retains the existing synchronous owner lifecycle
+    if device.type != "cuda":
+        return None
+    if not supported():
+        raise RuntimeError("native CUDA recovery requires the CacheOwner protocol")
     return Registration(device.index or 0, target, method)

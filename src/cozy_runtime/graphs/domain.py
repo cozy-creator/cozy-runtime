@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import tensorfs.varena.torch as vt
-from tensorfs import varena
+from tensorfs.varena import _runtime as varena
 
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import accel, kernel_ready
@@ -105,8 +105,7 @@ class Domain:
 
     def recovery_blocked(self, *, replay: bool = False) -> AbstractContextManager[Any]:
         """Block reclaim; actual capture also excludes native producers."""
-        # Older native cohorts retain their conservative capture guard.
-        guard = getattr(varena, "replay", varena.capture) if replay else varena.capture
+        guard = varena.replay if replay else varena.capture
         return guard(self.device)
 
     def initialize(self) -> None:

@@ -48,7 +48,7 @@ from typing import Any
 
 import tensorfs.varena.torch as vt
 import torch
-from tensorfs import varena
+from tensorfs.varena import _runtime as varena
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
@@ -2114,7 +2114,7 @@ class _Cutter:
             if binding is not None:
                 binding.close()
             raise
-        events = bool(getattr(varena.LoadSlot, "supports_event_input", False)) and bool(
+        events = varena.LoadSlot.supports_event_input and bool(
             getattr(_execution.ResidentRepeat, "supports_event_input", False)
         )
         plan._load = source

@@ -13,7 +13,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from typing import Any, NoReturn
 
 import torch
-from tensorfs import varena
+from tensorfs.varena import _runtime as varena
 
 from cozy_runtime import graphs
 from cozy_runtime.author._context import Context
@@ -571,7 +571,7 @@ class PreparedSequence:
             phase_controllers: dict[Any, Any] = {}
             phase_definitions: dict[tuple[Any, tuple[str, ...]], tuple[str, tuple[Any, ...]]] = {}
             request = _REQUEST.get()
-            phase_type = getattr(varena, "PhaseController", None)
+            phase_type = varena.PhaseController
             try:
                 # Every program model is claimed before model-wide phase identities are
                 # snapshotted. Unrelated declared siblings are not decorated or borrowed.
@@ -591,7 +591,7 @@ class PreparedSequence:
                             capsule, event_ordered=stage._load_ordering == "events"
                         )
                         reads.append((stage_index, observation, stage._owned_bindings))
-                    if callable(phase_type) and request is not None and stage._owned_bindings:
+                    if request is not None and stage._owned_bindings:
                         memories = {binding.model.memory for binding in stage._owned_bindings}
                         if len(memories) == 1:
                             memory = next(iter(memories))
