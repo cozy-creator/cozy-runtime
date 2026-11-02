@@ -1,0 +1,16 @@
+{
+  "source": "88b7f7619a8d1669bd8ae89e9e285a302ac3c061",
+  "command": [
+    "nice",
+    "-n",
+    "19",
+    "python3",
+    "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/build-runtime-candidate-v4.py",
+    "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-v2-current-core",
+    "/home/fidika/cozy_v2/outputs/xs138-p2-vae-block/native-a09e68dba/native-build-receipt.json"
+  ],
+  "exit": 0,
+  "seconds": 16.789,
+  "native_rebuild": false,
+  "UV_OFFLINE": true
+}

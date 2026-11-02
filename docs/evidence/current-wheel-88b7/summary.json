@@ -1,0 +1,67 @@
+{
+  "passed": true,
+  "owner": "/root/current_cohort_restart",
+  "creator_source": "0a37d56a8ab4758e063f7470e6312922c177c730",
+  "runtime_source": "88b7f7619a8d1669bd8ae89e9e285a302ac3c061",
+  "runtime_version": "0.37.2+dev.g88b7f761",
+  "wheel": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/runtime-build-88b7f7619/dist/cozy_runtime-0.37.2+dev.g88b7f761-cp312-abi3-manylinux_2_28_x86_64.whl",
+  "wheel_sha256": "c35299925087fac0c300b768802761bd1f503b9897f3f6a67d47af1795a78e5a",
+  "build_seconds": 16.789,
+  "record_rows": 832,
+  "source_members_verified": 225,
+  "native_input_files": 65,
+  "triton_spec_pairs": 49,
+  "triton_keys": 285,
+  "native_members": 581,
+  "source_changes_after_previous_freeze": [
+    "src/cozy_runtime/internal/execution/cuts.py",
+    "src/cozy_runtime/internal/execution/native_refiner_ffn.py"
+  ],
+  "cpu_checks": [
+    {
+      "name": "wheel-import-003",
+      "exit": 0,
+      "seconds": 2.918
+    },
+    {
+      "name": "wheel-cli-003",
+      "exit": 0,
+      "seconds": 0.419
+    },
+    {
+      "name": "refiner-host-003",
+      "exit": 0,
+      "seconds": 6.702
+    },
+    {
+      "name": "refiner-semantic-003",
+      "exit": 0,
+      "seconds": 1.729
+    },
+    {
+      "name": "strict-wheel-startup-003",
+      "exit": 0,
+      "seconds": 16.746
+    },
+    {
+      "name": "refiner-fixture-import-003",
+      "exit": 0,
+      "seconds": 4.553
+    }
+  ],
+  "strict_startup_cases": 9,
+  "rank_selections": 7,
+  "startup_sender_frames": "prior actual Rust sender; current Creator rank source hashes unchanged",
+  "tensorfs_wheel": "/home/fidika/cozy_v2/outputs/xs138-native-api-integrated/linux-d3e8b3651-final-001/wheels/tensorfs-0.17.16+dev.gd3e8b365-cp311-abi3-linux_x86_64.whl",
+  "tensorfs_sha256": "eadf34656d860e9e11b4f0b822d68495abd4759cad14cf20f2f5370d72b3ea2a",
+  "tensorfs_scope": "existing d3e8 native-lineage artifact read-only; no current Creator cohort wheel built",
+  "build_driver": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/build-runtime-candidate-v4.py",
+  "build_driver_sha256": "8e7a4bbfe71b3de48f8f35d05f4be1e4f8db81c5b5ab54264cd35793e39f444f",
+  "native_rebuild": false,
+  "current_worker_or_tensorfs_build": false,
+  "gpu_qualification": false,
+  "refiner_actual_gpu_dispatch": false,
+  "live_install": false,
+  "release": false,
+  "old_artifacts_preserved": true
+}

@@ -1,0 +1,93 @@
+{
+  "results": [
+    {
+      "name": "wheel-import-003",
+      "command": [
+        "nice",
+        "-n",
+        "19",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/bin/python",
+        "-c",
+        "import json,sys\nfrom pathlib import Path\nimport torch,cozy_runtime\nfrom cozy_runtime._build_provenance import COMMIT\nfrom cozy_runtime.internal.execution import cuts,native_refiner_ffn\nfrom tensorfs import _ext\nassert cozy_runtime.__version__ == '0.37.2+dev.g88b7f761'\nassert COMMIT == '88b7f7619a8d1669bd8ae89e9e285a302ac3c061'\nassert '/.task/runtime-wheel-003/' in cozy_runtime.__file__ and '/.task/runtime-wheel-003/' in cuts.__file__ and '/.task/runtime-wheel-003/' in native_refiner_ffn.__file__\nassert not torch.cuda.is_initialized() and 'libcuda.so' not in Path('/proc/self/maps').read_text()\nprint(json.dumps({'passed':True,'runtime':cozy_runtime.__file__,'version':cozy_runtime.__version__,'commit':COMMIT,'refiner':native_refiner_ffn.__file__,'tensorfs_extension':_ext.__file__,'torch':torch.__version__,'cuda_initialized':False,'driver_loaded':False}))"
+      ],
+      "exit": 0,
+      "seconds": 2.918
+    },
+    {
+      "name": "wheel-cli-003",
+      "command": [
+        "nice",
+        "-n",
+        "19",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/bin/python",
+        "-c",
+        "from cozy_runtime.cli.main import main; raise SystemExit(main([\"--json\",\"version\"]))"
+      ],
+      "exit": 0,
+      "seconds": 0.419
+    },
+    {
+      "name": "refiner-host-003",
+      "command": [
+        "nice",
+        "-n",
+        "19",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/bin/python",
+        "research/varena-refiner-ffn/host_check.py"
+      ],
+      "exit": 0,
+      "seconds": 6.702
+    },
+    {
+      "name": "refiner-semantic-003",
+      "command": [
+        "nice",
+        "-n",
+        "19",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/bin/python",
+        "research/varena-refiner-ffn/semantic_check.py"
+      ],
+      "exit": 0,
+      "seconds": 1.729
+    },
+    {
+      "name": "strict-wheel-startup-003",
+      "command": [
+        "nice",
+        "-n",
+        "19",
+        "/home/fidika/cozy_v2/cozy-runtime/.venv/bin/python",
+        "-I",
+        "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-v2-current-core/.task/strict-wheel-startup-003.py",
+        "--tensorfs-python",
+        "/home/fidika/cozy_v2/outputs/xs138-native-api-integrated/linux-d3e8b3651-final-001/wheel-tree",
+        "--torch-site",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/lib/python3.12/site-packages",
+        "--sender-frames",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-v2-current-core/crates/varena/evidence/current-cohort-118d/sender-frames-002.json",
+        "--out",
+        "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-v2-current-core/.task/strict-wheel-startup-003"
+      ],
+      "exit": 0,
+      "seconds": 16.746
+    },
+    {
+      "name": "refiner-fixture-import-003",
+      "command": [
+        "nice",
+        "-n",
+        "19",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/bin/python",
+        "-c",
+        "import sys;sys.path.insert(0,'research/varena-refiner-ffn/fixture');import ci_varena_refiner_ffn;print('updated actual-dispatch fixture imported; no GPU execution')"
+      ],
+      "exit": 0,
+      "seconds": 4.553
+    }
+  ],
+  "runtime_site": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-v2-current-core/.task/runtime-wheel-003",
+  "tensorfs_candidate": "/home/fidika/cozy_v2/outputs/xs138-native-api-integrated/linux-d3e8b3651-final-001/wheels/tensorfs-0.17.16+dev.gd3e8b365-cp311-abi3-linux_x86_64.whl",
+  "tensorfs_sha256": "eadf34656d860e9e11b4f0b822d68495abd4759cad14cf20f2f5370d72b3ea2a",
+  "source_runtime": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-v2-current-core",
+  "gpu_qualified": false
+}
