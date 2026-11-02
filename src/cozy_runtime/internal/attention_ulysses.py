@@ -53,19 +53,30 @@ class Local:
     implementation serving those operands, e.g. the SDPA backend torch dispatches. `rows`: the
     query block a call may be cut at and compute each row as whole (memory's `attend` cut);
     0 where the kernel needs every query row at once (a scale or mean over the sequence).
+    `refusal`: why its row does not serve a call, or empty; such a call runs on `instead`, a
+    (backend, kernel) whose row serves every call.
     """
 
     forward: Callable[..., Tensor]
     impl: Callable[..., str]
     head_local: bool = True
     rows: int = 0
+    refusal: Callable[..., str] | None = None
+    instead: tuple[str, Local] | None = None
 
 
-#: backend -> implementations served in the observed scope on this rank, and the operand
-#: signatures already named there (an implementation is named once per signature, not per call)
-_SEEN: ContextVar[tuple[dict[str, set[str]], set[object]] | None] = ContextVar(
-    "cozy_attention_seen", default=None
-)
+class Seen(dict[str, set[str]]):
+    """Backend -> implementations served in an observed scope on this rank, and `refused`: per
+    reason, the calls a kernel's row refused, which `Local.instead` served."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused: dict[str, int] = {}
+
+
+#: what served in the observed scope on this rank, and the operand signatures already named
+#: there (an implementation is named once per signature, not per call)
+_SEEN: ContextVar[tuple[Seen, set[object]] | None] = ContextVar("cozy_attention_seen", default=None)
 _MEMBERS: dict[str, AttentionBackendName] = {}
 
 
@@ -111,9 +122,9 @@ def serve(group_of: Callable[[object], ProcessGroup], exchange_of: Callable[...,
 
 
 @contextmanager
-def observing() -> Iterator[dict[str, set[str]]]:
-    """Collect, per backend, the implementations that served on this rank in this scope."""
-    seen: dict[str, set[str]] = {}
+def observing() -> Iterator[Seen]:
+    """Collect what served on this rank in this scope."""
+    seen = Seen()
     token = _SEEN.set((seen, set()))
     try:
         yield seen
@@ -176,6 +187,10 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
 def _call(
     backend: str, local: Local, query: Tensor, key: Tensor, value: Tensor, options: Options
 ) -> Tensor:
+    why = local.refusal(query, key, options) if local.refusal is not None else ""
+    if why and local.instead is not None:
+        refused(why)
+        backend, local = local.instead
     scope = _SEEN.get()
     if scope is not None:
         masked, causal = options["attn_mask"] is not None, options["is_causal"]
@@ -228,6 +243,13 @@ def describe(seen: dict[str, set[str]], names: dict[str, str]) -> str:
     if len(rows) == 1:
         return next(iter(rows.values()))
     return ",".join(f"{name}:{impl}" for name, impl in sorted(rows.items()))
+
+
+def refused(why: str, calls: int = 1) -> None:
+    """Record CALLS a kernel's row refused for WHY."""
+    scope = _SEEN.get()
+    if scope is not None:
+        scope[0].refused[why] = scope[0].refused.get(why, 0) + calls
 
 
 def record(backend: str, implementation: str) -> None:

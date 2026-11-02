@@ -14,6 +14,11 @@ again once it is ready (`compiled`): at the run's next step or stage boundary (a
 kernels, owner ruling 2026-10-09). A request's pin
 (`--attention-kernel`) is the opposite: it waits for its own kernel's build, holds it for every
 step, and refuses an unsupported or failed kernel (owner ruling 2026-10-10).
+
+A kernel's row can also rule out one call: a call it refuses (`Candidate.refusal`) runs on SDPA,
+whose row serves every call, and the run's record counts it (`evidence`). This is per call, for a
+pin too, and selection does not learn it: what a call carries is not its site's (Qwen-Image 2.1
+masks only its prefill's text, so its other steps keep their kernel).
 """
 
 from __future__ import annotations
@@ -166,7 +171,7 @@ class Candidate:
         ]
 
     def refusal(self, query: Any, key: Any, options: Mapping[str, Any]) -> str:
-        """Why it does not serve this call, or empty: its row, asserted on every call."""
+        """Why it does not serve this call, or empty, read on every call: `_local`."""
         dtype, dim = str(query.dtype).removeprefix("torch."), int(query.shape[-1])
         scale = options.get("scale")
         limits = (
@@ -516,11 +521,14 @@ def _member(candidate: Candidate) -> Any:
 
 #: backend -> the kernel its Diffusers member calls (`_local`)
 _LOCALS: dict[str, Local] = {}
+#: The kernel a call another kernel's row refuses runs on: SDPA's row refuses none.
+_SDPA = "sdpa"
+_INSTEAD = (BY_NAME[_SDPA].backend, BY_NAME[_SDPA].local)
 
 
 def _local(candidate: Candidate) -> Local:
-    """CANDIDATE's forward as every call reaches it: its row asserted first (`refusal`), a
-    sparse one's dense rows through its declared kernels' own."""
+    """CANDIDATE's forward as every call reaches it: a call its row refuses (`refusal`) on SDPA
+    instead, a sparse one's dense rows through its declared kernels' own."""
     found = _LOCALS.get(candidate.backend)
     if found is not None:
         return found
@@ -529,15 +537,9 @@ def _local(candidate: Candidate) -> Local:
         rows = [_dense_rows(BY_NAME[name]) for name in candidate.dense]
         exact = _dense_rows(BY_NAME[_exact_name(candidate)])
         forward = partial(forward, dense=rows[0], prefix_dense=rows[-1], exact=exact)
-
-    def guarded(query: Tensor, key: Tensor, value: Tensor, **options: Any) -> Tensor:
-        refused = candidate.refusal(query, key, options)
-        if refused:
-            raise ValueError(refused)
-        out: Tensor = forward(query, key, value, **options)
-        return out
-
-    found = _LOCALS[candidate.backend] = replace(candidate.local, forward=guarded)
+    found = _LOCALS[candidate.backend] = replace(
+        candidate.local, forward=forward, refusal=candidate.refusal, instead=_INSTEAD
+    )
     return found
 
 
@@ -921,14 +923,21 @@ def _expected(live_tokens: int, module: Any) -> None:
 _EXPECTED.append(_expected)
 
 
-def evidence(served: Iterable[str]) -> list[dict[str, Any]]:
+def evidence(
+    served: Iterable[str], refused: Mapping[str, int] | None = None
+) -> list[dict[str, Any]]:
     """This rank's kernels for a run's execution record: every kernel it served, and every
-    kernel of its chains it did not serve and why (compiling, failed, absent, unsupported)."""
+    kernel of its chains it did not serve and why (compiling, failed, absent, unsupported).
+    SDPA's row counts the calls a site's kernel refused, per reason (`attention_ulysses.Seen`)."""
     names = set(served)
     if not names:
         return []  # no attention site ran here
     states = {name: kernel_compile.State(name, "ready") for name in names}
     states.update(_STATES)
+    if refused:
+        names.add(_SDPA)
+        why = "; ".join(f"{reason} x{calls}" for reason, calls in sorted(refused.items()))
+        states[_SDPA] = kernel_compile.State(_SDPA, "ready", detail=why)
     return [
         {**state.document(), "kernel": name, "served": name in names}
         for name, state in sorted(states.items())
