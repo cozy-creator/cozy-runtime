@@ -84,19 +84,16 @@ jobs:
           pattern: kernels-linux-*
           path: kernels-out
           merge-multiple: true
-      # The Runtime's own Triton sets compiled for every card row, CPU-only, with the kernels job's
-      # launcher modules (`triton_prebuild`); Triton's keys need a libcuda, here a stub.
+      # The Runtime's own Triton sets compiled for every card row, CPU-only, for each Triton served
+      # (cozy_runtime/torch-triton.txt), with the kernels job's launcher modules (`triton_prebuild`).
       - name: The Runtime's Triton sets, prebuilt
         if: env.WHEELS == 'true'
         working-directory: source
         run: |
           set -o pipefail
-          stub=$(mktemp -d)
-          echo 'void cozy_libcuda_stub(void) {}' | cc -shared -x c -o "$stub/libcuda.so.1" -
-          TRITON_LIBCUDA_PATH=$stub uv run --extra derive python -m cozy_runtime.internal.triton_prebuild \
-            "$GITHUB_WORKSPACE/kernels-out/cozy_runtime/_triton" --launchers "$GITHUB_WORKSPACE/kernels-out/triton-launchers" \
+          bash scripts/prebuild-triton.sh "$GITHUB_WORKSPACE/kernels-out/cozy_runtime/_triton" "$GITHUB_WORKSPACE/kernels-out/triton-launchers" \
             | tee "$RUNNER_TEMP/triton-prebuild.json"
-          jq -c '{kernels, bytes, launchers}' "$RUNNER_TEMP/triton-prebuild.json" >> "$GITHUB_STEP_SUMMARY"
+          jq -c '{triton, kernels, bytes, launchers}' "$RUNNER_TEMP/triton-prebuild.json" >> "$GITHUB_STEP_SUMMARY"
       - name: The Linux wheel, the pure one plus its kernels
         if: env.WHEELS == 'true'
         working-directory: source
@@ -142,8 +139,14 @@ jobs:
           export CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/tmp/execution-target PYO3_PYTHON=/opt/python/cp312-cp312/bin/python
           cargo fetch --locked --manifest-path native/execution/Cargo.toml
           CARGO_NET_OFFLINE=true bash scripts/build-execution-native.sh modules
-          python -m pip install -q --root-user-action ignore "torch==$TORCH" --index-url https://download.pytorch.org/whl/cpu
-          python checks/kernel_modules.py modules --without _gemm --without _norm --without _fa3 --torch-python python
+          python checks/kernel_modules.py modules --without _gemm --without _norm --without _fa3
+          checks=()
+          for torch in $(grep -o '^torch==[^ ]*' src/cozy_runtime/torch-triton.txt); do
+            python -m venv "/tmp/$torch"
+            "/tmp/$torch/bin/python" -m pip install -q "$torch" --index-url https://download.pytorch.org/whl/cpu
+            checks+=(--torch-python "/tmp/$torch/bin/python")
+          done
+          python checks/kernel_modules.py modules "${checks[@]}"
           for py in /opt/python/cp312-cp312/bin/python /opt/python/cp313-cp313/bin/python /opt/python/cp314-cp314/bin/python; do
             "$py" -I - <<'SMOKE'
           import importlib.util
@@ -171,14 +174,14 @@ jobs:
           floor = max((tuple(map(int, m.split("."))) for m in re.findall(r"GLIBC_([0-9.]+)", versions)), default=(0,))
           assert floor <= (2, 28), floor
           paths = sorted(p for p in Path("native/execution").rglob("*") if p.is_file() and "target" not in p.parts)
-          paths += [Path("scripts/build-execution-native.sh"), Path("kernels/toolchain.env"), Path("checks/kernel_modules.py"), Path("src/cozy_runtime/_kernels/__init__.py"), Path(".github/workflows/dev-build.yaml")]
+          paths += [Path("scripts/build-execution-native.sh"), Path("kernels/toolchain.env"), Path("src/cozy_runtime/torch-triton.txt"), Path("checks/kernel_modules.py"), Path("src/cozy_runtime/_kernels/__init__.py"), Path(".github/workflows/dev-build.yaml")]
           digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
           receipt = {
               "source_commit": subprocess.check_output(["git", "-c", "safe.directory=/src", "rev-parse", "HEAD"], text=True).strip(),
               "native_input_sha256": {str(p): digest(p) for p in paths},
               "module": str(module), "module_sha256": digest(module),
               "glibc_floor": ".".join(map(str, floor)),
-              "toolchain": {k: os.environ[k] for k in ("MANYLINUX", "CUDA_NVCC", "CUDA_CUDART", "CUDA_CUOBJDUMP", "TORCH")},
+              "toolchain": {k: os.environ[k] for k in ("MANYLINUX", "CUDA_NVCC", "CUDA_CUDART", "CUDA_CUOBJDUMP")},
               "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
               "nvcc": subprocess.check_output(["nvcc", "--version"], text=True).strip(),
               "cc": subprocess.check_output([os.environ["CC"], "--version"], text=True).splitlines()[0],

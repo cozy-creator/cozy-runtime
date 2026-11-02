@@ -10,8 +10,9 @@ location; a driver update rebuilds nothing. `load` waits for a live build by its
 progress, then serves it or raises `KernelsUnavailable`: a request never compiles. The Runtime's
 own sets open through `opened` (`kernel_ready.TRITON`): loaded, then verified on the card.
 
-A set's own package ships it prebuilt (`triton_prebuild`), in `<package>/_triton` (`shipped`):
-every entry's compiled kernel by its Triton key, for every card row. The package is the one whose
+A set's own package ships it prebuilt (`triton_prebuild`), in `<package>/_triton/<Triton release>`
+(`shipped`), one directory per Triton it serves, read for the running Triton's only: every entry's
+compiled kernel by its Triton key, for every card row. The package is the one whose
 module declares the set (a package's fused plan declared over the Runtime's kernels is the
 package's); the native Runtime wheel ships its own sets and Triton's launcher module per Python
 tag (`PREBUILT`). The builder copies a set's kernels into the cache, as Triton writes them, when
@@ -131,9 +132,10 @@ def _launcher_key() -> str:
     return str(_get_cache_manager(launcher_source(), config=launcher_config()).key)
 
 
-#: Where a package ships its prebuilt sets: `manifest.json` and `kernels/<key>/`.
+#: Where a package ships its prebuilt sets: `<release>/manifest.json` and `<release>/kernels/<key>/`
+#: for each Triton release it serves.
 SHIPPED = "_triton"
-#: The Runtime's own (`triton_prebuild`), with Triton's launcher modules in `launcher/`.
+#: The Runtime's own (`triton_prebuild`), with Triton's launcher modules in `<release>/launcher/`.
 PREBUILT = Path(__file__).resolve().parents[1] / SHIPPED
 #: The launcher module's file name in Triton's cache, this Python's.
 LAUNCHER = f"cuda_utils{sysconfig.get_config_var('EXT_SUFFIX')}"
@@ -146,18 +148,19 @@ def home(kernels: TritonKernels) -> str:
 
 
 def shipped(kernels: TritonKernels) -> Path | None:
-    """`<package>/_triton` of the set's own package, imported here, whether or not it ships any."""
+    """`<package>/_triton/<this Triton>` of the set's own package, imported here, whether or not
+    it ships any."""
     file = getattr(sys.modules.get(home(kernels)), "__file__", None)
-    return Path(file).parent / SHIPPED if file else None
+    return Path(file).parent / SHIPPED / triton.__version__ if file else None
 
 
 @functools.cache
 def _manifest(root: str) -> dict[str, Any]:
     try:
-        found = json.loads((Path(root) / "manifest.json").read_text())
+        found: dict[str, Any] = json.loads((Path(root) / "manifest.json").read_text())
     except (OSError, ValueError):
         return {}
-    return found if found.get("triton") == triton.__version__ else {}
+    return found
 
 
 def _shipped(root: str, keys: Iterable[str]) -> bool:
@@ -166,7 +169,7 @@ def _shipped(root: str, keys: Iterable[str]) -> bool:
 
 
 def _launcher_shipped() -> dict[str, str] | None:
-    row = _manifest(str(PREBUILT)).get("launcher", {}).get(LAUNCHER)
+    row = _manifest(str(PREBUILT / triton.__version__)).get("launcher", {}).get(LAUNCHER)
     if row is None or row.get("driver_sha256") != hashlib.sha256(launcher_source()).hexdigest():
         return None
     return dict(row)
@@ -200,7 +203,7 @@ def _seed_launcher() -> None:
         return
     cache = _get_cache_manager(launcher_source(), config=launcher_config())
     if cache.get_file(LAUNCHER) is None:
-        cache.put((PREBUILT / "launcher" / row["file"]).read_bytes(), LAUNCHER)
+        cache.put((PREBUILT / triton.__version__ / "launcher" / row["file"]).read_bytes(), LAUNCHER)
 
 
 class _Kernel(Struct, frozen=True):
