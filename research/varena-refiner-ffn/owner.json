@@ -1,0 +1,1 @@
+{"owner":"/root/refiner_ffn_restart","purpose":"P2 exact H3 refiner SwiGLU FFN native allocation contract and consumer","branch":"codex/xs138-p2-refiner-ffn","base":"f01fe1d0bdcc9593ef493f219349fadcbefe0524","context":"78e58f7e51bade1bea92c75f238ba058d59421a2","scope":"Runtime exact FeedForward/SwiGLU int8 consumer; no rentals/install/release"}
