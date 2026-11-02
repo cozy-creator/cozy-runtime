@@ -1,0 +1,1 @@
+The run record times each demand fill: its trace entry carries the read's host time and when it ended (`ns`, `at_unix_ms`), a baked fill its bake's host and device time (`bake_ns`, `bake_device_ns`), and `moved.bake` sums them, so a step's first fill and its LoRA bake are told apart (cr-242: on a cold RTX 5090, H3 Turbo's step 1 holds 4.6 s of DiT reads and 2.4–2.5 s of bake).
