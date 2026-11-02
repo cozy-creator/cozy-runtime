@@ -3159,7 +3159,12 @@ class Memory:
                 if complete:
                     block.overlay = pending.overlay  # a cold block's first page is this forward's
                 if complete and pending.raw:
-                    block.raw = True  # its page is the baked bytes demand writes: that counts it
+                    # Its page is the baked bytes its demand writes, which counts the refill. Kept
+                    # preferred until then: unpreferred, the next allocation (its own cast region,
+                    # activations, the streaming window) took it first and the demand read it
+                    # again (cold RTX 5090, run 25857: 48 DiT blocks read twice, cr-242).
+                    block.raw = True
+                    pending.region.set_preferred(True)
                 elif complete:
                     page = _page(block, pending.identity, pending.overlay, final=pending.final)
                     self._refills[page] = self._refills.get(page, 0) + 1
@@ -3272,6 +3277,8 @@ class Memory:
             if prefetched:
                 page = _page(block, block.model.identity, overlay)
                 self._refills[page] = self._refills.get(page, 0) + 1
+                # Consumed: the region's preference is its block's again (`_native_region`).
+                block.region.set_preferred(block.preferred and not block.final_only())
             if use is not None and use.needs_fill:
                 page = _page(block, block.model.identity, overlay)
                 self._refills[page] = self._refills.get(page, 0) + 1
