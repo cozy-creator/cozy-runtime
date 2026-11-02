@@ -122,24 +122,32 @@ def _opening(name: str) -> Iterator[None]:
 def prime[T](name: str, opener: Opener[T]) -> None:
     """Opens `name`'s kernel now on a thread of its own, beside what the executor does next (the
     weight fill), outside any request. An ask while it opens waits for it instead of serving a
-    fallback, so the first call serves it and no call sees it change (cl-681)."""
+    fallback, so the first call serves it and no call sees it change (cl-681). One whose build
+    still runs makes no ask wait for the build: it lands as an unprimed open does (`boundary`)."""
     with _LOCK:
         if name in _SLOTS:
             return
         slot = _SLOTS[name] = _Slot("opening", primed=threading.Event())
+    primed = cast("threading.Event", slot.primed)
 
     def open_it() -> None:
+        kernel_compile.told.set(False)  # no request waits for its build
+        state = "ready"
         try:
             with _opening(name):
-                value = opener(True)
+                value = opener(False)
+                if value is None:  # building: asks serve the fallback until it lands
+                    state = "landed"
+                    primed.set()
+                    value = opener(True)
             if value is None:
                 raise RuntimeError("its opener waited and returned nothing")
         except Exception as exc:
             _ended(name, slot, exc)
         else:
-            _landed(name, slot, value, "ready")
+            _landed(name, slot, value, state)
         finally:
-            cast("threading.Event", slot.primed).set()
+            primed.set()
 
     threading.Thread(target=open_it, name=f"{THREAD}{name}", daemon=True).start()
 
