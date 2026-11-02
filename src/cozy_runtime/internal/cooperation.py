@@ -55,11 +55,37 @@ class Owner:
     ) -> None:
         if not capable():
             raise Failure("the selected cooperative device requires the native owner service")
-        self.config = config
+        self.config = config  # Negotiated Start intent, not a library creation default.
         self.pid = os.getpid()
-        self._peer = varena.CooperationOwner(
+        peer = varena.CooperationOwner(
             device, config.uuid, config.directory, shared=config.shared, priority=config.priority,
         )
+        try:
+            table = peer.snapshot()
+            facts = peer.facts()
+            row = next((row for row in table["rows"] if row["id"] == table["owner"]), None)
+            if (
+                row is None or row["pid"] != self.pid or facts["owner"] != table["owner"]
+                or not facts["active"] or facts["closed"]
+            ):
+                raise Failure("native cooperation did not retain this process's live service row")
+            if row["sharing"] != ("Shared" if config.shared else "Dedicated") or row["priority"] != config.priority:
+                raise Failure(
+                    "existing native cooperation configuration differs from negotiated Start: "
+                    f"row={row['id']} actual={row['sharing']}/{row['priority']} "
+                    f"requested={'Shared' if config.shared else 'Dedicated'}/{config.priority}"
+                )
+        except BaseException as error:
+            # The constructor acquired only one client lease. Never overwrite a surviving
+            # consumer's settings or publish a partially initialized Runtime Memory.
+            try:
+                peer.close()
+            except varena.CooperationDeferredError:
+                pass  # The native worker retains the final retirement ticket/resources.
+            except Exception as cleanup:
+                error.add_note(f"releasing the new cooperation lease also failed: {cleanup}")
+            raise
+        self._peer = peer
         self._failed = failed
         self._reported = False
         self._closed = False
