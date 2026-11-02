@@ -1427,14 +1427,12 @@ class Memory:
             _MEMORIES[str(device)] = memory
             return memory
 
-    def attach_cooperation(
-        self, config: cooperation.Config, failed: Callable[[BaseException], None]
-    ) -> None:
-        """Exclusive device Start only, after Memory.open released its initialization lock."""
+    def attach_cooperation(self, owner: cooperation.Owner) -> None:
+        """Adopt the already-validated Start owner; never create an extra execution client."""
         if self.cooperation is not None:
-            if self.cooperation.config != config:
+            if self.cooperation is not owner:
                 raise cooperation.Failure(
-                    "an active Memory cannot change cooperation configuration"
+                    "an active Memory cannot change its cooperation owner"
                 )
             return
         if (
@@ -1442,7 +1440,10 @@ class Memory:
             or self.room_limit is not None or self._room_pending is not None
         ):
             raise cooperation.Failure("cooperation must bind at a fresh CUDA Memory start")
-        self.cooperation = cooperation.Owner(self.device.index or 0, config, failed)
+        if owner.device != (self.device.index or 0):
+            raise cooperation.Failure("cooperation owner belongs to another device")
+        owner.check()
+        self.cooperation = owner
 
     def cooperation_boundary(self, *, used: bool = False, check: bool = True) -> None:
         owner = self.cooperation

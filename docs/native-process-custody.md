@@ -24,3 +24,14 @@ Runtime requests retain their existing boundary/error contract.
 
 Local source/CPU checks and real GPU qualification are separate. Root owns paired
 artifacts, GPU execution and tracker status. No GPU/rental/release in this lane.
+
+CPU evidence: the exact paired new debug TensorFS extension passed real framed
+Hello/Shutdown and all three pre-GPU Start refusals. No rejected command imported
+Torch or loaded CUDA/NVML. The refused UUID/seal fields are protocol metadata,
+not hardware identity proof. Mypy has the same17 baseline findings; the four
+changed Runtime files introduce no Ruff findings. Records are in
+`outputs/xs138-p4-process-custody/{types,hello-002,start-*-002}`.
+
+Successful CUDA bootstrap, actual Working attachment and the new public-consumer
+custody/reuse/donation cells remain GPU qualification, owned by the root. No
+multi-rank or no-Torch Runtime adapter is represented as completed.

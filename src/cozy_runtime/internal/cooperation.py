@@ -15,7 +15,11 @@ from tensorfs.varena import _runtime as varena
 
 
 def capable() -> bool:
-    return varena.CooperationOwner.capability() == 1
+    return (
+        varena.CooperationOwner.capability() == 1
+        and varena.CooperationOwner.pressure_capability() == 1
+        and varena.CooperationOwner.custody_capability() == 1
+    )
 
 
 def initialize() -> None:
@@ -55,6 +59,7 @@ class Owner:
         if not capable():
             raise Failure("the selected cooperative device requires the native owner service")
         self.config = config  # Negotiated Start intent, not a library creation default.
+        self.device = device
         self.pid = os.getpid()
         peer = varena.CooperationOwner(
             device, config.uuid, config.directory, shared=config.shared, priority=config.priority,
@@ -77,6 +82,10 @@ class Owner:
                     f"row={row['id']} actual={row['sharing']}/{row['priority']} "
                     f"requested={'Shared' if config.shared else 'Dedicated'}/{config.priority}"
                 )
+            peer.retain_working_lifetime()
+            retained = peer.facts()
+            if not retained["active"] or retained["closed"] or retained["passive_holds"] == 0:
+                raise Failure("native cooperation did not retain Working lifetime")
         except BaseException as error:
             # The constructor acquired only one client lease. Never overwrite a surviving
             # consumer's settings or publish a partially initialized Runtime Memory.

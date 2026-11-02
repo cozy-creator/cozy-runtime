@@ -30,6 +30,7 @@ from types import ModuleType
 from typing import Any, Literal
 
 import tensorfs.varena.torch as vt
+from tensorfs.varena import _runtime as varena
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
@@ -520,10 +521,24 @@ def drain(torch: Any, kind: str) -> None:
 JIT_DSLS = ("triton", "cutedsl", "helion")
 
 
+def bind_allocator(torch: Any, kind: str) -> None:
+    """Select Runtime's allocator without device activation or standalone defaults."""
+    if kind != "cuda":
+        return
+    # A request never compiles; keep the existing native-op override selection.
+    native = getattr(torch, "_native", None)
+    if native is not None:
+        native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
+    try:
+        varena.bind_torch_allocator()
+    except (ImportError, AttributeError, RuntimeError) as exc:
+        if fault(exc) is not Fault.OTHER:
+            raise
+        raise ResidencyError(f"native CUDA allocator is unavailable: {exc}") from exc
+
+
 def initialize(torch: Any, kind: str) -> None:
-    """Bring the accelerator context up EAGERLY, so its cost is a measured prepare step
-    rather than a surprise inside the first kernel. torch's allocator is configured first.
-    A CPU executor has no accelerator to bring up."""
+    """Initialize after allocator binding and the caller's explicit native custody."""
     if kind == "cpu":
         return
     if sees_no_gpu():
@@ -531,18 +546,6 @@ def initialize(torch: Any, kind: str) -> None:
     if kind == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("this Mac's torch has no usable MPS device")
     if kind == "cuda":
-        # A request never compiles: torch's `_native` overrides JIT their DSL kernels on an op's
-        # first call of each shape (torch 2.14's Triton bmm outer product: 0.1-0.3 s on a cold
-        # machine's request, per prompt-length bucket). aten serves those ops, as before 2.14.
-        native = getattr(torch, "_native", None)
-        if native is not None:
-            native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
-        try:
-            vt.install()
-        except (ImportError, AttributeError, RuntimeError) as exc:
-            if fault(exc) is not Fault.OTHER:
-                raise
-            raise ResidencyError(f"native CUDA allocator is unavailable: {exc}") from exc
         torch.cuda.init()
 
 

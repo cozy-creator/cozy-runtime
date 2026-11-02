@@ -1037,6 +1037,12 @@ class Executor:
         something else picked a device first.
         """
         owner = self.host
+        if self.device_kind == "cuda" and (
+            owner.cooperation_config is None or self.world != 1 or not cooperation.capable()
+        ):
+            return {"ok": False, "code": "cooperation_required",
+                    "detail": "CUDA initialization requires explicit single-GPU native "
+                              "cooperation and Working custody; no standalone defaults"}
         if not owner._startup_reported:
             # Observe before the explicit boundary on every rank, including a
             # previously adopted context. Stderr survives even a pre-reply crash.
@@ -1066,7 +1072,14 @@ class Executor:
         opening = self.device_kind == "cuda" and self.world == 1
         if opening:
             _cuda(self.channel, "opening")
+        staged_owner: cooperation.Owner | None = None
         try:
+            accel.bind_allocator(torch, self.device_kind)
+            if self.device_kind == "cuda":
+                assert owner.cooperation_config is not None
+                staged_owner = cooperation.Owner(
+                    0, owner.cooperation_config, owner._cooperation_failed
+                )
             accel.initialize(torch, self.device_kind)
             if self.device_kind == "cuda":
                 index = self.rank if self.world > 1 else 0
@@ -1079,9 +1092,17 @@ class Executor:
                     torch.cuda.stream, owner.execution_stream
                 )
                 _activity.WORKER_CONTEXT = lambda: torch.cuda.stream(torch.cuda.current_stream())
-            self._open_memory(torch)
-        except ResidencyError as exc:
-            return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+            self._open_memory(torch, staged_owner)
+            staged_owner = None  # Memory now owns this exact execution client.
+        except BaseException as exc:
+            if staged_owner is not None:
+                try:
+                    staged_owner.close()
+                except Exception as cleanup:
+                    exc.add_note(f"releasing staged native cooperation also failed: {cleanup}")
+            if isinstance(exc, ResidencyError):
+                return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+            raise
         accel.first_launches(torch, self.device_kind)
         if opening:
             _cuda(self.channel, "open")
@@ -1104,13 +1125,15 @@ class Executor:
         stream = self.host.execution_stream
         return contextlib.nullcontext() if stream is None else self.torch.cuda.stream(stream)
 
-    def _open_memory(self, torch: Any) -> None:
+    def _open_memory(self, torch: Any, native_owner: cooperation.Owner | None) -> None:
         """This executor's local residency and its pure-site execution helpers."""
         from cozy_runtime.internal import execution, loop
         from cozy_runtime.internal.residency import Memory
 
         host = self.host
         if host.memory is not None:
+            if native_owner is not None and host.memory.cooperation is not native_owner:
+                raise cooperation.Failure("initialized Memory has another execution owner")
             return
         device = self._rank_device(torch)
         # A transient native join refusal must not publish a partially initialized Memory.
@@ -1123,8 +1146,8 @@ class Executor:
         _split.install(execution)
         attention_ulysses.install(execution)
         loop.install()
-        if host.cooperation_config is not None:
-            memory.attach_cooperation(host.cooperation_config, host._cooperation_failed)
+        if native_owner is not None:
+            memory.attach_cooperation(native_owner)
         host.execution = execution
         host.loops = loop.ROWS
         host.memory = memory
@@ -1725,6 +1748,19 @@ class Executor:
                 f"{_gpu(self.rank)} of a {self.world}-GPU group sealed to "
                 f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
             }
+        if self.device_kind == "cuda" and command.devices and not command.import_only:
+            if selected is None or not cooperation.capable():
+                return {"ok": False, "code": "cooperation_required",
+                        "detail": "CUDA Start requires negotiated native cooperation and "
+                                  "Working custody; standalone defaults are not Runtime policy"}
+            if degree != 1:
+                return {"ok": False, "code": "cooperation_unsupported",
+                        "detail": "multi-rank CUDA requires per-rank native configuration; "
+                                  "qualification remains open"}
+            if importlib.util.find_spec("torch") is None:
+                return {"ok": False, "code": "cooperation_unsupported",
+                        "detail": "CUDA Runtime startup without Torch has no qualified "
+                                  "device adapter; no GPU work was started"}
         _restore_seal()
         try:
             interface = package_interface.parse(
