@@ -1730,8 +1730,6 @@ class Executor:
         self.host.gpu_memory_limit = command.gpu_memory_limit
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
-        if self.started or (command.import_only and self.imported):
-            return self._start_reply([], reused=True)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
         if command.devices != sealed_devices:
             self.poisoned = "env seal names other devices"
@@ -1743,7 +1741,10 @@ class Executor:
                 "an executor serves exactly its lane's devices",
             }
         expected = self.world if self.rank > 0 else max(degree, 1)
-        if degree != expected or (degree > 1 and degree != len(_sealed_entries())):
+        cuda_start = (
+            self.device_kind == "cuda" and bool(command.devices) and not command.import_only
+        )
+        if degree != expected or ((degree > 1 or cuda_start) and degree != len(_sealed_entries())):
             self.poisoned = "sequence-parallel degree mismatch"
             return {
                 "ok": False,
@@ -1752,7 +1753,7 @@ class Executor:
                 f"{_gpu(self.rank)} of a {self.world}-GPU group sealed to "
                 f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
             }
-        if self.device_kind == "cuda" and command.devices and not command.import_only:
+        if cuda_start:
             if selected is None or not cooperation.capable():
                 return {"ok": False, "code": "cooperation_required",
                         "detail": "CUDA Start requires negotiated native cooperation and "
@@ -1761,6 +1762,8 @@ class Executor:
                 return {"ok": False, "code": "cooperation_unsupported",
                         "detail": "CUDA Runtime startup without Torch has no qualified "
                                   "device adapter; no GPU work was started"}
+        if self.started or (command.import_only and self.imported):
+            return self._start_reply([], reused=True)
         _restore_seal()
         try:
             interface = package_interface.parse(
