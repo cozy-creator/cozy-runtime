@@ -262,7 +262,11 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
             or t.device != x.device
             or not t.is_contiguous()
             or t.data_ptr() % 16
-            or tuple(t.shape[-2:]) != (x.shape[1], 48)
+            or not (
+                tuple(t.shape[-2:]) == (x.shape[1], 48)
+                or tuple(t.shape) == (1, x.shape[1], 1, 48)
+            )
+            or t.stride(-2) != 48
             or t.numel() != x.shape[1] * 48
             for t in rotary
         )
