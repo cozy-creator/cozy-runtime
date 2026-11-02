@@ -15,7 +15,6 @@ region's working set plus every graph's static buffers.
 
 from __future__ import annotations
 
-import ctypes
 import sys
 import threading
 import weakref
@@ -24,7 +23,8 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from typing import Any
 
-from tensorfs import varena
+import tensorfs.varena.torch as vt
+from tensorfs.varena import _runtime as varena
 
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import accel, kernel_ready
@@ -42,12 +42,28 @@ def unsupported(torch: Any) -> str:
     )
 
 
+def working_peak(device: int) -> int:
+    """Measured working demand, including eager peaks retained across split-site resets."""
+    from cozy_runtime.internal.execution import catch
+    from cozy_runtime.internal.residency import _REQUEST
+
+    peak = int(vt.stats(device)["allocated_peak"])
+    # Capture preparation may open an idle request inside the still-active serving request.
+    for request in (catch.CURRENT.get(), _REQUEST.get()):
+        if (
+            request is not None
+            and request.memory.cuda
+            and (request.memory.device.index or 0) == device
+        ):
+            peak = max(peak, request.torch_peak)
+    return peak
+
+
 @dataclass(eq=False, slots=True)
 class Pool:
-    """A stock Torch graph-pool token. Graphs and their static tensors own its allocations.
+    """A Varena-backed graph-pool token; graphs, tensors and completion fences own backing.
 
-    Runtime retires every graph and waits for its readers before dropping those tensors.
-    The native weight manager does not own this activation/scratch pool.
+    Runtime retires every graph and joins its readers before dropping those tensors.
     """
 
     handle: tuple[int, int]
@@ -72,20 +88,6 @@ class Domain:
         self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
 
-    def _stream(self) -> Any:
-        pointer = ctypes.c_void_p()
-        status = self.torch.cuda.cudart().cudaStreamCreate(ctypes.addressof(pointer))
-        code = int(getattr(status, "value", status))
-        if code:
-            error = self.torch.AcceleratorError(f"cudaStreamCreate failed with CUDA error {code}")
-            error.error_code = code
-            raise error
-        try:
-            return self.torch.cuda.ExternalStream(pointer.value, device=self.device)
-        except BaseException:
-            self.torch.cuda.cudart().cudaStreamDestroy(pointer.value)
-            raise
-
     def configuration(self) -> tuple[Any, ...]:
         cuda = self.torch.backends.cuda
         return (
@@ -103,8 +105,7 @@ class Domain:
 
     def recovery_blocked(self, *, replay: bool = False) -> AbstractContextManager[Any]:
         """Block reclaim; actual capture also excludes native producers."""
-        # Older native cohorts retain their conservative capture guard.
-        guard = getattr(varena, "replay", varena.capture) if replay else varena.capture
+        guard = varena.replay if replay else varena.capture
         return guard(self.device)
 
     def initialize(self) -> None:
@@ -117,8 +118,8 @@ class Domain:
         # kernel probes must not invalidate this small lifetime-owner capture either.
         with kernel_ready.recording():
             try:
-                self.stream = self._stream()
-                self.control = self._stream()
+                self.stream = accel.nonblocking_stream(self.torch, self.device)
+                self.control = accel.nonblocking_stream(self.torch, self.device)
                 self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
                 self.fork.record(self.control)
                 self.join.record(self.stream)
@@ -126,12 +127,8 @@ class Domain:
                 self.owner = self.torch.cuda.CUDAGraph()
                 # No library work or allocation inside this owner graph. Recording an event makes
                 # its capture stream explicit; reset later clears only this stream.
-                with self.recovery_blocked(), self.torch.cuda.stream(self.stream):
-                    self.owner.capture_begin(capture_error_mode="thread_local")
-                    try:
-                        self.join.record(self.stream)
-                    finally:
-                        self.owner.capture_end()
+                with vt.graph(self.owner, stream=self.stream, reserve_bytes=0):
+                    self.join.record(self.stream)
                 self.config = self.configuration()
             except BaseException:
                 self.finish()
@@ -191,7 +188,10 @@ class Domain:
                 self.owner = None
             for stream in (self.stream, self.control):
                 if stream is not None:
-                    self.torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
+                    # Graph reset may enqueue allocator retirement events.
+                    stream.synchronize()
+                    vt.retire_stream(stream, device=self.device)
+                    accel.destroy_stream(self.torch, stream)
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
 

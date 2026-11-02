@@ -67,12 +67,11 @@ from typing import TYPE_CHECKING, Any
 
 import msgspec
 import tensorfs
-import tensorfs.varena
 from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, stepcache, weights_store
-from cozy_runtime.author import ModelRegistry, _split, describe
+from cozy_runtime.author import ModelRegistry, _activity, _split, describe
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
@@ -142,6 +141,7 @@ from cozy_runtime.internal import (
     call_types,
     canonical,
     child_env,
+    cooperation,
     effect_interfaces,
     execution_evidence,
     executor_commands,
@@ -821,6 +821,7 @@ class Executor:
         self.memory: Memory | None = None
         #: HOST ONLY: Start's development GPU memory limit, the memory's budget (the card's size)
         self.gpu_memory_limit: int | None = None
+        self.cooperation_config: cooperation.Config | None = None
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -876,6 +877,9 @@ class Executor:
         #: a follower's watcher aborted its collectives; cleared when the group forms again
         self._interrupted = threading.Event()
         self._device_ready = False
+        #: HOST ONLY: process-lifetime execution stream, selected on every Runtime worker.
+        #: Library workspaces/tensors may retain it until exit; do not destroy it at unload.
+        self.execution_stream: Any = None
         self._startup_reported = False
         #: the attempt spool while an attempt runs: where a mirrored call's payloads go
         self._attempt_spool: Path | None = None
@@ -1014,11 +1018,10 @@ class Executor:
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
+            "cooperative_owner": cooperation.capable(),
             # `room` read at once, a running call's included (`_room`), where TensorFS can hold one
             # (`residency.yields`: imported here, residency would bring Torch in before the hello).
-            "room": all(
-                callable(getattr(tensorfs.varena, f, None)) for f in ("make_room", "no_capture")
-            ),
+            "room": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -1035,6 +1038,12 @@ class Executor:
         something else picked a device first.
         """
         owner = self.host
+        if self.device_kind == "cuda" and (
+            owner.cooperation_config is None or self.world != 1 or not cooperation.capable()
+        ):
+            return {"ok": False, "code": "cooperation_required",
+                    "detail": "CUDA initialization requires explicit single-GPU native "
+                              "cooperation and Working custody; no standalone defaults"}
         if not owner._startup_reported:
             # Observe before the explicit boundary on every rank, including a
             # previously adopted context. Stderr survives even a pre-reply crash.
@@ -1064,14 +1073,37 @@ class Executor:
         opening = self.device_kind == "cuda" and self.world == 1
         if opening:
             _cuda(self.channel, "opening")
+        staged_owner: cooperation.Owner | None = None
         try:
+            accel.bind_allocator(torch, self.device_kind)
+            if self.device_kind == "cuda":
+                assert owner.cooperation_config is not None
+                staged_owner = cooperation.Owner(
+                    0, owner.cooperation_config, owner._cooperation_failed
+                )
             accel.initialize(torch, self.device_kind)
-            if self.world > 1 and self.device_kind == "cuda":
-                torch.cuda.set_device(self.rank)
-                kernel_ready.DEVICE[0] = functools.partial(torch.cuda.device, self.rank)
-            self._open_memory(torch)
-        except ResidencyError as exc:
-            return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+            if self.device_kind == "cuda":
+                index = self.rank if self.world > 1 else 0
+                torch.cuda.set_device(index)
+                owner.execution_stream = accel.nonblocking_stream(torch, index)
+                # This first command entered before a stream existed. Select it now, before
+                # Memory, library warm-up or any package allocation/launch can run.
+                torch.cuda.set_stream(owner.execution_stream)
+                kernel_ready.EXECUTION[0] = functools.partial(
+                    torch.cuda.stream, owner.execution_stream
+                )
+                _activity.WORKER_CONTEXT = lambda: torch.cuda.stream(torch.cuda.current_stream())
+            self._open_memory(torch, staged_owner)
+            staged_owner = None  # Memory now owns this exact execution client.
+        except BaseException as exc:
+            if staged_owner is not None:
+                try:
+                    staged_owner.close()
+                except Exception as cleanup:
+                    exc.add_note(f"releasing staged native cooperation also failed: {cleanup}")
+            if isinstance(exc, ResidencyError):
+                return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+            raise
         accel.first_launches(torch, self.device_kind)
         if opening:
             _cuda(self.channel, "open")
@@ -1079,24 +1111,48 @@ class Executor:
         place(self._device())
         return None
 
-    def _open_memory(self, torch: Any) -> None:
+    def _execution_context(self) -> contextlib.AbstractContextManager[Any]:
+        """Enter the process's CUDA stream on a command, idle or readiness worker.
+
+        Before device initialization this is cold, preserving Hello/Fork behavior. Torch's
+        stream context selects the stream's device and restores the caller's actual stream.
+        """
+        stream = self.host.execution_stream
+        return contextlib.nullcontext() if stream is None else self.torch.cuda.stream(stream)
+
+    def _open_memory(self, torch: Any, native_owner: cooperation.Owner | None) -> None:
         """This executor's local residency and its pure-site execution helpers."""
         from cozy_runtime.internal import execution, loop
         from cozy_runtime.internal.residency import Memory
 
         host = self.host
         if host.memory is not None:
+            if native_owner is not None and host.memory.cooperation is not native_owner:
+                raise cooperation.Failure("initialized Memory has another execution owner")
             return
         device = self._rank_device(torch)
-        host.memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
-        host.execution = execution
+        # A transient native join refusal must not publish a partially initialized Memory.
+        # Memory.open may retain its fresh singleton, but no executor can observe it as ready
+        # until all helpers and the selected participant have been installed successfully.
+        memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         PLANS[:] = [host.serving]
         _split.install(execution)
         attention_ulysses.install(execution)
         loop.install()
+        if native_owner is not None:
+            memory.attach_cooperation(native_owner)
+        host.execution = execution
         host.loops = loop.ROWS
+        host.memory = memory
+
+    def _cooperation_failed(self, error: BaseException) -> None:
+        # Called outside the pump/native/shared locks. Do not cancel a running request for
+        # pressure; preserve an actual coordination fault for its next boundary/reply.
+        self.poisoned = self.poisoned or f"native memory cooperation failed: {error}"[:300]
+        traceback.print_exception(error)
+        sys.stderr.flush()
 
     def _rank_identity(self) -> dict[str, Any]:
         owner = self.host
@@ -1413,7 +1469,7 @@ class Executor:
                     )
                 else:
                     component(*args, **kwargs)
-                accel.synchronize(self.torch, self.device_kind)
+                accel.drain(self.torch, self.device_kind)
             self._attempt_spool = spool
             ranked = self.host._rank_request
             working = accel.allocator_peak(self.host.memory, ranked.id) if ranked is not None else 0
@@ -1646,6 +1702,21 @@ class Executor:
         """
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        selected = cooperation.Config.from_wire(getattr(command, "cooperation", None))
+        if selected is not None and (
+            command.import_only or not command.devices
+            or command.sequence_parallel_degree != 1 or not cooperation.capable()
+        ):
+            return {"ok": False, "code": "cooperation_unsupported",
+                    "detail": "cooperation requires the negotiated single-GPU native owner "
+                              "capability; no legacy fallback"}
+        if (
+            (self.started or self.host.memory is not None)
+            and selected != self.host.cooperation_config
+        ):
+            return {"ok": False, "code": "cooperation_changed",
+                    "detail": "an active executor cannot change its negotiated memory policy"}
+        self.host.cooperation_config = selected
         self.host.gpu_memory_limit = command.gpu_memory_limit
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
@@ -1672,6 +1743,19 @@ class Executor:
                 f"{_gpu(self.rank)} of a {self.world}-GPU group sealed to "
                 f"{len(_sealed_entries())} device(s) ({sealed_devices!r})",
             }
+        if self.device_kind == "cuda" and command.devices and not command.import_only:
+            if selected is None or not cooperation.capable():
+                return {"ok": False, "code": "cooperation_required",
+                        "detail": "CUDA Start requires negotiated native cooperation and "
+                                  "Working custody; standalone defaults are not Runtime policy"}
+            if degree != 1:
+                return {"ok": False, "code": "cooperation_unsupported",
+                        "detail": "multi-rank CUDA requires per-rank native configuration; "
+                                  "qualification remains open"}
+            if importlib.util.find_spec("torch") is None:
+                return {"ok": False, "code": "cooperation_unsupported",
+                        "detail": "CUDA Runtime startup without Torch has no qualified "
+                                  "device adapter; no GPU work was started"}
         _restore_seal()
         try:
             interface = package_interface.parse(
@@ -1938,6 +2022,8 @@ class Executor:
         compiles: str = "",
     ) -> dict[str, Any]:
         total = free = -1
+        if self.host.memory is not None:
+            self.host.memory.cooperation_boundary()
         if self.torch is not None and accel.present(self.torch, self.device_kind):
             memory = accel.allocation(self.torch, self.device_kind, self.host.memory)
             total, free = memory["driver_total_bytes"], memory["driver_free_bytes"]
@@ -1955,6 +2041,10 @@ class Executor:
             "rss_bytes": _rss(),
             **({"compiles": compiles} if compiles else {}),
             "memory_backend": "rust-local" if self.device_kind == "cuda" else "torch",
+            "cooperation_active": bool(
+                self.host.memory is not None and self.host.memory.cooperation is not None
+                and self.host.memory.cooperation.facts()["active"]
+            ),
         }
 
     def serving(self) -> str:
@@ -3271,6 +3361,9 @@ class Executor:
         it, a running call's included. Idle and asked to give, its kept programs (graphs,
         decoders, holds) go first, in its command order. A group's followers serve their own
         GPUs: rank 0 takes only its own."""
+        if self.host.cooperation_config is not None:
+            self.poisoned = self.poisoned or "legacy room reached a cooperative executor"
+            raise cooperation.Failure(self.poisoned)
         memory = self.host.memory
         if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
             return
@@ -3299,11 +3392,11 @@ class Executor:
         call stays a native replay when they can."""
         assert self.order is not None
         try:
-            with self.order.turn(ticket):
+            with self.order.turn(ticket), self._execution_context():
                 before = memory.held()
                 memory.make_room(limit)
                 if not memory.requests and limit < memory.held():
-                    accel.synchronize(self.torch, self.device_kind)
+                    accel.drain(self.torch, self.device_kind)
                     self._release_programs()
                     memory.make_room(limit)
                 self._room_kept(memory, limit, before)
@@ -4879,8 +4972,8 @@ class Executor:
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
-        recorded. The proof is the device's own: every stream is complete."""
-        return accel.streams_idle(self.torch, self.device_kind)
+        recorded. The execution stream includes every explicitly joined consumer."""
+        return accel.streams_idle(self.torch, self.device_kind, stream=self.host.execution_stream)
 
     def _check_prepared_use(self, registration: Registration, payload: object) -> None:
         """Check current callable slots against the actual member, not historical aliases."""
@@ -4932,7 +5025,7 @@ class Executor:
                 if command.level == "ram":
                     # Map is ordered after every preceding invocation. Join its remaining
                     # consumer streams before retiring owners and returning allocator storage.
-                    accel.synchronize(self.torch, self.device_kind)
+                    accel.drain(self.torch, self.device_kind)
                     # Every slot's decoders, graphs and holds go before any model leaves: a
                     # language model's engine retains its drafter's weights too, and Klein's
                     # drafter slot maps before its upsampler, so an idle Klein refused every
@@ -5212,6 +5305,7 @@ def _remember_distributions() -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    cooperation.initialize()  # metadata only, before any fork-producing Runtime threads
     faulthandler.enable(all_threads=True)
     if hasattr(signal, "SIGUSR1"):  # every thread's Python stack to stderr, the process lives on
         faulthandler.register(signal.SIGUSR1, all_threads=True, chain=False)
@@ -5420,7 +5514,7 @@ def _idle(executor: Executor, order: _Order) -> None:
         return (bool(graphs.IDLE.jobs) or pins()) and not executor.awaiting_invoke()
 
     while not executor.poisoned:  # a faulted device takes no idle work: the machine ends it
-        with order.idle(answered, ready) as answered:
+        with order.idle(answered, ready) as answered, executor._execution_context():
             if executor.poisoned:
                 return
             try:
@@ -5479,8 +5573,13 @@ def serve(executor: Executor, channel: Channel) -> int:
 
 
 def _shut(executor: Executor, channel: Channel) -> int:
-    if executor.group is not None:
-        executor.group.close()
+    with executor._execution_context():
+        if executor.host.execution_stream is not None:
+            accel.drain(executor.torch, executor.device_kind)
+        if executor.host.memory is not None:
+            executor.host.memory.close_cooperation()
+        if executor.group is not None:
+            executor.group.close()
     channel.send({"reply": "shutdown", "ok": True})
     return int(Exit.ok)
 
@@ -5519,7 +5618,8 @@ def _reply(executor: Executor, frame: Frame) -> Frame | None:
         # command reads `poisoned_generation` and rebuilds the whole cgroup.
         executor.poisoned = f"group: {executor.group.broken}"[:200]
     try:
-        reply = answer(executor, frame)
+        with executor._execution_context():
+            reply = answer(executor, frame)
         if reply is None:
             return None
     except msgspec.ValidationError as exc:

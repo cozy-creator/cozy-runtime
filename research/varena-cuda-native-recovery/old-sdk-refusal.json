@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "tensorfs": "/home/fidika/cozy_v2/outputs/xs138-p2-retention-candidate-9ccb36a24/installed/tensorfs/__init__.py",
+  "torch": "2.14.0+cu130",
+  "actual_old_sdk_capability": false,
+  "cpu_memory_created": true,
+  "cuda_refusal": "ResidencyError: native CUDA weight residency is unavailable: native CUDA recovery requires the CacheOwner capability",
+  "cuda_initialized": false,
+  "scope": "real old native SDK capability refusal before CUDA setup; no mock and no GPU proof"
+}

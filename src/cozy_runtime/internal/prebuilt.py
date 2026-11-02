@@ -71,12 +71,14 @@ class Prebuilt:
     #: whether the wheel carries a CUTLASS fp8 GEMM for this card
     cutlass_fp8: bool
     _scratch: Callable[[int], Tensor] = field(init=False)
+    identity: str = field(init=False)
     #: Weights `_weight` has checked, by their pointers, shape and output dtype: a decode step
     #: calls each linear with a row or two, where re-checking costs more than the GEMV. Paged
     #: weights land at new addresses, so it is emptied at `CHECKED` entries.
     _checked: set[tuple[object, ...]] = field(init=False, default_factory=set)
 
     def __post_init__(self) -> None:
+        self.identity = artifact()
         device = self.torch.device("cuda", self.index)
         self._scratch = lambda size: self.torch.empty(size, dtype=self.torch.uint8, device=device)
 
