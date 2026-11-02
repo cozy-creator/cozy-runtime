@@ -1,0 +1,1 @@
+Record native working-demand observations for completed, explicitly keyed eager loops. Failed or retried work, preparation, capture and replay cannot train successful records. Successful cut retries release their saved exception frames while retaining measurement invalidation. Production sizing and prefetch remain unchanged pending qualified native decisions.

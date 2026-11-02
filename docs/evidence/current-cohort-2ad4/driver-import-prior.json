@@ -1,0 +1,14 @@
+{
+  "before": [],
+  "tensorfs": [],
+  "torch": [
+    "/usr/lib/x86_64-linux-gnu/libcuda.so.595.99.02"
+  ],
+  "executor": [
+    "/usr/lib/x86_64-linux-gnu/libcuda.so.595.99.02"
+  ],
+  "cuda_initialized": false,
+  "capable": true,
+  "tensorfs_file": "/home/fidika/cozy_v2/outputs/xs138-p4-public-consumer/helper-2990db724-parity004-001/host-overlay/tensorfs/__init__.py",
+  "torch_file": "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p0-torch/.task/torch-sdk/2.14.0+cu130-08187d9e/site-packages/torch/__init__.py"
+}

@@ -326,7 +326,8 @@ class Residency(Protocol):
         ...
 
     def region(
-        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None
+        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> Any:
         """An explicitly owned cache, released only while it has no active user."""
         ...
@@ -1398,7 +1399,7 @@ class ModelRegistry:
                     object.__setattr__(model, "_cozy_ready", False)
                     object.__setattr__(model, "_cozy_loading", False)
                 for cache in model._cozy_caches:
-                    cache.drop()
+                    cache._close()
             self._generations.clear()
             self._by_path.clear()
 

@@ -1,0 +1,25 @@
+{
+  "passed": true,
+  "kind": "host C++ syntax only, no object/link/module/CUDA execution",
+  "source_head": "5948028be94883423bf2b7c850171613998597e2",
+  "source_sha256": "0795d3ffced05771495bd41b9e20f43ba4ade2d8d2f03adc3184048708d26d7b",
+  "compiler": "g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0",
+  "flags": [
+    "-std=c++17",
+    "-fsyntax-only",
+    "-DPy_LIMITED_API=0x030c0000"
+  ],
+  "include_paths": [
+    "/usr/include/python3.12",
+    "/home/fidika/.cache/uv/archive-v0/xnOl_ytB2jQiCkYM/nanobind/include",
+    "/home/fidika/cozy_v2/outputs/xs138-p2-linear-kernels/cuda-13.0/include",
+    "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p0-torch/.task/torch-sdk/2.14.0+cu130-08187d9e/site-packages/nvidia/cu13/include"
+  ],
+  "toolkit_receipt": "/home/fidika/cozy_v2/outputs/xs138-p2-linear-kernels/toolchain-receipt.json",
+  "log": "dense-syntax-004.log",
+  "prior_missing_development_headers": [
+    "dense-syntax-001.log",
+    "dense-syntax-002.log",
+    "dense-syntax-003.log"
+  ]
+}

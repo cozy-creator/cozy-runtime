@@ -1,0 +1,67 @@
+{
+  "creator_source": "6c4f0e53a2a6324cff002d9ce558d8313c2f2904",
+  "source_contract_checks": [
+    {
+      "file": "crates/tensorfs-py/src/varena/working.rs",
+      "sha256": "95d90ad2965aba8ba75fb4ed759d1a5928abff1c4241cbbff35324fb0e91523d",
+      "required_symbols": [
+        "struct PyExecution",
+        "module.add_class::<PyExecution>()",
+        "varena::working::Execution::commit"
+      ],
+      "passed": true
+    },
+    {
+      "file": "crates/tensorfs-py/src/varena/cache_owner.rs",
+      "sha256": "91800e0911c3f53f91d4401cf9c15af36a68debbf3ba6647b6ef15852a5ea6ae",
+      "required_symbols": [
+        "const CACHE_OWNER_PROTOCOL: u32 = 1",
+        "fn defer_close",
+        "fn close"
+      ],
+      "passed": true
+    },
+    {
+      "file": "crates/tensorfs-py/src/varena/cooperative.rs",
+      "sha256": "f352767cfd6dee45832c79649ecba1a74e6a49d118cbdea6e18546bf8279b4a8",
+      "required_symbols": [
+        "const OWNER_PROTOCOL: u32 = 1",
+        "const PRESSURE_PROTOCOL: u32 = 1",
+        "fn request_boundary"
+      ],
+      "passed": true
+    },
+    {
+      "file": "crates/tensorfs-py/python/tensorfs/varena/__init__.py",
+      "sha256": "e580ed7e8bf15f464f623ffed29aae19ec0e7e1659264501f3f3c23f6dc53fcc",
+      "required_symbols": [
+        "class CacheOwner",
+        "def clear_streaming_limit",
+        "def prepare(self, *, reclaim: bool = True"
+      ],
+      "passed": true
+    },
+    {
+      "file": "crates/tensorfs-py/python/tensorfs/varena/cooperative.py",
+      "sha256": "bf6a0493c73b696b0c18427b53ff20d310b9fd2aa4a149ee71f2b8e91ec48259",
+      "required_symbols": [
+        "class CooperationOwner",
+        "def pressure_capability",
+        "def request_boundary",
+        "def initialize"
+      ],
+      "passed": true
+    },
+    {
+      "file": "crates/tensorfs-py/python/tensorfs/varena/torch.py",
+      "sha256": "ba841cbe5a6aff5b84f38e14446b1c87fa9497f33657916f91a46968dacabe9f",
+      "required_symbols": [
+        "def commit_execution",
+        "def split_begin",
+        "plan_generation"
+      ],
+      "passed": true
+    }
+  ],
+  "scope": "source ABI/capability presence only; installed mixed-cohort execution remains unqualified"
+}

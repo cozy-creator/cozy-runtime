@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-v2-current-core/research/varena-multi-gpu-start/cpu.py", line 165, in <module>
+    assert not state['driver_loaded'] and not state['cuda_initialized']
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError

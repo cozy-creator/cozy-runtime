@@ -1,0 +1,1 @@
+{"passed": true, "device": "cpu", "before": [[3.0, 3.0, 3.0, 3.0]], "after": [[3.0, 3.0, 3.0, 3.0]], "retained_before": [true, true], "retained_after": [false, false], "generations_before": [2, 2], "generations_after": [3, 3], "reported_reclaimed_bytes": 0, "models_after_close": 0, "cuda_initialized": false}
