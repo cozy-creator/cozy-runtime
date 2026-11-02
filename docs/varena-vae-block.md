@@ -206,3 +206,14 @@ decline before source hooks or numerical work. The body then reads and revalidat
 only its current block, chooses the native menu and validates all full/tail buffers
 before writes. It uses the actual framework stream explicitly and adds no per-operation
 synchronization. Shared context destruction is final-owner teardown.
+
+
+## Actual rotary presentation
+
+The real `MiniMaxH3VideoRotaryPosEmbed(48)` returns `[1,T,1,48]` cosine/sine tables.
+The first CPU file-consumer attempt exposed a fixture using only `[T,48]`, which the
+unfused reference cannot broadcast across its32 heads. The fixture now calls the actual
+rotary module. Native preflight accepts that actual broadcast shape as well as the
+existing compact prepared table, with contiguous FP32 storage, exactly`T*48` elements
+and token stride48. Kernel math, buffers and the existing flatten ABI are unchanged.
+The a09 source/artifact is preserved; this is a Python-only correction.

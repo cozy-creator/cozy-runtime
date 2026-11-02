@@ -11,13 +11,12 @@ import hashlib
 import math
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import tensorfs.varena.torch as vt
 import torch
 from torch import Tensor, nn
 
-from cozy_runtime import fusion
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._split import Cut
 from cozy_runtime.author.kernels import _BLOCK_SPLIT, LayerScaleBlock, read
@@ -27,6 +26,8 @@ from cozy_runtime.internal.execution.native_heads import _Attention, _attention,
 from cozy_runtime.internal.execution.native_linear_split import _chunks, _layout
 from cozy_runtime.internal.residency import _REQUEST, Model, Placeholder
 
+if TYPE_CHECKING:
+    from cozy_runtime import fusion
 
 class _Unsupported(ValueError):
     pass
@@ -173,6 +174,7 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
         or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
     ):
         raise _Unsupported("VAE requires an independent eager CUDA batch call")
+    from cozy_runtime import fusion
     from cozy_runtime.author.kernels import _SETS
     from cozy_runtime.internal.triton_kernels import _LOADED, _Launcher
 
@@ -260,30 +262,20 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
             or t.device != x.device
             or not t.is_contiguous()
             or t.data_ptr() % 16
-            or tuple(t.shape[-2:]) != (x.shape[1], 48)
+            or not (
+                tuple(t.shape[-2:]) == (x.shape[1], 48)
+                or tuple(t.shape) == (1, x.shape[1], 1, 48)
+            )
+            or t.stride(-2) != 48
             or t.numel() != x.shape[1] * 48
             for t in rotary
         )
     ):
         raise _Unsupported("VAE rotary must be the complete prepared FP32 split-half tables")
     with request.memory.lock:
-        models = tuple(
-            model for model in request.memory.models.values() if model.name in request.current
-        )
-    source = _source_identity(models)
-    global_hooks = nn.modules.module
-    owned = {id(hook) for model in models for hook in model.source_hooks}
-    if (
-        global_hooks._global_forward_pre_hooks
-        or global_hooks._global_forward_hooks
-        or module._backward_hooks
-        or module._backward_pre_hooks
-        or any(
-            id(hook) not in owned
-            for hook in (*module._forward_pre_hooks.values(), *module._forward_hooks.values())
-        )
-    ):
-        raise _Unsupported("VAE block has an opaque hook")
+        # A standalone declared block has not entered its source hook yet. Resolve
+        # ownership from real source tables, without binding any model's weights.
+        models = tuple(request.memory.models.values())
     linears = (*site.qkv, site.out, site.inputs[0], site.down)
     shapes = ((2048, 2048),) * 4 + ((16384, 2048), (2048, 8192))
     slots: list[_Slot] = []
@@ -315,6 +307,22 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
         _slot(module, name, (2048,), (torch.float32,), models)
         for name in (intent.gate_msa, intent.gate_mlp)
     ]
+    actual_owners = {id(slot.model) for slot in slots if slot.model is not None}
+    models = tuple(model for model in models if id(model) in actual_owners)
+    source = _source_identity(models)
+    global_hooks = nn.modules.module
+    owned = {id(hook) for model in models for hook in model.source_hooks}
+    if (
+        global_hooks._global_forward_pre_hooks
+        or global_hooks._global_forward_hooks
+        or module._backward_hooks
+        or module._backward_pre_hooks
+        or any(
+            id(hook) not in owned
+            for hook in (*module._forward_pre_hooks.values(), *module._forward_hooks.values())
+        )
+    ):
+        raise _Unsupported("VAE block has an opaque hook")
     if any(slot.metadata[3] != str(x.device) for slot in slots):
         raise _Unsupported("VAE source slots must declare the input's CUDA device")
     return _Inventory(
@@ -617,6 +625,8 @@ def _execute(
     index: Tensor,
     stream: int,
 ) -> Tensor:
+    from cozy_runtime import fusion
+
     x, site = inventory.intent.hidden, inventory.site
     weights, biases = values[:12:2], values[1:12:2]
     norm1, norm2, gate1, gate2 = values[12:]

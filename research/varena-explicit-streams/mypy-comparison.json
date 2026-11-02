@@ -1,0 +1,9 @@
+{
+  "baseline_errors": 50,
+  "candidate_errors": 49,
+  "added_errors": [],
+  "removed_errors": [
+    "src/cozy_runtime/author/_activity.py: error: Argument 1 to \"submit\" of \"Executor\" has incompatible type \"Callable[[Callable[_P, _T], **_P], _T]\"; expected \"Callable[[Callable[P, T], **P], T]\"  [arg-type]"
+  ],
+  "scope": "same six changed source files and same dfb SDK overlay; baseline diagnostics preserved"
+}

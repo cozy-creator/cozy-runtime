@@ -15,7 +15,6 @@ region's working set plus every graph's static buffers.
 
 from __future__ import annotations
 
-import ctypes
 import sys
 import threading
 import weakref
@@ -89,20 +88,6 @@ class Domain:
         self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
 
-    def _stream(self) -> Any:
-        pointer = ctypes.c_void_p()
-        status = self.torch.cuda.cudart().cudaStreamCreate(ctypes.addressof(pointer))
-        code = int(getattr(status, "value", status))
-        if code:
-            error = self.torch.AcceleratorError(f"cudaStreamCreate failed with CUDA error {code}")
-            error.error_code = code
-            raise error
-        try:
-            return self.torch.cuda.ExternalStream(pointer.value, device=self.device)
-        except BaseException:
-            self.torch.cuda.cudart().cudaStreamDestroy(pointer.value)
-            raise
-
     def configuration(self) -> tuple[Any, ...]:
         cuda = self.torch.backends.cuda
         return (
@@ -134,8 +119,8 @@ class Domain:
         # kernel probes must not invalidate this small lifetime-owner capture either.
         with kernel_ready.recording():
             try:
-                self.stream = self._stream()
-                self.control = self._stream()
+                self.stream = accel.nonblocking_stream(self.torch, self.device)
+                self.control = accel.nonblocking_stream(self.torch, self.device)
                 self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
                 self.fork.record(self.control)
                 self.join.record(self.stream)
@@ -207,7 +192,7 @@ class Domain:
                     # Graph reset may enqueue allocator retirement events.
                     stream.synchronize()
                     vt.retire_stream(stream, device=self.device)
-                    self.torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
+                    accel.destroy_stream(self.torch, stream)
             self.stream = self.control = self.fork = self.join = self.done = None
             self.closed = self.fenced = True
 

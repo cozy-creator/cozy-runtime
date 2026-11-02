@@ -72,7 +72,7 @@ from msgspec import UNSET, UnsetType
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, stepcache, weights_store
-from cozy_runtime.author import ModelRegistry, _split, describe
+from cozy_runtime.author import ModelRegistry, _activity, _split, describe
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
@@ -877,6 +877,9 @@ class Executor:
         #: a follower's watcher aborted its collectives; cleared when the group forms again
         self._interrupted = threading.Event()
         self._device_ready = False
+        #: HOST ONLY: process-lifetime execution stream, selected on every Runtime worker.
+        #: Library workspaces/tensors may retain it until exit; do not destroy it at unload.
+        self.execution_stream: Any = None
         self._startup_reported = False
         #: the attempt spool while an attempt runs: where a mirrored call's payloads go
         self._attempt_spool: Path | None = None
@@ -1068,9 +1071,17 @@ class Executor:
             _cuda(self.channel, "opening")
         try:
             accel.initialize(torch, self.device_kind)
-            if self.world > 1 and self.device_kind == "cuda":
-                torch.cuda.set_device(self.rank)
-                kernel_ready.DEVICE[0] = functools.partial(torch.cuda.device, self.rank)
+            if self.device_kind == "cuda":
+                index = self.rank if self.world > 1 else 0
+                torch.cuda.set_device(index)
+                owner.execution_stream = accel.nonblocking_stream(torch, index)
+                # This first command entered before a stream existed. Select it now, before
+                # Memory, library warm-up or any package allocation/launch can run.
+                torch.cuda.set_stream(owner.execution_stream)
+                kernel_ready.EXECUTION[0] = functools.partial(
+                    torch.cuda.stream, owner.execution_stream
+                )
+                _activity.WORKER_CONTEXT = lambda: torch.cuda.stream(torch.cuda.current_stream())
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
@@ -1086,6 +1097,15 @@ class Executor:
         self._device_ready = True
         place(self._device())
         return None
+
+    def _execution_context(self) -> contextlib.AbstractContextManager[Any]:
+        """Enter the process's CUDA stream on a command, idle or readiness worker.
+
+        Before device initialization this is cold, preserving Hello/Fork behavior. Torch's
+        stream context selects the stream's device and restores the caller's actual stream.
+        """
+        stream = self.host.execution_stream
+        return contextlib.nullcontext() if stream is None else self.torch.cuda.stream(stream)
 
     def _open_memory(self, torch: Any) -> None:
         """This executor's local residency and its pure-site execution helpers."""
@@ -1434,7 +1454,7 @@ class Executor:
                     )
                 else:
                     component(*args, **kwargs)
-                accel.synchronize(self.torch, self.device_kind)
+                accel.drain(self.torch, self.device_kind)
             self._attempt_spool = spool
             ranked = self.host._rank_request
             working = accel.allocator_peak(self.host.memory, ranked.id) if ranked is not None else 0
@@ -3338,11 +3358,11 @@ class Executor:
         call stays a native replay when they can."""
         assert self.order is not None
         try:
-            with self.order.turn(ticket):
+            with self.order.turn(ticket), self._execution_context():
                 before = memory.held()
                 memory.make_room(limit)
                 if not memory.requests and limit < memory.held():
-                    accel.synchronize(self.torch, self.device_kind)
+                    accel.drain(self.torch, self.device_kind)
                     self._release_programs()
                     memory.make_room(limit)
                 self._room_kept(memory, limit, before)
@@ -4918,8 +4938,8 @@ class Executor:
 
     def _quiescent(self) -> bool:
         """No author computation may still mutate GPU or output state when a terminal is
-        recorded. The proof is the device's own: every stream is complete."""
-        return accel.streams_idle(self.torch, self.device_kind)
+        recorded. The execution stream includes every explicitly joined consumer."""
+        return accel.streams_idle(self.torch, self.device_kind, stream=self.host.execution_stream)
 
     def _check_prepared_use(self, registration: Registration, payload: object) -> None:
         """Check current callable slots against the actual member, not historical aliases."""
@@ -4971,7 +4991,7 @@ class Executor:
                 if command.level == "ram":
                     # Map is ordered after every preceding invocation. Join its remaining
                     # consumer streams before retiring owners and returning allocator storage.
-                    accel.synchronize(self.torch, self.device_kind)
+                    accel.drain(self.torch, self.device_kind)
                     # Every slot's decoders, graphs and holds go before any model leaves: a
                     # language model's engine retains its drafter's weights too, and Klein's
                     # drafter slot maps before its upsampler, so an idle Klein refused every
@@ -5460,7 +5480,7 @@ def _idle(executor: Executor, order: _Order) -> None:
         return (bool(graphs.IDLE.jobs) or pins()) and not executor.awaiting_invoke()
 
     while not executor.poisoned:  # a faulted device takes no idle work: the machine ends it
-        with order.idle(answered, ready) as answered:
+        with order.idle(answered, ready) as answered, executor._execution_context():
             if executor.poisoned:
                 return
             try:
@@ -5519,10 +5539,13 @@ def serve(executor: Executor, channel: Channel) -> int:
 
 
 def _shut(executor: Executor, channel: Channel) -> int:
-    if executor.host.memory is not None:
-        executor.host.memory.close_cooperation()
-    if executor.group is not None:
-        executor.group.close()
+    with executor._execution_context():
+        if executor.host.execution_stream is not None:
+            accel.drain(executor.torch, executor.device_kind)
+        if executor.host.memory is not None:
+            executor.host.memory.close_cooperation()
+        if executor.group is not None:
+            executor.group.close()
     channel.send({"reply": "shutdown", "ok": True})
     return int(Exit.ok)
 
@@ -5561,7 +5584,8 @@ def _reply(executor: Executor, frame: Frame) -> Frame | None:
         # command reads `poisoned_generation` and rebuilds the whole cgroup.
         executor.poisoned = f"group: {executor.group.broken}"[:200]
     try:
-        reply = answer(executor, frame)
+        with executor._execution_context():
+            reply = answer(executor, frame)
         if reply is None:
             return None
     except msgspec.ValidationError as exc:
