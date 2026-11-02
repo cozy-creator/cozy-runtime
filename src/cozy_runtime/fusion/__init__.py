@@ -159,7 +159,9 @@ class DiTBlock:
     qk_affine: bool = True
     compose: bool = False
     hidden_states: str = "hidden_states"
+    name: str = field(init=False, repr=False, compare=False)
     entries: _kernels.Entries = field(init=False, repr=False, compare=False)
+    """Built, as `kernels`, only where Triton imports; elsewhere the blocks serve eager."""
     kernels: TritonKernels = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -172,6 +174,9 @@ class DiTBlock:
             raise ValueError(f"{self.block.__name__}: rotary {rotary} of {self.head_dim}")
         if (self.shift and not self.scale) or (self.mlp.value_first and self.mlp.up):
             raise ValueError(f"{self.block.__name__}: shift without scale, or value_first with up")
+        if _kernels.TRITON_ABSENT:
+            object.__setattr__(self, "name", f"fused.{self.block.__name__.lower()[:44]}")
+            return
         f16 = self.rows == "fp16"
         rounding = self.rope.rounding if self.rope else "sum"
         entries = _kernels.entries(
@@ -196,6 +201,7 @@ class DiTBlock:
         keys = "\n".join(e.key for e in entries.all())
         digest = hashlib.sha256(keys.encode()).hexdigest()[:12]
         name = f"fused.{self.block.__name__.lower()[:44]}.{digest}"
+        object.__setattr__(self, "name", name)
         object.__setattr__(self, "entries", entries)
         object.__setattr__(
             self, "kernels", TritonKernels(name, entries.all(), origin=_declaring_module())
@@ -658,8 +664,8 @@ def _report(plan: Plan, layout: DiTBlock, reason: str = "", blocks: int = 0) -> 
     """Under the layout's kernel set name, as Runtime reports that set's failed build."""
     document: dict[str, object] = {"block": layout.block.__qualname__, "applied": not reason}
     document |= {"reason": reason} if reason else {"blocks": blocks}
-    plan.report(layout.kernels.name, document)
-    print(f"[cozy] {layout.kernels.name}: {json.dumps(document, sort_keys=True)}", file=sys.stderr)
+    plan.report(layout.name, document)
+    print(f"[cozy] {layout.name}: {json.dumps(document, sort_keys=True)}", file=sys.stderr)
 
 
 def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
@@ -669,6 +675,9 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
     device = torch.device(plan.device)
     if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
         _report(plan, layout, f"fused blocks serve CUDA sm80+, not {device}")
+        return ""
+    if _kernels.TRITON_ABSENT:
+        _report(plan, layout, f"kernels_absent: {_kernels.TRITON_ABSENT}")
         return ""
     blocks: list[tuple[str, Any]] = [
         (f"{index}.{path}", module)
@@ -739,13 +748,20 @@ class ChannelNorm:
     dtype: Literal["bf16", "fp16", "fp32"] = "bf16"
     bias: bool = False
     entries: tuple[Any, ...] = field(init=False, repr=False, compare=False)
+    """Built, as `kernels`, only where Triton imports; elsewhere the norms serve eager."""
     kernels: TritonKernels = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if _kernels.TRITON_ABSENT:
+            return
         entries = _kernels.channel_entries(self.dtype, self.bias, bool(self.silu))
-        name = f"fused.{self.norm.__name__.lower()[:44]}.{self.dtype}"
         object.__setattr__(self, "entries", entries)
-        object.__setattr__(self, "kernels", TritonKernels(name, entries, origin=_declaring_module()))
+        kernels = TritonKernels(self.name, entries, origin=_declaring_module())
+        object.__setattr__(self, "kernels", kernels)
+
+    @property
+    def name(self) -> str:
+        return f"fused.{self.norm.__name__.lower()[:44]}.{self.dtype}"
 
     @property
     def torch_dtype(self) -> Any:
@@ -766,7 +782,8 @@ def _channel_norm_forward(self: Any, x: Any) -> Any:
     launch, layout = site.switch.launch, site.layout
     bias = self.bias if isinstance(self.bias, torch.Tensor) else None
     if (
-        launch is None
+        _kernels.TRITON_ABSENT
+        or launch is None
         or x.dtype is not layout.torch_dtype
         or x.dim() < 2
         or not _cuda(layout.torch_dtype, x, self.gamma, *(() if bias is None else (bias,)))
@@ -803,12 +820,14 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
 
     def report(reason: str = "", **counts: int) -> str:
         outcome = {**document, "applied": not reason, **({"reason": reason} if reason else counts)}
-        plan.report(layout.kernels.name, outcome)
-        print(f"[cozy] {layout.kernels.name}: {json.dumps(outcome, sort_keys=True)}", file=sys.stderr)
+        plan.report(layout.name, outcome)
+        print(f"[cozy] {layout.name}: {json.dumps(outcome, sort_keys=True)}", file=sys.stderr)
         return ""
 
     if device.type != "cuda" or torch.cuda.get_device_capability(device)[0] < 8:
         return report(f"fused norms serve CUDA sm80+, not {device}")
+    if _kernels.TRITON_ABSENT:
+        return report(f"kernels_absent: {_kernels.TRITON_ABSENT}")
     norms = [
         (f"{index}.{path}", module)
         for index, root in enumerate(roots)
