@@ -30,13 +30,15 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
+import tensorfs.varena.torch as vt
+
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import accel, attention_ulysses, kernel_ready
+from cozy_runtime.internal import attention_ulysses, cache_owners, kernel_ready
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
@@ -69,11 +71,10 @@ def say(key: str, line: str) -> None:
 def capture(
     torch: Any, step: Callable[[], object], pool: domain.Pool, owner: domain.Domain
 ) -> tuple[Any, str]:
-    """Record a caller-owned capture-safe computation in its already prepared pool.
+    """Record a pure computation after preparing Varena's mapped capture pool.
 
-    The caller owns purity, residency, static-data lifetime and all consuming streams. No
-    weight staging or eviction is allowed inside capture. Torch owns the capture pool and its
-    allocation bookkeeping; a failed capture is reset before its caller may try eager execution.
+    Bindings and outputs remain caller-owned. The measured eager working peak seeds pool
+    capacity; a larger actual capture refuses cleanly instead of mapping inside capture.
     """
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
@@ -84,32 +85,21 @@ def capture(
     try:
         with (
             kernel_ready.recording(),
-            owner.recovery_blocked(),
-            accel.capture_allocation(torch),
             torch.utils._python_dispatch._disable_current_modes(),
-            torch.cuda.stream(stream),
+            vt.graph(
+                graph, pool=pool.handle, stream=stream,
+                reserve_bytes=domain.working_peak(owner.device),
+            ),
         ):
-            try:
-                graph.capture_begin(pool=pool.handle, capture_error_mode="thread_local")
-            except Exception as exc:
-                failure = exc
-            else:
+            owner.fork.record(stream)
+            work.wait_event(owner.fork)
+            with torch.cuda.stream(work):
                 try:
-                    owner.fork.record(stream)
-                    work.wait_event(owner.fork)
-                    with torch.cuda.stream(work):
-                        try:
-                            step()
-                        finally:
-                            owner.join.record(work)
-                            stream.wait_event(owner.join)
-                except Exception as exc:
-                    failure = exc
-                try:
-                    graph.capture_end()
-                except Exception as exc:
-                    failure = failure or exc
-    except Building as exc:
+                    step()
+                finally:
+                    owner.join.record(work)
+                    stream.wait_event(owner.join)
+    except Exception as exc:
         failure = exc
     current.wait_stream(stream)
     current.wait_stream(work)
@@ -130,7 +120,7 @@ def capture(
     if failure is not None:
         if fault(failure) in (Fault.STICKY, Fault.DEVICE):
             code = getattr(failure, "error_code", None)
-            if code not in (900, 901):  # unsupported or invalidated capture, already ended
+            if code not in (900, 901):
                 raise failure
         return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
     owner.graphs.add(graph)
@@ -187,7 +177,7 @@ class _Recording:
                     static.copy_(value)
                     copied += static.nbytes
             with self.owner.recovery_blocked(replay=True):
-                self.graph.replay()
+                vt.replay(self.graph, stream=stream)
             for backend, implementation in self.served:
                 attention_ulysses.record(backend, implementation)
             source = torch.utils._pytree.tree_leaves(self.outputs)
@@ -199,6 +189,7 @@ class _Recording:
         finally:
             self.copied = copied
             self.done.record(stream)
+            vt.record_pool_stream(self.pool.handle, stream)
             self.fenced = True
 
     def close(self) -> None:
@@ -369,6 +360,32 @@ class _Recorder:
         self.replayed: _Timing = _Timing()
         #: the counters when the current attempt opened (`mark`): receipts are per request
         self.base: dict[str, Any] = {}
+        self._cache_owner: cache_owners.Registration | None = None
+
+    def _try_shrink(self) -> bool:
+        owner = self.domain
+        if owner is None:
+            return False
+        # These are the actual owner/domain gates used by replay and recording. A busy
+        # domain belongs to another sequence; never wait for it from a shrink callback.
+        with cache_owners.try_locks([owner.lock, self.lock]) as claimed:
+            if not claimed:
+                return False
+            binding = self.binding
+            locks = [] if binding is None else [binding.lock, binding.model.memory.lock]
+            with cache_owners.try_locks(locks) as bound:
+                if not bound:
+                    return False
+                if binding is not None and (
+                    binding.model.users or binding.model.retiring or binding.completion_lost
+                    or (binding.last is not None and not binding.last.query())
+                ):
+                    return False
+                if not self.recordings:
+                    if self._cache_owner is not None:
+                        self._cache_owner.suspend()
+                    return False
+                return self.forget()  # queries owned completion, then disables future replay
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -406,6 +423,8 @@ class _Recorder:
         self.failed.clear()
         self.waiting.clear()
         self.landed = LANDED[0]
+        if self._cache_owner is not None:
+            self._cache_owner.suspend()
 
 
 #: each installed component root's region
@@ -710,9 +729,14 @@ def forget_prepared(root: Any, definition: Any) -> None:
 
 def release(torch: Any, root: Any) -> None:
     """A generation's explicit teardown: finish its output copies before releasing addresses."""
+    recorder = _RECORDERS.get(root)
+    if recorder is not None and recorder._cache_owner is not None:
+        recorder._cache_owner.stop()
     retire(torch, root)
     _RECORDERS.pop(root, None)
     domain.release(root)
+    if recorder is not None and recorder._cache_owner is not None:
+        recorder._cache_owner.close()
 
 
 def mark(root: Any) -> None:
@@ -1022,7 +1046,7 @@ def _replay(
         # do not fit, so drain and retire it before the eager path allocates those outputs.
         recorder.finish()
         recorder.drop()
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         return _EAGER
     try:
         began = time.perf_counter()
@@ -1035,7 +1059,7 @@ def _replay(
         del out
         recorder.finish()
         recorder.drop()
-        torch.cuda.empty_cache()
+        vt.trim(torch.cuda.current_device())
         _refused(recorder, placed, f"its weights cannot all be resident at once ({exc})")
         return _EAGER
     try:
@@ -1044,6 +1068,8 @@ def _replay(
         lease.__exit__(None, None, None)
     recorder.gap = ""
     recorder.replays += 1
+    if recorder._cache_owner is not None:
+        recorder._cache_owner.touch()
     recorder.copy_bytes += entry.copied
     return result
 
@@ -1192,7 +1218,7 @@ def _record(
                     if target is not None:
                         target.copy_(value)
                 with owner.recovery_blocked(replay=True):
-                    graph.replay()  # served only when it reproduces the eager run bit for bit
+                    vt.replay(graph)  # served only when replay reproduces eager bit for bit
                 pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
                 if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
                     why = "its replay differs from the eager run on the same inputs"
@@ -1208,6 +1234,10 @@ def _record(
                     graph = None
                     return True
         recorder.recordings[key] = entry
+        if recorder._cache_owner is None:
+            recorder._cache_owner = cache_owners.register(owner.device, recorder, "_try_shrink")
+        else:
+            recorder._cache_owner.touch()
         recorder.captures += 1
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
         return True
