@@ -1,0 +1,3 @@
+src/cozy_runtime/internal/cooperation.py:14: error: Module "tensorfs" has no attribute "varena"  [attr-defined]
+src/cozy_runtime/internal/cooperation.py:129: error: Returning Any from function declared to return "dict[str, Any]"  [no-any-return]
+Found 2 errors in 1 file (checked 1 source file)
