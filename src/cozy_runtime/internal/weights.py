@@ -151,6 +151,8 @@ class Backend:
         self.leaves: dict[str, tuple[Any, Any, tuple[str, ...]]] = {}
         #: (component, provider) -> installed leaves, counted when they install (`gemm.selected`)
         self.gemm_sites: Counter[tuple[str, str]] = Counter()
+        #: component -> its 16-bit stored float dtypes, which a CPU executor computes in float32
+        self.widened: dict[str, tuple[str, ...]] = {}
 
     def _select(self, key: str, row: PlanRow) -> Selection:
         """The plan's provider for one destination, matched by digest against this build and
@@ -478,6 +480,7 @@ class Backend:
         # never at construction (v6 13633 filled the card with H3's transformer before its TE).
         model = self.memory.load(root, Level.RAM)
         if self.device.type == "cpu":
+            self.widened[name] = tuple(sorted({r.dtype for r in rows.values()} & {"f16", "bf16"}))
             _float32(self.torch, root)
         self._leg(f"{name}.load", leg)
         return model
