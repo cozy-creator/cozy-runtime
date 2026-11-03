@@ -1,0 +1,1 @@
+A file an attempt saved can be passed to its own child call. The machine checks its bytes against its digest first; files from other attempts stay refused (`foreign_asset`). Needs a cozy with this support.

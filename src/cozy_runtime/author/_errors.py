@@ -43,7 +43,8 @@ class ConformanceError(AuthorError):
 
 
 class InvalidRequest(AuthorError):
-    """The request does not satisfy the declared schema. API bounds REJECT (§1.2)."""
+    """The request does not satisfy the declared schema: a wrong type or a missing field. A
+    value over a limit is clamped or cut with a row, never refused (`_defaults.fit`)."""
 
     default_code = "invalid_request"
 

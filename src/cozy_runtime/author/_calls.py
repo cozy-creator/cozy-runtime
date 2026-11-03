@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import logging
 import math
@@ -24,7 +25,7 @@ from cozy_runtime.author._artifacts import ModelChoice
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import MediaReads
-from cozy_runtime.author._defaults import undeclared
+from cozy_runtime.author._defaults import fit
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._executor_requests import (
     MAX_CALL_INDEX,
@@ -37,14 +38,21 @@ from cozy_runtime.author._executor_requests import (
     Exchange,
     GpuRelease,
     ModelPrefetch,
+    SavedFile,
 )
-from cozy_runtime.author._files import File, Files, Tree, asset_dec_hook
+from cozy_runtime.author._files import _UNBOUND, File, Files, Tree, asset_dec_hook
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import WARNINGS, Model
 from cozy_runtime.author._model_defaults import model_components, model_defaults
 from cozy_runtime.author._observations import Scalar
-from cozy_runtime.author._services import Telemetry, _progress_scope, _ProgressScope
+from cozy_runtime.author._services import (
+    Attempt,
+    Telemetry,
+    _progress_scope,
+    _ProgressScope,
+    settle_frame,
+)
 from cozy_runtime.author._weights import Weights
 
 _LOG = logging.getLogger(__name__)
@@ -262,10 +270,16 @@ class PendingCall[R](Awaitable[R]):
     """Awaiting returns R unchanged."""
 
     def __init__(
-        self, broker: _Broker, index: int, binding: _CallType, payload: bytes, ctx: Context
+        self,
+        broker: _Broker,
+        index: int,
+        binding: _CallType,
+        payload: bytes,
+        ctx: Context,
+        saved: tuple[SavedFile, ...] = (),
     ):
         self.broker, self.index, self.binding, self.payload = broker, index, binding, payload
-        self.ctx = ctx
+        self.ctx, self.saved = ctx, saved
         self.request_id = ""
         self.task: asyncio.Task[R] | None = None
         self.progress_scope = _progress_scope.get()
@@ -278,7 +292,11 @@ class PendingCall[R](Awaitable[R]):
 
 
 def _input_ref(value: object, request_id: str) -> str:
-    """Forward only a verified input of this attempt; Creator rechecks its custody."""
+    """Forward only a verified input of this attempt; TensorD rechecks its custody."""
+    if isinstance(value, (File, Tree)) and value._attempt not in (_UNBOUND, request_id):
+        raise CapabilityError(
+            f"file {value.ref!r} belongs to attempt {value._attempt!r}", code="foreign_asset"
+        )
     if (
         isinstance(value, (File, Tree))
         and value.hydrated
@@ -289,7 +307,7 @@ def _input_ref(value: object, request_id: str) -> str:
             value._read_guard()
         return value.digest
     raise CapabilityError(
-        "child media must be a verified input granted to this parent attempt",
+        "child media must be a file this attempt saved, or a verified input granted to it",
         code="child.asset_ungranted",
     )
 
@@ -325,15 +343,23 @@ class _Broker:
         self.telemetry: Telemetry | None = None
         #: The attempt's media reader: received media read through it.
         self.media: MediaReads | None = None
+        #: The attempt, whose saved files it may give its children, and those it has hashed.
+        self.attempt: Attempt | None = None
+        self.saved_sha256: dict[str, str] = {}
 
     def bind(
-        self, ctx: Context, telemetry: Telemetry | None = None, media: MediaReads | None = None
+        self,
+        ctx: Context,
+        telemetry: Telemetry | None = None,
+        media: MediaReads | None = None,
+        attempt: Attempt | None = None,
     ) -> None:
         if self.closed or self.context is not None or ctx.request_id != self.request_id:
             raise CapabilityError("package broker escaped its attempt", code="escaped_handle")
         self.context = ctx
         self.telemetry = telemetry
         self.media = media
+        self.attempt = attempt
         ctx._release_gpus = self.release_gpus
 
     def chooses(self, models: object) -> None:
@@ -354,6 +380,33 @@ class _Broker:
         if self.closed:
             raise CapabilityError("GPU release escaped its attempt", code="escaped_handle")
         self._check(self.exchange(GpuRelease(), Answer), 0)
+
+    def _saved(self, value: object) -> SavedFile | None:
+        """`value` as a file this attempt saved, whole in its spool for TensorD to check: a frame
+        is encoded now. A child's input is named by SHA-256, which a saved file's digest isn't.
+        Its child has it, so the result need not return it."""
+        attempt = self.attempt
+        if (
+            attempt is None
+            or not isinstance(value, File)
+            or attempt.pending.get(value.ref) is not value
+        ):
+            return None
+        if value.ref in attempt.parts:
+            raise CapabilityError(
+                "a joined video has no one file to pass to a child; save it whole or pass its parts",
+                code="child.asset_ungranted",
+            )
+        if value.ref in attempt.frames:
+            settle_frame(attempt, value.ref)
+        attempt.shown.add(value.ref)
+        digest = self.saved_sha256.get(value.ref)
+        if digest is None:
+            assert value._local is not None  # a saved file's bytes are in the spool
+            with value._local.open("rb") as blob:
+                digest = f"sha256:{hashlib.file_digest(blob, 'sha256').hexdigest()}"
+            self.saved_sha256[value.ref] = digest
+        return SavedFile(asset_ref=value.ref, digest=digest, media_type=value.media_type)
 
     def reserve(
         self,
@@ -383,6 +436,7 @@ class _Broker:
         self.chooses(arguments.get("models"))
         if self.next_index > MAX_CALL_INDEX:
             raise CapabilityError("package call index is exhausted", code="child_index_exhausted")
+        saved: dict[str, SavedFile] = {}
         try:
 
             def asset_value(value: object) -> object:
@@ -398,14 +452,30 @@ class _Broker:
                         {"asset": item, "label": item.label, "fidelity": item.fidelity}
                         for item in value._items
                     ]
+                file = self._saved(value)
+                if file is not None:
+                    saved[file.digest] = file
+                    return file.digest
                 return _input_ref(value, ctx.request_id)
 
-            plain, ignored = undeclared(
+            plain, ignored, moved = fit(
                 binding.request, msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
             )
+            row: tuple[str, dict[str, Scalar]]
+            for change in moved:
+                row = (
+                    "a package call passed a value over its callee's limit; it was clamped",
+                    {
+                        "callee": f"{module}:{export}",
+                        "field": change.field,
+                        "applied": str(change.applied),
+                    },
+                )
+                if row not in WARNINGS:
+                    WARNINGS.append(row)
             if ignored:
                 # A field the installed callee does not declare is a warning, never a refusal.
-                row: tuple[str, dict[str, Scalar]] = (
+                row = (
                     "a package call named fields its callee does not declare; they were dropped",
                     {"callee": f"{module}:{export}", "fields": ", ".join(ignored)},
                 )
@@ -428,7 +498,7 @@ class _Broker:
         payload = application_json.encode(encoded)
         if len(payload) > MAX_CALL_BYTES:
             raise CapabilityError("package call exceeds inline bound", code="child_payload_bound")
-        call = PendingCall[Any](self, self.next_index, binding, payload, ctx)
+        call = PendingCall[Any](self, self.next_index, binding, payload, ctx, tuple(saved.values()))
         self.next_index += 1
         self.calls[call.index] = call
         return call
@@ -570,6 +640,7 @@ class _Broker:
             export=call.binding.export,
             payload=call.payload.decode(),
             progress_label=call.progress_scope.name if call.progress_scope else "",
+            saved=call.saved,
         )
 
     @staticmethod

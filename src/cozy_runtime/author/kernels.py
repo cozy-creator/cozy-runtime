@@ -44,7 +44,7 @@ class KernelsUnavailable(RuntimeError):
     """A package's kernels cannot serve on this GPU now. `code`: `kernels_absent` (no machine
     kernel store, no Triton, a CPU, or no entry compiled for these constexprs),
     `kernels_failed` (this machine run's build failed) or `kernels_corrupt` (built, but it does
-    not load: breakage, never a reason to serve another kernel quietly)."""
+    not load). The eager path serves any of them, and the run says why."""
 
     def __init__(self, code: str, detail: str) -> None:
         super().__init__(detail)

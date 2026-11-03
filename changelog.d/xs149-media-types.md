@@ -1,0 +1,1 @@
+`.m4a`, `.aac`, `.opus`, `.aiff`, `.mkv`, `.avi`, `.m4v`, `.mpg` and `.flv` are read like any other audio or video. An input field with no declared size has no size limit, and the shot contract no longer caps its inputs' file sizes or narrows a frame to PNG, JPEG or WebP. A shot's or an upscale's video and latents can be any size the disk holds.

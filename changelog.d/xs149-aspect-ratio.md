@@ -1,0 +1,1 @@
+An aspect ratio can be written `2.39:1`, `16/9`, `16x9` or `1.85`, and one past a model's range is held to it with a `clamp` row, a picture's own shape included. A box's corners may come in either order. Two references with one name warn, and a mention means the first. `ask` takes `prompts` over `prompt`, and swaps a reversed frame range, with a warning.

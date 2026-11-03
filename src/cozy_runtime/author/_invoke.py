@@ -281,10 +281,9 @@ class Invocation:
     its content digest and sniffed its bytes, all BEFORE acceptance. An `File` field whose
     input_id is absent here never hydrates and refuses typed — same law as `trees`, one
     modality over: the grant IS the read capability, and a ref is never a location."""
-    max_input_bytes: int | None = 64 << 20
-    """An explicit deployment ceiling narrows every field's own `FileBound`.
-    None honors each installed field's declared bound, with 64 MiB for fields that
-    declare none. A larger field never widens an undeclared sibling's allowance."""
+    max_input_bytes: int | None = None
+    """An explicit deployment ceiling narrows every field's own `FileBound`. None honors each
+    installed field's declared bound; a field that declares none has no size limit."""
     sources: Mapping[str, Weights[Any]] = field(default_factory=dict)
     """`Weights[M]` parameter -> its raw checkpoint, read through this attempt's source."""
     weights_bytes: ReadBytes | None = None
@@ -487,7 +486,7 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
 
     attempt.entered = True
     if inv.calls is not None:
-        inv.calls.bind(ctx, Telemetry(record, ctx), record.media)
+        inv.calls.bind(ctx, Telemetry(record, ctx), record.media, record)
     token, context = _current.set(inv.calls), CURRENT.set(ctx)
     try:
         result = _call(surface, kwargs)
@@ -795,13 +794,11 @@ def _check_input(
             code="asset_media_type",
             fields=[granted.input_id],
         )
-    declared = bound.max_bytes if bound is not None else None
-    ceiling = cap if cap is not None else declared or 64 << 20
-    limit = min(declared, ceiling) if declared else ceiling
-    if limit and granted.length > limit:
+    limits = [limit for limit in (bound.max_bytes if bound is not None else None, cap) if limit]
+    if limits and granted.length > min(limits):
         raise InvalidRequest(
             f"input {granted.input_id!r} is {granted.length} B and this field admits "
-            f"{limit} B. A size bound is a TYPED property of the field, so it refuses "
+            f"{min(limits)} B. A size bound is a TYPED property of the field, so it refuses "
             "before the handler is entered and not inside it",
             code="asset_too_large",
             fields=[granted.input_id],

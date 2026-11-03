@@ -16,9 +16,14 @@ on:
         type: string
         default: wheels
       runner:
-        description: Runner label
-        type: string
+        description: A standard runner, free on this public repo
+        type: choice
+        options: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, macos-latest]
         default: ubuntu-latest
+      billed_runner:
+        description: "A larger runner, named on purpose in place of runner. Never free (linux-x64-16core: $0.042/min, $2.52 a 60-min job) and the budget is about $10/day per org"
+        type: string
+        default: ''
       nonce:
         description: Caller's id, shown in the run name so the caller can find its run
         type: string
@@ -35,18 +40,22 @@ jobs:
     uses: ./.github/workflows/kernels.yaml
     with:
       ref: ${{ inputs.ref }}
-      linux: ${{ contains(inputs.runner, 'arm') && '["aarch64"]' || '["x86_64"]' }}
+      linux: ${{ contains(inputs.billed_runner || inputs.runner, 'arm') && '["aarch64"]' || '["x86_64"]' }}
       windows: 'no'
 
   dev:
     needs: modules
     if: ${{ inputs.build != 'execution' && !cancelled() && needs.modules.result != 'failure' }}
-    runs-on: ${{ inputs.runner }}
+    runs-on: ${{ inputs.billed_runner || inputs.runner }}
     # Hang bound, not a work budget.
     timeout-minutes: 60
     env:
       WHEELS: ${{ inputs.build == 'wheels' }}
     steps:
+      - if: ${{ inputs.billed_runner != '' }}
+        env:
+          RUNNER: ${{ inputs.billed_runner }}
+        run: echo "::warning::billed runner $RUNNER, never free; the budget is about \$10/day per org, and October passed it on 10-17 and 10-22 with these runs"
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref }}

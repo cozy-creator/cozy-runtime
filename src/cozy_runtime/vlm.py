@@ -61,8 +61,14 @@ DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
 THOUGHT_END = "</think>"
 #: A saved tokenizer's bookkeeping, not settings its constructor takes.
 TOKENIZER_METADATA = (
-    "added_tokens_decoder", "tokenizer_file", "processor_class", "chat_template", "name_or_path",
-    "backend", "is_local", "local_files_only",
+    "added_tokens_decoder",
+    "tokenizer_file",
+    "processor_class",
+    "chat_template",
+    "name_or_path",
+    "backend",
+    "is_local",
+    "local_files_only",
 )
 
 Images = Annotated[
@@ -147,9 +153,7 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
     """Answer each prompt about its text, images and videos, all prompts in one pass."""
     ctx.raise_if_cancelled()
     if payload.prompts and (payload.prompt or payload.images or payload.videos):
-        raise InvalidRequest(
-            "send prompt (with images and videos) or prompts, not both", code="ask_prompts"
-        )
+        tel.log("prompts wins: prompt, images and videos beside it are ignored", level="warning")
     prompts = payload.prompts or [AskPrompt(payload.prompt, payload.images, payload.videos)]
     if not prompts[0].text:
         raise InvalidRequest("prompt is empty", code="ask_prompts")
@@ -160,7 +164,8 @@ def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> A
         payload.max_frames or int(video.max_frames),
     )
     if lo > hi:
-        raise InvalidRequest(f"min_frames {lo} is above max_frames {hi}", code="ask_frames")
+        tel.log(f"min_frames {lo} is above max_frames {hi}: swapped", level="warning")
+        lo, hi = hi, lo
     questions = []
     with tel.stage("reading"):
         for p in prompts:

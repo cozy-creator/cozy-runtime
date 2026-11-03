@@ -525,6 +525,8 @@ def bind_allocator(torch: Any, kind: str) -> None:
     """Select Runtime's allocator without device activation or standalone defaults."""
     if kind != "cuda":
         return
+    # Preserve Torch 2.15 per-stream library workspace custody before first use.
+    os.environ["TORCH_CUBLAS_WORKSPACE_CACHE"] = "1"
     # A request never compiles; keep the existing native-op override selection.
     native = getattr(torch, "_native", None)
     if native is not None:
@@ -546,6 +548,7 @@ def initialize(torch: Any, kind: str) -> None:
     if kind == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("this Mac's torch has no usable MPS device")
     if kind == "cuda":
+
         torch.cuda.init()
 
 

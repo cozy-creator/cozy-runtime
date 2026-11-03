@@ -2,18 +2,19 @@
 
 The same names, types and meaning in every image package, so swapping one model for another never
 breaks a request. Every optional knob is None by default: the model's own recommended value, which
-its README and `--describe` state. The runtime rejects aspect ratios outside 1:16 through 16:1.
-Within that global envelope, a model clamps to its narrower range (a `clamp` row) and warns for
-a knob it has no use for. A package subclasses `ImageRequest`
+its README and `--describe` state. A model holds an aspect ratio to its range, at most 1:16 through
+16:1 (a `clamp` row), and warns for a knob it has no use for. A package subclasses `ImageRequest`
 only to narrow `pictures` to its model's count or to add a knob no other model has.
 """
 
 from __future__ import annotations
 
 import math
+import re
 import secrets
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from fractions import Fraction
 from typing import Annotated, NoReturn
 
 import msgspec
@@ -27,8 +28,8 @@ from cozy_runtime.author._services import AdjustmentRows, Adjustments
 AspectRatio = Annotated[
     str,
     msgspec.Meta(
-        pattern=r"^[1-9][0-9]*:[1-9][0-9]*$",
-        description="Output aspect ratio W:H, from 1:16 through 16:1 inclusive.",
+        description="Output aspect ratio: 16:9, 2.39:1, 16/9, 16x9 or 1.85. A model holds it to "
+        "its range, at most 1:16 through 16:1, and says so.",
     ),
 ]
 Seed = Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)]
@@ -38,33 +39,21 @@ MEGAPIXEL = 1 << 20
 MAX_IMAGE_ASPECT_RATIO = 16
 
 
-def _check_ratio(width: int, height: int) -> None:
-    """Use integer comparisons: float division can hide a ratio just above the limit."""
-    if width <= 0 or height <= 0:
-        raise InvalidRequest(
-            "aspect_ratio must contain two positive integers W:H",
-            code="aspect_ratio",
-            fields=("aspect_ratio",),
-        )
-    if width > MAX_IMAGE_ASPECT_RATIO * height or height > MAX_IMAGE_ASPECT_RATIO * width:
-        raise InvalidRequest(
-            f"image aspect ratio {width}:{height} is outside 1:16 through 16:1",
-            code="aspect_ratio",
-            fields=("aspect_ratio",),
-        )
-
-
 def _ratio(value: str) -> tuple[int, int]:
+    """`W:H` in lowest whole numbers, however it is written. Text that names no ratio refuses."""
+    sides = re.split(r"\s*[:/xX\u00d7]\s*", value.strip())
     try:
-        width, height = map(int, value.split(":"))
-    except (ValueError, AttributeError) as error:
+        width, height = map(Fraction, sides if len(sides) > 1 else [*sides, "1"])
+        ratio = width / height
+    except (ValueError, ZeroDivisionError):
+        ratio = Fraction(0)
+    if ratio <= 0:
         raise InvalidRequest(
-            "aspect_ratio must contain two positive integers W:H",
+            f"aspect_ratio {value!r} names no ratio: write it as 16:9 or 2.39:1",
             code="aspect_ratio",
             fields=("aspect_ratio",),
-        ) from error
-    _check_ratio(width, height)
-    return width, height
+        )
+    return ratio.numerator, ratio.denominator
 
 
 #: `[x0, y0, x1, y1]`: a box's corners, 0-1 of the output canvas, origin top-left, x0 < x1, y0 < y1.
@@ -77,9 +66,7 @@ class Picture(Reference, kw_only=True):
     """A picture the request edits or composes, named for the prompt's `<name>` mentions. Read
     upright and scaled down to 16 MP at most."""
 
-    image: Annotated[
-        ImageFile, FileBound(max_bytes=32 << 20), ImagePreparation(max_pixels=16 << 20)
-    ]
+    image: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
     #: Where it goes in the output, for a model with layout control; None places it nowhere in
     #: particular. A placed picture is an element, not the canvas: the size is the model's
     #: text-to-image default.
@@ -101,9 +88,6 @@ class Target:
 
     ratio: tuple[int, int]
     pixels: float
-
-    def __post_init__(self) -> None:
-        _check_ratio(*self.ratio)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +113,6 @@ class Sizes:
         1/16 over `pixels`. A size off the one the ratio itself rounds to is an `aspect_ratio`
         clamp row."""
         (w, h), (small, large), grid = ratio, self.sides, self.grid
-        _check_ratio(w, h)
         widest = min(self.widest, MAX_IMAGE_ASPECT_RATIO, large**2 / pixels, pixels / small**2)
         width, height = self._snapped(pixels, min(max(w / h, 1 / widest), widest))
         width, height = min(max(width, small), large), min(max(height, small), large)
@@ -161,7 +144,7 @@ class ImageRequest(msgspec.Struct):
     pictures: Annotated[list[Picture], msgspec.Meta(max_length=16)] = msgspec.field(
         default_factory=list
     )
-    #: W:H from 1:16 through 16:1. None: the first picture's, else the model's default.
+    #: W:H, held to 1:16 through 16:1. None: the first picture's, else the model's default.
     aspect_ratio: AspectRatio | None = None
     #: Any size, in 1024² pixels. None: the first picture's pixel count, else the model's default.
     megapixels: Annotated[float, msgspec.Meta(gt=0)] | None = None
@@ -176,7 +159,7 @@ class ImageRequest(msgspec.Struct):
     def __post_init__(self) -> None:
         # msgspec calls this while decoding, before admission or any model work.
         if self.aspect_ratio is not None:
-            _ratio(self.aspect_ratio)
+            self.aspect_ratio = ":".join(map(str, _ratio(self.aspect_ratio)))
 
     def target(
         self, first: tuple[int, int] | None, *, megapixels: float, ratio: str = "1:1"
@@ -283,11 +266,11 @@ def _removed(field: str) -> InvalidRequest:
 
 
 def corners(box: Sequence[float], field: str) -> tuple[float, float, float, float]:
-    """A `Box` as its corners, refused unless x0 < x1 and y0 < y1."""
-    x0, y0, x1, y1 = box
-    if not (x0 < x1 and y0 < y1):
+    """A `Box` as its corners, in order whichever way it was written. One with no area refuses."""
+    (x0, x1), (y0, y1) = sorted((box[0], box[2])), sorted((box[1], box[3]))
+    if x0 == x1 or y0 == y1:
         raise InvalidRequest(
-            f"a box is [x0, y0, x1, y1] with x0 < x1 and y0 < y1, got {list(box)}",
+            f"a box needs some area, got {list(box)}",
             code="invalid_box",
             fields=(field,),
         )

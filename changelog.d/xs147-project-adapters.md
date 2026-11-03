@@ -1,0 +1,1 @@
+`App.project_adapter` and the records it reads (`ProjectShot`, `ProjectUpscale`, `ProjectEntity`, `ProjectSetup`, `ProjectWorldState`, `Invocation`): a package can turn a `cozy project` node into its own call.

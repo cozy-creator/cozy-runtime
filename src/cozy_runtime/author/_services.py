@@ -191,7 +191,8 @@ class Attempt:
     published: list[Publish] = field(default_factory=list)
     #: The result fields `Outputs.publish` may name (`Surface.outputs`); None: not known here.
     outputs: frozenset[str] | None = None
-    #: Handles delivered as products, or joined into one: the result need not return them.
+    #: Handles delivered as products, joined into one or given to a child: the result need not
+    #: return them.
     shown: set[str] = field(default_factory=set)
     #: A composite asset's parts, by its handle: what `publish` sends instead of one file.
     parts: dict[str, tuple[PublishPart, ...]] = field(default_factory=dict)
@@ -208,6 +209,12 @@ class Attempt:
         if not self.ring.subject:
             self.ring.subject = self.request_id
         self.media = MediaReads(self)
+
+    def warn(self, field: str, message: str) -> None:
+        """One `warn` row for what a read tolerated in an input, once."""
+        row = AdjustmentRow("warn", field, None, None, message, "policy")
+        if row not in self.rows:
+            self.rows.append(row)
 
     def emit(self, kind: str, name: str, value: Scalar = None, /, **fields: Scalar) -> Observation:
         """One RETAINED record: the bounded ring, its emit-boundary checks, then the lane."""
@@ -387,8 +394,8 @@ class _AuthorEvents(Iterator[DecodedMediaEvent]):
 class Outputs(_Bound):
     """Transactional outputs (``out``). Save registers a bounded pending handle.
 
-    Returning a saved value completes it with the invocation. ``await commit(file)``
-    completes an owned file earlier so the running caller can forward it.
+    Returning a saved value completes it with the invocation. Passing a saved file to a child
+    call gives the child its bytes, and the result need not return it then.
     """
 
     __slots__ = ()
@@ -497,7 +504,31 @@ class Outputs(_Bound):
         audio_format = header.audio
 
         def feed(encoder: _codec.StreamingMP4Encoder) -> int:
+            # A source's clock needn't start at 0, hold one rate or start its sound with its first
+            # frame: the first frame is 0, each frame takes the next slot of `rate`, and the sound
+            # is placed once against the first frame, then runs on.
             audio_samples = 0
+            first: Fraction | None = None
+            early: list[DecodedMediaEvent] = []
+
+            def write_sound(chunk: DecodedMediaEvent) -> int:
+                assert first is not None
+                planar = self._audio_planar(audio_format, chunk, audio_samples, clocked=False)
+                if audio_samples or not isinstance(chunk, DecodedAudioChunk):
+                    encoder.write_audio(planar)
+                    return audio_samples + planar.shape[1]
+                lead = round((chunk.start_time - first) * chunk.sample_rate)
+                if lead > 0:
+                    silence = (bytes(lead * 4),) * chunk.channels
+                    encoder.write_audio(_codec.audio_chunk(silence, lead)[0])
+                    encoder.write_audio(planar)
+                    return lead + planar.shape[1]
+                if -lead >= chunk.sample_count:
+                    return 0
+                kept = tuple(pcm[-lead * 4 :] for pcm in chunk.pcm_f32le)
+                encoder.write_audio(_codec.audio_chunk(kept, chunk.sample_count + lead)[0])
+                return chunk.sample_count + lead
+
             for event in source:
                 self._attempt.check_open("Outputs.save_video_stream")
                 if isinstance(event, DecodedMediaHeader):
@@ -505,7 +536,10 @@ class Outputs(_Bound):
                         "streaming video contains a second header", code="media_header"
                     )
                 if not isinstance(event, DecodedVideoFrame):
-                    audio_samples = self._write_audio(encoder, audio_format, event, audio_samples)
+                    if first is None:
+                        early.append(event)
+                    else:
+                        audio_samples = write_sound(event)
                     continue
                 if (
                     event.width != video_format.width
@@ -520,18 +554,17 @@ class Outputs(_Bound):
                     raise OutputError(
                         "streaming video frame differs from its header", code="frame_shape"
                     )
-                expected = Fraction(encoder.video_frames, 1) / rate
-                if event.start_time != expected:
-                    raise OutputError(
-                        f"streaming video frame starts at {event.start_time}, expected {expected}",
-                        code="video_discontinuity",
-                    )
-                if event.duration * event.time_base != 1 / rate:
-                    raise OutputError(
-                        "streaming video frame duration differs from its output rate",
-                        code="video_discontinuity",
+                first = event.start_time if first is None else first
+                if abs(event.start_time - first - encoder.video_frames / rate) * rate > 1:
+                    self._attempt.warn(
+                        "video",
+                        f"its frames aren't on a constant clock; written at {float(rate):g} fps, "
+                        "so its timing is evened out",
                     )
                 encoder.write_video(event.rgb)
+                for chunk in early:
+                    audio_samples = write_sound(chunk)
+                early.clear()
             return audio_samples
 
         return self._save_mp4(
@@ -657,9 +690,15 @@ class Outputs(_Bound):
         return written + planar.shape[1]
 
     def _audio_planar(
-        self, audio_format: DecodedAudioFormat | None, event: DecodedMediaEvent, written: int
+        self,
+        audio_format: DecodedAudioFormat | None,
+        event: DecodedMediaEvent,
+        written: int,
+        *,
+        clocked: bool = True,
     ) -> _codec.Planar:
-        """One chunk checked against the declared format and continuing the sample clock."""
+        """One chunk checked against the declared format and, when `clocked`, continuing the sample
+        clock."""
         if not isinstance(event, DecodedAudioChunk):
             raise OutputError(
                 f"streaming video received {type(event).__name__}, not a media event",
@@ -676,7 +715,7 @@ class Outputs(_Bound):
         ):
             raise OutputError("streaming audio chunk differs from its header", code="audio_format")
         expected = Fraction(written, audio_format.sample_rate)
-        if event.start_time != expected:
+        if clocked and event.start_time != expected:
             raise OutputError(
                 f"streaming audio starts at {event.start_time}, expected {expected}",
                 code="audio_discontinuity",
@@ -934,9 +973,7 @@ class Outputs(_Bound):
             shutil.rmtree(target)
             raise
 
-    def save_file(
-        self, path: Path | str, *, media_type: str = "application/octet-stream"
-    ) -> File:
+    def save_file(self, path: Path | str, *, media_type: str = "application/octet-stream") -> File:
         """Copies immediately: a MUTABLE AUTHOR PATH is never retained (§3.4 step 2)."""
         return self._register(Path(path).read_bytes(), File, media_type)
 
