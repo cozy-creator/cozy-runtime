@@ -310,6 +310,16 @@ _VIDEO_STRUCTS = (
     "ShotResult",
     "UpscaleRequest",
     "UpscaleResult",
+    "Invocation",
+    "ProjectBeat",
+    "ProjectContinue",
+    "ProjectEntity",
+    "ProjectPicture",
+    "ProjectReference",
+    "ProjectSetup",
+    "ProjectShot",
+    "ProjectUpscale",
+    "ProjectWorldState",
 )
 #: Author-surface classes that translate to themselves in a TYPE position.
 _AUTHOR_TYPES = (
@@ -413,6 +423,7 @@ _CHILD_TASK_KEYWORDS = frozenset(
 _APP_KEYWORDS = {
     "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden"},
     "child_task": _CHILD_TASK_KEYWORDS,
+    "project_adapter": frozenset(),
 }
 _INVOCABLE_KEYWORDS = frozenset(
     {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
@@ -2045,7 +2056,16 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                 if method is None:
                     continue
                 keywords = decorator.keywords if isinstance(decorator, ast.Call) else []
-                if isinstance(decorator, ast.Call) and decorator.args:
+                if method == "project_adapter":
+                    kind = decorator.args[0] if isinstance(decorator, ast.Call) and decorator.args else None
+                    if not (isinstance(kind, ast.Constant) and isinstance(kind.value, str)):
+                        reader.refuse(module, decorator, "a project adapter names its kind", "static_unsupported")
+                    # `App.project_adapter`: an entrypoint by another name.
+                    method, keywords = "entrypoint", [
+                        ast.keyword("name", ast.Constant(f"project-adapter-{kind.value}")),
+                        ast.keyword("accelerator", ast.Constant(False)),
+                    ]
+                elif isinstance(decorator, ast.Call) and decorator.args:
                     reader.refuse(
                         module, decorator, "positional decorator arguments", "static_unsupported"
                     )

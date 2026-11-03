@@ -516,6 +516,8 @@ machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`, `component
 `emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
 repeat.
 
+**Project adapters (xs-147).** `@app.project_adapter("shot")` registers what turns one `cozy project` node (`ProjectShot`, `ProjectUpscale`, `ProjectEntity`, `ProjectSetup`, `ProjectWorldState`) into an `Invocation`: a function of this package and its exact input. The package owns its templating and vocabulary. It runs on the render machine on the CPU, and is pure: no GPU, no network, no file contents; a file is its digest. The record's `version` says which project format it reads. Opt-in: a package with none gets one flat `prompt`.
+
 Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,
 `Context.output`, and `Context.adopt_model`. TensorFS owns the typed `Derivation`, `Target`,
 `Tensor`, `Part`, and `Config` declarations and the source/output handles. Inspection keeps

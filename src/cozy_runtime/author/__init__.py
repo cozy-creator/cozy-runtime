@@ -184,6 +184,18 @@ from cozy_runtime.author._services import (
     Telemetry,
     VideoJoin,
 )
+from cozy_runtime.author._project import (
+    Invocation,
+    ProjectBeat,
+    ProjectContinue,
+    ProjectEntity,
+    ProjectPicture,
+    ProjectReference,
+    ProjectSetup,
+    ProjectShot,
+    ProjectUpscale,
+    ProjectWorldState,
+)
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._split import Cut, split
 from cozy_runtime.author._spread import spread
@@ -405,6 +417,16 @@ __all__ = [
     "uncaptured",
     "upload_checkpoint",
     "uses_components",
+    "Invocation",
+    "ProjectBeat",
+    "ProjectContinue",
+    "ProjectEntity",
+    "ProjectPicture",
+    "ProjectReference",
+    "ProjectSetup",
+    "ProjectShot",
+    "ProjectUpscale",
+    "ProjectWorldState",
 ]
 
 #: Names a Runtime removed, the release that removed them, and what replaces each. A package built
