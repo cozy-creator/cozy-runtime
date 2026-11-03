@@ -15,6 +15,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from cozy_runtime.internal.execution.native_vae_metadata import TensorSpec
+
 TORCH_COMMIT = "08187d9e0fba026dc8217405802ab5381dc88d90"
 IMPLEMENTATION = "h3-prefix-lt-fused-bias/1"
 GEOMETRY, PATCHES, TOKENS, CHANNELS, WIDTH = (7, 16, 16), 1792, 1797, 24, 2048
@@ -120,10 +122,13 @@ class Description:
 
 def describe(decoder: Any, value: Any, *, geometry: tuple[int, ...]) -> Description | None:
     """Metadata-only capability; no source views, hooks, CUDA or numeric work."""
+    spec = TensorSpec.read(value)
+    if spec is None:
+        return None
     if (torch.version.git_version != TORCH_COMMIT or tuple(geometry) != GEOMETRY
-            or type(value) is not Tensor or not _ordinary(value) or value.dtype is not torch.float16
-            or value.dim() != 5 or tuple(value.shape[1:]) != (CHANNELS, *GEOMETRY)
-            or value.shape[0] < 1 or value.shape[0] * PATCHES > 2**31 - 1 or not value.is_contiguous()):
+            or spec.dtype is not torch.float16
+            or len(spec.shape) != 5 or tuple(spec.shape[1:]) != (CHANNELS, *GEOMETRY)
+            or spec.shape[0] < 1 or spec.shape[0] * PATCHES > 2**31 - 1 or not spec.is_contiguous()):
         return None
     from diffusers.models.autoencoders.autoencoder_kl_minimax_h3 import (
         MiniMaxH3VideoViTDecoder3d, MiniMaxH3VideoRotaryPosEmbed,
@@ -145,20 +150,20 @@ def describe(decoder: Any, value: Any, *, geometry: tuple[int, ...]) -> Descript
     parameters = tuple(module._parameters.get(name) for module, name, *_ in sources)
     for tensor, (_, _, shape, dtypes, _) in zip(parameters, sources, strict=True):
         if (tensor is None or tuple(tensor.shape) != shape or tensor.dtype not in dtypes
-                or tensor.device != value.device or not tensor.is_contiguous()
+                or tensor.device != spec.device or not tensor.is_contiguous()
                 or (type(tensor) in (Tensor, nn.Parameter) and not _ordinary(tensor))):
             return None
     frequency = decoder.rope._buffers.get("inv_freq")
     if (not _ordinary(frequency) or hasattr(frequency, "_varena_read")
             or tuple(frequency.shape) != (8,) or frequency.dtype is not torch.float32
-            or frequency.device != value.device or not frequency.is_contiguous()):
+            or frequency.device != spec.device or not frequency.is_contiguous()):
         return None
     slots: tuple[Any, ...] = ()
     models: tuple[Any, ...] = ()
     identity: tuple[Any, ...] = ()
     if (not all(_ordinary(t) for t in parameters) or any(hasattr(t, "_varena_read") for t in parameters)
             or any(m._forward_pre_hooks or m._forward_hooks for m in modules)):
-        if value.device.type != "cuda":
+        if spec.device.type != "cuda":
             return None
         from cozy_runtime.internal.execution.native_vae import _slot, _source_identity, _Unsupported
         from cozy_runtime.internal.residency import _REQUEST, Placeholder
@@ -184,7 +189,7 @@ def describe(decoder: Any, value: Any, *, geometry: tuple[int, ...]) -> Descript
                 or any(id(hook) not in owned_hooks for hook in (
                     *module._forward_pre_hooks.values(), *module._forward_hooks.values()))):
             return None
-    return Description(decoder, _metadata(value), tuple(_metadata(t) for t in parameters),
+    return Description(decoder, spec.metadata, tuple(_metadata(t) for t in parameters),
                        _configuration(decoder), parameters, frequency, _metadata(frequency), slots, models, identity)
 
 

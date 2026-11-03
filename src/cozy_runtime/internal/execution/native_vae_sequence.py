@@ -7,7 +7,9 @@ physical buffer owners, fresh stage admissions and checked completion/retirement
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -224,3 +226,44 @@ class Cursor:
     @property
     def host_done(self) -> bool:
         return self.failure is None and self.active is None and self.position == len(self.operations)
+
+
+@dataclass(frozen=True)
+class EdgeAllocations:
+    """Snapshot of a real prepared provider, not a substitute for its live owners."""
+    stage: str
+    preparation: tuple[tuple[str, int], ...]
+    supplied: tuple[tuple[str, int], ...]
+    during_execute: tuple[tuple[str, int], ...]
+    workspace_bytes: int
+
+    @property
+    def all_execution_allocations(self) -> tuple[tuple[str, int], ...]:
+        return self.supplied + self.during_execute
+
+
+def edge_allocations(stage: str, prepared: Any) -> EdgeAllocations:
+    """Require the actual queried edge preparation; unknown workspace is never zero."""
+    from cozy_runtime.internal.execution import (
+        native_vae_post_quant as post, native_vae_prefix as prefix, native_vae_output as tail,
+    )
+    types = {"post_quant": post.Prepared, "prefix": prefix.Prepared, "tail": tail.Prepared}
+    if stage not in types or type(prepared) is not types[stage]:
+        raise TypeError("sequence allocation metadata requires the actual prepared edge")
+    if prepared.pid != os.getpid():
+        raise RuntimeError("prepared edge metadata cannot be inherited after fork")
+    from cozy_runtime._kernels import _dense
+    if type(prepared.plan) is not _dense.Plan or type(prepared.context) is not _dense.Context:
+        raise TypeError("sequence metadata requires a real native query and Context")
+    info = prepared.plan.info()
+    if info != prepared.info or info["bias_address"] != prepared.bias.data_ptr():
+        raise ValueError("prepared edge query or bias owner changed")
+    workspace = info["workspace_bytes"]
+    description = prepared.description
+    if stage == "tail":
+        supplied = description.preallocations(workspace)
+        functional = description.functional_allocations
+    else:
+        supplied, functional = description.allocations(workspace), ()
+    preparation = (("bias", prepared.bias.numel() * prepared.bias.element_size()),)
+    return EdgeAllocations(stage, preparation, supplied, functional, workspace)

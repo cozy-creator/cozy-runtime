@@ -14,6 +14,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from cozy_runtime.internal.execution.native_vae_metadata import TensorSpec
+
 TORCH_COMMIT = "08187d9e0fba026dc8217405802ab5381dc88d90"
 IMPLEMENTATION = "h3-output-functional-layernorm-lt/1"
 GEOMETRY = (7, 16, 16)
@@ -119,18 +121,31 @@ class Description:
         # The real bias is already live from query preparation and counted once there.
         return self.preallocations(workspace_bytes) + self.functional_allocations
 
+    def buffer_specs(self, workspace_bytes: int) -> tuple[tuple[str, tuple[int, ...], Any], ...]:
+        self.preallocations(workspace_bytes)
+        specs = [("input_rows", (self.rows, WIDTH), torch.float16),
+                 ("dense_result", (self.rows, PROJECTED), torch.float16),
+                 ("result", self.result_shape, torch.float16)]
+        if self.weight_cast:
+            specs.append(("weight_cast", (PROJECTED, WIDTH), torch.float16))
+        if workspace_bytes:
+            specs.append(("workspace", (workspace_bytes,), torch.uint8))
+        return tuple(specs)
+
 
 def describe(norm: Any, projection: Any, value: Any, *, geometry: tuple[int, ...]) -> Description | None:
     """Read metadata only. Unreviewed Torch builds, including 2.15, decline."""
+    spec = TensorSpec.read(value)
+    if spec is None:
+        return None
     if (torch.version.git_version != TORCH_COMMIT
             or type(norm) is not nn.LayerNorm or type(projection) is not nn.Linear
             or tuple(geometry) != GEOMETRY or tuple(norm.normalized_shape) != (WIDTH,)
             or not norm.elementwise_affine or norm.eps != 1e-5
             or projection.in_features != WIDTH or projection.out_features != PROJECTED
-            or type(value) is not Tensor or not _ordinary(value)
-            or value.dtype is not torch.float32 or value.dim() != 3
-            or tuple(value.shape[1:]) != (TOKENS, WIDTH) or value.shape[0] < 1
-            or value.shape[0] * TOKENS > 2**31 - 1 or not value.is_contiguous()):
+            or spec.dtype is not torch.float32 or len(spec.shape) != 3
+            or tuple(spec.shape[1:]) != (TOKENS, WIDTH) or spec.shape[0] < 1
+            or spec.shape[0] * TOKENS > 2**31 - 1 or not spec.is_contiguous()):
         return None
     modules = (norm, projection)
     for module in modules:
@@ -145,7 +160,7 @@ def describe(norm: Any, projection: Any, value: Any, *, geometry: tuple[int, ...
     parameters = tuple(module._parameters.get(name) for module, name, *_ in sources)
     for tensor, (_, _, shape, dtypes, _) in zip(parameters, sources, strict=True):
         if (tensor is None or tuple(tensor.shape) != shape or tensor.dtype not in dtypes
-                or tensor.device != value.device or not tensor.is_contiguous()
+                or tensor.device != spec.device or not tensor.is_contiguous()
                 or (type(tensor) in (Tensor, nn.Parameter) and not _ordinary(tensor))):
             return None
     slots: tuple[Any, ...] = ()
@@ -153,7 +168,7 @@ def describe(norm: Any, projection: Any, value: Any, *, geometry: tuple[int, ...
     identity: tuple[Any, ...] = ()
     if (not all(_ordinary(t) for t in parameters) or any(hasattr(t, "_varena_read") for t in parameters)
             or any(m._forward_pre_hooks or m._forward_hooks for m in modules)):
-        if value.device.type != "cuda":
+        if spec.device.type != "cuda":
             return None
         from cozy_runtime.internal.execution.native_vae import _slot, _source_identity, _Unsupported
         from cozy_runtime.internal.residency import _REQUEST, Placeholder
@@ -179,7 +194,7 @@ def describe(norm: Any, projection: Any, value: Any, *, geometry: tuple[int, ...
                 or any(id(hook) not in owned_hooks for hook in (
                     *module._forward_pre_hooks.values(), *module._forward_hooks.values()))):
             return None
-    return Description(norm, projection, _metadata(value), tuple(_metadata(t) for t in parameters),
+    return Description(norm, projection, spec.metadata, tuple(_metadata(t) for t in parameters),
                        tuple(_configuration(m) for m in modules), parameters, slots, models, identity)
 
 

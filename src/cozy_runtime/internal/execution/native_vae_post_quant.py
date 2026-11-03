@@ -16,6 +16,8 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from cozy_runtime.internal.execution.native_vae_metadata import TensorSpec
+
 IMPLEMENTATION = "h3-post-quant-pointwise-lt/1"
 CHANNELS = 24
 _UNPROVEN: list[Bound] = []
@@ -104,9 +106,23 @@ class Description:
             result.append(("workspace", workspace_bytes))
         return tuple(result)
 
+    def buffer_specs(self, workspace_bytes: int) -> tuple[tuple[str, tuple[int, ...], Any], ...]:
+        self.allocations(workspace_bytes)
+        specs = [("input_rows", (self.rows, CHANNELS), torch.float16),
+                 ("dense_result", (self.rows, CHANNELS), torch.float16),
+                 ("result", self.shape, torch.float16)]
+        if self.weight_cast:
+            specs.append(("weight_cast", (CHANNELS, CHANNELS), torch.float16))
+        if workspace_bytes:
+            specs.append(("workspace", (workspace_bytes,), torch.uint8))
+        return tuple(specs)
+
 
 def describe(module: Any, value: Any) -> Description | None:
     """Decline unsupported metadata without initializing CUDA or reading weights."""
+    spec = TensorSpec.read(value)
+    if spec is None:
+        return None
     if (
         type(module) is not nn.Conv3d
         or module.training
@@ -124,13 +140,11 @@ def describe(module: Any, value: Any) -> Description | None:
         or module.padding != (0, 0, 0)
         or module.groups != 1
         or module.padding_mode != "zeros"
-        or type(value) is not Tensor
-        or not _ordinary(value)
-        or value.dim() != 5
-        or value.shape[1] != CHANNELS
-        or min(value.shape) < 1
-        or not value.is_contiguous()
-        or value.dtype not in (torch.float16, torch.float32)
+        or len(spec.shape) != 5
+        or spec.shape[1] != CHANNELS
+        or min(spec.shape) < 1
+        or not spec.is_contiguous()
+        or spec.dtype not in (torch.float16, torch.float32)
     ):
         return None
     weight, bias = module._parameters.get("weight"), module._parameters.get("bias")
@@ -139,14 +153,14 @@ def describe(module: Any, value: Any) -> Description | None:
         tensor is None
         or tuple(tensor.shape) != shape
         or tensor.dtype not in (torch.float16, torch.float32)
-        or tensor.device != value.device
+        or tensor.device != spec.device
         or not tensor.is_contiguous()
         for tensor, shape in zip((weight, bias), expected, strict=True)
     ):
         return None
     if any(type(t) in (Tensor, nn.Parameter) and not _ordinary(t) for t in (weight, bias)):
         return None
-    rows = math.prod(value.shape) // CHANNELS
+    rows = math.prod(spec.shape) // CHANNELS
     if rows > 2**31 - 1:
         return None
     slots: tuple[Any, ...] = ()
@@ -159,7 +173,7 @@ def describe(module: Any, value: Any) -> Description | None:
         or module._forward_hooks
     ):
         # Reuse the reviewed raw-source slot contract, not a parallel binding layer.
-        if value.device.type != "cuda":
+        if spec.device.type != "cuda":
             return None
         from cozy_runtime.internal.execution.native_vae import (
             _slot,
@@ -207,7 +221,7 @@ def describe(module: Any, value: Any) -> Description | None:
         return None
     return Description(
         module,
-        _metadata(value),
+        spec.metadata,
         _metadata(weight),
         _metadata(bias),
         _configuration(module),

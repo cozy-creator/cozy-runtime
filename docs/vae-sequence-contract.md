@@ -79,3 +79,24 @@ Provider queries and bootstrap are not numerical warm-up. Unsupported topology,
 source layout, artifact/math policy or legal minimum may decline before writes.
 Accepted later failures never fall back to `_decode_tiles` or the old chooser.
 No guard is removed by this source lane.
+
+## Explicit stream and custody precondition
+
+The coordinator selects one owned nonblocking stream S. Actual preparation, buffer
+allocation, input/rotary production, source hooks and execution run under
+`torch.cuda.stream(S)` plus the existing `Domain.using()` serialization. `using()`
+alone does not select S. If a producer uses T, record a real completion event on T
+and join it with S.wait_event before binding. Do not infer producer readiness from
+Tensor metadata, native admission, or record_stream.
+
+The coordinator retains the supplied invocation, inputs, output/scratch and query
+owners through checked S completion, including an error. Existing source hooks keep
+their actual Memory._used -> native Use.consume_on(S) last-consumer fences; those
+are the source ownership mechanism, not a guessed replacement. Allocation streams
+are not silently inferred or redirected by the private supplied-block interface.
+
+The real GPU client includes a T allocation/producer -> event -> S.wait_event -> bind
+case, retaining every T owner until S completion before retirement. It uses the
+existing Domain teardown order: drain, retire allocator stream bookkeeping, destroy
+that owned stream. This case is prepared, not run; ordinary S-only client paths also
+keep all inputs and buffers until denoise_loop's checked S synchronization.

@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import hashlib
 import math
-from dataclasses import dataclass
+import os
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -131,8 +133,7 @@ def _source_identity(models: tuple[Model, ...]) -> tuple[Any, ...]:
 
 
 @dataclass(frozen=True)
-class _Inventory:
-    intent: LayerScaleBlock
+class _Facts:
     request: Any
     site: fusion._Site
     models: tuple[Model, ...]
@@ -143,45 +144,37 @@ class _Inventory:
     input_layout: object
     rotary_layout: tuple[object, ...]
 
+
+@dataclass(frozen=True)
+class _Inventory(_Facts):
+    intent: LayerScaleBlock
+
     @property
     def module(self) -> Any:
         return self.intent.module
 
 
-def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inventory:
-    request = _REQUEST.get()
-    x, module = intent.hidden, intent.module
-    if (
-        request is None
-        or request.idle
-        or not request.memory.cuda
-        or out is not None
-        or cuts != (Cut(0),)
-        or type(x) is not Tensor
-        or not x.is_cuda
-        or x.device != request.memory.device
-        or x.dim() != 3
-        or x.shape[-1] != 2048
-        or min(x.shape) < 1
-        or x.shape[1] < 2
-        or not x.is_contiguous()
-        or x.data_ptr() % 16
-        or x.dtype not in (torch.float16, torch.float32)
-        or torch.is_grad_enabled()
-        or catch.uncommitted_scope()
-        or _BLOCK_SPLIT.get() is not None
-        or torch.cuda.is_current_stream_capturing()
-        or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
-    ):
-        raise _Unsupported("VAE requires an independent eager CUDA batch call")
+@dataclass(frozen=True)
+class BlockMetadata(_Facts):
+    module: Any
+    shape: tuple[int, int, int]
+    dtype: torch.dtype
+    device: torch.device
+    gate_msa: str
+    gate_mlp: str
+    fingerprint: tuple[Any, ...]
+
+
+def _describe_module(
+    module: Any, shape: tuple[int, ...], on: torch.device, request: Any,
+    policy: dense_linear.Policy, input_layout: object, rotary_layout: tuple[object, ...],
+    gate_msa: str, gate_mlp: str,
+) -> _Facts:
     from cozy_runtime import fusion
     from cozy_runtime.author.kernels import _SETS
     from cozy_runtime.internal.triton_kernels import _LOADED, _Launcher
 
-    device = x.device.index or 0
-    policy = dense_linear.policy(device)
-    if policy is None or not vt.split_context(device)["eligible"]:
-        raise _Unsupported("VAE dense math/admission policy is not supported")
+    device = on.index or 0
     site = getattr(module, "_cozy_dit", None)
     if (
         type(site) is not fusion._Site
@@ -242,7 +235,7 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
     ):
         raise _Unsupported("VAE normalization epsilon is invalid")
     processor = site.attention.processor
-    route = _route(processor._attention_backend, int(x.shape[1]))
+    route = _route(processor._attention_backend, int(shape[1]))
     if (
         route is None
         or route.candidate is not attention.BY_NAME["kitchen-int8"]
@@ -252,26 +245,6 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
     kernel = _attention(route, device)
     if kernel is None:
         raise _Unsupported("VAE selected Kitchen artifact is not ready")
-    rotary = intent.rotary
-    if (
-        not isinstance(rotary, tuple)
-        or len(rotary) != 2
-        or any(
-            type(t) is not Tensor
-            or t.dtype is not torch.float32
-            or t.device != x.device
-            or not t.is_contiguous()
-            or t.data_ptr() % 16
-            or not (
-                tuple(t.shape[-2:]) == (x.shape[1], 48)
-                or tuple(t.shape) == (1, x.shape[1], 1, 48)
-            )
-            or t.stride(-2) != 48
-            or t.numel() != x.shape[1] * 48
-            for t in rotary
-        )
-    ):
-        raise _Unsupported("VAE rotary must be the complete prepared FP32 split-half tables")
     with request.memory.lock:
         # A standalone declared block has not entered its source hook yet. Resolve
         # ownership from real source tables, without binding any model's weights.
@@ -305,7 +278,7 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
     slots += [_slot(norm, "weight", (2048,), (torch.float32,), models) for norm in site.norms]
     slots += [
         _slot(module, name, (2048,), (torch.float32,), models)
-        for name in (intent.gate_msa, intent.gate_mlp)
+        for name in (gate_msa, gate_mlp)
     ]
     actual_owners = {id(slot.model) for slot in slots if slot.model is not None}
     models = tuple(model for model in models if id(model) in actual_owners)
@@ -323,20 +296,104 @@ def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inv
         )
     ):
         raise _Unsupported("VAE block has an opaque hook")
-    if any(slot.metadata[3] != str(x.device) for slot in slots):
+    if any(slot.metadata[3] != str(on) for slot in slots):
         raise _Unsupported("VAE source slots must declare the input's CUDA device")
-    return _Inventory(
-        intent,
-        request,
-        site,
-        models,
-        source,
-        tuple(slots),
-        policy,
-        kernel,
-        _layout(x),
-        tuple(_layout(t) for t in rotary),
-    )
+    return _Facts(request, site, models, source, tuple(slots), policy, kernel,
+                  input_layout, rotary_layout)
+
+
+def _bound_inventory(intent: LayerScaleBlock) -> _Inventory:
+    request = _REQUEST.get()
+    x, module = intent.hidden, intent.module
+    if (
+        request is None
+        or request.idle
+        or not request.memory.cuda
+        or type(x) is not Tensor
+        or not x.is_cuda
+        or x.device != request.memory.device
+        or x.dim() != 3
+        or x.shape[-1] != 2048
+        or min(x.shape) < 1
+        or x.shape[1] < 2
+        or not x.is_contiguous()
+        or x.data_ptr() % 16
+        or x.dtype not in (torch.float16, torch.float32)
+        or torch.is_grad_enabled()
+        or catch.uncommitted_scope()
+        or _BLOCK_SPLIT.get() is not None
+        or torch.cuda.is_current_stream_capturing()
+        or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
+    ):
+        raise _Unsupported("VAE requires an independent eager CUDA batch call")
+    device = x.device.index or 0
+    policy = dense_linear.policy(device)
+    if policy is None or not vt.split_context(device)["eligible"]:
+        raise _Unsupported("VAE dense math/admission policy is not supported")
+    rotary = intent.rotary
+    if (
+        not isinstance(rotary, tuple)
+        or len(rotary) != 2
+        or any(
+            type(t) is not Tensor
+            or t.dtype is not torch.float32
+            or t.device != x.device
+            or not t.is_contiguous()
+            or t.data_ptr() % 16
+            or not (
+                tuple(t.shape[-2:]) == (x.shape[1], 48)
+                or tuple(t.shape) == (1, x.shape[1], 1, 48)
+            )
+            or t.stride(-2) != 48
+            or t.numel() != x.shape[1] * 48
+            for t in rotary
+        )
+    ):
+        raise _Unsupported("VAE rotary must be the complete prepared FP32 split-half tables")
+    facts = _describe_module(module, tuple(x.shape), x.device, request, policy,
+                             _layout(x), tuple(_layout(t) for t in rotary),
+                             intent.gate_msa, intent.gate_mlp)
+    return _Inventory(**vars(facts), intent=intent)
+
+
+def _inventory(intent: LayerScaleBlock, out: Any, cuts: tuple[Cut, ...]) -> _Inventory:
+    if out is not None or cuts != (Cut(0),):
+        raise _Unsupported("VAE requires an independent eager CUDA batch call")
+    return _bound_inventory(intent)
+
+
+def _contiguous_layout(shape: tuple[int, ...], dtype: torch.dtype) -> tuple[Any, ...]:
+    return shape, tuple(math.prod(shape[i + 1:]) for i in range(len(shape))), str(dtype), 0
+
+
+def describe_block(
+    module: Any, shape: tuple[int, int, int], dtype: torch.dtype, device: torch.device,
+    *, gate_msa: str = "scale1", gate_mlp: str = "scale2",
+) -> BlockMetadata:
+    """Describe future contiguous activations without tensors, reads or source hooks.
+
+    This preserves the native scope/module/kernel/source guards. It is not an
+    execution permission; actual hidden/rotary/storage bind after allocation.
+    """
+    request = _REQUEST.get()
+    if (
+        request is None or request.idle or not request.memory.cuda
+        or device.type != "cuda" or device != request.memory.device
+        or len(shape) != 3 or any(type(n) is not int or n < 1 for n in shape)
+        or shape[-1] != 2048 or shape[1] < 2 or dtype not in (torch.float16, torch.float32)
+        or torch.is_grad_enabled() or catch.uncommitted_scope() or _BLOCK_SPLIT.get() is not None
+        or torch.cuda.is_current_stream_capturing()
+        or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
+    ):
+        raise _Unsupported("VAE metadata requires an independent eager CUDA batch call")
+    policy = dense_linear.policy(device.index or 0)
+    if policy is None or not vt.split_context(device.index or 0)["eligible"]:
+        raise _Unsupported("VAE dense math/admission policy is not supported")
+    hidden = _contiguous_layout(shape, dtype)
+    rotary = (_contiguous_layout((1, shape[1], 1, 48), torch.float32),) * 2
+    facts = _describe_module(module, shape, device, request, policy, hidden, rotary, gate_msa, gate_mlp)
+    return BlockMetadata(**vars(facts), module=module, shape=shape, dtype=dtype, device=device,
+                         gate_msa=gate_msa, gate_mlp=gate_mlp, fingerprint=_snapshot(facts))
 
 
 def _attention_shapes(batch: int, tokens: int) -> tuple[tuple[tuple[int, ...], Any], ...]:
@@ -506,14 +563,18 @@ def _attend(
 
 
 def _variants(
-    x: Tensor,
+    shape: tuple[int, ...],
     slots: tuple[_Slot, ...],
     bias: Tensor,
     policy: dense_linear.Policy,
     context: Any,
     stream: int,
+    chunks: tuple[int, ...] | None = None,
 ) -> tuple[tuple[_Variant, ...], int, tuple[Any, ...]]:
-    batch, tokens, _ = (int(n) for n in x.shape)
+    batch, tokens, _ = (int(n) for n in shape)
+    chunks = _chunks(batch) if chunks is None else chunks
+    if not chunks or len(set(chunks)) != len(chunks) or any(type(n) is not int or not 1 <= n <= batch for n in chunks):
+        raise ValueError("VAE query chunks must be distinct legal tile geometries")
     cast_bytes = max(
         (math.prod(s.metadata[0]) * 2 for s in slots if s.metadata[2] == "torch.float32"), default=0
     )
@@ -541,7 +602,7 @@ def _variants(
         return tuple(result)
 
     result = []
-    for at in _chunks(batch):
+    for at in chunks:
         tail_batch = batch % at
         full = dense(at)
         tail = dense(tail_batch) if tail_batch else full
@@ -826,7 +887,7 @@ def _prepare(inventory: _Inventory) -> _Call:
     bias = torch.empty(16384, dtype=torch.float16, device=x.device)
     index = torch.zeros(1, dtype=torch.int64, device=x.device)
     variants, cast_bytes, algorithms = _variants(
-        x, inventory.slots[:12:2], bias, inventory.policy, context, stream
+        tuple(x.shape), inventory.slots[:12:2], bias, inventory.policy, context, stream
     )
     binary = Path(_dense.__file__)
     stat = binary.stat()
@@ -875,3 +936,250 @@ def split_layer_scale_block(
             raise
         finally:
             _BLOCK_SPLIT.reset(token)
+
+
+# Private supplied-storage interface for the outer sequence. The standalone path
+# above keeps its own native menu, allocation, hooks and body unchanged.
+BlockBuffers = _Buffers
+
+
+def _snapshot(facts: _Facts) -> tuple[Any, ...]:
+    return (
+        facts.site.layout.kernels.identity, facts.source, facts.input_layout, facts.rotary_layout,
+        tuple(slot.metadata for slot in facts.slots), tuple(facts.site.eps),
+        tuple(float(norm.eps) for norm in facts.site.qk), facts.attention.identity, facts.policy,
+    )
+
+
+@dataclass(frozen=True)
+class PreparedBlock:
+    """Queries belong to stream S. The coordinator owns readiness and custody.
+
+    Prepare, allocate, produce and execute on S, or join the real producer event
+    onto S before bind. This interface cannot infer a Tensor's producer stream.
+    Keep the invocation, supplied tensors and query owners through checked S
+    completion; zero-additional admission is not an ordering/lifetime proof.
+    """
+    metadata: BlockMetadata
+    bias: Tensor
+    index: Tensor
+    variants: tuple[_Variant, ...]
+    cast_bytes: int
+    algorithms: tuple[Any, ...]
+    dense_identity: str
+    stream: int
+    pid: int
+    snapshot: tuple[Any, ...]
+
+    def variant(self, identity: str) -> _Variant:
+        matches = tuple(item for item in self.variants if item.identity == identity)
+        if len(matches) != 1:
+            raise ValueError("supplied VAE block must use its queried geometry")
+        return matches[0]
+
+    def buffer_specs(self, identity: str) -> tuple[tuple[str, tuple[int, ...], Any], ...]:
+        variant = self.variant(identity)
+        batch, tokens, _ = self.metadata.shape
+        at = variant.batch
+        specs = [("output", (batch, tokens, 2048), torch.float32),
+                 ("packed", (at * tokens, 16384), torch.float16),
+                 ("expanded", (at * tokens, 8192), torch.float16)]
+        if self.cast_bytes:
+            specs.append(("weight", (self.cast_bytes // 2,), torch.float16))
+        if variant.workspace:
+            specs.append(("workspace", (variant.workspace,), torch.uint8))
+        specs.extend((f"attention:{i}", shape, dtype)
+                     for i, (shape, dtype) in enumerate(_attention_shapes(at, tokens)))
+        return tuple(specs)
+
+    def allocate_buffers(self, identity: str, output: Tensor) -> _Buffers:
+        """Allocate on the caller's current stream under its real admission.
+
+        The coordinator uses prepared S, or joins this actual allocation/producer
+        stream onto S before binding, and retains every owner through S completion.
+        """
+        variant = self.variant(identity)
+        values = {name: torch.empty(shape, dtype=dtype, device=self.metadata.device)
+                  for name, shape, dtype in self.buffer_specs(identity) if name != "output"}
+        return _Buffers(output, values["packed"], values["expanded"], values.get("weight"),
+                        values.get("workspace"), tuple(values[f"attention:{i}"] for i in range(7)),
+                        variant.batch, self.metadata.shape[1])
+
+    def bind(self, hidden: Tensor, rotary: tuple[Tensor, Tensor], identity: str, buffers: _Buffers) -> _SuppliedInvocation:
+        """Bind real activation/storage; source reads remain inside ordinary hooks."""
+        if self.pid != os.getpid():
+            raise RuntimeError("VAE preparation cannot be inherited after fork")
+        m = self.metadata
+        intent = LayerScaleBlock(m.module, hidden, rotary, m.gate_msa, m.gate_mlp)
+        inventory = _bound_inventory(intent)
+        if inventory.site is not m.site or _snapshot(inventory) != self.snapshot:
+            raise RuntimeError("VAE supplied invocation differs from its prepared metadata")
+        return _SuppliedInvocation(self, inventory, self.variant(identity), buffers)
+
+
+def prepare_block(metadata: BlockMetadata, *, chunks: tuple[int, ...] | None = None) -> PreparedBlock:
+    """Query actual full/ragged plans without future hidden/rotary tensors or hooks."""
+    from cozy_runtime._kernels import _dense
+    from cozy_runtime.internal.execution.native_heads import _binary_identity
+
+    current = describe_block(metadata.module, metadata.shape, metadata.dtype, metadata.device,
+                             gate_msa=metadata.gate_msa, gate_mlp=metadata.gate_mlp)
+    if current.site is not metadata.site or current.fingerprint != metadata.fingerprint:
+        raise RuntimeError("VAE metadata changed before provider preparation")
+    if _dense.API != 1 or not hasattr(_dense, "NOT_SUPPORTED"):
+        raise RuntimeError("native VAE requires the prepared dense provider and typed query refusal")
+    memory, device = metadata.request.memory, metadata.device.index or 0
+    with torch.cuda.device(metadata.device):
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
+        context = getattr(memory, "_dense_context", None)
+        if context is None:
+            context = dense_linear.checked(_dense.Context, device, stream)
+            memory._dense_context = context
+        bias = torch.empty(16384, dtype=torch.float16, device=metadata.device)
+        index = torch.zeros(1, dtype=torch.int64, device=metadata.device)
+        try:
+            variants, cast_bytes, algorithms = _variants(metadata.shape, metadata.slots[:12:2], bias,
+                metadata.policy, context, stream, chunks)
+        except RuntimeError as error:
+            cause = error.__cause__
+            if isinstance(cause, _dense.Error) and cause.domain == "cublas" and cause.status == _dense.NOT_SUPPORTED:
+                raise _Unsupported("VAE provider has no plan for the declared geometry") from error
+            raise
+    binary = Path(_dense.__file__)
+    stat = binary.stat()
+    identity = _binary_identity(str(binary), stat.st_size, stat.st_mtime_ns)
+    return PreparedBlock(metadata, bias, index, variants, cast_bytes, algorithms, identity,
+                         stream, os.getpid(), metadata.fingerprint)
+
+
+def _validate_supplied(call: _SuppliedInvocation, values: tuple[Tensor, ...]) -> None:
+    p, inv, b = call.prepared, call.inventory, call.buffers
+    if type(b) is not _Buffers or b.batch != call.variant.batch or b.tokens != inv.intent.hidden.shape[1]:
+        raise ValueError("supplied VAE storage geometry differs from its query")
+    actual = {"output": b.output, "packed": b.packed, "expanded": b.expanded}
+    if b.weight is not None:
+        actual["weight"] = b.weight
+    if b.workspace is not None:
+        actual["workspace"] = b.workspace
+    actual.update((f"attention:{i}", value) for i, value in enumerate(b.attention))
+    specs = p.buffer_specs(call.variant.identity)
+    if set(actual) != {name for name, _, _ in specs}:
+        raise ValueError("supplied VAE storage differs from the complete inventory")
+    readonly = (inv.intent.hidden, *inv.intent.rotary, *values, p.bias, p.index)
+    destinations: list[Tensor] = []
+    for name, shape, dtype in specs:
+        value = actual[name]
+        if (type(value) not in (Tensor, nn.Parameter) or value.layout != torch.strided
+                or value.requires_grad or value.is_conj() or value.is_neg()
+                or tuple(value.shape) != shape or value.dtype != dtype or value.device != p.metadata.device
+                or not value.is_contiguous() or value.data_ptr() == 0 or value.data_ptr() % 16):
+            raise ValueError("supplied VAE buffer layout differs from its declaration")
+        for other in (*readonly, *destinations):
+            if not other.is_contiguous() or other.device != value.device:
+                raise ValueError("VAE overlap checks require contiguous same-device tensors")
+            if (torch._C._is_alias_of(value, other)
+                    or max(value.data_ptr(), other.data_ptr()) < min(
+                        value.data_ptr() + value.numel() * value.element_size(),
+                        other.data_ptr() + other.numel() * other.element_size())):
+                raise ValueError("supplied VAE buffers require independent owned storage")
+        destinations.append(value)
+    _validate_all(inv.intent.hidden, call.variant, values[:12:2], b, p.stream)
+
+
+@dataclass
+class _SuppliedInvocation:
+    """One host submission, not completion. Caller retains this through checked S.
+
+    Source hooks retain their existing Memory._used / native Use.consume_on(S)
+    ownership fences. Supplied working tensors are held by this invocation; the
+    coordinator keeps it alive until its actual completion proof, including failure.
+    """
+    prepared: PreparedBlock
+    inventory: _Inventory
+    variant: _Variant
+    buffers: _Buffers
+    attempted: bool = False
+    calls: int = 0
+    result: Tensor | None = None
+    lock: Any = field(default_factory=threading.Lock, repr=False)
+
+    @property
+    def module(self) -> Any:
+        return self.inventory.module
+
+    def __call__(self) -> Tensor:
+        if self.prepared.pid != os.getpid():
+            raise RuntimeError("VAE invocation cannot be inherited after fork")
+        with self.lock:
+            if self.attempted:
+                raise RuntimeError("supplied VAE invocation is one-shot")
+            self.attempted = True
+        intent = self.inventory.intent
+        try:
+            # Recheck all original scope/module/kernel/source eligibility before hooks.
+            current = _bound_inventory(intent)
+            if current.site is not self.inventory.site or _snapshot(current) != self.prepared.snapshot:
+                raise RuntimeError("VAE eligibility or metadata changed before invocation")
+            with torch.cuda.device(intent.hidden.device):
+                token = _BLOCK_SPLIT.set(self)
+                try:
+                    result = self.module(intent.hidden, intent.rotary)
+                    if self.calls != 1 or result is not self.result:
+                        raise RuntimeError("supplied VAE body was not reached exactly once")
+                    return result
+                finally:
+                    _BLOCK_SPLIT.reset(token)
+        except BaseException as error:
+            error.varena_no_retry = True  # type: ignore[attr-defined]
+            raise
+
+    def run(self, *args: Any, **kwargs: Any) -> Tensor:
+        inv, p = self.inventory, self.prepared
+        site = inv.site
+        assert site.layout.rope is not None
+        self.calls += 1
+        if self.calls != 1 or getattr(self.module, "_cozy_dit", None) is not site:
+            raise RuntimeError("supplied VAE forward changed or ran more than once")
+        arguments = site.signature.bind(self.module, *args, **kwargs)
+        arguments.apply_defaults()
+        if (arguments.arguments[site.layout.hidden_states] is not inv.intent.hidden
+                or arguments.arguments[site.layout.rope.argument] is not inv.intent.rotary
+                or _layout(inv.intent.hidden) != inv.input_layout
+                or tuple(_layout(t) for t in inv.intent.rotary) != inv.rotary_layout
+                or _source_identity(inv.models) != inv.source):
+            raise RuntimeError("supplied VAE call/source changed before binding")
+        values = tuple(slot.bind() for slot in inv.slots)
+        if _source_identity(inv.models) != inv.source:
+            raise RuntimeError("VAE source identity changed during supplied binding")
+        device = inv.intent.hidden.device.index or 0
+        if int(torch.cuda.current_stream(device).cuda_stream) != p.stream or dense_linear.policy(device) != inv.policy:
+            raise RuntimeError("VAE stream/policy changed before supplied execution")
+        _validate_supplied(self, values)
+        semantic = phase.configuration((
+            "layer-scale-block-supplied/1", p.snapshot, self.variant.identity,
+            tuple((g, tuple(sorted(c.items())), w, v, h) for g, c, w, v, h in p.algorithms),
+            p.dense_identity, p.buffer_specs(self.variant.identity),
+        ))
+        if semantic is None:
+            raise RuntimeError("supplied VAE configuration cannot be serialized")
+        key = "runtime.split.layer_scale_block_supplied/1:" + hashlib.sha256(semantic.encode()).hexdigest()
+        inv.request.memory.remember_working_phase(key, inv.models or (inv.request,))
+        # Real fixed buffers are already live. This is fresh phase/generation admission
+        # for one fixed body, not nested selection or a different geometry choice.
+        choices = ((self.variant.identity, ()),)
+        selection = vt.split_select(device, key, choices, preferred=self.variant.identity, stream=p.stream)
+        phase.choice(("native-split", key, self.variant.identity))
+        token = phase.begin_split(device, key, self.variant.identity, selection, stream=p.stream)
+        record = {"site": "supplied-layer-scale-block", "selection": selection,
+                  "batch_chunk": self.variant.batch, "additional_allocations": (),
+                  "source_hooks": "ordinary_module_call", "invocations": self.calls}
+        inv.request.working_splits[key] = record
+        submitted = False
+        try:
+            if dense_linear.policy(device) != inv.policy:
+                raise RuntimeError("VAE policy changed before supplied numerical writes")
+            self.result = _execute(inv, values, self.variant, self.buffers, p.bias, p.index, p.stream)
+            submitted = True
+            return self.result
+        finally:
+            record["submission"] = vt.split_end(device, token, submitted=submitted)
