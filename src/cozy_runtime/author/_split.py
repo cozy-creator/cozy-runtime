@@ -1,6 +1,7 @@
 """`split`: the package says how an op cuts (`Cut`); the memory says how finely (the execution
-layer's `split`, installed with it): whole, else in the windows the level Rust holds gives. A
-layout that changes the result (a blended cut) comes from the shape alone (`most`)."""
+layer's `split`, installed with it): native-selected for a complete contract, otherwise
+ordinary eager once. A layout that changes the result (a blended cut) comes from
+the shape alone (`most`)."""
 
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ class Cut:
 
 class Pieces(Protocol):
     """The memory's side of `split`: `split` runs `run(most)` in windows of at most `most` of
-    `total` elements, the least `finest`, finer while out of memory; `piece` marks each window's
+    `total` elements, the least `finest`; `piece` marks each window's
     start (the ops inside are numbered per window)."""
 
     def split(
@@ -42,7 +43,6 @@ class Pieces(Protocol):
         key: str,
         total: int,
         finest: int,
-        out_bytes: int,
         run: Callable[[int], Any],
     ) -> Any: ...
 
@@ -58,9 +58,19 @@ def install(runtime: Pieces | None) -> None:
 
 
 def split(
-    fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None,
-    intent: (ResidualFFN | ProjectedHeads | SparseProjectedHeads
-             | SingleUseProjection | LayerScaleBlock | None) = None,
+    fn: Callable[..., Any],
+    x: Any,
+    *cuts: Cut,
+    most: int | None = None,
+    out: Any = None,
+    intent: (
+        ResidualFFN
+        | ProjectedHeads
+        | SparseProjectedHeads
+        | SingleUseProjection
+        | LayerScaleBlock
+        | None
+    ) = None,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -100,7 +110,8 @@ def split(
             declared_intent = getattr(runtime, "split_layer_scale_block", None)
             if runtime is not None and not callable(declared_intent):
                 raise RuntimeError(
-                    "installed execution requires the declared layer-scale block API")
+                    "installed execution requires the declared layer-scale block API"
+                )
         elif type(intent) is SingleUseProjection:
             if fn is not intent.module or x is not intent.hidden:
                 raise ValueError("single-use projection intent must name this exact call")
@@ -122,13 +133,12 @@ def split(
         windows = _windows(shape, cuts, most)
         if runtime is None:
             return _run(fn, x, cuts, windows, lambda: None, out)
-        # One level: a refusal reclaims and runs the same windows again, never finer ones.
+        # Authored geometry is fixed, including on failure.
         return runtime.split(
             _name(fn),
             _key(fn, shape, cuts, x.dtype),
             most,
             most,
-            0 if out is not None else _bytes(shape, cuts, x),
             lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
         )
     if runtime is None or not cuts:
@@ -141,10 +151,8 @@ def split(
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
-        0 if out is not None else _bytes(shape, cuts, x),
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
     )
-
 
 
 def decode_vae_tiles(module: Any, tiles: Any, *, block_layout: Any) -> Any:
@@ -170,11 +178,6 @@ def _key(
     cut = {c.dim % len(shape) for c in cuts}
     rest = tuple(n if i not in cut else -1 for i, n in enumerate(shape))
     return f"{_name(fn)}{rest}:{dtype}"
-
-
-def _bytes(shape: tuple[int, ...], cuts: tuple[Cut, ...], x: Any) -> int:
-    """The whole output's bytes, which `split` allocates beside its windows."""
-    return int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size())
 
 
 def _name(fn: Callable[[Any], Any]) -> str:

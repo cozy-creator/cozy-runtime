@@ -101,6 +101,7 @@ def profile_call(ff, x):
               for name in ("gemm", "gemv", "quantize", "int8_plan")}
     counts = {"composites": 0, "legacy_cuts": 0, "native_errors": 0,
               **{name: 0 for name in native.values()}}
+    assert not hasattr(catch, "cut"), "the Python capacity/retry ladder must be retired"
     dispatches = []
     assert sys.getprofile() is None
 
@@ -108,8 +109,6 @@ def profile_call(ff, x):
         if event == "call":
             if frame.f_code is _execute.__code__:
                 counts["composites"] += 1
-            if frame.f_code is catch.cut.__code__:
-                counts["legacy_cuts"] += 1
             if frame.f_code is launch_projection.__code__:
                 dispatches.append(dict(vars(frame.f_locals["dispatch"])))
         elif event == "c_return" and arg in native:

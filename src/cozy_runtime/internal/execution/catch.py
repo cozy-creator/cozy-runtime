@@ -1,16 +1,9 @@
-"""Pure-site cuts sized from their operands against executor-local residency (`sizing`).
-
-A pure cut site estimates its level from live shapes (`need`) and local room (`r.room()`).
-An unexpected capacity refusal tries bounded reclamation before the full recovery fallback,
-retrying only this pure level after memory was released; otherwise it descends. Failure at the
-finest level ends the request, typed (device_out_of_memory). Model blocks and package code run once.
-"""
+"""Execution naming, cancellation boundaries and native uncommitted-scope guards."""
 
 from __future__ import annotations
 
 import functools
 import threading
-import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
@@ -20,18 +13,14 @@ import msgspec
 import torch
 from torch import Tensor, nn
 
-import cozy_runtime.internal.execution.sizing as sizing
-from cozy_runtime.author._attention_scope import active_attention_layout
 from cozy_runtime.author._context import CURRENT as ATTEMPT
-from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import TRANSPARENT
-from cozy_runtime.internal.execution import phase as working_phase
 from cozy_runtime.internal.residency import Request
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
 
-#: the request being served (`serving`): its pure cut sites size from its local room
+#: the request being served; native providers read its actual owners and phase
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
 
 
@@ -84,7 +73,7 @@ _local = _Local()
 
 @contextmanager
 def serving(request: Request) -> Iterator[None]:
-    """The attempt's pure cut sites size from `request`'s room while it runs."""
+    """Bind the current request without installing a Python allocator policy."""
     token = CURRENT.set(request)
     try:
         yield
@@ -118,7 +107,7 @@ def piece() -> None:
 
 
 def uncommitted_scope() -> bool:
-    """Legacy outer cuts can still change geometry after a refusal; they are not native menus."""
+    """An uncommitted enclosing scope cannot authorize a native operation."""
     return bool(_local.scopes)
 
 
@@ -136,143 +125,8 @@ def checkpoint() -> None:
     context.raise_if_cancelled()
 
 
-def short(exc: BaseException) -> bool:
-    """A pure site's allocation refusal outside capture."""
-    return (
-        not getattr(exc, "varena_no_retry", False)
-        and fault(exc) is Fault.OOM and not _capturing()
-    )
-
-
-def _clear(exc: BaseException) -> None:
-    """The refused attempt's frames go, and with them its tensors."""
-    seen: set[int] = set()
-    at: BaseException | None = exc
-    while at is not None and id(at) not in seen:
-        seen.add(id(at))
-        if at.__traceback__ is not None:
-            traceback.clear_frames(at.__traceback__)
-        at = at.__cause__ or at.__context__
-
-
 def _capturing() -> bool:
     return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
-
-
-def _refused(exc: BaseException) -> bool:
-    if not short(exc):
-        return False
-    _clear(exc)
-    return True
-
-
-def cut[T](
-    site: str,
-    finest: int,
-    need: sizing.Need,
-    run: Callable[[int], T],
-    *,
-    misfit: Callable[[], None] | None = None,
-) -> T:
-    """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
-    attention pieces, a package's split, a norm's or a conv's bands), at the coarsest level
-    whose `need` fits the request's room; a refusal descends. Outside a request it runs whole;
-    inside a capture at the level the room gives now (its pool was prepared for it). `misfit`
-    hears of a refusal at a level whose `need` fit the room: the estimate was short."""
-    checkpoint()
-    request = CURRENT.get()
-    if request is None:
-        return run(0)
-    scope = Scope(site)
-    _local.scopes.append(scope)
-    available: sizing.Room
-    retries = 0
-
-    def room() -> sizing.Room:
-        nonlocal available
-        available = request.room()
-        return available
-
-    def whole(level: int) -> T:
-        nonlocal retries
-        checkpoint()
-        scope.ordinals.clear()
-        # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
-        # site's predicted cold/warm bytes must be reclaimed before running that site. Torch's
-        # cached bytes are room too: its activations reuse them first, and returning them at
-        # every call of a step's sites is a device sync each (Krea 2's 2048² DiT stepped 14%
-        # slower beside its resident weights, emptying the cache 28 times a step).
-        if not _capturing() and (wanted := need(level, available.granularity)) > (
-            available.free + available.cached
-        ):
-            request.reclaim(wanted)
-        try:
-            return run(level)
-        except Exception as exc:
-            if not short(exc):
-                raise
-            working_phase.invalidate("cut_retry")
-            _clear(exc)
-            failure: BaseException | None = exc
-        if misfit is not None and need(level, available.granularity) <= sizing.capacity(available):
-            misfit()
-        # A failed allocation can reveal pressure the shape estimate cannot predict.
-        # This also runs at the finest level, which sizing.descend cannot make smaller.
-        # First release a bounded amount, now that failed-frame pins are gone. An
-        # underestimated workspace still gets the existing full-reclaim last chance.
-        fresh = request.room()
-        target = max(need(level, fresh.granularity), fresh.free + fresh.granularity)
-        for wanted in (target, 0):
-            if request.reclaim(wanted) <= 0:
-                continue
-            retries += 1
-            checkpoint()
-            scope.ordinals.clear()
-            try:
-                result = run(level)
-            except Exception as retry_error:
-                if not short(retry_error):
-                    raise
-                _clear(retry_error)
-                failure = retry_error
-                continue
-            # The kept failure's traceback holds this frame, and through each caller's
-            # frame every tensor their locals name, until the cyclic collector runs: a
-            # split's whole output and its input (2.5 GB at H3 15 s) outlived the call
-            # that retried and made an 8 GB card refuse the next block (xs-141, run 24683).
-            failure = None
-            return result
-        assert failure is not None
-        raise failure from None
-
-    try:
-        if _capturing():
-            available = request.room()
-            level = sizing.choose(finest, need, available)[0]
-            result = whole(level)
-            working_phase.choice((site, level, active_attention_layout()))
-            return result
-        try:
-            result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
-        except Exception as exc:
-            if short(exc):
-                with _ROWS_LOCK:
-                    _ROWS.setdefault(id(request), Cuts()).oom_floor += 1
-            raise
-        row = Cut(
-            site=site, level=level, need=need(level, 1), tier=tier, descent=steps, retries=retries
-        )
-        working_phase.choice((site, level, active_attention_layout()))
-        with _ROWS_LOCK:
-            rows = _ROWS.setdefault(id(request), Cuts())
-            calls = rows.levels.setdefault(site, [])
-            calls.extend([0] * (level + 1 - len(calls)))
-            calls[level] += 1
-            if steps or retries or all(r.site != site for r in rows.sites):
-                rows.sites.append(row)
-        return result
-    finally:
-        _local.scopes.remove(scope)
 
 
 def wrap(
@@ -280,7 +134,7 @@ def wrap(
     name: str,
     around: Callable[[nn.Module, Args, Kwargs], AbstractContextManager[None]] | None = None,
 ) -> None:
-    """Name a block's pure sites and enter pass agreement; invoke its forward exactly once."""
+    """Name a block's execution sites and invoke its forward exactly once."""
     forward = vars(module).get("forward") or current(module)
 
     @functools.wraps(module.forward)
