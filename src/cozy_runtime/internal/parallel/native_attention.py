@@ -292,6 +292,9 @@ class Prepared:
             self._int4(q, k, v, output, buffers)
         else:
             self._int8(q, k, v, output, buffers, "dense")
+        from cozy_runtime.internal import attention_ulysses
+
+        attention_ulysses.record(r.backend, r.kind)
         if r.exact_site is not None:
             attention_sol.note_exact(r.exact_site)
         if r.reason and r.kind != "kitchen-sol":

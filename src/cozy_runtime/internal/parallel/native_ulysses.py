@@ -409,6 +409,12 @@ def _exchange(
         "shape_identity": phase_id,
         "geometry": identity,
         "rank": rank,
+        "stream": int(stream.cuda_stream),
+        "provider_identity": geometry.local.identity,
+        "provider_sol_query": dict(geometry.local.sol_plan),
+        "buffer_inventory": tuple(
+            (name, shape, str(dtype)) for name, shape, dtype in geometry.specs(rank)
+        ),
         "rows": sizes,
         "eligible": selection["eligible"],
         "all_rank_eligible": [p["eligible"] for p in proposals],
@@ -420,6 +426,7 @@ def _exchange(
     custody = [query, key, value, geometry, owners, group, stream]
     try:
         error = None
+        final = None
         try:
             final = vt.split_select(
                 device, fixed_key, fixed, preferred=identity, stream=stream.cuda_stream
@@ -445,6 +452,7 @@ def _exchange(
             {
                 "choice": identity,
                 "physical_owners_allocated": error is None,
+                "native_selection": final,
                 "error": None if error is None else _failure(error),
             },
         )

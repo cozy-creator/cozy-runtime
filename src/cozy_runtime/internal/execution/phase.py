@@ -36,7 +36,8 @@ def _semantic(value: object) -> object:
         if parameters is None or not parameters.frozen:
             raise TypeError("mutable phase configuration")
         return (
-            type(value).__module__, type(value).__qualname__,
+            type(value).__module__,
+            type(value).__qualname__,
             tuple((field.name, _semantic(getattr(value, field.name))) for field in fields(value)),
         )
     raise TypeError(f"unrepresented phase configuration: {type(value).__qualname__}")
@@ -84,9 +85,7 @@ class Observation:
             encoded = _encoded(_semantic(configuration))
         except (TypeError, ValueError):
             return None
-        return namespace + ":" + hashlib.sha256(
-            encoded + b"\n" + self._cuts.digest()
-        ).hexdigest()
+        return namespace + ":" + hashlib.sha256(encoded + b"\n" + self._cuts.digest()).hexdigest()
 
     def complete(self, configuration: object | None) -> None:
         self.completed = True
@@ -112,7 +111,9 @@ def completion_owner(device: int, stream: int) -> int | None:
     """Only the eager owner's actual synchronized stream can qualify a submitted leaf."""
     active = _ACTIVE.get()
     if (
-        active is not None and active.device == device and active.completion_stream is not None
+        active is not None
+        and active.device == device
+        and active.completion_stream is not None
         and int(active.completion_stream.cuda_stream) == stream
     ):
         return active.token
@@ -120,17 +121,22 @@ def completion_owner(device: int, stream: int) -> int | None:
 
 
 def begin_split(
-    device: int, key: str, choice: str, selection: dict[str, Any], *, stream: int,
+    device: int,
+    key: str,
+    choice: str,
+    selection: dict[str, Any],
+    *,
+    stream: int,
 ) -> int:
-    """Forward selection identity, never infer it from mutable last-site state.
-
-    Older no-plan native cohorts omit the field. Their original call remains valid;
-    a native Plan cohort requires the exact opaque generation it returned.
-    """
-    options: dict[str, Any] = {"completion_owner": completion_owner(device, stream)}
-    if "plan_generation" in selection:
-        options["plan_generation"] = selection["plan_generation"]
-    return vt.split_begin(device, key, choice, stream=stream, **options)
+    """Forward the current native cohort's exact selection generation."""
+    return vt.split_begin(
+        device,
+        key,
+        choice,
+        stream=stream,
+        completion_owner=completion_owner(device, stream),
+        plan_generation=selection["plan_generation"],
+    )
 
 
 @contextmanager
@@ -142,7 +148,8 @@ def observing(
         return
     # Actual adaptive cuts are unknown at entry; no preceding pass is a promise about this one.
     observation = Observation(
-        device, vt.phase_enter(device, None, mode=mode),
+        device,
+        vt.phase_enter(device, None, mode=mode),
         torch.cuda.current_stream(device) if mode == "eager" else None,
     )
     token = _ACTIVE.set(observation)
@@ -153,7 +160,8 @@ def observing(
     finally:
         try:
             record = vt.phase_leave(
-                device, observation.token,
+                device,
+                observation.token,
                 completed=succeeded and (mode != "eager" or observation.completed),
                 key=observation.key,
             )
