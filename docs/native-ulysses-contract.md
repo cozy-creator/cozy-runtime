@@ -29,7 +29,10 @@ allocates a CUDA tensor or claims capacity.
    and accept that exact legal ID.
 5. Each rank freshly selects/begins that singleton, forwarding its exact returned
    plan generation, then physically allocates and validates all its supplied buffers.
-   All ranks report successful admission/allocation before the first tensor crossing.
+   Supplied writes are checked against actual live byte/Storage spans, including
+   distinct Storage objects sharing a pointer. Strided read-only operands use their
+   real Storage allocation spans, never guessed tensor bounds. All ranks report
+   successful admission/allocation before the first tensor crossing.
    Full, common and singleton menus have distinct immutable native keys: native
    registration does not allow reusing one key with changed choices/preference.
 

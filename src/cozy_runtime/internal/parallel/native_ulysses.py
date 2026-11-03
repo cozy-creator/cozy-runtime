@@ -124,6 +124,37 @@ class Geometry:
         )
 
 
+def validate_transport(inputs: tuple[Tensor, ...], owners: dict[str, Tensor]) -> None:
+    """Reject physical aliasing before packing or crossing writes.
+
+    Read-only Q/K/V may be strided views. Compare their actual Storage allocation
+    spans, not synthetic tensor bounds inferred from noncontiguous strides.
+    """
+    device = inputs[0].device
+    written: list[Tensor] = []
+    for target in owners.values():
+        if (
+            type(target) is not Tensor
+            or target.device != device
+            or not target.is_contiguous()
+            or target.requires_grad
+            or target.is_conj()
+            or target.is_neg()
+        ):
+            raise ValueError("native Ulysses transport writes require ordinary contiguous owners")
+        if not target.numel():
+            continue
+        begin, end = target.data_ptr(), target.data_ptr() + target.numel() * target.element_size()
+        for source in (*inputs, *written):
+            storage = source.untyped_storage()
+            start, stop = storage.data_ptr(), storage.data_ptr() + storage.nbytes()
+            if torch._C._is_alias_of(target, source) or max(begin, start) < min(end, stop):
+                raise ValueError(
+                    "native Ulysses transport owner overlaps an actual live storage span"
+                )
+        written.append(target)
+
+
 def _cross(
     group: Any,
     engines: Any,
@@ -441,6 +472,7 @@ def _exchange(
                 for name, tensor in owners.items()
                 if name.startswith("attention.")
             }
+            validate_transport((query, key, value), owners)
             geometry.local.validate(
                 *(owners[f"land.{c}"] for c in "qkv"), owners["attended"], scratch
             )
