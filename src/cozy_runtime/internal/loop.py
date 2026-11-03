@@ -2051,12 +2051,18 @@ class _Cutter:
         try:
             if binding is not None:
                 self._preparing.enter_context(binding.prepare())
+            loaded = () if binding is None else tuple(binding.immutable_inputs())
+            for tensor in loaded:
+                # LoadSlot materialized these storages on caller C. Declare their
+                # actual capture consumer S; _Graph.begin still supplies C-to-S
+                # ordering. Binding/LoadSlot retain the storages through capture exit.
+                tensor.record_stream(self.recording._domain.stream)
             self.graph = _Graph(
                 self.recording,
                 self.state,
                 1,
                 () if binding is None else (binding,),
-                loaded=() if binding is None else tuple(binding.immutable_inputs()),
+                loaded=loaded,
                 scratch=self.scratch,
                 unbound=self.immutable
                 - (frozenset() if binding is None else binding.immutable_buffer_ids(selected=True)),
