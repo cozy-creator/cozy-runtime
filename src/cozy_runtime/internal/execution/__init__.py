@@ -25,6 +25,7 @@ from cozy_runtime.internal.execution.native_linear_split import (
 from cozy_runtime.internal.execution.native_residual_ffn import split_residual_ffn
 from cozy_runtime.internal.execution.native_sparse_producer import split_sparse_projected_heads
 from cozy_runtime.internal.execution.native_vae import split_layer_scale_block
+from cozy_runtime.internal.execution.native_vae_sequence import decode_vae_tiles
 from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
 from cozy_runtime.internal.residency import Request, blocks_of
 
@@ -41,6 +42,7 @@ __all__ = [
     "split",
     "split_declared",
     "split_layer_scale_block",
+    "decode_vae_tiles",
     "split_projected_heads",
     "split_residual_ffn",
     "split_single_use_projection",

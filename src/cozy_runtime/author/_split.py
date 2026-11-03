@@ -146,6 +146,20 @@ def split(
     )
 
 
+
+def decode_vae_tiles(module: Any, tiles: Any, *, block_layout: Any) -> Any:
+    """Execute the declared complete H3 tile sequence under native memory policy.
+
+    This required execution capability has no eager or retry fallback. The producer
+    declares its exact block layout; Runtime owns query, window choice and custody.
+    """
+    runtime = _RUNTIME
+    executor = getattr(runtime, "decode_vae_tiles", None)
+    if not callable(executor):
+        raise RuntimeError("installed execution requires the native H3 VAE sequence")
+    return executor(module, tiles, block_layout=block_layout)
+
+
 type Window = tuple[tuple[int, int], ...]
 
 

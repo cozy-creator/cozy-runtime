@@ -16,7 +16,7 @@ from torch import Tensor, nn
 
 from cozy_runtime.internal.execution.native_vae_metadata import TensorSpec
 
-TORCH_COMMIT = "08187d9e0fba026dc8217405802ab5381dc88d90"
+TORCH_COMMIT = "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e"
 IMPLEMENTATION = "h3-output-functional-layernorm-lt/1"
 GEOMETRY = (7, 16, 16)
 PATCHES, TOKENS, WIDTH, PROJECTED = 1792, 1797, 2048, 3072

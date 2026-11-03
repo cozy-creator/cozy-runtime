@@ -240,6 +240,8 @@ def _describe_module(
         route is None
         or route.candidate is not attention.BY_NAME["kitchen-int8"]
         or getattr(processor, "_parallel_config", None) is not None
+        or getattr(module, "_parallel_config", None) is not None
+        or getattr(site.attention, "_parallel_config", None) is not None
     ):
         raise _Unsupported("VAE requires the actually selected single-GPU Kitchen INT8 route")
     kernel = _attention(route, device)
@@ -323,7 +325,6 @@ def _bound_inventory(intent: LayerScaleBlock) -> _Inventory:
         or catch.uncommitted_scope()
         or _BLOCK_SPLIT.get() is not None
         or torch.cuda.is_current_stream_capturing()
-        or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
     ):
         raise _Unsupported("VAE requires an independent eager CUDA batch call")
     device = x.device.index or 0
@@ -383,7 +384,6 @@ def describe_block(
         or shape[-1] != 2048 or shape[1] < 2 or dtype not in (torch.float16, torch.float32)
         or torch.is_grad_enabled() or catch.uncommitted_scope() or _BLOCK_SPLIT.get() is not None
         or torch.cuda.is_current_stream_capturing()
-        or (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
     ):
         raise _Unsupported("VAE metadata requires an independent eager CUDA batch call")
     policy = dense_linear.policy(device.index or 0)
