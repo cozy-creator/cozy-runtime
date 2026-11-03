@@ -341,6 +341,8 @@ def _exchange(
     )
     phase_id = _semantic(("native-ulysses/1", shapes))
     declarations: tuple[Geometry, ...] = ()
+    menu: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    local_key = None
     selection = None
     try:
         selected = native_attention.recipe(backend, options, sum(sizes), device)
@@ -376,17 +378,28 @@ def _exchange(
         error = None
     except BaseException as exc:
         error = exc
-    proposals = control.gather(
-        sequence,
-        phase_id + "/eligible",
-        {
-            "identity": None
-            if not declarations
-            else _semantic(tuple(g.local.identity for g in declarations)),
-            "eligible": [] if selection is None else selection["eligible"],
-            "error": None if error is None else _failure(error),
-        },
-    )
+    proposal = {
+        "identity": None
+        if not declarations
+        else _semantic(tuple(g.local.identity for g in declarations)),
+        "declared": dict(menu),
+        "local_key": local_key,
+        "choice_id": None if selection is None else selection["choice_id"],
+        "eligible": [] if selection is None else selection["eligible"],
+        "native_selection": selection,
+        "error": None if error is None else _failure(error),
+    }
+    agreement_key = "runtime.ulysses.agreement/1:" + _semantic((phase_id, rank))
+    agreement = {
+        "site": "native-ulysses-agreement",
+        "sequence": sequence,
+        "shape_identity": phase_id,
+        "rank": rank,
+        "local_proposal": proposal,
+    }
+    request.working_splits[agreement_key] = agreement
+    proposals = control.gather(sequence, phase_id + "/eligible", proposal)
+    agreement["all_rank_proposals"] = proposals
     _require(proposals, "native selection")
     if any(row["identity"] != proposals[0]["identity"] for row in proposals[1:]):
         raise ValueError(
@@ -398,23 +411,27 @@ def _exchange(
     common_menu = tuple(
         (g.identity, g.allocations(rank)) for g in declarations if g.identity in eligible
     )
+    agreement["mode"] = "common_snapshot" if common_menu else "leader_native_proposal"
     chosen = None
     error = None
     if rank == 0:
         try:
-            if not common_menu:
-                raise ValueError("native Ulysses ranks have no common legal geometry")
-            common_key = "runtime.ulysses.common/1:" + _semantic(
-                (phase_id, common_menu, proposals[0]["identity"])
-            )
-            request.memory.remember_working_phase(common_key, (request,))
-            chosen = vt.split_select(
-                device,
-                common_key,
-                common_menu,
-                preferred=common_menu[0][0],
-                stream=stream.cuda_stream,
-            )["choice_id"]
+            if common_menu:
+                common_key = "runtime.ulysses.common/1:" + _semantic(
+                    (phase_id, common_menu, proposals[0]["identity"])
+                )
+                request.memory.remember_working_phase(common_key, (request,))
+                chosen = vt.split_select(
+                    device,
+                    common_key,
+                    common_menu,
+                    preferred=common_menu[0][0],
+                    stream=stream.cuda_stream,
+                )["choice_id"]
+            else:
+                # Rank-local reuse snapshots can be disjoint. Propose one native
+                # choice; every rank still admits and allocates it below, or refuses.
+                chosen = proposals[0]["choice_id"]
         except BaseException as exc:
             error = exc
     agreed = control.gather(
@@ -422,18 +439,24 @@ def _exchange(
         phase_id + "/choice",
         {"choice": chosen, "error": None if error is None else _failure(error)},
     )
+    agreement["all_rank_choices"] = agreed
     _require(agreed, "common native choice")
     identity = agreed[0]["choice"]
-    if identity not in eligible:
+    if any(identity not in row["declared"] for row in proposals):
         raise RuntimeError(
-            "native Ulysses agreed choice is not every rank's declared legal geometry"
+            "native Ulysses agreed choice is not every rank's declared geometry"
         )
+    if eligible and identity not in eligible:
+        raise RuntimeError("native Ulysses agreed choice is outside the common native snapshot")
+    if not eligible and identity != proposals[0]["choice_id"]:
+        raise RuntimeError("native Ulysses agreed choice differs from the native leader proposal")
     geometry = next(g for g in declarations if g.identity == identity)
     fixed = ((identity, geometry.allocations(rank)),)
     fixed_key = "runtime.ulysses.fixed/1:" + _semantic(
         (phase_id, rank, fixed, geometry.local.identity)
     )
     request.memory.remember_working_phase(fixed_key, (request,))
+    agreement["fixed_key"] = fixed_key
     token, owners = None, {}
     submitted = False
     committed = False
@@ -441,6 +464,7 @@ def _exchange(
         "site": "native-ulysses",
         "sequence": sequence,
         "shape_identity": phase_id,
+        "agreement_key": agreement_key,
         "geometry": identity,
         "rank": rank,
         "stream": int(stream.cuda_stream),
@@ -484,17 +508,17 @@ def _exchange(
             )
         except BaseException as exc:
             error = exc
-        ready = control.gather(
-            sequence,
-            phase_id + "/" + identity + "/ready",
-            {
-                "choice": identity,
-                "physical_owners_allocated": error is None,
-                "native_selection": final,
-                "error": None if error is None else _failure(error),
-            },
-        )
+        local_readiness = {
+            "choice": identity,
+            "physical_owners_allocated": error is None,
+            "native_selection": final,
+            "error": None if error is None else _failure(error),
+        }
+        record["local_readiness"] = local_readiness
+        agreement["local_readiness"] = local_readiness
+        ready = control.gather(sequence, phase_id + "/" + identity + "/ready", local_readiness)
         record["all_rank_readiness"] = ready
+        agreement["all_rank_readiness"] = ready
         _require(ready, "fixed admission/allocation")
         committed = True
         engines = copy_engine.for_group(group)
