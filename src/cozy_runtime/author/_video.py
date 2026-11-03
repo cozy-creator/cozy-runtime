@@ -17,19 +17,15 @@ from cozy_runtime.author._image import AspectRatio, Seed
 from cozy_runtime.author._markers import FileBound
 from cozy_runtime.author._references import Reference
 
-Frame = Annotated[
-    ImageFile,
-    FileBound(
-        max_bytes=64 << 20,
-        max_decoded_bytes=256 << 20,
-        media_types=("image/png", "image/jpeg", "image/webp"),
-    ),
-]
-Video = Annotated[VideoFile, FileBound(max_bytes=1 << 30, max_decoded_bytes=2 << 30)]
-Sound = Annotated[AudioFile, FileBound(max_bytes=256 << 20)]
+#: An output's or latents' byte bound: TensorD's output allowance reads it (256 MiB where none is
+#: declared), and the disk is the real limit. A long 2160p upscale must not end in a refusal.
+ANY_SIZE = 1 << 40
+Frame = Annotated[ImageFile, FileBound(max_decoded_bytes=256 << 20)]
+Video = Annotated[VideoFile, FileBound(max_decoded_bytes=2 << 30)]
+Sound = AudioFile
 #: A shot's own latents, in its renderer's format and opaque to the caller: a later call of the same
 #: package continues from them, and its upscaler starts from them instead of re-encoding the video.
-Latents = Annotated[File, FileBound(max_bytes=1 << 30, media_types=("application/octet-stream",))]
+Latents = Annotated[File, FileBound(max_bytes=ANY_SIZE, media_types=("application/octet-stream",))]
 #: Speed against fidelity, as a video encoder's presets: `quality` the slowest and closest to the
 #: model's reference, `fast` the quickest; each renderer or upscaler maps them to its own recipes.
 Preset = Literal["quality", "balanced", "fast"]
@@ -130,7 +126,7 @@ class ShotRequest(msgspec.Struct, kw_only=True):
 
 
 class ShotResult(msgspec.Struct):
-    video: Annotated[VideoFile, FileBound(max_bytes=1 << 30, media_types=("video/mp4",))]
+    video: Annotated[VideoFile, FileBound(max_bytes=ANY_SIZE, media_types=("video/mp4",))]
     warnings: list[str]
     #: The shot's latents, when its renderer keeps them: a project keeps them with the video, for
     #: `continue_from` and the upscale.
@@ -152,4 +148,4 @@ class UpscaleRequest(msgspec.Struct, kw_only=True):
 
 
 class UpscaleResult(msgspec.Struct):
-    video: Annotated[VideoFile, FileBound(max_bytes=1 << 30, media_types=("video/mp4",))]
+    video: Annotated[VideoFile, FileBound(max_bytes=ANY_SIZE, media_types=("video/mp4",))]

@@ -66,9 +66,7 @@ class Picture(Reference, kw_only=True):
     """A picture the request edits or composes, named for the prompt's `<name>` mentions. Read
     upright and scaled down to 16 MP at most."""
 
-    image: Annotated[
-        ImageFile, FileBound(max_bytes=32 << 20), ImagePreparation(max_pixels=16 << 20)
-    ]
+    image: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
     #: Where it goes in the output, for a model with layout control; None places it nowhere in
     #: particular. A placed picture is an element, not the canvas: the size is the model's
     #: text-to-image default.
