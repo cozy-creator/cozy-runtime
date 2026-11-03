@@ -3748,7 +3748,7 @@ class Executor:
                 self._emit_compute(record, member)
             for feature, instead in accel.unavailable(self.device_kind) if self.models else ():
                 record.emit(
-                    "log", f"{feature} unavailable on {self.device_kind}", "warn", instead=instead
+                    "log", f"{feature} unavailable on {self.device_kind}", "info", instead=instead
                 )
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
@@ -3766,7 +3766,7 @@ class Executor:
             members = self.model_executors or [self]
             facts = next((m.device_facts for m in members if m.device_facts), None)
             if facts is not None and (unnamed := arch.inherited(facts.sm, facts.name)):
-                record.emit("log", unnamed, "warn")
+                record.emit("log", unnamed, "info")
         stage_memo.ENGINE.close(record.emit)
         if later:
             # The override put back the run's first selection; the construction keeps its last.

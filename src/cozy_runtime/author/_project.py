@@ -96,13 +96,15 @@ class ProjectUpscale(msgspec.Struct, kw_only=True):
 
 
 class ProjectEntity(msgspec.Struct, kw_only=True):
-    """A character, prop or environment's picture. `kind`: `character`, `prop` or `environment`."""
+    """A character, prop or environment's picture. `kind`: `character`, `prop` or `environment`. `description` is what it is,
+    which shots read too; `instructions` is how to draw this picture, which nothing else reads."""
 
     version: Literal[1] = 1
     name: str
     function: str
     kind: str
     description: str = ""
+    instructions: str = ""
     style: str = ""
     aspect_ratio: str | None = None
     pictures: list[ProjectPicture] = msgspec.field(default_factory=list)
