@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.37.9"
+version = "0.38.0"
 source = { editable = "." }
 dependencies = [
     { name = "msgspec" },
@@ -364,8 +364,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", specifier = ">=0.17.13,<0.18" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.17.13,<0.18" },
+    { name = "tensorfs", specifier = ">=0.17.13,<0.19" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", specifier = ">=0.17.13,<0.19" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.14" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.14" },
