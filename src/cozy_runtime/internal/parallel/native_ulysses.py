@@ -211,6 +211,7 @@ def _execute(
     group: Any,
     engines: Any,
     rank: int,
+    record: dict[str, Any],
 ) -> Tensor:
     world = len(geometry.rows)
     step = geometry.step
@@ -225,6 +226,7 @@ def _execute(
     for start in range(0, output.shape[2], step):
         for letter, source in zip("qkv", inputs, strict=True):
             pack_heads(source, values[f"send.{letter}"], start, world)
+        record["tensor_crossing_attempted"] = True
         _cross(
             group,
             engines,
@@ -239,6 +241,7 @@ def _execute(
         values["send.back"].copy_(values["attended"].permute(1, 0, 2, 3))
         _cross(group, engines, [values["send.back"]], [values["recv.back"]], back, rank)
         unpack_heads(values["recv.back"], output, start, world)
+        record["completed_head_groups"] += 1
     return output[:, :, : geometry.heads]
 
 
@@ -451,7 +454,10 @@ def _exchange(
         "all_rank_eligible": [p["eligible"] for p in proposals],
         "additional_allocations": geometry.allocations(rank),
         "library_holdings": "ProcessGroup/copy-engine owners; library pressure is not reserved",
-        "first_tensor_collective_entered": False,
+        "tensor_crossing_attempted": False,
+        "submission_started": False,
+        "completed_head_groups": 0,
+        "checked_stream_completion": False,
     }
     request.working_splits[fixed_key] = record
     custody = [query, key, value, geometry, owners, group, stream]
@@ -494,9 +500,10 @@ def _exchange(
         engines = copy_engine.for_group(group)
         custody.append(engines)
         record["transport"] = "nccl" if engines is None else "copy_engines"
-        record["first_tensor_collective_entered"] = True
-        result = _execute(geometry, owners, (query, key, value), group, engines, rank)
+        record["submission_started"] = True
+        result = _execute(geometry, owners, (query, key, value), group, engines, rank, record)
         stream.synchronize()
+        record["checked_stream_completion"] = True
         submitted = True
         return result
     except BaseException as exc:
