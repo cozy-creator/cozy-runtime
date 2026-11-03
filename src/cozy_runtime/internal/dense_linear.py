@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-_TORCH = "08187d9e0fba026dc8217405802ab5381dc88d90"
+_TORCH = "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e"
 _LT_SETTING = os.environ.get("DISABLE_ADDMM_CUDA_LT")
 
 

@@ -1,6 +1,6 @@
 """Component-owned library and graph scratch, serialized across its graphs.
 
-Torch 2.14 resets cuBLAS workspaces on a graph's capture stream. Region graphs therefore
+Torch 2.15 resets cuBLAS workspaces on a graph's capture stream. Region graphs therefore
 begin/end on a control stream and fork onto a separate, uniquely owned library stream. A
 small owner graph on the library stream is reset only at final domain teardown; it is never
 replayed. Its reset frees that stream's cached library pointers before the pool/streams die.
@@ -37,8 +37,8 @@ class Unavailable(RuntimeError):
 def unsupported(torch: Any) -> str:
     return (
         ""
-        if torch.__version__.split(".")[:2] in (["2", "14"], ["2", "15"])
-        else ("library-workspace graph lifetime is qualified only on Torch 2.14 and 2.15")
+        if torch.version.git_version == "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e"
+        else ("library-workspace graph lifetime requires the reviewed Torch 2.15 source")
     )
 
 

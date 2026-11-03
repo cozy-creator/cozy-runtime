@@ -143,3 +143,30 @@ for the pass. `ulysses._level` still derives its next proposal from a Python Roo
 snapshot. It does not implement native legal-choice agreement before collectives.
 This is a distinct transformer integration gap, not covered by independent VAE
 spread. Full 15s/362-frame/1344x768/30-step/audio and rank2/4 gates remain mandatory.
+
+## Required 2.15 provider alignment
+
+The initial b94 source migrated edge descriptors but left the shared dense policy
+and native RMS provider pinned to08187. That source therefore declines the new
+2.15 VAE before numerical work; CPU arithmetic/layout tests did not exercise the
+CUDA policy. Preserve that blocked control receipt.
+
+The current successor pins dense policy, RMS, prefix/tail and graph Domain to one
+reviewed Torch2.15 source d0f2af8b66b20da4baa50644c0cd3f887a2eae2e. Heads, sparse
+producer and refiner contain no old Torch source rejection; their real provider/API,
+math, source and shape guards remain. No thresholds or numerical kernels changed.
+
+Exact2.15 `CUDABlas.cpp`, `detail/CublasLtUtils.h`, `CublasHandlePool.cpp` and the
+Python CUDA backend getter confirm the same effective FP16 accumulation, reduction/
+split-K mask, SM carveout and workspace-byte contract read by dense_linear.Policy.
+The actual CUDA wheel header contains the identical type-selection source body
+inside its generated stable-ABI include guard. Prepared Lt still queries the actual
+algorithm/workspace, rather than assuming a plan is available on either GPU.
+
+Exact2.15 `_fused_rms_norm_cuda` borrows matching contiguous input/weight, allocates Y
+plus one accumulation-dtype rstd (FP32 for the admitted input dtypes), and returns a
+statistics view. Its vectorized/fallback launches add no device Tensor allocation.
+Current `CUDAGraph.reset` clears cached BLAS workspace for its capture stream;
+Runtime sets `TORCH_CUBLAS_WORKSPACE_CACHE=1` before first BLAS use and keeps the
+existing owner/stream retirement order. The first actual GPU edge gate must assert
+non-None effective dense policy in real FP16 autocast before any full-model run.

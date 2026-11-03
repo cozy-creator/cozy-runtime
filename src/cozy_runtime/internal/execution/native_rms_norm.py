@@ -18,7 +18,7 @@ from cozy_runtime.internal.residency import _REQUEST
 # This is an allocation ABI, not an estimate of a generic torch normalization. At this
 # reviewed build, matching contiguous CUDA operands allocate Y and FP32 rstd only.
 # Other implementations keep their ordinary path until their actual contract is reviewed.
-_TORCH = "08187d9e0fba026dc8217405802ab5381dc88d90"
+_TORCH = "d0f2af8b66b20da4baa50644c0cd3f887a2eae2e"
 
 
 def rms_norm(site: str, module: nn.Module, x: Tensor) -> Tensor | None:
