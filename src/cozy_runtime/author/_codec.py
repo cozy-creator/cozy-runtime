@@ -55,10 +55,11 @@ from cozy_runtime.author._errors import OutputError
 #: snapshot copy — not the OOM killer — is what stops it.
 SNAPSHOT_FACTOR = 16
 
-#: Pinned x264 settings. crf 17 is visually-lossless-grade for a generation product;
-#: veryfast keeps the CPU tail small on pods. Changing either changes every banked
-#: container digest, so a change here is deliberate, never drift.
-_X264 = {"crf": "17", "preset": "veryfast"}
+#: Pinned x264 settings. crf 17 turned low-contrast areas into flat rectangles and lost grain
+#: (0.94x of the source; crf 14 keeps it, for 40% more bytes and the same CPU). veryfast keeps
+#: the CPU tail small on pods; medium cost 5x the CPU and looked no better. Changing either
+#: changes every banked container digest, so a change here is deliberate, never drift.
+_X264 = {"crf": "14", "preset": "veryfast"}
 
 #: The most x264 frame threads any host gets. It is the smallest vCPU count of a qualified
 #: H3 pod class (h3a-017), so every pod encodes with the same count and the same bytes; it
