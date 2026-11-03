@@ -547,6 +547,12 @@ def initialize(torch: Any, kind: str) -> None:
         native = getattr(torch, "_native", None)
         if native is not None:
             native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
+        # Torch 2.15 allocates a library workspace per operation by default, inside a capture too,
+        # which fragments the capture's scratch (770 MiB on SDXL, too much for a 12 GB card to
+        # instantiate its graph: cr-252). The workspaces stay per stream, as on 2.14: made once by
+        # `first_launches` and `graphs.domain.prime_blas`, outside any request, and the domain
+        # serializes the graphs that share them. Torch reads this at its first library call.
+        os.environ["TORCH_CUBLAS_WORKSPACE_CACHE"] = "1"
         torch._C._accelerator_setAllocatorSettings(ALLOCATOR)
         try:
             varena.install_allocator()
