@@ -97,10 +97,28 @@ def profile_call(ff, x):
     from cozy_runtime.internal.execution.native_linear_split import launch_projection
     from cozy_runtime.internal.execution.native_refiner_ffn import _execute
 
-    native = {getattr(_kernels._gemm, name): name
-              for name in ("gemm", "gemv", "quantize", "int8_plan")}
+    import threading
+
+    originals = {name: getattr(_kernels._gemm, name)
+                 for name in ("gemm", "gemv", "quantize", "int8_plan")}
     counts = {"composites": 0, "legacy_cuts": 0, "native_errors": 0,
-              **{name: 0 for name in native.values()}}
+              **{name: 0 for name in originals}}
+    thread = threading.get_ident()
+
+    def observe_native(name, actual):
+        # nanobind.nb_func does not emit CPython c_return/c_exception profile
+        # events. Forward the real callable unchanged and count this thread.
+        def observed(*args, **kwargs):
+            try:
+                result = actual(*args, **kwargs)
+            except BaseException:
+                if threading.get_ident() == thread:
+                    counts["native_errors"] += 1
+                raise
+            if threading.get_ident() == thread:
+                counts[name] += 1
+            return result
+        return observed
     dispatches = []
     assert sys.getprofile() is None
 
@@ -112,16 +130,16 @@ def profile_call(ff, x):
                 counts["legacy_cuts"] += 1
             if frame.f_code is launch_projection.__code__:
                 dispatches.append(dict(vars(frame.f_locals["dispatch"])))
-        elif event == "c_return" and arg in native:
-            counts[native[arg]] += 1
-        elif event == "c_exception" and arg in native:
-            counts["native_errors"] += 1
 
+    for name, actual in originals.items():
+        setattr(_kernels._gemm, name, observe_native(name, actual))
     sys.setprofile(profile)
     try:
         output = ff(x)
     finally:
         sys.setprofile(None)
+        for name, actual in originals.items():
+            setattr(_kernels._gemm, name, actual)
     assert counts["composites"] == 1 and counts["legacy_cuts"] == 0, counts
     assert counts["int8_plan"] > 0 and counts["native_errors"] == 0, counts
     assert counts["gemm"] == sum(part["kind"] == 0 for part in dispatches), counts
@@ -142,7 +160,8 @@ def consumer(payload: Probe, ctx: Context) -> Report:
     device = ctx.device.index or 0
     torch_device = torch.device(str(ctx.device))
     result = {"pid": os.getpid(), "scope": "H3-width FFN consumer only; no model qualification",
-              "torch": str(torch.__version__), "cases": [], "keys": []}
+              "torch": str(torch.__version__), "cases": [], "keys": [],
+              "instrumentation": "transparent actual-native call observers; not performance evidence"}
     try:
         assert int8_linear.native(torch, device) is not None
         library = int8_linear.library(device)
