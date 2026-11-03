@@ -200,6 +200,12 @@ class App:
         field that describes its fixed repeated weight use before construction."""
         return self._register(fn, True, **options)
 
+    def project_adapter(self, kind: str, /) -> Callable[[Callable[P, R]], Callable[P, R]]:
+        """Register what turns one project node into this package's own call (`author.Invocation`): `kind` is `shot`,
+        `upscale`, `entity`, `setup` or `world_state`, and it reads that node's record (`author.ProjectShot`, ...). A public
+        function named `project-adapter-<kind>`, on the CPU, so a machine runs it as it runs any other."""
+        return self._register(None, False, name=f"project-adapter-{kind}", accelerator=False)
+
     def _register(
         self,
         fn: Callable[P, R] | None,
