@@ -101,13 +101,14 @@ def _slot(
             model.closed
             or model.retiring
             or model.fill is not None
-            or model.bind is not None
-            or model.finals is not None
             or model.wanted_identity() is None
         ):
             raise _Unsupported(
                 "VAE native source requires an established raw stored representation"
             )
+        # Declared verbatim routes may install bind/finals objects on the model.
+        # raw_views exists only for an exact source layout without block finals;
+        # bind() below rechecks its current Region address and byte offset.
         for block in model.groups():
             view = block.raw_views.get((id(module._parameters), name))
             if view is not None:
