@@ -1,0 +1,1 @@
+A failed host-tier pin is no longer silent. A store read that fails while a page pins, pinning that turns the host tier off, a model whose stage memo is off and idle work that fails each warn on the next run to end; `baked_pages.pin_failed` counts the pages. These all made runs slower with no sign in the run's record.
