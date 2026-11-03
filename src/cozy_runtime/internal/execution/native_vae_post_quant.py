@@ -262,6 +262,16 @@ def _pointer(tensor: Tensor | None) -> int:
     return 0 if tensor is None else tensor.data_ptr()
 
 
+def _overlap(left: Tensor, right: Tensor) -> bool:
+    # Imported/exported tensors may have distinct Storage objects for overlapping
+    # memory. Bounds here are valid only after contiguous same-device validation.
+    if left.device != right.device or not left.is_contiguous() or not right.is_contiguous():
+        raise ValueError("VAE span checks require contiguous tensors on one device")
+    return (torch._C._is_alias_of(left, right)
+            or max(left.data_ptr(), right.data_ptr())
+            < min(left.data_ptr() + _capacity(left), right.data_ptr() + _capacity(right)))
+
+
 def _no_retry(error: BaseException) -> None:
     error.varena_no_retry = True  # type: ignore[attr-defined]
 
@@ -416,7 +426,7 @@ class Prepared:
         outputs = [tensor for tensor, _, _ in expected]
         for index, tensor in enumerate(outputs):
             if any(
-                torch._C._is_alias_of(tensor, other)
+                _overlap(tensor, other)
                 for other in [value, weight, bias, *outputs[:index]]
             ):
                 raise ValueError("post-quant writes require independent owned storage")
