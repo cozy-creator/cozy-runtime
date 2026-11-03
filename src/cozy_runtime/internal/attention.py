@@ -731,7 +731,11 @@ def _wheel(candidate: Candidate, device: DeviceFacts) -> dict[str, str] | None:
 def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
     """FlashAttention-3 from the Runtime wheel once it verifies on this Hopper card; a
     failure is the run's one warning for it, and the local build is tried next."""
-    if device.kind != "cuda" or not prebuilt.serves(candidate.name, device.sm):
+    if (
+        prebuilt.ATTENTION.get(candidate.name) != "_fa3"
+        or device.kind != "cuda"
+        or not prebuilt.serves(candidate.name, device.sm)
+    ):
         return None
     import torch
 
