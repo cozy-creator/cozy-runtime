@@ -1,0 +1,11 @@
+{
+  "source": "eb4e6fd5b5694e34095fa865c67e42f794a4c27c",
+  "version": "0.37.5+dev.geb4e6fd5",
+  "wheel": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/runtime-build-eb4e6fd5b/dist/cozy_runtime-0.37.5+dev.geb4e6fd5-cp312-abi3-manylinux_2_28_x86_64.whl",
+  "sha256": "aef42dbdc8c015ff28388de555ee8864ac8c5d10e44308b9bf3dd1a8b9b958cb",
+  "record_rows": 833,
+  "native_members": 581,
+  "postquant_member_verified": true,
+  "installed_site": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/runtime-postquant-wheel",
+  "gpu_qualified": false
+}
