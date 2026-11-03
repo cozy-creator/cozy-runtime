@@ -327,8 +327,6 @@ _VIDEO_STRUCTS = (
     "PictureOperation",
     "SetupFields",
     "SetupOperation",
-    "WorldStateFields",
-    "WorldStateOperation",
     "UpscaleFields",
     "UpscaleOperation",
     "CleanFields",

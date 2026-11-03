@@ -214,8 +214,6 @@ from cozy_runtime.author._project import (
     ShotPlate,
     UpscaleFields,
     UpscaleOperation,
-    WorldStateFields,
-    WorldStateOperation,
     Write,
     spoken,
 )
@@ -460,8 +458,6 @@ __all__ = [
     "ShotPlate",
     "UpscaleFields",
     "UpscaleOperation",
-    "WorldStateFields",
-    "WorldStateOperation",
     "Write",
     "spoken",
     "ProjectBeat",

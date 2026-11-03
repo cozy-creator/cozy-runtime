@@ -39,7 +39,8 @@ class Read(msgspec.Struct, kw_only=True):
 
 
 class Write(msgspec.Struct, kw_only=True):
-    """A revision of a series this operation's text names (`coast.1`), to write `at_s` into it, or at its end."""
+    """A revision of a series this operation's text names (`coast.1`), to screenshot `at_s` into it, or at its end. `fields`: what
+    the file says of that revision as an asset of its own, if it does."""
 
     name: str
     at_s: float | None = None
@@ -96,9 +97,9 @@ class Refuse(InvalidRequest):
 
 
 class BeatWrite(msgspec.Struct, kw_only=True):
-    """A screenshot of the state: `state` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
+    """A screenshot: `scene` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
 
-    state: str
+    scene: str
     at: float | None = None
 
 
@@ -133,7 +134,7 @@ class ShotOperation(Operation, kw_only=True):
 
 
 class PictureFields(msgspec.Struct, kw_only=True):
-    """A picture: `character`, `prop`, `environment`, `storyboard`. `description` is what it is, which shots read too;
+    """A picture: `character`, `prop`, `environment`, `scene`, `image`. `description` is what it is, which shots read too;
     `instructions` how to draw this picture, which nothing else reads."""
 
     description: str = ""
@@ -156,17 +157,6 @@ class SetupFields(PictureFields, kw_only=True):
 
 class SetupOperation(Operation, kw_only=True):
     fields: SetupFields
-
-
-class WorldStateFields(PictureFields, kw_only=True):
-    """A world state's first picture: how it starts, and who and what is where."""
-
-    init: str = ""
-    blocking: str = ""
-
-
-class WorldStateOperation(Operation, kw_only=True):
-    fields: WorldStateFields
 
 
 class UpscaleFields(msgspec.Struct, kw_only=True):
