@@ -491,8 +491,8 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     token, context = _current.set(inv.calls), CURRENT.set(ctx)
     try:
         result = _call(surface, kwargs)
-        if result is None and surface.result_type is _project.Invocation:
-            result = _project.Invocation()  # a project adapter's no run
+        if surface.result_type is _project.Invocations and type(result) is list:
+            result = _project.Invocations(invocations=result)
         prepared_scope.join()  # every submitted execution settles before success serialization
         if inv.calls is not None:
             inv.calls.finish()

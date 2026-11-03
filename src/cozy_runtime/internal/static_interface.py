@@ -312,11 +312,27 @@ _VIDEO_STRUCTS = (
     "UpscaleRequest",
     "UpscaleResult",
     "Invocation",
+    "Invocations",
     "Operation",
     "OperationFile",
     "Read",
     "Write",
     "Keep",
+    "BeatWrite",
+    "ShotBeat",
+    "ShotPlate",
+    "ShotFields",
+    "ShotOperation",
+    "PictureFields",
+    "PictureOperation",
+    "SetupFields",
+    "SetupOperation",
+    "WorldStateFields",
+    "WorldStateOperation",
+    "UpscaleFields",
+    "UpscaleOperation",
+    "CleanFields",
+    "CleanOperation",
     "ProjectBeat",
     "ProjectContinue",
     "ProjectEntity",
@@ -2070,10 +2086,10 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                         reader.refuse(
                             module,
                             decorator,
-                            "a project adapter names its functions",
+                            "a project adapter names its kinds",
                             "static_unsupported",
                         )
-                    # `App.project_adapter`: an entrypoint by another name, per function.
+                    # `App.project_adapter`: an entrypoint by another name, per kind.
                     for adapted in names:
                         registration = _registration(
                             reader,

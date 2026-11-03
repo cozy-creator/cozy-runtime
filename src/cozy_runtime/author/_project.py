@@ -14,7 +14,6 @@ from typing import Any, Literal
 import msgspec
 
 from cozy_runtime.author._errors import InvalidRequest
-from cozy_runtime.author._walker import unwrap_optional
 
 
 class OperationFile(msgspec.Struct, kw_only=True):
@@ -59,12 +58,11 @@ class Keep(msgspec.Struct, kw_only=True):
 
 
 class Operation(msgspec.Struct, kw_only=True):
-    """The work that makes one asset. `fields` is everything else the file says of it, after defaults; subclass this to type
-    them, which puts a signature in the package's interface. `function` is the name it was asked for."""
+    """The work that makes one asset of `kind`, which names the adapter. `fields` is everything else the file says of it, after
+    defaults; a kind types them by subclassing this, which puts a signature in the package's interface."""
 
     version: Literal[2]
     asset: str
-    function: str
     kind: str = ""
     fields: dict[str, Any]
     reads: list[Read]
@@ -73,18 +71,124 @@ class Operation(msgspec.Struct, kw_only=True):
 
 
 class Invocation(msgspec.Struct, kw_only=True):
-    """A function of this package and its exact input. Later render options, models and LoRAs go on top. An adapter's `None`
-    reaches the caller as this with no `function`: no run, and the asset's files are what it reads."""
+    """A function of this package and its exact input. Later render options, models and LoRAs go on top. A string in `input` that
+    is exactly `$0.video` is that field of the result of the invocation at that position, one run earlier in the list."""
 
-    function: str = ""
-    input: dict[str, Any] = {}
+    function: str
+    input: dict[str, Any]
     warnings: list[str] = []
+
+
+class Invocations(msgspec.Struct, kw_only=True):
+    """What an adapter's `list[Invocation]` is on the wire: run in order, usually one. None: this asset's files are what it reads."""
+
+    invocations: list[Invocation]
 
 
 class Refuse(InvalidRequest):
     """An adapter's no: nothing is made, and these words say why."""
 
     default_code = "project_refused"
+
+
+# The kinds first-party packages share, so a project can swap one model for another without rewriting its file. A package opts in
+# by annotating its adapter with one; a third party's own kind needs nothing here. Calcifer passes fields through and knows none.
+
+
+class BeatWrite(msgspec.Struct, kw_only=True):
+    """A screenshot of the state: `state` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
+
+    state: str
+    at: float | None = None
+
+
+class ShotBeat(msgspec.Struct, kw_only=True):
+    description: str = ""
+    duration: float | None = None
+    writes: list[BeatWrite] = []
+
+
+class ShotPlate(msgspec.Struct, kw_only=True):
+    video: str = ""
+    use_audio: bool = False
+
+
+class ShotFields(msgspec.Struct, kw_only=True):
+    """A shot. `first_frame`, `last_frame` and `plate`'s `video` mention an asset."""
+
+    summary: str = ""
+    beats: list[ShotBeat] = []
+    style: str = ""
+    soundscape: str = ""
+    music: str = ""
+    aspect_ratio: str | None = None
+    first_frame: str = ""
+    last_frame: str = ""
+    plate: ShotPlate | None = None
+    turbo: bool | None = None
+
+
+class ShotOperation(Operation, kw_only=True):
+    fields: ShotFields
+
+
+class PictureFields(msgspec.Struct, kw_only=True):
+    """A picture: `character`, `prop`, `environment`, `storyboard`. `description` is what it is, which shots read too;
+    `instructions` how to draw this picture, which nothing else reads."""
+
+    description: str = ""
+    instructions: str = ""
+    style: str = ""
+    aspect_ratio: str | None = None
+    turbo: bool = False
+
+
+class PictureOperation(Operation, kw_only=True):
+    fields: PictureFields
+
+
+class SetupFields(PictureFields, kw_only=True):
+    """A place from a camera position, in screen terms. `from_frame`: the picture it reads is a shot's frame."""
+
+    camera: str = ""
+    from_frame: bool = False
+
+
+class SetupOperation(Operation, kw_only=True):
+    fields: SetupFields
+
+
+class WorldStateFields(PictureFields, kw_only=True):
+    """A world state's first picture: how it starts, and who and what is where."""
+
+    init: str = ""
+    blocking: str = ""
+
+
+class WorldStateOperation(Operation, kw_only=True):
+    fields: WorldStateFields
+
+
+class UpscaleFields(msgspec.Struct, kw_only=True):
+    """A shot taken up: `video` mentions it, `resolution` its short edge (`1440p`)."""
+
+    video: str = ""
+    resolution: str | None = None
+    style: str = ""
+
+
+class UpscaleOperation(Operation, kw_only=True):
+    fields: UpscaleFields
+
+
+class CleanFields(msgspec.Struct, kw_only=True):
+    """A picture with its background removed: `image` mentions it."""
+
+    image: str = ""
+
+
+class CleanOperation(Operation, kw_only=True):
+    fields: CleanFields
 
 
 _REVISION = re.compile(r"<([^<>\n]+)\.(\d+)>")
@@ -96,8 +200,8 @@ def spoken(text: str) -> str:
 
 
 def adapter_result(annotation: object) -> object:
-    """A result annotated `Invocation | None` has the schema of `Invocation`."""
-    return Invocation if unwrap_optional(annotation) == (Invocation, True) else annotation
+    """A result annotated `list[Invocation]` has the schema of `Invocations`."""
+    return Invocations if annotation == list[Invocation] else annotation
 
 
 class ProjectPicture(msgspec.Struct, kw_only=True):
