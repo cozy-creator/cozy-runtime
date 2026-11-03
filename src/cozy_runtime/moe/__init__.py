@@ -229,8 +229,6 @@ def install(plan: Plan, model: nn.Module) -> str:
             say(KERNELS.name, f"[moe] {KERNELS.name} compiling: it serves from the next request")
             _report(plan, "compiling: it serves from the next request")
     except KernelsUnavailable as exc:
-        if exc.code == "kernels_corrupt":
-            raise
         say(KERNELS.name, f"[moe] each expert runs its own Linears: {exc.code}: {exc}")
         return _report(plan, f"{exc.code}: {exc}")
     return f"{KERNELS.name}:{KERNELS.identity}"

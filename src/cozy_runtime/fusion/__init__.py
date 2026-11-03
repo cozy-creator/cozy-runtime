@@ -724,8 +724,6 @@ def install(plan: Plan, layout: DiTBlock, *roots: Any) -> str:
         elif not plan.when_ready(layout.kernels, activate):
             _report(plan, layout, "compiling; fused from the next request on")
     except KernelsUnavailable as exc:
-        if exc.code == "kernels_corrupt":
-            raise
         for module, cls in eager:
             module.__class__ = cls
         _report(plan, layout, f"{exc.code}: {exc}")
@@ -886,8 +884,6 @@ def install_norms(plan: Plan, layout: ChannelNorm, *roots: Any) -> str:
         elif not plan.when_ready(layout.kernels, activate):
             report("compiling; fused from the next request on")
     except KernelsUnavailable as exc:
-        if exc.code == "kernels_corrupt":
-            raise
         for module, cls in eager:
             module.__class__ = cls
         return report(f"{exc.code}: {exc}")
