@@ -136,10 +136,32 @@ class Outcome:
 #: Tail bound on `Outcome.traceback`. The innermost frames and the exception line are at
 #: the end, so the tail is the half that explains.
 TRACEBACK_CAP = 16 * 1024
+#: The frames of a failure's first cause a person reads.
+TRACEBACK_FRAMES = 12
+
+
+def _first_cause(exc: BaseException) -> BaseException:
+    seen = {id(exc)}
+    while True:
+        earlier = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+        if earlier is None or id(earlier) in seen:
+            return exc
+        seen.add(id(earlier))
+        exc = earlier
 
 
 def _trace(exc: BaseException) -> str:
-    text = "".join(_tb.format_exception(exc))
+    """Where the failure began: its first cause's last frames, no position markers; a child
+    call's as the child said it. The whole chain goes to stderr, which the machine's log keeps."""
+    _tb.print_exception(exc)
+    first = _first_cause(exc)
+    text = getattr(first, "child_traceback", "") or "\n".join(
+        line
+        for line in "".join(
+            _tb.format_exception(first, limit=-TRACEBACK_FRAMES, chain=False)
+        ).splitlines()
+        if line.strip(" ^~")
+    )
     return text[-TRACEBACK_CAP:] if len(text) > TRACEBACK_CAP else text
 
 
@@ -302,7 +324,7 @@ def classify(exc: BaseException | None) -> Outcome:
         "failed",
         "author",
         "unhandled_exception",
-        f"{type(exc).__name__}: {exc}",
+        f"{type(exc).__name__}: {str(exc).partition(chr(10))[0]}"[:400],
         (),
         _trace(exc),
     )

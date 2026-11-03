@@ -1512,7 +1512,7 @@ class Executor:
             return {
                 "ok": False,
                 "code": outcome.code,
-                "detail": f"{type(exc).__name__}: {str(exc)[:640]} (at {at})"[:900],
+                "detail": f"{type(exc).__name__}: {str(exc)[:640]}"[:900],
                 "rank": self.rank,
             }
         return {
@@ -3759,7 +3759,7 @@ class Executor:
             for work, (ms, times) in blocking.items():
                 took = {"ms": round(ms, 1), "times": times}
                 record.emit("confession", "request_path.blocking", work, **took)
-                record.emit("log", f"{work} blocked the request", "warn", work=work, **took)
+                record.emit("log", f"{work} blocked the request", "info", work=work, **took)
             followed()
             for name, where in swapped:
                 record.emit("confession", "kernel.ready", name, **where)
@@ -5028,7 +5028,7 @@ class Executor:
         first, stage, record = target.handled.pop(request_id, None) or (later, "", None)
         first = first if first.terminal == "failed" else later
         where = f" in {stage}" if stage else ""
-        message = first.message + where + ("" if first is later else f"; then {later.message}")
+        message = first.message + where
         capacity, quiet = later.code in CAPACITY_CODES, False
         if capacity:
             with contextlib.suppress(Exception):  # a sticky fault raises here: then it is one
