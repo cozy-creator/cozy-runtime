@@ -73,18 +73,20 @@ class Nudges(Protocol):
 
 
 class ChildCallError(CapabilityError):
-    """A child call's failure, as its RecordOwner states it; its cause is the child's own
-    failure, with the child's traceback (`ChildFailure`)."""
+    """A child call's failure, as its RecordOwner states it, with the child's traceback."""
 
-    def __init__(self, code: str, message: str, call_index: int, child_request_id: str = ""):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        call_index: int,
+        child_request_id: str = "",
+        child_traceback: str = "",
+    ):
         super().__init__(message, code=code)
         self.call_index = call_index
         self.child_request_id = child_request_id
-
-
-class ChildFailure(Exception):
-    """The failure inside a child call: its detail and traceback, chained under the
-    `ChildCallError` so the parent's traceback holds the child's."""
+        self.child_traceback = child_traceback
 
 
 @dataclass(frozen=True, slots=True)
@@ -649,11 +651,13 @@ class _Broker:
             if ctx is not None:
                 # A child ended by this attempt's own cancel is that cancel, not its failure.
                 ctx.raise_if_cancelled()
-            child = ChildFailure(
-                "\n".join(filter(None, (answer.detail, getattr(answer, "traceback", ""))))
+            raise ChildCallError(
+                answer.code,
+                answer.detail,
+                index,
+                getattr(answer, "child_request_id", ""),
+                getattr(answer, "traceback", ""),
             )
-            child_id = getattr(answer, "child_request_id", "")
-            raise ChildCallError(answer.code, answer.detail, index, child_id) from child
 
     def close(self) -> None:
         self.closed = True

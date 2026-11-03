@@ -135,7 +135,7 @@ def mirror_component(
                 except BaseException as exc:
                     first = group.broken
                     if not kept:
-                        group._break(_failed(f"mirrored component {name!r}", exc))
+                        group._break(_failed(f"mirrored component {name[1]!r}", exc))
                     if first and not isinstance(exc, (Cancelled, GroupRefusal)):
                         # A follower failed first and its collectives were aborted: this
                         # error is the consequence, and the call fails with the cause.
@@ -192,7 +192,7 @@ def _hosted(
                 reply = _accept(name, group, rank, frame)
             except BaseException as exc:
                 if getattr(exc, "code", None) not in SHORT:  # short of memory: not a fault
-                    group._break(_failed(f"hosted component {name!r}", exc))
+                    group._break(_failed(f"hosted component {name[1]!r}", exc))
                 raise
             return wire.unmarshal(reply.result, results, device=device)
         finally:
@@ -294,7 +294,7 @@ def install_spread(
                     finished[index] = result
                     calls[str(rank)] = calls.get(str(rank), 0) + 1
         except BaseException as exc:
-            group._break(_failed(f"spread {name!r}.{method}", exc))
+            group._break(_failed(f"spread {name[1]!r}.{method}", exc))
             raise
         finally:
             for _rank, _index, _args, payloads in sent:
@@ -455,9 +455,7 @@ def _accept(
         raise GroupRefusal(f"{name}: {group.gpu(rank)} answered malformed: {exc}"[:600]) from exc
     if not reply.ok:
         raise GroupRefusal(
-            f"{name}: {group.gpu(rank)} failed its part of the call: {reply.code}: {reply.detail}"[
-                :600
-            ],
+            f"{group.gpu(rank)}: {reply.detail}"[:600],
             code=reply.code or "group_broken",
         )
     group.working_peaks[rank] = max(group.working_peaks.get(rank, 0), reply.working_peak_bytes)
