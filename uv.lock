@@ -309,7 +309,7 @@ wheels = [
 
 [[package]]
 name = "cozy-runtime"
-version = "0.37.6"
+version = "0.37.7"
 source = { editable = "." }
 dependencies = [
     { name = "msgspec" },
