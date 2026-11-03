@@ -201,6 +201,7 @@ from cozy_runtime.author._project import (
     Read,
     Refuse,
     Write,
+    spoken,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._split import Cut, split
@@ -430,6 +431,7 @@ __all__ = [
     "Read",
     "Refuse",
     "Write",
+    "spoken",
     "ProjectBeat",
     "ProjectContinue",
     "ProjectEntity",

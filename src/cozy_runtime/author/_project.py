@@ -8,6 +8,7 @@ with none gets one flat `prompt`.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Literal
 
 import msgspec
@@ -84,6 +85,14 @@ class Refuse(InvalidRequest):
     """An adapter's no: nothing is made, and these words say why."""
 
     default_code = "project_refused"
+
+
+_REVISION = re.compile(r"<([^<>\n]+)\.(\d+)>")
+
+
+def spoken(text: str) -> str:
+    """A revision's mention in a text as a model reads it: `<coast.2>` as `<coast 2>`."""
+    return _REVISION.sub(r"<\1 \2>", text)
 
 
 def adapter_result(annotation: object) -> object:
