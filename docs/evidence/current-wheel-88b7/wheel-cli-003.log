@@ -1,0 +1,10 @@
+{
+  "commit": "88b7f7619a8d",
+  "distribution": "0.37.2+dev.g88b7f761",
+  "next": [
+    "cozy-runtime new <name> — scaffold a package"
+  ],
+  "python_contract": "0.0.2",
+  "supports_guarded_restart": true,
+  "tag": "v0.37.2+dev.g88b7f761"
+}

@@ -1,0 +1,20 @@
+{
+  "passed": true,
+  "scope": "exact production semantic expression, host metadata only",
+  "native_plan_queried": false,
+  "gpu_plan_qualification": false,
+  "real_cpu_tensor_layouts_and_native_leaf_provider_types": true,
+  "dispatch_values": "explicit metadata-only values; no supported GPU plan claimed",
+  "key": "runtime.split.refiner_ffn/1:0c8e17840d8cb12b1320d0ebdd2e3bb1105d5be9b1a8899f0f447b48ffdad773",
+  "mutation_keys": {
+    "selected_dispatch_geometry": "runtime.split.refiner_ffn/1:4818772f5b07e3a12f7d97012750a3ecb808e79a6e4485456d8e3319bbdf1392",
+    "input_layout": "runtime.split.refiner_ffn/1:fc56c82918ddb189a985201b8dd690c31c40e3d81c9a99b9b394b4552dec5f48",
+    "library_identity": "runtime.split.refiner_ffn/1:15f22b58bc5aa7fe45971377769141b04c83166648450fe4b53481e78c07a8dd",
+    "allocation_menu": "runtime.split.refiner_ffn/1:a9a8295923543c47c8b282aa64ea97de1ea4ec814bc7822296826bdc82a3f0c5",
+    "provider_identity": "runtime.split.refiner_ffn/1:e209483830bff6712f574a6ed1468d39a586729b9bb1c7ab91bf35c08435f779"
+  },
+  "global_mutable_metadata_rejection": true,
+  "source_sha256": "fe6b3bd0af3cdb1fd99ffcb5f199b817cac0197c0efe1f7832c6f094ea15d021",
+  "cuda_initialized": false,
+  "libcuda_mapped": false
+}

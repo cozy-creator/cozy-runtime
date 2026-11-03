@@ -1,0 +1,22 @@
+{
+  "owner": "/root/core_restart",
+  "branch": "codex/xs138-p2-vae-immutable",
+  "base_master": "f01fe1d0b",
+  "frozen_control": "2f7d8c681e47fbbae732d02a04b92dc1e801e8ab",
+  "changed_product_file": "src/cozy_runtime/internal/execution/native_vae.py",
+  "controlled_patch_sha256": "6f14ee962c712cb8f525d9c0a336f2d5b7d1215593133f0b682bb620cf1e700a",
+  "candidate_file_sha256": "6b7d7b3d835b1cfaaa680ddfdd8d3e71644d77a8fd28fcd850d2b5b1cd89e465",
+  "native_input_diff_vs_control": [],
+  "upstream_source_deltas_vs_control": [
+    "src/cozy_runtime/fusion/__init__.py",
+    "src/cozy_runtime/internal/encoding/leaves.py",
+    "src/cozy_runtime/internal/executor.py",
+    "src/cozy_runtime/internal/fp8_linear.py",
+    "src/cozy_runtime/internal/kernel_ready.py",
+    "src/cozy_runtime/internal/nvfp4_linear.py",
+    "src/cozy_runtime/internal/residency.py",
+    "src/cozy_runtime/internal/svdq_linear.py",
+    "src/cozy_runtime/internal/w4a8_linear.py"
+  ],
+  "gpu_run": false
+}

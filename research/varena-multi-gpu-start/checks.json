@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "scope": "CPU source/protocol only; no GPU qualification",
+  "cpu_result_sha256": "cc9a971ecaa5b0cf7158679b7ce24683ec105a89686738ef8694e85e7c292ce9",
+  "mypy_baseline_errors": 6,
+  "mypy_candidate_errors": 6,
+  "mypy_added": [],
+  "mypy_removed": [],
+  "native_check": "Creator protocol + TensorD cargo check passed117s; actual Rust example cold123s, cached1.48s",
+  "failed_attempts_preserved": {
+    "cpu-001": "actual no-Torch checking environment could not reach valid preflight; fixture now uses a real CPU Torch package",
+    "cpu-002": "test incorrectly required no Torch import; unchanged stepcache imports installed Torch on executor import. Revised assertion preserves import state and requires no driver load or CUDA initialization"
+  },
+  "receipt_root": "outputs/xs138-multi-gpu-start"
+}

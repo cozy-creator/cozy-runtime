@@ -1,0 +1,649 @@
+{
+  "passed": true,
+  "owner": "/root/current_cohort_restart",
+  "creator_source_head": "118d668f0d7ec05348ff011bb8502488f210f27e",
+  "runtime_source_head": "78e58f7e51bade1bea92c75f238ba058d59421a2",
+  "native_reference": "ebe91ad3447c668a93776cf4628b8f585e5aedd6",
+  "native_paths_equal": [
+    "crates/varena/src",
+    "crates/varena/Cargo.toml",
+    "crates/varena/build.rs",
+    "crates/varena/include",
+    "crates/tensorfs",
+    "crates/tensorfs-py",
+    "crates/varena-client"
+  ],
+  "unchanged_updater": [
+    {
+      "path": "crates/calcifer/src/update.rs",
+      "reference": "37a4b7fcc",
+      "sha256": "6f7f61680ad7a27dff8bef9b41aed659c2a940a1c85f406c3b026345d2e1f0b0",
+      "equal": true
+    },
+    {
+      "path": "crates/calcifer/src/update/proof.rs",
+      "reference": "37a4b7fcc",
+      "sha256": "eb43428571a3d5aa00223cfc56ecbb061253ab696ee22eaafe1333b90e1ef397",
+      "equal": true
+    },
+    {
+      "path": "crates/calcifer/src/lib.rs",
+      "reference": "37a4b7fcc",
+      "sha256": "6afc2d2c515bd2dc0c6dd798b87871732d128a9483e60793cf2918831e7b14ab",
+      "equal": true
+    },
+    {
+      "path": "crates/protocol/src/calcifer.rs",
+      "reference": "37a4b7fcc",
+      "sha256": "9c7d80be3263ce1010d0eb41159357ac675f362e76e03fee3296e675cb636bb0",
+      "equal": true
+    },
+    {
+      "path": "crates/cli/src/machine/end.rs",
+      "reference": "37a4b7fcc",
+      "sha256": "83e7b5161e9e5c16f74fdd057780e0d7410e73db127a0ad126e716b6a0496929",
+      "equal": true
+    },
+    {
+      "path": "crates/cli/src/machine/mod.rs",
+      "reference": "37a4b7fcc",
+      "sha256": "6c4d0186fb52914bc1de040fbbc8413910d38365118ca1dfb1e1a295f55e4b25",
+      "equal": true
+    }
+  ],
+  "unchanged_rank_sender": [
+    {
+      "path": "crates/protocol/src/executor.rs",
+      "reference": "6ca492122",
+      "sha256": "06a8ae2232c42ce3717cb79075d5212b0dd40a9ce0ca5e54c86ad82d57b182d4",
+      "equal": true
+    },
+    {
+      "path": "crates/protocol/examples/varena_rank_start.rs",
+      "reference": "6ca492122",
+      "sha256": "92857660c517606357ff40a9434b462517c18f0035ed861ec0d642474491b73b",
+      "equal": true
+    },
+    {
+      "path": "crates/tensord/src/device_executor.rs",
+      "reference": "6ca492122",
+      "sha256": "38b28e83c40266212b05d89edb917acd0c4a4dde3efbb759b8e345b262c821b5",
+      "equal": true
+    }
+  ],
+  "native_input_differences": [
+    {
+      "path": "Cargo.lock",
+      "native_blob": "191756787bfc173758b89de3b0128847c1118767",
+      "current_blob": "9db121393b90e0d564ea84ac651155d5f8ee323c"
+    },
+    {
+      "path": "Cargo.toml",
+      "native_blob": "8b28dd2a0e604c1d117e019c630ca81648c28c8e",
+      "current_blob": "3311aaf821efa98b6ce6e9462104d013dc207d38"
+    },
+    {
+      "path": "crates/platform/src/durable.rs",
+      "native_blob": "d9709bd4fb0338a245c31f8a3a34d2fe251fa220",
+      "current_blob": "8d1aaed527b90a105528dcaf5895e320651a6d7f"
+    },
+    {
+      "path": "crates/platform/src/paths.rs",
+      "native_blob": "8c1017c81ed3cb1a4f746053db07e792aabb19e0",
+      "current_blob": "94dc530e01e4914fa90c3ec26aa09eb144d7ca3c"
+    },
+    {
+      "path": "crates/platform/src/service/systemd.rs",
+      "native_blob": "ede4aadffa28c6a8cb49c9c03902772e65b56f47",
+      "current_blob": "1b619b0c32c577c1abc3029b78a0a6c4470743cd"
+    },
+    {
+      "path": "crates/protocol/Cargo.toml",
+      "native_blob": "71c2e082700ff35ff8940e03c46fe2cd9cacfd6b",
+      "current_blob": "b06f258d92a58a78a01fa09f8f9c4d6472aef55b"
+    },
+    {
+      "path": "crates/protocol/examples/varena_rank_start.rs",
+      "native_blob": null,
+      "current_blob": "aa91a2d66a2c47990f2123e026bdcc781b690403"
+    },
+    {
+      "path": "crates/protocol/src/calcifer.rs",
+      "native_blob": "db181a7602d6ec3723c6b30cd17de7bb4f0bf3be",
+      "current_blob": "8d3d06979f81e18f8ca6d35f83d36c124d1ee627"
+    },
+    {
+      "path": "crates/protocol/src/contract.rs",
+      "native_blob": null,
+      "current_blob": "cd65412100e1d9706d9c3ee402ebfceebf411194"
+    },
+    {
+      "path": "crates/protocol/src/digests.rs",
+      "native_blob": null,
+      "current_blob": "62467a5576b7f962af2e5b745cf4e3704068e2b8"
+    },
+    {
+      "path": "crates/protocol/src/executor.rs",
+      "native_blob": "2e1a4a849754fab82381238570e244a4562d079c",
+      "current_blob": "a88aef0bfbd6a4d5f017d2e68a26ae9e78f66c27"
+    },
+    {
+      "path": "crates/protocol/src/hub.rs",
+      "native_blob": null,
+      "current_blob": "c3c36cc222016a6c154388d2031df09a07aac539"
+    },
+    {
+      "path": "crates/protocol/src/interface.rs",
+      "native_blob": "3f5f787e83b6521daa9dc5efe79798a5a264e588",
+      "current_blob": "e8853c0433cc7d2b5deac380c407c19708eb6464"
+    },
+    {
+      "path": "crates/protocol/src/lib.rs",
+      "native_blob": "183fa5c6c56e106f834c5151c310e1a0fa15e0e4",
+      "current_blob": "29e32f2bd13ac3a9ca7ec207e20565e9d32166a1"
+    },
+    {
+      "path": "crates/protocol/src/project.rs",
+      "native_blob": "f955f48543f3d660badbefeb0c1ecea731ea6e40",
+      "current_blob": "be1b549b6071b092443cedf38dd026802024463f"
+    },
+    {
+      "path": "crates/protocol/src/report.rs",
+      "native_blob": null,
+      "current_blob": "5b4f8e608a613060c5449013047b0e538eb18e9e"
+    },
+    {
+      "path": "crates/protocol/src/stage.rs",
+      "native_blob": null,
+      "current_blob": "bf642e447b07350d1f1995f558035879460af760"
+    },
+    {
+      "path": "crates/protocol/src/target.rs",
+      "native_blob": null,
+      "current_blob": "f28618770f0a524e05841099ba74267632892b05"
+    }
+  ],
+  "cargo_lock_delta": {
+    "removed": [
+      {
+        "name": "calcifer",
+        "version": "0.16.2",
+        "dependencies": [
+          "axum",
+          "base64 0.23.1",
+          "ed25519-dalek",
+          "futures-util",
+          "getrandom 0.3.4",
+          "hex",
+          "hub-client",
+          "platform",
+          "protocol",
+          "reqwest",
+          "rusqlite",
+          "serde",
+          "serde_ignored",
+          "serde_json",
+          "serde_path_to_error",
+          "sha2",
+          "tempfile",
+          "thiserror 2.0.21",
+          "time",
+          "tokio",
+          "tokio-util",
+          "tracing",
+          "tracing-subscriber"
+        ]
+      },
+      {
+        "name": "cli",
+        "version": "0.16.2",
+        "dependencies": [
+          "anstream",
+          "anstyle",
+          "base64 0.23.1",
+          "clap",
+          "clap_complete",
+          "comfy-table",
+          "crossterm",
+          "ed25519-dalek",
+          "flate2",
+          "futures-util",
+          "getrandom 0.3.4",
+          "hex",
+          "hub-client",
+          "indicatif",
+          "infer",
+          "jiff",
+          "platform",
+          "protocol",
+          "ratatui",
+          "reqwest",
+          "rustix",
+          "saphyr",
+          "self-replace",
+          "semver",
+          "serde",
+          "serde_ignored",
+          "serde_json",
+          "sha2",
+          "supports-hyperlinks",
+          "tar",
+          "tempfile",
+          "tensorfs",
+          "tokio",
+          "tokio-util",
+          "toml",
+          "toml_edit",
+          "url",
+          "zip"
+        ]
+      },
+      {
+        "name": "cozy",
+        "version": "0.16.2",
+        "dependencies": [
+          "calcifer",
+          "cli",
+          "tensord"
+        ]
+      },
+      {
+        "name": "hub-client",
+        "version": "0.16.2",
+        "dependencies": [
+          "aws-lc-rs",
+          "base64 0.23.1",
+          "ed25519-dalek",
+          "jsonwebtoken",
+          "percent-encoding",
+          "platform",
+          "protocol",
+          "reqwest",
+          "serde",
+          "serde_json",
+          "serde_path_to_error",
+          "thiserror 2.0.21",
+          "tokio",
+          "tracing"
+        ]
+      },
+      {
+        "name": "platform",
+        "version": "0.16.2",
+        "dependencies": [
+          "flate2",
+          "getrandom 0.3.4",
+          "hex",
+          "libc",
+          "libloading 0.9.0",
+          "nvml-wrapper",
+          "serde",
+          "serde_json",
+          "sha2",
+          "sigstore-verify",
+          "tar",
+          "tempfile",
+          "thiserror 2.0.21",
+          "tracing",
+          "windows-sys 0.61.2",
+          "zip"
+        ]
+      },
+      {
+        "name": "protocol",
+        "version": "0.16.2",
+        "dependencies": [
+          "base64 0.23.1",
+          "bytes",
+          "ed25519-dalek",
+          "eventsource-stream",
+          "futures-util",
+          "hex",
+          "platform",
+          "pyo3",
+          "reqwest",
+          "rustls",
+          "saphyr",
+          "serde",
+          "serde_ignored",
+          "serde_json",
+          "serde_path_to_error",
+          "sha2",
+          "tensorfs",
+          "thiserror 2.0.21",
+          "tokio",
+          "tokio-rustls",
+          "toml",
+          "url"
+        ]
+      },
+      {
+        "name": "tensord",
+        "version": "0.16.2",
+        "dependencies": [
+          "async-trait",
+          "aws-lc-rs",
+          "axum",
+          "base64 0.23.1",
+          "bytes",
+          "clap",
+          "ed25519-dalek",
+          "flate2",
+          "getrandom 0.3.4",
+          "hmac",
+          "http-body-util",
+          "hub-client",
+          "hyper",
+          "hyper-util",
+          "libc",
+          "nix",
+          "platform",
+          "protocol",
+          "rcgen",
+          "reqwest",
+          "rusqlite",
+          "rustls",
+          "self-replace",
+          "serde",
+          "serde_json",
+          "serde_json_canonicalizer",
+          "serde_path_to_error",
+          "sha2",
+          "str0m",
+          "tar",
+          "tempfile",
+          "tensorfs",
+          "time",
+          "tokio",
+          "tokio-rustls",
+          "tokio-stream",
+          "toml",
+          "toml_edit",
+          "tracing",
+          "tracing-appender",
+          "tracing-subscriber",
+          "uuid",
+          "varena",
+          "webpki-roots",
+          "zip"
+        ]
+      }
+    ],
+    "added": [
+      {
+        "name": "calcifer",
+        "version": "0.16.4",
+        "dependencies": [
+          "axum",
+          "base64 0.23.1",
+          "ed25519-dalek",
+          "futures-util",
+          "getrandom 0.3.4",
+          "hex",
+          "hub-client",
+          "infer",
+          "platform",
+          "protocol",
+          "reqwest",
+          "rusqlite",
+          "serde",
+          "serde_ignored",
+          "serde_json",
+          "serde_path_to_error",
+          "sha2",
+          "tempfile",
+          "tensorfs",
+          "thiserror 2.0.21",
+          "time",
+          "tokio",
+          "tokio-util",
+          "toml",
+          "toml_edit",
+          "tracing",
+          "tracing-subscriber"
+        ]
+      },
+      {
+        "name": "cli",
+        "version": "0.16.4",
+        "dependencies": [
+          "anstream",
+          "anstyle",
+          "base64 0.23.1",
+          "calcifer",
+          "clap",
+          "clap_complete",
+          "comfy-table",
+          "crossterm",
+          "ed25519-dalek",
+          "flate2",
+          "futures-util",
+          "getrandom 0.3.4",
+          "hex",
+          "indicatif",
+          "infer",
+          "jiff",
+          "platform",
+          "protocol",
+          "ratatui",
+          "reqwest",
+          "rustix",
+          "saphyr",
+          "self-replace",
+          "semver",
+          "serde",
+          "serde_ignored",
+          "serde_json",
+          "sha2",
+          "supports-hyperlinks",
+          "tar",
+          "tempfile",
+          "tensorfs",
+          "tokio",
+          "tokio-util",
+          "toml",
+          "toml_edit",
+          "url",
+          "zip"
+        ]
+      },
+      {
+        "name": "cozy",
+        "version": "0.16.4",
+        "dependencies": [
+          "calcifer",
+          "cli",
+          "tensord"
+        ]
+      },
+      {
+        "name": "hub-client",
+        "version": "0.16.4",
+        "dependencies": [
+          "aws-lc-rs",
+          "base64 0.23.1",
+          "ed25519-dalek",
+          "jsonwebtoken",
+          "percent-encoding",
+          "platform",
+          "protocol",
+          "reqwest",
+          "serde",
+          "serde_json",
+          "serde_path_to_error",
+          "thiserror 2.0.21",
+          "tokio",
+          "tracing"
+        ]
+      },
+      {
+        "name": "platform",
+        "version": "0.16.4",
+        "dependencies": [
+          "flate2",
+          "getrandom 0.3.4",
+          "hex",
+          "libc",
+          "libloading 0.9.0",
+          "nvml-wrapper",
+          "serde",
+          "serde_json",
+          "sha2",
+          "sigstore-verify",
+          "tar",
+          "tempfile",
+          "thiserror 2.0.21",
+          "tracing",
+          "windows-sys 0.61.2",
+          "zip"
+        ]
+      },
+      {
+        "name": "protocol",
+        "version": "0.16.4",
+        "dependencies": [
+          "base64 0.23.1",
+          "bytes",
+          "ed25519-dalek",
+          "eventsource-stream",
+          "futures-util",
+          "hex",
+          "platform",
+          "pyo3",
+          "reqwest",
+          "rustls",
+          "saphyr",
+          "serde",
+          "serde_ignored",
+          "serde_json",
+          "serde_path_to_error",
+          "sha2",
+          "tempfile",
+          "tensorfs",
+          "thiserror 2.0.21",
+          "tokio",
+          "tokio-rustls",
+          "toml",
+          "url"
+        ]
+      },
+      {
+        "name": "tensord",
+        "version": "0.16.4",
+        "dependencies": [
+          "async-trait",
+          "aws-lc-rs",
+          "axum",
+          "base64 0.23.1",
+          "bytes",
+          "clap",
+          "ed25519-dalek",
+          "flate2",
+          "getrandom 0.3.4",
+          "hmac",
+          "http-body-util",
+          "hub-client",
+          "hyper",
+          "hyper-util",
+          "libc",
+          "nix",
+          "platform",
+          "protocol",
+          "rcgen",
+          "reqwest",
+          "rusqlite",
+          "rustls",
+          "self-replace",
+          "serde",
+          "serde_json",
+          "serde_json_canonicalizer",
+          "serde_path_to_error",
+          "sha2",
+          "str0m",
+          "tar",
+          "tempfile",
+          "tensorfs",
+          "time",
+          "tokio",
+          "tokio-rustls",
+          "tokio-stream",
+          "toml",
+          "toml_edit",
+          "tracing",
+          "tracing-appender",
+          "tracing-subscriber",
+          "uuid",
+          "varena",
+          "webpki-roots",
+          "zip"
+        ]
+      }
+    ],
+    "changed": []
+  },
+  "source_composition": [
+    {
+      "original": "9976aee45cc5ce59b1a182cb300b3f1bfabe234d",
+      "composed": "dadc4b499f16ca33673906d5524ad385b46a92e1",
+      "subject": "Prepare gated Source and final-alias Torch export GPU cells"
+    },
+    {
+      "original": "bc71cafa6d92d0e0381980418999f6d53a536c51",
+      "composed": "7935693e6ec832e8bd32293f7b1fcf90063db5ee",
+      "subject": "Require partial Source contents to remain unreadable while pending"
+    },
+    {
+      "original": "1e566daf2cf7391b48f747efb7e9632ce8f6a13a",
+      "composed": "f185a59211510f88582b0f92e8aa8ff3992f2c82",
+      "subject": "Propose the Torch offload adapter ownership and stream contract"
+    },
+    {
+      "original": "86c5da38ed9510969e4e1005e0845f9c1aee4e84",
+      "composed": "091b6443a8803e62fc2a1d9dac149ad247e091fc",
+      "subject": "Add non-mutating Torch offload inventory and CPU contract clients"
+    },
+    {
+      "original": "759c4bc4a785d7ec919c5ef1674e0039b28a89cf",
+      "composed": "15c30f895c72c1a0cf61b3f8a00c4c4f39392e8d",
+      "subject": "Record CPU offload contract evidence and preserved counterexamples"
+    },
+    {
+      "original": "4008e6c5da1919c19fdebad8e1a8fad870c94a3a",
+      "composed": "3716c50f99f1d16bdf5f01ace4fa3bdb32caacfe",
+      "subject": "Implement managed Torch offload over immutable Source versions"
+    },
+    {
+      "original": "8266a446e820ed8de8a22caeb480722126eda60e",
+      "composed": "335848b49305f04b32982974ff01707df51f3ae5",
+      "subject": "Record approved offload CPU and mixed-binding integration proof"
+    },
+    {
+      "original": "521904b6157ccffc97bd7b5481b4aad340e5d786",
+      "composed": "f076cba5483a6d2a1437a805552de6f1f76c1b64",
+      "subject": "Fix writable out operations and floating-only offload convenience casts"
+    },
+    {
+      "original": "7946441368b14567f2fdac5fe70eac1a44708840",
+      "composed": "bb548f89844f23a3491c119c6695e62be4a944ec",
+      "subject": "Pass declared offload module boundaries to native Region intent"
+    },
+    {
+      "original": "c28c8627c2e68ffeaa24365687f290287141612e",
+      "composed": "e19a510bd5b9cbd5276e45d930c215bf139ddc6d",
+      "subject": "Preserve review reproductions and offload intent integration receipts"
+    },
+    {
+      "original": "a247d24a3bb172df790445cc0ad6a06c557d709a",
+      "composed": "3d75c153efd820a358a1631d92a61a8bf329ee8e",
+      "subject": "Observe retained weight accounting after capture exclusion ends"
+    },
+    {
+      "original": "ebe91ad3447c668a93776cf4628b8f585e5aedd6",
+      "composed": "118d668f0d7ec05348ff011bb8502488f210f27e",
+      "subject": "Accept initialized CLIP no-split set declarations in offload inventory"
+    }
+  ],
+  "trim_excluded": true,
+  "gpu_qualified": false,
+  "complete_artifact_cohort_built": false
+}

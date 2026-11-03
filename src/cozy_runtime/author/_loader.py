@@ -586,7 +586,9 @@ class DerivedCache:
         self._bytes = 0
         self._owner = owner
         self._region: _Region | None = None
-        self._pins: list[AbstractContextManager[bool]] = []
+        # A scope can open before the first cache entry creates its Region. Keep its
+        # marker so late creation cannot leave an outer scope unpinned after inner exit.
+        self._pins: list[AbstractContextManager[bool] | None] = []
 
     def __repr__(self) -> str:
         return (
@@ -641,25 +643,55 @@ class DerivedCache:
         self._entries.clear()
         self._bytes = 0
 
+    def _close(self) -> None:
+        """Retire this generation's owner even if a diagnostic keeps the model alive."""
+        if self._pins:
+            raise ConformanceError(
+                f"cache {self.name!r} still has active component scopes", code="cache_in_use"
+            )
+        if self._region is not None:
+            self._region.close()
+            self._region = None
+        self.drop()
+
+    def _try_drop(self) -> bool:
+        # The Region claims its own lock and checks every active component pin before
+        # calling this owner. No byte target or replacement policy belongs in this hook.
+        if self._pins:
+            return False
+        self.drop()
+        return True
+
     def _made(self) -> _Region | None:
         """Its region, made with its first entry on a placed model (None unplaced)."""
         residency = self._owner._cozy_residency
         if self._region is None and residency is not None:
-            self._region = residency.region(f"cache:{self.name}", "latent", (), release=self.drop)
+            self._region = residency.region(
+                f"cache:{self.name}", "latent", (), release=self.drop, shrink=self._try_drop
+            )
+            for index, held in enumerate(self._pins):
+                if held is None:
+                    pin = self._region.pin()
+                    pin.__enter__()
+                    self._pins[index] = pin
         return self._region
 
     def enter(self) -> None:
         """A component scope of its model opens: its region stays mapped until `leave`; one
         that came back empty empties the cache."""
-        if self._region is not None:
-            pin = self._region.pin()
-            if pin.__enter__():
-                self.drop()
-            self._pins.append(pin)
+        if self._region is None:
+            self._pins.append(None)
+            return
+        pin = self._region.pin()
+        if pin.__enter__():
+            self.drop()
+        self._pins.append(pin)
 
     def leave(self) -> None:
         if self._pins:
-            self._pins.pop().__exit__(None, None, None)
+            pin = self._pins.pop()
+            if pin is not None:
+                pin.__exit__(None, None, None)
 
 
 def _require_immutable(name: str, value: object) -> None:
@@ -692,10 +724,13 @@ class _Region(Protocol):
 
     def allocating(self) -> AbstractContextManager[bool]: ...
 
+    def close(self) -> None: ...
+
 
 class _Residency(Protocol):
     def region(
-        self, owner: str, kind: str, sets: object, *, release: Callable[[], None] | None = None
+        self, owner: str, kind: str, sets: object, *, release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> _Region: ...
 
 
