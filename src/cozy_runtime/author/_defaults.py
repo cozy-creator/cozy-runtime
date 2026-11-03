@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import math
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, cast
@@ -126,11 +128,11 @@ def resolve(
     model_params: Sequence[str] = (),
 ) -> Overlay:
     """Build the one overlay and the revalidated payload."""
-    wire, ignored = undeclared(payload_type, wire)
+    wire, ignored, fitted = fit(payload_type, wire)
     marked = marked_fields(payload_type)
 
-    # Layer 1 of the two-layer clamp: API bounds REJECT what the caller actually sent,
-    # before any policy has a chance to quietly clamp it into range.
+    # What the caller sent decodes on its own, before any recipe joins it: a wrong type or a
+    # missing field refuses here. Its numbers and lengths are already within their limits.
     decode_request(cast("type[Any]", payload_type), wire)
 
     for recipe in default_sets:
@@ -139,7 +141,7 @@ def resolve(
     omitted = [name for name in marked if name not in wire]
     values: dict[str, object] = {}
     sources: dict[str, str] = {}
-    rows: list[AdjustmentRow] = []
+    rows = list(fitted)
 
     for name in omitted:
         node = marked[name]
@@ -207,18 +209,22 @@ def resolve(
     )
 
 
-def undeclared(
+def fit(
     payload_type: object, wire: Mapping[str, object]
-) -> tuple[dict[str, object], tuple[str, ...]]:
-    """The request without the fields its type does not declare, at any depth, and their paths.
+) -> tuple[dict[str, object], tuple[str, ...], tuple[AdjustmentRow, ...]]:
+    """The request as its type can take it, at any depth, what it dropped and what it moved.
 
     An undeclared field is a warning, never a refusal (owner, 2026-09-28): a newer caller may
     name fields this package does not know, whatever its structs' `forbid_unknown_fields`.
-    Types, required fields and bounds stay the decoder's, and stay strict.
+    A value over a limit is clamped or cut with a row, never refused (owner, 2026-11-03): a
+    number holds to its bounds and `multiple_of`, or a numeric Literal's nearest member, and text
+    and lists to their `max_length`, and a resolution takes its enum's nearest tier. Types and
+    required fields stay the decoder's, and stay strict.
     """
     ignored: list[str] = []
-    kept = _prune(_type_info(payload_type), dict(wire), "", ignored)
-    return cast("dict[str, object]", kept), tuple(sorted(ignored))
+    rows: list[AdjustmentRow] = []
+    kept = _prune(_type_info(payload_type), dict(wire), "", ignored, rows)
+    return cast("dict[str, object]", kept), tuple(sorted(ignored)), tuple(rows)
 
 
 @functools.lru_cache(maxsize=256)
@@ -227,14 +233,20 @@ def _type_info(payload_type: object) -> mi.Type:
 
 
 _OBJECTS = (mi.StructType, mi.DataclassType, mi.TypedDictType)
+_LIMIT = "the field's limit"
+_TIER = re.compile(r"[1-9][0-9]*p")
+_ASKED = re.compile(r"([0-9]+)(p|k)?")
+_K_TIERS = {"1": 720, "2": 1440, "4": 2160, "8": 4320}
 
 
-def _prune(info: mi.Type, value: object, path: str, ignored: list[str]) -> object:
+def _prune(
+    info: mi.Type, value: object, path: str, ignored: list[str], rows: list[AdjustmentRow]
+) -> object:
     if isinstance(info, mi.Metadata):
-        return _prune(info.type, value, path, ignored)
+        return _prune(info.type, value, path, ignored, rows)
     if isinstance(info, mi.UnionType):
         branch = _branch(info, value)
-        return value if branch is None else _prune(branch, value, path, ignored)
+        return value if branch is None else _prune(branch, value, path, ignored, rows)
     if isinstance(info, _OBJECTS) and isinstance(value, dict):
         fields = {field.encode_name: field.type for field in info.fields}
         tag = info.tag_field if isinstance(info, mi.StructType) else None
@@ -242,7 +254,7 @@ def _prune(info: mi.Type, value: object, path: str, ignored: list[str]) -> objec
         for key, item in value.items():
             where = f"{path}.{key}" if path else str(key)
             if key in fields:
-                kept[key] = _prune(fields[key], item, where, ignored)
+                kept[key] = _prune(fields[key], item, where, ignored, rows)
             elif key == tag:
                 kept[key] = item
             else:
@@ -252,24 +264,108 @@ def _prune(info: mi.Type, value: object, path: str, ignored: list[str]) -> objec
         if isinstance(info, mi.TupleType):
             items = info.item_types
         else:
+            most = info.max_length
+            if most is not None and len(value) > most:
+                rows.append(
+                    AdjustmentRow(
+                        "clamp", path, f"{len(value)} items", f"{most} items", _LIMIT, "policy"
+                    )
+                )
+                value = value[:most]
             items = (info.item_type,) * len(value)
         return [
-            _prune(items[i], item, f"{path}[{i}]", ignored) if i < len(items) else item
+            _prune(items[i], item, f"{path}[{i}]", ignored, rows) if i < len(items) else item
             for i, item in enumerate(value)
         ]
     if isinstance(info, mi.DictType) and isinstance(value, dict):
-        return {k: _prune(info.value_type, v, f"{path}.{k}", ignored) for k, v in value.items()}
-    return value
+        return {
+            k: _prune(info.value_type, v, f"{path}.{k}", ignored, rows) for k, v in value.items()
+        }
+    if isinstance(info, mi.StrType) and isinstance(value, str):
+        most = info.max_length
+        if most is None or len(value) <= most:
+            return value
+        rows.append(
+            AdjustmentRow(
+                "clamp", path, f"{len(value)} characters", f"{most} characters", _LIMIT, "policy"
+            )
+        )
+        return value[:most]
+    if isinstance(info, mi.EnumType) and isinstance(value, str):
+        return _tier(info, value, path, rows)
+    applied = _held(info, value)
+    if applied != value:
+        rows.append(AdjustmentRow("clamp", path, value, applied, _LIMIT, "policy"))
+    return applied
+
+
+def _tier(info: mi.EnumType, value: str, path: str, rows: list[AdjustmentRow]) -> str:
+    """A resolution an enum of `1080p`-style tiers doesn't name, as its nearest (`4k` is 2160p);
+    any other enum's value as it is, for the decoder."""
+    tiers = {
+        int(member.value[:-1]): member.value
+        for member in info.cls
+        if _TIER.fullmatch(str(member.value))
+    }
+    asked = _ASKED.fullmatch(value.strip().casefold())
+    if len(tiers) != len(info.cls) or asked is None or value in tiers.values():
+        return value
+    height = _K_TIERS.get(asked[1]) if asked[2] == "k" else int(asked[1])
+    if height is None:
+        return value
+    applied = tiers[min(tiers, key=lambda tier: (abs(tier - height), tier))]
+    if applied != value:
+        rows.append(
+            AdjustmentRow("clamp", path, value, applied, "the nearest size served", "policy")
+        )
+    return applied
+
+
+def _held(info: mi.Type, value: object) -> object:
+    """A number within a field's bounds and on its `multiple_of`, or a numeric Literal's nearest
+    member (the lower of two); anything else as it is, for the decoder."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return value
+    if isinstance(info, mi.LiteralType):
+        members = [m for m in info.values if type(m) in (int, float)]
+        if not members or value in members:
+            return value
+        return min(members, key=lambda member: (abs(member - value), member))
+    whole = isinstance(info, mi.IntType)
+    if not isinstance(info, (mi.IntType, mi.FloatType)) or (whole and isinstance(value, float)):
+        return value
+    low, high = info.ge, info.le
+    if info.gt is not None:
+        low = info.gt + 1 if whole else math.nextafter(info.gt, math.inf)
+    if info.lt is not None:
+        high = info.lt - 1 if whole else math.nextafter(info.lt, -math.inf)
+    held = value if low is None or value >= low else low
+    held = held if high is None or held <= high else high
+    step = info.multiple_of
+    if not step:
+        return held
+    near = round(held / step) * step
+    if low is not None and near < low:
+        return near + step
+    return near - step if high is not None and near > high else near
 
 
 def _branch(info: mi.UnionType, value: object) -> mi.Type | None:
     """The one member a value decodes as: msgspec admits at most one object-like and one
-    array-like member, besides structs told apart by their tag."""
-    if not isinstance(value, (dict, list)):
+    array-like member, besides structs told apart by their tag; a scalar's is the one member of
+    its kind, if it has just one."""
+    arrays = (mi.CollectionType, mi.TupleType)
+    if isinstance(value, dict):
+        kinds = (*_OBJECTS, mi.DictType)
+    elif isinstance(value, list):
+        kinds = arrays
+    elif isinstance(value, str):
+        kinds = (mi.StrType, mi.EnumType)
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        kinds = (mi.IntType, mi.FloatType, mi.LiteralType)
+    else:
         return None
     fields = value if isinstance(value, dict) else {}
-    arrays = (mi.CollectionType, mi.TupleType)
-    kinds = (*_OBJECTS, mi.DictType) if isinstance(value, dict) else arrays
     members = [member.type if isinstance(member, mi.Metadata) else member for member in info.types]
     candidates = [member for member in members if isinstance(member, kinds)]
     tagged = [m for m in candidates if isinstance(m, mi.StructType) and m.tag_field is not None]

@@ -25,7 +25,7 @@ from cozy_runtime.author._artifacts import ModelChoice
 from cozy_runtime.author._call_results import decode
 from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import MediaReads
-from cozy_runtime.author._defaults import undeclared
+from cozy_runtime.author._defaults import fit
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._executor_requests import (
     MAX_CALL_INDEX,
@@ -458,12 +458,24 @@ class _Broker:
                     return file.digest
                 return _input_ref(value, ctx.request_id)
 
-            plain, ignored = undeclared(
+            plain, ignored, moved = fit(
                 binding.request, msgspec.to_builtins(dict(arguments), enc_hook=asset_value)
             )
+            row: tuple[str, dict[str, Scalar]]
+            for change in moved:
+                row = (
+                    "a package call passed a value over its callee's limit; it was clamped",
+                    {
+                        "callee": f"{module}:{export}",
+                        "field": change.field,
+                        "applied": str(change.applied),
+                    },
+                )
+                if row not in WARNINGS:
+                    WARNINGS.append(row)
             if ignored:
                 # A field the installed callee does not declare is a warning, never a refusal.
-                row: tuple[str, dict[str, Scalar]] = (
+                row = (
                     "a package call named fields its callee does not declare; they were dropped",
                     {"callee": f"{module}:{export}", "fields": ", ".join(ignored)},
                 )
