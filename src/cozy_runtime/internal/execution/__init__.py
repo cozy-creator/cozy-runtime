@@ -1,9 +1,4 @@
-"""Torch execution with executor-local residency: exact pure-site cuts sized from
-their operands against the request's room, and the Ulysses agreement.
-
-The executor opens a request (`with mem.request(id, plan=[]) as r, serving(r):`) and installs
-the catch on every model it loads (`install`); nothing else here is the executor's to call.
-"""
+"""Declared native execution and ordinary eager operations with executor-local residency."""
 
 from __future__ import annotations
 
@@ -13,8 +8,7 @@ import tensorfs
 import torch
 from torch import nn
 
-from cozy_runtime.internal.execution import agree, catch, cuts
-from cozy_runtime.internal.execution.agree import agreed, sizes
+from cozy_runtime.internal.execution import catch, cuts
 from cozy_runtime.internal.execution.catch import cut_rows, piece, serving
 from cozy_runtime.internal.execution.cuts import attend, split
 from cozy_runtime.internal.execution.native_heads import split_projected_heads
@@ -31,7 +25,6 @@ from cozy_runtime.internal.residency import Request, blocks_of
 
 __all__ = [
     "Steps",
-    "agreed",
     "attend",
     "cut_rows",
     "decode_vae_tiles",
@@ -39,7 +32,6 @@ __all__ = [
     "piece",
     "record",
     "serving",
-    "sizes",
     "split",
     "split_declared",
     "split_layer_scale_block",
@@ -59,7 +51,7 @@ def install(module: nn.Module) -> None:
     for path, child in module.named_children():
         if path not in blocks:
             catch.wrap(child, path)
-    catch.wrap(module, "model", agree.passing)
+    catch.wrap(module, "model")
 
 
 class Steps:
@@ -88,7 +80,6 @@ def record(
         stats=request.stats(),
         torch_peak=torch_peak if device is not None else None,
     )
-
 
 
 #: each (device, store)'s measured ceilings, once per executor

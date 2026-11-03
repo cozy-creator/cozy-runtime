@@ -73,14 +73,35 @@ class CopyEngineExchange:
         s order. Every GPU passes the same matrix and tensors of the same row shapes, so every
         GPU takes the same rounds: each moves up to `chunk` rows of every pair's block (0: as
         many as the buffer holds; the calibration asks for fewer, to cross in rounds)."""
+        out = [t.new_empty((sum(row[self.rank] for row in matrix), *t.shape[1:])) for t in sends]
+        self.all_to_all_into(sends, matrix, out, chunk)
+        return out
+
+    def all_to_all_into(
+        self,
+        sends: Sequence[Any],
+        matrix: Sequence[Sequence[int]],
+        out: Sequence[Any],
+        chunk: int = 0,
+    ) -> None:
+        """The same crossing into actual preallocated receivers; no hidden output owner."""
         torch, world, rank = self.torch, self.world, self.rank
+        if len(out) != len(sends):
+            raise ValueError("copy-engine receiver count differs from its sends")
+        for tensor, target in zip(sends, out, strict=True):
+            if (
+                not tensor.is_contiguous()
+                or not target.is_contiguous()
+                or target.shape != (sum(row[rank] for row in matrix), *tensor.shape[1:])
+                or target.dtype != tensor.dtype
+                or target.device != tensor.device
+            ):
+                raise ValueError("copy-engine supplied receiver differs from its declared layout")
         widths = [tensor.element_size() * math.prod(tensor.shape[1:]) for tensor in sends]
         chunk = min(chunk or self.buffer.numel(), self.buffer.numel() // (world * sum(widths)))
         if chunk < 1:
             raise ValueError(f"one row of {sum(widths)} B per GPU exceeds the exchange buffer")
-        # where each sender's rows land in the result
         firsts = [sum(matrix[s][rank] for s in range(q)) for q in range(world)]
-        out = [t.new_empty((sum(row[rank] for row in matrix), *t.shape[1:])) for t in sends]
         current = torch.cuda.current_stream(self.device)
         for start in range(0, max(max(row) for row in matrix), chunk):
             counts = [[min(max(n - start, 0), chunk) for n in row] for row in matrix]
@@ -99,7 +120,6 @@ class CopyEngineExchange:
                     region = self.buffer[base : base + rows * width].view(tensor.dtype)
                     into[first : first + rows].copy_(region.view(rows, *tensor.shape[1:]))
                     base += rows * width
-        return out
 
     def _issue(
         self,

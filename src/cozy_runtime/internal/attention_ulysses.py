@@ -82,7 +82,7 @@ _MEMBERS: dict[str, AttentionBackendName] = {}
 
 class Execution(Protocol):
     """The execution layer's side (`internal.execution`, installed with the memory): the
-    attention cut, the pass's agreed exchange level and its exchanged sizes."""
+    ordinary attention invocation. Native exchanges carry their prepared provider directly."""
 
     def attend(
         self,
@@ -96,14 +96,8 @@ class Execution(Protocol):
         heads: bool = True,
     ) -> Tensor: ...
 
-    def agreed(self) -> int: ...
-
-    def sizes(self, gather: Callable[[], list[int]]) -> list[int]: ...
-
 
 _EXECUTION: Execution | None = None
-#: the exchanges' one cut site (`execution.agree.SITE`)
-SITE = "ulysses"
 
 
 def install(execution: Execution | None) -> None:
@@ -178,7 +172,8 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
             key,
             value,
             group(_parallel_config),
-            lambda q, k, v: _call(backend, local, q, k, v, options),
+            backend=backend,
+            options=options,
         )
 
     return attention
@@ -224,13 +219,15 @@ def exchange(
     key: Tensor,
     value: Tensor,
     handle: ProcessGroup,
-    compute: Callable[[Tensor, Tensor, Tensor], Tensor],
+    *,
+    backend: str,
+    options: Options,
 ) -> Tensor:
-    """Sequence shards -> full sequence per head subset -> `compute` -> back
+    """Sequence shards -> the exact selected prepared local provider -> back
     (`internal.parallel.ulysses.exchange`)."""
     if _EXCHANGE is None:
         raise ValueError(_UNSERVED)
-    return _EXCHANGE(query, key, value, handle, compute)
+    return _EXCHANGE(query, key, value, handle, backend=backend, options=options)
 
 
 _UNSERVED = "Ulysses runs where torch does: nothing imported internal.parallel.ulysses"
