@@ -721,7 +721,7 @@ def _unkept(
 ) -> str:
     """Why no call keeps this call's whole program ("" when one does)."""
     resident = all(not _unresident(model, paths) for model, paths in body.items())
-    if ident is None or loop.after is None or loop.phases is not None or not resident:
+    if ident is None or loop.phases is not None or not resident:
         return f"{'resident' if resident else 'streamed'}, and no call keeps the program"
     if shape in known.unfit:
         return f"no whole call: {known.why.get(shape, 'it did not fit')}"

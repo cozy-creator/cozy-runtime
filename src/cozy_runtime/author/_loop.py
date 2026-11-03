@@ -66,11 +66,11 @@ def denoise_loop(
     - `inputs`: read-only tensors of this call.
     - `phases`: one hashable host-side plan per step; each run of equal phases is one captured
       segment, and the step receives its phase.
-    - `key`: with `inputs` and an `after`, lets the Runtime keep the whole call for a later
-      call with an equal key and equal tensor layouts. It names everything the step bakes in
-      that is not a declared tensor (a guidance float, say). The step, `before` and `after` must
-      then reach every per-call tensor through their arguments; the Runtime keeps its own
-      copies and copies values in and out.
+    - `key`: with `inputs`, lets the Runtime keep the whole call for a later call with an
+      equal key and equal tensor layouts. It names everything the step bakes in that is not
+      a declared tensor (a guidance float, say). `before` and `after` remain optional. The
+      step and any declared `before`/`after` must reach every per-call tensor through their
+      arguments; the Runtime keeps its own copies and copies values in and out.
     - `on_step(index)`: called on the host after each completed step.
     - `before` and `after`: work that runs once before the first step and after the last,
       called like the step without its index (`before(*state, *carried, *inputs)`): a text
