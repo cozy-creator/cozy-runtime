@@ -1,0 +1,44 @@
+{
+  "passed": true,
+  "torch": "2.14.1+cpu",
+  "cases": [
+    {
+      "consumer": "native_vae_post_quant",
+      "source_sha256": "04ea3791efd5f5aab3f0dd393c6a95dbaecd4cb2f447815c857f330e38a58ff8",
+      "storage_identity_detects_duplicate": false,
+      "address_span_detects_duplicate": true,
+      "partial_overlap_detected": true,
+      "adjacent_independent_spans_accepted": true,
+      "writes_share_real_bytes": true,
+      "actual_cpu_dlpack_alias_detected": true,
+      "noncontiguous_helper_refusal": "VAE span checks require contiguous tensors on one device",
+      "scope": "CPU pointer predicate only; CUDA binding/ownership is unrun"
+    },
+    {
+      "consumer": "native_vae_output",
+      "source_sha256": "1331db70ad1529a5d55df3764b7faac5419cb71892b99df55b046e57e0fda04c",
+      "storage_identity_detects_duplicate": false,
+      "address_span_detects_duplicate": true,
+      "partial_overlap_detected": true,
+      "adjacent_independent_spans_accepted": true,
+      "writes_share_real_bytes": true,
+      "actual_cpu_dlpack_alias_detected": true,
+      "noncontiguous_helper_refusal": "VAE span checks require contiguous tensors on one device",
+      "scope": "CPU pointer predicate only; CUDA binding/ownership is unrun"
+    },
+    {
+      "consumer": "native_vae_prefix",
+      "source_sha256": "b2ac35aa6f92b1345265e4fed0c6f67287a23ba438114dfbcec708b602197aa1",
+      "storage_identity_detects_duplicate": false,
+      "address_span_detects_duplicate": true,
+      "partial_overlap_detected": true,
+      "adjacent_independent_spans_accepted": true,
+      "writes_share_real_bytes": true,
+      "actual_cpu_dlpack_alias_detected": true,
+      "noncontiguous_helper_refusal": null,
+      "scope": "CPU pointer predicate only; CUDA binding/ownership is unrun"
+    }
+  ],
+  "cuda_initialized": false,
+  "gpu_qualified": false
+}

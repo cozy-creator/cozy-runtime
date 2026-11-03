@@ -1,0 +1,159 @@
+{
+  "passed": true,
+  "torch": "2.14.0+cpu",
+  "torch_commit": "08187d9e0fba026dc8217405802ab5381dc88d90",
+  "consumer_sha256": "1331db70ad1529a5d55df3764b7faac5419cb71892b99df55b046e57e0fda04c",
+  "scope": "actual pinned CPU LayerNorm and linear arithmetic plus production allocation metadata/assembly",
+  "cuda_initialized": false,
+  "gpu_qualified": false,
+  "cases": [
+    {
+      "batch": 1,
+      "weight_dtype": "torch.float16",
+      "input_dtype": "torch.float32",
+      "result_shape": [
+        1,
+        3,
+        28,
+        256,
+        256
+      ],
+      "result_dtype": "torch.float16",
+      "bit_exact": true,
+      "preallocations": {
+        "input_rows": 7360512,
+        "dense_result": 11040768,
+        "result": 11010048
+      },
+      "functional_allocations": {
+        "norm_output": 14721024,
+        "norm_mean": 7188,
+        "norm_rstd": 7188
+      },
+      "copy_ops": [
+        "aten.view.default",
+        "aten.copy_.default",
+        "aten.view.default",
+        "aten.slice.Tensor",
+        "aten.view.default",
+        "aten.permute.default",
+        "aten.view.default",
+        "aten.copy_.default"
+      ]
+    },
+    {
+      "batch": 3,
+      "weight_dtype": "torch.float16",
+      "input_dtype": "torch.float32",
+      "result_shape": [
+        3,
+        3,
+        28,
+        256,
+        256
+      ],
+      "result_dtype": "torch.float16",
+      "bit_exact": true,
+      "preallocations": {
+        "input_rows": 22081536,
+        "dense_result": 33122304,
+        "result": 33030144
+      },
+      "functional_allocations": {
+        "norm_output": 44163072,
+        "norm_mean": 21564,
+        "norm_rstd": 21564
+      },
+      "copy_ops": [
+        "aten.view.default",
+        "aten.copy_.default",
+        "aten.view.default",
+        "aten.slice.Tensor",
+        "aten.view.default",
+        "aten.permute.default",
+        "aten.view.default",
+        "aten.copy_.default"
+      ]
+    },
+    {
+      "batch": 1,
+      "weight_dtype": "torch.float32",
+      "input_dtype": "torch.float32",
+      "result_shape": [
+        1,
+        3,
+        28,
+        256,
+        256
+      ],
+      "result_dtype": "torch.float16",
+      "bit_exact": true,
+      "preallocations": {
+        "input_rows": 7360512,
+        "dense_result": 11040768,
+        "result": 11010048,
+        "weight_cast": 12582912
+      },
+      "functional_allocations": {
+        "norm_output": 14721024,
+        "norm_mean": 7188,
+        "norm_rstd": 7188
+      },
+      "copy_ops": [
+        "aten.view.default",
+        "aten.copy_.default",
+        "aten.copy_.default",
+        "aten.view.default",
+        "aten.slice.Tensor",
+        "aten.view.default",
+        "aten.permute.default",
+        "aten.view.default",
+        "aten.copy_.default"
+      ]
+    },
+    {
+      "batch": 3,
+      "weight_dtype": "torch.float32",
+      "input_dtype": "torch.float32",
+      "result_shape": [
+        3,
+        3,
+        28,
+        256,
+        256
+      ],
+      "result_dtype": "torch.float16",
+      "bit_exact": true,
+      "preallocations": {
+        "input_rows": 22081536,
+        "dense_result": 33122304,
+        "result": 33030144,
+        "weight_cast": 12582912
+      },
+      "functional_allocations": {
+        "norm_output": 44163072,
+        "norm_mean": 21564,
+        "norm_rstd": 21564
+      },
+      "copy_ops": [
+        "aten.view.default",
+        "aten.copy_.default",
+        "aten.copy_.default",
+        "aten.view.default",
+        "aten.slice.Tensor",
+        "aten.view.default",
+        "aten.permute.default",
+        "aten.view.default",
+        "aten.copy_.default"
+      ]
+    }
+  ],
+  "refusals": [
+    "fp16_residual",
+    "wrong_geometry",
+    "missing_suffix",
+    "noncontiguous",
+    "empty_batch",
+    "changed_epsilon"
+  ]
+}

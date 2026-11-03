@@ -1,0 +1,10 @@
+{
+  "source": "d2e5501b6bca51e5240ef39d7d7d747f7e623183",
+  "version": "0.37.5+dev.gd2e5501b",
+  "wheel": "/home/fidika/cozy_v2/outputs/varena-v2-p0-20261031/runtime-build-d2e5501b6/dist/cozy_runtime-0.37.5+dev.gd2e5501b-cp312-abi3-manylinux_2_28_x86_64.whl",
+  "sha256": "338304db98697f0098f52d983d9ee105950ebea9c16dcc1b6cce74b26ee7b5df",
+  "record_rows": 835,
+  "unchanged_native": 581,
+  "installed_site": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/runtime-vae-edges-wheel",
+  "gpu_qualified": false
+}

@@ -1,0 +1,33 @@
+{
+  "torch_site": "/home/fidika/.cache/uv/archive-v0/ze1ma6eT_qRYunlo",
+  "torch_cohort": "2.14.0+cpu/08187d9e",
+  "results": [
+    {
+      "case": "prefix",
+      "command": [
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/bin/python",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-current-cohort-nov3/release-gate/suites/varena/vae-prefix/packing_host.py",
+        "--consumer",
+        "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/runtime-vae-edges-wheel/cozy_runtime/internal/execution/native_vae_prefix.py"
+      ],
+      "exit": 0,
+      "seconds": 15.074,
+      "stdout": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/packaged-edges-prefix-002.json",
+      "stderr": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/packaged-edges-prefix-002.stderr"
+    },
+    {
+      "case": "tail",
+      "command": [
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-p4-torch-offload/.task/torch-cpu/bin/python",
+        "/home/fidika/cozy/.worktrees/cozy-creator/xs138-current-cohort-nov3/release-gate/suites/varena/vae-output/tail_host.py",
+        "--consumer",
+        "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/runtime-vae-edges-wheel/cozy_runtime/internal/execution/native_vae_output.py"
+      ],
+      "exit": 0,
+      "seconds": 42.134,
+      "stdout": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/packaged-edges-tail-002.json",
+      "stderr": "/home/fidika/cozy/.worktrees/cozy-runtime/xs138-current-cohort-nov3/.task/packaged-edges-tail-002.stderr"
+    }
+  ],
+  "gpu_qualified": false
+}
