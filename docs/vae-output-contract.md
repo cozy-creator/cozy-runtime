@@ -77,3 +77,37 @@ must run in the ordinary child against frozen artifacts, verify full output and
 actual allocation census, minimum refusal, one-shot accepted failure and custody.
 No unit mocks. Complete outer/model acceptance remains root-owned and uses
 15 seconds, 362 frames, 1344x768, 30 steps and audio.
+
+## Implemented invocation boundary
+
+`native_vae_output.describe(norm, projection, hidden, geometry=(7,16,16))`
+returns metadata only. `prepare(..., context=shared_context, stream=owned_stream)`
+retains/query-prepares the actual FP16 bias and Lt Plan. `prepared.allocations`
+contains the entire future allocation list; `description.preallocations` and
+`description.functional_allocations` distinguish who creates each tensor.
+
+After root's complete admission and ordinary source hooks, allocate `Buffers`,
+call `prepared.bind(hidden, buffers)` once, then `bound.execute()` once. Binding
+checks source identities, actual owner pointers, source hooks/configuration, dtype,
+math policy, capacities/alignment and aliases before numerical writes. Execution
+calls functional LayerNorm once, copies its FP32 output to the owned FP16 projection
+input, casts any FP32 matrix/bias, executes the retained Plan, then assembles pixels.
+`bound.wait()`/successful `bound.poll()` proves completion on the explicit stream
+and releases the three held norm results. The caller retains/orders the returned
+pixel storage on later streams. Failed/unproven submissions retain exact available
+custody and mark errors non-retryable. A shared Context remains the caller's owner.
+
+The host release-gate client passed four complete actual H3 tail comparisons at
+B=1/3 and FP16/FP32 matrix storage: all projection and pixel values were bit exact.
+Six metadata/layout refusals passed. Actual Torch 2.15 CPU/meta invocation declined
+before execution. The pinned 2.14.0 CPU profiler confirmed the three native norm
+allocations for functional and `.out`; output values matched exactly. The actual
+GPU fixture imports and constructs Diffusers norm/projection modules on CPU.
+
+Fourteen ordinary-child GPU cells are prepared but **unrun**: six full/ragged output
+comparisons (B=1/3/7 and both matrix dtypes), two alias refusals, two native minimum
+refusals, two post-write allocation failures with one execution, and two retained
+Context refusals. Their census expects exactly three allocations inside execute,
+plus the previously declared fixed buffers. It does not assert zero-allocation
+execution. Raw Source retirement, asynchronous CUDA-error custody, vendor resources,
+whole outer adoption and full model quality remain separate unrun operator gates.
