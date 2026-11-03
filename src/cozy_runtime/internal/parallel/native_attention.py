@@ -120,7 +120,8 @@ def recipe(backend: str, options: dict[str, Any], tokens: int, device: int) -> R
     identity = (
         "kitchen-sol-direct/1",
         candidate.name,
-        tuple(sorted(ready.artifact.items())),
+        ready.artifact.get("artifact"),
+        ready.artifact.get("key"),
         _binary_identity(str(path), stat.st_size, stat.st_mtime_ns),
         layout.live_tokens,
         layout.protected_prefix,

@@ -85,3 +85,19 @@ input tensor arithmetic. Actual CPU entry refuses GPU admission on every rank.
 This is not CUDA, native attention or full-H3 qualification. GPU acceptance remains
 full15s/362frames/1344x768/30steps/audio at ranks2 and4 with current provider/artifact
 receipts, independent GPU repetition and output quality/performance checks.
+
+
+The existing whole-model graph preflight is earlier than the authored QKV body:
+`loop._run` calls `_eligible`, whose multi-rank check selects `loop.eager_all` before
+any step capture; the graph-region `_region_call` also records `across GPUs` and
+executes the ordinary call before preparing/replaying a graph. Ulysses' local
+capture check remains a last boundary for direct/manual invocation, not the first
+whole-model discovery of its eager requirement.
+
+Cross-rank provider identity includes artifact/key, actual binary SHA and semantic
+policy. Compilation duration and filesystem timestamps are receipts, not identity.
+The CUDA NVFP4 PreparedUse retained-float optimization is removed: it had no native
+admission contract and selected routes from Python aggregate room/weight/workspace
+formulas. Current encoded execution remains. Host/MPS source lifecycle and passive
+telemetry are not removed. Retained-float performance is a separate follow-up if a
+complete native provider is later justified; it adds no current benchmark matrix.

@@ -2690,21 +2690,6 @@ class Executor:
         # the plan already chosen and the package already imported; a plan whose route the
         # package cannot consent to is not a candidate, so it is never built.
         consent = str(getattr(model_cls, "__encoded_leaves__", "refuse"))
-        prepared_ineligible = ""
-        if use is not None:
-            assert registration is not None
-            if self.world != 1 or len(registration.surface.slots) != 1:
-                prepared_ineligible = (
-                    "multi-rank or multi-slot preparation remains on its existing route"
-                )
-            elif binding.adapters or any(
-                model_config.ADAPTERS in held.assets
-                for checkpoint in checkpoints.values() for held in checkpoint.ck.components.values()
-            ):
-                prepared_ineligible = (
-                    "adapter preparation has no fixed complete-footprint allowance"
-                )
-        prepared_memory = host.memory
         try:
             plan = resolve(
                 variant=reference,
@@ -2717,14 +2702,6 @@ class Executor:
                 encoded_leaves=consent,
                 dtype_name=dtype_name,
                 prepared_use=use,
-                prepared_free_bytes=(
-                    prepared_memory.room().free
-                    if use is not None and prepared_memory is not None else 0
-                ),
-                prepared_granularity=(
-                    prepared_memory.granularity if prepared_memory is not None else 0
-                ),
-                prepared_ineligible=prepared_ineligible,
             )
         except PlanRefusal as exc:
             return {
