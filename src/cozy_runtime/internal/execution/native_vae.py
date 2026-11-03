@@ -1,7 +1,7 @@
 """The declared fused layer-scale block: metadata first, one bound invocation, one choice.
 
-The first closed producer is the actual2048-wide FP16-autocast VAE layout with FP32
-residuals, two RMS norms, six biased dense projections and unmasked Kitchen INT8.
+The closed producer is the actual2048-wide FP16-autocast VAE layout with FP32
+residuals, two RMS norms, six biased float/encoded projections and unmasked Kitchen INT8.
 An enclosing legacy cut remains unsupported; its geometry is not a committed plan.
 """
 
@@ -21,11 +21,11 @@ from torch import Tensor, nn
 
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._split import Cut
-from cozy_runtime.author.kernels import _BLOCK_SPLIT, LayerScaleBlock, read
-from cozy_runtime.internal import attention, dense_linear
-from cozy_runtime.internal.execution import catch, phase
+from cozy_runtime.author.kernels import _BLOCK_SPLIT, _LINEAR_SPLIT, LayerScaleBlock, read
+from cozy_runtime.internal import attention, dense_linear, int8_linear
+from cozy_runtime.internal.execution import catch, native_vae_projection as encoded_projection, phase
 from cozy_runtime.internal.execution.native_heads import _Attention, _attention, _route
-from cozy_runtime.internal.execution.native_linear_split import _chunks, _layout
+from cozy_runtime.internal.execution.native_linear_split import _Dispatch, _chunks, _layout
 from cozy_runtime.internal.residency import _REQUEST, Model, Placeholder
 
 if TYPE_CHECKING:
@@ -49,9 +49,10 @@ class _Slot:
     model: Any = None
     block: Any = None
     offset: int = 0
+    buffer: bool = False
 
     def bind(self) -> Tensor:
-        current = self.module._parameters[self.name]
+        current = (self.module._buffers if self.buffer else self.module._parameters)[self.name]
         value = read(current)
         if (
             type(value) not in (Tensor, nn.Parameter)
@@ -80,8 +81,10 @@ def _slot(
     models: tuple[Model, ...],
     *,
     matrix: bool = False,
+    buffer: bool = False,
 ) -> _Slot:
-    value = module._parameters.get(name)
+    table = module._buffers if buffer else module._parameters
+    value = table.get(name)
     if (
         type(value) not in (Tensor, nn.Parameter, Placeholder)
         or tuple(value.shape) != shape
@@ -92,7 +95,7 @@ def _slot(
     alignment = 256 if matrix and value.dtype is torch.float16 else 16
     for model in models:
         if not any(
-            site.table is module._parameters and site.name == name
+            site.table is table and site.name == name
             for sites in model.sites.values()
             for site in sites
         ):
@@ -110,18 +113,18 @@ def _slot(
         # raw_views exists only for an exact source layout without block finals;
         # bind() below rechecks its current Region address and byte offset.
         for block in model.groups():
-            view = block.raw_views.get((id(module._parameters), name))
+            view = block.raw_views.get((id(table), name))
             if view is not None:
                 offset, _ = view
                 if offset % alignment:
                     raise _Unsupported("VAE raw source offset does not meet the kernel alignment")
-                return _Slot(module, name, value, _metadata(value), alignment, model, block, offset)
+                return _Slot(module, name, value, _metadata(value), alignment, model, block, offset, buffer)
         raise _Unsupported("VAE source slot has no raw address layout")
     if type(value) not in (Tensor, nn.Parameter) or hasattr(value, "_varena_read"):
         raise _Unsupported("VAE placeholder has no current declared owner")
     if value.data_ptr() % alignment:
         raise _Unsupported("VAE parameter does not meet the kernel alignment")
-    return _Slot(module, name, value, _metadata(value), alignment)
+    return _Slot(module, name, value, _metadata(value), alignment, buffer=buffer)
 
 
 def _source_identity(models: tuple[Model, ...]) -> tuple[Any, ...]:
@@ -144,6 +147,19 @@ class _Facts:
     attention: _Attention
     input_layout: object
     rotary_layout: tuple[object, ...]
+    encoded: tuple[bool, ...]
+    library: Any
+    projection_identity: tuple[Any, ...]
+
+
+def _plain_norm(module: nn.Module) -> bool:
+    forward = vars(module).get("forward")
+    return bool(
+        not module.training and module._compiled_call_impl is None
+        and (forward is None or forward is vars(module).get("_cozy_norm_cut_forward"))
+        and not module._forward_pre_hooks and not module._forward_hooks
+        and not module._backward_hooks and not module._backward_pre_hooks
+    )
 
 
 @dataclass(frozen=True)
@@ -221,13 +237,14 @@ def _describe_module(
         raise _Unsupported("VAE requires its actual ready compiled fused kernel set")
     if any(
         type(norm) is not nn.RMSNorm
+        or not _plain_norm(norm)
         or norm.weight is not None
         or tuple(norm.normalized_shape) != (64,)
         for norm in site.qk
     ):
         raise _Unsupported("VAE head norms differ from the declared weightless operation")
     if any(
-        type(norm) is not nn.RMSNorm or tuple(norm.normalized_shape) != (2048,)
+        type(norm) is not nn.RMSNorm or not _plain_norm(norm) or tuple(norm.normalized_shape) != (2048,)
         for norm in site.norms
     ):
         raise _Unsupported("VAE row norms differ from the declared operation")
@@ -255,8 +272,19 @@ def _describe_module(
     linears = (*site.qkv, site.out, site.inputs[0], site.down)
     shapes = ((2048, 2048),) * 4 + ((16384, 2048), (2048, 8192))
     slots: list[_Slot] = []
-    for leaf, (channels, width) in zip(linears, shapes, strict=True):
-        if (
+    encoded = tuple(encoded_projection.eligible(leaf, channels, width)
+                    for leaf, (channels, width) in zip(linears, shapes, strict=True))
+    library = None
+    if any(encoded):
+        from cozy_runtime import _kernels
+        if (_LINEAR_SPLIT.get() is not None or int8_linear.serving(device) != int8_linear.OP
+                or not hasattr(_kernels._gemm, "int8_plan")):
+            raise _Unsupported("VAE encoded projections require the actual ready native INT8 provider")
+        library = int8_linear.library(device)
+        if library.family != "mma.sync":
+            raise _Unsupported("VAE encoded projection requires the queried mma.sync provider")
+    for leaf, (channels, width), is_encoded in zip(linears, shapes, encoded, strict=True):
+        if not is_encoded and (
             type(leaf) is not nn.Linear
             or leaf.training
             or "forward" in vars(leaf)
@@ -270,19 +298,24 @@ def _describe_module(
         slots.append(
             _slot(
                 leaf,
-                "weight",
+                "data" if is_encoded else "weight",
                 (channels, width),
-                (torch.float16, torch.float32),
+                (torch.int8,) if is_encoded else (torch.float16, torch.float32),
                 models,
                 matrix=True,
+                buffer=is_encoded,
             )
         )
-        slots.append(_slot(leaf, "bias", (channels,), (torch.float16, torch.float32), models))
+        slots.append(_slot(leaf, "bias", (channels,), (torch.float16, torch.float32), models,
+                           buffer=is_encoded))
     slots += [_slot(norm, "weight", (2048,), (torch.float32,), models) for norm in site.norms]
     slots += [
         _slot(module, name, (2048,), (torch.float32,), models)
         for name in (gate_msa, gate_mlp)
     ]
+    slots += [_slot(leaf, "scale", (channels,), (torch.float32,), models, buffer=True)
+              for leaf, (channels, _), is_encoded in zip(linears, shapes, encoded, strict=True)
+              if is_encoded]
     actual_owners = {id(slot.model) for slot in slots if slot.model is not None}
     models = tuple(model for model in models if id(model) in actual_owners)
     source = _source_identity(models)
@@ -301,8 +334,13 @@ def _describe_module(
         raise _Unsupported("VAE block has an opaque hook")
     if any(slot.metadata[3] != str(on) for slot in slots):
         raise _Unsupported("VAE source slots must declare the input's CUDA device")
+    projection_identity = tuple(
+        (leaf.provider, leaf.encoding, str(leaf.out_dtype), leaf.in_features, leaf.out_features)
+        if is_encoded else ("biased-dense", channels, width)
+        for leaf, (channels, width), is_encoded in zip(linears, shapes, encoded, strict=True)
+    )
     return _Facts(request, site, models, source, tuple(slots), policy, kernel,
-                  input_layout, rotary_layout)
+                  input_layout, rotary_layout, encoded, library, projection_identity)
 
 
 def _bound_inventory(intent: LayerScaleBlock) -> _Inventory:
@@ -418,6 +456,8 @@ class _Variant:
     workspace: int
     allocations: tuple[int, ...]
     identity: str
+    quantized_bytes: int = 0
+    scale_rows: int = 0
 
 
 @dataclass
@@ -430,6 +470,8 @@ class _Buffers:
     attention: tuple[Tensor, ...]
     batch: int
     tokens: int
+    quantized: Tensor | None = None
+    scales: Tensor | None = None
 
     @classmethod
     def allocate(cls, x: Tensor, variant: _Variant, weight_bytes: int) -> _Buffers:
@@ -451,6 +493,10 @@ class _Buffers:
             ),
             at,
             tokens,
+            torch.empty(variant.quantized_bytes, dtype=torch.int8, device=x.device)
+            if variant.quantized_bytes else None,
+            torch.empty(variant.scale_rows, dtype=torch.float32, device=x.device)
+            if variant.scale_rows else None,
         )
 
     def narrow(self, batch: int) -> tuple[tuple[Tensor, ...], Tensor, Tensor, tuple[Tensor, ...]]:
@@ -571,6 +617,8 @@ def _variants(
     context: Any,
     stream: int,
     chunks: tuple[int, ...] | None = None,
+    encoded: tuple[bool, ...] = (False,) * 6,
+    library: Any = None,
 ) -> tuple[tuple[_Variant, ...], int, tuple[Any, ...]]:
     batch, tokens, _ = (int(n) for n in shape)
     chunks = _chunks(batch) if chunks is None else chunks
@@ -579,27 +627,32 @@ def _variants(
     cast_bytes = max(
         (math.prod(s.metadata[0]) * 2 for s in slots if s.metadata[2] == "torch.float32"), default=0
     )
-    queries: dict[tuple[int, int, int], tuple[Any, Any]] = {}
+    queries: dict[tuple[bool, int, int, int], tuple[Any, Any]] = {}
 
     def dense(at: int) -> tuple[Any, ...]:
         result = []
-        for slot in slots:
+        for slot, is_encoded in zip(slots, encoded, strict=True):
             channels, width = slot.metadata[0]
             geometry = (at * tokens, int(width), int(channels))
-            if geometry not in queries:
-                plan = dense_linear.checked(
-                    context.query,
-                    *geometry,
-                    bias.data_ptr(),
-                    bias.numel() * 2,
-                    policy.half_accumulation,
-                    policy.reduction,
-                    policy.sm_target,
-                    policy.workspace_limit,
-                    stream,
-                )
-                queries[geometry] = plan, plan.info()
-            result.append(queries[geometry][0])
+            key = (is_encoded, *geometry)
+            if key not in queries:
+                if is_encoded:
+                    plan = encoded_projection.query(library, bias.device.index or 0, *geometry)
+                    if plan is None:
+                        raise _Unsupported("VAE INT8 provider has no plan for the declared geometry")
+                    info = {"algorithm": {"provider": "int8.convrot", "kind": plan.kind,
+                                          "config": plan.config},
+                            "workspace_bytes": plan.workspace,
+                            "library_version": library.identity, "header_version": "int8_plan"}
+                else:
+                    plan = dense_linear.checked(
+                        context.query, *geometry, bias.data_ptr(), bias.numel() * 2,
+                        policy.half_accumulation, policy.reduction, policy.sm_target,
+                        policy.workspace_limit, stream,
+                    )
+                    info = plan.info()
+                queries[key] = plan, info
+            result.append(queries[key][0])
         return tuple(result)
 
     result = []
@@ -607,12 +660,21 @@ def _variants(
         tail_batch = batch % at
         full = dense(at)
         tail = dense(tail_batch) if tail_batch else full
-        workspace = max(plan.info()["workspace_bytes"] for plan in (*full, *tail))
+        workspace = max(plan.workspace if isinstance(plan, _Dispatch) else plan.info()["workspace_bytes"]
+                        for plan in (*full, *tail))
+        encoded_plans = [(plan, slot.metadata[0][1])
+                         for plans in (full, tail)
+                         for plan, slot in zip(plans, slots, strict=True)
+                         if isinstance(plan, _Dispatch) and plan.kind == 0]
+        quantized_bytes = max((plan.rows * width for plan, width in encoded_plans), default=0)
+        scale_rows = max((plan.rows for plan, _ in encoded_plans), default=0)
         allocations = [batch * tokens * 2048 * 4, at * tokens * 16384 * 2, at * tokens * 8192 * 2]
         if cast_bytes:
             allocations.append(cast_bytes)
         if workspace:
             allocations.append(workspace)
+        if quantized_bytes:
+            allocations.extend((quantized_bytes, scale_rows * 4))
         allocations.extend(
             math.prod(shape) * (1 if dtype is torch.int8 else 4)
             for shape, dtype in _attention_shapes(at, tokens)
@@ -626,6 +688,8 @@ def _variants(
                 workspace,
                 tuple(allocations),
                 f"batch:{at}/tail:{tail_batch}",
+                quantized_bytes,
+                scale_rows,
             )
         )
     # The current compute recipe includes actual algorithms/library/policy, never the
@@ -644,8 +708,21 @@ def _variants(
 
 
 def _validate_all(
-    x: Tensor, variant: _Variant, weights: tuple[Tensor, ...], buffers: _Buffers, stream: int
+    inventory: _Inventory, variant: _Variant, values: tuple[Tensor, ...], buffers: _Buffers, stream: int
 ) -> None:
+    x = inventory.intent.hidden
+    weights, biases = values[:12:2], values[1:12:2]
+    scales = iter(values[16:])
+    weight_scales = tuple(next(scales) if is_encoded else None for is_encoded in inventory.encoded)
+    if any(inventory.encoded):
+        modules = (*inventory.site.qkv, inventory.site.out, inventory.site.inputs[0], inventory.site.down)
+        device = x.device.index or 0
+        if (int8_linear.serving(device) != int8_linear.OP
+                or int8_linear.library(device) is not inventory.library
+                or any(not encoded_projection.eligible(module, weight.shape[0], weight.shape[1])
+                       for module, weight, is_encoded in zip(modules, weights, inventory.encoded, strict=True)
+                       if is_encoded)):
+            raise RuntimeError("VAE encoded provider or module changed before writes")
     for batch, plans in ((variant.batch, variant.full), (variant.tail_batch, variant.tail)):
         if not batch:
             continue
@@ -661,7 +738,12 @@ def _validate_all(
             (normalized, up),
             (expanded, rows[0]),
         )
-        for plan, weight, (source, target) in zip(plans, weights, pairs, strict=True):
+        for plan, weight, bias, scale, (source, target) in zip(plans, weights, biases, weight_scales, pairs, strict=True):
+            if isinstance(plan, _Dispatch):
+                assert scale is not None
+                encoded_projection.validate(plan, weight, scale, bias, source, target,
+                                            buffers.quantized, buffers.scales, buffers.workspace)
+                continue
             operand = weight
             if weight.dtype is torch.float32:
                 assert buffers.weight is not None
@@ -691,7 +773,20 @@ def _execute(
 
     x, site = inventory.intent.hidden, inventory.site
     weights, biases = values[:12:2], values[1:12:2]
-    norm1, norm2, gate1, gate2 = values[12:]
+    norm1, norm2, gate1, gate2 = values[12:16]
+    scales = iter(values[16:])
+    weight_scales = tuple(next(scales) if is_encoded else None for is_encoded in inventory.encoded)
+    modules = (*site.qkv, site.out, site.inputs[0], site.down)
+
+    def project(i: int, plan: Any, source: Tensor, target: Tensor) -> None:
+        if isinstance(plan, _Dispatch):
+            scale = weight_scales[i]
+            assert scale is not None
+            encoded_projection.execute(modules[i], inventory.library, plan, weights[i], scale,
+                biases[i], source, target, buffers.quantized, buffers.scales, buffers.workspace,
+                bias, stream)
+        else:
+            _linear(plan, source, weights[i], biases[i], target, buffers, bias, stream)
     launch, entries = site.switch.launch, site.layout.entries
     assert entries.second is not None and entries.rope is not None and launch is not None
     cos, sin = inventory.intent.rotary
@@ -717,7 +812,7 @@ def _execute(
             norm_out=normalized,
         )
         for i in range(3):
-            _linear(plans[i], normalized, weights[i], biases[i], rows[i], buffers, bias, stream)
+            project(i, plans[i], normalized, rows[i])
         for i in range(2):
             fusion._kernels.head_norm_rope(
                 launch,
@@ -739,7 +834,7 @@ def _execute(
             scratch,
             stream,
         )
-        _linear(plans[3], rows[1], weights[3], biases[3], rows[2], buffers, bias, stream)
+        project(3, plans[3], rows[1], rows[2])
         fusion._kernels.norm_modulate(
             launch,
             entries.second,
@@ -754,10 +849,10 @@ def _execute(
             hidden_out=target.view(batch * buffers.tokens, 2048),
             norm_out=normalized,
         )
-        _linear(plans[4], normalized, weights[4], biases[4], up, buffers, bias, stream)
+        project(4, plans[4], normalized, up)
         value, gate = up.chunk(2, dim=-1)
         fusion._kernels.swiglu(launch, entries.swiglu, gate, value, out=expanded)
-        _linear(plans[5], expanded, weights[5], biases[5], rows[0], buffers, bias, stream)
+        project(5, plans[5], expanded, rows[0])
         fusion._kernels.norm_modulate(
             launch,
             entries.residual,
@@ -830,6 +925,8 @@ class _Call:
                 tuple(float(norm.eps) for norm in inventory.site.qk),
                 inventory.attention.identity,
                 inventory.policy,
+                inventory.projection_identity,
+                None if inventory.library is None else (inventory.library.identity, inventory.library.family),
                 tuple(
                     (geometry, tuple(sorted(config.items())), workspace, library, header)
                     for geometry, config, workspace, library, header in algorithms
@@ -862,7 +959,7 @@ class _Call:
         submitted = False
         try:
             buffers = _Buffers.allocate(x, variant, cast_bytes)
-            _validate_all(x, variant, values[:12:2], buffers, stream)
+            _validate_all(inventory, variant, values, buffers, stream)
             if dense_linear.policy(device) != inventory.policy:
                 raise RuntimeError("VAE dense policy changed before the first numerical write")
             result = _execute(inventory, values, variant, buffers, bias, index, stream)
@@ -888,7 +985,8 @@ def _prepare(inventory: _Inventory) -> _Call:
     bias = torch.empty(16384, dtype=torch.float16, device=x.device)
     index = torch.zeros(1, dtype=torch.int64, device=x.device)
     variants, cast_bytes, algorithms = _variants(
-        tuple(x.shape), inventory.slots[:12:2], bias, inventory.policy, context, stream
+        tuple(x.shape), inventory.slots[:12:2], bias, inventory.policy, context, stream,
+        encoded=inventory.encoded, library=inventory.library,
     )
     binary = Path(_dense.__file__)
     stat = binary.stat()
@@ -911,6 +1009,8 @@ def split_layer_scale_block(
     with torch.cuda.device(inventory.intent.hidden.device):
         try:
             call = _prepare(inventory)
+        except _Unsupported:
+            return None
         except RuntimeError as error:
             # A valid no-algorithm outcome declines before source hooks or numerical work.
             cause = error.__cause__
@@ -949,6 +1049,8 @@ def _snapshot(facts: _Facts) -> tuple[Any, ...]:
         facts.site.layout.kernels.identity, facts.source, facts.input_layout, facts.rotary_layout,
         tuple(slot.metadata for slot in facts.slots), tuple(facts.site.eps),
         tuple(float(norm.eps) for norm in facts.site.qk), facts.attention.identity, facts.policy,
+        facts.encoded, None if facts.library is None else (facts.library.identity, facts.library.family),
+        facts.projection_identity,
     )
 
 
@@ -989,6 +1091,9 @@ class PreparedBlock:
             specs.append(("weight", (self.cast_bytes // 2,), torch.float16))
         if variant.workspace:
             specs.append(("workspace", (variant.workspace,), torch.uint8))
+        if variant.quantized_bytes:
+            specs.extend((("quantized", (variant.quantized_bytes,), torch.int8),
+                          ("scales", (variant.scale_rows,), torch.float32)))
         specs.extend((f"attention:{i}", shape, dtype)
                      for i, (shape, dtype) in enumerate(_attention_shapes(at, tokens)))
         return tuple(specs)
@@ -1004,7 +1109,7 @@ class PreparedBlock:
                   for name, shape, dtype in self.buffer_specs(identity) if name != "output"}
         return _Buffers(output, values["packed"], values["expanded"], values.get("weight"),
                         values.get("workspace"), tuple(values[f"attention:{i}"] for i in range(7)),
-                        variant.batch, self.metadata.shape[1])
+                        variant.batch, self.metadata.shape[1], values.get("quantized"), values.get("scales"))
 
     def bind(self, hidden: Tensor, rotary: tuple[Tensor, Tensor], identity: str, buffers: _Buffers) -> _SuppliedInvocation:
         """Bind real activation/storage; source reads remain inside ordinary hooks."""
@@ -1040,7 +1145,7 @@ def prepare_block(metadata: BlockMetadata, *, chunks: tuple[int, ...] | None = N
         index = torch.zeros(1, dtype=torch.int64, device=metadata.device)
         try:
             variants, cast_bytes, algorithms = _variants(metadata.shape, metadata.slots[:12:2], bias,
-                metadata.policy, context, stream, chunks)
+                metadata.policy, context, stream, chunks, metadata.encoded, metadata.library)
         except RuntimeError as error:
             cause = error.__cause__
             if isinstance(cause, _dense.Error) and cause.domain == "cublas" and cause.status == _dense.NOT_SUPPORTED:
@@ -1062,6 +1167,10 @@ def _validate_supplied(call: _SuppliedInvocation, values: tuple[Tensor, ...]) ->
         actual["weight"] = b.weight
     if b.workspace is not None:
         actual["workspace"] = b.workspace
+    if b.quantized is not None:
+        actual["quantized"] = b.quantized
+    if b.scales is not None:
+        actual["scales"] = b.scales
     actual.update((f"attention:{i}", value) for i, value in enumerate(b.attention))
     specs = p.buffer_specs(call.variant.identity)
     if set(actual) != {name for name, _, _ in specs}:
@@ -1084,7 +1193,7 @@ def _validate_supplied(call: _SuppliedInvocation, values: tuple[Tensor, ...]) ->
                         other.data_ptr() + other.numel() * other.element_size())):
                 raise ValueError("supplied VAE buffers require independent owned storage")
         destinations.append(value)
-    _validate_all(inv.intent.hidden, call.variant, values[:12:2], b, p.stream)
+    _validate_all(inv, call.variant, values, b, p.stream)
 
 
 @dataclass

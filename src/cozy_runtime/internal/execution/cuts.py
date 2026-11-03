@@ -26,6 +26,7 @@ def install(module: nn.Module) -> int:
     for path, sub in module.named_modules():
         if type(sub) is nn.RMSNorm and "forward" not in vars(sub) and "_cozy_cut" not in vars(sub):
             sub.forward = catch.transparent(_norm(f"{path}:tokens", sub, _forward(sub)))
+            vars(sub)["_cozy_norm_cut_forward"] = sub.forward
             vars(sub)["_cozy_cut"] = True
             count += 1
             continue

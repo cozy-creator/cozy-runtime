@@ -735,6 +735,8 @@ def _execute_windows(
                 tuple(values[f"attention:{i}"] for i in range(7)),
                 window.block_chunk,
                 TOKENS,
+                values.get("quantized"),
+                values.get("scales"),
             )
             invocation = prepared.bind(hidden, rotary, identity, buffers)
             invocations.append(invocation)
