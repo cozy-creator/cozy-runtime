@@ -69,6 +69,11 @@ class Pool:
     handle: tuple[int, int]
 
 
+# A failed CUDA destruction does not prove whether its handle remains valid.
+# Keep its events/library/stream owners until the executor exits; never probe it again.
+_UNPROVEN: list[Any] = []
+
+
 class Domain:
     def __init__(self, torch: Any, memory: Any) -> None:
         self.torch, self.memory = torch, memory
@@ -84,6 +89,8 @@ class Domain:
         self.last_stream: Any = None
         self.fenced = True
         self.closed = False
+        self.closing = False
+        self._destruction_error: BaseException | None = None
         self.config: Any = None
         self.graphs: weakref.WeakSet[Any] = weakref.WeakSet()
         self.local = threading.local()
@@ -99,6 +106,8 @@ class Domain:
     def refusal(self) -> str:
         if self.closed:
             return "graph domain is closed"
+        if self.closing:
+            return "graph domain is closing"
         if self.config is not None and self.configuration() != self.config:
             return "library workspace configuration changed while graphs retain its pointers"
         return unsupported(self.torch)
@@ -138,6 +147,8 @@ class Domain:
     def using(self) -> Iterator[None]:
         """Serialize shared workspace and order producers/output copies across streams."""
         with self.lock:
+            if self.closed or self.closing:
+                raise Unavailable("graph domain is closing or closed")
             current = self.torch.cuda.current_stream(self.device)
             depth = getattr(self.local, "depth", 0)
             if not depth and self.done is not None:
@@ -165,14 +176,22 @@ class Domain:
             self.primed = True
 
     def finish(self) -> None:
-        """Drain all uses, invalidate executables, then free only this domain's resources."""
+        """Drain uses, retire every live stream, then destroy with explicit progress.
+
+        No submission or consumer declaration may follow closing. A fallible retirement
+        leaves all handles alive; a successful destroy clears its field immediately. An
+        unknown destruction outcome is terminal and retains all remaining custody.
+        """
         # At interpreter shutdown, pinned-host tensor destructors may still need these
         # streams. The CUDA process owns final reclamation; ordinary unload calls us early.
         if sys.is_finalizing():
             return
         with self.lock:
+            if self._destruction_error is not None:
+                self._unproven_destruction(self._destruction_error)
             if self.closed:
                 return
+            self.closing = True
             if not self.fenced and self.last_stream is not None:
                 self.last_stream.synchronize()
             if self.done is not None:
@@ -180,6 +199,8 @@ class Domain:
             for stream in (self.stream, self.control):
                 if stream is not None:
                     stream.synchronize()
+            self.last_stream = None
+            self.fenced = True
             for graph in self.graphs:
                 graph.reset()
             self.graphs.clear()
@@ -191,9 +212,27 @@ class Domain:
                     # Graph reset may enqueue allocator retirement events.
                     stream.synchronize()
                     vt.retire_stream(stream, device=self.device)
-                    accel.destroy_stream(self.torch, stream)
-            self.stream = self.control = self.fork = self.join = self.done = None
+            # Retire all live handles before destroying either: a refusal for control
+            # must not leave a destroyed library-stream handle for a later finish().
+            for name in ("stream", "control"):
+                stream = getattr(self, name)
+                if stream is not None:
+                    try:
+                        accel.destroy_stream(self.torch, stream)
+                        setattr(self, name, None)
+                    except BaseException as error:
+                        self._unproven_destruction(error)
+            self.fork = self.join = self.done = None
             self.closed = self.fenced = True
+
+    def _unproven_destruction(self, cause: BaseException) -> None:
+        if self._destruction_error is None:
+            self._destruction_error = cause
+            _UNPROVEN.append(self)
+        error = self.torch.AcceleratorError(
+            f"graph stream destruction is unproven; retire executor: {cause}"
+        )
+        raise error from cause
 
 
 _LOCK = threading.RLock()
