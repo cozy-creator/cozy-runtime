@@ -15,7 +15,6 @@ from typing import NamedTuple
 
 import msgspec
 
-from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._services import AdjustmentRows, Adjustments
 
 #: A mention: `<`, any text without brackets or line breaks, `>`.
@@ -49,21 +48,24 @@ class Mention(NamedTuple):
     position: int | None
 
 
-def mentions(
-    text: str, references: Sequence[Reference], field: str = "references"
-) -> list[Mention]:
-    """Every `<...>` in `text`, in order, with the reference it names. Two references with one
-    name refuse, naming `field`."""
+def _shared_names(references: Sequence[Reference]) -> list[str]:
+    """The names a second reference repeats, which a mention reads as the first."""
+    seen: set[str] = set()
+    shared = []
+    for reference in references:
+        key = name_key(reference.name)
+        if key in seen:
+            shared.append(reference.name)
+        seen.add(key)
+    return shared
+
+
+def mentions(text: str, references: Sequence[Reference]) -> list[Mention]:
+    """Every `<...>` in `text`, in order, with the reference it names, the first of any that share
+    a name."""
     names: dict[str, int] = {}
     for index, reference in enumerate(references):
-        key = name_key(reference.name)
-        if key in names:
-            raise InvalidRequest(
-                f"two references are named <{reference.name}>",
-                code="reference_name",
-                fields=(field,),
-            )
-        names[key] = index
+        names.setdefault(name_key(reference.name), index)
     return [
         Mention(m.start(), m.end(), m.group(0), names.get(name_key(m.group(1))))
         for m in MENTION.finditer(text)
@@ -86,11 +88,11 @@ def render[R: Reference](
 ) -> str:
     """`text` with each mention of a reference replaced by `label(n, reference)`, `n` its 1-based
     position in the list `listed` names. A mention of no reference stays as written, with one
-    warning."""
+    warning; so does a second reference with a taken name, which mentions never reach."""
     parts: list[str] = []
     unknown: dict[str, None] = {}
     at = 0
-    for mention in mentions(text, references, listed):
+    for mention in mentions(text, references):
         parts.append(text[at : mention.start])
         if mention.position is None:
             parts.append(mention.text)
@@ -99,6 +101,8 @@ def render[R: Reference](
             parts.append(label(mention.position + 1, references[mention.position]))
         at = mention.end
     parts.append(text[at:])
+    for name in _shared_names(references) if adj is not None else ():
+        adj.warn(listed, f"two references are named <{name}>; a mention means the first")
     if unknown and adj is not None:
         verb = "names" if len(unknown) == 1 else "name"
         adj.warn(field, f"{', '.join(unknown)} {verb} no reference; left as written")
