@@ -47,6 +47,17 @@ class _Attempt(Protocol):
 
     def components_active(self) -> bool: ...
 
+    def warn(self, field: str, message: str) -> None: ...
+
+
+#: Tells the caller what a read tolerated in its file (a `warn` row on the attempt's input).
+_Note = Callable[[str], None]
+#: How far audio's clock may stray from its samples before it counts as a gap: ffmpeg's resampler's
+#: own hard-compensation line. A rounded container clock (Matroska's milliseconds) strays by less.
+_AUDIO_SLACK = Fraction(1, 10)
+#: A clock this far behind itself has restarted (joined files), not stumbled.
+_CLOCK_RESTART = Fraction(1)
+
 
 @dataclass(frozen=True, slots=True)
 class DecodeLimits:
@@ -60,7 +71,6 @@ class DecodeLimits:
     max_decoded_bytes: int
     max_pixels_per_frame: int
     max_video_frames: int
-    max_audio_channels: int
     max_audio_samples: int
 
     def __post_init__(self) -> None:
@@ -69,7 +79,6 @@ class DecodeLimits:
                 self.max_decoded_bytes,
                 self.max_pixels_per_frame,
                 self.max_video_frames,
-                self.max_audio_channels,
                 self.max_audio_samples,
             )
             <= 0
@@ -86,7 +95,6 @@ DEFAULT_DECODE_LIMITS = DecodeLimits(
     max_decoded_bytes=2 * 1024**3,
     max_pixels_per_frame=8192 * 8192,
     max_video_frames=3600,
-    max_audio_channels=8,
     max_audio_samples=48_000 * 60 * 10,
 )
 
@@ -344,6 +352,11 @@ class _AudioStreamDecoder:
     the first kept chunk begins at the exact sample, its time to the nearest tick. `origin`
     defaults to the stream's own first presentation time. The total-sample ceiling applies
     to a retained read; a stream holds one chunk at a time.
+
+    Real files have holes: past `_AUDIO_SLACK` a gap in the clock is filled with silence, a frame
+    that repeats or overlaps what came before is cut, a clock that restarts runs on, and a damaged
+    frame is dropped and its gap filled, each with a warning, so the samples stay continuous from
+    the first. Within it the samples simply run on: a container's rounded times are not a gap.
     """
 
     def __init__(
@@ -352,6 +365,7 @@ class _AudioStreamDecoder:
         stream: Any,
         limits: DecodeLimits,
         budget: _Budget,
+        note: _Note,
         *,
         start: Fraction | None = None,
         end: Fraction | None = None,
@@ -361,6 +375,7 @@ class _AudioStreamDecoder:
         self._av = av
         self._limits = limits
         self._budget = budget
+        self._note = note
         self._start = start
         self._end = end
         self._origin = origin
@@ -369,7 +384,8 @@ class _AudioStreamDecoder:
         self._keep: int | None = None
         self._decoded = 0
         self._resampler: Any | None = None
-        self._last_presentation_time: Fraction | None = None
+        self._source = ""
+        self._shift = Fraction(0)
         self._time_base: Fraction | None = None
         self._start_time: Fraction | None = None
         self.channels = 0
@@ -380,14 +396,7 @@ class _AudioStreamDecoder:
 
         context = stream.codec_context
         context.thread_count = 1
-        _set_decoder_option(context, "err_detect", "explode")
         _set_decoder_option(context, "max_samples", limits.max_audio_samples)
-        header_channels = int(context.channels or 0)
-        if header_channels > limits.max_audio_channels:
-            raise MediaDecodeError(
-                f"audio has {header_channels} channels; limit is {limits.max_audio_channels}",
-                code="audio_channels_limit",
-            )
 
     @property
     def start_time(self) -> Fraction | None:
@@ -399,15 +408,12 @@ class _AudioStreamDecoder:
         return self._keep is not None and self._decoded >= self._keep
 
     def _lock_format(self, frame: Any) -> None:
-        self.channels = len(frame.layout.channels)
         self.sample_rate = int(frame.sample_rate or 0)
-        self.channel_layout = str(frame.layout.name)
-        self.channel_names = tuple(str(channel.name) for channel in frame.layout.channels)
-        if self.channels <= 0 or self.channels > self._limits.max_audio_channels:
-            raise MediaDecodeError(
-                f"audio has {self.channels} channels; limit is {self._limits.max_audio_channels}",
-                code="audio_channels_limit",
-            )
+        self._source = str(frame.layout.name)
+        self.channel_layout, self.channel_names = _kept_layout(frame.layout)
+        self.channels = len(self.channel_names)
+        if len(frame.layout.channels) > self.channels:
+            self._note(f"{self._source} audio was mixed down to stereo")
         if (
             self.sample_rate <= 0
             or not self.channel_layout
@@ -423,41 +429,32 @@ class _AudioStreamDecoder:
     def decode(self, frame: Any) -> DecodedAudioChunk | None:
         """One validated chunk, or None when nothing of this frame precedes `end`."""
         if frame.is_corrupt:
-            raise MediaDecodeError("audio decoder marked a frame corrupt", code="media_corrupt")
+            self._note("a damaged audio frame was dropped")
+            return None
         if self._resampler is None:
             self._lock_format(frame)
         samples = int(frame.samples or 0)
-        channels = len(frame.layout.channels)
-        rate = int(frame.sample_rate or 0)
-        layout = str(frame.layout.name)
-        names = tuple(str(channel.name) for channel in frame.layout.channels)
         if samples <= 0:
-            raise MediaDecodeError("audio contains an empty frame", code="media_empty")
+            return None
         if (
-            channels != self.channels
-            or rate != self.sample_rate
-            or layout != self.channel_layout
-            or names != self.channel_names
+            int(frame.sample_rate or 0) != self.sample_rate
+            or str(frame.layout.name) != self._source
         ):
-            raise MediaDecodeError(
-                "audio format changes between decoded frames", code="audio_format_change"
-            )
+            self._note("audio that changes format partway was dropped from the change on")
+            return None
 
         valid_samples = _valid_audio_samples(frame, samples, self.sample_rate)
+        began = self._start_time
+        expected = None if began is None else began + Fraction(self._decoded, self.sample_rate)
         if frame.pts is None or frame.time_base is None:
-            raise MediaDecodeError("audio frame has no exact presentation time", code="media_clock")
-        time_base = _positive_fraction(frame.time_base, "audio frame time base")
-        presentation_time = _fraction(frame.pts, "audio frame PTS") * time_base
-        if self._time_base is None:
-            self._time_base = time_base
-        elif time_base != self._time_base:
-            raise MediaDecodeError("audio time base changes between frames", code="media_clock")
-        if (
-            self._last_presentation_time is not None
-            and presentation_time <= self._last_presentation_time
-        ):
-            raise MediaDecodeError("audio PTS is not strictly monotone", code="media_clock")
-        if self._start_time is None:
+            time_base = self._time_base or Fraction(1, self.sample_rate)
+            presentation_time = Fraction(0) if expected is None else expected
+        else:
+            time_base = _positive_fraction(frame.time_base, "audio frame time base")
+            presentation_time = _fraction(frame.pts, "audio frame PTS") * time_base + self._shift
+        self._time_base = time_base
+        hole = 0
+        if expected is None:
             self._start_time = presentation_time
             origin = presentation_time if self._origin is None else self._origin
             if self._start is not None:
@@ -466,20 +463,24 @@ class _AudioStreamDecoder:
             if self._end is not None:
                 cut = (origin + self._end - presentation_time) * self.sample_rate
                 self._keep = max(0, _half_up(cut))
-        else:
-            expected = self._start_time + Fraction(self._decoded, self.sample_rate)
-            if abs(presentation_time - expected) > time_base / 2:
-                raise MediaDecodeError(
-                    f"audio presentation is discontinuous: expected {expected}, got "
-                    f"{presentation_time}",
-                    code="audio_discontinuity",
-                )
-        self._last_presentation_time = presentation_time
+        elif presentation_time - expected < -_CLOCK_RESTART:
+            self._note("an audio clock that restarts partway was run on")
+            self._shift += expected - presentation_time
+        elif abs(presentation_time - expected) > _AUDIO_SLACK:
+            hole = _half_up((presentation_time - expected) * self.sample_rate)
+            self._note(
+                "a gap in the audio was filled with silence"
+                if hole > 0
+                else "audio that overlaps itself was cut to run on"
+            )
+            if -hole >= valid_samples:
+                return None
+        # This frame on the continuous clock: `silence` zero samples, then its own past `cut`.
+        silence, cut_samples = max(hole, 0), max(-hole, 0)
+        length = silence + valid_samples - cut_samples
         first = max(0, self._skip - self._decoded)
-        stop = (
-            valid_samples if self._keep is None else min(valid_samples, self._keep - self._decoded)
-        )
-        self._decoded += valid_samples
+        stop = length if self._keep is None else min(length, self._keep - self._decoded)
+        self._decoded += length
         take = stop - first
         if take <= 0:
             return None
@@ -497,9 +498,10 @@ class _AudioStreamDecoder:
             raise MediaDecodeError(
                 "native-rate audio conversion changed the sample clock", code="audio_format"
             )
-        chunks = [bytearray() for _ in range(self.channels)]
-        remaining = take
-        offset = first
+        filled = max(0, min(silence, stop) - first)
+        chunks = [bytearray(filled * 4) for _ in range(self.channels)]
+        remaining = take - filled
+        offset = max(0, first - silence) + cut_samples
         for out in converted:
             if str(out.format.name) != "fltp" or len(out.planes) != self.channels:
                 raise MediaDecodeError(
@@ -533,7 +535,13 @@ class _AudioStreamDecoder:
             channel_layout=self.channel_layout,
             channel_names=self.channel_names,
             pcm_f32le=tuple(bytes(chunk) for chunk in chunks),
-            pts=int(frame.pts) + _half_up(Fraction(first, self.sample_rate) / time_base),
+            pts=_half_up(
+                (
+                    (presentation_time if expected is None else expected)
+                    + Fraction(first, self.sample_rate)
+                )
+                / time_base
+            ),
             time_base=time_base,
         )
 
@@ -560,22 +568,22 @@ class _AudioStreamDecoder:
         self.finish()
 
 
+def _kept_layout(layout: Any) -> tuple[str, tuple[str, ...]]:
+    """The layout a read gives: the source's, or stereo for anything wider, which every reader and
+    the MP4 writer take."""
+    if len(layout.channels) > 2:
+        return "stereo", ("FL", "FR")
+    return str(layout.name), tuple(str(channel.name) for channel in layout.channels)
+
+
 def _stream_audio_format(stream: Any, limits: DecodeLimits) -> DecodedAudioFormat:
     context = stream.codec_context
-    channels = int(context.channels or 0)
     sample_rate = int(context.sample_rate or 0)
     time_base = _positive_fraction(stream.time_base, "audio stream time base")
     layout = context.layout
-    channel_layout = str(layout.name) if layout is not None else ""
-    channel_names = (
-        tuple(str(channel.name) for channel in layout.channels) if layout is not None else ()
-    )
-    if channels <= 0 or channels > limits.max_audio_channels:
-        raise MediaDecodeError(
-            f"audio has {channels} channels; limit is {limits.max_audio_channels}",
-            code="audio_channels_limit",
-        )
-    if sample_rate <= 0 or not channel_layout or len(channel_names) != channels:
+    channel_layout, channel_names = _kept_layout(layout) if layout is not None else ("", ())
+    channels = len(channel_names)
+    if sample_rate <= 0 or not channel_layout or not channels:
         raise MediaDecodeError("audio header has no valid native rate/layout", code="audio_format")
     return DecodedAudioFormat(
         channels=channels,
@@ -625,17 +633,21 @@ class _VideoClock:
         stream: Any,
         limits: DecodeLimits,
         end: Fraction | None,
+        note: _Note,
         *,
         start: Fraction | None = None,
         origin: Fraction | None = None,
     ) -> None:
         self._limits = limits
+        self._note = note
         self._av = av
         self._end = end
         self._start = start
         self._origin_time = origin
         self._reformatter = av.video.reformatter.VideoReformatter()
         self._declared_frames = int(stream.frames or 0)
+        self._stream_base = stream.time_base
+        self._shift = 0
         self._last_pts: int | None = None
         self._rotation: int | None = None
         self._color_facts: tuple[int, int, int, int] | None = None
@@ -657,7 +669,6 @@ class _VideoClock:
 
         context = stream.codec_context
         context.thread_count = 1
-        _set_decoder_option(context, "err_detect", "explode")
         _set_decoder_option(context, "max_pixels", limits.max_pixels_per_frame)
         width, height = int(context.width or 0), int(context.height or 0)
         if width > 0 and height > 0:
@@ -668,36 +679,44 @@ class _VideoClock:
         assert self.origin is not None and self.time_base is not None
         return self.origin * self.time_base
 
-    def _check(self, frame: Any) -> _Picture:
+    def _check(self, frame: Any) -> _Picture | None:
+        """A frame on the stream's clock, at its first size and colour, with a warning for what
+        it took to get there; None for one that runs backwards in time."""
         if frame.is_corrupt:
-            raise MediaDecodeError("video decoder marked a frame corrupt", code="media_corrupt")
+            self._note("a damaged video frame was kept as decoded")
         width, height = int(frame.width), int(frame.height)
         _check_pixels(width, height, self._limits)
-        if frame.pts is None or frame.time_base is None:
-            raise MediaDecodeError("video frame has no exact PTS/time base", code="media_clock")
-        time_base = _positive_fraction(frame.time_base, "video frame time base")
+        base = _positive_fraction(frame.time_base or self._stream_base, "video frame time base")
         if self.time_base is None:
-            self.time_base = time_base
-        elif time_base != self.time_base:
-            raise MediaDecodeError("video time base changes between frames", code="media_clock")
-        pts = int(frame.pts)
+            self.time_base = base
+        if frame.pts is None:
+            pts = 0 if self._last_pts is None else self._last_pts + self._frame_step()
+        else:
+            pts = _half_up(_fraction(frame.pts, "video frame PTS") * base / self.time_base)
+        pts += self._shift
         if self._last_pts is not None and pts <= self._last_pts:
-            raise MediaDecodeError("video PTS is not strictly monotone", code="media_clock")
+            if (self._last_pts - pts) * self.time_base <= _CLOCK_RESTART:
+                self._note("video frames that run backwards in time were dropped")
+                return None
+            self._note("a video clock that restarts partway was run on")
+            self._shift += self._last_pts + self._frame_step() - pts
+            pts = self._last_pts + self._frame_step()
         duration = int(frame.duration or 0)
-        rotation = _display_rotation(frame)
+        rotation, skewed = _display_rotation(frame)
+        if skewed:
+            self._note("a flip or shear in the video's display matrix was ignored")
         if self._rotation is None:
             self._rotation = rotation
             if rotation % 180:
                 self.pixel_aspect_ratio = 1 / self.pixel_aspect_ratio
         elif rotation != self._rotation:
-            raise MediaDecodeError("display rotation changes between frames", code="media_rotation")
+            self._note("a display rotation that changes partway was ignored")
         if self._geometry is None:
             self._geometry = (width, height)
-            self.width, self.height = (height, width) if rotation % 180 else (width, height)
+            self.width, self.height = (height, width) if self._rotation % 180 else (width, height)
         elif self._geometry != (width, height):
-            raise MediaDecodeError(
-                "video frame geometry changes after display rotation", code="media_geometry"
-            )
+            self._note("video frames that change size partway were scaled to the first")
+            frame = frame.reformat(width=self._geometry[0], height=self._geometry[1])
         color_facts = _color.normalize(
             width=width,
             height=height,
@@ -709,16 +728,21 @@ class _VideoClock:
         if self._color_facts is None:
             self._color_facts = color_facts
         elif color_facts != self._color_facts:
-            raise MediaDecodeError(
-                "video color facts change between frames", code="media_color_change"
-            )
+            self._note("colour tags that change partway were read as the first")
+            color_facts = self._color_facts
         if self.origin is None:
             self.origin = (
-                pts if self._origin_time is None else _half_up(self._origin_time / time_base)
+                pts if self._origin_time is None else _half_up(self._origin_time / self.time_base)
             )
         self._last_pts = pts
         self._seen += 1
         return _Picture(self, frame, pts, duration, color_facts)
+
+    def _frame_step(self) -> int:
+        """One frame of the stream's nominal rate on its clock, for a frame that states no time."""
+        assert self.time_base is not None
+        rate = self.nominal_frame_rate
+        return max(1, _half_up(1 / (rate * self.time_base))) if rate else 1
 
     def _ends(self, frame: Any, pending: _Picture) -> bool:
         """Whether `frame` starts at or after `end`; then its start ends `pending`."""
@@ -727,11 +751,9 @@ class _VideoClock:
         assert self.origin is not None and self.time_base is not None
         if _positive_fraction(frame.time_base, "video frame time base") != self.time_base:
             return False
-        pts = int(frame.pts)
-        if (pts - self.origin) * self.time_base < self._end:
+        pts = int(frame.pts) + self._shift
+        if (pts - self.origin) * self.time_base < self._end or pts <= pending.pts:
             return False
-        if pts <= pending.pts:
-            raise MediaDecodeError("video PTS is not strictly monotone", code="media_clock")
         pending.duration = pts - pending.pts
         return True
 
@@ -762,6 +784,8 @@ class _VideoClock:
                 self.stopped = True
                 break
             current = self._check(frame)
+            if current is None:
+                continue
             if self._start is not None and pending is None:
                 assert self._origin_time is not None and self.time_base is not None
                 begin = math.floor((self._origin_time + self._start) / self.time_base)
@@ -782,14 +806,11 @@ class _VideoClock:
             and self._declared_frames
             and self._seen != self._declared_frames
         ):
-            raise MediaDecodeError(
-                f"video decoded {self._seen} of {self._declared_frames} declared frames",
-                code="media_truncated",
+            self._note(
+                f"the video decoded {self._seen} of the {self._declared_frames} frames it declares"
             )
         if pending.duration <= 0:
-            raise MediaDecodeError(
-                "the last video frame has no exact positive duration", code="media_clock"
-            )
+            pending.duration = self._frame_step()
         if self._end is not None:
             assert self.origin is not None and self.time_base is not None
             room = self._end / self.time_base - (pending.pts - self.origin)
@@ -825,19 +846,30 @@ class _VideoClock:
 _Event = DecodedMediaHeader | _Picture | DecodedAudioChunk
 
 
-def _one_stream(streams: list[Any], kind: str) -> Any:
-    if len(streams) != 1:
-        _required_stream(kind, len(streams))
+def _first_stream(streams: list[Any], kind: str, note: _Note | None = None) -> Any:
+    """A file's first stream of a kind; it needs one."""
+    if not streams:
+        _required_stream(kind)
+    if len(streams) > 1 and note is not None:
+        note(f"this file has {len(streams)} {kind} streams; the first is used")
     return streams[0]
 
 
-def _soundtrack(container: Any) -> Any | None:
+def _soundtrack(container: Any, note: _Note | None = None) -> Any | None:
     streams = list(container.streams.audio)
-    if len(streams) > 1:
-        raise MediaDecodeError(
-            "video file has more than one soundtrack stream", code="multiple_audio_streams"
-        )
-    return streams[0] if streams else None
+    return _first_stream(streams, "audio", note) if streams else None
+
+
+def _decoded(av: Any, container: Any, stream: Any, note: _Note) -> Iterator[Any]:
+    """A stream's frames, as `container.decode` gives them, past any packet the decoder can't read,
+    which is skipped with a warning as ffmpeg skips it."""
+    for packet in container.demux(stream):
+        try:
+            frames = packet.decode()
+        except av.FFmpegError:
+            note(f"a damaged {stream.type} packet was skipped")
+            continue
+        yield from frames
 
 
 def _audio_events(
@@ -846,6 +878,7 @@ def _audio_events(
     stream: Any,
     limits: DecodeLimits,
     budget: _Budget,
+    note: _Note,
     *,
     end: Fraction | None,
     origin: Fraction | None,
@@ -854,10 +887,10 @@ def _audio_events(
 ) -> Iterator[_Event]:
     audio_format = _stream_audio_format(stream, limits)
     decoder = _AudioStreamDecoder(
-        av, stream, limits, budget, start=start, end=end, origin=origin, retained=retained
+        av, stream, limits, budget, note, start=start, end=end, origin=origin, retained=retained
     )
     yield DecodedMediaHeader(video=None, audio=audio_format)
-    yield from decoder.chunks(iter(container.decode(stream)))
+    yield from decoder.chunks(_decoded(av, container, stream, note))
 
 
 def _media_events(
@@ -866,6 +899,7 @@ def _media_events(
     kind: str,
     limits: DecodeLimits,
     budget: _Budget,
+    note: _Note,
     *,
     end: Fraction | None,
     retained: bool,
@@ -885,35 +919,35 @@ def _media_events(
         source = stack.enter_context(path.open("rb"))
         container = stack.enter_context(av.open(source, mode="r"))
         if kind == "audio":
-            stream = _one_stream(list(container.streams.audio), "audio")
+            stream = _first_stream(list(container.streams.audio), "audio", note)
             yield from _audio_events(
-                av, container, stream, limits, budget,
+                av, container, stream, limits, budget, note,
                 start=start, end=end, origin=None, retained=retained,
             )  # fmt: skip
             return
-        _one_stream(list(container.streams.video), "video")
-        soundtrack = _soundtrack(container)
+        _first_stream(list(container.streams.video), "video", note)
+        soundtrack = _soundtrack(container, note if audio else None)
         if not pictures:
             if soundtrack is None:
-                _required_stream("audio", 0)
+                _required_stream("audio")
             origin = None if start is None and end is None else _first_picture_time(av, path)
             yield from _audio_events(
-                av, container, soundtrack, limits, budget,
+                av, container, soundtrack, limits, budget, note,
                 start=start, end=end, origin=origin, retained=retained,
             )  # fmt: skip
             return
         video_stream = container.streams.video[0]
         origin = None if start is None else _first_picture_time(av, path)
-        clock = _VideoClock(av, video_stream, limits, end, start=start, origin=origin)
+        clock = _VideoClock(av, video_stream, limits, end, note, start=start, origin=origin)
         frames = None
         if origin is not None and start is not None:
-            frames = _seek(av, container, video_stream, origin + start)
+            frames = _seek(av, container, video_stream, origin + start, note)
             if frames is None:
                 source = stack.enter_context(path.open("rb"))
                 container = stack.enter_context(av.open(source, mode="r"))
                 video_stream = container.streams.video[0]
-                clock = _VideoClock(av, video_stream, limits, end, start=start, origin=origin)
-        video = clock.pictures(frames or iter(container.decode(video_stream)))
+                clock = _VideoClock(av, video_stream, limits, end, note, start=start, origin=origin)
+        video = clock.pictures(frames or _decoded(av, container, video_stream, note))
         next_video: _Picture | None = next(video)
         assert next_video is not None and clock.time_base is not None
 
@@ -923,19 +957,20 @@ def _media_events(
         if audio and soundtrack is not None:
             audio_source = stack.enter_context(path.open("rb"))
             audio_container = stack.enter_context(av.open(audio_source, mode="r"))
-            audio_stream = _one_stream(list(audio_container.streams.audio), "audio")
+            audio_stream = audio_container.streams.audio[0]
             audio_format = _stream_audio_format(audio_stream, limits)
             decoder = _AudioStreamDecoder(
                 av,
                 audio_stream,
                 limits,
                 budget,
+                note,
                 start=start,
                 end=end,
                 origin=clock.origin_time,
                 retained=retained,
             )
-            sound = decoder.chunks(iter(audio_container.decode(audio_stream)))
+            sound = decoder.chunks(_decoded(av, audio_container, audio_stream, note))
         next_audio = next(sound, None)
 
         primaries, transfer, matrix, color_range = next_video.color
@@ -965,7 +1000,9 @@ def _media_events(
                 next_audio = next(sound, None)
 
 
-def _seek(av: Any, container: Any, stream: Any, target: Fraction) -> Iterator[Any] | None:
+def _seek(
+    av: Any, container: Any, stream: Any, target: Fraction, note: _Note
+) -> Iterator[Any] | None:
     """The stream's frames from the keyframe at or before `target` seconds, or None when a
     seek does not reach one that starts by then and decodes."""
     if stream.time_base is None:
@@ -973,7 +1010,7 @@ def _seek(av: Any, container: Any, stream: Any, target: Fraction) -> Iterator[An
     at = target
     for _ in range(2):
         container.seek(math.floor(at / stream.time_base), stream=stream, backward=True)
-        frames = iter(container.decode(stream))
+        frames = _decoded(av, container, stream, note)
         try:
             first = next(frames, None)
         except av.FFmpegError:
@@ -988,14 +1025,18 @@ def _seek(av: Any, container: Any, stream: Any, target: Fraction) -> Iterator[An
     return None
 
 
+def _unsaid(_: str) -> None:
+    """For a look ahead whose read says the same again."""
+
+
 def _first_picture_time(av: Any, path: Path) -> Fraction:
     """The presentation time of a video's first decoded frame: the origin `end` counts from."""
     with path.open("rb") as source, av.open(source, mode="r") as container:
         stream = container.streams.video[0]
         stream.codec_context.thread_count = 1
-        for frame in container.decode(stream):
+        for frame in _decoded(av, container, stream, _unsaid):
             if frame.pts is None or frame.time_base is None:
-                raise MediaDecodeError("video frame has no exact PTS/time base", code="media_clock")
+                return Fraction(0)
             return _fraction(frame.pts, "video frame PTS") * _positive_fraction(
                 frame.time_base, "video frame time base"
             )
@@ -1187,6 +1228,7 @@ class MediaReads:
             "video",
             self._limits,
             budget,
+            self._noting(asset),
             start=begin,
             end=cut,
             retained=True,
@@ -1205,7 +1247,9 @@ class MediaReads:
         cut = _effective_end(end, asset._end)
         budget, path = self._start(asset, "AudioFile.read")
         av = _av()
-        events = _media_events(av, path, "audio", self._limits, budget, end=cut, retained=True)
+        events = _media_events(
+            av, path, "audio", self._limits, budget, self._noting(asset), end=cut, retained=True
+        )
         try:
             with _reading(asset, av, "audio"):
                 header = next(events)
@@ -1246,6 +1290,7 @@ class MediaReads:
                 asset.kind,
                 self._limits,
                 budget,
+                self._noting(asset),
                 start=begin,
                 end=cut,
                 retained=False,
@@ -1279,6 +1324,10 @@ class MediaReads:
         if asset._end is not None and probed.source_duration > asset._end:
             return replace(probed, duration=asset._end)
         return probed
+
+    def _noting(self, asset: File) -> _Note:
+        """What a read of `asset` tolerates, as a warning on that field."""
+        return lambda message: self._attempt.warn(asset._input_id or asset.ref, message)
 
     def _acquire_stream(self) -> None:
         self._attempt.check_open("VideoFile.stream")
@@ -1516,24 +1565,13 @@ def _stream_duration(av: Any, container: Any, stream: Any) -> Fraction:
 
 def _probe_video(av: Any, path: Path, limits: DecodeLimits) -> VideoProbe:
     with path.open("rb") as source, av.open(source, mode="r") as container:
-        stream = _one_stream(list(container.streams.video), "video")
+        stream = _first_stream(list(container.streams.video), "video")
         soundtrack = _soundtrack(container)
         context = stream.codec_context
         width, height = int(context.width or 0), int(context.height or 0)
         _check_pixels(width, height, limits)
         matrix = (context.coded_side_data or {}).get("display_matrix")
-        rotation = 0
-        if matrix is not None:
-            raw = bytes(matrix)
-            found = (
-                _PURE_DISPLAY_MATRICES.get(struct.unpack("=9i", raw)) if len(raw) == 36 else None
-            )
-            if found is None:
-                raise MediaDecodeError(
-                    "display matrix contains a flip, shear, scale, or non-quarter rotation",
-                    code="media_rotation",
-                )
-            rotation = found
+        rotation = _matrix_rotation(bytes(matrix))[0] if matrix is not None else 0
         ratio = stream.sample_aspect_ratio
         aspect = _positive_fraction(ratio, "video pixel aspect ratio") if ratio else Fraction(1)
         if rotation % 180:
@@ -1554,7 +1592,7 @@ def _probe_video(av: Any, path: Path, limits: DecodeLimits) -> VideoProbe:
 
 def _probe_audio(av: Any, path: Path, limits: DecodeLimits) -> AudioProbe:
     with path.open("rb") as source, av.open(source, mode="r") as container:
-        stream = _one_stream(list(container.streams.audio), "audio")
+        stream = _first_stream(list(container.streams.audio), "audio")
         audio_format = _stream_audio_format(stream, limits)
         duration = _stream_duration(av, container, stream)
     return AudioProbe(
@@ -1815,48 +1853,39 @@ def _require_finite_f32(data: bytes) -> None:
         raise MediaDecodeError("audio PCM contains NaN or infinity", code="audio_format")
 
 
-_PURE_DISPLAY_MATRICES = {
-    (65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824): 0,
-    (0, -65536, 0, 65536, 0, 0, 0, 0, 1073741824): 90,
-    (0, 65536, 0, -65536, 0, 0, 0, 0, 1073741824): -90,
-    (-65536, 0, 0, 0, -65536, 0, 0, 0, 1073741824): 180,
-}
+def _quarter_turn(degrees: float) -> int:
+    """The nearest of the four upright turns, in `_rotate_rgb`'s terms."""
+    return {0: 0, 1: 90, 2: 180, 3: -90}[round(degrees / 90) % 4]
 
 
-def _display_rotation(frame: Any) -> int:
+def _matrix_rotation(raw: bytes) -> tuple[int, bool]:
+    """A display matrix's quarter turn, and whether it holds more than that (a mirror selfie's flip,
+    a shear, a scale or a slant), which is not applied."""
+    if len(raw) != 36:
+        return 0, True
+    a, b, _, c, d, *_rest = struct.unpack("=9i", raw)
+    # A negative determinant is a flip: without it, what is left is the rotation (FFmpeg's reading).
+    flipped = a * d - b * c < 0
+    degrees = math.degrees(math.atan2(-c if flipped else c, -a if flipped else a))
+    turn = _quarter_turn(degrees)
+    upright = {0: (65536, 0, 0, 65536), 90: (0, -65536, 65536, 0), -90: (0, 65536, -65536, 0),
+               180: (-65536, 0, 0, -65536)}[turn]  # fmt: skip
+    return turn, (a, b, c, d) != upright
+
+
+def _display_rotation(frame: Any) -> tuple[int, bool]:
+    """A frame's quarter turn, and whether its display transform holds more (`_matrix_rotation`)."""
     try:
         # Both PyAV 18 and 19 support typed lookup; iteration changed from values
         # to keys in 19 when SideDataContainer adopted the Mapping contract.
         matrix = frame.side_data.get("DISPLAYMATRIX")
-    except ValueError as exc:
-        # PyAV 18.1 cannot represent some FFmpeg side-data enums (notably EXIF display
-        # transforms). Accepting only frame.rotation would silently discard mirror state.
-        raise MediaDecodeError(
-            "display transform cannot be inspected without losing orientation",
-            code="media_rotation",
-        ) from exc
-    if matrix is None:
-        if int(frame.rotation):
-            raise MediaDecodeError(
-                "frame reports rotation without an inspectable display matrix",
-                code="media_rotation",
-            )
-        return 0
-    raw = bytes(matrix)
-    if len(raw) != 36:
-        raise MediaDecodeError("display matrix has an invalid size", code="media_rotation")
-    rotation = _PURE_DISPLAY_MATRICES.get(struct.unpack("=9i", raw))
-    if rotation is None:
-        raise MediaDecodeError(
-            "display matrix contains a flip, shear, scale, or non-quarter rotation",
-            code="media_rotation",
-        )
-    reported = int(frame.rotation)
-    if reported == -180:
-        reported = 180
-    if reported != rotation:
-        raise MediaDecodeError("display matrix rotation is inconsistent", code="media_rotation")
-    return rotation
+    except ValueError:
+        # PyAV 18.1 cannot represent some FFmpeg side-data enums (notably EXIF display transforms).
+        matrix = None
+    if matrix is not None:
+        return _matrix_rotation(bytes(matrix))
+    reported = float(frame.rotation or 0)
+    return _quarter_turn(reported), bool(reported % 90)
 
 
 def _set_decoder_option(context: Any, name: str, value: object) -> None:
@@ -1874,13 +1903,8 @@ def _check_pixels(width: int, height: int, limits: DecodeLimits) -> None:
         )
 
 
-def _required_stream(kind: str, count: int) -> None:
-    if count == 0:
-        raise MediaDecodeError(f"{kind} file has no {kind} stream", code=f"{kind}_stream_missing")
-    raise MediaDecodeError(
-        f"{kind} file has {count} {kind} streams; exactly one is required",
-        code=f"multiple_{kind}_streams",
-    )
+def _required_stream(kind: str) -> None:
+    raise MediaDecodeError(f"{kind} file has no {kind} stream", code=f"{kind}_stream_missing")
 
 
 def _fraction(value: object, what: str) -> Fraction:
