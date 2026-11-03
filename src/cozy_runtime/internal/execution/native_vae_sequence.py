@@ -472,6 +472,8 @@ def _edge(
     allocations = template.description.functional_allocations if stage == "tail" else ()
     declaration = (
         stage,
+        template.facts()["implementation"],
+        torch.version.git_version,
         template.description.input_metadata,
         template.policy,
         tuple(sorted(template.info["algorithm"].items())),
