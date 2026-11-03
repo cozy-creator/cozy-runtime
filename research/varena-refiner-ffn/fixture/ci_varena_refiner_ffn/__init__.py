@@ -64,7 +64,7 @@ def actual(payload: Probe, ctx: Context):
     assert digest(Path(_ext.__file__)) == payload.extension_sha256
     assert digest(Path(tensorfs.__file__).parent / "_varena_torch.so") == payload.shim_sha256
     assert ctx.device.type == "cuda" and torch.cuda.device_count() == 1
-    uuid = str(torch.cuda.get_device_properties(ctx.device).uuid)
+    uuid = str(torch.cuda.get_device_properties(torch.device(str(ctx.device))).uuid)
     assert uuid.removeprefix("GPU-").lower() == payload.gpu_uuid.removeprefix("GPU-").lower()
     request = _REQUEST.get()
     assert isinstance(request, Request) and request.id == ctx.request_id and not request.idle
@@ -140,6 +140,7 @@ def consumer(payload: Probe, ctx: Context) -> Report:
 
     request, vt = actual(payload, ctx)
     device = ctx.device.index or 0
+    torch_device = torch.device(str(ctx.device))
     result = {"pid": os.getpid(), "scope": "H3-width FFN consumer only; no model qualification",
               "torch": str(torch.__version__), "cases": [], "keys": []}
     try:
@@ -151,7 +152,7 @@ def consumer(payload: Probe, ctx: Context) -> Report:
         assert vt.split_context(device)["eligible"]
         with torch.inference_mode():
             for dtype in (torch.bfloat16, torch.float16):
-                refiner = network(dtype, ctx.device)
+                refiner = network(dtype, torch_device)
                 ff = refiner.ff
                 leaves = (ff.net[0].proj, ff.net[2])
                 assert all(type(leaf) is _native_leaf_class(torch) for leaf in leaves)
@@ -163,7 +164,7 @@ def consumer(payload: Probe, ctx: Context) -> Report:
                 inputs, references = [], []
                 for rows in (5, 17, 513):
                     value = torch.randn((1, rows, 5376), dtype=dtype,
-                                        generator=torch.Generator().manual_seed(13831)).to(ctx.device)
+                                        generator=torch.Generator().manual_seed(13831)).to(torch_device)
                     inputs.append(value)
                     references.append(ff(value).cpu())
                 execution.install(refiner)
@@ -172,7 +173,7 @@ def consumer(payload: Probe, ctx: Context) -> Report:
                 for value, reference in zip(inputs, references, strict=True):
                     # Returning None for unsupported contracts precedes any execution.
                     old_bias = ff.net[2].bias
-                    ff.net[2].bias = torch.zeros(5376, dtype=dtype, device=ctx.device)
+                    ff.net[2].bias = torch.zeros(5376, dtype=dtype, device=torch_device)
                     before = sum(row["selections"] for row in request.working_splits.values())
                     assert split_ffn(contract, value) is None
                     after = sum(row["selections"] for row in request.working_splits.values())
