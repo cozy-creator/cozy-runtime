@@ -75,14 +75,6 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
     return int(stats["allocated_bytes"]), int(stats["mapped_bytes"]), int(stats["allocated_peak"])
 
 
-#: Legacy TensorD room-floor compatibility, not a native retention window. P3 replaces
-#: this external-pressure formula separately; normal demand never sizes its cache from it.
-_ROOM_BLOCKS = 3
-
-
-def yields() -> bool:
-    """Whether the native allocator accepts TensorD's process room; lifecycle stays in TensorD."""
-    return True
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
@@ -1336,15 +1328,6 @@ class Memory:
         self.device = torch.device(device)
         self.cuda: bool = self.device.type == "cuda"
         self.budget_bytes = budget_bytes
-        #: What the machine leaves this process of the GPU while another program needs it
-        #: (`make_room`): its weight pages plus Torch's reserved bytes; None for no limit.
-        self.room_limit: int | None = None
-        self._room_unsupported = False  # a room ask came to a TensorFS that cannot hold one: told once
-        #: the machine's last target for this process's driver bytes (None: none, or lifted)
-        self.room_target: int | None = None
-        #: a raised room (or none) for the running call, taken at its next pass (`_take_room`)
-        self._room_pending: tuple[int | None] | None = None
-        self.last_room: dict[str, object] | None = None
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
         self._working_phase_owners: dict[str, set[Model | Request]] = {}
@@ -1440,7 +1423,6 @@ class Memory:
             return
         if (
             not self.cuda or self.requests or self.models
-            or self.room_limit is not None or self._room_pending is not None
         ):
             raise cooperation.Failure("cooperation must bind at a fresh CUDA Memory start")
         if owner.device != (self.device.index or 0):
@@ -1481,81 +1463,6 @@ class Memory:
         allocated, reserved, peak, resident = self._reading()
         return allocated + resident, reserved + resident, peak + resident
 
-    def room_for(self, target: int | None, held: int) -> int | None:
-        """The machine's `target` for what the driver charges this process (charged `held` at its
-        reading) as a limit on Torch's reserve plus weight pages: the difference is its context
-        and what neither holds, which no limit takes back. Read when the target arrives."""
-        if target is None or not self.cuda:
-            return None
-        return max(target - max(held - self._figures()[1], 0), 0)
-
-    def make_room(self, limit: int | None) -> None:
-        """What the machine leaves this process of the GPU (design/vram-yield.md; `room_for`),
-        None for no limit. Lower than it holds, it gives at once: idle working backing, then
-        weight pages in Varena's reclaim order; in a call, pages only, never below what the call
-        has needed and runs on, so a run streams and is never ended for it. Higher, the running
-        call takes it at its next pass (`_take_room`); idle, at once. Called on the seam's reading
-        thread (or an idle executor's turn): no Memory lock."""
-        if not self.cuda:
-            return
-        if self.cooperation is not None:
-            raise cooperation.Failure("legacy room cannot control a cooperative Memory")
-        if not yields():
-            if not self._room_unsupported:
-                self._room_unsupported = True
-                print(
-                    "residency: TensorFS has no make_room (older than 0.17.16): room asks are"
-                    " ignored, this process does not yield",
-                    file=sys.stderr,
-                    flush=True,
-                )
-            return
-        accounted = self._figures()[1]
-        if limit is not None and max(limit, self._room_floor()) < accounted:
-            # A call's cache is its working set: emptied, another program takes it at once and
-            # the call's next step finds the card full (sieg 23082: out of memory mid-step).
-            if not self.requests:
-                self._release_cache()
-            limit = max(limit, self._room_floor())
-        elif limit is not None and limit < accounted:
-            limit = max(limit, self._room_floor())  # at its floor already: nothing more to give
-        else:
-            raised = limit is None or (self.room_limit is not None and limit > self.room_limit)
-            if raised and self.requests:
-                self._room_pending = (limit,)
-                return
-        self._room_pending = None
-        self._apply_room(limit)
-
-    def room_reading(self, limit: int | None, before: int) -> dict[str, Any]:
-        """A room's outcome and each reason bytes stay: the call's working set, Torch's cache,
-        pages pinned (a call or a kept program on them), pages still filling, and those that could
-        go but did not (reclaim order)."""
-        allocated, reserved, _ = _torch_bytes(self.device)
-        native = self.native.stats() if self.native is not None else {}
-        resident = int(native.get("resident_bytes", 0))
-        calls = sum(1 for request in list(self.requests) if not request.idle)
-        return {
-            "at": time.time(),
-            "target": self.room_target,
-            "limit": limit,
-            "held_before": before,
-            "held": reserved + resident,
-            "floor": self._room_floor(),
-            "calls": calls,
-            "idle_requests": len(self.requests) - calls,
-            "torch_allocated": allocated,
-            "torch_cached": reserved - allocated,
-            "pages_resident": resident,
-            "pages_pinned": int(native.get("pinned_bytes", 0)),
-            "pages_filling": max(resident - int(native.get("ready_bytes", resident)), 0),
-            "pages_reclaimable": int(native.get("reclaimable_bytes", 0)),
-        }
-
-    def held(self) -> int:
-        """Torch's reserve plus this process's weight pages: what a room limits."""
-        return self._figures()[1]
-
     def remember_working_phase(self, key: str, models: tuple[Model | Request, ...]) -> None:
         """A semantic observation lives with its model owners, or its componentless request."""
         with self.lock:
@@ -1579,48 +1486,6 @@ class Memory:
                     owners.remove(model)
                 model.working_phase_keys.remove(key)
 
-    def _room_floor(self) -> int:
-        """What this process must keep to go on: its call's working set as it has peaked (across
-        cut resets) or mapped working backing, whichever is more, its pinned pages and streamed
-        blocks in flight of the models of its phase (running, or the last entered, between
-        forwards); idle, what remains live. A later phase that needs more (a decode) takes
-        it from the call's weight pages through the native allocator."""
-        native = self.native.stats() if self.native is not None else {}
-        pinned = int(native.get("pinned_bytes", 0))
-        allocated, reserved, _ = _torch_bytes(self.device)
-        requests = list(self.requests)
-        if not requests:
-            return allocated + pinned
-        peak = max(request.torch_peak for request in requests)
-        running = set().union(
-            *(r.current | (r.phase(r.last) if r.last else frozenset()) for r in requests)
-        )
-        blocks = (
-            b.allocation_bytes
-            for m in list(self.models.values())
-            if m.name in running
-            for b in m.groups()
-            if not b.table  # one that does not fit gathers (`_gather`)
-        )
-        return max(peak, reserved) + pinned + _ROOM_BLOCKS * max(blocks, default=0)
-
-    def _release_cache(self) -> None:
-        """Return idle working backing; native trim owns capture exclusion."""
-        if not yields():
-            return
-        vt.trim(self.device.index or 0)
-
-    def _apply_room(self, limit: int | None) -> None:
-        self.room_limit = limit
-        reclaimed = varena.make_room(self.device.index or 0, limit)
-        self.last_room = {"limit": limit, "reclaimed": reclaimed, "at_ns": time.time_ns()}
-
-    def _take_room(self) -> None:
-        """A pass boundary: a raised room the running call was given takes effect."""
-        pending, self._room_pending = self._room_pending, None
-        if pending is not None:
-            self._apply_room(pending[0])
-
     def room(self, current: Collection[str] = ()) -> Room:
         if self.cuda:
             free, total = torch.cuda.mem_get_info(self.device)
@@ -1634,8 +1499,6 @@ class Memory:
                 # headroom for an eager allocation.
                 card = max(free - (int(total) - self.budget_bytes), 0)
                 free = min(card, max(self.budget_bytes - self._figures()[1], 0))
-            if self.room_limit is not None:
-                free = min(free, max(self.room_limit - self._figures()[1], 0))
         elif self.device.type == "mps":
             figures = allocation(torch, "mps")
             free, reserved = figures["driver_free_bytes"], figures["reserved_bytes"]
@@ -3270,10 +3133,8 @@ class Memory:
             if not depth:
                 self._declare(model)
             if outer_forward:
-                self._take_room()
                 if request is not None and not request.passed:
                     request.passed = True
-                    request.room_first = {"target": self.room_target, "limit": self.room_limit}
                 self._activate_phase(model)
             if depth:
                 return
@@ -3339,7 +3200,6 @@ class Memory:
                     if not other.idle:
                         other.overlap = True
             self.requests.add(request)
-        self._take_room()  # a raise or lift that came between calls binds this one from its start
         token = _REQUEST.set(request)
         observed = False
         try:
@@ -3369,13 +3229,6 @@ class Memory:
                 try:
                     with self.lock:
                         self.requests.discard(request)
-                        alone = not self.requests
-                    if alone:
-                        self._take_room()  # one that came in the call's last forward
-                    if alone and self.room_limit is not None:
-                        # Held to a room, the next call starts with its own cache, not this one's
-                        # (sieg: SDXL's decode cache left its next denoise nothing to give)
-                        self._release_cache()
                 finally:
                     _REQUEST.reset(token)
                     if observed and self.cooperation is not None:
@@ -3440,8 +3293,6 @@ class Request:
         self.others = tuple(others)
         self.current: set[str] = set()
         self.last = ""  # the model it entered last: its phase streams between forwards too
-        #: the machine's target and the room it ran its first pass in (None: no limit)
-        self.room_first: dict[str, int | None] | None = None
         self.passed = False
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
@@ -3450,8 +3301,7 @@ class Request:
         self.working_phase_keys: set[str] = set()
         self.working_splits: dict[str, dict[str, Any]] = {}
         self.peak = 0
-        #: Working allocation peak over the whole request, kept across cut-site resets: the
-        #: least room its call runs in (`Memory._room_floor`)
+        #: Working allocation peak over the whole request, kept across cut-site resets.
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
@@ -3649,7 +3499,6 @@ class Request:
                 self.memory.cooperation.facts() if self.memory.cooperation is not None else None
             ),
             "phase_policy_supported": self.memory.phase_supported,
-            "room_first_pass": self.room_first,
             "gathered": self.gathered,
             "host": None,
         }

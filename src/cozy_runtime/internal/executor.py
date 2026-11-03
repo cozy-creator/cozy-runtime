@@ -809,7 +809,7 @@ class Executor:
         self.mux: Mux = (
             host.mux
             if host is not None
-            else Mux(channel, functools.partial(_supplied, self.bearers), self._discard, self._room)
+            else Mux(channel, functools.partial(_supplied, self.bearers), self._discard)
         )
         self.in_flight: _InFlight = host.in_flight if host is not None else _InFlight()
         #: the construction key this generation was loaded under; "" on the host
@@ -1020,9 +1020,6 @@ class Executor:
             # Correlated PrepareRequest replies and cancellation-safe publication.
             "request_lookahead": True,
             "cooperative_owner": cooperation.capable(),
-            # `room` read at once, a running call's included (`_room`), where TensorFS can hold one
-            # (`residency.yields`: imported here, residency would bring Torch in before the hello).
-            "room": True,
             "sealed": dict(_SEALED),
             "rank": self.rank,
             "world": self.world,
@@ -3369,72 +3366,6 @@ class Executor:
         if self.order is not None:
             self.order.wake()  # an idle period may open now (`awaiting_invoke`)
 
-    def _room(self, frame: Frame) -> None:
-        """TensorD's `room` (design/vram-yield.md): the GPU bytes this process may hold (`target`,
-        against what the driver charged it, `held`; none: no limit). Taken on the thread that read
-        it, a running call's included. Idle and asked to give, its kept programs (graphs,
-        decoders, holds) go first, in its command order. A group's followers serve their own
-        GPUs: rank 0 takes only its own."""
-        if self.host.cooperation_config is not None:
-            self.poisoned = self.poisoned or "legacy room reached a cooperative executor"
-            raise cooperation.Failure(self.poisoned)
-        memory = self.host.memory
-        if memory is None or not memory.cuda or int(frame.get("device", 0)) != 0:
-            return
-        target = frame.get("target")
-        try:
-            held = int(frame.get("held", 0))
-            memory.room_target = None if target is None else int(target)
-            limit = memory.room_for(memory.room_target, held)
-            if limit is not None and not memory.requests and self.order is not None:
-                ticket = self.order.ticket(True, "room")
-                threading.Thread(
-                    target=self._idle_room, args=(memory, limit, ticket), name="room", daemon=True
-                ).start()
-                return
-            before = memory.held()
-            memory.make_room(limit)
-            self._room_kept(memory, limit, before)
-        except Exception as exc:  # the seam outlives a refused room; the next reading asks again
-            self._room_kept(memory, None, 0, exc)
-            traceback.print_exc()
-            sys.stderr.flush()
-
-    def _idle_room(self, memory: Memory, limit: int, ticket: int) -> None:
-        """An idle executor's room, in its turn: its unpinned pages go first; only if they cannot
-        meet it do its kept programs (graphs, decoders, holds) release their pins, so its next
-        call stays a native replay when they can."""
-        assert self.order is not None
-        try:
-            with self.order.turn(ticket), self._execution_context():
-                before = memory.held()
-                memory.make_room(limit)
-                if not memory.requests and limit < memory.held():
-                    accel.drain(self.torch, self.device_kind)
-                    self._release_programs()
-                    memory.make_room(limit)
-                self._room_kept(memory, limit, before)
-        except Exception as exc:
-            self._room_kept(memory, limit, 0, exc)
-            traceback.print_exc()
-            sys.stderr.flush()
-
-    def _room_kept(
-        self, memory: Memory, limit: int | None, before: int, error: Exception | None = None
-    ) -> None:
-        """What this process holds after a room, and why, in `room.json` in its root, where the
-        machine reads it when a give moved less than asked; a room that raised says so, gave 0."""
-        reading: dict[str, Any] = {"at": time.time(), "gave": 0, "error": repr(error)}
-        if error is None:
-            reading = memory.room_reading(limit, before)
-        reading["order"] = self.order.holders() if self.order is not None else []
-        path = self.root / "room.json"
-        try:
-            path.with_suffix(".tmp").write_text(json.dumps(reading))
-            path.with_suffix(".tmp").replace(path)
-        except (OSError, TypeError, ValueError):
-            pass  # the report is evidence only
-
     def _release_programs(self, constructions: Iterable[Executor] | None = None) -> None:
         """Every slot's decoders, graphs and holds go: what pins weight pages besides a call."""
         for child in self.constructions.values() if constructions is None else constructions:
@@ -5514,7 +5445,7 @@ class _Order:
                 self._changed.notify_all()
 
     def holders(self) -> list[str]:
-        """What holds or waits for the order now (`room.json`)."""
+        """What holds or waits for the command order now."""
         with self._changed:
             return [what for _, what in self._open.values()]
 
