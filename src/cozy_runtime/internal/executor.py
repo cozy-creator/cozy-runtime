@@ -5448,6 +5448,12 @@ def _idle(executor: Executor, order: _Order) -> None:
                 if fault(exc) in (Fault.STICKY, Fault.DEVICE):
                     executor.poisoned = executor.poisoned or f"device fault at idle: {exc}"[:300]
                     return
+                row = (
+                    "idle work failed: graphs or host pages stay unbuilt",
+                    {"reason": type(exc).__name__},
+                )
+                if row not in WARNINGS:
+                    WARNINGS.append(row)
 
 
 def serve(executor: Executor, channel: Channel) -> int:

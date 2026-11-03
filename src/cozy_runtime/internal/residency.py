@@ -34,6 +34,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import CapabilityError, Fault, fault
+from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
@@ -1418,6 +1419,8 @@ class Memory:
         self._host_cap = max(physical_memory(), 0) // 2
         #: stored pages to pin once the executor is idle (`pin_idle`), never on a request's path
         self._wanted: OrderedDict[tuple[object, ...], _Block] = OrderedDict()
+        #: wanted pages whose idle read failed: their refills stay on the store
+        self._pin_failed = 0
         #: a wanted page read whole when a command arrived: it registers at the next idle
         self._filled: tuple[tuple[object, ...], _Block, Tensor] | None = None
         #: each stored page's refills in the running request, and in the last request that
@@ -2084,7 +2087,15 @@ class Memory:
                         offset += (part.nbytes + 255) // 256 * 256
                         tensor[end:offset].zero_()
                 tensor[offset:].zero_()
-            except Exception:  # a store or fetch failure only leaves this page unpinned
+            except Exception as exc:  # a store or fetch failure only leaves this page unpinned
+                self._pin_failed += 1
+                row = (
+                    "a host page did not pin: its refills stay on the store",
+                    {"reason": type(exc).__name__},
+                )
+                if row not in WARNINGS:
+                    WARNINGS.append(row)
+                    print(f"[residency] a host page did not pin: {exc!r}"[:300], file=sys.stderr)
                 continue
             if waiting():
                 self._filled = (page, block, tensor)
@@ -2169,6 +2180,12 @@ class Memory:
             return _HostPage(tensor)
         except (RuntimeError, OSError) as error:
             self._host_tier = False
+            WARNINGS.append(
+                (
+                    "weights stream from the store: pinning host memory failed",
+                    {"reason": str(error)[:300]},
+                )
+            )
             warnings.warn(
                 f"weights stream from the store: pinning host memory failed ({error})",
                 RuntimeWarning,
@@ -3911,6 +3928,7 @@ class Request:
                 "cap": self.memory._host_cap,
                 "pinned": self.memory._host_tier,
                 "wanted": len(self.memory._wanted),
+                "pin_failed": self.memory._pin_failed,
             },
             "trace": list(self.trace),
             "trace_scope": "fills",

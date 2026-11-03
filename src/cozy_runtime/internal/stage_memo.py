@@ -48,6 +48,7 @@ from cozy_runtime.author._executor_requests import (
     StageMemoStore,
 )
 from cozy_runtime.author._files import File
+from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.author._stage_memo import exactness
 from cozy_runtime.internal import attention, hostfacts, installed
 from cozy_runtime.internal.executor_commands import MemoSettings
@@ -776,6 +777,12 @@ def install(
         )
     except Exception as exc:  # the memo is an optimization: this load serves without it
         _LOG.warning("stage memo off for %s: %s", type(model).__qualname__, exc)
+        WARNINGS.append(
+            (
+                "a model's stage memo is off: its stages run on every request",
+                {"model": type(model).__qualname__, "reason": str(exc)[:300]},
+            )
+        )
         return
     object.__setattr__(model, "_cozy_memo", memo)
 
