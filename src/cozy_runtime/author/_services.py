@@ -191,7 +191,8 @@ class Attempt:
     published: list[Publish] = field(default_factory=list)
     #: The result fields `Outputs.publish` may name (`Surface.outputs`); None: not known here.
     outputs: frozenset[str] | None = None
-    #: Handles delivered as products, or joined into one: the result need not return them.
+    #: Handles delivered as products, joined into one or given to a child: the result need not
+    #: return them.
     shown: set[str] = field(default_factory=set)
     #: A composite asset's parts, by its handle: what `publish` sends instead of one file.
     parts: dict[str, tuple[PublishPart, ...]] = field(default_factory=dict)
@@ -387,8 +388,8 @@ class _AuthorEvents(Iterator[DecodedMediaEvent]):
 class Outputs(_Bound):
     """Transactional outputs (``out``). Save registers a bounded pending handle.
 
-    Returning a saved value completes it with the invocation. ``await commit(file)``
-    completes an owned file earlier so the running caller can forward it.
+    Returning a saved value completes it with the invocation. Passing a saved file to a child
+    call gives the child its bytes, and the result need not return it then.
     """
 
     __slots__ = ()

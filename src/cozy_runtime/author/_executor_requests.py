@@ -29,6 +29,15 @@ class ChildEvents(_Request, frozen=True, kw_only=True, tag="child_events"):
     """The socket the worker nudges when one of this attempt's calls moves."""
 
 
+class SavedFile(msgspec.Struct, frozen=True, kw_only=True):
+    """A file the caller saved and passes to its child: its handle, and the digest the payload
+    names it by, which TensorD checks its bytes against."""
+
+    asset_ref: str
+    digest: str
+    media_type: str = ""
+
+
 class ChildCall(_Request, frozen=True, kw_only=True, tag="child_call"):
     call_index: Annotated[int, msgspec.Meta(ge=0, le=MAX_CALL_INDEX)]
     module: str
@@ -36,6 +45,7 @@ class ChildCall(_Request, frozen=True, kw_only=True, tag="child_call"):
     #: The callee's canonical request document.
     payload: str
     progress_label: str = ""
+    saved: tuple[SavedFile, ...] = ()
 
 
 class _Indexed(_Request, frozen=True, kw_only=True):
