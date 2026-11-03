@@ -37,8 +37,8 @@ class Unavailable(RuntimeError):
 def unsupported(torch: Any) -> str:
     return (
         ""
-        if torch.__version__.split(".")[:2] == ["2", "14"]
-        else ("library-workspace graph lifetime is qualified only on Torch 2.14")
+        if torch.__version__.split(".")[:2] in (["2", "14"], ["2", "15"])
+        else ("library-workspace graph lifetime is qualified only on Torch 2.14 and 2.15")
     )
 
 
