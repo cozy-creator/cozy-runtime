@@ -51,6 +51,14 @@ def _pointer(value: Tensor | None) -> int:
     return 0 if value is None else value.data_ptr()
 
 
+def _overlap(left: Tensor, right: Tensor) -> bool:
+    # Independently exported Storage objects can still name the same memory.
+    # Check the actual contiguous spans as well as Torch's Storage identity.
+    return (torch._C._is_alias_of(left, right)
+            or max(left.data_ptr(), right.data_ptr())
+            < min(left.data_ptr() + _capacity(left), right.data_ptr() + _capacity(right)))
+
+
 def _scope() -> None:
     from cozy_runtime.internal.execution import catch
     if catch.uncommitted_scope():
@@ -317,7 +325,7 @@ class Prepared:
         frequency = d.decoder.rope._buffers.get("inv_freq")
         if frequency is not d.inv_freq or not _ordinary(frequency) or _metadata(frequency) != d.frequency_metadata:
             raise ValueError("H3 prefix frequency buffer changed")
-        if any(t.data_ptr() % 16 for t in (value, *parameters, frequency)):
+        if any(t.data_ptr() == 0 or t.data_ptr() % 16 for t in (value, *parameters, frequency)):
             raise ValueError("H3 prefix sources require aligned native layouts")
         expected = d.buffer_specs(self.info["workspace_bytes"])
         if set(buffers.values) != {name for name, _, _ in expected}:
@@ -326,9 +334,10 @@ class Prepared:
         for name, shape, dtype in (*expected, ("prepared_bias", (WIDTH,), torch.float16)):
             tensor = self.bias if name == "prepared_bias" else buffers[name]
             if (not _ordinary(tensor) or tuple(tensor.shape) != shape or tensor.dtype != dtype
-                    or tensor.device != value.device or not tensor.is_contiguous() or tensor.data_ptr() % 256):
+                    or tensor.device != value.device or not tensor.is_contiguous()
+                    or tensor.data_ptr() == 0 or tensor.data_ptr() % 256):
                 raise ValueError("H3 prefix buffer differs from its declared allocation")
-            if any(torch._C._is_alias_of(tensor, other) for other in (value, *parameters, frequency, *destinations)):
+            if any(_overlap(tensor, other) for other in (value, *parameters, frequency, *destinations)):
                 raise ValueError("H3 prefix writes require independent owned storage")
             destinations.append(tensor)
         matrix = buffers["weight_cast"] if d.weight_cast else parameters[0]
