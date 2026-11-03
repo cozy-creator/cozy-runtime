@@ -200,11 +200,20 @@ class App:
         field that describes its fixed repeated weight use before construction."""
         return self._register(fn, True, **options)
 
-    def project_adapter(self, kind: str, /) -> Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register what turns one project node into this package's own call (`author.Invocation`): `kind` is `shot`,
-        `upscale`, `entity`, `setup` or `world_state`, and it reads that node's record (`author.ProjectShot`, ...). A public
-        function named `project-adapter-<kind>`, on the CPU, so a machine runs it as it runs any other."""
-        return self._register(None, False, name=f"project-adapter-{kind}", accelerator=False)
+    def project_adapter(self, *functions: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+        """Register what turns one project operation into this package's own call, for each function named: it reads an
+        `author.Operation`, or a subclass typing `fields`, and answers an `author.Invocation`, `None` for no run, or raises
+        `author.Refuse`. A public function per name, `project-adapter-<function>`, on the CPU, so a machine runs it as it
+        runs any other. Until Calcifer moves, a node kind (`shot`, `entity`, ...) names one too, reading its old record."""
+
+        def decorate(target: Callable[P, R]) -> Callable[P, R]:
+            for function in functions:
+                self._register(None, False, name=f"project-adapter-{function}", accelerator=False)(
+                    target
+                )
+            return target
+
+        return decorate
 
     def _register(
         self,

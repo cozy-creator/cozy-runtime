@@ -186,6 +186,9 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._project import (
     Invocation,
+    Keep,
+    Operation,
+    OperationFile,
     ProjectBeat,
     ProjectContinue,
     ProjectEntity,
@@ -195,6 +198,9 @@ from cozy_runtime.author._project import (
     ProjectShot,
     ProjectUpscale,
     ProjectWorldState,
+    Read,
+    Refuse,
+    Write,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
 from cozy_runtime.author._split import Cut, split
@@ -418,6 +424,12 @@ __all__ = [
     "upload_checkpoint",
     "uses_components",
     "Invocation",
+    "Keep",
+    "Operation",
+    "OperationFile",
+    "Read",
+    "Refuse",
+    "Write",
     "ProjectBeat",
     "ProjectContinue",
     "ProjectEntity",

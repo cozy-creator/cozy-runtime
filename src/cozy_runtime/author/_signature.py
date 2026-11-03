@@ -45,6 +45,7 @@ from cozy_runtime.author._markers import (
 )
 from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
+from cozy_runtime.author._project import adapter_result
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional, walk
 from cozy_runtime.author._weights import WeightsOutput, weights_class
@@ -654,7 +655,7 @@ def analyze(
             payload_type = assets_payload(
                 typing.cast(type[msgspec.Struct], payload_type), binding, fn.__name__, fn.__module__
             )
-    result = hints.get("return")
+    result = adapter_result(hints.get("return"))
     if result is None or not is_struct(strip(result)[0]):
         raise ConformanceError(
             f"{where}: the return annotation must be a msgspec.Struct result schema "

@@ -66,6 +66,7 @@ from cozy_runtime.author._model_defaults import (
     model_phases,
     model_prepared_use,
 )
+from cozy_runtime.author._project import adapter_result
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
 from cozy_runtime.author._services import SERVICES
@@ -311,6 +312,11 @@ _VIDEO_STRUCTS = (
     "UpscaleRequest",
     "UpscaleResult",
     "Invocation",
+    "Operation",
+    "OperationFile",
+    "Read",
+    "Write",
+    "Keep",
     "ProjectBeat",
     "ProjectContinue",
     "ProjectEntity",
@@ -2057,15 +2063,35 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                     continue
                 keywords = decorator.keywords if isinstance(decorator, ast.Call) else []
                 if method == "project_adapter":
-                    kind = decorator.args[0] if isinstance(decorator, ast.Call) and decorator.args else None
-                    if not (isinstance(kind, ast.Constant) and isinstance(kind.value, str)):
-                        reader.refuse(module, decorator, "a project adapter names its kind", "static_unsupported")
-                    # `App.project_adapter`: an entrypoint by another name.
-                    method, keywords = "entrypoint", [
-                        ast.keyword("name", ast.Constant(f"project-adapter-{kind.value}")),
-                        ast.keyword("accelerator", ast.Constant(False)),
-                    ]
-                elif isinstance(decorator, ast.Call) and decorator.args:
+                    names = decorator.args if isinstance(decorator, ast.Call) else []
+                    if not names or not all(
+                        isinstance(n, ast.Constant) and isinstance(n.value, str) for n in names
+                    ):
+                        reader.refuse(
+                            module,
+                            decorator,
+                            "a project adapter names its functions",
+                            "static_unsupported",
+                        )
+                    # `App.project_adapter`: an entrypoint by another name, per function.
+                    for adapted in names:
+                        registration = _registration(
+                            reader,
+                            module,
+                            stmt,
+                            "entrypoint",
+                            [
+                                ast.keyword(
+                                    "name", ast.Constant(f"project-adapter-{adapted.value}")
+                                ),
+                                ast.keyword("accelerator", ast.Constant(False)),
+                            ],
+                            decorator=decorator,
+                        )
+                        if registration is not None:
+                            found.append(registration)
+                    continue
+                if isinstance(decorator, ast.Call) and decorator.args:
                     reader.refuse(
                         module, decorator, "positional decorator arguments", "static_unsupported"
                     )
@@ -2360,7 +2386,7 @@ def _callable(reader: Reader, registration: Registration) -> Declaration:
         )
     if fn.returns is None:
         reader.refuse(module, fn, "no return annotation")
-    result = reader.translate(module, fn.returns)
+    result = adapter_result(reader.translate(module, fn.returns))
     if not is_struct(result):
         reader.refuse(
             module, fn.returns, "the return annotation must be a msgspec.Struct result schema"
