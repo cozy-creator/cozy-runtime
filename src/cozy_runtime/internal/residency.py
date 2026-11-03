@@ -1437,6 +1437,10 @@ class Memory:
             try:
                 if budget_bytes is not None:
                     varena.set_activation_limit(self.device.index or 0, budget_bytes)
+                    if yields():
+                        # A smaller room reads as a smaller card to every fill, a prefetch's too: on
+                        # a 32 GB card an 8 GiB cap let H3's text encoder fill 22 GB (s8-h3).
+                        varena.make_room(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = bool(
@@ -1598,6 +1602,8 @@ class Memory:
 
     def _apply_room(self, limit: int | None) -> None:
         self.room_limit = limit
+        if self.budget_bytes is not None:  # the development cap stays whatever the machine asks
+            limit = self.budget_bytes if limit is None else min(limit, self.budget_bytes)
         reclaimed = varena.make_room(self.device.index or 0, limit)
         self.last_room = {"limit": limit, "reclaimed": reclaimed, "at_ns": time.time_ns()}
 
@@ -2754,7 +2760,6 @@ class Memory:
         needed = int(region.allocated_bytes)
         if (
             reclaim
-            and self.budget_bytes is None
             and not region.resident
             and not self.capturing()
             and not self._running(model)
@@ -2763,13 +2768,10 @@ class Memory:
         ):
             # Common weights may bind before their model's first forward enters its phase.
             # Return unused Torch cache first; native allocation still decides whether idle
-            # weights actually need eviction. Budgeted demand already does this in reclaim().
+            # weights actually need eviction.
             release_cached(torch, self.device.type)
-        if not region.resident and (not reclaim or self.budget_bytes is not None):
-            if reclaim and needed > self.room().free:
-                self.reclaim(needed, current={model.name})
-            if needed > self.room().free:
-                raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
+        if not region.resident and not reclaim and needed > self.room().free:
+            raise torch.OutOfMemoryError("the weight block exceeds currently free local memory")
         # Converted raw bytes are working storage for an admitted preferred final block.
         # Avoid charging that temporary Fill against the idle streaming window; native
         # prefix reductions and real allocation pressure still apply to the preparation.
