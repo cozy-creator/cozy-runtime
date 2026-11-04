@@ -45,7 +45,11 @@ def attention(
     blocks = -(-len_k // cta)
     device, f32, i8 = q.device, torch.float32, torch.int8
     wide = q.numel() >= HEADS_FIRST
-    out = torch.empty(batch, heads, len_q, dim, dtype=q.dtype, device=device) if wide else torch.empty_like(q)
+    out = (
+        torch.empty(batch, heads, len_q, dim, dtype=q.dtype, device=device)
+        if wide
+        else torch.empty_like(q)
+    )
     q4 = torch.empty(batch, heads, len_q, dim // 2, dtype=i8, device=device)
     k4 = torch.empty(batch, heads_k, len_k, dim // 2, dtype=i8, device=device)
     v8 = torch.empty(batch * heads_k * dim, blocks * cta, dtype=i8, device=device)

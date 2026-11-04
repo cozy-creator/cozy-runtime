@@ -464,7 +464,7 @@ class _Launcher:
 
     def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
         if torch.cuda.current_device() != self.index:
-            # Triton launches on this thread's device, where these handles and operands mean nothing.
+            # Triton launches on this thread's device, where these mean nothing.
             raise ValueError(
                 f"{kernel.__name__} is loaded on cuda:{self.index}, this thread is on "
                 f"cuda:{torch.cuda.current_device()}"

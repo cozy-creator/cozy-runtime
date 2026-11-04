@@ -360,15 +360,34 @@ _FA3_UNIT = "if not (packgqa and (paged or split))]"
 #: SageAttention2's Hopper path addresses past 2^31 elements (a real H3 1440p: Xid 31, run 28514):
 #: its Triton quantizers' offsets in 64 bits, and its tensor maps' strides, which an int wraps
 #: until `cuTensorMapEncodeTiled` refuses them and upstream asserts.
-_SAGE_QUANT, _SAGE_SM90 = "sageattention/triton/quant_per_thread.py", "csrc/qattn/qk_int_sv_f8_cuda_sm90.cu"
+_SAGE_QUANT, _SAGE_SM90 = (
+    "sageattention/triton/quant_per_thread.py",
+    "csrc/qattn/qk_int_sv_f8_cuda_sm90.cu",
+)
 _SAGE_OFFSETS: tuple[tuple[str, str, str], ...] = (
-    (_SAGE_QUANT, "off_blk = tl.program_id(0) // 8", "off_blk = (tl.program_id(0) // 8).to(tl.int64)"),
-    (_SAGE_QUANT, "off_blk = tl.program_id(0) // 4", "off_blk = (tl.program_id(0) // 4).to(tl.int64)"),
+    (
+        _SAGE_QUANT,
+        "off_blk = tl.program_id(0) // 8",
+        "off_blk = (tl.program_id(0) // 8).to(tl.int64)",
+    ),
+    (
+        _SAGE_QUANT,
+        "off_blk = tl.program_id(0) // 4",
+        "off_blk = (tl.program_id(0) // 4).to(tl.int64)",
+    ),
     (_SAGE_QUANT, "off_h = tl.program_id(1)", "off_h = tl.program_id(1).to(tl.int64)"),
     (_SAGE_QUANT, "off_b = tl.program_id(2)", "off_b = tl.program_id(2).to(tl.int64)"),
-    (_SAGE_SM90, "int stride1, int stride2, int stride3", "int64_t stride1, int64_t stride2, int64_t stride3"),
+    (
+        _SAGE_SM90,
+        "int stride1, int stride2, int stride3",
+        "int64_t stride1, int64_t stride2, int64_t stride3",
+    ),
     *(
-        (_SAGE_SM90, f"int stride_bz_{x} = {name}.stride(0);", f"int64_t stride_bz_{x} = {name}.stride(0);")
+        (
+            _SAGE_SM90,
+            f"int stride_bz_{x} = {name}.stride(0);",
+            f"int64_t stride_bz_{x} = {name}.stride(0);",
+        )
         for x, name in (("q", "query"), ("k", "key"), ("v", "value"), ("o", "output"))
     ),
 )
