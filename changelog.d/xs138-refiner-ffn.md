@@ -1,1 +1,0 @@
-- Add a complete native row-selection consumer for supported Diffusers SwiGLU FFNs using actual int8 projection plans and supplied activation/output storage. Accepted calls bypass both legacy FFN choosers without retries; GPU qualification remains pending.

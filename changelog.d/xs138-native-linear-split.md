@@ -1,1 +1,0 @@
-- Add an exact native workspace query and a varena row menu for standalone mma.sync int8 projections; preserve other split paths while the new consumer is qualified.

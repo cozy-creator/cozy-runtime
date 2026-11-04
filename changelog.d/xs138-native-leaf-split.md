@@ -1,1 +1,0 @@
-Declare a complete native split menu for noncontiguous batched fused channel norms, preserving the kernel and reduction domains. Commit one exact choice before execution, prevent retry after partial writes, and learn only after an explicit same-stream phase completion; capture, legacy nested cuts and other kernel families remain outside this first adapter.

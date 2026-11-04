@@ -1,1 +1,0 @@
-Runtime owns an explicit non-blocking CUDA execution stream across initialization, commands, readiness and idle work; graph domains use unique non-blocking streams and completion boundaries use recorded events.
