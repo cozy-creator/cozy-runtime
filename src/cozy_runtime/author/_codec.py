@@ -180,7 +180,7 @@ def _drain(obj: object, what: str) -> tuple[object, str]:
 
 
 def snapshot_video(frames: object, max_output_bytes: int) -> Planar:
-    """[T, H, W, 3] uint8, H and W even (yuv420p), snapshot-bounded. Refusals are typed
+    """[T, H, W, 3] uint8, cut to even H and W (yuv420p), snapshot-bounded. Refusals are typed
     at registration, never at encode time."""
     arr, dtype = _drain(frames, "video frames")
     if "uint8" not in dtype:
@@ -192,11 +192,9 @@ def snapshot_video(frames: object, max_output_bytes: int) -> Planar:
         )
     t, h, w, _ = shape
     if h % 2 or w % 2:
-        raise OutputError(
-            f"video frames are {w}x{h}: H.264 yuv420p needs even dimensions — the geometry "
-            "fit/restore plane (cr-017's remaining half) owns fitting, not the encoder",
-            code="frame_shape",
-        )
+        h, w = h - h % 2, w - w % 2
+        arr = arr[:, :h, :w]  # type: ignore[index]
+        shape = (t, h, w, 3)
     limit = SNAPSHOT_FACTOR * max_output_bytes
     if t * h * w * 3 > limit:
         raise OutputError(
@@ -213,6 +211,14 @@ def snapshot_video(frames: object, max_output_bytes: int) -> Planar:
             f"video frames yielded {data.nbytes} bytes for shape {shape}", code="frame_shape"
         )
     return Planar(data, shape)
+
+
+def even_rgb(rgb: bytes, width: int, height: int) -> bytes:
+    """An RGB8 frame without its last row or column where a side is odd, as H.264 needs."""
+    if not width % 2:
+        return rgb if not height % 2 else rgb[: width * (height - 1) * 3]
+    image = Image.frombuffer("RGB", (width, height), rgb, "raw", "RGB", 0, 1)
+    return image.crop((0, 0, width - 1, height - height % 2)).tobytes()
 
 
 def snapshot_audio(waveform: object, max_output_bytes: int) -> tuple[Planar, int]:

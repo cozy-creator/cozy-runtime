@@ -453,13 +453,16 @@ class Outputs(_Bound):
         self._attempt.check_open("Outputs.save_video")
         if format != "mp4":
             raise OutputError(
-                f"video format {format!r} has no encoder: the one A/V product is the muxed "
-                "mp4 (h264+aac) and the codec zoo is a closed door (cr-017)",
+                f"video format {format!r} has no encoder: save it as mp4 (h264+aac)",
                 code="encoder_unavailable",
             )
         if not (isinstance(fps, (int, float)) and 0 < fps < 1000 and fps == fps):
             raise OutputError(f"fps {fps!r} is not a positive frame rate", code="frame_rate")
         video = _codec.snapshot_video(frames, self._attempt.max_output_bytes)
+        _, height, width, _ = video.shape
+        shaped = getattr(frames, "shape", ())
+        if len(shaped) == 4 and (int(shaped[1]), int(shaped[2])) != (height, width):
+            self._attempt.warn("video", f"H.264 takes even sides, so it was cut to {width}x{height}")
         planar = None
         if audio is not None:
             if sample_rate is None:
@@ -498,9 +501,16 @@ class Outputs(_Bound):
                 "streaming video must begin with one video header", code="media_header"
             )
         video_format = header.video
-        if video_format.nominal_frame_rate is None:
-            raise OutputError("streaming video header has no nominal frame rate", code="frame_rate")
         rate = video_format.nominal_frame_rate
+        if rate is None or not 0 < rate < 1000:
+            self._attempt.warn("video", "it names no frame rate this can write; written at 24 fps")
+            rate = Fraction(24)
+        width, height = video_format.width, video_format.height
+        even = (width - width % 2, height - height % 2)
+        if even != (width, height):
+            self._attempt.warn(
+                "video", f"H.264 takes even sides, so {width}x{height} was cut to {even[0]}x{even[1]}"
+            )
         audio_format = header.audio
 
         def feed(encoder: _codec.StreamingMP4Encoder) -> int:
@@ -561,7 +571,7 @@ class Outputs(_Bound):
                         f"its frames aren't on a constant clock; written at {float(rate):g} fps, "
                         "so its timing is evened out",
                     )
-                encoder.write_video(event.rgb)
+                encoder.write_video(_codec.even_rgb(event.rgb, width, height))
                 for chunk in early:
                     audio_samples = write_sound(chunk)
                 early.clear()
@@ -569,8 +579,8 @@ class Outputs(_Bound):
 
         return self._save_mp4(
             dict(
-                width=video_format.width,
-                height=video_format.height,
+                width=even[0],
+                height=even[1],
                 frame_rate=rate,
                 pixel_aspect_ratio=video_format.pixel_aspect_ratio,
                 color_primaries=video_format.color_primaries,

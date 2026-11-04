@@ -664,7 +664,7 @@ class _VideoClock:
         self.width = 0
         self.height = 0
         self.stopped = False
-        rate = stream.average_rate
+        rate = stream.average_rate or stream.guessed_rate
         self.nominal_frame_rate = _positive_fraction(rate, "video average rate") if rate else None
         ratio = stream.sample_aspect_ratio
         # PyAV 19 represents unspecified ratios as a falsy AVRational rather
@@ -1583,7 +1583,7 @@ def _probe_video(av: Any, path: Path, limits: DecodeLimits) -> VideoProbe:
         aspect = _positive_fraction(ratio, "video pixel aspect ratio") if ratio else Fraction(1)
         if rotation % 180:
             width, height, aspect = height, width, 1 / aspect
-        rate = stream.average_rate
+        rate = stream.average_rate or stream.guessed_rate
         audio_format = _stream_audio_format(soundtrack, limits) if soundtrack is not None else None
         duration = _stream_duration(av, container, stream)
     return VideoProbe(
@@ -1943,7 +1943,9 @@ def _check_pixels(width: int, height: int, limits: DecodeLimits) -> None:
 
 
 def _required_stream(kind: str) -> None:
-    raise MediaDecodeError(f"{kind} file has no {kind} stream", code=f"{kind}_stream_missing")
+    raise MediaDecodeError(
+        f"this file has no {kind} in it: give a file that does", code=f"{kind}_stream_missing"
+    )
 
 
 def _fraction(value: object, what: str) -> Fraction:
