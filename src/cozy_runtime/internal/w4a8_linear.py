@@ -45,7 +45,7 @@ def _row_has_int8(torch: ModuleType, index: int) -> bool:
 
 
 def _after_library(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
-    if int8_linear.native(torch, index) is None:  # it waits for the library's own prime
+    if kernel_ready.opened(f"{int8_linear.NATIVE} cuda:{index}") is None:  # its own prime
         raise RuntimeError("the 8-bit library does not serve this card")
     return _verified(torch, index, wait)
 
