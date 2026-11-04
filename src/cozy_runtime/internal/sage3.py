@@ -86,7 +86,7 @@ KERNELS = TritonKernels(
              **dict.fromkeys(("B", "H", "L"), "i32"),
              "D": "constexpr",
              **dict.fromkeys(("stride_qb", "stride_qh", "stride_ql", "stride_qd", "stride_qmb",
-                              "stride_qmh", "stride_qml", "stride_qmd"), "i32"),
+                              "stride_qmh", "stride_qml", "stride_qmd"), "i64"),
              "GROUP_SIZE": "constexpr", "BF16": "constexpr"},
             {"D": dim, "GROUP_SIZE": GROUP_SIZE, "BF16": int(dtype == "bf16")},
         )
