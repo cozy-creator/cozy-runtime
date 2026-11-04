@@ -138,11 +138,10 @@ def owners(request: Request) -> tuple[Any, ...]:
 def select(
     device: int, key: str, menu: Sequence[tuple[str, Sequence[int]]], stream: int, floor: int = 0
 ) -> tuple[int, dict[str, Any] | None]:
-    """The level native selection takes, no coarser than `floor`, taking room for the menu's last
-    if nothing fits. An estimate that nothing fits is not a refusal: the finest runs, and the
-    allocator decides."""
+    """The level native selection takes, no coarser than `floor`. An estimate that nothing fits
+    is not a refusal: the finest runs, and the allocator decides."""
     try:
-        selection = vt.split_select(device, key, menu, preferred=menu[-1][0], stream=stream)
+        selection = vt.split_select(device, key, menu, stream=stream)
     except Exception as exc:
         if fault(exc) is not Fault.OOM:
             raise
