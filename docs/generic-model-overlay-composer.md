@@ -26,7 +26,7 @@ lease for source acquisition or this derivation.
 The package's own SDK constructs upstream PEFT layers before the ordinary census,
 fill, optimization and inference path. Alpha/rank and each requested strength apply
 once; changed order or strength produces a distinct model construction. Factors
-participate in the existing MemoryManager residency and gang admission. A requested
+participate in ordinary weight residency and gang admission. A requested
 unsupported stack fails the request rather than serving the pristine base. Old
 SDKs must advertise `peft_graph/1` for adapted construction/loading, and old Runtimes
 refuse model overrides independently of ordinary base-only work.
