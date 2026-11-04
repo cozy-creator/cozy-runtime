@@ -339,8 +339,9 @@ class Declaration:
     accelerator: bool = True
     """False: CPU only, never opens CUDA. True: the machine's GPU when it has one."""
     reserved: tuple[str, ...] = ()
-    ui: str = ""
     """A project adapter's tags: what its model reads in a text, which stay text."""
+    ui: str = ""
+    """The path in its package of the component that draws its box on a canvas."""
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Model argument -> the components this callable runs; an absent argument runs all."""
@@ -520,6 +521,7 @@ def analyze(
     child_task: bool = False,
     accelerator: bool = True,
     reserved: tuple[str, ...] = (),
+    ui: str = "",
     invocable: bool = False,
     memoize: Memoize | None = None,
     model_defaults: Mapping[str, str] | None = None,
@@ -707,6 +709,7 @@ def analyze(
         child_task=child_task,
         accelerator=accelerator,
         reserved=reserved,
+        ui=ui,
         invocable=invocable,
         memoize=memoize,
         model_defaults=model_defaults or {},
