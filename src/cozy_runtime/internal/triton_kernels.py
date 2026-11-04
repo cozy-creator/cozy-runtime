@@ -409,16 +409,6 @@ def expect(kernels: TritonKernels, arch: int) -> str:
         return f"{exc.code}: {exc}"
 
 
-#: What a pointer's bytes read as, where the wrong tensor would read as other numbers: i8 and u8
-#: are bytes to every kernel that takes them.
-_POINTERS = {
-    "bf16": "bfloat16",
-    "fp16": "float16",
-    "fp32": "float32",
-    "fp8e4nv": "float8_e4m3fn",
-    "i32": "int32",
-    "i64": "int64",
-}
 _I32 = 2**31
 
 
@@ -430,19 +420,15 @@ def _operands_fit(
     aligned: tuple[str, ...] = (),
 ) -> None:
     """Refuses what Triton's launcher would hand the kernel silently: an i32 past its range wraps,
-    a pointer reads a tensor of another dtype as its own, and an integer the entry compiled as
-    divisible by 16 that isn't faults the card (Xid 43, run 28432)."""
+    and an integer the entry compiled as divisible by 16 that isn't faults the card (Xid 43, run
+    28432). A pointer's dtype can't be held the same way: an entry that never reads one takes any
+    tensor there (run 28711)."""
     for name, value in zip(params, args, strict=True):
-        declared = signature[name]
-        if declared == "i32":
+        if signature[name] == "i32":
             if not -_I32 <= cast("int", value) < _I32:
                 raise ValueError(f"{key}: {name} = {value} does not fit its i32")
             if name in aligned and cast("int", value) % 16:
                 raise ValueError(f"{key}: {name} = {value}, compiled as divisible by 16")
-        elif declared.startswith("*") and isinstance(value, torch.Tensor):
-            want = _POINTERS.get(declared[1:])
-            if want is not None and value.dtype != getattr(torch, want):
-                raise ValueError(f"{key}: {name} is {declared}, this tensor is {value.dtype}")
 
 
 class _Launcher:
