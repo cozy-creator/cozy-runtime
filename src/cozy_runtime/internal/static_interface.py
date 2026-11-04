@@ -437,7 +437,7 @@ _CHILD_TASK_KEYWORDS = frozenset(
 _APP_KEYWORDS = {
     "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden"},
     "child_task": _CHILD_TASK_KEYWORDS,
-    "project_adapter": frozenset(),
+    "project_adapter": frozenset({"reserved"}),
 }
 _INVOCABLE_KEYWORDS = frozenset(
     {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
@@ -1506,6 +1506,8 @@ class Registration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     child_task: bool = False
     accelerator: bool = True
+    #: A project adapter's `reserved=`.
+    reserved: tuple[str, ...] = ()
     #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
@@ -1530,6 +1532,7 @@ class Registration:
             memoize=self.memoize,
             child_task=self.child_task,
             accelerator=self.accelerator,
+            reserved=self.reserved,
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
@@ -2081,6 +2084,24 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                             "a project adapter names its kinds",
                             "static_unsupported",
                         )
+                    reserved: tuple[str, ...] = ()
+                    for keyword in keywords:
+                        tags = keyword.value
+                        if (
+                            keyword.arg not in _APP_KEYWORDS[method]
+                            or not isinstance(tags, (ast.List, ast.Tuple))
+                            or not all(
+                                isinstance(tag, ast.Constant) and isinstance(tag.value, str)
+                                for tag in tags.elts
+                            )
+                        ):
+                            reader.refuse(
+                                module,
+                                keyword,
+                                "a project adapter takes only reserved=[...], its tags as written",
+                                "static_unsupported",
+                            )
+                        reserved = tuple(tag.value for tag in tags.elts)
                     # `App.project_adapter`: an entrypoint by another name, per kind.
                     for adapted in names:
                         registration = _registration(
@@ -2097,7 +2118,7 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                             decorator=decorator,
                         )
                         if registration is not None:
-                            found.append(registration)
+                            found.append(replace(registration, reserved=reserved))
                     continue
                 if isinstance(decorator, ast.Call) and decorator.args:
                     reader.refuse(

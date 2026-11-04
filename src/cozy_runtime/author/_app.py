@@ -91,6 +91,8 @@ class Registration:
     """Called by this installed package revision's own code only; never a root request."""
     accelerator: bool = True
     """False: CPU only. True (the default): the machine's GPU when it has one."""
+    reserved: tuple[str, ...] = ()
+    """A project adapter's tags: what its model reads in a text, which stay text."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
     is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
@@ -113,6 +115,7 @@ class Registration:
                 hidden=self.hidden,
                 child_task=self.child_task,
                 accelerator=self.accelerator,
+                reserved=self.reserved,
                 invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
@@ -200,17 +203,20 @@ class App:
         field that describes its fixed repeated weight use before construction."""
         return self._register(fn, True, **options)
 
-    def project_adapter(self, *kinds: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
+    def project_adapter(
+        self, *kinds: str, reserved: Sequence[str] = ()
+    ) -> Callable[[Callable[P, R]], Callable[P, R]]:
         """Register what turns one project operation producing a file of each `kind`, `image`, `video` or `audio`, into this package's
         own calls: it reads an `author.Operation`, or a subclass typing `fields`, and answers `list[author.Invocation]`, run in order,
         or raises `author.Refuse`. A package with no adapter for a kind can't make an asset of it. A public function per kind,
-        `project-adapter-<kind>`, on the CPU, so a machine runs it as it runs any other."""
+        `project-adapter-<kind>`, on the CPU, so a machine runs it as it runs any other. `reserved` names the tags its model
+        reads in a text, such as `d` for `<d>`: Calcifer leaves them there as text, read statically with the rest of this."""
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             for kind in kinds:
-                self._register(None, False, name=f"project-adapter-{kind}", accelerator=False)(
-                    target
-                )
+                self._register(
+                    None, False, name=f"project-adapter-{kind}", accelerator=False, reserved=tuple(reserved)
+                )(target)
             return target
 
         return decorate
@@ -238,6 +244,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
+        reserved: tuple[str, ...] = (),
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         # Immutable CPU metadata; the source reader uses the same closed validator.
         declared_phases = model_phases(phases)
@@ -301,6 +308,7 @@ class App:
                 hidden=hidden,
                 child_task=child_task,
                 accelerator=accelerator is not False,
+                reserved=reserved,
             )
             return target
 
