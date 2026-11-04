@@ -156,7 +156,7 @@ def begin(
 def note(request: Request, key: str, name: str, level: int) -> dict[str, Any]:
     """A site's calls per level, for the run record."""
     record = request.working_splits.setdefault(key, {"site": name, "levels": {}, "finer": 0})
-    record["levels"][level] = record["levels"].get(level, 0) + 1
+    record["levels"][str(level)] = record["levels"].get(str(level), 0) + 1
     return record
 
 
@@ -168,12 +168,14 @@ def cut[T](
     small, it runs whole; inside a capture or another site's leaf, at this key's last level."""
     checkpoint()
     request = CURRENT.get()
-    if request is None or not request.memory.cuda or sum(need(0)) < _SMALL:
+    native = request is not None and request.memory.cuda
+    if not (native or _capturing()) or sum(need(0)) < _SMALL:
         return _finer(run, 0, finest, pure)
     menu = tuple((str(level), need(level)) for level in range(finest + 1))
     key = f"{name}:{hash(menu):x}"
-    if not LEAF.acquire(blocking=False):
+    if not native or not LEAF.acquire(blocking=False):
         return _finer(run, LEVELS.get(key, 0), finest, pure)
+    assert request is not None
     try:
         device = request.memory.device.index or 0
         if not vt.split_context(device)["eligible"]:
