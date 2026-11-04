@@ -107,9 +107,9 @@ class Refuse(InvalidRequest):
 
 
 class BeatWrite(msgspec.Struct, kw_only=True):
-    """A screenshot: `storyboard` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
+    """A screenshot: `world_state` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
 
-    storyboard: str
+    world_state: str
     at: float | None = None
 
 
@@ -143,7 +143,7 @@ class ShotOperation(Operation, kw_only=True):
 
 
 class PictureFields(msgspec.Struct, kw_only=True):
-    """A picture: `character`, `prop`, `environment`, `storyboard`, `image`. `description` is what it is, which shots read too;
+    """A picture: `character`, `prop`, `environment`, `storyboard`, `world_state`, `image`. `description` is what it is, which shots read too;
     `instructions` how to draw this picture, which nothing else reads."""
 
     description: str = ""
