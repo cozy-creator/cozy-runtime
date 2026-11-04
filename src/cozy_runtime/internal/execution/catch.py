@@ -120,11 +120,12 @@ def _finer[T](name: str, run: Callable[[int], T], level: int, finest: int, pure:
         level += 1
 
 
-def preferred(menu: Sequence[tuple[str, Sequence[int]]]) -> str:
-    """The choice to take room for when nothing fits: the coarsest within 1/64 of the finest's
-    bytes. Past it the whole output is the need, and more pieces only add launches."""
-    least = sum(menu[-1][1])
-    return next(id_ for id_, sizes in menu if sum(sizes) <= least + least // 64)
+def useful(sizes: Sequence[Sequence[int]]) -> list[Sequence[int]]:
+    """The levels worth listing: down to the first within 1/64 of the finest's bytes (the whole
+    output is the need by then) or at 1/64 of the whole's. Finer only adds launches."""
+    least, whole = sum(sizes[-1]), sum(sizes[0])
+    floor = max(least + least // 64, whole // 64)
+    return list(sizes[: next(n for n, row in enumerate(sizes) if sum(row) <= floor) + 1])
 
 
 def owners(request: Request) -> tuple[Any, ...]:
@@ -137,10 +138,11 @@ def owners(request: Request) -> tuple[Any, ...]:
 def select(
     device: int, key: str, menu: Sequence[tuple[str, Sequence[int]]], stream: int, floor: int = 0
 ) -> tuple[int, dict[str, Any] | None]:
-    """The level native selection takes, no coarser than `floor`. An estimate that nothing fits
-    is not a refusal: the finest runs, and the allocator decides."""
+    """The level native selection takes, no coarser than `floor`, taking room for the menu's last
+    if nothing fits. An estimate that nothing fits is not a refusal: the finest runs, and the
+    allocator decides."""
     try:
-        selection = vt.split_select(device, key, menu, preferred=preferred(menu), stream=stream)
+        selection = vt.split_select(device, key, menu, preferred=menu[-1][0], stream=stream)
     except Exception as exc:
         if fault(exc) is not Fault.OOM:
             raise
@@ -180,7 +182,10 @@ def cut[T](
     native = request is not None and request.memory.cuda
     if not (native or _capturing()) or sum(need(0)) < _SMALL:
         return _finer(name, run, 0, finest, pure)
-    menu = tuple((str(level), need(level)) for level in range(finest + 1))
+    menu = tuple(
+        (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
+    )
+    finest = len(menu) - 1
     key = f"{name}:{hash(menu):x}"
     if not native or not LEAF.acquire(blocking=False):
         return _finer(name, run, LEVELS.get(key, 0), finest, pure)

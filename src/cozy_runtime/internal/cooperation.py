@@ -75,7 +75,6 @@ class Owner:
         self.config = config  # Negotiated Start intent, not a library creation default.
         self.device = device
         self.pid = os.getpid()
-        config.directory.mkdir(mode=0o700, exist_ok=True)
         peer = varena.CooperationOwner(
             device, config.uuid, config.directory, shared=config.shared, priority=config.priority,
         )

@@ -201,6 +201,7 @@ def _exchange(
     batch, mine, heads, dim = (int(n) for n in query.shape)
     padded = heads + (-heads % world)
     steps = _steps(padded, world)
+    # What a rank's rows and heads make of a group fixes the menu; each rank's menu stays its own.
     menu = tuple(
         (str(at), _need(step, batch, mine, padded, dim, query.element_size(), world))
         for at, step in enumerate(steps)
