@@ -179,16 +179,6 @@ class UpscaleOperation(Operation, kw_only=True):
     fields: UpscaleFields
 
 
-class CleanFields(msgspec.Struct, kw_only=True):
-    """A picture with its background removed: `image` mentions it."""
-
-    image: str = ""
-
-
-class CleanOperation(Operation, kw_only=True):
-    fields: CleanFields
-
-
 _MENTION = re.compile(r"<([^<>\n]+)>")
 
 

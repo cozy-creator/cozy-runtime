@@ -329,8 +329,6 @@ _VIDEO_STRUCTS = (
     "SetupOperation",
     "UpscaleFields",
     "UpscaleOperation",
-    "CleanFields",
-    "CleanOperation",
     "ProjectBeat",
     "ProjectContinue",
     "ProjectEntity",

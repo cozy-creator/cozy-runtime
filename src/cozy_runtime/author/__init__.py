@@ -186,8 +186,6 @@ from cozy_runtime.author._services import (
 )
 from cozy_runtime.author._project import (
     BeatWrite,
-    CleanFields,
-    CleanOperation,
     Invocation,
     Invocations,
     Keep,
@@ -439,8 +437,6 @@ __all__ = [
     "upload_checkpoint",
     "uses_components",
     "BeatWrite",
-    "CleanFields",
-    "CleanOperation",
     "Invocation",
     "Invocations",
     "Keep",
