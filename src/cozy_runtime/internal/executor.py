@@ -122,7 +122,6 @@ from cozy_runtime.author._model import (
     component_use,
 )
 from cozy_runtime.author._observations import DEVICE, PLANS, Attribution
-from cozy_runtime.author._prepared_use import PreparedUse, prepared_use
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
@@ -826,8 +825,6 @@ class Executor:
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: HOST ONLY: each open or just-ended request's cut rows (`measurements.execution.cuts`)
-        self.cuts: dict[str, object] = {}
         #: each request's `author.denoise_loop` rows (`internal.loop.ROWS`), once memory opens
         self.loops: dict[str, list[dict[str, object]]] = {}
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
@@ -900,7 +897,6 @@ class Executor:
         self.model_executors: list[Executor] = []
         self.models: dict[str, Any] = {}
         # Accepted with this member (or its deferred container), never a per-alias cache.
-        self._prepared_use: PreparedUse | None = None
         self.group_components: dict[tuple[str, str], tuple[Any, Any]] = {}
         self.group_sharded: set[tuple[str, str]] = set()
         #: component -> the follower rank that keeps it resident for the whole group
@@ -2212,7 +2208,7 @@ class Executor:
         return self._load_reply(key, child, reused=False)
 
     def _bind_parameters(self, command: Load) -> dict[str, Any] | None:
-        """A reuse binds aliases to the same path-ordered members and immutable uses."""
+        """A reuse binds aliases to the same path-ordered members."""
         members = self.model_executors or [self]
         rows = tuple(sorted(command.rows(), key=lambda row: row.binding.model_binding_path))
         if len(rows) != len(members):
@@ -2223,14 +2219,6 @@ class Executor:
         claimed = {name: member for member in members for name in member.models}
         pairs = tuple(zip(rows, members, strict=True))
         for row, member in pairs:
-            try:
-                use = None if row.binding.prepared_use is None else prepared_use(
-                    msgspec.to_builtins(row.binding.prepared_use)
-                )
-            except InvalidRequest as exc:
-                return self._refusal(exc.code, str(exc))
-            if use != member._prepared_use:
-                return self._refusal("prepared_use_binding", "changed use needs a new construction")
             for name in row.binding.parameter_names():
                 if claimed.setdefault(name, member) is not member:
                     return self._refusal(
@@ -2364,7 +2352,6 @@ class Executor:
             }
             for member in (*members, child):
                 member.models.clear()
-                member._prepared_use = None
                 member.prepared.clear()
                 member.model_executors = []
                 member.backend = member.residency = member.registry = None
@@ -2486,14 +2473,6 @@ class Executor:
         if self._group_parent is None and self._deferred(single.binding):
             return self._prepare_many(command, (single,))
         binding = single.binding
-        try:
-            use = None if binding.prepared_use is None else prepared_use(
-                msgspec.to_builtins(binding.prepared_use)
-            )
-        except InvalidRequest as exc:
-            return self._refusal(exc.code, str(exc))
-        if use is not None and not binding.model_class:
-            return self._refusal("prepared_use_binding", "prepared use requires a model")
         self._group_model_key = f"{self.construction}#{binding.model_binding_path}"
         started = time.perf_counter()
         # THE SEGMENT LEDGER (cr-102). A `prepare` that reports one total and one fill leg
@@ -2560,15 +2539,6 @@ class Executor:
         if self.discovered is None:
             self._discover_provisioned(binding)
         stage("package_import")
-
-        registration = None
-        if use is not None:
-            entrypoint = binding.model_binding_path.partition(".models.")[0]
-            registration = self.discovered.app.get(entrypoint)
-            if binding.model_parameter_name not in registration.model_prepared_use:
-                return self._refusal(
-                    "prepared_use_binding", "the model declares no prepared-use field"
-                )
 
         # The header ref identifies stored weights and metadata. Runtime opens it through
         # TensorFS in the shared store, then plans reads from its components.
@@ -2701,7 +2671,6 @@ class Executor:
                 placement=binding.placement or "all_resident",
                 encoded_leaves=consent,
                 dtype_name=dtype_name,
-                prepared_use=use,
             )
         except PlanRefusal as exc:
             return {
@@ -3013,7 +2982,6 @@ class Executor:
             "delivery": plan.wire_document(),
             "attention": applied.document() if applied is not None else None,
         }
-        self._prepared_use = use
         return {
             "ok": True,
             "ready": True,
@@ -3052,15 +3020,6 @@ class Executor:
                 "detail": "model paths and parameters must be named and unique",
             }
 
-        try:
-            uses = tuple(
-                None if row.binding.prepared_use is None else prepared_use(
-                    msgspec.to_builtins(row.binding.prepared_use)
-                )
-                for row in rows
-            )
-        except InvalidRequest as exc:
-            return self._refusal(exc.code, str(exc))
         children: list[tuple[str, Executor, dict[str, Any]]] = []
         for row in rows:
             binding = row.binding
@@ -3223,10 +3182,6 @@ class Executor:
             "delivery": delivery,
             "models": {parameter: facts for parameter, facts in facts_rows},
         }
-        # Deferred members are accepted bindings even before their first materialization.
-        for (_, member, reply), use in zip(children, uses, strict=True):
-            if not reply:
-                member._prepared_use = use
         self.ready = True
         return {
             "ok": True,
@@ -3476,7 +3431,6 @@ class Executor:
             finally:
                 kernel_compile.held.reset(held)
         try:
-            self._check_prepared_use(registration, command.payload)
             prepared = prepare(registration, command.payload, input_metadata=command.input_metadata)
         except Exception as exc:
             outcome = classify(exc)
@@ -3893,9 +3847,6 @@ class Executor:
                     attention.implementations(served_impls),
                     segments if len(segments) > 1 else (),
                     served_impls.refused,
-                ),
-                "cuts": self.host.cuts.pop(
-                    command.request_id, {"sites": [], "levels": {}, "oom_floor": 0}
                 ),
                 "loops": self.host.loops.pop(command.request_id, []),
                 # When this reply was built, and (`_send_reply`) when it went on the seam: a
@@ -4885,7 +4836,6 @@ class Executor:
                 finally:
                     del host.requests[request_id]
                     peak = accel.allocator_peak(host.memory, request_id)  # read while open
-                    host.cuts[request_id] = msgspec.to_builtins(host.execution.cut_rows(request))
         finally:
             if request is not None:
                 gpu = _gpu_numbers(self.world)[self.rank] if cuda else -1
@@ -4911,37 +4861,6 @@ class Executor:
         """No author computation may still mutate GPU or output state when a terminal is
         recorded. The execution stream includes every explicitly joined consumer."""
         return accel.streams_idle(self.torch, self.device_kind, stream=self.host.execution_stream)
-
-    def _check_prepared_use(self, registration: Registration, payload: object) -> None:
-        """Check current callable slots against the actual member, not historical aliases."""
-        declarations = registration.model_prepared_use
-        slots = {slot.parameter for slot in registration.surface.slots if not slot.weights}
-        checked: set[str] = set()
-        for member in self.model_executors or [self]:
-            names = slots.intersection(member.models)
-            if not names:
-                continue
-            declared = names.intersection(declarations)
-            use = member._prepared_use
-            if declared != (names if use is not None else set()):
-                raise InvalidRequest(
-                    "prepared-use declaration differs from the loaded construction",
-                    code="prepared_use_binding",
-                )
-            for name in declared:
-                field = declarations[name]
-                if not isinstance(payload, Mapping) or field not in payload:
-                    raise InvalidRequest(
-                        "prepared-use field is absent", code="prepared_use_invalid"
-                    )
-                if prepared_use(payload[field]) != use:
-                    raise InvalidRequest(
-                        "changed prepared use needs a new construction",
-                        code="prepared_use_binding",
-                    )
-            checked.update(declared)
-        if checked != set(declarations):
-            raise InvalidRequest("a prepared model slot is absent", code="prepared_use_binding")
 
     def map(self, command: Map) -> dict[str, Any]:
         """TensorD's warming: one loaded construction's models at `command.level`, on every GPU

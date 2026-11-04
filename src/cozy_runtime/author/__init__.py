@@ -212,7 +212,7 @@ from cozy_runtime.author._project import (
     spoken,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
-from cozy_runtime.author._split import Cut, decode_vae_tiles, split
+from cozy_runtime.author._split import Cut, split
 from cozy_runtime.author._spread import spread
 from cozy_runtime.author._video import (
     AudioReference,
@@ -405,7 +405,6 @@ __all__ = [
     "corners",
     "data_values",
     "decode_request",
-    "decode_vae_tiles",
     "denoise_loop",
     "describe",
     "device",

@@ -58,6 +58,7 @@ from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, say
 from cozy_runtime.graphs.domain import Pool
+from cozy_runtime.internal import cache_owners
 from cozy_runtime.lm import _kernels
 
 try:
@@ -2164,8 +2165,6 @@ class _Engine:
     # ------------------------------------------------------------------ memory
 
     def _try_drop(self) -> bool:
-        from cozy_runtime.internal import cache_owners
-
         with cache_owners.try_locks([_PLANE, self.cond]) as claimed:
             if not claimed or self.driver is not None or self.pending or self._occupied():
                 return False

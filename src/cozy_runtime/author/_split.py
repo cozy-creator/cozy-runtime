@@ -1,23 +1,13 @@
 """`split`: the package says how an op cuts (`Cut`); the memory says how finely (the execution
-layer's `split`, installed with it): native-selected for a complete contract, otherwise
-ordinary eager once. A layout that changes the result (a blended cut) comes from
-the shape alone (`most`)."""
+layer's `split`, installed with it): whole, else in the windows native selection gives. A
+layout that changes the result (a blended cut) comes from the shape alone (`most`)."""
 
 from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
-
-if TYPE_CHECKING:
-    from cozy_runtime.author.kernels import (
-        LayerScaleBlock,
-        ProjectedHeads,
-        ResidualFFN,
-        SingleUseProjection,
-        SparseProjectedHeads,
-    )
+from typing import Any, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,8 +24,7 @@ class Cut:
 
 class Pieces(Protocol):
     """The memory's side of `split`: `split` runs `run(most)` in windows of at most `most` of
-    `total` elements, the least `finest`; `piece` marks each window's
-    start (the ops inside are numbered per window)."""
+    `total` elements, the least `finest`, once; `piece` marks each window's start."""
 
     def split(
         self,
@@ -43,6 +32,8 @@ class Pieces(Protocol):
         key: str,
         total: int,
         finest: int,
+        out_bytes: int,
+        item_bytes: float,
         run: Callable[[int], Any],
     ) -> Any: ...
 
@@ -58,19 +49,7 @@ def install(runtime: Pieces | None) -> None:
 
 
 def split(
-    fn: Callable[..., Any],
-    x: Any,
-    *cuts: Cut,
-    most: int | None = None,
-    out: Any = None,
-    intent: (
-        ResidualFFN
-        | ProjectedHeads
-        | SparseProjectedHeads
-        | SingleUseProjection
-        | LayerScaleBlock
-        | None
-    ) = None,
+    fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -82,50 +61,8 @@ def split(
 
     With `most`, the windows are the fewest of at most `most` elements, on every device and
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
-    cut's (an `overlap`) does. Without it such a layout follows free memory.
-
-    ``intent`` declares a complete supported operation. Runtime may decline it before
-    execution and use ``fn`` normally; after native acceptance there is no operation retry.
-    A Runtime without that native executor still serves the original callable.
-    """
+    cut's (an `overlap`) does. Without it such a layout follows free memory."""
     runtime = _RUNTIME
-    if intent is not None:
-        from cozy_runtime.author.kernels import (
-            LayerScaleBlock,
-            ProjectedHeads,
-            ResidualFFN,
-            SingleUseProjection,
-            SparseProjectedHeads,
-        )
-
-        if type(intent) is ResidualFFN:
-            declared_intent = getattr(runtime, "split_residual_ffn", None)
-        elif type(intent) is ProjectedHeads:
-            declared_intent = getattr(runtime, "split_projected_heads", None)
-        elif type(intent) is SparseProjectedHeads:
-            declared_intent = getattr(runtime, "split_sparse_projected_heads", None)
-        elif type(intent) is LayerScaleBlock:
-            if x is not intent.hidden:
-                raise ValueError("layer-scale block intent must name this exact input")
-            declared_intent = getattr(runtime, "split_layer_scale_block", None)
-            if runtime is not None and not callable(declared_intent):
-                raise RuntimeError(
-                    "installed execution requires the declared layer-scale block API"
-                )
-        elif type(intent) is SingleUseProjection:
-            if fn is not intent.module or x is not intent.hidden:
-                raise ValueError("single-use projection intent must name this exact call")
-            declared_intent = getattr(runtime, "split_single_use_projection", None)
-        else:
-            raise TypeError("split intent must declare a supported complete operation")
-        if most is None and callable(declared_intent):
-            result = declared_intent(intent, out, cuts)
-            if result is not None:
-                return result
-    if runtime is not None and most is None and out is None:
-        declared = getattr(runtime, "split_declared", None)
-        if declared is not None and (result := declared(fn, x, cuts)) is not None:
-            return result
     shape = tuple(int(n) for n in x.shape)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
@@ -133,12 +70,13 @@ def split(
         windows = _windows(shape, cuts, most)
         if runtime is None:
             return _run(fn, x, cuts, windows, lambda: None, out)
-        # Authored geometry is fixed, including on failure.
         return runtime.split(
             _name(fn),
             _key(fn, shape, cuts, x.dtype),
             most,
             most,
+            0 if out is not None else _bytes(shape, cuts, x),
+            _item_bytes(cuts, x),
             lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
         )
     if runtime is None or not cuts:
@@ -151,21 +89,10 @@ def split(
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
+        0 if out is not None else _bytes(shape, cuts, x),
+        _item_bytes(cuts, x),
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
     )
-
-
-def decode_vae_tiles(module: Any, tiles: Any, *, block_layout: Any) -> Any:
-    """Execute the declared complete H3 tile sequence under native memory policy.
-
-    This required execution capability has no eager or retry fallback. The producer
-    declares its exact block layout; Runtime owns query, window choice and custody.
-    """
-    runtime = _RUNTIME
-    executor = getattr(runtime, "decode_vae_tiles", None)
-    if not callable(executor):
-        raise RuntimeError("installed execution requires the native H3 VAE sequence")
-    return executor(module, tiles, block_layout=block_layout)
 
 
 type Window = tuple[tuple[int, int], ...]
@@ -178,6 +105,16 @@ def _key(
     cut = {c.dim % len(shape) for c in cuts}
     rest = tuple(n if i not in cut else -1 for i, n in enumerate(shape))
     return f"{_name(fn)}{rest}:{dtype}"
+
+
+def _item_bytes(cuts: tuple[Cut, ...], x: Any) -> float:
+    """Output bytes per input element."""
+    return float(math.prod(c.scale for c in cuts) * x.element_size())
+
+
+def _bytes(shape: tuple[int, ...], cuts: tuple[Cut, ...], x: Any) -> int:
+    """The whole output's bytes, which `split` allocates beside its windows."""
+    return int(math.prod(shape) * _item_bytes(cuts, x))
 
 
 def _name(fn: Callable[[Any], Any]) -> str:

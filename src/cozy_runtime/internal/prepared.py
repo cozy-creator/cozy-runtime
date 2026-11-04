@@ -8,7 +8,7 @@ import hashlib
 import threading
 import time
 import weakref
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from typing import Any, NoReturn
 
@@ -95,11 +95,8 @@ class PreparedRepeat:
         self._closed = False
         self._owned_bindings: tuple[Any, ...] = ()
         self._binding_cleanup = ExitStack()
-        self._load: Any = None
         self._capture_cache: dict[str, int] = {}
-        self._load_ordering_requested = "checked"
         self._sequence_owner: Any = None
-        self._load_ordering = "checked"
         self._landed = landed
         # Native immutable capture traces add metadata ownership, never extra physical pins.
         self._footprints: tuple[Any, ...] = ()
@@ -199,7 +196,6 @@ class PreparedRepeat:
             self._footprints = ()
             self._execution_key = None
             self._release_owned_bindings()
-            self._load = None
             if settled_error is not None:
                 _native_error(settled_error)
 
@@ -212,8 +208,6 @@ class PreparedRepeat:
         return {
             **self._native.facts(),
             "capture_cache": dict(self._capture_cache),
-            "load_ordering_requested": self._load_ordering_requested,
-            "load_ordering": self._load_ordering,
             "working_execution_key": self._execution_key,
             "capture_footprints": [dict(footprint.facts()) for footprint in self._footprints],
         }
@@ -229,44 +223,29 @@ class Execution:
         outputs: tuple[Any, ...],
         readout: Any,
         models: list[Any],
-        load_job: Any = None,
+        sequence: Any = None,
     ) -> None:
         self.plan, self.context = plan, context
         self._finished: Progress | None = None
         self._epoch, self._outputs, self._readout = epoch, outputs, readout
         self._observation = threading.RLock()
         self._models = models
-        self._load_job = load_job
-        self._load_request = _REQUEST.get()
-        self._load_recorded = False
+        self._sequence = sequence
+        self._request = _REQUEST.get()
         self._failure: Exception | None = None
-        self._queued_eligible = context is not None and load_job is None
         self._queued_offered: str | None = None
 
     def _offer_queued(self) -> None:
         # Scratch, outputs and resident weights are already retained. This optional
-        # observer work never advances GPU execution or admits a streamed future workspace.
-        if (
-            self._queued_eligible
-            and self._queued_offered is None
-            and self._load_request is not None
-        ):
-            self._queued_offered = self._load_request.prefetch_queued()
+        # observer work never advances GPU execution.
+        if self.context is not None and self._queued_offered is None and self._request is not None:
+            self._queued_offered = self._request.prefetch_queued()
 
     def facts(self) -> dict[str, object]:
-        """Native execution and, when present, its actual owned input read."""
-        facts = self.plan.facts()
-        if self._load_job is not None:
-            facts["native_load"] = dict(self._load_job.facts())
-        return facts
+        return self.plan.facts()
 
     def completion_proven(self) -> bool:
-        """Whether native work and readout/drain completed, independently of its result.
-
-        A failed load sets _finished only after TensorFS certifies checked cleanup
-        and this execution releases every model claim.
-        poll() and wait() must still report that load's original error.
-        """
+        """Whether native work and readout/drain completed, independently of its result."""
         with self._observation:
             return self._finished is not None
 
@@ -275,37 +254,8 @@ class Execution:
             self._models[-1]._release()
             self._models.pop()
 
-    def _record_load(self, facts: Mapping[str, Any]) -> None:
-        if self._load_recorded or not facts.get("done", False):
-            return
-        self._load_recorded = True
-        if self._load_request is None or not facts.get("read_done", False):
-            return
-        for binding in self.plan._owned_bindings:
-            if binding._load_slot is self.plan._load:
-                for block, nbytes in zip(binding.groups, facts["input_read_bytes"], strict=True):
-                    if nbytes:
-                        # The native worker did this I/O. Record bytes once after completion;
-                        # its separate native clocks are not Python read-wait measurements.
-                        self._load_request.read(block, 0, int(nbytes))
-
-    def _failed_load(self, error: Exception) -> None:
-        """A native input/sequence job may prove cleanup; an exception is not that proof."""
-        if self._load_job is None:
-            return
-        self._failure = error
-        facts = self._load_job.facts()
-        self._record_load(facts)
-        if facts.get("completion_proven", False):
-            # No readout of failed/partial input. Public observers retain the original error;
-            # close may now retire the graph and its bindings after this native certificate.
-            self._release_models()
-            self._finished = Progress(0, bool(facts.get("canceled", False)), True)
-
     def _finish(self, completed: int, canceled: bool) -> Progress:
         if self._finished is None:
-            if self._load_job is not None:
-                self._record_load(self._load_job.facts())
             with torch.cuda.device(self.plan.device), torch.no_grad():
                 for output, state in zip(self._outputs, self.plan.state, strict=True):
                     output.copy_(state)
@@ -324,21 +274,17 @@ class Execution:
             try:
                 completed, canceled, done = (
                     self.plan._native.poll(self._epoch)
-                    if self._load_job is None
-                    else self._load_job.poll()
+                    if self._sequence is None
+                    else self._sequence.poll()
                 )
                 if done:
                     completed, canceled = (
                         self.plan._native.wait(self._epoch)
-                        if self._load_job is None
-                        else self._load_job.wait()
+                        if self._sequence is None
+                        else self._sequence.wait()
                     )
             except Exception as error:
-                self._failed_load(error)
                 _native_error(error)
-            # The input certificate covers producer/graph completion, not this readout.
-            # Never reinterpret a copy, synchronization or model-release failure as a
-            # clean input failure merely because the load worker finished successfully.
             if done:
                 return self._finish(completed, canceled)
             # The one queued CPU preflight can finish after submit. Re-offer only while
@@ -348,10 +294,10 @@ class Execution:
 
     def cancel(self) -> None:
         try:
-            if self._load_job is None:
+            if self._sequence is None:
                 self.plan._native.cancel(self._epoch)
             else:
-                self._load_job.cancel()
+                self._sequence.cancel()
         except Exception as error:
             _native_error(error)
 
@@ -361,11 +307,10 @@ class Execution:
                 try:
                     completed, canceled = (
                         self.plan._native.wait(self._epoch)
-                        if self._load_job is None
-                        else self._load_job.wait()
+                        if self._sequence is None
+                        else self._sequence.wait()
                     )
                 except Exception as error:
-                    self._failed_load(error)
                     _native_error(error)
                 self._finish(completed, canceled)
 
@@ -391,6 +336,25 @@ class Execution:
             self.plan.close()
 
 
+def _phase_definition(
+    memory: Any, claimed: list[Any], names: tuple[str, ...]
+) -> tuple[str, tuple[Any, ...]]:
+    """A phase's key and regions. Model source/fill/generation identity belongs to this submission;
+    actual readiness is inspected natively at phase entry. Only the compact digest crosses the
+    capability and progress boundaries: complete identities can hold large per-weight route tables."""
+    selected = [m for m in claimed if m.memory is memory and m.name in names]
+    regions = {
+        id(region): region
+        for model in selected
+        for block in model.groups()
+        for region in (block.region, block.final_region)
+        if region is not None
+    }
+    identity = repr(sorted((m.name, m.wanted_identity(), m.generation) for m in selected))
+    label = "+".join(sorted(m.component for m in selected))[:128]
+    return f"{label}:{hashlib.sha256(identity.encode()).hexdigest()}", tuple(regions.values())
+
+
 class PreparedSequence:
     """Own ordered prepared stages; one submission advances them entirely in native code.
 
@@ -402,9 +366,6 @@ class PreparedSequence:
 
     Constructing this object transfers definition ownership: close/idle retirement of any
     stage closes the whole sequence.
-
-    `prefetch=False` omits speculative next-stage reads when other work has priority; True
-    permits bounded lookahead only when actual capacity admits it.
     """
 
     @classmethod
@@ -419,15 +380,11 @@ class PreparedSequence:
         *,
         outputs: Sequence[Any] | None = None,
         repeat: tuple[int, int, int] | None = None,
-        prefetch: bool = True,
     ) -> None:
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
                 "native sequence module is unavailable", code="prepared_graph_ineligible"
             )
-        if type(prefetch) is not bool:
-            raise TypeError("sequence prefetch policy must be a boolean")
-        self.prefetch = prefetch
         self.stages = tuple(stages)
         if not self.stages or len(self.stages) > 65536:
             raise ValueError("a prepared sequence needs 1..65536 stages")
@@ -475,31 +432,14 @@ class PreparedSequence:
         # not close a stage already transferred to another live sequence.
         self._closed = True
         self._closing = False
-        self._load = None
         self._owned_bindings: tuple[Any, ...] = ()
         with self._locked_stages():
-            for stage_index, stage in enumerate(self.stages):
+            for stage in self.stages:
                 stage._validate()
                 if stage._sequence_owner is not None and stage._sequence_owner() is not None:
                     raise RuntimeError("a prepared stage already belongs to another sequence")
                 if stage._active is not None and not stage._active.poll().done:
                     raise RuntimeError("a running definition cannot enter a new sequence")
-                if stage._load is not None and not callable(
-                    getattr(stage._load, "continuation", None)
-                ):
-                    raise CapabilityError(
-                        "this input loader cannot defer its native stage",
-                        code="prepared_load_unavailable",
-                    )
-                if (
-                    self._repeated(stage_index)
-                    and stage._load is not None
-                    and not getattr(stage._load, "supports_reusable_input", False)
-                ):
-                    raise CapabilityError(
-                        "this input loader cannot rearm a native stage",
-                        code="prepared_load_unavailable",
-                    )
             owner = weakref.ref(self)
             for stage in self.stages:
                 stage._sequence_owner = owner
@@ -565,13 +505,11 @@ class PreparedSequence:
                 producer = torch.cuda.current_stream(self.device).cuda_stream
             claimed: list[Any] = []
             capsules: list[Any] = []
-            reads: list[tuple[int, Any, tuple[Any, ...]]] = []
             native = None
             execution = None
             phase_controllers: dict[Any, Any] = {}
             phase_definitions: dict[tuple[Any, tuple[str, ...]], tuple[str, tuple[Any, ...]]] = {}
             request = _REQUEST.get()
-            phase_type = varena.PhaseController
             try:
                 # Every program model is claimed before model-wide phase identities are
                 # snapshotted. Unrelated declared siblings are not decorated or borrowed.
@@ -586,114 +524,9 @@ class PreparedSequence:
                         capsule, _ = stage._native.continuation(producer, reusable=True)
                     else:
                         capsule, _ = stage._native.continuation(producer)
-                    if stage._load is not None:
-                        capsule, observation = stage._load.continuation(
-                            capsule, event_ordered=stage._load_ordering == "events"
-                        )
-                        reads.append((stage_index, observation, stage._owned_bindings))
-                    if request is not None and stage._owned_bindings:
-                        memories = {binding.model.memory for binding in stage._owned_bindings}
-                        if len(memories) == 1:
-                            memory = next(iter(memories))
-                            with memory.lock:
-                                exclusive = (
-                                    request.memory is memory
-                                    and not request.idle
-                                    and not memory._active_beside(request)
-                                )
-                                names = tuple(
-                                    sorted(
-                                        set().union(
-                                            *(
-                                                request.phase(binding.model.name)
-                                                for binding in stage._owned_bindings
-                                            )
-                                        )
-                                    )
-                                )
-                                selected = [
-                                    model
-                                    for model in claimed
-                                    if model.memory is memory and model.name in names
-                                ]
-                                if exclusive and memory.native is not None:
-                                    definition = phase_definitions.get((memory, names))
-                                    if definition is None:
-                                        regions = tuple(
-                                            {
-                                                id(region): region
-                                                for model in selected
-                                                for block in model.groups()
-                                                for region in (block.region, block.final_region)
-                                                if region is not None
-                                            }.values()
-                                        )
-                                        # Model source/fill/generation identity belongs to this
-                                        # submission. Actual readiness is inspected natively
-                                        # at phase entry, never guessed from this snapshot.
-                                        identity = repr(
-                                            tuple(
-                                                sorted(
-                                                    (
-                                                        model.name,
-                                                        model.wanted_identity(),
-                                                        model.generation,
-                                                    )
-                                                    for model in selected
-                                                )
-                                            )
-                                        )
-                                        # Only the compact digest crosses the capability and
-                                        # progress boundaries; complete immutable identities
-                                        # can contain large per-weight route tables.
-                                        digest = hashlib.sha256(identity.encode()).hexdigest()
-                                        label = "+".join(
-                                            sorted(model.component for model in selected)
-                                        )[:128]
-                                        key = f"{label}:{digest}"
-                                        definition = key, regions
-                                        phase_definitions[(memory, names)] = definition
-                            if exclusive and memory.native is not None:
-                                controller = phase_controllers.get(memory)
-                                if controller is None:
-                                    controller = phase_type(memory.native)
-                                    phase_controllers[memory] = controller
-                                capsule = controller.wrap(
-                                    capsule, *definition,
-                                    footprints=stage._footprints,
-                                    execution_key=stage._execution_key,
-                                )
-                                if stage._execution_key is not None:
-                                    memory.remember_working_phase(
-                                        stage._execution_key,
-                                        tuple(model for model in claimed if model.memory is memory),
-                                    )
-                    elif callable(phase_type) and request is not None and stage._footprints:
-                        # An inter-block graph can own scratch without a weight binding.
-                        # Observe it through the sequence's one memory owner, leaving the
-                        # current preference plan untouched (None is not an empty plan).
-                        memories = {model.memory for model in claimed}
-                        if len(memories) == 1:
-                            memory = next(iter(memories))
-                            with memory.lock:
-                                exclusive = (
-                                    request.memory is memory
-                                    and not request.idle
-                                    and not memory._active_beside(request)
-                                )
-                            if exclusive and memory.native is not None:
-                                controller = phase_controllers.get(memory)
-                                if controller is None:
-                                    controller = phase_type(memory.native)
-                                    phase_controllers[memory] = controller
-                                capsule = controller.wrap(
-                                    capsule, None, (), footprints=stage._footprints,
-                                    execution_key=stage._execution_key,
-                                )
-                                if stage._execution_key is not None:
-                                    memory.remember_working_phase(
-                                        stage._execution_key, tuple(claimed),
-                                    )
+                    capsule = self._observed(
+                        stage, capsule, request, claimed, phase_controllers, phase_definitions
+                    )
                     capsules.append(capsule)
                 native = (
                     _execution.NativeSequence(capsules, self.device)
@@ -701,14 +534,11 @@ class PreparedSequence:
                     else _execution.NativeSequence(capsules, self.device, self._repeat)
                 )
                 execution = _SequenceExecution(
-                    self, context, outputs, readout, claimed, native, reads, phase_controllers
+                    self, context, outputs, readout, claimed, native, phase_controllers
                 )
                 self._native, self._active = native, execution
                 for stage in self.stages:
                     stage._active = execution
-                # Every observer/capsule is strongly owned before optional Weak lookahead
-                # links are installed. Admission allocates no source bytes and launches no work.
-                execution._prepare_lookahead()
                 # All Python/native owners exist before the sole native worker can start.
                 native.start()
                 execution._offer_queued()
@@ -746,6 +576,51 @@ class PreparedSequence:
                 if isinstance(error, Exception):
                     _native_error(error)
                 raise
+
+    @staticmethod
+    def _observed(
+        stage: PreparedRepeat,
+        capsule: Any,
+        request: Any,
+        claimed: list[Any],
+        controllers: dict[Any, Any],
+        definitions: dict[tuple[Any, tuple[str, ...]], tuple[str, tuple[Any, ...]]],
+    ) -> Any:
+        """`stage`'s capsule under its memory's phase controller, on an exclusive request. A stage
+        with weights declares the regions its phase holds; one without (an inter-block graph that
+        owns scratch) only measures, and leaves the current preference plan untouched."""
+        bound = stage._owned_bindings
+        if request is None or not (bound or stage._footprints):
+            return capsule
+        memories = {b.model.memory for b in bound} if bound else {m.memory for m in claimed}
+        if len(memories) != 1:
+            return capsule
+        memory = next(iter(memories))
+        with memory.lock:
+            if (
+                (bound and request.memory is not memory)
+                or request.idle
+                or memory._active_beside(request)
+                or memory.native is None
+            ):
+                return capsule
+            definition: tuple[Any, ...] = (None, ())
+            if bound:
+                names = tuple(sorted(set().union(*(request.phase(b.model.name) for b in bound))))
+                if (memory, names) not in definitions:
+                    definitions[(memory, names)] = _phase_definition(memory, claimed, names)
+                definition = definitions[(memory, names)]
+        controller = controllers.get(memory)
+        if controller is None:
+            controller = controllers[memory] = varena.PhaseController(memory.native)
+        wrapped = controller.wrap(
+            capsule, *definition, footprints=stage._footprints, execution_key=stage._execution_key
+        )
+        if stage._execution_key is not None:
+            memory.remember_working_phase(
+                stage._execution_key, tuple(m for m in claimed if m.memory is memory)
+            )
+        return wrapped
 
     def _retire_if_idle(self) -> None:
         with self._submission:
@@ -956,60 +831,16 @@ class _SharedDomain:
 class _SequenceExecution(Execution):
     plan: PreparedSequence
 
-    def __init__(self, plan, context, outputs, readout, models, native, reads, phases=None):
+    def __init__(self, plan, context, outputs, readout, models, native, phases=None):
         super().__init__(plan, context, 0, outputs, readout, models, native)
-        self._stage_reads = reads
-        # Only all-resident sequences have already retained every future stage workspace.
-        # Source-backed stages keep their existing separate current-stage lookahead policy.
-        self._queued_eligible = context is not None and not reads
         self._phase_controllers = phases or {}
-        self._prefetch_admission: list[dict[str, object]] = []
         self._working_phases_recorded = False
-
-    def _prepare_lookahead(self) -> None:
-        if not self.plan.prefetch:
-            self._prefetch_admission.append({"state": "disabled_by_author"})
-            return
-        for current, following in zip(self._stage_reads, self._stage_reads[1:], strict=False):
-            index, job, bindings = current
-            next_index, next_job, next_bindings = following
-            # Declare actual sequence order. A suffix follows a repeated interval only on
-            # its last pass; the existing bounded link does not describe that conditional edge.
-            repeat = self.plan._repeat
-            if repeat is not None and repeat[2] > 1 and next_index == repeat[1]:
-                continue
-            if (
-                not bindings
-                or not next_bindings
-                or not callable(getattr(job, "link_next", None))
-            ):
-                continue
-            if not all(
-                getattr(source, "supports_measured_lookahead", False)
-                for source in (job, next_job)
-            ):
-                self._prefetch_admission.append({
-                    "from_stage": index, "to_stage": next_index,
-                    "state": "unsupported_native_admission",
-                })
-                continue
-            current_stage = self.plan.stages[index]
-            # Identity/order are the declaration. Native admission checks the active replay,
-            # its same-definition measurement and actual raw-source capacity at read time.
-            linked = bool(job.link_next(
-                next_job, execution_key=current_stage._execution_key,
-                footprints=current_stage._footprints,
-            ))
-            self._prefetch_admission.append({
-                "from_stage": index, "to_stage": next_index,
-                "state": "linked" if linked else "native_refusal",
-            })
 
     def _release_models(self) -> None:
         # Base execution calls this only after checked native completion/readout. If the
         # drain is unproven, source/graph owners remain retained for retirement.
         if not self._working_phases_recorded:
-            request = self._load_request
+            request = self._request
             if request is not None:
                 for controller in self._phase_controllers.values():
                     request.working_phases.extend(
@@ -1023,7 +854,7 @@ class _SequenceExecution(Execution):
             if not controller.facts()["transitions"]:
                 continue  # measurement-only wrappers did not change weight preferences
             with memory.lock:
-                request = self._load_request
+                request = self._request
                 if (
                     request is not None
                     and not memory._active_beside(request)
@@ -1035,39 +866,8 @@ class _SequenceExecution(Execution):
 
     def facts(self) -> dict[str, object]:
         facts = self.plan.facts()
-        facts["sequence"] = dict(self._load_job.facts())
-        facts["stage_prefetch_admission"] = list(self._prefetch_admission)
+        facts["sequence"] = dict(self._sequence.facts())
         facts["native_phases"] = [
             dict(controller.facts()) for controller in self._phase_controllers.values()
         ]
-        facts["stage_inputs"] = [
-            {"stage": index, **dict(job.facts())} for index, job, _ in self._stage_reads
-        ]
         return facts
-
-    def _record_load(self, facts: Mapping[str, Any]) -> None:
-        if self._load_recorded or not facts.get("done", False):
-            return
-        for _, job, bindings in self._stage_reads:
-            loaded = job.facts()
-            if self._load_request is not None and (
-                loaded.get("read_done", False) or getattr(job, "supports_native_lookahead", False)
-            ):
-                # Lookahead jobs expose complete padded ledgers after aggregate done,
-                # including prefetched bytes when demand was canceled before starting.
-                blocks = [block for binding in bindings for block in binding.groups]
-                if blocks:
-                    prefetched = loaded.get("prefetch_input_read_bytes", [0] * len(blocks))
-                    for block, nbytes, speculative in zip(
-                        blocks, loaded["input_read_bytes"], prefetched, strict=True
-                    ):
-                        nbytes, speculative = int(nbytes), int(speculative)
-                        if not 0 <= speculative <= nbytes:
-                            raise RuntimeError(
-                                "native prefetch byte accounting exceeds total input reads"
-                            )
-                        if nbytes > speculative:
-                            self._load_request.read(block, 0, nbytes - speculative)
-                        if speculative:
-                            self._load_request.read(block, 0, speculative, speculative=True)
-        self._load_recorded = True

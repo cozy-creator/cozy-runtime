@@ -82,7 +82,7 @@ _MEMBERS: dict[str, AttentionBackendName] = {}
 
 class Execution(Protocol):
     """The execution layer's side (`internal.execution`, installed with the memory): the
-    ordinary attention invocation. Native exchanges carry their prepared provider directly."""
+    attention cut."""
 
     def attend(
         self,
@@ -172,8 +172,7 @@ def _dispatch(backend: str, local: Local) -> Callable[..., Tensor]:
             key,
             value,
             group(_parallel_config),
-            backend=backend,
-            options=options,
+            lambda q, k, v: _call(backend, local, q, k, v, options),
         )
 
     return attention
@@ -219,15 +218,13 @@ def exchange(
     key: Tensor,
     value: Tensor,
     handle: ProcessGroup,
-    *,
-    backend: str,
-    options: Options,
+    compute: Callable[[Tensor, Tensor, Tensor], Tensor],
 ) -> Tensor:
-    """Sequence shards -> the exact selected prepared local provider -> back
+    """Sequence shards -> full sequence per head subset -> `compute` -> back
     (`internal.parallel.ulysses.exchange`)."""
     if _EXCHANGE is None:
         raise ValueError(_UNSERVED)
-    return _EXCHANGE(query, key, value, handle, backend=backend, options=options)
+    return _EXCHANGE(query, key, value, handle, compute)
 
 
 _UNSERVED = "Ulysses runs where torch does: nothing imported internal.parallel.ulysses"

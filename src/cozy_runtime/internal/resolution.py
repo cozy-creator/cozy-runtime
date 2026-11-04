@@ -29,7 +29,6 @@ from typing import Protocol
 
 import msgspec
 
-from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.internal import canonical
 from cozy_runtime.internal.delivery import DELIVERY_RUNGS, ROUTE_KERNEL
 from cozy_runtime.internal.encoding.formats import Encoded, EncodingRefusal, Provider
@@ -215,8 +214,6 @@ class ResolvedModelPlan:
     construction: ConstructionFacts
     encoded_leaves: str
     walk: tuple[Step, ...] = ()
-    prepared_use: PreparedUse | None = None
-    prepared_use_reason: str = ""
 
     # ------------------------------------------------------------------ derived facts
 
@@ -304,11 +301,6 @@ class ResolvedModelPlan:
             "runtime": self.runtime.document(),
             "placement": self.placement,
             "construction": self.construction.document(),
-            **(
-                {"prepared_use": msgspec.to_builtins(self.prepared_use)}
-                if self.prepared_use
-                else {}
-            ),
         }
 
     def digest(self) -> str:
@@ -350,16 +342,6 @@ class ResolvedModelPlan:
             "stored_bytes": self.stored_bytes(),
             "tensors": [row.document() for row in self.tensors],
             "walk": msgspec.to_builtins(self.walk),
-            **(
-                {
-                    "prepared_use": {
-                        "request": msgspec.to_builtins(self.prepared_use),
-                        "reason": self.prepared_use_reason,
-                    }
-                }
-                if self.prepared_use
-                else {}
-            ),
         }
 
     def summary(self) -> str:
@@ -399,7 +381,6 @@ def resolve(
     placement: str = "all_resident",
     encoded_leaves: str = "refuse",
     dtype_name: Callable[[str], str],
-    prepared_use: PreparedUse | None = None,
 ) -> ResolvedModelPlan:
     """The variant's header rows -> ONE plan, by rule.
 
@@ -439,15 +420,6 @@ def resolve(
         placement=placement,
         encoded_leaves=encoded_leaves,
         dtype_name=dtype_name,
-    )
-    plan = dataclasses.replace(
-        plan,
-        prepared_use=prepared_use,
-        prepared_use_reason=(
-            "retained-float optimization has no native admission contract; existing route retained"
-            if prepared_use is not None
-            else ""
-        ),
     )
     step = Step(
         variant.name,

@@ -1,4 +1,5 @@
-"""Declared native execution and ordinary eager operations with executor-local residency."""
+"""Torch execution with executor-local residency: pure-site cuts sized by native selection from
+their operands' shape estimates."""
 
 from __future__ import annotations
 
@@ -9,37 +10,13 @@ import torch
 from torch import nn
 
 from cozy_runtime.internal.execution import catch, cuts
-from cozy_runtime.internal.execution.catch import cut_rows, piece, serving
+from cozy_runtime.internal.execution.catch import checkpoint as piece
+from cozy_runtime.internal.execution.catch import serving
 from cozy_runtime.internal.execution.cuts import attend, split
-from cozy_runtime.internal.execution.native_heads import split_projected_heads
-from cozy_runtime.internal.execution.native_linear_split import (
-    split_declared,
-    split_single_use_projection,
-)
-from cozy_runtime.internal.execution.native_residual_ffn import split_residual_ffn
-from cozy_runtime.internal.execution.native_sparse_producer import split_sparse_projected_heads
-from cozy_runtime.internal.execution.native_vae import split_layer_scale_block
-from cozy_runtime.internal.execution.native_vae_sequence import decode_vae_tiles
 from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
 from cozy_runtime.internal.residency import Request, blocks_of
 
-__all__ = [
-    "Steps",
-    "attend",
-    "cut_rows",
-    "decode_vae_tiles",
-    "install",
-    "piece",
-    "record",
-    "serving",
-    "split",
-    "split_declared",
-    "split_layer_scale_block",
-    "split_projected_heads",
-    "split_residual_ffn",
-    "split_single_use_projection",
-    "split_sparse_projected_heads",
-]
+__all__ = ["Steps", "attend", "install", "piece", "record", "serving", "split"]
 
 
 def install(module: nn.Module) -> None:

@@ -16,9 +16,9 @@ import warnings
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from enum import Enum
 from itertools import pairwise
 from typing import Any, Protocol
@@ -33,7 +33,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
-from cozy_runtime.author._errors import CapabilityError, Fault, fault
+from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import cache_owners, cooperation, proctree
 from cozy_runtime.internal.accel import (
@@ -56,7 +56,6 @@ __all__ = [
     "QueuedPrefetch",
     "Region",
     "Request",
-    "Room",
     "TensorLayout",
     "Weights",
     "blocks_of",
@@ -66,7 +65,6 @@ __all__ = [
 ]
 
 progress = 0
-_RESERVE = 512 << 20
 
 
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
@@ -104,9 +102,7 @@ _DTYPES = {
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
 # During authored stage preparation, undeclared model reads must not page in sibling blocks.
-_CAPTURE_BLOCKS: ContextVar[frozenset[int] | None] = ContextVar("cozy_capture_blocks", default=None)
 #: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
-CUTTER: ContextVar[Any] = ContextVar("cozy_loop_cutter", default=None)
 #: A native loop's eager call (`internal.loop`): the models and blocks it ran.
 ENTERED: ContextVar[set[Any] | None] = ContextVar("cozy_loop_entered", default=None)
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
@@ -118,18 +114,6 @@ _UNPROVEN: list[Binding] = []
 class Level(Enum):
     RAM = "ram"
     GPU = "gpu"
-
-
-@dataclass(frozen=True, slots=True)
-class Room:
-    free: int
-    cold: int
-    warm: int
-    granularity: int = 512
-    floor: int = 0
-    #: Existing sizing policy's unallocated working backing. P2 replaces this aggregate
-    #: with stream/pool-aware capacity; it is not a physical-reclamation guarantee.
-    cached: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -510,8 +494,10 @@ class _Prefetch:
     identity: str
     request: Request | None
     queued: QueuedPrefetch | None = None
-    #: The immutable RAW source's overlay identity, verified again at settlement.
+    #: The immutable source's overlay identity, verified again at settlement.
     overlay: Hashable = None
+    #: Its final (cast) region's bytes, not its stored ones.
+    final: bool = False
 
 
 class _HostPage:
@@ -519,16 +505,45 @@ class _HostPage:
     unregistered when the page goes. Demand copies are synchronous. Registered once
     filled: registering touched memory runs at about twice the rate of untouched memory."""
 
-    __slots__ = ("tensor",)
+    __slots__ = ("event", "tensor")
 
     def __init__(self, tensor: Tensor) -> None:
         self.tensor = tensor
+        #: its last async read's completion, which `release` waits for
+        self.event: Any = None
         code = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.numel(), 0)
         if int(code) != 0:
             raise RuntimeError(f"cudaHostRegister returned {code}")
 
     def release(self) -> None:
+        if self.event is not None:
+            self.event.synchronize()
         torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr())
+
+
+class _HostRead:
+    """A prefetch from a host page: one DMA on the copy stream. Its fill commits only once the
+    copy completed, so nothing that pins the region ready can read it early."""
+
+    def __init__(self, use: Any, event: Any, nbytes: int) -> None:
+        self.use, self.event, self.nbytes, self.canceled = use, event, nbytes, False
+
+    def start(self) -> None:
+        pass
+
+    def poll(self) -> dict[str, bool]:
+        return {"done": bool(self.event.query())}
+
+    def cancel(self) -> None:
+        self.canceled = True
+
+    def wait(self) -> dict[str, Any]:
+        self.event.synchronize()
+        use, self.use = self.use, None
+        if use is not None and not self.canceled:
+            use.commit()
+        nbytes = 0 if self.canceled else self.nbytes
+        return {"canceled": self.canceled, "bytes": nbytes, "host": True}
 
 
 class Model:
@@ -678,9 +693,9 @@ class Model:
                     ),
                     _HOST_STAGING,
                 )
-            if free_only and missing > self.memory.room().free:
+            if free_only and missing > self.memory._free():
                 release_cached(torch, self.memory.device.type)
-                if missing > self.memory.room().free:
+                if missing > self.memory._free():
                     return None
             entered: list[_Block] = []
             try:
@@ -797,13 +812,6 @@ class Binding:
         self.held: list[tuple[_Block, int]] = []
         self.lock = threading.RLock()
         self.last: Any = None
-        self._load_slot: Any = None
-        self._stage_source: Any = None
-        self._stage_regions: tuple[tuple[_Block, Any], ...] = ()
-        self._load_data: dict[_Block, dict[str, dict[str, Tensor]]] | None = None
-        self._load_storage: dict[_Block, int] = {}
-        self._load_source: Weights | None = None
-        self._load_target_strides: list[tuple[_Site, tuple[int, ...]]] = []
 
     def valid(self) -> bool:
         return not self._invalid()
@@ -818,15 +826,6 @@ class Binding:
             return "fill identity changed"
         if self.generation != model.generation:
             return "model generation changed"
-        if not all(block.region is region for block, region in self._stage_regions):
-            return "stage region replaced"
-        if self._load_source is not None and model.source is not self._load_source:
-            return "load source changed"
-        if not all(
-            (value := site.table[site.name]) is not None and tuple(value.stride()) == stride
-            for site, stride in self._load_target_strides
-        ):
-            return "target strides changed"
         if not all(
             (value := site.table[site.name]) is not None
             and tuple(value.shape) == shape
@@ -835,8 +834,7 @@ class Binding:
         ):
             return "target shape or dtype changed"
         if not all(
-            (self._load_data is not None or b.data is not None) and b.generation == generation
-            for b, generation in self.held
+            b.data is not None and b.generation == generation for b, generation in self.held
         ):
             return "held block released"
         return ""
@@ -855,245 +853,6 @@ class Binding:
                 return f"{name} block {b.path or '(common)'}: raw {_state(b.region)}{final}"
         return ""
 
-    def _load_refusal(self, stage: bool, region_input: bool) -> str:
-        """The first reason `prepare_load` refuses this binding, or empty when it can load."""
-        memory, model = self.model.memory, self.model
-        if why := self._invalid():
-            return f"binding {why}"
-        for why, refused in (
-            ("binding already prepared", self.used),
-            ("binding holds its blocks", self.held),
-            ("a load slot is open", self._load_slot is not None),
-            ("a stage source is open", self._stage_source is not None),
-            ("memory is not CUDA", not memory.cuda),
-            ("a capture is active", memory.capturing()),
-            ("no native memory", memory.native is None),
-            ("TensorFS cannot take region inputs", not region_input),
-            ("the model has a fill", model.fill is not None),
-        ):
-            if refused:
-                return why
-        for block in self.groups:
-            finals = sorted(block.finals)
-            encoded = any(set(parts) != {"value"} for parts in block.parts.values())
-            for why, refused in (
-                ("has no declared layout", block.aliases is None),
-                (f"has {len(finals)} final rows ({', '.join(finals[:3])})", finals),
-                (
-                    "has encoded parts outside a routed stage",
-                    encoded and (not stage or model.finals is None or not model.finals.encoded),
-                ),
-                ("has no storage", not block.storage_bytes),
-                (
-                    "has packed F4 parts",
-                    any(p.dtype == "F4" for parts in block.parts.values() for p in parts.values()),
-                ),
-                (f"is in use ({block.count})", block.count),
-                (f"is retained ({block.retained}) in {model.component}", block.retained),
-                ("is loading", block.loading),
-            ):
-                if refused:
-                    return f"block {block.path or '(common)'} {why}"
-        return ""
-
-    def prepare_load(self, *, stage: bool = False) -> Any:
-        """Create capture-private views for immutable raw blocks, without reading weights.
-
-        Ordinary block data is never changed here. The native slot atomically retains ready
-        regions and owns unpublished missing fills; its views are installed only by prepare().
-        """
-        memory, model = self.model.memory, self.model
-        with self.lock:
-            model._claim()
-            try:
-                if why := self._load_refusal(
-                    stage, varena.LoadSlot.supports_region_input
-                ):
-                    raise StaleBinding(
-                        f"native component loading needs idle immutable raw layouts: {why}"
-                    )
-                if any(
-                    getattr(module, "_compiled_call_impl", None) is not None
-                    or hasattr(module, "_orig_mod")
-                    for module in model.module.modules()
-                ):
-                    raise StaleBinding("compiled modules require resident weight preparation")
-                self._load_source = model.source
-                self._load_target_strides = [
-                    (site, tuple(site.table[site.name].stride())) for site, _, _ in self.targets
-                ]
-                # Protect every existing ready block before phase policy or a later cold
-                # allocation can reclaim it. Native group admission takes its own pins before
-                # these temporary owners are released. Nothing here exposes unreadable data.
-                ready_uses = [
-                    use
-                    for block in self.groups
-                    if block.region is not None
-                    if (use := block.region.pin()) is not None
-                ]
-                # Run existing phase admission before private capacity is reserved, so
-                # warmup hooks do not mistake those allocated inputs for missing bytes.
-                memory._activate_phase(model)
-                with memory.lock:
-                    if memory._prefetch is not None:
-                        memory._settle_prefetch(cancel=True)
-                groups = []
-                for block in self.groups:
-                    region = memory._native_region(block)
-                    offset = 0
-                    parts = []
-                    for key, roles in block.parts.items():
-                        for part in roles.values():
-                            parts.append(
-                                (
-                                    f"{model.component}/{key}#{part.role or 'value'}",
-                                    offset,
-                                    part.nbytes,
-                                )
-                            )
-                            offset += (part.nbytes + 255) // 256 * 256
-                    groups.append((region, parts))
-                if stage and not varena.LoadSlot.supports_ready_stage:
-                    raise StaleBinding("TensorFS lacks ready-input model stage preparation")
-                slot = (
-                    varena.LoadSlot.from_regions(model.source.ck, groups, keep_ready=True)
-                    if stage
-                    else varena.LoadSlot.from_regions(model.source.ck, groups)
-                )
-                if (
-                    stage
-                    and slot is not None
-                    and not callable(getattr(slot._native, "detach_source", None))
-                ):
-                    slot.close()
-                    raise StaleBinding("TensorFS lacks detached model-stage input ownership")
-                # Native now owns ready inputs, or ordinary resident capture revalidates.
-                ready_uses.clear()
-                if slot is None:
-                    return None  # The caller must revalidate/reacquire its resident binding.
-                self._load_slot = slot
-                data: dict[_Block, dict[str, dict[str, Tensor]]] = {}
-                for block, raw in zip(self.groups, slot.tensors, strict=True):
-                    self._load_storage[block] = int(raw.untyped_storage().data_ptr())
-                    offset = 0
-                    rows = data[block] = {}
-                    for key, parts in block.parts.items():
-                        row = rows[key] = {}
-                        for role, part in parts.items():
-                            if part.dtype == "F4":
-                                raise StaleBinding(
-                                    "native raw component loading excludes packed weights"
-                                )
-                            value = raw[offset : offset + part.nbytes].view(
-                                getattr(torch, _DTYPES[part.dtype])
-                            )
-                            row[role] = value.view(part.shape)
-                            offset += (part.nbytes + 255) // 256 * 256
-                self._load_data = data
-                return slot
-            except BaseException:
-                if self._load_slot is not None:
-                    self._load_slot.close()
-                    self._load_slot = None
-                self._load_data = None
-                self._load_storage.clear()
-                self._load_source = None
-                self._load_target_strides.clear()
-                raise
-            finally:
-                model._release()
-
-    def immutable_buffer_ids(self, *, selected: bool = False) -> frozenset[int]:
-        """Declared checkpoint-backed buffers, including idle placeholders in other blocks.
-
-        They are immutable inputs, not mutable module state to clone while capturing one
-        block. Restrict this to named final-layout targets; ordinary nonweight buffers keep
-        the existing state snapshot and restoration behavior.
-        """
-        names: set[str] = set()
-        for block in self.groups if selected else self.model.groups():
-            for key in block.parts:
-                if self.model.finals is not None:
-                    layout = self.model.finals.layout(key)
-                    if layout is not None:
-                        names.update(layout)
-                elif set(block.parts[key]) == {"value"}:
-                    names.add(
-                        self.model.source.bound.get(key, key) if self.model.source.bound else key
-                    )
-        return frozenset(
-            id(site.table[site.name])
-            for name in names
-            for site in self.model.sites.get(name, ())
-            if not site.parameter and site.table[site.name] is not None
-        )
-
-    def undeclared_input_ranges(self) -> tuple[tuple[Any, int, int], ...]:
-        """Existing source/final reservations outside this stage, including escaped views."""
-        return tuple(
-            (
-                self.model.memory.device,
-                int(region.ptr),
-                int(region.ptr) + int(region.allocated_bytes),
-            )
-            for block in self.model.groups()
-            if block not in self.groups
-            for region in (block.region, block.final_region)
-            if region is not None
-        )
-
-    def detach_stage(self) -> Any:
-        """Keep immutable source/VA identity after checked capture; release physical pins.
-
-        The native source owns the Region reservations. It reacquires ready pins or missing
-        fills on each sequence pass, without calling Python or replacing parameter addresses.
-        """
-        with self.lock:
-            slot = self._load_slot
-            if (
-                slot is None
-                or self._load_data is None
-                or not self.used
-                or self._stage_source is not None
-                or not self.valid()
-            ):
-                raise StaleBinding("detachment requires a valid completed raw capture")
-            if self.last is not None:
-                try:
-                    self.last.synchronize()
-                except BaseException as incomplete:
-                    self._unproven(incomplete)
-            with self.model.memory.lock:
-                if any(block.count or block.loading for block in self.groups):
-                    raise StaleBinding("model stage capture is still using its input views")
-                regions = tuple((block, block.region) for block in self.groups)
-                if any(region is None for _, region in regions):
-                    raise StaleBinding("model stage lost its managed input reservation")
-                for block, _ in self.held:
-                    block.retained -= 1
-                    self.model.memory._idle(block)
-                self.held.clear()
-                self._load_data = None
-                self._load_storage.clear()
-            # Drop every private Python tensor owner before native's actual live-Pin check.
-            # An escaped external view makes this refuse; no refcount guess or gc sweep.
-            slot._tensor = None
-            slot._tensors = None
-            source = slot._native.detach_source()
-            self._stage_regions = regions
-            self._stage_source = source
-            self._load_slot = None
-            slot.close()
-            return source
-
-    def immutable_inputs(self) -> tuple[Tensor, ...]:
-        """The native-loaded source ranges, including the all-ready resident fallback."""
-        if self._load_source is None:
-            return ()
-        if self._load_slot is not None:
-            return tuple(self._load_slot.immutable_inputs)
-        return tuple(tensor for block in self.groups for tensor in block.tensors())
-
     @contextmanager
     def prepare(self, stream: Any = None) -> Iterator[Binding]:
         memory = self.model.memory
@@ -1111,15 +870,11 @@ class Binding:
                     and self.model.wanted_identity() is None
                     and self.generation == self.model.generation
                 )
-                if self._stage_source is not None:
-                    raise StaleBinding("detached model stages prepare only through native input")
                 if not self.valid() and not ephemeral:
                     raise StaleBinding("graph weight storage or fill changed")
                 request = _REQUEST.get()
                 if request is not None and request.idle and not self.resident():
                     raise StaleBinding("idle graph preparation cannot page weights in")
-                if self._load_data is not None and self.used:
-                    raise StaleBinding("a native loaded binding can only prepare once")
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None:
@@ -1127,7 +882,6 @@ class Binding:
                     entered: list[_Block] = []
                     retained: list[tuple[_Block, int]] = []
                     published = False
-                    restored: list[tuple[_Block, Any, Any, Any, Any]] = []
                     try:
                         if not self.held:
                             # Claim the complete dependency set before any preparation. Neither
@@ -1136,20 +890,6 @@ class Binding:
                                 for block in self.groups:
                                     block.retained += 1
                                     retained.append((block, block.generation))
-                        if self._load_data is not None:
-                            for block in self.groups:
-                                restored.append(
-                                    (
-                                        block,
-                                        block.data,
-                                        block.assigned,
-                                        block.ready,
-                                        block.native_storage,
-                                    )
-                                )
-                                block.data = self._load_data[block]
-                                block.assigned = block.ready = None
-                                block.native_storage = self._load_storage[block]
                         for block in self.groups:
                             memory._enter(block)
                             entered.append(block)
@@ -1168,13 +908,8 @@ class Binding:
                             if memory.cuda and entered:
                                 self._finish(stream)
                         finally:
-                            try:
-                                for block in reversed(entered):
-                                    memory._exit(block)
-                            finally:
-                                for block, data, assigned, ready, storage in reversed(restored):
-                                    block.data, block.assigned = data, assigned
-                                    block.ready, block.native_storage = ready, storage
+                            for block in reversed(entered):
+                                memory._exit(block)
             finally:
                 self.model._release()
 
@@ -1240,28 +975,6 @@ class Binding:
                     block.retained -= 1
                     self.model.memory._idle(block)
                 self.held.clear()
-            if self._load_slot is not None:
-                self._load_slot.close()
-                self._load_slot = None
-                # Abandoning the slot drops any unpublished fill, leaving its region Cold.
-                # A capture-only alias may have escaped and outlive it, so retire the region
-                # identity of every block that was being filled (not resident), as _ensure
-                # does on a failed fill. Otherwise a later prepare() returns Busy against the
-                # dropped fill and breaks the eager fallback. Resident inputs keep their cache.
-                with self.model.memory.lock:
-                    for block in self.groups:
-                        region = block.region
-                        if region is not None and not region.resident:
-                            self.model.memory._retire_phase_plan(
-                                "binding_fill_abandoned", model=self.model,
-                            )
-                            block.region = None
-            self._load_data = None
-            self._load_storage.clear()
-            self._load_source = None
-            self._load_target_strides.clear()
-            self._stage_source = None
-            self._stage_regions = ()
 
 
 class Region:
@@ -1357,8 +1070,6 @@ class Memory:
         self.granularity = 512
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
-        self.phase_supported = False
-        self.phase_plan_supported = False
         self._phase_plan: Any = None
         self._phase_plan_signature: tuple[Any, ...] | None = None
         self._phase_plan_key: str | None = None
@@ -1373,6 +1084,8 @@ class Memory:
         self._baked_bytes = 0
         #: resident pages baked once: kept from their first refill
         self._baked_once: set[tuple[object, ...]] = set()
+        #: the copy stream a host page's prefetch runs on
+        self._h2d_stream: Any = None
         #: a hooked block's pages whose fill wrote nothing: their stored bytes are the page, so a
         #: store read prefetches and the idle tier pins them as it does a plain block's
         self._plain: set[tuple[object, ...]] = set()
@@ -1408,8 +1121,6 @@ class Memory:
                 self._apply_cap()
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = varena.supports_refill()
-                self.phase_supported = True
-                self.phase_plan_supported = True
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
                     raise
@@ -1505,7 +1216,8 @@ class Memory:
             # If another scope is active, a refused retirement retains the ownership request.
             for key in model.working_phase_keys:
                 if self._working_phase_owners[key] == {model}:
-                    vt.phase_forget(self.device.index or 0, key)
+                    with suppress(RuntimeError):  # still active: its native record outlives it
+                        vt.phase_forget(self.device.index or 0, key)
             for key in tuple(model.working_phase_keys):
                 owners = self._working_phase_owners[key]
                 if owners == {model}:
@@ -1514,68 +1226,15 @@ class Memory:
                     owners.remove(model)
                 model.working_phase_keys.remove(key)
 
-    def room(self, current: Collection[str] = ()) -> Room:
-        if self.cuda:
-            free, total = torch.cuda.mem_get_info(self.device)
-            # reserved - allocated includes graph-private storage that ordinary eager
-            # allocation cannot necessarily reuse. Driver free is a conservative bound.
-            free = max(int(free) - _RESERVE, 0)
-            if self.budget_bytes is not None:
-                # The card is `budget_bytes` (a development cap): what it lacks of the real one
-                # is never there, whoever holds the rest. Account native backing beside Torch
-                # reservations, including graph pools: unused private-pool bytes are not
-                # headroom for an eager allocation.
-                card = max(free - (int(total) - self.budget_bytes), 0)
-                free = min(card, max(self.budget_bytes - self._figures()[1], 0))
-        elif self.device.type == "mps":
-            figures = allocation(torch, "mps")
-            free, reserved = figures["driver_free_bytes"], figures["reserved_bytes"]
-            if self.budget_bytes is not None:
-                free = min(free, max(self.budget_bytes - reserved, 0))
-        else:
-            free = host_memory().free_bytes
-        if self.native is not None:
-            # Native pins, including escaped Torch storage aliases, are the authority.
-            # Do not count an idle Python block as reclaimable merely because hooks closed.
-            # Existing native preferences and the active phase's actual idle pages are warm:
-            # generic cuts take a finer level before evicting the weights they run (H3 Turbo
-            # on a 4090: one coarser FFN cut evicted 20 transformer blocks, re-read and re-baked).
-            stats = self.native.stats()
-            reclaimable = int(stats["reclaimable_bytes"])
-            own = min(int(stats.get("preferred_bytes", 0)) + self._own_idle(), reclaimable)
-            # Pure-cut workspace estimates still use Torch's allocation granularity.
-            return Room(int(free), reclaimable - own, own)
-        with self.lock:
-            cold = warm = 0
-            for model in self.models.values():
-                for block in model.groups():
-                    if block.data is not None and not (
-                        block.count
-                        or block.retained
-                        or block.loading
-                        or (model.users and model.thread != threading.get_ident())
-                    ):
-                        if model.name in current:
-                            warm += block.nbytes
-                        else:
-                            cold += block.nbytes
-        return Room(int(free), cold, warm)
-
-    def _own_idle(self) -> int:
-        """The active phase's resident, idle, unpreferred weight bytes (its streamed blocks'
-        cache): weights of the running phase, never room for its activations (`Room.cold`)."""
-        names = self._phase_names or ()
-        total = 0
-        for model in self.models.values():
-            if model.name not in names:
-                continue
-            for block in model.groups():
-                if block.count or block.retained or block.loading:
-                    continue
-                for region in (block.region, block.final_region):
-                    if region is not None and region.resident and not region.preferred:
-                        total += int(region.allocated_bytes)
-        return total
+    def _free(self) -> int:
+        """Free bytes where no native owner answers (MPS, CPU)."""
+        if self.device.type != "mps":
+            return host_memory().free_bytes
+        figures = allocation(torch, "mps")
+        free = int(figures["driver_free_bytes"])
+        if self.budget_bytes is not None:
+            free = min(free, max(self.budget_bytes - int(figures["reserved_bytes"]), 0))
+        return free
 
     def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         level = Level(level) if isinstance(level, str) else level
@@ -1872,15 +1531,19 @@ class Memory:
             model.identity = identity
             model.generation += 1
 
-    def _keep_baked(self, page: tuple[object, ...], tensor: Tensor) -> None:
-        """Keep a page after an actual repeated bake, not a predicted device-cache prefix.
+    def _streams(self, model: Model) -> bool:
+        """A model over half the card will page its blocks beside its working memory (H3's 21 GB
+        DiT, on 24 and on 32 GB). Used only to keep a bake from the first: wrong either way costs
+        one host copy, or one more bake."""
+        total = self.budget_bytes or int(torch.cuda.mem_get_info(self.device)[1])
+        return 2 * sum(block.allocation_bytes for block in model.groups()) > total
 
-        The first completed bake records history; a later refill demonstrates host reuse.
-        Host-RAM capacity and the ordinary synchronous demand path remain unchanged.
-        """
+    def _keep_baked(self, page: tuple[object, ...], block: _Block, tensor: Tensor) -> None:
+        """A block's baked bytes, kept in the host tier for its next refill: a streaming model's
+        from its first bake, a resident one's from its first refill. Bake it once."""
         if page in self._baked:
             return
-        if page not in self._baked_once:
+        if not self._streams(block.model) and page not in self._baked_once:
             self._baked_once.add(page)
             return
         if not self._admit(page, tensor.numel()):
@@ -1916,7 +1579,7 @@ class Memory:
             return
         page = _page(block, block.model.identity, block.overlay, final=True)
         self._refills[page] = self._refills.get(page, 0) + 1
-        self._keep_baked(page, tensor)
+        self._keep_baked(page, block, tensor)
 
     def _want(self, block: _Block, page: tuple[object, ...]) -> None:
         """A store read of `page` completed: the page is pinned once the executor is idle
@@ -2115,6 +1778,31 @@ class Memory:
         self._baked_once = {page for page in self._baked_once if page[0] != model.name}
         self._plain = {page for page in self._plain if page[0] != model.name}
 
+    def _host_read(
+        self, region: Any, kept: _HostPage, *, evict_completed: bool
+    ) -> _HostRead | None:
+        """A refill from a host page: the region's fill, admitted without waiting, one async DMA;
+        None when the region is resident already. A fill admitted here that fails is released
+        before its error leaves: a traceback holding it kept the region `already being filled`
+        for the retry (cr-225)."""
+        if self._h2d_stream is None:
+            self._h2d_stream = torch.cuda.Stream(self.device)
+        stream = self._h2d_stream
+        use = region.prepare(reclaim=False, evict_completed=evict_completed)
+        if not use.needs_fill:
+            return None
+        try:
+            use.consume_on(stream.cuda_stream)  # its release fences on the copy
+            with torch.cuda.stream(stream):
+                use.tensor.copy_(kept.tensor, non_blocking=True)
+                event = torch.cuda.Event()
+                event.record(stream)
+        except BaseException:
+            use = None  # the fill and its tensor go now, not with the traceback
+            raise
+        kept.event = event
+        return _HostRead(use, event, kept.tensor.numel())
+
     def _switch_overlay(self, block: _Block, overlay: Hashable) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
         a LoRA forward, or the reverse). As for a changed fill, its model's holds go first. A
@@ -2203,18 +1891,15 @@ class Memory:
             with self.lock:
                 model.retiring = False
 
-    def reclaim(
-        self, need: int = 0, *, current: Collection[str] = (), activations: bool = False
-    ) -> int:
+    def reclaim(self, need: int = 0) -> int:
         """Non-CUDA owner recovery; native CUDA allocation owns its bounded recovery."""
-        del activations  # CUDA's activation/weight distinction no longer selects Python victims.
         if self.cuda:
             return 0
         before_allocated, before_reserved, _ = self._figures()
-        available = self.room(current).free if need else 0
+        available = self._free() if need else 0
         if need and available < need:
             release_cached(torch, self.device.type)
-            available = self.room(current).free
+            available = self._free()
         dropped = 0
 
         def enough(released: int = 0, *, flush: bool = False) -> bool:
@@ -2223,10 +1908,10 @@ class Memory:
                 return False
             dropped += released
             if flush or dropped >= max(need - available, 1):
-                available = self.room(current).free
+                available = self._free()
                 if available < need:
                     release_cached(torch, self.device.type)
-                    available = self.room(current).free
+                    available = self._free()
                 dropped = 0
             return available >= need
 
@@ -2241,16 +1926,13 @@ class Memory:
         for hold in holds:
             hold.shed()
         with self.lock:
-            blocks = sorted(
-                (b for m in self.models.values() for b in m.groups()),
-                key=lambda b: (b.model.name in current, b.last),
-            )
+            blocks = sorted((b for m in self.models.values() for b in m.groups()), key=lambda b: b.last)
         for block in blocks:
             if enough():
                 break
             enough(self._discard(block))
         if not enough(flush=True):
-            for model in sorted(list(self.models.values()), key=lambda m: m.name in current):
+            for model in list(self.models.values()):
                 if enough():
                     break
                 if self._retire(model):
@@ -2329,7 +2011,7 @@ class Memory:
             # TensorFS reads into bounded host staging; account for that transient beside
             # the retained MPS part before asking Torch for its destination allocation.
             need = nbytes + min(nbytes, _HOST_STAGING)
-            if need > self.room().free:
+            if need > self._free():
                 self.reclaim(need)
         try:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
@@ -2392,9 +2074,6 @@ class Memory:
         A first pass may create raw/final handles. Until every required handle exists,
         this phase stays unplanned; evicted-but-still-owned reservations are sufficient.
         """
-        if not self.phase_plan_supported:
-            self._note_phase_plan("unplanned", "native_capability_missing")
-            return
         models = [model for model in self.models.values() if model.name in names]
         reason = ""
         if len(models) != len(names) or {model.name for model in models} != set(names):
@@ -2468,7 +2147,7 @@ class Memory:
         """
         self.cooperation_boundary(used=True)
         request = _REQUEST.get()
-        if not self.phase_supported or self.capturing() or (request is not None and request.idle):
+        if not self.cuda or self.capturing() or (request is not None and request.idle):
             return
         names = request.phase(model.name) if request is not None else frozenset({model.name})
         request_id = request.id if request is not None else None
@@ -2549,12 +2228,10 @@ class Memory:
         *,
         queued: QueuedPrefetch | None = None,
     ) -> None:
-        """Offer one immutable stored RAW source to native measured admission.
-
-        Unknown keys and physical shortfalls decline without IO or Python recovery.
-        Host-kept/final/transformed sources await their own native source contract;
-        ordinary demand retains the existing host-tier and fill paths.
-        """
+        """Admit one immutable read, without eviction or Python fill callbacks: a page the host
+        tier keeps (stored, baked or cast) by one DMA, else the stored bytes under native measured
+        admission, and for a hooked block only when its fill writes nothing under the overlay this
+        forward arms. A cast block the tier keeps cast prefetches only its kept final bytes."""
         if (
             not self.prefetch_supported
             or self.capturing()
@@ -2580,7 +2257,9 @@ class Memory:
             overlay = block.model.fill.overlay(block.path, block.parts)
             if overlay != block.overlay:
                 return  # demand parks or refills a page of another overlay (`_switch_overlay`)
-        page = _page(block, identity, overlay)
+        final = _host_final(block)
+        page = _page(block, identity, overlay, final=final)
+        size = block.final_bytes if final else block.storage_bytes
         with self.lock:
             if (
                 self._prefetch is not None
@@ -2590,19 +2269,17 @@ class Memory:
                 or block.cached()
             ):
                 return
-            if _host_final(block) or (block.model.fill is not None and page not in self._plain):
+            if block.finals and not final and block.region is not None and block.region.resident:
+                return  # its stored bytes are resident; demand writes the final ones
+            kept = self._baked.get(page)
+            if kept is not None and kept.tensor.numel() != size:
+                kept = None
+            hooked = block.model.fill is not None and page not in self._plain
+            if kept is None and (final or hooked):
                 if request is not None:
                     counts = request.prefetch_unsupported
                     counts["transform"] = counts.get("transform", 0) + 1
-                return
-            if block.finals and block.region is not None and block.region.resident:
-                return  # its stored bytes are resident; demand writes the final ones
-            kept = self._baked.get(page)
-            if kept is not None and kept.tensor.numel() == block.storage_bytes:
-                if request is not None:
-                    counts = request.prefetch_unsupported
-                    counts["kept_host"] = counts.get("kept_host", 0) + 1
-                return
+                return  # only a kept page, or a hooked one whose fill writes nothing, is read
             offset = 0
             parts = []
             for key, roles in block.parts.items():
@@ -2611,8 +2288,13 @@ class Memory:
                     parts.append((name, offset, part.nbytes))
                     offset += (part.nbytes + 255) // 256 * 256
             try:
-                region = self._native_region(block)
-                read = region.prepare_prefetch(block.model.source.ck, parts)
+                region = self._native_region(block, final=final)
+                if kept is not None:
+                    read = self._host_read(region, kept, evict_completed=queued is None)
+                    if read is None:
+                        return  # resident already
+                else:
+                    read = region.prepare_prefetch(block.model.source.ck, parts)
                 if read is None:
                     if request is not None:
                         request.prefetch_declined += 1
@@ -2647,6 +2329,7 @@ class Memory:
                 request,
                 queued,
                 overlay=overlay,
+                final=final,
             )
             try:
                 # Publication precedes the last validity check, so a concurrent discard either
@@ -2745,11 +2428,13 @@ class Memory:
                             0,
                             int(row.get("bytes", 0)),
                             speculative=True,
+                            origin="baked" if row.get("host") else "store",
                         )
                 if complete:
-                    page = _page(block, pending.identity, pending.overlay)
+                    page = _page(block, pending.identity, pending.overlay, final=pending.final)
                     self._refills[page] = self._refills.get(page, 0) + 1
-                    self._want(block, page)
+                    if not row.get("host"):
+                        self._want(block, page)
             except (tensorfs.Error, torch.OutOfMemoryError, torch.AcceleratorError) as error:
                 if fault(error) not in (Fault.OTHER, Fault.OOM):
                     raise
@@ -2760,9 +2445,10 @@ class Memory:
             finally:
                 if request is not None:
                     request.prefetch_wait_ns += time.perf_counter_ns() - began
-                if not complete and block.region is pending.region:
+                field = "final_region" if pending.final else "region"
+                if not complete and getattr(block, field) is pending.region:
                     self._retire_phase_plan("prefetch_fill_abandoned", model=block.model)
-                    block.region = None
+                    setattr(block, field, None)
                 self._prefetch = None
 
     def _final_views(self, block: _Block, reclaim: bool) -> None:
@@ -2883,7 +2569,7 @@ class Memory:
                 changed = kept is None and block.model.fill(block.path, data)
                 bake = baking.end(self.stream()) if changed and baking is not None else None
                 if changed and page is not None and use is not None:
-                    self._keep_baked(page, use.tensor)
+                    self._keep_baked(page, block, use.tensor)
                 block.overlay = overlay
             if page is not None and kept is None and not changed:
                 with self.lock:  # this store read completed, and its bytes are the page
@@ -2991,12 +2677,6 @@ class Memory:
             raw[offset:stop].copy_(view, non_blocking=False)
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
-        declared = _CAPTURE_BLOCKS.get()
-        if declared is not None and id(block) not in declared:
-            raise CapabilityError(
-                "model stage reads a block outside its declared paths",
-                code="prepared_graph_ineligible",
-            )
         global progress
         model = block.model
         overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
@@ -3091,12 +2771,6 @@ class Memory:
         self, block: _Block, site: _Site, raw_view: tuple[int, _Part] | None = None
     ) -> Tensor:
         global progress
-        declared = _CAPTURE_BLOCKS.get()
-        if declared is not None and id(block) not in declared:
-            raise CapabilityError(
-                "model stage reads a block outside its declared paths",
-                code="prepared_graph_ineligible",
-            )
         model = block.model
         model._claim()
         try:
@@ -3395,37 +3069,6 @@ class Request:
         matching = [step for step in self.steps if name in step]
         return frozenset().union(*matching) if matching else frozenset({name})
 
-    def room(self, step: int | None = None) -> Room:
-        current = self.current if step is None or step >= len(self.steps) else self.steps[step]
-        room = self.memory.room(current)
-        if not self.memory.cuda or not torch.cuda.is_initialized():
-            return room
-        working = vt.stats(self.memory.device.index or 0)
-        allocated = int(working["allocated_bytes"])
-        return replace(room, cached=max(int(working["mapped_bytes"]) - allocated, 0))
-
-    def reclaim(self, need: int = 0) -> int:
-        """Legacy non-CUDA cuts may shed their step's speculative whole-model hold.
-
-        CUDA allocation already owns recovery. This compatibility hook does not migrate
-        the remaining legacy operation sizing/split contract or retry package execution.
-        """
-        if self.memory.cuda or self.idle or self.memory.capturing():
-            # The allocating native call has already attempted its finite owner recovery.
-            # The remaining legacy split contract must not run a second victim policy.
-            return 0
-        with self.memory.lock:
-            holds = [
-                hold
-                for model in self.memory.models.values()
-                if model.name in self.current and model.thread == threading.get_ident()
-                for hold in model.holds
-                if hold.reclaimable
-            ]
-        for hold in holds:
-            hold.shed()
-        return self.memory.reclaim(need, current=self.current, activations=True)
-
     @contextmanager
     def on_thread(self) -> Iterator[Request]:
         token = _REQUEST.set(self)
@@ -3438,13 +3081,6 @@ class Request:
     def yielding(self) -> Iterator[None]:
         # A child wait does not prove this entire invocation is idle or release live tensors.
         yield
-
-    def reset_peak(self) -> int:
-        self.sample()
-        _, _, peak = self.memory._figures()
-        if self.memory.cuda and len(self.memory.requests) == 1:
-            vt.reset_peak(self.memory.device.index or 0)
-        return peak
 
     def read(
         self,
@@ -3528,7 +3164,6 @@ class Request:
             "cooperation": (
                 self.memory.cooperation.facts() if self.memory.cooperation is not None else None
             ),
-            "phase_policy_supported": self.memory.phase_supported,
             "gathered": self.gathered,
             "host": None,
         }
@@ -3576,9 +3211,7 @@ class Request:
                     "unsupported_sources": dict(self.prefetch_unsupported),
                     "failed": self.prefetch_failed,
                     "wait_ns": self.prefetch_wait_ns,
-                    "scope": (
-                        "immutable stored RAW; native measured admission; unknown keys decline"
-                    ),
+                    "scope": "host pages by DMA; stored RAW under native measured admission",
                     "queued": list(self.queued_prefetch),
                 },
             )
@@ -3899,8 +3532,6 @@ def _hooks(model: Model) -> None:
         sub = model.module.get_submodule(block.path)
 
         def entered(*_: object, b: _Block = block) -> None:
-            if (cut := CUTTER.get()) is not None:
-                cut.enter(b)
             if (seen := ENTERED.get()) is not None:
                 seen.add(b)
             model._claim()
@@ -3920,8 +3551,6 @@ def _hooks(model: Model) -> None:
                 memory._exit(b)
             finally:
                 model._release()
-            if (cut := CUTTER.get()) is not None:
-                cut.exit(b)
 
         model.handles.extend(_paired(sub, entered, exited, model))
         if block.table:

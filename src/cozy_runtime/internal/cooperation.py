@@ -61,8 +61,7 @@ class Config:
 
 
 class Failure(RuntimeError):
-    # A background coordination failure cannot replay partially executed package code.
-    varena_no_retry = True
+    pass
 
 
 class Owner:
@@ -80,27 +79,7 @@ class Owner:
             device, config.uuid, config.directory, shared=config.shared, priority=config.priority,
         )
         try:
-            table = peer.snapshot()
-            facts = peer.facts()
-            row = next((row for row in table["rows"] if row["id"] == table["owner"]), None)
-            if (
-                row is None or row["pid"] != self.pid or facts["owner"] != table["owner"]
-                or not facts["active"] or facts["closed"]
-            ):
-                raise Failure("native cooperation did not retain this process's live service row")
-            if (
-                row["sharing"] != ("Shared" if config.shared else "Dedicated")
-                or row["priority"] != config.priority
-            ):
-                raise Failure(
-                    "existing native cooperation configuration differs from negotiated Start: "
-                    f"row={row['id']} actual={row['sharing']}/{row['priority']} "
-                    f"requested={'Shared' if config.shared else 'Dedicated'}/{config.priority}"
-                )
             peer.retain_working_lifetime()
-            retained = peer.facts()
-            if not retained["active"] or retained["closed"] or retained["passive_holds"] == 0:
-                raise Failure("native cooperation did not retain Working lifetime")
         except BaseException as error:
             # The constructor acquired only one client lease. Never overwrite a surviving
             # consumer's settings or publish a partially initialized Runtime Memory.
@@ -158,8 +137,6 @@ class Owner:
         self._process()
         if self._closed:
             return
-        if self._peer.pressure_capability() != 1:
-            raise Failure("native cooperation has an unsupported pressure protocol")
         try:
             self._peer.request_boundary(begin=begin)
         except Exception as cause:

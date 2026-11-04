@@ -22,10 +22,9 @@ from cozy_runtime.author._errors import CapabilityError, ConformanceError
 from cozy_runtime.author._files import asset_kinds, field_preparation
 from cozy_runtime.author._markers import FileBound
 from cozy_runtime.author._model_defaults import check_model_arguments
-from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.author._services import UNGRANTABLE
 from cozy_runtime.author._signature import Declaration, Surface, media_kinds
-from cozy_runtime.author._walker import MISSING, is_struct, walk
+from cozy_runtime.author._walker import walk
 from cozy_runtime.author._weights import MAX_WEIGHTS_OUTPUTS
 
 if TYPE_CHECKING:
@@ -147,28 +146,6 @@ def _models(declared: Declaration) -> None:
     constructed = [slot.parameter for slot in declared.slots if not slot.weights]
     check_model_arguments(declared.model_defaults, slots)
     check_model_arguments(declared.model_components, slots, what="components")
-    check_model_arguments(declared.model_prepared_use, constructed, what="prepared_use")
-    if declared.model_prepared_use:
-        if not declared.child_task or not declared.accelerator:
-            raise ConformanceError(
-                "prepared_use belongs to a child task's GPU program, not public request knobs",
-                code="model_prepared_use",
-            )
-        nodes = {node.path: node for node in walk(declared.payload_type)}
-        for name in declared.model_prepared_use.values():
-            node = nodes.get(name)
-            if (
-                node is None
-                or node.optional
-                or node.default is not MISSING
-                or not is_struct(node.annotation)
-                or set(getattr(node.annotation, "__struct_fields__", ()))
-                != set(PreparedUse.__struct_fields__)
-            ):
-                raise ConformanceError(
-                    f"prepared_use field {name!r} must be the closed typed fixed-use record",
-                    code="model_prepared_use",
-                )
     check_model_arguments(dict.fromkeys(declared.model_on_demand), constructed, what="on_demand")
     degrees = [set(slot.spec.sequence_parallel) for slot in declared.slots]
     if any(degrees) and not set.intersection(*degrees):

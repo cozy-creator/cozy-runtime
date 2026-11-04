@@ -22,13 +22,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from cozy_runtime import lora
-from cozy_runtime.author.kernels import (
-    _LINEAR_SPLIT,
-    INT8_CONVROT,
-    ROWWISE_FP8,
-    PreQuantized,
-    readable,
-)
+from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8, PreQuantized, readable
 
 
 class Rows(Protocol):
@@ -88,10 +82,6 @@ def _leaf(
         }
         vars(window)["_forward_hooks"] = {}
         vars(window)["out_features"] = stop - start
-        planned = _LINEAR_SPLIT.get()
-        prepared_rows = getattr(planned, "rows", None)
-        if planned is not None and planned.module is leaf and callable(prepared_rows):
-            return prepared_rows(window, x, start, stop, out)
         # `linear`, never `forward`: a residency wrapper on the leaf's forward is the whole's.
         if out is not None and window.WRITES_INTO:
             return window.linear(x, None, out)

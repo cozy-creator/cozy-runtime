@@ -1,0 +1,3 @@
+- Varena v2: Torch allocates through varena for the whole process, weights page at stable addresses, and cooperating processes return idle memory to each other.
+- One general split: conv bands, attention pieces, FFN tokens, norm bands and `author.split` windows list shape estimates, and native selection chooses and measures them on every model and card.
+- Ulysses exchanges any head-local attention, agreed over the group's store before the first crossing.

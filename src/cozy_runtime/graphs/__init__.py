@@ -86,10 +86,7 @@ def capture(
         with (
             kernel_ready.recording(),
             torch.utils._python_dispatch._disable_current_modes(),
-            vt.graph(
-                graph, pool=pool.handle, stream=stream,
-                reserve_bytes=domain.working_peak(owner.device),
-            ),
+            vt.graph(graph, pool=pool.handle, stream=stream),
         ):
             owner.fork.record(stream)
             work.wait_event(owner.fork)
