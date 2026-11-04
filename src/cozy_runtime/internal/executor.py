@@ -63,7 +63,7 @@ from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, S
 from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 import msgspec
 import tensorfs
@@ -3318,6 +3318,8 @@ class Executor:
             }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if (why := varena.poisoned()) is not None:
+            _retire(f"native fault before entry: {why}")
         if self.surface_names.get(command.entrypoint) is None:
             return {
                 "ok": False,
@@ -3401,6 +3403,8 @@ class Executor:
             }
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if (why := varena.poisoned()) is not None:
+            _retire(f"native fault before entry: {why}")
         if self.surface_names.get(command.entrypoint) is None:
             return {
                 "ok": False,
@@ -5270,13 +5274,18 @@ class _Order:
             self._changed.notify_all()
 
 
+def _retire(why: str) -> NoReturn:
+    """A fault no request caused ends this process at once. The next request finds the executor
+    gone before it entered and goes to a fresh one (TensorD's `run_on`)."""
+    print(why[:300], file=sys.stderr, flush=True)
+    os._exit(1)
+
+
 def _idle(executor: Executor, order: _Order) -> None:
     """Graphs record and host pages pin off the request path (`graphs.capture_idle`,
     `Memory.pin_idle`): after a command is answered, while no other is open. One arriving makes
     either yield at its next op or stored part, and its wait goes into its call's record
-    (`IDLE_WAITED`). A device fault there ends this process at once: no request caused it, and the
-    next one finds the executor gone before it entered and goes to a fresh one (TensorD's `run_on`).
-    """
+    (`IDLE_WAITED`). A device fault there retires this process at once (`_retire`)."""
     answered = 0
 
     def pins() -> bool:
@@ -5296,8 +5305,7 @@ def _idle(executor: Executor, order: _Order) -> None:
             except Exception as exc:
                 traceback.print_exc()
                 if fault(exc) in (Fault.STICKY, Fault.DEVICE):
-                    print(f"device fault at idle: {exc}"[:300], file=sys.stderr, flush=True)
-                    os._exit(1)
+                    _retire(f"device fault at idle: {exc}")
                 row = (
                     "idle work failed: graphs or host pages stay unbuilt",
                     {"reason": type(exc).__name__},
