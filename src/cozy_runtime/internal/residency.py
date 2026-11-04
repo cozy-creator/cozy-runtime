@@ -16,7 +16,7 @@ import time
 import warnings
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -602,6 +602,7 @@ class Model:
         self.retiring = False
         self.retire_graphs: Callable[[], None] | None = None
         self.sites = _sites(module)
+        self._block_sites: dict[str, list[_Site]] | None = None
         self.handles: list[Any] = []
         self.holds: list[Hold] = []
         self.blocks: dict[str, _Block] = {}
@@ -611,6 +612,22 @@ class Model:
         self.prefix: int | None = None
         #: the block entered last, whose successor in execution order `_enter` records (`next`)
         self.entered: _Block | None = None
+
+    def sites_in(self, groups: Iterable[_Block]) -> list[_Site]:
+        """The weight sites `groups` hold, mapped once: a LoRA bake binds one source block per
+        linear, and walking every site for each took 6 s of Qwen's first step (cr-245)."""
+        if self._block_sites is None:
+            paths = list(self.blocks)
+            held: dict[int, tuple[str, list[_Site]]] = {}
+            for name, sites in self.sites.items():
+                path = _block_of(name, paths)
+                was = held.get(id(sites))
+                # A tied tensor used by distinct blocks stays common, as `_register` places it.
+                held[id(sites)] = (path if was is None or was[0] == path else "", sites)
+            self._block_sites = {}
+            for path, sites in held.values():
+                self._block_sites.setdefault(path, []).extend(sites)
+        return [site for block in groups for site in self._block_sites.get(block.path, ())]
 
     def wanted_identity(self) -> str | None:
         fill = "stored" if self.fill is None else self.fill.identity
@@ -807,8 +824,7 @@ class Binding:
         self.generation = model.generation
         self.targets = [
             (site, tuple(value.shape), value.dtype)
-            for sites in model.sites.values()
-            for site in sites
+            for site in model.sites_in(groups)
             if (value := site.table[site.name]) is not None
         ]
         self.identity = hashlib.sha256(
