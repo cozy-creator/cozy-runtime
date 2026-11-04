@@ -28,7 +28,7 @@ def install(module: nn.Module) -> None:
     for path, child in module.named_children():
         if path not in blocks:
             catch.wrap(child, path)
-    catch.wrap(module, "model")
+    catch.wrap(module, "model", catch.passing)
 
 
 class Steps:

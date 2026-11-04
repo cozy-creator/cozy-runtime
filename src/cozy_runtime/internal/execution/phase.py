@@ -55,43 +55,27 @@ def configuration(value: object) -> str | None:
         return None
 
 
+def execution_key(configuration: str | None, namespace: str) -> str | None:
+    """The key of a declared configuration's passes; a pass with an unknown one publishes nothing.
+    A site's level can change between passes, so a sample is a measured hint for the next."""
+    if configuration is None:
+        return None
+    return f"{namespace}:{hashlib.sha256(configuration.encode()).hexdigest()}"
+
+
 class Observation:
     def __init__(self, device: int, token: int, completion_stream: Any = None) -> None:
         self.device, self.token = device, token
         self.completion_stream = completion_stream
-        self.key: str | None = None
         self.result: dict[str, Any] | None = None
         self.completed = False
         self.choices = 0
-        self._cuts = hashlib.sha256()
 
     def invalidate(self, reason: str) -> None:
         vt.phase_invalidate(self.device, self.token, reason=reason)
 
-    def choice(self, value: object) -> None:
-        self.choices += 1
-        try:
-            encoded = _encoded(_semantic(value))
-        except (TypeError, ValueError):
-            self.invalidate("unrepresented_dispatch")
-            return
-        self._cuts.update(encoded + b"\n")
-
-    def key_for(self, configuration: object | None, namespace: str) -> str | None:
-        """A sealed dispatch fingerprint; making a key alone never publishes a sample."""
-        if configuration is None:
-            return None
-        try:
-            encoded = _encoded(_semantic(configuration))
-        except (TypeError, ValueError):
-            return None
-        return namespace + ":" + hashlib.sha256(encoded + b"\n" + self._cuts.digest()).hexdigest()
-
-    def complete(self, configuration: object | None) -> None:
+    def complete(self) -> None:
         self.completed = True
-        self.key = self.key_for(configuration, "runtime.eager/1")
-        # Unknown phase identity prevents its watermark from publishing, but does not erase
-        # a valid completion proof for fully represented leaf sites on the same stream.
 
 
 _ACTIVE: ContextVar[Observation | None] = ContextVar("cozy_working_phase", default=None)
@@ -102,9 +86,9 @@ def invalidate(reason: str) -> None:
         active.invalidate(reason)
 
 
-def choice(value: object) -> None:
+def choice() -> None:
     if (active := _ACTIVE.get()) is not None:
-        active.choice(value)
+        active.choices += 1
 
 
 def completion_owner(device: int, stream: int) -> int | None:
@@ -141,18 +125,21 @@ def begin_split(
 
 @contextmanager
 def observing(
-    device: int | None, mode: Mode, records: list[dict[str, Any]] | None
+    device: int | None, mode: Mode, records: list[dict[str, Any]] | None, key: str | None = None
 ) -> Iterator[Observation | None]:
+    """One execution's observation; none where another owns the device (an enclosing loop)."""
     if device is None or records is None:
         yield None
         return
-    # Actual adaptive cuts are unknown at entry; no preceding pass is a promise about this one.
+    try:
+        token = vt.phase_enter(device, key, mode=mode)
+    except vt.PhaseOverlapError:
+        yield None
+        return
     observation = Observation(
-        device,
-        vt.phase_enter(device, None, mode=mode),
-        torch.cuda.current_stream(device) if mode == "eager" else None,
+        device, token, torch.cuda.current_stream(device) if mode == "eager" else None
     )
-    token = _ACTIVE.set(observation)
+    active = _ACTIVE.set(observation)
     succeeded = False
     try:
         yield observation
@@ -163,9 +150,9 @@ def observing(
                 device,
                 observation.token,
                 completed=succeeded and (mode != "eager" or observation.completed),
-                key=observation.key,
             )
-            observation.result = {**record, "cut_choices": observation.choices}
+            sites = record.pop("split_observations", ())
+            observation.result = {**record, "cut_choices": observation.choices, "sites": len(sites)}
             records.append(observation.result)
         finally:
-            _ACTIVE.reset(token)
+            _ACTIVE.reset(active)

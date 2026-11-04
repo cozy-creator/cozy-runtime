@@ -598,6 +598,7 @@ class _Loop:
         with working_phase.observing(
             tensors[0].device.index if measured else None, mode,
             request.working_phases if measured and request is not None else None,
+            key=working_phase.execution_key(configuration, "runtime.eager/1"),
         ) as observation:
             index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
             for i in indices:
@@ -631,7 +632,7 @@ class _Loop:
                     actual = _phase_configuration(self, indices, tensors, models)
                     if epoch != LANDED[0] or actual != configuration:
                         observation.invalidate("dispatch_changed")
-                    observation.complete(actual)
+                    observation.complete()
         if (
             observation is not None and observation.result is not None
             and (key := observation.result.get("key")) is not None
@@ -1621,7 +1622,7 @@ class _Graph:
                 and not observation.result.get("invalidated", True)
                 and actual is not None and actual == self._configuration_before
             ):
-                self._replay_key = observation.key_for(actual, "runtime.graph/1")
+                self._replay_key = working_phase.execution_key(actual, "runtime.graph/1")
 
     def abort(self, error: BaseException | None = None) -> None:
         """End a failed capture with its error so the owner cannot publish a partial graph."""

@@ -475,11 +475,6 @@ def _attend(
     return out
 
 
-#: An opaque op's working allocations: this many of its window's output. Allocator reclaim covers
-#: a short estimate; a completed phase's measured sample replaces it.
-_OPAQUE = 5
-
-
 def split[T](
     name: str,
     key: str,
@@ -487,6 +482,7 @@ def split[T](
     finest: int,
     out_bytes: int,
     item_bytes: float,
+    holds: int,
     run: Callable[[int], T],
 ) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
@@ -494,13 +490,15 @@ def split[T](
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
     Package code runs once: a refusal fails the call. `out_bytes` is the whole output held beside
-    the windows, `item_bytes` a window's output per element."""
+    the windows, `item_bytes` a window's output per element, `holds` how many of that its op's
+    peak holds, its author's estimate: allocator reclaim covers a short one, and a completed
+    pass's measured sample replaces it."""
     deepest = levels(-(-total // max(finest, 1)))
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
 
     def need(level: int) -> tuple[int, ...]:
-        return (out_bytes, *[int(window(level) * item_bytes)] * _OPAQUE)
+        return (out_bytes, *[int(window(level) * item_bytes)] * holds)
 
     return catch.cut(f"split:{key}", deepest, need, lambda level: run(window(level)), pure=False)

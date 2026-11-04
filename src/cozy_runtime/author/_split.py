@@ -34,6 +34,7 @@ class Pieces(Protocol):
         finest: int,
         out_bytes: int,
         item_bytes: float,
+        holds: int,
         run: Callable[[int], Any],
     ) -> Any: ...
 
@@ -49,7 +50,12 @@ def install(runtime: Pieces | None) -> None:
 
 
 def split(
-    fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None
+    fn: Callable[..., Any],
+    x: Any,
+    *cuts: Cut,
+    most: int | None = None,
+    out: Any = None,
+    holds: int = 5,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -61,7 +67,10 @@ def split(
 
     With `most`, the windows are the fewest of at most `most` elements, on every device and
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
-    cut's (an `overlap`) does. Without it such a layout follows free memory."""
+    cut's (an `overlap`) does. Without it such a layout follows free memory.
+
+    `holds` is `fn`'s peak beside the whole output, in windows of its output: the estimate the
+    device's choice starts from before it has measured a pass."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
@@ -77,6 +86,7 @@ def split(
             most,
             0 if out is not None else _bytes(shape, cuts, x),
             _item_bytes(cuts, x),
+            holds,
             lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
         )
     if runtime is None or not cuts:
@@ -91,6 +101,7 @@ def split(
         _finest(shape, cuts),
         0 if out is not None else _bytes(shape, cuts, x),
         _item_bytes(cuts, x),
+        holds,
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
     )
 
@@ -104,7 +115,7 @@ def _key(
     """Bytes per element depend on the op and its uncut extents."""
     cut = {c.dim % len(shape) for c in cuts}
     rest = tuple(n if i not in cut else -1 for i, n in enumerate(shape))
-    return f"{_name(fn)}{rest}:{dtype}"
+    return f"{getattr(fn, '__module__', '')}.{_name(fn)}{rest}:{dtype}"
 
 
 def _item_bytes(cuts: tuple[Cut, ...], x: Any) -> float:

@@ -17,7 +17,7 @@ from typing import Any
 
 import tensorfs.varena.torch as vt
 import torch
-from torch import nn
+from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
@@ -142,7 +142,7 @@ def begin(
     device: int, key: str, level: int, selection: dict[str, Any] | None, stream: int
 ) -> int | None:
     """Open `level`'s native observation, making its room; None where the estimate is refused."""
-    phase.choice((key, level))
+    phase.choice()
     if selection is None:
         return None
     try:
@@ -201,6 +201,37 @@ def cut[T](
                     vt.split_end(device, token, submitted=submitted)
     finally:
         LEAF.release()
+
+
+def _tensors(value: object, depth: int = 3) -> list[Tensor]:
+    """The tensors in `value`, `depth` levels of sequences and mappings deep."""
+    if isinstance(value, Tensor):
+        return [value]
+    if depth and isinstance(value, list | tuple | Mapping):
+        items = value.values() if isinstance(value, Mapping) else value
+        return [t for item in items for t in _tensors(item, depth - 1)]
+    return []
+
+
+@contextmanager
+def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
+    """A component's forward as one observed execution, keyed by its operands' shapes: native
+    keeps its working peak for the next pass's prefetch, and its sites' measured peaks replace
+    their estimates. An enclosing loop's observation owns the device instead."""
+    request = CURRENT.get()
+    if request is None or request.idle or not request.memory.cuda or _capturing():
+        yield
+        return
+    device = request.memory.device.index or 0
+    shapes = [(tuple(t.shape), str(t.dtype)) for t in _tensors((args, kwargs))]
+    key = phase.execution_key(f"{type(module).__qualname__}:{shapes}", "runtime.pass/1")
+    assert key is not None
+    request.memory.remember_working_phase(key, owners(request))
+    with phase.observing(device, "eager", request.working_phases, key=key) as observation:
+        yield
+        if observation is not None:
+            observation.completion_stream.synchronize()
+            observation.complete()
 
 
 def wrap(
