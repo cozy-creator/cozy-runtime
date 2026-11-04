@@ -471,8 +471,7 @@ def _classify(name: str, annotation: object, where: str) -> Param:
             raise ConformanceError(
                 f"{where}: model parameter {name} carries {markers[0]!r} — the Annotated "
                 "override-marker plane is EMPTY at launch: a bare typed parameter is "
-                "unconditionally the whole declaration (§1.1). Future markers enter "
-                "through cr-018's door",
+                "unconditionally the whole declaration: remove the marker",
                 code="empty_marker_plane",
                 fields=[name],
             )
@@ -547,7 +546,7 @@ def analyze(
                 f"({parameter.default!r}) — every parameter here is INJECTED by the runtime, "
                 "so a default is a second source of the same fact. A model slot in "
                 "particular is declared by its bare type alone: there is no slot object and "
-                "no artifacts= dict (§1.1)",
+                "no artifacts= dict",
                 code="injected_default",
                 fields=[parameter.name],
             )

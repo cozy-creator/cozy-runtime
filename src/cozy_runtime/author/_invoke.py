@@ -753,16 +753,16 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
         granted = inv.trees.get(tree.ref)
         if granted is None:
             raise InvalidRequest(
-                f"input tree {tree.ref!r} is not granted to this attempt: this run "
-                f"materialized {sorted(inv.trees) or 'no trees'}. A tree is a digest-verified "
-                "READ CAPABILITY minted by the RecordOwner, never a path a function may name",
+                f"input tree {tree.ref!r} did not reach this run, which holds "
+                f"{sorted(inv.trees) or 'no trees'}: send the request again, and if it recurs "
+                "that is a bug in cozy, not in the request",
                 code="tree_ungranted",
             )
         root, digest = granted
         if not root.is_dir():
             raise InvalidRequest(
-                f"input tree {tree.ref!r} was granted at a location that is not a directory: "
-                "the RecordOwner minted this address, so this runtime substitutes none",
+                f"input tree {tree.ref!r} is not a directory on this machine: send the request "
+                "again, and if it recurs that is a bug in cozy, not in the request",
                 code="tree_unmaterialized",
             )
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
@@ -836,10 +836,9 @@ def _hydrate(
         granted = inv.assets.get(item.input_id)
         if granted is None:
             raise InvalidRequest(
-                f"input file {item.input_id!r} (ref {item.asset.ref!r}) is not granted to this "
-                f"attempt: this run materialized {sorted(inv.assets) or 'no assets'}. An "
-                "asset is a digest-verified READ CAPABILITY minted by the RecordOwner, "
-                "never a location a request may name",
+                f"{item.input_id} (ref {item.asset.ref!r}) did not reach this run, which holds "
+                f"{sorted(inv.assets) or 'no files'}: a file field takes a file you attach, not "
+                "a path on the machine",
                 code="asset_ungranted",
                 fields=[item.input_id],
             )
@@ -993,8 +992,8 @@ def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
         return _Unbound(param.name)  # a request may leave it unused: refused only when read
     if model is None:
         raise InvalidRequest(
-            f"no model bound for parameter {param.name!r}: the run names none and the slot "
-            "declares no default",
+            f"this function needs a model for {param.name!r} and has no default: name one with "
+            f"`model.{param.name}=<org/model>`",
             code="unbound_model",
             fields=[param.name],
         )
@@ -1011,8 +1010,8 @@ class _Unbound:
 
     def __getattr__(self, attribute: str) -> object:
         raise InvalidRequest(
-            f"no model bound for parameter {self._name!r}: the run names none, and this request "
-            "reads it",
+            f"this request needs a model for {self._name!r} and has no default: name one with "
+            f"`model.{self._name}=<org/model>`",
             code="unbound_model",
             fields=[self._name],
         )

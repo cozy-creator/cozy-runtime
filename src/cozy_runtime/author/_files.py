@@ -185,7 +185,7 @@ class File:
         if self._local is None:
             raise PreflightViolation(
                 f"file {self.ref!r} has no bytes here: preflight and describe read counts, "
-                "kinds and typed metadata only — bytes exist after hydration (§1.3)",
+                "kinds and typed metadata only — bytes exist after hydration",
                 code="asset_bytes_unavailable",
             )
         if self._read_guard is not None:

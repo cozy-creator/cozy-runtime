@@ -425,8 +425,7 @@ class Outputs(_Bound):
         self._attempt.check_open("Outputs.save_audio")
         if format != "flac":
             raise OutputError(
-                f"audio format {format!r} has no encoder: flac is the audio product and "
-                "the codec zoo is a closed door (cr-017)",
+                f"audio format {format!r} has no encoder: save it as flac",
                 code="encoder_unavailable",
             )
         self._check_rate(sample_rate)
@@ -1675,9 +1674,8 @@ class Egress(_Bound):
         self._attempt.check_open("Egress.fetch")
         if self._broker is None:
             raise CapabilityError(
-                f"no egress broker is installed for {method} {url}: the worker-side "
-                "broker, the control-plane host allowlist and the SSRF fail-closed path "
-                "are cr-012, and a package cannot declare `net` until they land",
+                f"{method} {url}: a package can't reach the network this way yet, so fetch "
+                "what it needs before the run and pass it as a file",
                 code="egress_broker_unavailable",
             )
         result = self._broker(url, method, dict(headers or {}), body)

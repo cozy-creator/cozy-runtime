@@ -122,7 +122,7 @@ def install(*, allow_write_prefixes: Sequence[str] = ()) -> None:
     writable = tuple(allow_write_prefixes)
     refuse_network(
         "a derivation reads configs and code, never the network. Kernel binaries are pinned "
-        "image inputs; a boot-time kernel fetch is exactly what this refuses (cr-004)"
+        "image inputs; a boot-time kernel fetch is exactly what this refuses"
     )
 
     def hook(event: str, args: tuple[object, ...]) -> None:

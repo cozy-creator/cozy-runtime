@@ -99,7 +99,7 @@ class RequestView:
     def __init_subclass__(cls) -> None:
         raise CapabilityError(
             f"class {cls.__name__}(RequestView): the request view is exactly three SDK-owned "
-            "members — a subclass is the deleted pipeline proxy under another name (§1.3)",
+            "members — a subclass is the deleted pipeline proxy under another name",
             code="view_subclass",
         )
 
