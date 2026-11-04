@@ -4890,7 +4890,7 @@ class Executor:
                     for model in member.backend.models.values():
                         self.memory.load(model.module, command.level)
                 if command.level == "ram":
-                    self.memory.trim()
+                    self.memory.release_host()
             for reply in group.collect("map") if group is not None else ():
                 if not reply.get("ok"):
                     raise GroupRefusal(

@@ -1932,26 +1932,15 @@ class Memory:
         allocated, reserved, _ = self._figures()
         return max(before_allocated - allocated, before_reserved - reserved, 0)
 
-    def trim(self) -> int:
-        """Idle offload: this executor's owners let go; on CUDA the native core keeps or returns
-        the pages they leave, as it is asked. Returns the reserved bytes that went.
-
-        The host tier goes too. Its pages are pinned, so no other process can reclaim them, and
-        the call the machine offloads this executor for needs host RAM as well: beside an idle
-        H3 executor's 42 GB of pages, SeedVR2's 2160p decode on a 4090 pod was killed by the
-        kernel (gate 40991023097). Its pages refill from the store on this executor's next call."""
+    def release_host(self) -> None:
+        """A controller's `ram` level: this executor's host tier goes too. Its pages are pinned, so
+        no other process can reclaim them, and the call the machine offloads this executor for
+        needs host RAM as well: beside an idle H3 executor's 42 GB of pages, SeedVR2's 2160p decode
+        on a 4090 pod was killed by the kernel (gate 40991023097). Its pages refill from the store
+        on this executor's next call. Where no native core runs, its own owners go as well."""
         if self.capturing():
             raise ResidencyError("idle offload cannot run during graph capture")
-        before = self._figures()[1]
-        for model in list(self.models.values()):
-            self._retire(model)
-        if self.cuda:
-            for region in list(self.regions):
-                region.discard()
-            for model in list(self.models.values()):
-                for block in model.groups():
-                    self._discard(block)
-        else:
+        if not self.cuda:
             self.reclaim()
         with self.lock:
             pages = list(self._baked.values())
@@ -1961,7 +1950,6 @@ class Memory:
             self._filled = None
         for page in pages:
             page.release()
-        return max(before - self._figures()[1], 0)
 
     def region(
         self,
@@ -2135,12 +2123,9 @@ class Memory:
                     )
             self._refresh_phase_plan(names)
 
-    def _prepare_native(self, block: _Block, reclaim: bool, *, final: bool = False) -> Any:
-        region = self._native_region(block, final=final)
-        # Native demand owns all finite allocation recovery, including owner requests.
-        # Its terminal refusal is not a reason to select Python victims and retry again.
-        # Free-only preparation must remain free-only even if physical room changes now.
-        return region.prepare(reclaim=reclaim)
+    def _prepare_native(self, block: _Block, *, final: bool = False) -> Any:
+        """Native demand owns all finite allocation recovery; its refusal is terminal."""
+        return self._native_region(block, final=final).prepare()
 
     def _prefetch_next(self, current: _Block) -> None:
         """Demand's own next block takes priority over queued-request speculation."""
@@ -2420,10 +2405,10 @@ class Memory:
                     setattr(block, field, None)
                 self._prefetch = None
 
-    def _final_views(self, block: _Block, reclaim: bool) -> None:
+    def _final_views(self, block: _Block) -> None:
         if not block.finals:
             return
-        use = self._prepare_native(block, reclaim, final=True) if block.final_bytes else None
+        use = self._prepare_native(block, final=True) if block.final_bytes else None
         block.final_use = block.final_native_use = use
         request = _REQUEST.get()
         if use is not None and use.needs_fill and request is not None and request.idle:
@@ -2469,7 +2454,7 @@ class Memory:
             source = block.model.source
             tensors = source.ck.components[source.component].tensors
             if self.native is not None:
-                self._final_views(block, reclaim)
+                self._final_views(block)
                 final = block.final_use
                 if _host_final(block) and final is not None and final.needs_fill:
                     self._final_from_host(block, overlay)
@@ -2483,7 +2468,7 @@ class Memory:
                     block.generation += 1
                     return
             if self.native is not None and block.storage_bytes:
-                use = self._prepare_native(block, reclaim)
+                use = self._prepare_native(block)
                 request = _REQUEST.get()
                 if use.needs_fill and request is not None and request.idle:
                     raise StaleBinding(
