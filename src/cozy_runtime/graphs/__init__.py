@@ -152,7 +152,10 @@ class _Recording:
         # Nothing reads a pool between replays, so the core may take its pages back when idle.
         held = [t for t in inputs if t is not None]
         held += [t for t in torch.utils._pytree.tree_leaves(outputs) if isinstance(t, torch.Tensor)]
-        vt.pool_scratch(pool.handle, held, owner.device)
+        try:
+            vt.pool_scratch(pool.handle, held, owner.device)
+        except (RuntimeError, ValueError) as exc:  # An escaped alias: its pool just stays mapped.
+            say("graph-pool-not-scratch", f"a CUDA graph's pool stays mapped while idle: {exc}")
 
     def output(self) -> Any:
         """Caller-owned outputs, allocated before residency admission or graph launch."""
