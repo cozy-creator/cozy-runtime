@@ -8,8 +8,10 @@ again. No stored verdict ever turns a kernel off (owner, 2026-10-22).
 
 The one thing kept on the machine is a probe that crashed its process: a marker written before
 the probe and removed after it, naming the probing process, while a fatal signal's traceback
-(`faulthandler`) goes to that process's crash file. A marker whose process crashed refuses its
-kernel in the next process of this boot instead of crash-looping it; one whose process was ended
+(`faulthandler`) goes to that process's crash file. A probe that killed its CUDA context crashed
+too, whatever its next call raised: the process cannot go on, and its marker keeps the fault. A
+marker whose process crashed refuses its kernel in the next process of this boot instead of
+crash-looping it; one whose process was ended
 mid-probe (TensorD ending it for room or an update, a kill) says nothing of the kernel, and the
 next process probes again (cr-227: an ended executor turned cozy-int8 off for the pod's life). The
 marker is keyed by the kernel, its artifact's digest, the card, the driver and the Runtime build,
@@ -28,6 +30,7 @@ import hashlib
 import json
 import math
 import os
+import sys
 import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -39,7 +42,7 @@ from typing import Any
 from cozy_runtime import __version__
 from cozy_runtime._build_provenance import COMMIT
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author._errors import is_capacity
+from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.internal import accel, filelock, kernel_cache
 from cozy_runtime.internal.derive import placing
 from cozy_runtime.internal.encoding.formats import Tensor
@@ -127,10 +130,44 @@ def _probed(key: Key, probe: Callable[[], Verdict]) -> Verdict:
             return Verdict(False, CRASHED)
         with _armed(path.parent) as crash:
             _write(path, key, Verdict(False, CRASHED), crash)
+            faulted = ""
             try:
-                return _run(probe)
+                verdict = _run(probe)
+                faulted = _device_fault()
+                return verdict
             finally:
-                path.unlink(missing_ok=True)
+                if faulted:
+                    _keep_fault(path, key, faulted)
+                else:
+                    path.unlink(missing_ok=True)
+
+
+def _device_fault() -> str:
+    """Why this thread's CUDA context is dead, else empty. A wild launch kills the context, and
+    the probe's next call may raise any library's status (run 28217: cuBLAS's internal error)."""
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_initialized():
+        return ""
+    try:
+        torch.cuda.synchronize()
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}" if fault(exc) is Fault.STICKY else ""
+    return ""
+
+
+def _keep_fault(path: Path, key: Key, why: str) -> None:
+    """Said in the machine's log, and refused in the next process (`_crashed`)."""
+    print(
+        f"[kernels] {key[0]} faulted the GPU in its self-check: {why}"[:400],
+        file=sys.stderr,
+        flush=True,
+    )
+    crash = f"fault-{path.stem}"
+    try:
+        (path.parent / crash).write_text(why)
+    except OSError:
+        return
+    _write(path, key, Verdict(False, CRASHED), crash)
 
 
 def _run(probe: Callable[[], Verdict]) -> Verdict:
