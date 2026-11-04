@@ -562,7 +562,7 @@ def owned_stream(torch: Any, device: int) -> Any:
     """
     pointer = ctypes.c_void_p()
     with torch.cuda.device(device):
-        code = torch.cuda.cudart().cudaStreamCreate(ctypes.addressof(pointer))
+        code = int(torch.cuda.cudart().cudaStreamCreate(ctypes.addressof(pointer)))
         if code:
             error = torch.AcceleratorError(f"cudaStreamCreate failed with CUDA error {code}")
             error.error_code = code
@@ -577,7 +577,7 @@ def owned_stream(torch: Any, device: int) -> Any:
 def destroy_stream(torch: Any, stream: Any) -> None:
     """Destroy an owned stream only after its owner retires and joins every consumer."""
     with torch.cuda.device(stream.device):
-        code = torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
+        code = int(torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream))
     if code:
         error = torch.AcceleratorError(f"cudaStreamDestroy failed with CUDA error {code}")
         error.error_code = code
