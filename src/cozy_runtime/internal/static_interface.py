@@ -319,18 +319,10 @@ _VIDEO_STRUCTS = (
     "Keep",
     "ShotBeat",
     "ShotPlate",
-    "ShotFields",
+    "ShotInputs",
     "ShotOperation",
-    "PictureFields",
+    "PictureInputs",
     "PictureOperation",
-    "ProjectBeat",
-    "ProjectContinue",
-    "ProjectEntity",
-    "ProjectPicture",
-    "ProjectReference",
-    "ProjectSetup",
-    "ProjectShot",
-    "ProjectUpscale",
 )
 #: Author-surface classes that translate to themselves in a TYPE position.
 _AUTHOR_TYPES = (
@@ -434,7 +426,7 @@ _CHILD_TASK_KEYWORDS = frozenset(
 _APP_KEYWORDS = {
     "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden", "ui"},
     "child_task": _CHILD_TASK_KEYWORDS,
-    "project_adapter": frozenset({"functions", "reserved"}),
+    "project_adapter": frozenset({"reserved"}),
 }
 _INVOCABLE_KEYWORDS = frozenset(
     {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
@@ -2121,10 +2113,10 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                         reader.refuse(
                             module,
                             decorator,
-                            "a project adapter names its kinds",
+                            "a project adapter names its functions",
                             "static_unsupported",
                         )
-                    listed: dict[str, tuple[str, ...]] = {}
+                    reserved: tuple[str, ...] = ()
                     for keyword in keywords:
                         words = keyword.value
                         if (
@@ -2138,33 +2130,27 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                             reader.refuse(
                                 module,
                                 keyword,
-                                "a project adapter takes only functions=[...] and reserved=[...], "
-                                "as written",
+                                "a project adapter takes only reserved=[...], as written",
                                 "static_unsupported",
                             )
-                        listed[keyword.arg] = tuple(word.value for word in words.elts)
-                    # `App.project_adapter`: an entrypoint by another name, per kind and function.
+                        reserved = tuple(word.value for word in words.elts)
+                    # `App.project_adapter`: an entrypoint by another name, per function.
                     for adapted in names:
-                        for function in listed.get("functions") or (None,):
-                            suffix = f"-{function}" if function else ""
-                            registration = _registration(
-                                reader,
-                                module,
-                                stmt,
-                                "entrypoint",
-                                [
-                                    ast.keyword(
-                                        "name",
-                                        ast.Constant(f"project-adapter-{adapted.value}{suffix}"),
-                                    ),
-                                    ast.keyword("accelerator", ast.Constant(False)),
-                                ],
-                                decorator=decorator,
-                            )
-                            if registration is not None:
-                                found.append(
-                                    replace(registration, reserved=listed.get("reserved", ()))
-                                )
+                        registration = _registration(
+                            reader,
+                            module,
+                            stmt,
+                            "entrypoint",
+                            [
+                                ast.keyword(
+                                    "name", ast.Constant(f"project-adapter-{adapted.value}")
+                                ),
+                                ast.keyword("accelerator", ast.Constant(False)),
+                            ],
+                            decorator=decorator,
+                        )
+                        if registration is not None:
+                            found.append(replace(registration, reserved=reserved))
                     continue
                 if isinstance(decorator, ast.Call) and decorator.args:
                     reader.refuse(

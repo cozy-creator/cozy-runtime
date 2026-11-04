@@ -1,9 +1,8 @@
 """xs-139 — the shot and upscale contract: the field names and shapes a project sends to whatever
 function renders a shot or upscales one, so another package can replace any of them. Opt-in, like
 the image interface: a package subclasses these structs, narrows `references` to the kinds its model
-takes and adds its own fields. A project with no adapter for the package (`App.project_adapter`)
-matches fields by name against the function's request schema; nothing here is a registry, and Runtime
-core never reads it.
+takes and adds its own fields. A function no adapter speaks for (`App.project_adapter`) has its inputs
+matched by name against its request schema; nothing here is a registry, and Runtime core never reads it.
 """
 
 from __future__ import annotations

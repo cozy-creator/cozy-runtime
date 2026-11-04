@@ -210,25 +210,24 @@ class App:
         return self._register(fn, True, **options)
 
     def project_adapter(
-        self, *kinds: str, functions: Sequence[str] = (), reserved: Sequence[str] = ()
+        self, *functions: str, reserved: Sequence[str] = ()
     ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register what turns one project operation producing a file of each `kind`, `image`, `video` or `audio`, into this package's
-        own calls: it reads an `author.Operation`, or a subclass typing `fields`, and answers `list[author.Invocation]`, run in order,
-        or raises `author.Refuse`. On the CPU, so a machine runs it as it runs any other.
-
-        `functions` names what it speaks for: `op.function` is the one a node's tool names, and its typed `fields` are that tool's box.
-        A public function per kind and function, `project-adapter-<kind>-<function>`. With none it answers an operation that names only
-        this package, picking for itself, as `project-adapter-<kind>`; stack both on one function to do both. A function no adapter
-        speaks for is called directly. `reserved` names the tags its model reads in a text, such as `d` for `<d>`: Calcifer leaves them
-        there as text. All of this is read statically."""
+        """Register what turns one asset a tool of each of `functions` makes into this package's own calls: it reads an
+        `author.Operation`, or a subclass typing `inputs`, which are that tool's controls, and answers `list[author.Invocation]`, run in
+        order, or raises `author.Refuse`. `op.function` says which. On the CPU, so a machine runs it as it runs any other. A public
+        function each, `project-adapter-<function>`. A function no adapter speaks for is called directly. `text` is no function: an
+        adapter of it answers what to ask for a picture's description. `reserved` names the tags its model reads in a text, such as `d`
+        for `<d>`: Calcifer leaves them there as text. All of this is read statically."""
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
-            for kind in kinds:
-                for function in functions or (None,):
-                    name = f"project-adapter-{kind}" + (f"-{function}" if function else "")
-                    self._register(
-                        None, False, name=name, accelerator=False, reserved=tuple(reserved)
-                    )(target)
+            for function in functions:
+                self._register(
+                    None,
+                    False,
+                    name=f"project-adapter-{function}",
+                    accelerator=False,
+                    reserved=tuple(reserved),
+                )(target)
             return target
 
         return decorate
