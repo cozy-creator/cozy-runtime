@@ -423,15 +423,22 @@ _I32 = 2**31
 
 
 def _operands_fit(
-    key: str, signature: dict[str, str], params: Iterable[str], args: Iterable[object]
+    key: str,
+    signature: dict[str, str],
+    params: Iterable[str],
+    args: Iterable[object],
+    aligned: tuple[str, ...] = (),
 ) -> None:
     """Refuses what Triton's launcher would hand the kernel silently: an i32 past its range wraps,
-    and a pointer reads a tensor of another dtype as its own: a wild address or plausible garbage."""
+    a pointer reads a tensor of another dtype as its own, and an integer the entry compiled as
+    divisible by 16 that isn't faults the card (Xid 43, run 28432)."""
     for name, value in zip(params, args, strict=True):
         declared = signature[name]
         if declared == "i32":
             if not -_I32 <= cast("int", value) < _I32:
                 raise ValueError(f"{key}: {name} = {value} does not fit its i32")
+            if name in aligned and cast("int", value) % 16:
+                raise ValueError(f"{key}: {name} = {value}, compiled as divisible by 16")
         elif declared.startswith("*") and isinstance(value, torch.Tensor):
             want = _POINTERS.get(declared[1:])
             if want is not None and value.dtype != getattr(torch, want):
@@ -450,9 +457,10 @@ class _Launcher:
         names: dict[str, tuple[str, ...]],
         key: str,
         index: int,
+        aligned: dict[str, tuple[str, ...]],
     ) -> None:
         self.arch, self.compiled, self.names, self.key = arch, compiled, names, key
-        self.index = index
+        self.index, self.aligned = index, aligned
 
     def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
         if torch.cuda.current_device() != self.index:
@@ -472,7 +480,7 @@ class _Launcher:
                 "kernels_absent",
                 f"{key} is not compiled for sm{self.arch}",
             )
-        _operands_fit(key, found.src.signature, params, args)
+        _operands_fit(key, found.src.signature, params, args, self.aligned[key])
         at = [i for i, value in enumerate(args) if isinstance(value, torch.Tensor)]
         with readable(*(args[i] for i in at)) as real:
             operands = list(args)
@@ -525,7 +533,8 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
             ) from exc
         compiled[entry.key] = kernel
         names[entry.kernel.__name__] = tuple(sorted(entry.constexprs))
-    launcher = _Launcher(arch, compiled, names, found.key.digest, index)
+    aligned = {entry.key: entry.aligned for entry in kernels.entries}
+    launcher = _Launcher(arch, compiled, names, found.key.digest, index, aligned)
     _LOADED[(kernels.name, index)] = launcher
     return launcher
 

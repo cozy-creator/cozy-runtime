@@ -166,6 +166,9 @@ string(SHA256 sage3_digest "${sage3_quant}")
 if(NOT sage3_digest STREQUAL "1d15638e2b9ca049c56e18abf0419a3e8a968958e3f70423128c641847567c82")
     message(FATAL_ERROR "SageAttention3's quantizer kernels are not the checked cut (${sage3_digest})")
 endif()
+# Upstream's element offsets (`head_id * stride_h_input`) are int: past 2^31 elements of a tensor they
+# wrap to a wild address (Xid 31 at 320k tokens x 56 heads, run 28437).
+string(REPLACE "int stride_" "int64_t stride_" sage3_quant "${sage3_quant}")
 file(WRITE "${CMAKE_BINARY_DIR}/sage3/quant_kernels.cuh" "${sage3_quant}")
 add_library(sage3_units OBJECT csrc/sage3/fwd.cu csrc/sage3/quant.cu)
 # C++20 as the recipe patches upstream's setup.py to; sm_*a for the block-scaled FP4 MMA.

@@ -16,6 +16,9 @@ if TYPE_CHECKING:
 
 #: Kitchen's key tile: 128 keys past 1024 (its own rule), else 64
 LONG_KEYS = 1024
+#: Kitchen's kernel addresses within a head in int32: past this many elements in Diffusers' layout
+#: the output takes heads first, whose rows are one head's alone.
+HEADS_FIRST = 2**31
 
 
 def attention(
@@ -41,7 +44,8 @@ def attention(
     cta = 128 if len_k > LONG_KEYS else 64
     blocks = -(-len_k // cta)
     device, f32, i8 = q.device, torch.float32, torch.int8
-    out = torch.empty_like(q)
+    wide = q.numel() >= HEADS_FIRST
+    out = torch.empty(batch, heads, len_q, dim, dtype=q.dtype, device=device) if wide else torch.empty_like(q)
     q4 = torch.empty(batch, heads, len_q, dim // 2, dtype=i8, device=device)
     k4 = torch.empty(batch, heads_k, len_k, dim // 2, dtype=i8, device=device)
     v8 = torch.empty(batch * heads_k * dim, blocks * cta, dtype=i8, device=device)
@@ -77,12 +81,12 @@ def attention(
         strides(q),
         strides(k),
         strides(v),
-        strides(out),
+        (out.stride(0), out.stride(1), out.stride(2)) if wide else strides(out),
         torch.cuda.current_stream(device).cuda_stream,
     )
     if code:
         raise RuntimeError(f"kitchen-int4qk: {_kernels._attn4.error_name(code)}")
-    return out
+    return out.transpose(1, 2) if wide else out
 
 
 KITCHEN_INT4QK = Local(attention, upstream._named("cozy _attn4 (int4 Q·Kᵀ, Kitchen int8 P·V)"))

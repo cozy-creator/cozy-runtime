@@ -141,9 +141,6 @@ class Candidate:
     #: the Runtime module whose `KERNELS` (a `TritonKernels` set) it launches: it serves once
     #: they are built here (`triton_kernels`)
     kernels: str = ""
-    #: its kernels compute element offsets in int32: a call of `OFFSETS32` or more elements (padded
-    #: to its query tile) would read wild addresses, so it runs on SDPA
-    offsets32: bool = False
     #: the most tokens its compiled kernels take; zero is any
     max_tokens: int = 0
 
@@ -199,12 +196,6 @@ class Candidate:
                 "a softmax scale other than D^-1/2",
             ),
             (
-                self.offsets32
-                and -(-int(query.shape[1]) // 128) * 128 * int(query.shape[0] * query.shape[2]) * dim
-                >= OFFSETS32,
-                f"{query.shape[1]} tokens: past its int32 element offsets",
-            ),
-            (
                 bool(self.max_tokens) and int(query.shape[1]) > self.max_tokens,
                 f"{query.shape[1]} tokens: past its {self.max_tokens}",
             ),
@@ -212,9 +203,6 @@ class Candidate:
         return next((f"{self.name} does not serve {what}" for off, what in limits if off), "")
 
 
-#: Where an int32 element offset wraps: upstream's `batch * stride + head * stride` (`_sage3`'s
-#: quantizer) and the same limit `_attn4` refuses at.
-OFFSETS32 = 2**31
 _GPU = frozenset({arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05})
 _MMA, _WGMMA, _TCGEN05 = (frozenset({f}) for f in (arch.MMA_SYNC, arch.WGMMA, arch.TCGEN05))
 _FP8, _FP4, _INT4 = frozenset({"fp8"}), frozenset({"fp4"}), frozenset({"int4"})
@@ -282,25 +270,25 @@ KERNELS: tuple[Candidate, ...] = (
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, level=4,
         dtypes=_HALF, max_head_dim=128, head_dims=_D64_128, causal=False, gqa=False,
-        scales=False, artifact=_SAGE3, import_name=_SAGE3, kernels=_SAGE3_WHEEL, offsets32=True,
+        scales=False, artifact=_SAGE3, import_name=_SAGE3, kernels=_SAGE3_WHEEL,
     ),
     Candidate(
         "sageattention3-fp4-global-lowmem", "_cozy_sage3_fp4_global_lowmem",
         upstream.SAGE3_GLOBAL_LOWMEM, _MMA, _FP4, level=4, dtypes=_HALF, max_head_dim=128,
         head_dims=_D64_128, causal=False, gqa=False, scales=False, artifact=_SAGE3,
-        import_name=_SAGE3, offsets32=True,
+        import_name=_SAGE3,
     ),
     Candidate(
         "sageattention3-fp4-fixed-means", "_cozy_sage3_fp4_fixed_means",
         upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, level=4, dtypes=_BF16, max_head_dim=128,
         head_dims=_D128, causal=False, gqa=False, cross=False, batches=False, scales=False,
         artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
-        offsets32=True, max_tokens=_MEAN_TOKENS,
+        max_tokens=_MEAN_TOKENS,
     ),
     Candidate(
         "kitchen-int4qk", "_cozy_kitchen_int4qk", attention_int4.KITCHEN_INT4QK, _MMA, _INT4,
         level=4, dtypes=_HALF, head_dims=_D128, max_head_dim=128, causal=False,
-        artifact=PREBUILT, import_name="cozy_runtime._kernels._attn4", offsets32=True,
+        artifact=PREBUILT, import_name="cozy_runtime._kernels._attn4",
     ),
     Candidate(
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
