@@ -185,7 +185,6 @@ from cozy_runtime.author._services import (
     VideoJoin,
 )
 from cozy_runtime.author._project import (
-    BeatWrite,
     Invocation,
     Invocations,
     Keep,
@@ -201,14 +200,12 @@ from cozy_runtime.author._project import (
     ProjectSetup,
     ProjectShot,
     ProjectUpscale,
-    ProjectWorldState,
     Read,
     Refuse,
     ShotBeat,
     ShotFields,
     ShotOperation,
     ShotPlate,
-    Write,
     spoken,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
@@ -432,7 +429,6 @@ __all__ = [
     "uncaptured",
     "upload_checkpoint",
     "uses_components",
-    "BeatWrite",
     "Invocation",
     "Invocations",
     "Keep",
@@ -446,7 +442,6 @@ __all__ = [
     "ShotFields",
     "ShotOperation",
     "ShotPlate",
-    "Write",
     "spoken",
     "ProjectBeat",
     "ProjectContinue",
@@ -456,7 +451,6 @@ __all__ = [
     "ProjectSetup",
     "ProjectShot",
     "ProjectUpscale",
-    "ProjectWorldState",
 ]
 
 #: Names a Runtime removed, the release that removed them, and what replaces each. A package built

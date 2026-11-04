@@ -316,9 +316,7 @@ _VIDEO_STRUCTS = (
     "Operation",
     "OperationFile",
     "Read",
-    "Write",
     "Keep",
-    "BeatWrite",
     "ShotBeat",
     "ShotPlate",
     "ShotFields",
@@ -333,7 +331,6 @@ _VIDEO_STRUCTS = (
     "ProjectSetup",
     "ProjectShot",
     "ProjectUpscale",
-    "ProjectWorldState",
 )
 #: Author-surface classes that translate to themselves in a TYPE position.
 _AUTHOR_TYPES = (

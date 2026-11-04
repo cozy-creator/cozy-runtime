@@ -30,7 +30,7 @@ class OperationFile(msgspec.Struct, kw_only=True):
 
 class Read(msgspec.Struct, kw_only=True):
     """What an operation mentions: what the file says of it, and its state now by role (`image`, `video`, `audio`, `voice`, ...). `name`
-    is as the mention spells it, so `coast.2` for that revision. `kind`: an entity's (`character`, `prop`, `environment`), or an asset's
+    is as the mention spells it. `kind`: an entity's (`character`, `prop`, `environment`), or an asset's
     file type. `made_by`: `org/package/function@release`."""
 
     name: str
@@ -44,15 +44,6 @@ class Read(msgspec.Struct, kw_only=True):
         listed = {int(key[len(field) + 1 :]): file for key, file in self.files.items()
                   if key.startswith(f"{field}-") and key[len(field) + 1 :].isdigit()}  # fmt: skip
         return [*([self.files[field]] if field in self.files else []), *(listed[index] for index in sorted(listed))]
-
-
-class Write(msgspec.Struct, kw_only=True):
-    """A revision of a series this operation's text names (`coast.1`), to screenshot `at_s` into it, or at its end. `fields`: what
-    the file says of that revision as an asset of its own, if it does."""
-
-    name: str
-    at_s: float | None = None
-    fields: dict[str, Any] = {}
 
 
 class Keep(msgspec.Struct, kw_only=True):
@@ -80,7 +71,6 @@ class Operation(msgspec.Struct, kw_only=True):
     #: What the file says for this package alone, any field to any value: `turbo`, a model's own settings. Not part of the standard.
     options: dict[str, Any] = {}
     reads: list[Read]
-    writes: list[Write] = []
     keep: Keep | None = None
 
     def known_options(self, known: Collection[str]) -> tuple[dict[str, Any], list[str]]:
@@ -114,17 +104,9 @@ class Refuse(InvalidRequest):
 # annotating its adapter with them. Calcifer passes fields through and knows none.
 
 
-class BeatWrite(msgspec.Struct, kw_only=True):
-    """A screenshot: `image` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
-
-    image: str
-    at: float | None = None
-
-
 class ShotBeat(msgspec.Struct, kw_only=True):
     description: str = ""
     duration: float | None = None
-    writes: list[BeatWrite] = []
 
 
 class ShotPlate(msgspec.Struct, kw_only=True):
@@ -168,7 +150,7 @@ _MENTION = re.compile(r"<([^<>\n]+)>")
 
 
 def spoken(text: str) -> str:
-    """A dotted name's mention in a text as a model reads it: `<kyogre.primordial>` as `<kyogre primordial>`, `<coast.2>` as `<coast 2>`."""
+    """A dotted name's mention in a text as a model reads it: `<kyogre.primordial>` as `<kyogre primordial>`."""
     return _MENTION.sub(lambda found: f"<{found[1].replace('.', ' ')}>", text)
 
 
@@ -213,8 +195,7 @@ class ProjectContinue(msgspec.Struct, kw_only=True):
 
 
 class ProjectShot(msgspec.Struct, kw_only=True):
-    """One call of a shot: its whole text, and from `start_s` to `end_s` on its timeline. It is the whole shot unless a
-    mid-shot write splits it. A cut is a new shot; `beats` are in order."""
+    """One call of a shot: its whole text, and from `start_s` to `end_s` on its timeline. A cut is a new shot; `beats` are in order."""
 
     version: Literal[1] = 1
     name: str
@@ -276,19 +257,6 @@ class ProjectSetup(msgspec.Struct, kw_only=True):
     description: str = ""
     camera: str = ""
     from_frame: bool = False
-    style: str = ""
-    aspect_ratio: str | None = None
-    pictures: list[ProjectPicture] = msgspec.field(default_factory=list)
-
-
-class ProjectWorldState(msgspec.Struct, kw_only=True):
-    """A world state's first picture: how it starts, and who and what is where."""
-
-    version: Literal[1] = 1
-    name: str
-    function: str
-    init: str = ""
-    blocking: str = ""
     style: str = ""
     aspect_ratio: str | None = None
     pictures: list[ProjectPicture] = msgspec.field(default_factory=list)
