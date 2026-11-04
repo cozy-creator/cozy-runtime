@@ -516,7 +516,7 @@ machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`, `component
 `emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
 repeat.
 
-**Project adapters.** `@app.project_adapter("generate", "generate_turbo", reserved=["d"])` registers what turns one asset of those functions into `Invocation`s: functions of this package and their exact inputs. It's told the function as `op.function`, and its typed `inputs` are that tool's controls. The package owns its templating and vocabulary. It runs on the render machine on the CPU, and is pure: no GPU, no network, no file contents; a file is its digest. The record's `version` says which project format it reads. Opt-in: a function no adapter speaks for is called directly with its asset's inputs, each `<mention>` in a file input the file it names. All of it is read statically.
+**A function is a node.** Its typed inputs are its box and its result is what it makes, on a canvas, in `cozy run` and for an agent alike. `node=Node(label=, show=, hide=, fill=, reserved=, ui=)` on `app.entrypoint` says only what the types can't: its name, inputs to show or never draw, inputs the platform fills from a mention (`{"latents": "video.latents"}`) or a take (`{"continue_from": "take"}`), and the model's own tags in a text. A list of structs with a `name` member is filled from `<name>` mentions in text, each member by its name; any other list of structs is a repeating group. Hints on a field stay in `msgspec.Meta(extra={"min", "max", "options", "label", "placeholder", "total"})`.
 
 Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,
 `Context.output`, and `Context.adopt_model`. TensorFS owns the typed `Derivation`, `Target`,

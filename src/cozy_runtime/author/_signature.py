@@ -46,7 +46,7 @@ from cozy_runtime.author._markers import (
 from cozy_runtime.author._media import KIND_MEDIA, slot_kind
 from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
-from cozy_runtime.author._project import adapter_result
+from cozy_runtime.author._node import Node
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional, walk
 from cozy_runtime.author._weights import WeightsOutput, weights_class
@@ -357,10 +357,8 @@ class Declaration:
     """Run by its own package's calls only (`app.child_task`), never a root request."""
     accelerator: bool = True
     """False: CPU only, never opens CUDA. True: the machine's GPU when it has one."""
-    reserved: tuple[str, ...] = ()
-    """A project adapter's tags: what its model reads in a text, which stay text."""
-    ui: str = ""
-    """The path in its package of the component that draws its box on a canvas."""
+    node: Node | None = None
+    """What its box says that its types can't."""
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     """Model argument -> the components this callable runs; an absent argument runs all."""
@@ -538,8 +536,7 @@ def analyze(
     hidden: bool = False,
     child_task: bool = False,
     accelerator: bool = True,
-    reserved: tuple[str, ...] = (),
-    ui: str = "",
+    node: Node | None = None,
     invocable: bool = False,
     memoize: Memoize | None = None,
     model_defaults: Mapping[str, str] | None = None,
@@ -679,7 +676,7 @@ def analyze(
             payload_type = assets_payload(
                 typing.cast(type[msgspec.Struct], payload_type), binding, fn.__name__, fn.__module__
             )
-    result = adapter_result(hints.get("return"))
+    result = hints.get("return")
     if result is None or not is_struct(strip(result)[0]):
         raise ConformanceError(
             f"{where}: the return annotation must be a msgspec.Struct result schema "
@@ -726,8 +723,7 @@ def analyze(
         hidden=hidden,
         child_task=child_task,
         accelerator=accelerator,
-        reserved=reserved,
-        ui=ui,
+        node=node,
         invocable=invocable,
         memoize=memoize,
         model_defaults=model_defaults or {},

@@ -25,6 +25,7 @@ from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy, one_memo
+from cozy_runtime.author._node import Node
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
@@ -91,10 +92,8 @@ class Registration:
     """Called by this installed package revision's own code only; never a root request."""
     accelerator: bool = True
     """False: CPU only. True (the default): the machine's GPU when it has one."""
-    reserved: tuple[str, ...] = ()
-    """A project adapter's tags: what its model reads in a text, which stay text."""
-    ui: str = ""
-    """The path in this package of the component that draws this function's box on a canvas."""
+    node: Node | None = None
+    """What its box says that its types can't."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
     is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
@@ -117,8 +116,7 @@ class Registration:
                 hidden=self.hidden,
                 child_task=self.child_task,
                 accelerator=self.accelerator,
-                reserved=self.reserved,
-                ui=self.ui,
+                node=self.node,
                 invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
@@ -166,12 +164,12 @@ class App:
         *,
         hidden: bool = False,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
-        ui: str = "",
+        node: Node | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a public function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
 
-        `ui="ui/box.js"` names the component in this package that draws its box on a canvas, a literal.
+        `node=Node(...)` says what its box on a canvas needs that its types can't, read statically.
 
         `weights=` names the TensorFS model outputs it writes; `publishes=`/`emits_media=`
         declare its `Outputs`. `accelerator=False` runs it on CPU only; otherwise (`True`,
@@ -188,7 +186,7 @@ class App:
         in place of its annotation (the Runtime's own generic functions). `phases=` declares
         immutable component groups in execution order, available to queued preparation before
         handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
-        return self._register(fn, False, hidden=hidden, model_classes=model_classes, ui=ui, **options)
+        return self._register(fn, False, hidden=hidden, model_classes=model_classes, node=node, **options)
 
     @overload
     def child_task(
@@ -208,29 +206,6 @@ class App:
         `model_classes`. `prepared_use={"model": "use"}` (a child task's only) names the typed
         field that describes its fixed repeated weight use before construction."""
         return self._register(fn, True, **options)
-
-    def project_adapter(
-        self, *functions: str, reserved: Sequence[str] = ()
-    ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register what turns one asset a tool of each of `functions` makes into this package's own calls: it reads an
-        `author.Operation`, or a subclass typing `inputs`, which are that tool's controls, and answers `list[author.Invocation]`, run in
-        order, or raises `author.Refuse`. `op.function` says which. On the CPU, so a machine runs it as it runs any other. A public
-        function each, `project-adapter-<function>`. A function no adapter speaks for is called directly. `text` is no function: an
-        adapter of it answers what to ask for a picture's description. `reserved` names the tags its model reads in a text, such as `d`
-        for `<d>`: Calcifer leaves them there as text. All of this is read statically."""
-
-        def decorate(target: Callable[P, R]) -> Callable[P, R]:
-            for function in functions:
-                self._register(
-                    None,
-                    False,
-                    name=f"project-adapter-{function}",
-                    accelerator=False,
-                    reserved=tuple(reserved),
-                )(target)
-            return target
-
-        return decorate
 
     def _register(
         self,
@@ -255,8 +230,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
-        reserved: tuple[str, ...] = (),
-        ui: str = "",
+        node: Node | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         # Immutable CPU metadata; the source reader uses the same closed validator.
         declared_phases = model_phases(phases)
@@ -320,8 +294,7 @@ class App:
                 hidden=hidden,
                 child_task=child_task,
                 accelerator=accelerator is not False,
-                reserved=reserved,
-                ui=ui,
+                node=node,
             )
             return target
 

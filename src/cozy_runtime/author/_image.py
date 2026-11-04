@@ -67,6 +67,8 @@ class Picture(Reference, kw_only=True):
     upright and scaled down to 16 MP at most."""
 
     image: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
+    #: What it is, for a model that reads a picture better named in words.
+    description: str = ""
     #: Where it goes in the output, for a model with layout control; None places it nowhere in
     #: particular. A placed picture is an element, not the canvas: the size is the model's
     #: text-to-image default.

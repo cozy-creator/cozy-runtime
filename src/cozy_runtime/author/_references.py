@@ -39,6 +39,11 @@ def name_key(name: str) -> str:
     return " ".join(re.sub(r"[_-]", " ", name).split()).casefold()
 
 
+def spoken(text: str) -> str:
+    """A dotted name's mention in a text as a model reads it: `<kyogre.primordial>` as `<kyogre primordial>`."""
+    return MENTION.sub(lambda found: f"<{found[1].replace('.', ' ')}>", text)
+
+
 class Mention(NamedTuple):
     start: int
     end: int

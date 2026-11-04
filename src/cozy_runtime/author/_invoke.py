@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import msgspec
 
-from cozy_runtime.author import _project
 from cozy_runtime.author._activity import asides
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelArtifact
@@ -491,8 +490,6 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     token, context = _current.set(inv.calls), CURRENT.set(ctx)
     try:
         result = _call(surface, kwargs)
-        if surface.result_type is _project.Invocations and type(result) is list:
-            result = _project.Invocations(invocations=result)
         prepared_scope.join()  # every submitted execution settles before success serialization
         if inv.calls is not None:
             inv.calls.finish()

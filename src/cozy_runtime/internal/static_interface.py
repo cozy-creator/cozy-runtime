@@ -67,7 +67,6 @@ from cozy_runtime.author._model_defaults import (
     model_phases,
     model_prepared_use,
 )
-from cozy_runtime.author._project import adapter_result
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
 from cozy_runtime.author._services import SERVICES
@@ -299,31 +298,11 @@ _ENUM_BASES: dict[str, type[enum.Enum]] = {
 }
 #: The shot and upscale contract (xs-139): types, and bases a package's struct extends.
 _VIDEO_STRUCTS = (
-    "Beat",
-    "ShotReference",
-    "CharacterReference",
-    "PropReference",
-    "EnvironmentReference",
-    "VideoReference",
-    "AudioReference",
     "Plate",
     "ContinueFrom",
-    "ShotRequest",
     "ShotResult",
-    "UpscaleRequest",
     "UpscaleResult",
     "Invocation",
-    "Invocations",
-    "Operation",
-    "OperationFile",
-    "Read",
-    "Keep",
-    "ShotBeat",
-    "ShotPlate",
-    "ShotInputs",
-    "ShotOperation",
-    "PictureInputs",
-    "PictureOperation",
 )
 #: Author-surface classes that translate to themselves in a TYPE position.
 _AUTHOR_TYPES = (
@@ -349,7 +328,6 @@ _AUTHOR_TYPES = (
     "Region",
     "AspectRatio",
     "Seed",
-    "ShotReferences",
     "Follow",
     "Preset",
     "Latents",
@@ -371,6 +349,7 @@ _AUTHOR_VALUES = (
     "Bound",
     "Shape",
     "Memoize",
+    "Node",
     "data_values",
     "QuantizationPlan",
     "SelectionPlan",
@@ -425,9 +404,8 @@ _CHILD_TASK_KEYWORDS = frozenset(
     }
 )
 _APP_KEYWORDS = {
-    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden", "ui"},
+    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden", "node"},
     "child_task": _CHILD_TASK_KEYWORDS,
-    "project_adapter": frozenset({"reserved"}),
 }
 _INVOCABLE_KEYWORDS = frozenset(
     {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
@@ -1512,10 +1490,8 @@ class Registration:
     #: Local execution advice, not a client callable/schema field. Source identity covers it.
     phases: tuple[tuple[str, ...], ...] = ()
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
-    #: A project adapter's `reserved=`.
-    reserved: tuple[str, ...] = ()
-    #: `ui=`, a literal.
-    ui: str = ""
+    #: `node=`.
+    node: author.Node | None = None
 
     def declaration(self, **found: Any) -> Declaration:
         """Its record, with what its signature declares (`found`)."""
@@ -1530,8 +1506,7 @@ class Registration:
             memoize=self.memoize,
             child_task=self.child_task,
             accelerator=self.accelerator,
-            reserved=self.reserved,
-            ui=self.ui,
+            node=self.node,
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
@@ -2115,53 +2090,6 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                 if method is None:
                     continue
                 keywords = decorator.keywords if isinstance(decorator, ast.Call) else []
-                if method == "project_adapter":
-                    names = decorator.args if isinstance(decorator, ast.Call) else []
-                    if not names or not all(
-                        isinstance(n, ast.Constant) and isinstance(n.value, str) for n in names
-                    ):
-                        reader.refuse(
-                            module,
-                            decorator,
-                            "a project adapter names its functions",
-                            "static_unsupported",
-                        )
-                    reserved: tuple[str, ...] = ()
-                    for keyword in keywords:
-                        words = keyword.value
-                        if (
-                            keyword.arg not in _APP_KEYWORDS[method]
-                            or not isinstance(words, (ast.List, ast.Tuple))
-                            or not all(
-                                isinstance(word, ast.Constant) and isinstance(word.value, str)
-                                for word in words.elts
-                            )
-                        ):
-                            reader.refuse(
-                                module,
-                                keyword,
-                                "a project adapter takes only reserved=[...], as written",
-                                "static_unsupported",
-                            )
-                        reserved = tuple(word.value for word in words.elts)
-                    # `App.project_adapter`: an entrypoint by another name, per function.
-                    for adapted in names:
-                        registration = _registration(
-                            reader,
-                            module,
-                            stmt,
-                            "entrypoint",
-                            [
-                                ast.keyword(
-                                    "name", ast.Constant(f"project-adapter-{adapted.value}")
-                                ),
-                                ast.keyword("accelerator", ast.Constant(False)),
-                            ],
-                            decorator=decorator,
-                        )
-                        if registration is not None:
-                            found.append(replace(registration, reserved=reserved))
-                    continue
                 if isinstance(decorator, ast.Call) and decorator.args:
                     reader.refuse(
                         module, decorator, "positional decorator arguments", "static_unsupported"
@@ -2268,7 +2196,7 @@ def _registration(
     on_demand: tuple[str, ...] = ()
     phases: tuple[tuple[str, ...], ...] = ()
     uses: dict[str, str] = {}
-    ui = ""
+    node: author.Node | None = None
     for keyword in keywords:
         if keyword.arg not in _APP_KEYWORDS[method]:
             reader.refuse(
@@ -2318,10 +2246,10 @@ def _registration(
             uses = model_prepared_use(value)
         elif keyword.arg == "name":
             name = str(value)
-        elif keyword.arg == "ui":
-            if type(value) is not str:
-                reader.refuse(module, keyword.value, "ui names a file in this package, as text")
-            ui = value
+        elif keyword.arg == "node":
+            if not isinstance(value, author.Node):
+                reader.refuse(module, keyword.value, "node= is a Node(...)")
+            node = value
         elif keyword.arg == "hidden" and value is True:
             hidden = True
         elif keyword.arg == "accelerator":
@@ -2356,7 +2284,7 @@ def _registration(
         emits_media=emits_media,
         phases=phases,
         model_prepared_use=uses,
-        ui=ui,
+        node=node,
     )
 
 
@@ -2463,7 +2391,7 @@ def _callable(reader: Reader, registration: Registration) -> Declaration:
         )
     if fn.returns is None:
         reader.refuse(module, fn, "no return annotation")
-    result = adapter_result(reader.translate(module, fn.returns))
+    result = reader.translate(module, fn.returns)
     if not is_struct(result):
         reader.refuse(
             module, fn.returns, "the return annotation must be a msgspec.Struct result schema"
