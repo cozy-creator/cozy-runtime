@@ -482,12 +482,14 @@ def split[T](
     item_bytes: float,
     holds: int,
     run: Callable[[int], T],
+    pure: bool = False,
 ) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
-    Package code runs once: a refusal fails the call. `out_bytes` is the whole output held beside
+    Package code runs once: a refusal fails the call, unless `pure` says `run` is a Runtime leaf's
+    and goes finer. `out_bytes` is the whole output held beside
     the windows, `item_bytes` a window's output per element, `holds` how many of that its op's
     peak holds, its author's estimate: allocator reclaim covers a short one, and a completed
     pass's measured sample replaces it."""
@@ -499,4 +501,4 @@ def split[T](
     def need(level: int) -> tuple[int, ...]:
         return (out_bytes, *[int(window(level) * item_bytes)] * holds)
 
-    return catch.cut(f"split:{key}", deepest, need, lambda level: run(window(level)), pure=False)
+    return catch.cut(f"split:{key}", deepest, need, lambda level: run(window(level)), pure=pure)
