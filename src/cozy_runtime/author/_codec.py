@@ -397,7 +397,8 @@ def encode_mp4(video: Planar, fps: float, audio: Planar | None, sample_rate: int
                 padded = bytearray()
                 pad = b"\x00" * (plane.line_size - w * 3)
                 for y in range(h):
-                    padded += raw[y * w * 3 : (y + 1) * w * 3] + pad
+                    padded += raw[y * w * 3 : (y + 1) * w * 3]
+                    padded += pad
                 plane.update(bytes(padded))
             frame = frame.reformat(format="yuv420p")
             frame.pts = index
