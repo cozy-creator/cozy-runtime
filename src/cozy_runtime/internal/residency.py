@@ -2116,6 +2116,9 @@ class Memory:
             if names != self._phase_names or request_id != self._phase_request:
                 self._settle_prefetch(cancel=True)
                 self._retire_phase_plan("phase_boundary")
+                # Declares the boundary: native evicts this phase's own pages newest first, which
+                # keeps what a loop reaches next. Without it a loop refills every block every pass.
+                self.native.reset_preferences()
                 self._phase_names, self._phase_request = names, request_id
                 if request is not None:
                     request.phase_changes.append(
