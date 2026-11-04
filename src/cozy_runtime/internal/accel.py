@@ -712,15 +712,12 @@ RELEASED: dict[str, list[int]] = {}
 
 
 def release_cached(torch: Any, kind: str) -> None:
-    """Return unused allocator blocks to the driver; live tensors remain owned."""
-    if kind not in ("cuda", "mps"):
+    """MPS's unused allocator blocks back to its driver. On CUDA the native core alone does this."""
+    if kind != "mps":
         return
-    if kind == "cuda":
-        freed = int(vt.trim(torch.cuda.current_device()))
-    else:
-        before = reserved(torch, kind)
-        torch.mps.empty_cache()
-        freed = before - reserved(torch, kind)
+    before = reserved(torch, kind)
+    torch.mps.empty_cache()
+    freed = before - reserved(torch, kind)
     if freed > 0:
         row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
         row[0] += 1

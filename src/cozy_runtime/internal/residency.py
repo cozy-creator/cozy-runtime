@@ -1082,8 +1082,6 @@ class Memory:
         #: its next refill copies them back, with no store read, factor read or bake
         self._baked: OrderedDict[tuple[object, ...], Tensor] = OrderedDict()
         self._baked_bytes = 0
-        #: resident pages baked once: kept from their first refill
-        self._baked_once: set[tuple[object, ...]] = set()
         #: the copy stream a host page's prefetch runs on
         self._h2d_stream: Any = None
         #: a hooked block's pages whose fill wrote nothing: their stored bytes are the page, so a
@@ -1115,9 +1113,6 @@ class Memory:
                 if budget_bytes is not None:
                     vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
-                # One policy for this Memory lifetime. Registration, phase changes and
-                # dtype rebinding never reinstall an estimated idle-cache window.
-                self.native.clear_streaming_limit()
                 self._apply_cap()
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = varena.supports_refill()
@@ -1531,22 +1526,9 @@ class Memory:
             model.identity = identity
             model.generation += 1
 
-    def _streams(self, model: Model) -> bool:
-        """A model over half the card will page its blocks beside its working memory (H3's 21 GB
-        DiT, on 24 and on 32 GB). Used only to keep a bake from the first: wrong either way costs
-        one host copy, or one more bake."""
-        total = self.budget_bytes or int(torch.cuda.mem_get_info(self.device)[1])
-        return 2 * sum(block.allocation_bytes for block in model.groups()) > total
-
-    def _keep_baked(self, page: tuple[object, ...], block: _Block, tensor: Tensor) -> None:
-        """A block's baked bytes, kept in the host tier for its next refill: a streaming model's
-        from its first bake, a resident one's from its first refill. Bake it once."""
-        if page in self._baked:
-            return
-        if not self._streams(block.model) and page not in self._baked_once:
-            self._baked_once.add(page)
-            return
-        if not self._admit(page, tensor.numel()):
+    def _keep_baked(self, page: tuple[object, ...], tensor: Tensor) -> None:
+        """A block's baked bytes, kept in the host tier for its next refill: bake it once."""
+        if page in self._baked or not self._admit(page, tensor.numel()):
             return
         kept = self._pin(torch.zeros(tensor.numel(), dtype=torch.uint8))
         if kept is not None:
@@ -1579,7 +1561,7 @@ class Memory:
             return
         page = _page(block, block.model.identity, block.overlay, final=True)
         self._refills[page] = self._refills.get(page, 0) + 1
-        self._keep_baked(page, block, tensor)
+        self._keep_baked(page, tensor)
 
     def _want(self, block: _Block, page: tuple[object, ...]) -> None:
         """A store read of `page` completed: the page is pinned once the executor is idle
@@ -1775,7 +1757,6 @@ class Memory:
             kept = self._baked.pop(page)
             self._baked_bytes -= kept.tensor.numel()
             kept.release()
-        self._baked_once = {page for page in self._baked_once if page[0] != model.name}
         self._plain = {page for page in self._plain if page[0] != model.name}
 
     def _host_read(
@@ -1806,8 +1787,8 @@ class Memory:
     def _switch_overlay(self, block: _Block, overlay: Hashable) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
         a LoRA forward, or the reverse). As for a changed fill, its model's holds go first. A
-        native page is parked under its overlay, first for reclaim to take, and the wanted
-        overlay's parked page serves again: alternating overlays refill nothing while both fit.
+        native page is parked under its overlay, and the wanted overlay's parked page serves
+        again: alternating overlays refill nothing while both stay resident.
         Off native backing the page is dropped and the next fill writes the wanted overlay."""
         for hold in list(block.model.holds):
             hold.shed()
@@ -1822,9 +1803,6 @@ class Memory:
         self._discard(block)
         current = (block.region, block.final_region)
         if current != (None, None):
-            for region in current:
-                if region is not None:
-                    region.set_preferred(False)
             block.parked[block.overlay] = current
         while len(block.parked) > _PARKED:
             block.parked.pop(next(iter(block.parked)))
@@ -1955,7 +1933,8 @@ class Memory:
         return max(before_allocated - allocated, before_reserved - reserved, 0)
 
     def trim(self) -> int:
-        """Idle offload: release eligible owners and return actual reserved-byte reduction.
+        """Idle offload: this executor's owners let go; on CUDA the native core keeps or returns
+        the pages they leave, as it is asked. Returns the reserved bytes that went.
 
         The host tier goes too. Its pages are pinned, so no other process can reclaim them, and
         the call the machine offloads this executor for needs host RAM as well: beside an idle
@@ -1967,16 +1946,11 @@ class Memory:
         for model in list(self.models.values()):
             self._retire(model)
         if self.cuda:
-            # Explicit offload discards every eligible owner; it is not a byte-target
-            # victim selector or a retry of a failed allocation. Live pins still refuse.
             for region in list(self.regions):
                 region.discard()
             for model in list(self.models.values()):
                 for block in model.groups():
                     self._discard(block)
-            if self.native is not None:
-                self.native.reclaim(int(self.native.stats()["resident_bytes"]))
-            release_cached(torch, self.device.type)
         else:
             self.reclaim()
         with self.lock:
@@ -2140,11 +2114,7 @@ class Memory:
         self._note_phase_plan("active", phase=key, native=candidate.facts())
 
     def _activate_phase(self, model: Model) -> None:
-        """Declare a component-phase boundary; native policy retains/evicts actual pages.
-
-        Resetting preference metadata marks prior idle backing as standby. Native reclaim
-        orders that cache LRU and this phase's touched pages MRU, without a Python budget.
-        """
+        """Declare a component-phase boundary; native policy retains/evicts actual pages."""
         self.cooperation_boundary(used=True)
         request = _REQUEST.get()
         if not self.cuda or self.capturing() or (request is not None and request.idle):
@@ -2158,7 +2128,6 @@ class Memory:
             if names != self._phase_names or request_id != self._phase_request:
                 self._settle_prefetch(cancel=True)
                 self._retire_phase_plan("phase_boundary")
-                self.native.reset_preferences()  # No mapping, reclaim or driver call.
                 self._phase_names, self._phase_request = names, request_id
                 if request is not None:
                     request.phase_changes.append(
@@ -2569,7 +2538,7 @@ class Memory:
                 changed = kept is None and block.model.fill(block.path, data)
                 bake = baking.end(self.stream()) if changed and baking is not None else None
                 if changed and page is not None and use is not None:
-                    self._keep_baked(page, block, use.tensor)
+                    self._keep_baked(page, use.tensor)
                 block.overlay = overlay
             if page is not None and kept is None and not changed:
                 with self.lock:  # this store read completed, and its bytes are the page
@@ -3004,6 +2973,8 @@ class Request:
         self.working_phases: list[dict[str, Any]] = []
         self.working_phase_keys: set[str] = set()
         self.working_splits: dict[str, dict[str, Any]] = {}
+        #: refusals that took a pure site finer than its estimate chose: zero in a normal run
+        self.finer_splits = 0
         self.peak = 0
         #: Working allocation peak over the whole request, kept across cut-site resets.
         self.torch_peak = 0
@@ -3161,6 +3132,7 @@ class Request:
             "phases": list(self.phase_changes),
             "working_phases": list(self.working_phases),
             "working_splits": list(self.working_splits.values()),
+            "finer_splits": self.finer_splits,
             "cooperation": (
                 self.memory.cooperation.facts() if self.memory.cooperation is not None else None
             ),
@@ -3459,10 +3431,8 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
             if (request := _REQUEST.get()) is not None:
                 request.final_fills += 1
             if block.final_only():
-                # Compute consumes only the completed final bytes. Retire our raw views
-                # and make their backing the first victim; an escaped alias still pins it.
-                if block.region is not None:
-                    block.region.set_preferred(False)
+                # Compute consumes only the completed final bytes. Retire our raw views; an
+                # escaped alias still pins their backing.
                 block.data = {}
                 block.native_storage = block.native_use = None
         # Only ordinary owning views remain. The native region can become evictable

@@ -2,12 +2,14 @@
 
 A pure site lists its levels' shape estimates (`sizing`); native selection chooses one and
 observes it. An ordinary operation runs once. A refusal inside a Runtime-owned pure op selects
-a finer level before anything leaves it; a package's `split` never runs again.
+a finer level before anything leaves it, and warns and counts: it should never happen, and one in
+a normal run is an estimate to fix. A package's `split` never runs again.
 """
 
 from __future__ import annotations
 
 import functools
+import sys
 import threading
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -99,7 +101,14 @@ def refused(exc: BaseException) -> bool:
     return True
 
 
-def _finer[T](run: Callable[[int], T], level: int, finest: int, pure: bool) -> T:
+def went_finer(name: str, level: int) -> None:
+    """A refusal took this site finer than its estimate chose (`stats.finer_splits`)."""
+    print(f"cozy-runtime: {name} refused at level {level}: a short estimate", file=sys.stderr)
+    if (request := CURRENT.get()) is not None:
+        request.finer_splits += 1
+
+
+def _finer[T](name: str, run: Callable[[int], T], level: int, finest: int, pure: bool) -> T:
     """`run(level)` outside a native leaf; a pure op's refusal goes one level finer."""
     while True:
         try:
@@ -107,6 +116,7 @@ def _finer[T](run: Callable[[int], T], level: int, finest: int, pure: bool) -> T
         except Exception as exc:
             if not pure or level >= finest or not refused(exc):
                 raise
+        went_finer(name, level)
         level += 1
 
 
@@ -153,11 +163,10 @@ def begin(
         return None
 
 
-def note(request: Request, key: str, name: str, level: int) -> dict[str, Any]:
+def note(request: Request, key: str, name: str, level: int) -> None:
     """A site's calls per level, for the run record."""
-    record = request.working_splits.setdefault(key, {"site": name, "levels": {}, "finer": 0})
+    record = request.working_splits.setdefault(key, {"site": name, "levels": {}})
     record["levels"][str(level)] = record["levels"].get(str(level), 0) + 1
-    return record
 
 
 def cut[T](
@@ -170,16 +179,16 @@ def cut[T](
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
     if not (native or _capturing()) or sum(need(0)) < _SMALL:
-        return _finer(run, 0, finest, pure)
+        return _finer(name, run, 0, finest, pure)
     menu = tuple((str(level), need(level)) for level in range(finest + 1))
     key = f"{name}:{hash(menu):x}"
     if not native or not LEAF.acquire(blocking=False):
-        return _finer(run, LEVELS.get(key, 0), finest, pure)
+        return _finer(name, run, LEVELS.get(key, 0), finest, pure)
     assert request is not None
     try:
         device = request.memory.device.index or 0
         if not vt.split_context(device)["eligible"]:
-            return _finer(run, LEVELS.get(key, 0), finest, pure)
+            return _finer(name, run, LEVELS.get(key, 0), finest, pure)
         request.memory.remember_working_phase(key, owners(request))
         stream = int(torch.cuda.current_stream(device).cuda_stream)
         floor = 0
@@ -187,7 +196,7 @@ def cut[T](
             level, selection = select(device, key, menu, stream, floor)
             token = begin(device, key, level, selection, stream)
             LEVELS[key] = level
-            record = note(request, key, name, level)
+            note(request, key, name, level)
             submitted = False
             try:
                 result = run(level)
@@ -196,11 +205,11 @@ def cut[T](
             except Exception as exc:
                 if not pure or level >= finest or not refused(exc):
                     raise
-                record["finer"] += 1
                 floor = level + 1
             finally:
                 if token is not None:
                     vt.split_end(device, token, submitted=submitted)
+            went_finer(name, level)
     finally:
         LEAF.release()
 

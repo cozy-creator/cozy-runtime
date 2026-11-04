@@ -725,7 +725,6 @@ def _record_first(
                     loading.callback(hold.release)  # the recording's bindings retain them
             _lap("load")
             recording._prepare((*mutable, counter))
-            vt.trim(torch.cuda.current_device())
             _lap("prepare")
             with recording.capturing():
                 parts, blocks = _record_resident(
@@ -774,7 +773,6 @@ def _record(
         why = None
         try:
             recording._prepare((*mutable, counter))
-            vt.trim(torch.cuda.current_device())
             _lap("prepare")
             began = time.perf_counter()
             ctx.raise_if_cancelled()
@@ -846,7 +844,6 @@ def _record_whole(
     failure: BaseException | None = None
     try:
         recording._prepare((*mutable, counter))
-        vt.trim(torch.cuda.current_device())
         _lap("prepare")
         _yield_point()
         with recording.capturing():
@@ -1190,7 +1187,6 @@ def _abandon(recording: _SequenceCapture, failure: BaseException | None = None) 
     _drop_stages(recording)
     recording.close()
     gc.collect()
-    vt.trim(torch.cuda.current_device())
 
 
 def _drop_stages(recording: _SequenceCapture) -> None:

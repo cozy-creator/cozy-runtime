@@ -249,6 +249,7 @@ def _exchange(
         buffers = out = None  # type: ignore[assignment]
         if at + 1 == len(steps) or not all(row["oom"] for row in answers if row.get("error")):
             _refusal(answers)
+        catch.went_finer("ulysses", at)
         floor = at + 1
     catch.LEVELS[site] = at
     if request is not None:

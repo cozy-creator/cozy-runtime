@@ -1534,7 +1534,6 @@ class Executor:
         """Why a spread call is declined rather than failed: this GPU ran short of memory in
         it (`mirror.ending`)."""
         if ending == MEMORY_EXHAUSTED:
-            accel.release_cached(self.torch, self.device_kind)
             return f"{getattr(exc, 'code', DEVICE_OOM)}: {exc}"[:300]
         return None
 
