@@ -457,21 +457,19 @@ def _attend(
 ) -> Tensor:
     """Query heads [h, h + hp) with the K/V heads they read, by query rows [s, s + rp)."""
     group, hp, rp = cut
-    batch, length, count = int(q.shape[0]), int(q.shape[1]), int(q.shape[2])
+    length, count = int(q.shape[1]), int(q.shape[2])
     if hp >= count and rp >= length:
         return call(q, k, v, mask)
     whole = mask.expand(-1, count, length, -1) if mask is not None else None
-    out: Tensor | None = None
+    out = catch.whole(q)
     for h in range(0, count, hp):
         n, lo, hi = min(hp, count - h), h // group, (min(h + hp, count) - 1) // group + 1
         for s in range(0, length, rp):
             catch.checkpoint()
             part = whole[:, h : h + n, s : s + rp] if whole is not None else None
             piece = call(q[:, s : s + rp, h : h + n], k[:, :, lo:hi], v[:, :, lo:hi], part)
-            out = piece.new_empty((batch, length, count, *piece.shape[3:])) if out is None else out
             out[:, s : s + rp, h : h + n].copy_(piece)
             del piece
-    assert out is not None
     return out
 
 

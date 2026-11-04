@@ -87,9 +87,20 @@ def _capturing() -> bool:
     return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
 
 
+def whole(like: Tensor) -> Tensor:
+    """An output like `like`, allocated before any piece runs. Every level holds it the same, so
+    its refusal is final: no finer level can shrink it."""
+    try:
+        return like.new_empty(like.shape)
+    except Exception as exc:
+        exc.whole_output = True  # type: ignore[attr-defined]
+        raise
+
+
 def refused(exc: BaseException) -> bool:
-    """An allocation refusal outside capture; the refused attempt's frames and tensors go."""
-    if fault(exc) is not Fault.OOM or _capturing():
+    """An allocation refusal a finer level may clear, outside capture; the refused attempt's frames
+    and tensors go."""
+    if getattr(exc, "whole_output", False) or fault(exc) is not Fault.OOM or _capturing():
         return False
     seen: set[int] = set()
     at: BaseException | None = exc
