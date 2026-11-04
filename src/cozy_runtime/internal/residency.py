@@ -523,10 +523,11 @@ class _HostPage:
 
 class _HostRead:
     """A prefetch from a host page: one DMA on the copy stream. Its fill commits only once the
-    copy completed, so nothing that pins the region ready can read it early."""
+    copy completed, so nothing that pins the region ready can read it early. Nothing cancels it:
+    the copy is submitted and its bytes are the page's, and an abandoned fill stays pinned."""
 
     def __init__(self, use: Any, event: Any, nbytes: int) -> None:
-        self.use, self.event, self.nbytes, self.canceled = use, event, nbytes, False
+        self.use, self.event, self.nbytes = use, event, nbytes
 
     def start(self) -> None:
         pass
@@ -535,15 +536,14 @@ class _HostRead:
         return {"done": bool(self.event.query())}
 
     def cancel(self) -> None:
-        self.canceled = True
+        pass
 
     def wait(self) -> dict[str, Any]:
         self.event.synchronize()
         use, self.use = self.use, None
-        if use is not None and not self.canceled:
+        if use is not None:
             use.commit()
-        nbytes = 0 if self.canceled else self.nbytes
-        return {"canceled": self.canceled, "bytes": nbytes, "host": True}
+        return {"canceled": False, "bytes": self.nbytes, "host": True}
 
 
 class Model:
