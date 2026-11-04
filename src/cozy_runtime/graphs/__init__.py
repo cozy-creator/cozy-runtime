@@ -171,7 +171,8 @@ class _Recording:
         copied = 0
         try:
             for static, value in zip(self.inputs, leaves, strict=True):
-                if static is not None and not _same(static, value):
+                # Always: a pool's contents need not survive between replays.
+                if static is not None:
                     static.copy_(value)
                     copied += static.nbytes
             with self.owner.recovery_blocked(replay=True):
@@ -207,16 +208,6 @@ class _Recording:
             self.stream.synchronize()
         if self.done is not None:
             self.done.synchronize()
-
-
-def _same(static: Any, value: Any) -> bool:
-    """`value` is `static`'s memory as it is laid out: reading it in place needs no copy."""
-    return value is static or (
-        value.data_ptr() == static.data_ptr()
-        and value.shape == static.shape
-        and value.stride() == static.stride()
-        and value.dtype == static.dtype
-    )
 
 
 class _Timing:
