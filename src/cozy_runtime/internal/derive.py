@@ -405,18 +405,16 @@ def _guard_mode(seen: Observations) -> Any:
             if name in _MOVE:
                 raise ConstructionFault(
                     f"device move via {name}()",
-                    "placement is platform policy derived from measurement (§1) and there "
-                    "are no developer-facing placement knobs. A construction-time move "
-                    "pins the tensor where the author guessed, forever",
+                    "cozy places a model's tensors itself, so `load()` builds them without "
+                    "moving them: remove this call",
                     site=_author_site(),
                 )
             named = _named_device(args, kwargs or {})
             if named is not None:
                 raise ConstructionFault(
                     f"device pin `device={named}`",
-                    "naming a device during construction is not a knob — it survives every "
-                    "later placement the runtime performs. Allocate shapes and dtypes and "
-                    "let the runtime decide where they live",
+                    "cozy places a model's tensors itself, so `load()` names no device: remove "
+                    "this argument",
                     site=_author_site(),
                 )
             if name in _EGRESS and args and not is_virtual(args[0]):

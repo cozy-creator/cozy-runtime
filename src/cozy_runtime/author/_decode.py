@@ -25,6 +25,7 @@ from numbers import Integral
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+import PIL.Image
 from PIL.Image import DecompressionBombError, Resampling, Transpose
 from PIL.Image import Image as PILImage
 from PIL.Image import frombytes as pil_frombytes
@@ -327,6 +328,11 @@ class _Budget:
             if self.parent is not None:
                 self.parent.claim(size, "attempt media")
             self.used = next_used
+
+    def room(self) -> int:
+        """Bytes a read can still claim here and in the budget above it."""
+        left = self.limit - self.used
+        return left if self.parent is None else min(left, self.parent.room())
 
     def refund(self) -> None:
         """Return what a failed read claimed, so the attempt can read again."""
@@ -658,7 +664,7 @@ class _VideoClock:
         self.width = 0
         self.height = 0
         self.stopped = False
-        rate = stream.average_rate
+        rate = stream.average_rate or stream.guessed_rate
         self.nominal_frame_rate = _positive_fraction(rate, "video average rate") if rate else None
         ratio = stream.sample_aspect_ratio
         # PyAV 19 represents unspecified ratios as a falsy AVRational rather
@@ -1206,7 +1212,9 @@ class MediaReads:
         budget, path = self._start(asset, "ImageFile.read")
         try:
             with _reading(asset, None, "image"):
-                prepared = _image(path, self._limits, budget, _image_preparation(asset), mode)
+                prepared = _image(
+                    path, self._limits, budget, _image_preparation(asset), mode, self._noting(asset)
+                )
         except BaseException:
             budget.refund()
             raise
@@ -1301,11 +1309,12 @@ class MediaReads:
 
     def probe(self, asset: File) -> Probe:
         """Source header facts, cached on the handle. Never decodes a picture or sample."""
-        _budget, path = self._start(asset, f"{type(asset).__name__}.probe", decode=False)
+        budget, path = self._start(asset, f"{type(asset).__name__}.probe", decode=False)
+        fitted = _within(_image_preparation(asset), self._limits, budget, "RGB")
         if asset._probed is None:
             if asset.kind == "image":
                 with _reading(asset, None, "image"):
-                    asset._probed = _probe_image(path, self._limits)
+                    asset._probed = _probe_image(path, fitted)
             else:
                 av = _av()
                 with _reading(asset, av, asset.kind):
@@ -1316,9 +1325,7 @@ class MediaReads:
                     )
         probed = asset._probed
         if isinstance(probed, ImageProbe):
-            width, height = image_target_size(
-                probed.source_width, probed.source_height, _image_preparation(asset)
-            )
+            width, height = image_target_size(probed.source_width, probed.source_height, fitted)
             return replace(probed, width=width, height=height)
         assert isinstance(probed, (VideoProbe, AudioProbe))
         if asset._end is not None and probed.source_duration > asset._end:
@@ -1576,7 +1583,7 @@ def _probe_video(av: Any, path: Path, limits: DecodeLimits) -> VideoProbe:
         aspect = _positive_fraction(ratio, "video pixel aspect ratio") if ratio else Fraction(1)
         if rotation % 180:
             width, height, aspect = height, width, 1 / aspect
-        rate = stream.average_rate
+        rate = stream.average_rate or stream.guessed_rate
         audio_format = _stream_audio_format(soundtrack, limits) if soundtrack is not None else None
         duration = _stream_duration(av, container, stream)
     return VideoProbe(
@@ -1615,7 +1622,10 @@ def _pillow() -> Iterator[None]:
     except MediaDecodeError:
         raise
     except DecompressionBombError as exc:
-        raise MediaDecodeError(str(exc), code="pixels_per_frame_limit") from exc
+        raise MediaDecodeError(
+            "this image has too many pixels to read: resize it and run again",
+            code="pixels_per_frame_limit",
+        ) from exc
     except OSError as exc:
         if exc.errno is not None:
             raise  # Filesystem failures retain the caller's materialization error boundary.
@@ -1628,14 +1638,10 @@ def _pillow() -> Iterator[None]:
         ) from exc
 
 
-def _probe_image(path: Path, limits: DecodeLimits) -> ImageProbe:
-    if path.stat().st_size > IMAGE_SOURCE_MAX_BYTES:
-        raise MediaDecodeError(
-            "image source exceeds preparation byte ceiling", code="image_source_bytes"
-        )
+def _probe_image(path: Path, preparation: ImagePreparation) -> ImageProbe:
+    with _pillow():
+        width, height = image_source_geometry(path, preparation)
     with _pillow(), pil_open(path) as header:
-        width, height = header.size
-        _check_pixels(width, height, limits)
         # The base reader parses header metadata only; a PNG `eXIf` after its pixels
         # would need a decode and is not consulted here.
         orientation = PILImage.getexif(header).get(0x0112, 1)
@@ -1661,6 +1667,9 @@ def require_decoder_dependency() -> None:
 # are source/working limits, separate from FileBound and retained RGB budgets.
 IMAGE_SOURCE_MAX_BYTES = 256 << 20
 IMAGE_WORKING_MAX_BYTES = 2 << 30
+# Pillow refuses at twice this. `image_source_geometry` holds a source to the working bytes
+# first; its own default (178 MP) would refuse a phone's 200 MP photo that a read scales down.
+PIL.Image.MAX_IMAGE_PIXELS = IMAGE_WORKING_MAX_BYTES // 8
 
 
 def image_target_size(
@@ -1685,6 +1694,22 @@ def image_target_size(
     return target_width, target_height
 
 
+def _within(
+    preparation: ImagePreparation | None,
+    limits: DecodeLimits,
+    budget: _Budget,
+    mode: Literal["RGB", "RGBA"],
+) -> ImagePreparation:
+    """`preparation`, no larger than a frame's ceiling or what the budget still holds in `mode`: a
+    larger source reads smaller, never refused. A budget with no room left refuses at its claim."""
+    most = max(1, min(limits.max_pixels_per_frame, budget.room() // len(mode)))
+    if preparation is None:
+        return ImagePreparation(max_pixels=most)
+    if preparation.max_pixels is not None and preparation.max_pixels <= most:
+        return preparation
+    return replace(preparation, max_pixels=most)
+
+
 def image_decoded_bytes(path: Path) -> int:
     """Header-only RGB8 size of an encoded image: what a decoded bound promises."""
     with pil_open(path) as header:
@@ -1694,24 +1719,29 @@ def image_decoded_bytes(path: Path) -> int:
     return width * height * 3
 
 
-def image_source_geometry(
-    path: Path, limits: DecodeLimits, preparation: ImagePreparation | None
-) -> tuple[int, int]:
-    """Header-only refusal before the codec opens or decodes a full frame."""
-    if path.stat().st_size > IMAGE_SOURCE_MAX_BYTES:
+def image_source_geometry(path: Path, preparation: ImagePreparation | None) -> tuple[int, int]:
+    """A source's size from its header, refused only when reading it would not fit its working
+    memory, before the codec opens or decodes a full frame."""
+    size = path.stat().st_size
+    if size > IMAGE_SOURCE_MAX_BYTES:
         raise MediaDecodeError(
-            "image source exceeds preparation byte ceiling", code="image_source_bytes"
+            f"this image file is {size >> 20} MiB, and an image file can be at most "
+            f"{IMAGE_SOURCE_MAX_BYTES >> 20} MiB: save it smaller and run again",
+            code="image_source_bytes",
         )
     with pil_open(path) as header:
         width, height = header.size
-        _check_pixels(width, height, limits)
+    if width <= 0 or height <= 0:
+        raise MediaDecodeError("image has invalid frame geometry", code="media_geometry")
     target = image_target_size(width, height, preparation)
     # A conservative planned envelope, not a claim that native allocations are
     # individually intercepted. The executor's containment remains authoritative.
     working = width * height * 8 + target[0] * target[1] * 16 + (64 << 20)
     if working > IMAGE_WORKING_MAX_BYTES:
         raise MediaDecodeError(
-            "image source exceeds preparation working envelope", code="image_working_bytes"
+            f"this image is {width}x{height}, too large to scale down in the "
+            f"{IMAGE_WORKING_MAX_BYTES >> 30} GiB a read works in: resize it and run again",
+            code="image_working_bytes",
         )
     return width, height
 
@@ -1722,6 +1752,7 @@ def _image(
     budget: _Budget,
     preparation: ImagePreparation | None,
     mode: Literal["RGB", "RGBA"] = "RGB",
+    note: _Note | None = None,
 ) -> PILImage:
     """Decode a still image with Pillow; CLI preparation and Runtime use this one core.
 
@@ -1730,13 +1761,20 @@ def _image(
     file (an iPhone MPO's gain map, APNG, GIF, TIFF pages) reads as its first frame,
     the picture every viewer shows; Pillow opens there. An RGB read composites any
     transparency over white, as upstream Qwen's checkpoints were trained; RGBA keeps it.
+    A source past a frame's ceiling or the read's budget reads smaller, with a note.
     """
     with _pillow():
-        source_geometry = image_source_geometry(path, limits, preparation)
+        fitted = _within(preparation, limits, budget, mode)
+        source_geometry = image_source_geometry(path, fitted)
         with pil_open(path) as image:
             if image.size != source_geometry:
                 raise MediaDecodeError("image header geometry changed", code="media_geometry")
-            width, height = image_target_size(*source_geometry, preparation)
+            width, height = image_target_size(*source_geometry, fitted)
+            if note is not None and (width, height) != image_target_size(*source_geometry, preparation):
+                note(
+                    f"this {source_geometry[0]}x{source_geometry[1]} image was read at "
+                    f"{width}x{height}, the most this read holds"
+                )
             budget.claim(width * height * len(mode), f"image {mode}")
             # in_place avoids an extra full-size copy for the common upright case.
             exif_transpose(image, in_place=True)
@@ -1746,7 +1784,7 @@ def _image(
                 pixels.paste(rgba, mask=rgba)
             else:
                 pixels = image.convert(mode)
-            size = image_target_size(*pixels.size, preparation)
+            size = image_target_size(*pixels.size, fitted)
             if pixels.size != size:
                 pixels = pixels.resize(size, Resampling.LANCZOS)
             return pixels
@@ -1898,13 +1936,16 @@ def _check_pixels(width: int, height: int, limits: DecodeLimits) -> None:
         raise MediaDecodeError("media has invalid frame geometry", code="media_geometry")
     if pixels > limits.max_pixels_per_frame:
         raise MediaDecodeError(
-            f"frame has {pixels} pixels; limit is {limits.max_pixels_per_frame}",
+            f"this video's frames are {width}x{height}, and a frame can be at most "
+            f"{limits.max_pixels_per_frame} pixels: scale it down and run again",
             code="pixels_per_frame_limit",
         )
 
 
 def _required_stream(kind: str) -> None:
-    raise MediaDecodeError(f"{kind} file has no {kind} stream", code=f"{kind}_stream_missing")
+    raise MediaDecodeError(
+        f"this file has no {kind} in it: give a file that does", code=f"{kind}_stream_missing"
+    )
 
 
 def _fraction(value: object, what: str) -> Fraction:

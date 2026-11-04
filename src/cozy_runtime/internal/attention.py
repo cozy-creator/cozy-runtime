@@ -1893,10 +1893,17 @@ def override(
 
 
 def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> AttentionRefusal:
+    shape = f"{dtype or 'unknown'} activations at head dimension {head_dim or 'unknown'}"
+    if name == "no available attention kernel":
+        return AttentionRefusal(
+            "attention_kernel_unsupported",
+            f"no attention kernel on this machine serves {component}'s attention ({shape}): that "
+            "is a bug in the package or in cozy, not in your request; try another lane with `--lane`",
+        )
     return AttentionRefusal(
         "attention_kernel_unsupported",
-        f"{name} does not serve {component}'s attention: {dtype or 'unknown'} activations "
-        f"at head dimension {head_dim or 'unknown'}. A pinned kernel is never quietly replaced",
+        f"{name} does not serve {component}'s attention: {shape}. A pinned kernel is never "
+        "quietly replaced: pin another, or none",
     )
 
 

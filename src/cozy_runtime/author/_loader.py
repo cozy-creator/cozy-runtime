@@ -247,7 +247,7 @@ class Config:
                 raise ConformanceError(
                     f"{where}.{key}: {carrier} — the construction config is a typed "
                     "capability, never a path: no source carrier, checkpoint path or "
-                    "catalog ref reaches a factory (§1.1)",
+                    "catalog ref reaches a factory",
                     code="config_path",
                     fields=[f"{where}.{key}"],
                 )
@@ -540,7 +540,7 @@ class _NullBackend:
     def fill(self, key: str, spec: TensorSpec, destination: TensorLike) -> None:
         raise CapabilityError(
             "derive mode allocates nothing: construction walks and matches under fake "
-            "tensors, and fills only under serve (§1.1)",
+            "tensors, and fills only under serve",
             code="derive_fill",
         )
 
@@ -666,7 +666,7 @@ def _require_immutable(name: str, value: object) -> None:
     if isinstance(value, (list, dict, set, bytearray)):
         raise ConformanceError(
             f"cache {name!r}: {type(value).__name__} entries are mutable — the cache accepts "
-            "only immutable derived entries (§1.3)",
+            "only immutable derived entries",
             code="cache_mutable",
         )
     if isinstance(value, tuple):
@@ -855,7 +855,7 @@ class Loader:
         if not isinstance(obj, t):
             raise ConformanceError(
                 f"factory {identity} returned {type(obj).__name__}, declared {t.__name__} — "
-                "a factory returns ONE whole object; no partial-binding tier exists (§1.1)",
+                "a factory returns ONE whole object; no partial-binding tier exists",
                 code="factory_result",
             )
         if self._artifact._prepare is not None:
@@ -952,7 +952,7 @@ class Loader:
         if not self._open:
             raise CapabilityError(
                 f"{what} outside load/unload: the Loader is the LOAD-ONLY surface and request "
-                "code cannot reach it — `ctx` always means the request Context (§1.3)",
+                "code cannot reach it — `ctx` always means the request Context",
                 code="loader_closed",
             )
 

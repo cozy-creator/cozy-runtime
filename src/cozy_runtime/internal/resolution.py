@@ -562,9 +562,9 @@ def _prepared_choices(
 
 def _refusal(variant: Variant, device: DeviceFacts, step: Step) -> str:
     return (
-        f"the {variant.name!r} variant resolves to no executable plan on {device_line(device)}. "
-        f"The tensor schema is known; what is missing is a route from these stored bytes to a "
-        f"kernel this device has. {step.verdict} — {step.why[:200]}"
+        f"the {variant.name!r} lane can't be read on {device_line(device)}: this Runtime has no "
+        f"way to run how it's stored. Run `cozy machine update`, or choose another lane with "
+        f"`--lane`. {step.verdict} — {step.why[:200]}"
     )
 
 

@@ -73,16 +73,12 @@ TOKENIZER_METADATA = (
 
 Images = Annotated[
     list[ImageFile],
-    FileBound(
-        max_bytes=64 << 20,
-        max_decoded_bytes=256 << 20,
-        media_types=("image/png", "image/jpeg", "image/webp"),
-    ),
+    FileBound(max_decoded_bytes=256 << 20),
     msgspec.Meta(max_length=16),
 ]
 Videos = Annotated[
     list[VideoFile],
-    FileBound(max_bytes=1 << 30, max_decoded_bytes=16 << 30),
+    FileBound(max_decoded_bytes=16 << 30),
     msgspec.Meta(max_length=4),
 ]
 Text = Annotated[str, msgspec.Meta(max_length=65536)]

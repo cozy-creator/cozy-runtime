@@ -20,7 +20,7 @@ import hashlib
 import math
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal, cast
 
 import msgspec
@@ -107,16 +107,30 @@ def _validate_recipe(
             f"parameter (have {', '.join(model_params) or 'none'})",
             code="unknown_binding",
         )
-    unknown = [k for k in recipe.values if k not in marked]
-    if unknown:
-        raise DefaultResolutionError(
-            f"{recipe.source} names {', '.join(sorted(unknown))}, which are not "
-            "ModelDefault request fields — the recipe refuses as a unit",
-            code="unknown_default",
-            fields=sorted(unknown),
-        )
+
+
+def _usable(
+    recipe: DefaultSet, marked: Mapping[str, Node], rows: list[AdjustmentRow]
+) -> DefaultSet:
+    """The values of a recipe this function can take, held to their bounds. A recipe is a model's
+    advice, so one that names a field this function doesn't have, or a value it can't use, costs
+    that value and a warning, never the run."""
+    kept: dict[str, object] = {}
     for key, value in recipe.values.items():
-        _convert(value, marked[key], recipe.source)
+        node = marked.get(key)
+        if node is None:
+            rows.append(
+                AdjustmentRow(
+                    "warn", key, value, None, "this function takes no default for it", recipe.source
+                )
+            )
+            continue
+        held = _prune(_type_info(node.annotation), value, key, [], rows)
+        try:
+            kept[key] = _convert(held, node, recipe.source)
+        except DefaultResolutionError as exc:
+            rows.append(AdjustmentRow("warn", key, value, None, exc.message, recipe.source))
+    return replace(recipe, values=kept)
 
 
 def resolve(
@@ -135,13 +149,14 @@ def resolve(
     # missing field refuses here. Its numbers and lengths are already within their limits.
     decode_request(cast("type[Any]", payload_type), wire)
 
+    rows = list(fitted)
     for recipe in default_sets:
         _validate_recipe(recipe, marked, model_params)
+    default_sets = [_usable(recipe, marked, rows) for recipe in default_sets]
 
     omitted = [name for name in marked if name not in wire]
     values: dict[str, object] = {}
     sources: dict[str, str] = {}
-    rows = list(fitted)
 
     for name in omitted:
         node = marked[name]
@@ -154,16 +169,20 @@ def resolve(
             for name in (n for n in recipe.values if n in omitted):
                 contributors.setdefault(name, []).append(recipe)
         for name, applying in contributors.items():
-            if layer == "adapter" and len(applying) > 1:
-                raise DefaultResolutionError(
-                    f"{name}: {' and '.join(r.source for r in applying)} both supply this "
-                    "omitted field and it defines no composition rule — stack order never "
-                    "silently becomes configuration precedence",
-                    code="recipe_conflict",
-                    fields=[name],
-                )
             recipe = applying[-1]
-            values[name] = _convert(recipe.values[name], marked[name], recipe.source)
+            if layer == "adapter" and len(applying) > 1:
+                rows.append(
+                    AdjustmentRow(
+                        "warn",
+                        name,
+                        None,
+                        recipe.values[name],
+                        f"{' and '.join(r.source for r in applying)} each set it: the last wins; "
+                        "set it in the request to choose",
+                        recipe.source,
+                    )
+                )
+            values[name] = recipe.values[name]
             sources[name] = recipe.source
 
     merged: dict[str, object] = {**values, **wire}
