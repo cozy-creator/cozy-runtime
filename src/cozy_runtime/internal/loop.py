@@ -51,7 +51,14 @@ from torch.utils._pytree import tree_leaves
 from cozy_runtime import graphs, stepcache
 from cozy_runtime.author import _loop
 from cozy_runtime.author._context import CURRENT, Context
-from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
+from cozy_runtime.author._errors import (
+    CAPTURE_ERRORS,
+    CapabilityError,
+    Fault,
+    OutputError,
+    fault,
+    unwind,
+)
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention, cache_owners, kernel_ready
@@ -92,8 +99,6 @@ _REFUSED = (
     "prepared_load_unavailable",
     "prepared_load_events_unavailable",
 )
-#: cudaError_t stream-capture codes (900-908): an operation the step runs cannot be recorded.
-_CAPTURE_ERRORS = range(900, 909)
 #: a refusal by one of them (`_refusal`)
 _UNRECORDABLE = "the step cannot be recorded"
 #: request id -> its loops, for the run record (`execution.loops`)
@@ -146,7 +151,7 @@ def _refusal(error: BaseException) -> str | None:
     if isinstance(error, ResidencyError):
         return f"residency refused preparation: {error}"
     code = getattr(error, "error_code", None)
-    if isinstance(code, int) and code in _CAPTURE_ERRORS:
+    if isinstance(code, int) and code in CAPTURE_ERRORS:
         return f"{_UNRECORDABLE}: {error}"
     if isinstance(error, Exception) and fault(error) is Fault.OTHER:
         return f"recording failed: {type(error).__name__}: {error}"

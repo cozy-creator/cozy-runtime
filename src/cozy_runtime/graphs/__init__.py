@@ -35,7 +35,7 @@ import tensorfs.varena.torch as vt
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.author._errors import Fault, fault, is_capacity
+from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
@@ -116,8 +116,7 @@ def capture(
         raise failure
     if failure is not None:
         if fault(failure) in (Fault.STICKY, Fault.DEVICE):
-            code = getattr(failure, "error_code", None)
-            if code not in (900, 901):
+            if getattr(failure, "error_code", None) not in CAPTURE_ERRORS:
                 raise failure
         return None, f"{type(failure).__name__}: {failure}".splitlines()[0][:300]
     owner.graphs.add(graph)
