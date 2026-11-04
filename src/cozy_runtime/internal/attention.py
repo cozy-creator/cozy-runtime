@@ -92,6 +92,8 @@ class Lacking(AttentionRefusal):
 
 #: One self-check case: (head dimension, dtype, batch, query length, key length, causal).
 type Case = tuple[int, str, int, int, int, bool]
+#: A self-check's long keys: past Kitchen's and `_attn4`'s 1024, where they change tile.
+LONG_KEYS = 1536
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,8 @@ class Candidate:
     #: the Runtime module whose `KERNELS` (a `TritonKernels` set) it launches: it serves once
     #: they are built here (`triton_kernels`)
     kernels: str = ""
+    #: the most tokens its compiled kernels take; zero is any
+    max_tokens: int = 0
 
     @property
     def exact(self) -> bool:
@@ -166,7 +170,11 @@ class Candidate:
             for d in dims
             for n in names
             if self.admits(n, d)
-            for case in ((d, n, batch, query, 257, False), (d, n, batch, 257, 257, True))
+            for case in (
+                (d, n, batch, query, 257, False),
+                (d, n, batch, 257, 257, True),
+                (d, n, 1, LONG_KEYS, LONG_KEYS, False),
+            )
             if self.causal or not case[5]
         ]
 
@@ -187,6 +195,10 @@ class Candidate:
                 and not math.isclose(scale, dim**-0.5, rel_tol=1e-6),
                 "a softmax scale other than D^-1/2",
             ),
+            (
+                bool(self.max_tokens) and int(query.shape[1]) > self.max_tokens,
+                f"{query.shape[1]} tokens: past its {self.max_tokens}",
+            ),
         )
         return next((f"{self.name} does not serve {what}" for off, what in limits if off), "")
 
@@ -205,6 +217,8 @@ _SAGE3_WHEEL = "cozy_runtime.internal.sage3"
 _E4M3 = "cozy_runtime.internal.attention_fp8"
 #: A kernel the Runtime wheel alone carries (`prebuilt.ATTENTION`): no source recipe builds it.
 PREBUILT = "prebuilt"
+#: The fixed K means' compiled reduction (`attention_sage2_fixed_mean.REDUCE_MAX` tiles).
+_MEAN_TOKENS = 2048 * 256
 #: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
 _SOL: dict[str, Any] = dict(
     sparse=True, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False, gqa=False,
@@ -269,6 +283,7 @@ KERNELS: tuple[Candidate, ...] = (
         upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, level=4, dtypes=_BF16, max_head_dim=128,
         head_dims=_D128, causal=False, gqa=False, cross=False, batches=False, scales=False,
         artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
+        max_tokens=_MEAN_TOKENS,
     ),
     Candidate(
         "kitchen-int4qk", "_cozy_kitchen_int4qk", attention_int4.KITCHEN_INT4QK, _MMA, _INT4,
@@ -279,7 +294,7 @@ KERNELS: tuple[Candidate, ...] = (
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
         _WGMMA, level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
         gqa=False, batches=False, artifact="sageattention", import_name="sageattention",
-        kernels="cozy_runtime.internal.attention_sage2_fixed_mean",
+        kernels="cozy_runtime.internal.attention_sage2_fixed_mean", max_tokens=_MEAN_TOKENS,
     ),
     Candidate(
         "sol-attn", "_cozy_sol_bf16", attention_sol.SOL, _GPU, _FP8, artifact=_PY,

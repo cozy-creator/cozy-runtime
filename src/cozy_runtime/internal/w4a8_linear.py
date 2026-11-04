@@ -15,7 +15,7 @@ from functools import partial
 from types import ModuleType
 
 from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
-from cozy_runtime.internal import int8_linear, kernel_ready, prebuilt
+from cozy_runtime.internal import arch, int8_linear, kernel_ready, prebuilt
 from cozy_runtime.internal.encoding.formats import Tensor
 
 OP = "cozy-w4a8"
@@ -26,7 +26,7 @@ OPERAND = INT8_CONVROT
 def native(torch: ModuleType, index: int) -> prebuilt.Prebuilt | None:
     """The 8-bit library on this card once its w4a8 GEMM verifies here, off any request thread
     (`kernel_ready.serve`); None until then, and for good where the GEMM fails its probe."""
-    if int8_linear.native(torch, index) is None:
+    if not _row_has_int8(torch, index) or int8_linear.native(torch, index) is None:
         return None
     capturing = torch.cuda.is_current_stream_capturing()
     return kernel_ready.serve(f"{OP} cuda:{index}", partial(_verified, torch, index), capturing)
@@ -35,7 +35,13 @@ def native(torch: ModuleType, index: int) -> prebuilt.Prebuilt | None:
 def prime(torch: ModuleType, index: int) -> None:
     """Opens this card's w4a8 GEMM at device init (`kernel_ready.prime`), once the 8-bit library
     it is part of serves here."""
-    kernel_ready.prime(f"{OP} cuda:{index}", partial(_after_library, torch, index))
+    if _row_has_int8(torch, index):
+        kernel_ready.prime(f"{OP} cuda:{index}", partial(_after_library, torch, index))
+
+
+def _row_has_int8(torch: ModuleType, index: int) -> bool:
+    """Its GEMM multiplies int8: a card with no int8 tensor cores (B300) must never launch it."""
+    return arch.row(int8_linear.capability(torch, index)).int8
 
 
 def _after_library(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:

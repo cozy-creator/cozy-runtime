@@ -35,7 +35,7 @@ import sysconfig
 from collections.abc import Callable, Iterable
 from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import msgspec
 from msgspec import Struct
@@ -409,6 +409,28 @@ def expect(kernels: TritonKernels, arch: int) -> str:
         return f"{exc.code}: {exc}"
 
 
+_I32 = 2**31
+
+
+def _operands_fit(
+    key: str,
+    signature: dict[str, str],
+    params: Iterable[str],
+    args: Iterable[object],
+    aligned: tuple[str, ...] = (),
+) -> None:
+    """Refuses what Triton's launcher would hand the kernel silently: an i32 past its range wraps,
+    and an integer the entry compiled as divisible by 16 that isn't faults the card (Xid 43, run
+    28432). A pointer's dtype can't be held the same way: an entry that never reads one takes any
+    tensor there (run 28711)."""
+    for name, value in zip(params, args, strict=True):
+        if signature[name] == "i32":
+            if not -_I32 <= cast("int", value) < _I32:
+                raise ValueError(f"{key}: {name} = {value} does not fit its i32")
+            if name in aligned and cast("int", value) % 16:
+                raise ValueError(f"{key}: {name} = {value}, compiled as divisible by 16")
+
+
 class _Launcher:
     """A set's compiled entries on one GPU. Tensor operands are read by pointer, so each has
     real bytes behind it first (`readable`): a norm scale read from a sibling module may be a
@@ -420,18 +442,31 @@ class _Launcher:
         compiled: dict[str, CompiledKernel],
         names: dict[str, tuple[str, ...]],
         key: str,
+        index: int,
+        aligned: dict[str, tuple[str, ...]],
     ) -> None:
         self.arch, self.compiled, self.names, self.key = arch, compiled, names, key
+        self.index, self.aligned = index, aligned
 
     def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
+        if torch.cuda.current_device() != self.index:
+            # Triton launches on this thread's device, where these mean nothing.
+            raise ValueError(
+                f"{kernel.__name__} is loaded on cuda:{self.index}, this thread is on "
+                f"cuda:{torch.cuda.current_device()}"
+            )
         params = kernel.arg_names
+        if len(args) != len(params):  # Triton's launcher indexes the list by its signature's length
+            raise ValueError(f"{kernel.__name__} takes {len(params)} arguments, not {len(args)}")
         constexprs = {name: args[params.index(name)] for name in self.names[kernel.__name__]}
-        found = self.compiled.get(entry_key(kernel.__name__, constexprs))
+        key = entry_key(kernel.__name__, constexprs)
+        found = self.compiled.get(key)
         if found is None:
             raise KernelsUnavailable(
                 "kernels_absent",
-                f"{entry_key(kernel.__name__, constexprs)} is not compiled for sm{self.arch}",
+                f"{key} is not compiled for sm{self.arch}",
             )
+        _operands_fit(key, found.src.signature, params, args, self.aligned[key])
         at = [i for i, value in enumerate(args) if isinstance(value, torch.Tensor)]
         with readable(*(args[i] for i in at)) as real:
             operands = list(args)
@@ -476,14 +511,17 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
             )
         kernel = CompiledKernel(_source(entry), group, digest)
         try:
-            kernel._init_handles()
+            with torch.cuda.device(index):  # Triton loads onto the thread's current device
+                kernel._init_handles()
         except Exception as exc:
             raise KernelsUnavailable(
                 "kernels_corrupt", f"{entry.key} does not load on sm{arch}: {exc}"
             ) from exc
         compiled[entry.key] = kernel
         names[entry.kernel.__name__] = tuple(sorted(entry.constexprs))
-    launcher = _LOADED[(kernels.name, index)] = _Launcher(arch, compiled, names, found.key.digest)
+    aligned = {entry.key: entry.aligned for entry in kernels.entries}
+    launcher = _Launcher(arch, compiled, names, found.key.digest, index, aligned)
+    _LOADED[(kernels.name, index)] = launcher
     return launcher
 
 
