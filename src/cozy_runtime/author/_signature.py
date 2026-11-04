@@ -43,6 +43,7 @@ from cozy_runtime.author._markers import (
     Preparation,
     _PreflightMarker,
 )
+from cozy_runtime.author._media import KIND_MEDIA, slot_kind
 from cozy_runtime.author._memo import Memoize
 from cozy_runtime.author._model import Model, component_use
 from cozy_runtime.author._project import adapter_result
@@ -95,6 +96,14 @@ class AssetsBinding:
 
     def preparation(self, kind: str) -> Preparation | None:
         return next((p for p in self.preparations if p.kind == kind), None)
+
+    def media_types(self, kind: str) -> tuple[str, ...]:
+        """What `kind` takes in this slot: what it declares, less what binds to another kind
+        here (`slot_kind`), so each type is in one row."""
+        kinds = [cls.kind for cls, _ in self.kinds]
+        bound = next(bound for cls, bound in self.kinds if cls.kind == kind)
+        declared = bound.media_types if bound and bound.media_types else KIND_MEDIA[kind]
+        return tuple(media for media in declared if slot_kind(kinds, media) in (kind, None))
 
     @property
     def wire_type(self) -> object:
@@ -201,7 +210,7 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
             raise ConformanceError(
                 f"conflicting {type(marker).__name__} markers", code="preparation_target"
             )
-    return AssetsBinding(
+    binding = AssetsBinding(
         name,
         annotation,
         tuple(kinds[key] for key in sorted(kinds)),
@@ -210,6 +219,16 @@ def assets_binding(name: str, annotation: object) -> AssetsBinding:
         tuple(preparations[key] for key in sorted(preparations)),
         frozenset(undeclared),
     )
+    for cls, bound in binding.kinds:
+        if not binding.media_types(cls.kind) and (
+            cls.kind != "file" or (bound and bound.media_types)
+        ):
+            raise ConformanceError(
+                f"{cls.__name__} in {name} takes nothing another kind there doesn't: "
+                "name a media type only that kind reads, or drop it",
+                code="assets_element",
+            )
+    return binding
 
 
 def check_parameter_markers(annotation: object) -> None:

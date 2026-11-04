@@ -28,7 +28,6 @@ from cozy_runtime.author._markers import (
     ImagePreparation,
     VideoPreparation,
 )
-from cozy_runtime.author._media import KIND_MEDIA
 from cozy_runtime.author._model import ENCODED_LEAVES
 from cozy_runtime.author._model_defaults import model_default
 from cozy_runtime.author._recipes import DeclaredRecipe
@@ -269,9 +268,7 @@ def entry(declared: Declaration) -> dict[str, Json]:
         for cls, bound in assets.kinds:
             row: dict[str, Json] = {
                 "kind": cls.kind,
-                "media_types": list(
-                    bound.media_types if bound and bound.media_types else KIND_MEDIA[cls.kind]
-                ),
+                "media_types": list(assets.media_types(cls.kind)),
             }
             counts = dict(assets.counts)
             if cls.kind in counts:

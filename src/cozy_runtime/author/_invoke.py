@@ -77,7 +77,7 @@ from cozy_runtime.author._files import (
     bind_tree,
 )
 from cozy_runtime.author._markers import FileBound, ImagePreparation
-from cozy_runtime.author._media import KIND_MEDIA, admits
+from cozy_runtime.author._media import KIND_MEDIA, admits, slot_kind
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
 from cozy_runtime.author._prepared import Execution, PreparedWork
@@ -633,18 +633,9 @@ def _prepare_assets(
                 code="asset_ungranted",
                 fields=[input_id],
             )
-        options = [
-            (cls, bound)
-            for cls, bound in binding.kinds
-            if cls.kind != "file" and admits(cls.kind, row.media_type)
-        ]
+        taken = slot_kind((cls.kind for cls, _ in binding.kinds), row.media_type) or "file"
+        options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == taken]
         if not options:
-            options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == "file"]
-        if len(options) > 1:
-            # A video is a video in a list that takes both, though an audio field reads its sound.
-            family = row.media_type.partition("/")[0]
-            options = [option for option in options if option[0].kind == family] or options[:1]
-        if len(options) != 1:
             raise InvalidRequest(
                 f"{input_id} is {row.media_type or 'of no recognised type'}, and "
                 f"{binding.parameter} takes {[cls.kind for cls, _ in binding.kinds]} files: "
