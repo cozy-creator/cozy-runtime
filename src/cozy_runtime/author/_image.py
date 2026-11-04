@@ -245,8 +245,9 @@ class ImageRequest(msgspec.Struct):
 class ImageResult(msgspec.Struct):
     image: Annotated[
         ImageFile,
+        # TensorD's output allowance reads `max_bytes`: a finished picture must not be lost to it.
         FileBound(
-            max_bytes=64 << 20, max_decoded_bytes=256 << 20, media_types=("image/png", "image/webp")
+            max_bytes=1 << 40, max_decoded_bytes=256 << 20, media_types=("image/png", "image/webp")
         ),
     ]
     width: int
