@@ -111,9 +111,9 @@ class Refuse(InvalidRequest):
 
 
 class BeatWrite(msgspec.Struct, kw_only=True):
-    """A screenshot: `world_state` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
+    """A screenshot: `image` is a revision (`coast.1`), `at` seconds into its beat, else the beat's end."""
 
-    world_state: str
+    image: str
     at: float | None = None
 
 
@@ -147,8 +147,8 @@ class ShotOperation(Operation, kw_only=True):
 
 
 class PictureFields(msgspec.Struct, kw_only=True):
-    """A picture: `character`, `prop`, `environment`, `storyboard`, `world_state`, `image`. `description` is what it is, which shots read too;
-    `instructions` how to draw this picture, which nothing else reads."""
+    """A picture. `description` is what it is, which what reads it reads too; `instructions` how to draw this picture, which nothing
+    else reads."""
 
     description: str = ""
     instructions: str = ""
@@ -158,29 +158,6 @@ class PictureFields(msgspec.Struct, kw_only=True):
 
 class PictureOperation(Operation, kw_only=True):
     fields: PictureFields
-
-
-class SetupFields(PictureFields, kw_only=True):
-    """A place from a camera position, in screen terms. `from_frame`: the picture it reads is a shot's frame."""
-
-    camera: str = ""
-    from_frame: bool = False
-
-
-class SetupOperation(Operation, kw_only=True):
-    fields: SetupFields
-
-
-class UpscaleFields(msgspec.Struct, kw_only=True):
-    """A shot taken up: `video` mentions it, `resolution` its short edge (`1440p`)."""
-
-    video: str = ""
-    resolution: str | None = None
-    style: str = ""
-
-
-class UpscaleOperation(Operation, kw_only=True):
-    fields: UpscaleFields
 
 
 _MENTION = re.compile(r"<([^<>\n]+)>")
