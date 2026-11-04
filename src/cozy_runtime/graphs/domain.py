@@ -110,8 +110,8 @@ class Domain:
         # kernel probes must not invalidate this small lifetime-owner capture either.
         with kernel_ready.recording():
             try:
-                self.stream = accel.nonblocking_stream(self.torch, self.device)
-                self.control = accel.nonblocking_stream(self.torch, self.device)
+                self.stream = accel.owned_stream(self.torch, self.device)
+                self.control = accel.owned_stream(self.torch, self.device)
                 self.fork, self.join, self.done = (self.torch.cuda.Event() for _ in range(3))
                 self.fork.record(self.control)
                 self.join.record(self.stream)

@@ -1063,7 +1063,7 @@ class Executor:
             if self.device_kind == "cuda":
                 index = self.rank if self.world > 1 else 0
                 torch.cuda.set_device(index)
-                owner.execution_stream = accel.nonblocking_stream(torch, index)
+                owner.execution_stream = accel.owned_stream(torch, index)
                 # This first command entered before a stream existed. Select it now, before
                 # Memory, library warm-up or any package allocation/launch can run.
                 torch.cuda.set_stream(owner.execution_stream)

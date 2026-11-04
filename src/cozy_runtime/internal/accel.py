@@ -570,19 +570,19 @@ def _stream_driver() -> Any:
     return driver
 
 
-def nonblocking_stream(torch: Any, device: int) -> Any:
-    """A unique Runtime-owned CU_STREAM_NON_BLOCKING stream.
+def owned_stream(torch: Any, device: int) -> Any:
+    """A unique Runtime-owned blocking stream. It orders with the legacy default stream, where a
+    CUDA extension launches when it passes no stream, and a capture on it refuses that launch
+    instead of leaving it out of the graph.
 
     The caller owns destruction after all library handles, tensors and events using it
     have retired. Executor streams live until process exit; graph domains close theirs.
     """
     pointer = ctypes.c_void_p()
     with torch.cuda.device(device):
-        code = _stream_driver().cuStreamCreate(ctypes.byref(pointer), 1)
+        code = _stream_driver().cuStreamCreate(ctypes.byref(pointer), 0)
         if code:
-            error = torch.AcceleratorError(
-                f"cuStreamCreate(CU_STREAM_NON_BLOCKING) failed with CUDA error {code}"
-            )
+            error = torch.AcceleratorError(f"cuStreamCreate failed with CUDA error {code}")
             error.error_code = code
             raise error
         try:
