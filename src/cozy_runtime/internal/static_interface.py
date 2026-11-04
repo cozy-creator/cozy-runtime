@@ -1506,8 +1506,6 @@ class Registration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     child_task: bool = False
     accelerator: bool = True
-    #: A project adapter's `reserved=`.
-    reserved: tuple[str, ...] = ()
     #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
     memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
@@ -1518,6 +1516,8 @@ class Registration:
     #: Local execution advice, not a client callable/schema field. Source identity covers it.
     phases: tuple[tuple[str, ...], ...] = ()
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
+    #: A project adapter's `reserved=`.
+    reserved: tuple[str, ...] = ()
 
     def declaration(self, **found: Any) -> Declaration:
         """Its record, with what its signature declares (`found`)."""
