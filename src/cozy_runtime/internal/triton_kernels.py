@@ -449,10 +449,18 @@ class _Launcher:
         compiled: dict[str, CompiledKernel],
         names: dict[str, tuple[str, ...]],
         key: str,
+        index: int,
     ) -> None:
         self.arch, self.compiled, self.names, self.key = arch, compiled, names, key
+        self.index = index
 
     def __call__(self, kernel: JITFunction, grid: tuple[int, ...], *args: object) -> None:
+        if torch.cuda.current_device() != self.index:
+            # Triton launches on this thread's device, where these handles and operands mean nothing.
+            raise ValueError(
+                f"{kernel.__name__} is loaded on cuda:{self.index}, this thread is on "
+                f"cuda:{torch.cuda.current_device()}"
+            )
         params = kernel.arg_names
         if len(args) != len(params):  # Triton's launcher indexes the list by its signature's length
             raise ValueError(f"{kernel.__name__} takes {len(params)} arguments, not {len(args)}")
@@ -509,14 +517,16 @@ def load(kernels: TritonKernels, *, device: object) -> Launch:
             )
         kernel = CompiledKernel(_source(entry), group, digest)
         try:
-            kernel._init_handles()
+            with torch.cuda.device(index):  # Triton loads onto the thread's current device
+                kernel._init_handles()
         except Exception as exc:
             raise KernelsUnavailable(
                 "kernels_corrupt", f"{entry.key} does not load on sm{arch}: {exc}"
             ) from exc
         compiled[entry.key] = kernel
         names[entry.kernel.__name__] = tuple(sorted(entry.constexprs))
-    launcher = _LOADED[(kernels.name, index)] = _Launcher(arch, compiled, names, found.key.digest)
+    launcher = _Launcher(arch, compiled, names, found.key.digest, index)
+    _LOADED[(kernels.name, index)] = launcher
     return launcher
 
 

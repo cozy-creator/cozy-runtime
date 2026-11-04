@@ -144,6 +144,8 @@ class Candidate:
     #: its kernels compute element offsets in int32: a call of `OFFSETS32` or more elements (padded
     #: to its query tile) would read wild addresses, so it runs on SDPA
     offsets32: bool = False
+    #: the most tokens its compiled kernels take; zero is any
+    max_tokens: int = 0
 
     @property
     def exact(self) -> bool:
@@ -202,6 +204,10 @@ class Candidate:
                 >= OFFSETS32,
                 f"{query.shape[1]} tokens: past its int32 element offsets",
             ),
+            (
+                bool(self.max_tokens) and int(query.shape[1]) > self.max_tokens,
+                f"{query.shape[1]} tokens: past its {self.max_tokens}",
+            ),
         )
         return next((f"{self.name} does not serve {what}" for off, what in limits if off), "")
 
@@ -223,6 +229,8 @@ _SAGE3_WHEEL = "cozy_runtime.internal.sage3"
 _E4M3 = "cozy_runtime.internal.attention_fp8"
 #: A kernel the Runtime wheel alone carries (`prebuilt.ATTENTION`): no source recipe builds it.
 PREBUILT = "prebuilt"
+#: The fixed K means' compiled reduction (`attention_sage2_fixed_mean.REDUCE_MAX` tiles).
+_MEAN_TOKENS = 2048 * 256
 #: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
 _SOL: dict[str, Any] = dict(
     sparse=True, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False, gqa=False,
@@ -287,7 +295,7 @@ KERNELS: tuple[Candidate, ...] = (
         upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, level=4, dtypes=_BF16, max_head_dim=128,
         head_dims=_D128, causal=False, gqa=False, cross=False, batches=False, scales=False,
         artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
-        offsets32=True,
+        offsets32=True, max_tokens=_MEAN_TOKENS,
     ),
     Candidate(
         "kitchen-int4qk", "_cozy_kitchen_int4qk", attention_int4.KITCHEN_INT4QK, _MMA, _INT4,
@@ -298,7 +306,7 @@ KERNELS: tuple[Candidate, ...] = (
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
         _WGMMA, level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
         gqa=False, batches=False, artifact="sageattention", import_name="sageattention",
-        kernels="cozy_runtime.internal.attention_sage2_fixed_mean",
+        kernels="cozy_runtime.internal.attention_sage2_fixed_mean", max_tokens=_MEAN_TOKENS,
     ),
     Candidate(
         "sol-attn", "_cozy_sol_bf16", attention_sol.SOL, _GPU, _FP8, artifact=_PY,
