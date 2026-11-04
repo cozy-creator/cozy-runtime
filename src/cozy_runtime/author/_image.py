@@ -270,7 +270,8 @@ def corners(box: Sequence[float], field: str) -> tuple[float, float, float, floa
     (x0, x1), (y0, y1) = sorted((box[0], box[2])), sorted((box[1], box[3]))
     if x0 == x1 or y0 == y1:
         raise InvalidRequest(
-            f"a box needs some area, got {list(box)}",
+            f"a box is its corners as fractions of the canvas, 0 to 1, with some area: this one "
+            f"comes to {list(box)}",
             code="invalid_box",
             fields=(field,),
         )

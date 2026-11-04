@@ -398,6 +398,8 @@ def _fixed_point(value: Json, path: str = "") -> None:
     """The package interface's fixed point, proven over the built document (§1.0)."""
     if isinstance(value, Mapping):
         for key, item in value.items():
+            if key == "description":  # an author's words, the same in every environment
+                continue
             if key == "operation_identity" and re.fullmatch(
                 r"\.entrypoints\[\d+\]\.invocable", path
             ):
@@ -413,7 +415,7 @@ def _fixed_point(value: Json, path: str = "") -> None:
                 raise ConformanceError(
                     f"{path}.{key}: the package interface is the SOURCE-STABLE surface — release "
                     "digests, timestamps, machine paths, mutable bindings and "
-                    "candidate-selected facts live on other clocks (cr-004)",
+                    "candidate-selected facts don't belong in it: remove this key",
                     code="fixed_point",
                     fields=[f"{path}.{key}"],
                 )

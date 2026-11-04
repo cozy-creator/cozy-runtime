@@ -112,7 +112,7 @@ def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
 
     def hook(event: str, args: tuple[object, ...]) -> None:
         if event in NETWORK_EVENTS and not (allow_unix_seam and unix_seam(event, args)):
-            raise FenceViolation("no_network", f"{event}{args[1:2] or args[:1]} — {why}")
+            raise FenceViolation("no_network", f"{event}{args[1:2] or args[:1]}: {why}")
 
     sys.addaudithook(hook)
 

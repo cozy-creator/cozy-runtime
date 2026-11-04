@@ -38,7 +38,6 @@ import msgspec
 import numpy as np
 from PIL import Image
 
-from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._executor_requests import (
     Answer,
     MemoEntry,
@@ -704,12 +703,11 @@ class GenerationMemo:
             engine.store(key, stage, numerics, None, "failed")
             raise
         if _rng(self.torch) != before:
+            # The work is done and good: only its memo isn't. It keeps the result, unmemoized.
             engine.store(key, stage, numerics, None, "memo_rng")
-            raise ConformanceError(
-                f"{name} drew from the default random generator: a memoized method's result "
-                "must be a function of its arguments, so take an explicit seed argument",
-                code="memo_rng",
-            )
+            stats.skips["memo_rng"] += 1
+            engine.record(Call(name, "skip", "drew from the default random generator"))
+            return result
         cost = time.perf_counter() - started
         stats.misses += 1
         stats.produce_s = _ewma(stats.produce_s, cost)
