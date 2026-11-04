@@ -40,6 +40,12 @@ class Read(msgspec.Struct, kw_only=True):
     files: dict[str, OperationFile] = {}
     made_by: str = ""
 
+    def files_of(self, field: str) -> list[OperationFile]:
+        """A file field's files in order: `image`, or a list's `image-0`, `image-1`, ... ."""
+        listed = {int(key[len(field) + 1 :]): file for key, file in self.files.items()
+                  if key.startswith(f"{field}-") and key[len(field) + 1 :].isdigit()}  # fmt: skip
+        return [*([self.files[field]] if field in self.files else []), *(listed[index] for index in sorted(listed))]
+
 
 class Write(msgspec.Struct, kw_only=True):
     """A revision of a series this operation's text names (`coast.1`), to screenshot `at_s` into it, or at its end. `fields`: what
