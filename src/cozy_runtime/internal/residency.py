@@ -1437,11 +1437,11 @@ class Memory:
             try:
                 if budget_bytes is not None:
                     varena.set_activation_limit(self.device.index or 0, budget_bytes)
-                    if yields():
-                        # A smaller room reads as a smaller card to every fill, a prefetch's too: on
-                        # a 32 GB card an 8 GiB cap let H3's text encoder fill 22 GB (s8-h3).
-                        varena.make_room(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
+                if budget_bytes is not None and yields():
+                    # A smaller room reads as a smaller card to every fill, a prefetch's too: on
+                    # a 32 GB card an 8 GiB cap let H3's text encoder fill 22 GB (s8-h3).
+                    self._apply_room(None)
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = bool(
                     callable(getattr(varena, "replay", None))
@@ -1600,10 +1600,19 @@ class Memory:
         except RuntimeError:
             pass  # a capture is in progress: the room bounds its next allocations
 
+    def _capped(self) -> int:
+        """The development cap as a room: what the driver charges beyond Torch's reserve and the
+        weight pages (this process's context and kernels, anyone else's) is on a card of that size
+        too, so it comes out of the cap (s8-h3: pages and reserve held 7.99 GiB, the driver read
+        9.03)."""
+        assert self.budget_bytes is not None
+        free, total = torch.cuda.mem_get_info(self.device)
+        return max(self.budget_bytes - max(int(total) - int(free) - self._figures()[1], 0), 0)
+
     def _apply_room(self, limit: int | None) -> None:
         self.room_limit = limit
         if self.budget_bytes is not None:  # the development cap stays whatever the machine asks
-            limit = self.budget_bytes if limit is None else min(limit, self.budget_bytes)
+            limit = self._capped() if limit is None else min(limit, self._capped())
         reclaimed = varena.make_room(self.device.index or 0, limit)
         self.last_room = {"limit": limit, "reclaimed": reclaimed, "at_ns": time.time_ns()}
 
@@ -1612,6 +1621,8 @@ class Memory:
         pending, self._room_pending = self._room_pending, None
         if pending is not None:
             self._apply_room(pending[0])
+        elif self.budget_bytes is not None and yields():
+            self._apply_room(self.room_limit)  # what the cap's room leaves moves with the context
 
     def room(self, current: Collection[str] = ()) -> Room:
         if self.cuda:
