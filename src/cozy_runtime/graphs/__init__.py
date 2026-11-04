@@ -1233,7 +1233,8 @@ def _record(
                     return True
         recorder.recordings[key] = entry
         if recorder._cache_owner is None:
-            recorder._cache_owner = cache_owners.register(owner.device, recorder, "_try_shrink")
+            device = torch.device("cuda", owner.device)
+            recorder._cache_owner = cache_owners.register(device, recorder, "_try_shrink")
         else:
             recorder._cache_owner.touch()
         recorder.captures += 1
