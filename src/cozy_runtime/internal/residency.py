@@ -35,7 +35,7 @@ from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import WARNINGS
-from cozy_runtime.internal import cache_owners, cooperation, proctree
+from cozy_runtime.internal import cache_owners, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -736,7 +736,6 @@ class Model:
                 self.memory._discard(block, forget=True)
             self.memory._forget_baked(self)
             self.memory.models.pop(self.module, None)
-        self.memory.cooperation_boundary(check=False)
 
 
 class Hold:
@@ -1066,7 +1065,6 @@ class Memory:
         self.requests: set[Request] = set()
         self.last: dict[str, Any] | None = None
         self.native: Any = None
-        self.cooperation: cooperation.Owner | None = None
         self.granularity = 512
         self.prefetch_supported = False
         self._prefetch: _Prefetch | None = None
@@ -1137,34 +1135,6 @@ class Memory:
             memory = cls(device, budget_bytes)
             _MEMORIES[str(device)] = memory
             return memory
-
-    def attach_cooperation(self, owner: cooperation.Owner) -> None:
-        """Adopt the already-validated Start owner; never create an extra execution client."""
-        if self.cooperation is not None:
-            if self.cooperation is not owner:
-                raise cooperation.Failure(
-                    "an active Memory cannot change its cooperation owner"
-                )
-            return
-        if (
-            not self.cuda or self.requests or self.models
-        ):
-            raise cooperation.Failure("cooperation must bind at a fresh CUDA Memory start")
-        if owner.device != (self.device.index or 0):
-            raise cooperation.Failure("cooperation owner belongs to another device")
-        owner.check()
-        self.cooperation = owner
-
-    def cooperation_boundary(self, *, used: bool = False, check: bool = True) -> None:
-        owner = self.cooperation
-        if owner is not None:
-            if check:
-                owner.check()
-            owner.wake(used=used, check=check)
-
-    def close_cooperation(self) -> None:
-        if self.cooperation is not None:
-            self.cooperation.close()
 
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
@@ -2103,7 +2073,6 @@ class Memory:
 
     def _activate_phase(self, model: Model) -> None:
         """Declare a component-phase boundary; native policy retains/evicts actual pages."""
-        self.cooperation_boundary(used=True)
         request = _REQUEST.get()
         if not self.cuda or self.capturing() or (request is not None and request.idle):
             return
@@ -2849,7 +2818,6 @@ class Memory:
     ) -> Iterator[Request]:
         """`others`: the process's other constructions' sets, whose cached weights are not this
         request's working set (`Request.sample`)."""
-        self.cooperation_boundary(used=not idle)
         request = Request(self, id, idle, others)
         request.plan(plan)
         with self.lock:
@@ -2862,13 +2830,9 @@ class Memory:
             self.requests.add(request)
         self._apply_cap()
         token = _REQUEST.set(request)
-        observed = False
+        if self.cuda:
+            varena.request_boundary(self.device.index or 0, begin=True)
         try:
-            # Preparation is real device-owner activity too; the native boundary tracks
-            # overlap and rejects uncertain measurements without a Python byte formula.
-            if self.cooperation is not None:
-                self.cooperation.request_boundary(begin=True)
-                observed = True
             yield request
         finally:
             try:
@@ -2892,9 +2856,8 @@ class Memory:
                         self.requests.discard(request)
                 finally:
                     _REQUEST.reset(token)
-                    if observed and self.cooperation is not None:
-                        self.cooperation.request_boundary(begin=False, check=False)
-                    self.cooperation_boundary(check=False)
+                    if self.cuda:
+                        varena.request_boundary(self.device.index or 0, begin=False)
 
     def stats(self) -> dict[str, Any] | None:
         return self.last
@@ -3121,9 +3084,6 @@ class Request:
             "working_phases": list(self.working_phases),
             "working_splits": list(self.working_splits.values()),
             "finer_splits": self.finer_splits,
-            "cooperation": (
-                self.memory.cooperation.facts() if self.memory.cooperation is not None else None
-            ),
             "gathered": self.gathered,
             "host": None,
         }

@@ -189,15 +189,6 @@ class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True
     components: tuple[str, ...] = ()
 
 
-class Cooperation(msgspec.Struct, frozen=True, kw_only=True):
-    """Negotiated native owner intent; no byte allowance or fallback controller."""
-
-    uuid: str
-    directory: str
-    shared: bool
-    priority: int
-
-
 class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: The session's GPUs; empty runs on the CPU and never opens CUDA (`accelerator=False`).
     devices: str = ""
@@ -219,9 +210,8 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     #: card of this many bytes, the executor's memory budget, to test constrained VRAM on bigger
     #: cards.
     gpu_memory_limit: int | None = None
-    #: One native owner intent per sealed GPU, in the same order as `devices`.
-    #: Empty for CPU/MPS or an import-only parent; a CUDA start requires every rank.
-    cooperation: tuple[Cooperation, ...] = ()
+    #: The machine's mode: idle memory yields to foreign programs too. Peers donate either way.
+    shared: bool = False
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
