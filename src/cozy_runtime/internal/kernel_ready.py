@@ -177,8 +177,9 @@ def opened[T](name: str) -> T | None:
     _primed(name)
     with _LOCK:
         slot = _SLOTS.get(name)
-        landed = slot is not None and slot.state in ("landed", "ready")
-        return cast("T", slot.value) if landed else None
+        if slot is None or slot.state not in ("landed", "ready"):
+            return None
+        return cast("T", slot.value)
 
 
 def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
