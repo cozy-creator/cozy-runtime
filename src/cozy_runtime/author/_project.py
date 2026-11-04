@@ -9,6 +9,7 @@ with none gets one flat `prompt`.
 from __future__ import annotations
 
 import re
+from collections.abc import Collection
 from typing import Any, Literal
 
 import msgspec
@@ -66,9 +67,16 @@ class Operation(msgspec.Struct, kw_only=True):
     asset: str
     kind: str = ""
     fields: dict[str, Any]
+    #: What the file says for this package alone, any field to any value: `turbo`, a model's own settings. Not part of the standard.
+    options: dict[str, Any] = {}
     reads: list[Read]
     writes: list[Write] = []
     keep: Keep | None = None
+
+    def known_options(self, known: Collection[str]) -> tuple[dict[str, Any], list[str]]:
+        """The options this adapter reads, and one warning for each key it doesn't know."""
+        return ({key: value for key, value in self.options.items() if key in known},
+                [f"{self.asset}: this package has no option `{key}`: it's ignored" for key in self.options if key not in known])  # fmt: skip
 
 
 class Invocation(msgspec.Struct, kw_only=True):
@@ -126,7 +134,6 @@ class ShotFields(msgspec.Struct, kw_only=True):
     first_frame: str = ""
     last_frame: str = ""
     plate: ShotPlate | None = None
-    turbo: bool | None = None
 
 
 class ShotOperation(Operation, kw_only=True):
@@ -141,7 +148,6 @@ class PictureFields(msgspec.Struct, kw_only=True):
     instructions: str = ""
     style: str = ""
     aspect_ratio: str | None = None
-    turbo: bool = False
 
 
 class PictureOperation(Operation, kw_only=True):
