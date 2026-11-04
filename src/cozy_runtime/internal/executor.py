@@ -1507,7 +1507,7 @@ class Executor:
         self, torch: Any, model: Any, homes: Mapping[str, int]
     ) -> dict[str, Any] | None:
         """Every rank shards its replica, takes its side of the mirror, and keeps the placeable
-        components TensorD homed on its GPU (`Binding.homes`, decided by varena)."""
+        components TensorD homed on its GPU (`Binding.homes`)."""
         if self.world <= 1:
             return None
         owner = self.host
