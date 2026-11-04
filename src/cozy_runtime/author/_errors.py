@@ -56,7 +56,7 @@ class UnsupportedInput(InvalidRequest):
 
 
 class DefaultResolutionError(InvalidRequest):
-    """The ModelDefault overlay could not be resolved. Recipes refuse AS A UNIT (§1.2)."""
+    """The ModelDefault overlay could not be resolved: a package's model slots, not a recipe."""
 
     default_code = "default_resolution"
 

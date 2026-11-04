@@ -60,7 +60,7 @@ def run(function: str | None, opts: Options) -> Result:
         raise CliError(
             "validation",
             str(exc),
-            "a package's surface must be valid before it can be described (§1.0)",
+            "a package's surface must be valid before it can be described",
             Exit.validation,
         ) from exc
     if function is not None:

@@ -127,7 +127,7 @@ def _prepare(request: _Request) -> Result:
     policy = ImagePreparation(request.prepare.max_edge, request.prepare.max_pixels)
     if request.prepare.profile != IMAGE_PREPARATION_PROFILE:
         return _raw(source, source_length, source_mime, request.max_bytes)
-    geometry = image_source_geometry(source, DEFAULT_DECODE_LIMITS, policy)
+    geometry = image_source_geometry(source, policy)
     if image_target_size(*geometry, policy) == geometry:
         # Raw fallback keeps normal Runtime validation; do not decode small images twice.
         return _raw(source, source_length, source_mime, request.max_bytes)

@@ -110,7 +110,9 @@ bounded per event.
 ## Collections
 
 `assets["first"]` requires an occurrence labelled `first`; `assets.get("last")` returns
-`None` when absent. Integer indexing preserves input order. Counts in `FileLimits` are
+`None` when absent. Integer indexing preserves input order. A file binds to one kind: its own
+family's when the collection takes that, else one that reads it (an `.mp4` is a video where video is
+taken and only otherwise a source of sound, a GIF an image and only otherwise a video). Counts in `FileLimits` are
 upper limits and compile into the request's list constraint; conflicting totals refuse at
 describe. `assets.info(key)` returns readonly `FileInfo` (`id`, `position`, `label`,
 `fidelity`, `kind`, `media_type`, `size_bytes`, `digest`) without reading. Preflight sees

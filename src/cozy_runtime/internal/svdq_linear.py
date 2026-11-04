@@ -691,6 +691,7 @@ def _quantized(
     """`_quantize`: the packed codes, E4M3 scales and down-projection of `x`, and its `g_x`."""
     cols, r = int(roles["pre_quant_scale"].numel()), int(roles["lowrank_down"].shape[0])
     flat = x.reshape(-1, cols).contiguous()
+    flat = flat if flat.data_ptr() % 16 == 0 else flat.clone()  # its kernel takes x_ptr aligned
     rows = int(flat.shape[0])
     g = activation_scale(torch, flat, roles).contiguous()
     q = torch.empty(rows, cols // 2, dtype=torch.uint8, device=x.device)

@@ -39,16 +39,16 @@ int quant(int kind, int device, uintptr_t input, uintptr_t output, uintptr_t out
         uint8_t* f = reinterpret_cast<uint8_t*>(output_sf);
         if (kind == 2) {
             scaled_fp4_quant_trans_kernel<HEAD_DIM, BLOCK_SIZE, T><<<grid, block, 0, s>>>(
-                x, o, f, batch, heads, tokens, int(in[0]), int(in[1]), int(in[2]), int(out[0]),
-                int(out[1]), int(out[2]), int(sf[0]), int(sf[1]), int(sf[2]));
+                x, o, f, batch, heads, tokens, in[0], in[1], in[2], out[0], out[1], out[2], sf[0],
+                sf[1], sf[2]);
         } else if (kind == 1) {
             scaled_fp4_quant_kernel<HEAD_DIM, BLOCK_SIZE, true, T><<<grid, block, 0, s>>>(
-                x, o, f, batch, heads, tokens, int(in[0]), int(in[1]), int(in[2]), int(out[0]),
-                int(out[1]), int(out[2]), int(sf[0]), int(sf[1]), int(sf[2]));
+                x, o, f, batch, heads, tokens, in[0], in[1], in[2], out[0], out[1], out[2], sf[0],
+                sf[1], sf[2]);
         } else {
             scaled_fp4_quant_kernel<HEAD_DIM, BLOCK_SIZE, false, T><<<grid, block, 0, s>>>(
-                x, o, f, batch, heads, tokens, int(in[0]), int(in[1]), int(in[2]), int(out[0]),
-                int(out[1]), int(out[2]), int(sf[0]), int(sf[1]), int(sf[2]));
+                x, o, f, batch, heads, tokens, in[0], in[1], in[2], out[0], out[1], out[2], sf[0],
+                sf[1], sf[2]);
         }
     };
     using D64 = std::integral_constant<int, 64>;

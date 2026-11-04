@@ -305,8 +305,9 @@ def _env_changes() -> tuple[str, ...]:
 
 
 def _attention_pin(kernel: str, bits: int) -> str:
-    """A request's attention override: its pin, else level 16 at 16 bits (C4)."""
-    return kernel or (attention.EXACT if bits == 16 else "")
+    """A request's attention override: its pin, else level 16 at 16 bits (C4). A pin on a kernel
+    no longer here is none (`invoke` warns)."""
+    return ("" if attention.retired(kernel) else kernel) or (attention.EXACT if bits == 16 else "")
 
 
 def _sealed_entries() -> tuple[str, ...]:
@@ -1775,9 +1776,8 @@ class Executor:
                             "code": "device_out_of_memory"
                             if fault(exc) is Fault.OOM
                             else "accelerator_unavailable",
-                            "detail": "the sealed devices "
-                            f"{_SEALED.get('CUDA_VISIBLE_DEVICES')!r} "
-                            f"could not be initialized: {exc}"[:900],
+                            "detail": f"GPU {_SEALED.get('CUDA_VISIBLE_DEVICES')} could not be "
+                            f"started: {exc}. Update its driver, or run it --on new"[:900],
                         }
                     if refused is not None:
                         self.poisoned = f"start refused: {refused['code']}"
@@ -2506,8 +2506,8 @@ class Executor:
                 return {
                     "ok": False,
                     "code": "modeled_accelerator_unavailable",
-                    "detail": "a model needs a GPU, and this machine has none it can use (an "
-                    "NVIDIA GPU, or an Apple Silicon Mac's own): run it --on new",
+                    "detail": "this GPU's architecture could not be read, so cozy can't choose its "
+                    "kernels: update its driver, or run it --on new",
                 }
             hardware_variant = f"sm{device_facts.sm}"
         reference = Variant(
@@ -3551,6 +3551,9 @@ class Executor:
                 attention_sol.observing(ranks=sol_rank_counts, kernels=sol_kernels) as sol_counts,
                 attention_ulysses.observing() as served_impls,
             ):
+                if removed := attention.retired(command.attention_kernel):
+                    said = f"attention kernel {removed} is gone: the normal choice runs"
+                    WARNINGS.append((said, {"code": "attention_kernel_removed"}))
                 served_attention = self._attention_selection(served_attention)
                 if prepared.phases:
                     self._plan_request(command.request_id, prepared.phases)
@@ -5119,8 +5122,7 @@ def main(argv: list[str] | None = None) -> int:
     # Python-level egress from package code; it is not a kernel bound and
     # `sandbox.refuse_network` says exactly which adversary that leaves.
     sandbox.refuse_network(
-        "the executor is handed verified files in its attempt spool and never an address "
-        "(cr-012). Package code that dials is a bug, and this is where the bug stops",
+        "a package can't use the network while it runs: take what it needs as an input file",
         allow_unix_seam=True,
     )
     channel = (

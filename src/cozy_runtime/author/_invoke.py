@@ -77,7 +77,7 @@ from cozy_runtime.author._files import (
     bind_tree,
 )
 from cozy_runtime.author._markers import FileBound, ImagePreparation
-from cozy_runtime.author._media import KIND_MEDIA, admits
+from cozy_runtime.author._media import KIND_MEDIA, admits, slot_kind
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
 from cozy_runtime.author._prepared import Execution, PreparedWork
@@ -633,16 +633,13 @@ def _prepare_assets(
                 code="asset_ungranted",
                 fields=[input_id],
             )
-        options = [
-            (cls, bound)
-            for cls, bound in binding.kinds
-            if cls.kind != "file" and admits(cls.kind, row.media_type)
-        ]
+        taken = slot_kind((cls.kind for cls, _ in binding.kinds), row.media_type) or "file"
+        options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == taken]
         if not options:
-            options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == "file"]
-        if len(options) != 1:
             raise InvalidRequest(
-                "Files occurrence has an unsupported media type",
+                f"{input_id} is {row.media_type or 'of no recognised type'}, and "
+                f"{binding.parameter} takes {[cls.kind for cls, _ in binding.kinds]} files: "
+                "convert it and run again",
                 code="asset_media_type",
                 fields=[input_id],
             )
@@ -650,7 +647,8 @@ def _prepare_assets(
         counts[cls.kind] = counts.get(cls.kind, 0) + 1
         if cls.kind in limits and counts[cls.kind] > limits[cls.kind]:
             raise InvalidRequest(
-                "Files media kind count exceeds its declared limit",
+                f"{binding.parameter} has more than {limits[cls.kind]} {cls.kind} files, the "
+                "most this function takes: send fewer",
                 code="asset_count",
                 fields=[binding.parameter],
             )
@@ -746,16 +744,16 @@ def _materialize_trees(payload: object, inv: Invocation) -> None:
         granted = inv.trees.get(tree.ref)
         if granted is None:
             raise InvalidRequest(
-                f"input tree {tree.ref!r} is not granted to this attempt: this run "
-                f"materialized {sorted(inv.trees) or 'no trees'}. A tree is a digest-verified "
-                "READ CAPABILITY minted by the RecordOwner, never a path a function may name",
+                f"input tree {tree.ref!r} did not reach this run, which holds "
+                f"{sorted(inv.trees) or 'no trees'}: send the request again, and if it recurs "
+                "that is a bug in cozy, not in the request",
                 code="tree_ungranted",
             )
         root, digest = granted
         if not root.is_dir():
             raise InvalidRequest(
-                f"input tree {tree.ref!r} was granted at a location that is not a directory: "
-                "the RecordOwner minted this address, so this runtime substitutes none",
+                f"input tree {tree.ref!r} is not a directory on this machine: send the request "
+                "again, and if it recurs that is a bug in cozy, not in the request",
                 code="tree_unmaterialized",
             )
         bind_tree(tree, root=root, digest=digest, attempt=inv.request_id)
@@ -783,26 +781,24 @@ def _check_input(
     kind = type(asset).kind
     if not admits(kind, granted.media_type):
         raise InvalidRequest(
-            f"input {granted.input_id!r} is {granted.media_type or 'of no recognised type'} "
-            f"and the field is a {type(asset).__name__}, which admits "
-            f"{list(KIND_MEDIA.get(kind, ())) or 'any recognised type'}. Input binding "
-            "metadata must satisfy the declared type; hydration also verifies its bytes",
+            f"{granted.input_id} is {granted.media_type or 'of no recognised type'}, and this "
+            f"field takes a {kind} file ({', '.join(KIND_MEDIA.get(kind, ()))}): convert it and "
+            "run again",
             code="asset_media_type",
             fields=[granted.input_id],
         )
     if bound is not None and bound.media_types and granted.media_type not in bound.media_types:
         raise InvalidRequest(
-            f"input {granted.input_id!r} is {granted.media_type!r} and this field declares "
-            f"{list(bound.media_types)}",
+            f"{granted.input_id} is {granted.media_type}, and this field takes "
+            f"{', '.join(bound.media_types)}: convert it and run again",
             code="asset_media_type",
             fields=[granted.input_id],
         )
     limits = [limit for limit in (bound.max_bytes if bound is not None else None, cap) if limit]
     if limits and granted.length > min(limits):
         raise InvalidRequest(
-            f"input {granted.input_id!r} is {granted.length} B and this field admits "
-            f"{min(limits)} B. A size bound is a TYPED property of the field, so it refuses "
-            "before the handler is entered and not inside it",
+            f"{granted.input_id} is {granted.length} bytes, and this field takes at most "
+            f"{min(limits)}: send a smaller file",
             code="asset_too_large",
             fields=[granted.input_id],
         )
@@ -831,10 +827,9 @@ def _hydrate(
         granted = inv.assets.get(item.input_id)
         if granted is None:
             raise InvalidRequest(
-                f"input file {item.input_id!r} (ref {item.asset.ref!r}) is not granted to this "
-                f"attempt: this run materialized {sorted(inv.assets) or 'no assets'}. An "
-                "asset is a digest-verified READ CAPABILITY minted by the RecordOwner, "
-                "never a location a request may name",
+                f"{item.input_id} (ref {item.asset.ref!r}) did not reach this run, which holds "
+                f"{sorted(inv.assets) or 'no files'}: a file field takes a file you attach, not "
+                "a path on the machine",
                 code="asset_ungranted",
                 fields=[item.input_id],
             )
@@ -888,8 +883,8 @@ def prepare_duration(asset: File, record: Attempt) -> None:
     minimum, maximum = preparation.minimum, preparation.maximum
     if minimum is not None and source < minimum:
         raise InvalidRequest(
-            f"{asset.kind} input {field_id!r} is {_seconds(source)} s; this field needs at "
-            f"least {preparation.min_seconds} s",
+            f"{field_id} is {_seconds(source)} s of {asset.kind}, and this field needs at least "
+            f"{preparation.min_seconds} s: give a longer one",
             code="media_too_short",
             fields=[field_id],
         )
@@ -898,8 +893,8 @@ def prepare_duration(asset: File, record: Attempt) -> None:
     if preparation.excess == "refuse":
         if source > maximum:
             raise InvalidRequest(
-                f"{asset.kind} input {field_id!r} is {_seconds(source)} s; this field admits "
-                f"at most {preparation.max_seconds} s",
+                f"{field_id} is {_seconds(source)} s of {asset.kind}, and this field takes at "
+                f"most {preparation.max_seconds} s: cut it and run again",
                 code="media_too_long",
                 fields=[field_id],
             )
@@ -988,8 +983,8 @@ def _model(param: Param, inv: Invocation, on_demand: bool) -> object:
         return _Unbound(param.name)  # a request may leave it unused: refused only when read
     if model is None:
         raise InvalidRequest(
-            f"no model bound for parameter {param.name!r}: the run names none and the slot "
-            "declares no default",
+            f"this function needs a model for {param.name!r} and has no default: name one with "
+            f"`model.{param.name}=<org/model>`",
             code="unbound_model",
             fields=[param.name],
         )
@@ -1006,8 +1001,8 @@ class _Unbound:
 
     def __getattr__(self, attribute: str) -> object:
         raise InvalidRequest(
-            f"no model bound for parameter {self._name!r}: the run names none, and this request "
-            "reads it",
+            f"this request needs a model for {self._name!r} and has no default: name one with "
+            f"`model.{self._name}=<org/model>`",
             code="unbound_model",
             fields=[self._name],
         )

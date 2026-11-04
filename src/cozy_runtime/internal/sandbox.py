@@ -112,7 +112,7 @@ def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
 
     def hook(event: str, args: tuple[object, ...]) -> None:
         if event in NETWORK_EVENTS and not (allow_unix_seam and unix_seam(event, args)):
-            raise FenceViolation("no_network", f"{event}{args[1:2] or args[:1]} — {why}")
+            raise FenceViolation("no_network", f"{event}{args[1:2] or args[:1]}: {why}")
 
     sys.addaudithook(hook)
 
@@ -122,7 +122,7 @@ def install(*, allow_write_prefixes: Sequence[str] = ()) -> None:
     writable = tuple(allow_write_prefixes)
     refuse_network(
         "a derivation reads configs and code, never the network. Kernel binaries are pinned "
-        "image inputs; a boot-time kernel fetch is exactly what this refuses (cr-004)"
+        "image inputs; a boot-time kernel fetch is exactly what this refuses"
     )
 
     def hook(event: str, args: tuple[object, ...]) -> None:

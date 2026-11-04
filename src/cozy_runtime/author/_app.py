@@ -258,7 +258,7 @@ class App:
             if self._frozen:
                 raise RegistrationError(
                     f"{target.__name__}: the registry is frozen — after describe, "
-                    "registration is immutable (§1.0)"
+                    "registration is immutable"
                 )
             registered = name or target.__name__
             if registered in self._registry:
