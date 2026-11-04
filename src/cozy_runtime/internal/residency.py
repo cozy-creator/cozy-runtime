@@ -309,6 +309,8 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
     return ("repeated", best) if best else ("none", [])
 
 
+#: Left free under a software cap: s8-h3 on an RTX 5090 peaked 57 MiB over 8 GiB with none.
+_CAP_SLACK = 128 << 20
 #: A paging unit larger than this is a warning: a quarter of an 8 GB card.
 _LARGEST_UNIT = 2 << 30
 #: A paging unit holding more than this splits (`split`), the same on every card.
@@ -1620,10 +1622,11 @@ class Memory:
         """The development cap as a room: what the driver charges beyond Torch's reserve and the
         weight pages (this process's context and kernels, anyone else's) is on a card of that size
         too, so it comes out of the cap (s8-h3: pages and reserve held 7.99 GiB, the driver read
-        9.03)."""
+        9.03). `_CAP_SLACK` is what that charge grows by before the next pass reads it."""
         assert self.budget_bytes is not None
         free, total = torch.cuda.mem_get_info(self.device)
-        return max(self.budget_bytes - max(int(total) - int(free) - self._figures()[1], 0), 0)
+        outside = max(int(total) - int(free) - self._figures()[1], 0)
+        return max(self.budget_bytes - outside - _CAP_SLACK, 0)
 
     def _apply_room(self, limit: int | None) -> None:
         self.room_limit = limit
