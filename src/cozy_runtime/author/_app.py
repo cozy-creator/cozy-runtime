@@ -201,9 +201,9 @@ class App:
         return self._register(fn, True, **options)
 
     def project_adapter(self, *kinds: str) -> Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register what turns one project operation of each `kind` into this package's own calls: it reads an
-        `author.Operation`, or a kind's typed subclass, and answers `list[author.Invocation]`, run in order, or raises
-        `author.Refuse`. A package with no adapter for a kind can't make an asset of it. A public function per kind,
+        """Register what turns one project operation producing a file of each `kind`, `image`, `video` or `audio`, into this package's
+        own calls: it reads an `author.Operation`, or a subclass typing `fields`, and answers `list[author.Invocation]`, run in order,
+        or raises `author.Refuse`. A package with no adapter for a kind can't make an asset of it. A public function per kind,
         `project-adapter-<kind>`, on the CPU, so a machine runs it as it runs any other."""
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:

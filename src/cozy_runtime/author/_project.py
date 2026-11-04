@@ -29,8 +29,9 @@ class OperationFile(msgspec.Struct, kw_only=True):
 
 
 class Read(msgspec.Struct, kw_only=True):
-    """An asset an operation mentions: what the file says of it, and its state now by role (`image`, `video`, `audio`, ...).
-    `name` is as the mention spells it, so `coast.2` for that revision. `made_by`: `org/package/function@release`."""
+    """What an operation mentions: what the file says of it, and its state now by role (`image`, `video`, `audio`, `voice`, ...). `name`
+    is as the mention spells it, so `coast.2` for that revision. `kind`: an entity's (`character`, `prop`, `environment`), or an asset's
+    file type. `made_by`: `org/package/function@release`."""
 
     name: str
     kind: str = ""
@@ -66,8 +67,9 @@ class Keep(msgspec.Struct, kw_only=True):
 
 
 class Operation(msgspec.Struct, kw_only=True):
-    """The work that makes one asset of `kind`, which names the adapter. `fields` is everything else the file says of it, after
-    defaults; a kind types them by subclassing this, which puts a signature in the package's interface."""
+    """The work that makes one asset. `kind` is the file it produces, `image`, `video` or `audio`, which names the adapter. `fields` is
+    everything else the file says of it, after defaults; an adapter types them by subclassing this, which puts a signature in the
+    package's interface."""
 
     version: Literal[2]
     asset: str
@@ -106,8 +108,8 @@ class Refuse(InvalidRequest):
     default_code = "project_refused"
 
 
-# The kinds first-party packages share, so a project can swap one model for another without rewriting its file. A package opts in
-# by annotating its adapter with one; a third party's own kind needs nothing here. Calcifer passes fields through and knows none.
+# The fields first-party packages share, so a project can swap one model for another without rewriting its file. A package opts in by
+# annotating its adapter with them. Calcifer passes fields through and knows none.
 
 
 class BeatWrite(msgspec.Struct, kw_only=True):
