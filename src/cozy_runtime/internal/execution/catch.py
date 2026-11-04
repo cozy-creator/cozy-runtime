@@ -164,10 +164,20 @@ def begin(
         return None
 
 
-def note(request: Request, key: str, name: str, level: int) -> None:
-    """A site's calls per level, for the run record."""
-    record = request.working_splits.setdefault(key, {"site": name, "levels": {}})
+def note(
+    request: Request, key: str, name: str, level: int, selection: dict[str, Any] | None = None
+) -> None:
+    """A site's calls per level and what each was last chosen against, for the run record."""
+    record = request.working_splits.setdefault(key, {"site": name, "levels": {}, "chosen": {}})
     record["levels"][str(level)] = record["levels"].get(str(level), 0) + 1
+    if selection is not None:
+        record["chosen"][str(level)] = {
+            "full": selection["allocation_backing_bytes"],
+            "budget": selection["budget_bytes"],
+            "capacity": selection["capacity_bytes"],
+            "live": selection["live_bytes"],
+            "weights": selection["phase_weight_bytes"],
+        }
 
 
 def cut[T](
@@ -200,7 +210,7 @@ def cut[T](
             level, selection = select(device, key, menu, stream, floor)
             token = begin(device, key, level, selection, stream)
             LEVELS[key] = level
-            note(request, key, name, level)
+            note(request, key, name, level, selection)
             submitted = False
             try:
                 result = run(level)
