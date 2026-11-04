@@ -1518,10 +1518,20 @@ _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", tensor_schema={}, config=C
 
 def _coverage(cls: type, record: ConstructionRecord) -> None:
     """A load whose construction and checkpoint disagree says so once, in the next attempt's
-    warnings, naming the tensors, and serves: stored tensors no destination reads were not
-    loaded, and persistent buffers the checkpoint does not store keep their constructed values.
-    What the class declares (`unloaded=`, `derived=`) is not warned about."""
+    warnings, naming the tensors, and serves: persistent buffers the checkpoint does not store
+    keep their constructed values. Stored tensors no destination reads were not loaded: every
+    tensor the model builds was filled, so an unused head changes nothing and is a log line.
+    A quarter or more of what it did load left unread is another matter: the code and the
+    checkpoint may not be one model, and that warns. What the class declares (`unloaded=`,
+    `derived=`) is not warned about."""
     ignored, unstored = uncovered(cls, record.ignored_extras, record.unstored)
+    unread = cast("int", (record.fit or {}).get("ignored_bytes", 0))
+    if ignored and unread * 4 < record.filled_bytes:
+        _LOG.info(
+            "%s: %d checkpoint tensors not loaded, %d bytes of %d: %s",
+            cls.__name__, len(ignored), unread, record.filled_bytes, ", ".join(ignored[:8]),
+        )  # fmt: skip
+        ignored = []
     for message, kind, names in (
         ("checkpoint tensors were not loaded: the model builds no destination for them",
          "tensors", ignored),
