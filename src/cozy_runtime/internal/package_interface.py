@@ -174,6 +174,8 @@ class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     accelerator: bool | msgspec.UnsetType = msgspec.UNSET
     #: A project adapter's tags: what its model reads in a text, which stay text.
     reserved: tuple[str, ...] = ()
+    #: The path in its package of the component that draws its box on a canvas.
+    ui: str | msgspec.UnsetType = msgspec.UNSET
     weights_outputs: (
         Annotated[tuple[WeightsOutputDeclaration, ...], msgspec.Meta(min_length=1, max_length=16)]
         | msgspec.UnsetType
@@ -290,6 +292,8 @@ def entry(declared: Declaration) -> dict[str, Json]:
         doc["accelerator"] = False
     if declared.reserved:
         doc["reserved"] = list(declared.reserved)
+    if declared.ui:
+        doc["ui"] = declared.ui
     if declared.weights_outputs:
         doc["weights_outputs"] = [
             {

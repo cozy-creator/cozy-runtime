@@ -2,8 +2,8 @@
 
 A project (`project.yaml`) is general and a model isn't: an adapter turns one operation into this package's own call, so the
 package owns its templating and vocabulary. It is pure, on the render machine in the package's environment: no GPU, no
-network, no file contents. A file is its digest, which goes into the call's input as is. All of this is opt-in: a package
-with none gets one flat `prompt`.
+network, no file contents. A file is its digest, which goes into the call's input as is. All of this is opt-in: a function no
+adapter speaks for is called directly with its node's fields, each `<mention>` the file it names.
 """
 
 from __future__ import annotations
@@ -67,13 +67,15 @@ class Keep(msgspec.Struct, kw_only=True):
 
 
 class Operation(msgspec.Struct, kw_only=True):
-    """The work that makes one asset. `kind` is the file it produces, `image`, `video` or `audio`, which names the adapter. `fields` is
-    everything else the file says of it, after defaults; an adapter types them by subclassing this, which puts a signature in the
-    package's interface."""
+    """The work that makes one asset. `kind` is the file it produces, `image`, `video` or `audio`, which names the adapter. `function` is
+    the one its tool names, for this adapter to make the input of; empty when it names only this package, for the adapter to pick. `fields`
+    is everything else the file says of it, after defaults; an adapter types them by subclassing this, which puts a signature in the
+    package's interface and, where it speaks for a function, is that tool's box."""
 
     version: Literal[2]
     asset: str
     kind: str = ""
+    function: str = ""
     fields: dict[str, Any]
     #: What the file says for this package alone, any field to any value: `turbo`, a model's own settings. Not part of the standard.
     options: dict[str, Any] = {}

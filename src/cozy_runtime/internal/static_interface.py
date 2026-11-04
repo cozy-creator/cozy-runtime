@@ -435,9 +435,9 @@ _CHILD_TASK_KEYWORDS = frozenset(
     }
 )
 _APP_KEYWORDS = {
-    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden"},
+    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden", "ui"},
     "child_task": _CHILD_TASK_KEYWORDS,
-    "project_adapter": frozenset({"reserved"}),
+    "project_adapter": frozenset({"functions", "reserved"}),
 }
 _INVOCABLE_KEYWORDS = frozenset(
     {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
@@ -1518,6 +1518,8 @@ class Registration:
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
     #: A project adapter's `reserved=`.
     reserved: tuple[str, ...] = ()
+    #: `ui=`, a literal.
+    ui: str = ""
 
     def declaration(self, **found: Any) -> Declaration:
         """Its record, with what its signature declares (`found`)."""
@@ -1533,6 +1535,7 @@ class Registration:
             child_task=self.child_task,
             accelerator=self.accelerator,
             reserved=self.reserved,
+            ui=self.ui,
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
@@ -2084,41 +2087,47 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                             "a project adapter names its kinds",
                             "static_unsupported",
                         )
-                    reserved: tuple[str, ...] = ()
+                    listed: dict[str, tuple[str, ...]] = {}
                     for keyword in keywords:
-                        tags = keyword.value
+                        words = keyword.value
                         if (
                             keyword.arg not in _APP_KEYWORDS[method]
-                            or not isinstance(tags, (ast.List, ast.Tuple))
+                            or not isinstance(words, (ast.List, ast.Tuple))
                             or not all(
-                                isinstance(tag, ast.Constant) and isinstance(tag.value, str)
-                                for tag in tags.elts
+                                isinstance(word, ast.Constant) and isinstance(word.value, str)
+                                for word in words.elts
                             )
                         ):
                             reader.refuse(
                                 module,
                                 keyword,
-                                "a project adapter takes only reserved=[...], its tags as written",
+                                "a project adapter takes only functions=[...] and reserved=[...], "
+                                "as written",
                                 "static_unsupported",
                             )
-                        reserved = tuple(tag.value for tag in tags.elts)
-                    # `App.project_adapter`: an entrypoint by another name, per kind.
+                        listed[keyword.arg] = tuple(word.value for word in words.elts)
+                    # `App.project_adapter`: an entrypoint by another name, per kind and function.
                     for adapted in names:
-                        registration = _registration(
-                            reader,
-                            module,
-                            stmt,
-                            "entrypoint",
-                            [
-                                ast.keyword(
-                                    "name", ast.Constant(f"project-adapter-{adapted.value}")
-                                ),
-                                ast.keyword("accelerator", ast.Constant(False)),
-                            ],
-                            decorator=decorator,
-                        )
-                        if registration is not None:
-                            found.append(replace(registration, reserved=reserved))
+                        for function in listed.get("functions") or (None,):
+                            suffix = f"-{function}" if function else ""
+                            registration = _registration(
+                                reader,
+                                module,
+                                stmt,
+                                "entrypoint",
+                                [
+                                    ast.keyword(
+                                        "name",
+                                        ast.Constant(f"project-adapter-{adapted.value}{suffix}"),
+                                    ),
+                                    ast.keyword("accelerator", ast.Constant(False)),
+                                ],
+                                decorator=decorator,
+                            )
+                            if registration is not None:
+                                found.append(
+                                    replace(registration, reserved=listed.get("reserved", ()))
+                                )
                     continue
                 if isinstance(decorator, ast.Call) and decorator.args:
                     reader.refuse(
@@ -2226,6 +2235,7 @@ def _registration(
     on_demand: tuple[str, ...] = ()
     phases: tuple[tuple[str, ...], ...] = ()
     uses: dict[str, str] = {}
+    ui = ""
     for keyword in keywords:
         if keyword.arg not in _APP_KEYWORDS[method]:
             reader.refuse(
@@ -2275,6 +2285,10 @@ def _registration(
             uses = model_prepared_use(value)
         elif keyword.arg == "name":
             name = str(value)
+        elif keyword.arg == "ui":
+            if type(value) is not str:
+                reader.refuse(module, keyword.value, "ui names a file in this package, as text")
+            ui = value
         elif keyword.arg == "hidden" and value is True:
             hidden = True
         elif keyword.arg == "accelerator":
@@ -2309,6 +2323,7 @@ def _registration(
         emits_media=emits_media,
         phases=phases,
         model_prepared_use=uses,
+        ui=ui,
     )
 
 

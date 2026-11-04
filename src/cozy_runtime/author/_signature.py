@@ -339,6 +339,7 @@ class Declaration:
     accelerator: bool = True
     """False: CPU only, never opens CUDA. True: the machine's GPU when it has one."""
     reserved: tuple[str, ...] = ()
+    ui: str = ""
     """A project adapter's tags: what its model reads in a text, which stay text."""
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)

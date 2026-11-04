@@ -93,6 +93,8 @@ class Registration:
     """False: CPU only. True (the default): the machine's GPU when it has one."""
     reserved: tuple[str, ...] = ()
     """A project adapter's tags: what its model reads in a text, which stay text."""
+    ui: str = ""
+    """The path in this package of the component that draws this function's box on a canvas."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
     is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
@@ -116,6 +118,7 @@ class Registration:
                 child_task=self.child_task,
                 accelerator=self.accelerator,
                 reserved=self.reserved,
+                ui=self.ui,
                 invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
@@ -163,9 +166,12 @@ class App:
         *,
         hidden: bool = False,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        ui: str = "",
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a public function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
+
+        `ui="ui/box.js"` names the component in this package that draws its box on a canvas, a literal.
 
         `weights=` names the TensorFS model outputs it writes; `publishes=`/`emits_media=`
         declare its `Outputs`. `accelerator=False` runs it on CPU only; otherwise (`True`,
@@ -182,7 +188,7 @@ class App:
         in place of its annotation (the Runtime's own generic functions). `phases=` declares
         immutable component groups in execution order, available to queued preparation before
         handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
-        return self._register(fn, False, hidden=hidden, model_classes=model_classes, **options)
+        return self._register(fn, False, hidden=hidden, model_classes=model_classes, ui=ui, **options)
 
     @overload
     def child_task(
@@ -204,19 +210,25 @@ class App:
         return self._register(fn, True, **options)
 
     def project_adapter(
-        self, *kinds: str, reserved: Sequence[str] = ()
+        self, *kinds: str, functions: Sequence[str] = (), reserved: Sequence[str] = ()
     ) -> Callable[[Callable[P, R]], Callable[P, R]]:
         """Register what turns one project operation producing a file of each `kind`, `image`, `video` or `audio`, into this package's
         own calls: it reads an `author.Operation`, or a subclass typing `fields`, and answers `list[author.Invocation]`, run in order,
-        or raises `author.Refuse`. A package with no adapter for a kind can't make an asset of it. A public function per kind,
-        `project-adapter-<kind>`, on the CPU, so a machine runs it as it runs any other. `reserved` names the tags its model
-        reads in a text, such as `d` for `<d>`: Calcifer leaves them there as text, read statically with the rest of this."""
+        or raises `author.Refuse`. On the CPU, so a machine runs it as it runs any other.
+
+        `functions` names what it speaks for: `op.function` is the one a node's tool names, and its typed `fields` are that tool's box.
+        A public function per kind and function, `project-adapter-<kind>-<function>`. With none it answers an operation that names only
+        this package, picking for itself, as `project-adapter-<kind>`; stack both on one function to do both. A function no adapter
+        speaks for is called directly. `reserved` names the tags its model reads in a text, such as `d` for `<d>`: Calcifer leaves them
+        there as text. All of this is read statically."""
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             for kind in kinds:
-                self._register(
-                    None, False, name=f"project-adapter-{kind}", accelerator=False, reserved=tuple(reserved)
-                )(target)
+                for function in functions or (None,):
+                    name = f"project-adapter-{kind}" + (f"-{function}" if function else "")
+                    self._register(
+                        None, False, name=name, accelerator=False, reserved=tuple(reserved)
+                    )(target)
             return target
 
         return decorate
@@ -245,6 +257,7 @@ class App:
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
         reserved: tuple[str, ...] = (),
+        ui: str = "",
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         # Immutable CPU metadata; the source reader uses the same closed validator.
         declared_phases = model_phases(phases)
@@ -309,6 +322,7 @@ class App:
                 child_task=child_task,
                 accelerator=accelerator is not False,
                 reserved=reserved,
+                ui=ui,
             )
             return target
 
