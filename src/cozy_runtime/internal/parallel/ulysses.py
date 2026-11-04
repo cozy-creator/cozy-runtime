@@ -75,6 +75,7 @@ class _Rendezvous:
 
 
 _RENDEZVOUS: weakref.WeakKeyDictionary[ProcessGroup, _Rendezvous] = weakref.WeakKeyDictionary()
+_RENDEZVOUS_LOCK = threading.Lock()
 
 
 def _rendezvous(handle: ProcessGroup) -> _Rendezvous:
@@ -83,9 +84,6 @@ def _rendezvous(handle: ProcessGroup) -> _Rendezvous:
         if found is None:
             found = _RENDEZVOUS[handle] = _Rendezvous(handle)
         return found
-
-
-_RENDEZVOUS_LOCK = threading.Lock()
 
 
 def _steps(heads: int, world: int) -> list[int]:

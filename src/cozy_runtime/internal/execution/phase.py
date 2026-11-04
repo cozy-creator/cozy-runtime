@@ -152,7 +152,16 @@ def observing(
                 completed=succeeded and (mode != "eager" or observation.completed),
             )
             sites = record.pop("split_observations", ())
-            observation.result = {**record, "cut_choices": observation.choices, "sites": len(sites)}
-            records.append(observation.result)
+            observation.result = {
+                **record, "cut_choices": observation.choices, "sites": len(sites), "passes": 1,
+            }
+            last = records[-1] if records else None
+            if last is not None and key is not None and last.get("key") == key:
+                # Repeated passes of one key are one row: an LM's tokens, a DiT's steps.
+                observation.result["passes"] += last["passes"]
+                observation.result["peak_bytes"] = max(record["peak_bytes"], last["peak_bytes"])
+                records[-1] = observation.result
+            else:
+                records.append(observation.result)
         finally:
             _ACTIVE.reset(active)
