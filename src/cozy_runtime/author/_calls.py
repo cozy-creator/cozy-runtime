@@ -386,13 +386,13 @@ class _Broker:
     def _saved(self, value: object) -> SavedFile | None:
         """`value` as a file this attempt saved, whole in its spool for TensorD to check: a frame
         is encoded now. A child's input is named by SHA-256, which a saved file's digest isn't.
-        Its child has it, so the result need not return it."""
+        Its child has it, so the result need not return it. `value` may be a labeled copy of the
+        handle saved: its `ref` names the file, and only the handle saved hears of its frame."""
         attempt = self.attempt
-        if (
-            attempt is None
-            or not isinstance(value, File)
-            or attempt.pending.get(value.ref) is not value
-        ):
+        if attempt is None or not isinstance(value, File):
+            return None
+        saved = attempt.pending.get(value.ref)
+        if saved is None:
             return None
         if value.ref in attempt.parts:
             raise CapabilityError(
@@ -404,11 +404,11 @@ class _Broker:
         attempt.shown.add(value.ref)
         digest = self.saved_sha256.get(value.ref)
         if digest is None:
-            assert value._local is not None  # a saved file's bytes are in the spool
-            with value._local.open("rb") as blob:
+            assert saved._local is not None  # a saved file's bytes are in the spool
+            with saved._local.open("rb") as blob:
                 digest = f"sha256:{hashlib.file_digest(blob, 'sha256').hexdigest()}"
             self.saved_sha256[value.ref] = digest
-        return SavedFile(asset_ref=value.ref, digest=digest, media_type=value.media_type)
+        return SavedFile(asset_ref=value.ref, digest=digest, media_type=saved.media_type)
 
     def reserve(
         self,

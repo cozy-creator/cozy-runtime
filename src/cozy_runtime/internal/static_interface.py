@@ -66,6 +66,7 @@ from cozy_runtime.author._model_defaults import (
     model_phases,
     model_prepared_use,
 )
+from cozy_runtime.author._project import adapter_result
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
 from cozy_runtime.author._services import SERVICES
@@ -311,6 +312,19 @@ _VIDEO_STRUCTS = (
     "UpscaleRequest",
     "UpscaleResult",
     "Invocation",
+    "Invocations",
+    "Operation",
+    "OperationFile",
+    "Read",
+    "Write",
+    "Keep",
+    "BeatWrite",
+    "ShotBeat",
+    "ShotPlate",
+    "ShotFields",
+    "ShotOperation",
+    "PictureFields",
+    "PictureOperation",
     "ProjectBeat",
     "ProjectContinue",
     "ProjectEntity",
@@ -423,7 +437,7 @@ _CHILD_TASK_KEYWORDS = frozenset(
 _APP_KEYWORDS = {
     "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden"},
     "child_task": _CHILD_TASK_KEYWORDS,
-    "project_adapter": frozenset(),
+    "project_adapter": frozenset({"reserved"}),
 }
 _INVOCABLE_KEYWORDS = frozenset(
     {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
@@ -1502,6 +1516,8 @@ class Registration:
     #: Local execution advice, not a client callable/schema field. Source identity covers it.
     phases: tuple[tuple[str, ...], ...] = ()
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
+    #: A project adapter's `reserved=`.
+    reserved: tuple[str, ...] = ()
 
     def declaration(self, **found: Any) -> Declaration:
         """Its record, with what its signature declares (`found`)."""
@@ -1516,6 +1532,7 @@ class Registration:
             memoize=self.memoize,
             child_task=self.child_task,
             accelerator=self.accelerator,
+            reserved=self.reserved,
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
@@ -2057,15 +2074,53 @@ def _registrations(reader: Reader, modules: Sequence[Module], app: Assigned) -> 
                     continue
                 keywords = decorator.keywords if isinstance(decorator, ast.Call) else []
                 if method == "project_adapter":
-                    kind = decorator.args[0] if isinstance(decorator, ast.Call) and decorator.args else None
-                    if not (isinstance(kind, ast.Constant) and isinstance(kind.value, str)):
-                        reader.refuse(module, decorator, "a project adapter names its kind", "static_unsupported")
-                    # `App.project_adapter`: an entrypoint by another name.
-                    method, keywords = "entrypoint", [
-                        ast.keyword("name", ast.Constant(f"project-adapter-{kind.value}")),
-                        ast.keyword("accelerator", ast.Constant(False)),
-                    ]
-                elif isinstance(decorator, ast.Call) and decorator.args:
+                    names = decorator.args if isinstance(decorator, ast.Call) else []
+                    if not names or not all(
+                        isinstance(n, ast.Constant) and isinstance(n.value, str) for n in names
+                    ):
+                        reader.refuse(
+                            module,
+                            decorator,
+                            "a project adapter names its kinds",
+                            "static_unsupported",
+                        )
+                    reserved: tuple[str, ...] = ()
+                    for keyword in keywords:
+                        tags = keyword.value
+                        if (
+                            keyword.arg not in _APP_KEYWORDS[method]
+                            or not isinstance(tags, (ast.List, ast.Tuple))
+                            or not all(
+                                isinstance(tag, ast.Constant) and isinstance(tag.value, str)
+                                for tag in tags.elts
+                            )
+                        ):
+                            reader.refuse(
+                                module,
+                                keyword,
+                                "a project adapter takes only reserved=[...], its tags as written",
+                                "static_unsupported",
+                            )
+                        reserved = tuple(tag.value for tag in tags.elts)
+                    # `App.project_adapter`: an entrypoint by another name, per kind.
+                    for adapted in names:
+                        registration = _registration(
+                            reader,
+                            module,
+                            stmt,
+                            "entrypoint",
+                            [
+                                ast.keyword(
+                                    "name", ast.Constant(f"project-adapter-{adapted.value}")
+                                ),
+                                ast.keyword("accelerator", ast.Constant(False)),
+                            ],
+                            decorator=decorator,
+                        )
+                        if registration is not None:
+                            found.append(replace(registration, reserved=reserved))
+                    continue
+                if isinstance(decorator, ast.Call) and decorator.args:
                     reader.refuse(
                         module, decorator, "positional decorator arguments", "static_unsupported"
                     )
@@ -2360,7 +2415,7 @@ def _callable(reader: Reader, registration: Registration) -> Declaration:
         )
     if fn.returns is None:
         reader.refuse(module, fn, "no return annotation")
-    result = reader.translate(module, fn.returns)
+    result = adapter_result(reader.translate(module, fn.returns))
     if not is_struct(result):
         reader.refuse(
             module, fn.returns, "the return annotation must be a msgspec.Struct result schema"

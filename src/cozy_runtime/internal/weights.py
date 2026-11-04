@@ -13,6 +13,7 @@ and notes.
 from __future__ import annotations
 
 import functools
+import hashlib
 import time
 import warnings
 import zlib
@@ -571,17 +572,20 @@ class _Routes:
             if row.key in backend.leaves
         }
         self._layouts = {key: self._layout(key) for key in self.rows}
-        self._identity = repr(
-            tuple(
-                (
-                    key,
-                    implementation_digest(self.providers[key]),
-                    self.providers[key].params,
-                    None if layout is None else tuple(layout.items()),
+        # A digest: every binding reads it, and its text is 557 KB on Qwen's LoRA (cr-245).
+        self._identity = hashlib.sha256(
+            repr(
+                tuple(
+                    (
+                        key,
+                        implementation_digest(self.providers[key]),
+                        self.providers[key].params,
+                        None if layout is None else tuple(layout.items()),
+                    )
+                    for key, layout in sorted(self._layouts.items())
                 )
-                for key, layout in sorted(self._layouts.items())
-            )
-        )
+            ).encode()
+        ).hexdigest()
 
     @property
     def identity(self) -> str:

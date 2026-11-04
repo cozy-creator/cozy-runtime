@@ -15,7 +15,7 @@ import time
 import warnings
 import weakref
 from collections import OrderedDict
-from collections.abc import Callable, Collection, Hashable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Hashable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
@@ -288,6 +288,8 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
     return ("repeated", best) if best else ("none", [])
 
 
+#: Left free under a software cap: s8-h3 on an RTX 5090 peaked 57 MiB over 8 GiB with none.
+_CAP_SLACK = 128 << 20
 #: A paging unit larger than this is a warning: a quarter of an 8 GB card.
 _LARGEST_UNIT = 2 << 30
 #: A paging unit holding more than this splits (`split`), the same on every card.
@@ -548,6 +550,7 @@ class Model:
         self.retiring = False
         self.retire_graphs: Callable[[], None] | None = None
         self.sites = _sites(module)
+        self._block_sites: dict[str, list[_Site]] | None = None
         self.handles: list[Any] = []
         # Exact source-lifecycle callbacks accepted by explicit closed producers.
         self.source_hooks: set[Callable[..., Any]] = set()
@@ -558,6 +561,22 @@ class Model:
         self.working_phase_keys: set[str] = set()
         #: the block entered last, whose successor in execution order `_enter` records (`next`)
         self.entered: _Block | None = None
+
+    def sites_in(self, groups: Iterable[_Block]) -> list[_Site]:
+        """The weight sites `groups` hold, mapped once: a LoRA bake binds one source block per
+        linear, and walking every site for each took 6 s of Qwen's first step (cr-245)."""
+        if self._block_sites is None:
+            paths = list(self.blocks)
+            held: dict[int, tuple[str, list[_Site]]] = {}
+            for name, sites in self.sites.items():
+                path = _block_of(name, paths)
+                was = held.get(id(sites))
+                # A tied tensor used by distinct blocks stays common, as `_register` places it.
+                held[id(sites)] = (path if was is None or was[0] == path else "", sites)
+            self._block_sites = {}
+            for path, sites in held.values():
+                self._block_sites.setdefault(path, []).extend(sites)
+        return [site for block in groups for site in self._block_sites.get(block.path, ())]
 
     def wanted_identity(self) -> str | None:
         fill = "stored" if self.fill is None else self.fill.identity
@@ -758,8 +777,7 @@ class Binding:
         self.generation = model.generation
         self.targets = [
             (site, tuple(value.shape), value.dtype)
-            for sites in model.sites.values()
-            for site in sites
+            for site in model.sites_in(groups)
             if (value := site.table[site.name]) is not None
         ]
         self.identity = hashlib.sha256(
@@ -1387,6 +1405,7 @@ class Memory:
                 # One policy for this Memory lifetime. Registration, phase changes and
                 # dtype rebinding never reinstall an estimated idle-cache window.
                 self.native.clear_streaming_limit()
+                self._apply_cap()
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = varena.supports_refill()
                 self.phase_supported = True
@@ -1462,6 +1481,15 @@ class Memory:
     def _figures(self) -> tuple[int, int, int]:
         allocated, reserved, peak, resident = self._reading()
         return allocated + resident, reserved + resident, peak + resident
+
+    def _apply_cap(self) -> None:
+        """A development cap reads as a card of that size: what the driver charges beyond working
+        memory and weight pages (contexts, kernels, anyone else's) comes out of it (cr-253)."""
+        if self.budget_bytes is None or not self.cuda:
+            return
+        free, total = torch.cuda.mem_get_info(self.device)
+        outside = max(int(total) - int(free) - self._figures()[1], 0)
+        vt.set_limit(self.device.index or 0, max(self.budget_bytes - outside - _CAP_SLACK, 0))
 
     def remember_working_phase(self, key: str, models: tuple[Model | Request, ...]) -> None:
         """A semantic observation lives with its model owners, or its componentless request."""
@@ -3133,6 +3161,7 @@ class Memory:
             if not depth:
                 self._declare(model)
             if outer_forward:
+                self._apply_cap()
                 if request is not None and not request.passed:
                     request.passed = True
                 self._activate_phase(model)
@@ -3200,6 +3229,7 @@ class Memory:
                     if not other.idle:
                         other.overlap = True
             self.requests.add(request)
+        self._apply_cap()
         token = _REQUEST.set(request)
         observed = False
         try:
