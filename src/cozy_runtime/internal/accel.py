@@ -24,7 +24,6 @@ import sys
 import threading
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import cache
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal
@@ -552,52 +551,35 @@ def initialize(torch: Any, kind: str) -> None:
         torch.cuda.init()
 
 
-@cache
-def _stream_driver() -> Any:
-    """The installed CUDA driver, loaded only after the executor's device boundary.
-
-    Torch 2.14 exposes only blocking cudaStreamCreate through its cudart Python shim.
-    Driver streams are the same handles accepted by Torch's ExternalStream and events.
-    """
-    if sys.platform == "win32":
-        driver = ctypes.WinDLL("nvcuda.dll")
-    else:
-        driver = ctypes.CDLL("libcuda.so.1")
-    driver.cuStreamCreate.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
-    driver.cuStreamCreate.restype = ctypes.c_int
-    driver.cuStreamDestroy_v2.argtypes = [ctypes.c_void_p]
-    driver.cuStreamDestroy_v2.restype = ctypes.c_int
-    return driver
-
-
 def owned_stream(torch: Any, device: int) -> Any:
     """A unique Runtime-owned blocking stream. It orders with the legacy default stream, where a
     CUDA extension launches when it passes no stream, and a capture on it refuses that launch
-    instead of leaving it out of the graph.
+    instead of leaving it out of the graph. CUDA's runtime makes it, so a thread that has not yet
+    touched the device (the idle recorder's) needs no context of its own.
 
     The caller owns destruction after all library handles, tensors and events using it
     have retired. Executor streams live until process exit; graph domains close theirs.
     """
     pointer = ctypes.c_void_p()
     with torch.cuda.device(device):
-        code = _stream_driver().cuStreamCreate(ctypes.byref(pointer), 0)
+        code = torch.cuda.cudart().cudaStreamCreate(ctypes.addressof(pointer))
         if code:
-            error = torch.AcceleratorError(f"cuStreamCreate failed with CUDA error {code}")
+            error = torch.AcceleratorError(f"cudaStreamCreate failed with CUDA error {code}")
             error.error_code = code
             raise error
         try:
             return torch.cuda.ExternalStream(pointer.value, device=device)
         except BaseException:
-            _stream_driver().cuStreamDestroy_v2(pointer)
+            torch.cuda.cudart().cudaStreamDestroy(pointer.value)
             raise
 
 
 def destroy_stream(torch: Any, stream: Any) -> None:
     """Destroy an owned stream only after its owner retires and joins every consumer."""
     with torch.cuda.device(stream.device):
-        code = _stream_driver().cuStreamDestroy_v2(stream.cuda_stream)
+        code = torch.cuda.cudart().cudaStreamDestroy(stream.cuda_stream)
     if code:
-        error = torch.AcceleratorError(f"cuStreamDestroy failed with CUDA error {code}")
+        error = torch.AcceleratorError(f"cudaStreamDestroy failed with CUDA error {code}")
         error.error_code = code
         raise error
 
