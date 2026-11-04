@@ -20,7 +20,9 @@ In a group every GPU switches at the same boundary, or none does. Each follower 
 kernels in its load's and every call's reply (`pending`, `report`); at its boundary rank 0 serves
 what landed on some GPU and opens or failed on none, and sends that with its next call to each
 follower, which serves it from that call on. A GPU that never asked for an agreed kernel opens it
-at its first ask: it is built on this machine, since another GPU serves it.
+at its first ask: it is built on this machine, since another GPU serves it. A `prime`d kernel lands
+for that boundary too: each GPU's load waits for its own (`settle`), so its first request's first
+boundary serves them.
 """
 
 from __future__ import annotations
@@ -123,7 +125,8 @@ def prime[T](name: str, opener: Opener[T]) -> None:
     """Opens `name`'s kernel now on a thread of its own, beside what the executor does next (the
     weight fill), outside any request. An ask while it opens waits for it instead of serving a
     fallback, so the first call serves it and no call sees it change (cl-681). One whose build
-    still runs makes no ask wait for the build: it lands as an unprimed open does (`boundary`)."""
+    still runs makes no ask wait for the build: it lands as an unprimed open does (`boundary`).
+    In a group every one lands for the group's `boundary`."""
     with _LOCK:
         if name in _SLOTS:
             return
@@ -132,7 +135,7 @@ def prime[T](name: str, opener: Opener[T]) -> None:
 
     def open_it() -> None:
         kernel_compile.told.set(False)  # no request waits for its build
-        state = "ready"
+        state = "ready" if _GROUP[0] is None else "landed"
         try:
             with _opening(name):
                 value = opener(False)
@@ -157,6 +160,26 @@ def _primed(name: str) -> None:
     slot = _SLOTS.get(name)
     if slot is not None and slot.primed is not None:
         slot.primed.wait()
+
+
+def settle() -> None:
+    """Waits for every `prime`d opener here, none of them for a build: what a group's load then
+    states (`pending`) is what its first request's boundary can agree on."""
+    with _LOCK:
+        primes = [slot.primed for slot in _SLOTS.values() if slot.primed is not None]
+    for primed in primes:
+        primed.wait()
+
+
+def opened[T](name: str) -> T | None:
+    """`name`'s kernel once its `prime`d opener ended, serving or landed for a group's boundary,
+    else None: for another kernel's opener to build on, which serves no call."""
+    _primed(name)
+    with _LOCK:
+        slot = _SLOTS.get(name)
+        if slot is None or slot.state not in ("landed", "ready"):
+            return None
+        return cast("T", slot.value)
 
 
 def ready[T](name: str, opener: Opener[T] | None = None) -> T | None:
