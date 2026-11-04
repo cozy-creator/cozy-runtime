@@ -30,7 +30,7 @@ from types import FrameType, ModuleType
 from cozy_runtime.author import App, ConformanceError, Surface, describe
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.derive import recipes as declared_recipes
-from cozy_runtime.internal.static_interface import read_application
+from cozy_runtime.internal.static_interface import missing_app, read_application
 
 #: Author top-level code runs inside the boundary. It may import heavy dependencies; it may
 #: not EXECUTE them at module scope (§1.0), so a generous ceiling still catches a module
@@ -166,8 +166,7 @@ def _discover(
     if app is None:
         others = sorted(n for n, v in vars(module).items() if isinstance(v, App))
         raise DiscoveryError(
-            f"{module_name} exports no {attribute!r}"
-            + (f" (it does export {', '.join(others)})" if others else " and no App at all"),
+            missing_app(module_name, attribute, others),
             code="missing_application",
         )
     if not isinstance(app, App):
@@ -241,7 +240,7 @@ def _wall_clock(seconds: float | None, application: str) -> Iterator[None]:
     def fire(signum: int, frame: FrameType | None) -> None:
         raise DiscoveryError(
             f"{application}: importing the app exceeded {seconds:g}s — heavy dependencies are "
-            "imported but never EXECUTED at module scope (§1.0)",
+            "imported but never EXECUTED at module scope",
             code="import_timeout",
         )
 

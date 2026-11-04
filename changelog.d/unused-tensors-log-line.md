@@ -1,0 +1,1 @@
+A checkpoint's tensors that nothing builds, such as an unused head, are a log line. They warn only when a quarter or more of what the model loaded goes unread, as the code and the checkpoint may not be one model.

@@ -1,0 +1,1 @@
+Removed three attention kernels nothing chooses: `flash-attn3-fp8` (garbled H3, no longer builds), `sageattention-fp16pv` and `flashinfer-bf16-fp8`, with `sageattention-full`'s recipe and the `flashinfer-python` pin. `flash-attn3-full` stays: it is FA3's source build. A `--attention-kernel` pin naming one warns (`attention_kernel_removed`) and runs the normal choice.

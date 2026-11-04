@@ -1334,8 +1334,8 @@ class Reader:
             construct = construct[:CONSTRUCT_CHARS] + "…"
         line = getattr(node, "lineno", 0)
         raise StaticRefusal(
-            f"{self.spell(module.path)}:{line}: `{construct}` — {why}; the static interface "
-            "reads a closed vocabulary and never guesses (cr-114)",
+            f"{self.spell(module.path)}:{line}: `{construct}` — {why}; cozy reads a package's "
+            "interface from its source, without running it",
             code=code,
         )
 
@@ -1686,6 +1686,15 @@ def _build(
 ) -> dict[str, Json]:
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
+    if attribute not in entry.bindings:
+        raise StaticRefusal(
+            missing_app(
+                reader.spell(entry.path),
+                attribute,
+                [name for name, stmt in entry.bindings.items() if _assigns_app(stmt)],
+            ),
+            code="missing_application",
+        )
     app = reader.lookup(entry, attribute, entry.tree)
     if not (isinstance(app, Assigned) and _is_app_call(reader, app)):
         raise StaticRefusal(
@@ -1707,7 +1716,19 @@ def _build(
                 f"duplicate registration {registration.name!r}",
                 "static_unsupported",
             )
-        row = _callable(reader, registration)
+        try:
+            row = _callable(reader, registration)
+        except StaticRefusal:
+            raise
+        except Exception as exc:
+            # Not the author's mistake to decode: name what was being read, in their terms.
+            reader.refuse(
+                registration.module,
+                registration.fn,
+                f"cozy-runtime could not read this function's declaration, which is a bug in "
+                f"cozy-runtime ({type(exc).__name__}: {exc})",
+                "static_unsupported",
+            )
         if installed and (registration.memoize or registration.weights):
             identity = _operation_identity(reader, registration)
             if identity is not None:
@@ -2008,6 +2029,25 @@ def _installed_source(reader: Reader, parts: Sequence[str]) -> Path | None:
             if path.is_file():
                 return path
     return None
+
+
+def missing_app(where: str, attribute: str, others: Sequence[str]) -> str:
+    """What to do about a module with no `attribute = App()`."""
+    if others:
+        return f"{where} has `{others[0]} = App()`: name it `{attribute}`, which is where cozy looks"
+    return (
+        f"{where} has no `{attribute} = App()`: add `from cozy_runtime.author import App` and "
+        f"`{attribute} = App()`, and decorate your function with `@{attribute}.entrypoint`"
+    )
+
+
+def _assigns_app(stmt: ast.stmt) -> bool:
+    """Whether a module-level statement reads as `name = App()`, for a refusal to point at."""
+    call = stmt.value if isinstance(stmt, ast.Assign) else None
+    if not isinstance(call, ast.Call):
+        return False
+    name = call.func.attr if isinstance(call.func, ast.Attribute) else getattr(call.func, "id", "")
+    return name == "App"
 
 
 def _is_app_call(reader: Reader, app: Assigned) -> bool:

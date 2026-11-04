@@ -334,7 +334,10 @@ def ensure(
         return chosen
     uv = shutil.which("uv")
     if uv is None:
-        raise InterpreterRefusal("uv is required to provision a supported Python interpreter")
+        raise InterpreterRefusal(
+            "this machine needs uv to fetch a supported Python: install it from "
+            "https://docs.astral.sh/uv/ and run again"
+        )
     selected = _download_version(uv, constraint, cancel, version)
     _check_cancel(cancel)
     _require_owned_root(root)

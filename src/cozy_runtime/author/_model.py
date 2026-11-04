@@ -757,7 +757,7 @@ def component_set(names: Sequence[object], *, memoize: bool, memo: bool) -> tupl
     if not names:
         raise ConformanceError(
             "@uses_components() is empty: a method that touches no components is pure "
-            "orchestration and belongs in module code, never on a Model (§1.1)",
+            "orchestration and belongs in module code, never on a Model",
             code="empty_component_set",
         )
     seen: list[str] = []
@@ -788,20 +788,20 @@ def component_method(qualname: str, parameters: Iterable[str]) -> None:
         raise ConformanceError(
             f"@uses_components on {name}: lifecycle and runtime-owned members do "
             "not open component scopes — decorate the public method that forms the "
-            "runtime boundary (§1.1)",
+            "runtime boundary",
             code="component_placement",
         )
     if name.startswith("_"):
         raise ConformanceError(
             f"@uses_components on {name}: private helpers inherit their caller's "
-            "active scope and cannot be called as handler operations (§1.1)",
+            "active scope and cannot be called as handler operations",
             code="component_placement",
         )
     for parameter in parameters:
         if (why := EXCLUDED_KEYWORDS.get(parameter)) is not None:
             raise ConformanceError(
                 f"{qualname}({parameter}=): {why} — the method wrapper exposes no device, "
-                "movement, allocation, offload, pinning, eviction or residency backend (§1.1)",
+                "movement, allocation, offload, pinning, eviction or residency backend",
                 code="excluded_keyword",
                 fields=[parameter],
             )
@@ -811,7 +811,7 @@ def _refuse_lazy(method: str, result: object) -> None:
     if inspect.isgenerator(result) or inspect.iscoroutine(result) or inspect.isasyncgen(result):
         raise CapabilityError(
             f"{method} returned a {type(result).__name__}: a lazy object that touches model "
-            "components after the method completes escapes its component-use lease (§1.1)",
+            "components after the method completes escapes its component-use lease",
             code="lazy_escape",
         )
 
@@ -933,7 +933,7 @@ class Model[PipelineT]:
         """Construct this model from the bound artifact. The runtime owns WHEN it runs."""
         raise ConformanceError(
             f"{type(self).__name__} defines no load(loader): a Model constructs through "
-            "loader.construct(T, factory=…) — the one construction primitive (§1.1)",
+            "loader.construct(T, factory=…) — the one construction primitive",
             code="no_load",
         )
 
@@ -1021,7 +1021,7 @@ class Model[PipelineT]:
         if not checkpoint_ref.startswith("test://"):
             raise ConformanceError(
                 f"for_test(checkpoint_ref={checkpoint_ref!r}): a test double names a "
-                "test:// ref — author code never names an artifact identifier (§1.1)",
+                "test:// ref — author code never names an artifact identifier",
                 code="identifier_in_code",
                 fields=["checkpoint_ref"],
             )
@@ -1050,7 +1050,7 @@ class Model[PipelineT]:
         if self._cozy_harness is None:
             raise CapabilityError(
                 f"{type(self).__name__} was constructed by the runtime, not by for_test: "
-                "there is no harness and no parallel fake runtime (§1.6)",
+                "there is no harness and no parallel fake runtime",
                 code="no_harness",
             )
         return self._cozy_harness
@@ -1066,7 +1066,7 @@ class Model[PipelineT]:
         if self._cozy_active is None and remote_scope(self) is None:
             raise CapabilityError(
                 f"{what} outside an active component-use scope: the runtime joins the entry's "
-                "lease to the scope, and there is nowhere for it to live otherwise (§1.3)",
+                "lease to the scope, and there is nowhere for it to live otherwise",
                 code="no_active_scope",
             )
 
@@ -1074,7 +1074,7 @@ class Model[PipelineT]:
         if not self._cozy_ready:
             raise CapabilityError(
                 f"{type(self).__name__}.{what}: no generation is Ready — construction is "
-                "transactional and nothing is observable before it completes (§1.1)",
+                "transactional and nothing is observable before it completes",
                 code="not_ready",
             )
 
@@ -1086,14 +1086,14 @@ class Model[PipelineT]:
                 raise CapabilityError(
                     f"{type(self).__name__}.{name} = {type(value).__name__}: request-local "
                     "state cannot escape onto the long-lived model — it lives on the "
-                    "RequestView or a package-specific attempt object (§1.1.2)",
+                    "RequestView or a package-specific attempt object",
                     code="request_state_escape",
                     fields=[name],
                 )
             raise CapabilityError(
                 f"{type(self).__name__}.{name} = …: the model generation is immutable after "
                 "construction — a model instance never hides unaccounted state; declare a "
-                "loader.cache(...) handle for reusable derived entries (§1.3)",
+                "loader.cache(...) handle for reusable derived entries",
                 code="persistent_allocation",
                 fields=[name],
             )
@@ -1177,7 +1177,7 @@ class _ComponentScope:
             if remote_scope(model) is not None:
                 raise CapabilityError(
                     f"{type(model).__name__}.{self._method} entered inside another remote "
-                    "scope of the same instance in this context (§1.1)",
+                    "scope of the same instance in this context",
                     code="concurrent_scope",
                 )
             placement.enter(self._components)
@@ -1436,7 +1436,7 @@ class ModelRegistry:
             if not records:
                 raise ConformanceError(
                     f"{cls.__name__}.load did not construct anything: the one construction "
-                    "primitive is loader.construct(T, factory=…) (§1.1)",
+                    "primitive is loader.construct(T, factory=…)",
                     code="no_construction",
                 )
             record = records[0] if len(records) == 1 else _merge(records)
@@ -1518,10 +1518,20 @@ _EMPTY_ARTIFACT = Artifact(snapshot="unload://drain", tensor_schema={}, config=C
 
 def _coverage(cls: type, record: ConstructionRecord) -> None:
     """A load whose construction and checkpoint disagree says so once, in the next attempt's
-    warnings, naming the tensors, and serves: stored tensors no destination reads were not
-    loaded, and persistent buffers the checkpoint does not store keep their constructed values.
-    What the class declares (`unloaded=`, `derived=`) is not warned about."""
+    warnings, naming the tensors, and serves: persistent buffers the checkpoint does not store
+    keep their constructed values. Stored tensors no destination reads were not loaded: every
+    tensor the model builds was filled, so an unused head changes nothing and is a log line.
+    A quarter or more of what it did load left unread is another matter: the code and the
+    checkpoint may not be one model, and that warns. What the class declares (`unloaded=`,
+    `derived=`) is not warned about."""
     ignored, unstored = uncovered(cls, record.ignored_extras, record.unstored)
+    unread = cast("int", (record.fit or {}).get("ignored_bytes", 0))
+    if ignored and unread * 4 < record.filled_bytes:
+        _LOG.info(
+            "%s: %d checkpoint tensors not loaded, %d bytes of %d: %s",
+            cls.__name__, len(ignored), unread, record.filled_bytes, ", ".join(ignored[:8]),
+        )  # fmt: skip
+        ignored = []
     for message, kind, names in (
         ("checkpoint tensors were not loaded: the model builds no destination for them",
          "tensors", ignored),
@@ -1576,7 +1586,7 @@ def _prove_components(cls: type, record: ConstructionRecord) -> None:
             f"{cls.__name__} constructs {', '.join(surplus)}, which no method declares — a "
             "class declares only component names EVERY admissible artifact for its slots "
             "constructs, so a construction the declarations do not cover could never pass "
-            "exact binding against a narrow artifact (§1.1)",
+            "exact binding against a narrow artifact",
             code="undeclared_construction",
             fields=surplus,
         )

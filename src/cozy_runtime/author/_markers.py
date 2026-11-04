@@ -199,7 +199,7 @@ Excess = Literal["refuse", "truncate"]
 class _Trim:
     min_seconds: int | float | None = None
     max_seconds: int | float | None = None
-    excess: Excess = "refuse"
+    excess: Excess = "truncate"
 
     kind = ""
     profile = ""
@@ -257,9 +257,9 @@ class _Trim:
 class VideoPreparation(_Trim):
     """Declared duration policy and fit for a video field or the videos of an Files input.
 
-    Shorter than `min_seconds`, or longer than `max_seconds` with `excess="refuse"`,
-    refuses the request before the handler runs. `excess="truncate"` ends every read
-    and stream of that input at `max_seconds` and reports an `adjusted` row.
+    Shorter than `min_seconds` refuses the request before the handler runs. Longer than
+    `max_seconds` ends every read and stream of that input there and reports an `adjusted`
+    row (`excess="truncate"`, the default), or refuses with `excess="refuse"`.
 
     The fit is the most of the input the package reads, never a refusal: `max_short_edge`,
     `max_long_edge` and `max_pixels` bound a frame, `max_fps` the frame rate, and `audio` is

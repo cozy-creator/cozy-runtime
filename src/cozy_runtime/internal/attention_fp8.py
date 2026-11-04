@@ -110,7 +110,7 @@ def _entries() -> list[TritonEntry]:
             found.append(
                 TritonEntry(
                     _cast,
-                    {**pointers, "out_ptr": "*fp8e4nv", **sizes},
+                    {"x_ptr": f"*{half}", "out_ptr": "*fp8e4nv", "amax_ptr": "*fp32", **sizes},
                     constexprs,
                     ("x_ptr", "out_ptr", "amax_ptr"),
                     num_warps=4,

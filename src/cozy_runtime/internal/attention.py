@@ -92,6 +92,8 @@ class Lacking(AttentionRefusal):
 
 #: One self-check case: (head dimension, dtype, batch, query length, key length, causal).
 type Case = tuple[int, str, int, int, int, bool]
+#: A self-check's long keys: past Kitchen's and `_attn4`'s 1024, where they change tile.
+LONG_KEYS = 1536
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,8 @@ class Candidate:
     #: the Runtime module whose `KERNELS` (a `TritonKernels` set) it launches: it serves once
     #: they are built here (`triton_kernels`)
     kernels: str = ""
+    #: the most tokens its compiled kernels take; zero is any
+    max_tokens: int = 0
 
     @property
     def exact(self) -> bool:
@@ -166,7 +170,11 @@ class Candidate:
             for d in dims
             for n in names
             if self.admits(n, d)
-            for case in ((d, n, batch, query, 257, False), (d, n, batch, 257, 257, True))
+            for case in (
+                (d, n, batch, query, 257, False),
+                (d, n, batch, 257, 257, True),
+                (d, n, 1, LONG_KEYS, LONG_KEYS, False),
+            )
             if self.causal or not case[5]
         ]
 
@@ -187,6 +195,10 @@ class Candidate:
                 and not math.isclose(scale, dim**-0.5, rel_tol=1e-6),
                 "a softmax scale other than D^-1/2",
             ),
+            (
+                bool(self.max_tokens) and int(query.shape[1]) > self.max_tokens,
+                f"{query.shape[1]} tokens: past its {self.max_tokens}",
+            ),
         )
         return next((f"{self.name} does not serve {what}" for off, what in limits if off), "")
 
@@ -205,6 +217,8 @@ _SAGE3_WHEEL = "cozy_runtime.internal.sage3"
 _E4M3 = "cozy_runtime.internal.attention_fp8"
 #: A kernel the Runtime wheel alone carries (`prebuilt.ATTENTION`): no source recipe builds it.
 PREBUILT = "prebuilt"
+#: The fixed K means' compiled reduction (`attention_sage2_fixed_mean.REDUCE_MAX` tiles).
+_MEAN_TOKENS = 2048 * 256
 #: Every sparse kernel's admission: one BF16 document at head dimension 128, equal Q/K/V.
 _SOL: dict[str, Any] = dict(
     sparse=True, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False, gqa=False,
@@ -221,11 +235,6 @@ KERNELS: tuple[Candidate, ...] = (
         shapes=_FA3, artifact="flash-attn3-full", import_name="flash_attn_interface",
     ),
     Candidate(
-        "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, level=8,
-        dtypes=_HALF, max_head_dim=128, gqa=False, artifact="flash-attn3-full",
-        import_name="flash_attn_interface", kernels=_E4M3,
-    ),
-    Candidate(
         "flash-attn4", "_cozy_flash_attn4", upstream.FA4, _WGMMA | _TCGEN05, dtypes=_HALF,
         max_head_dim=256, artifact=_PY, import_name="flash_attn.cute",
     ),
@@ -239,19 +248,9 @@ KERNELS: tuple[Candidate, ...] = (
         dtypes=_HALF, max_head_dim=128, artifact="sageattention", import_name="sageattention",
     ),
     Candidate(
-        "sageattention-fp16pv", "_cozy_sage_fp16pv", upstream.SAGE_FP16PV, _WGMMA, level=8,
-        dtypes=_HALF, max_head_dim=128, artifact="sageattention-full",
-        import_name="sageattention",
-    ),
-    Candidate(
         "kitchen-int8", "_cozy_kitchen_int8", upstream.KITCHEN, _GPU, level=8, dtypes=_HALF,
         max_head_dim=256, masks=True, causal=False, artifact=_KITCHEN,
         import_name="comfy_kitchen",
-    ),
-    Candidate(
-        "flashinfer-bf16-fp8", "_cozy_flashinfer_bf16_fp8", upstream.FLASHINFER, _TCGEN05,
-        level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
-        artifact=_PY, import_name="flashinfer", kernels=_E4M3,
     ),
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, level=4,
@@ -269,6 +268,7 @@ KERNELS: tuple[Candidate, ...] = (
         upstream.SAGE3_FIXED_MEANS, _MMA, _FP4, level=4, dtypes=_BF16, max_head_dim=128,
         head_dims=_D128, causal=False, gqa=False, cross=False, batches=False, scales=False,
         artifact=_SAGE3, import_name=_SAGE3, kernels="cozy_runtime.internal.attention_sage3_fixed",
+        max_tokens=_MEAN_TOKENS,
     ),
     Candidate(
         "kitchen-int4qk", "_cozy_kitchen_int4qk", attention_int4.KITCHEN_INT4QK, _MMA, _INT4,
@@ -279,7 +279,7 @@ KERNELS: tuple[Candidate, ...] = (
         attention_sage2_fixed.DENSE_NAME, "_cozy_sage2_fixed_kmean", attention_sage2_fixed.DENSE,
         _WGMMA, level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
         gqa=False, batches=False, artifact="sageattention", import_name="sageattention",
-        kernels="cozy_runtime.internal.attention_sage2_fixed_mean",
+        kernels="cozy_runtime.internal.attention_sage2_fixed_mean", max_tokens=_MEAN_TOKENS,
     ),
     Candidate(
         "sol-attn", "_cozy_sol_bf16", attention_sol.SOL, _GPU, _FP8, artifact=_PY,
@@ -313,6 +313,17 @@ KERNELS: tuple[Candidate, ...] = (
     ),
 )  # fmt: skip
 BY_NAME: dict[str, Candidate] = {c.name: c for c in KERNELS}
+#: Kernels no longer here (Paul, 2026-11-04): a pin naming one runs the normal choice and warns,
+#: where an unknown name refuses.
+RETIRED = frozenset({"flash-attn3-fp8", "sageattention-fp16pv", "flashinfer-bf16-fp8"})
+
+
+def retired(pin: str) -> str:
+    """The removed kernel PIN names, else nothing."""
+    name = pin.rpartition("=")[2]
+    return name if name in RETIRED else ""
+
+
 
 #: Each family's kernels per attention level, best first (precision-tiers §2.4; the order is
 #: the release gate's measurements). A site walks its level's cell, each level above, then SDPA.
@@ -864,7 +875,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
                     "attention_kernel_absent",
                     f"{candidate.name}: compiled Kitchen Sol is unavailable",
                 )
-        if candidate.local in (upstream.FA3, upstream.FA3_FP8):
+        if candidate.local is upstream.FA3:
             upstream.bind_fa3(
                 cast("upstream.FlashAttn3", module), (artifact or {}).get("key", "environment")
             )
@@ -1878,10 +1889,17 @@ def override(
 
 
 def _site_refusal(name: str, component: str, dtype: str, head_dim: int) -> AttentionRefusal:
+    shape = f"{dtype or 'unknown'} activations at head dimension {head_dim or 'unknown'}"
+    if name == "no available attention kernel":
+        return AttentionRefusal(
+            "attention_kernel_unsupported",
+            f"no attention kernel on this machine serves {component}'s attention ({shape}): that "
+            "is a bug in the package or in cozy, not in your request; try another lane with `--lane`",
+        )
     return AttentionRefusal(
         "attention_kernel_unsupported",
-        f"{name} does not serve {component}'s attention: {dtype or 'unknown'} activations "
-        f"at head dimension {head_dim or 'unknown'}. A pinned kernel is never quietly replaced",
+        f"{name} does not serve {component}'s attention: {shape}. A pinned kernel is never "
+        "quietly replaced: pin another, or none",
     )
 
 

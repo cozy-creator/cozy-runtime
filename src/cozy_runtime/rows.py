@@ -7,10 +7,13 @@ projection with it where its consumer reads output features apart (attention's h
 
 A row reads only its own weights and scale under a plain `nn.Linear` and under the per-row-scaled
 encoded leaves (int8.convrot, fp8.rowwise): a window is the whole's arithmetic in a narrower GEMM
-(whose kernel may round differently). An overlay's LoRA (`lora.Hook`) adds its rows of `up`, and
-a user LoRA's layer (`lora_composition`) its base's rows and each adapter's rows of `lora_B`;
-baked, the base's rows alone. Anything else (a tensor-global scale, an unknown hook, another
-PEFT layer) does not cut: `rows` is None and the caller computes the whole."""
+(whose kernel may round differently). nvfp4's rows read their own payload and block scales too:
+its second level is the weight's and its activation scale the whole input's, which a window of
+output rows reads whole, so they are the same in every window; only its scales' 128-row tiles
+bound where a window starts. An overlay's LoRA (`lora.Hook`) adds its rows of `up`, and a user
+LoRA's layer (`lora_composition`) its base's rows and each adapter's rows of `lora_B`; baked, the
+base's rows alone. Anything else (a scale over the output's rows, an unknown hook, another PEFT
+layer) does not cut: `rows` is None and the caller computes the whole."""
 
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ from torch.nn import functional as F
 
 from cozy_runtime import lora
 from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8, PreQuantized, readable
+from cozy_runtime.internal.encoding.leaves import NVFP4
 
 
 class Rows(Protocol):
@@ -31,8 +35,13 @@ class Rows(Protocol):
     ) -> Tensor: ...
 
 
-#: Encoded leaves whose weight scale is one per output row.
-_ROWWISE = frozenset({INT8_CONVROT, ROWWISE_FP8})
+#: Encoded leaves whose rows compute alone: their stored roles, and the output rows a tile of
+#: their scales holds (a window takes whole tiles; nvfp4's are `formats.to_blocked`'s).
+_ROWWISE: dict[str, tuple[frozenset[str], int]] = {
+    INT8_CONVROT: (frozenset({"weight", "scale"}), 1),
+    ROWWISE_FP8: (frozenset({"weight", "scale"}), 1),
+    NVFP4: (frozenset({"weight", "scale", "scale_2"}), 128),
+}
 
 
 def rows(linear: nn.Module) -> Rows | None:
@@ -49,7 +58,8 @@ def rows(linear: nn.Module) -> Rows | None:
         return lambda x, a, b, out=None: _adapted(linear, x, base(x, a, b, out), a, b)
     if type(linear) is nn.Linear:
         return lambda x, a, b, out=None: _hooked(linear, x, _plain(linear, x, a, b, out), a, b)
-    if getattr(linear, "provider", None) in _ROWWISE and set(linear.roles()) == {"weight", "scale"}:
+    cuts = _ROWWISE.get(getattr(linear, "provider", None))
+    if cuts is not None and set(linear.roles()) == cuts[0]:
         return lambda x, a, b, out=None: _hooked(linear, x, _leaf(linear, x, a, b, out), a, b)
     return None
 
@@ -70,22 +80,29 @@ def _plain(
 def _leaf(
     leaf: nn.Module, x: Tensor | PreQuantized, start: int, stop: int, out: Tensor | None
 ) -> Tensor:
-    """The leaf's own forward over a copy holding its rows: one code path for its GEMM, its
+    """The leaf's own forward over a copy holding its rows, in whole tiles of its scales (a slice
+    stops at the weight's end where its last tile is padded): one code path for its GEMM, its
     operand sharing (`quantize_once`) and its autocast rule."""
-    with readable(leaf.data, leaf.scale, leaf.bias) as (data, scale, bias):
+    tile = _ROWWISE[leaf.provider][1]
+    low, high = start // tile * tile, -(-stop // tile) * tile
+    weights, scales = (leaf.BUFFERS.get(role, role) for role in ("weight", "scale"))
+    stored = getattr(leaf, weights), getattr(leaf, scales), leaf.bias
+    with readable(*stored) as (weight, scale, bias):
         window = copy.copy(leaf)
         vars(window)["_buffers"] = {
             **leaf._buffers,
-            "data": data[start:stop],
-            "scale": scale[start:stop],
-            "bias": None if bias is None else bias[start:stop],
+            weights: weight[low:high],
+            scales: scale[low:high],
+            "bias": None if bias is None else bias[low:high],
         }
         vars(window)["_forward_hooks"] = {}
-        vars(window)["out_features"] = stop - start
+        vars(window)["out_features"] = min(high, leaf.out_features) - low
         # `linear`, never `forward`: a residency wrapper on the leaf's forward is the whole's.
-        if out is not None and window.WRITES_INTO:
+        if out is not None and window.WRITES_INTO and (low, high) == (start, stop):
             return window.linear(x, None, out)
         found = window.linear(x, None)
+        if (low, high) != (start, stop):
+            found = found[..., start - low : stop - low]
     if out is None:
         return found
     out.copy_(found)

@@ -193,7 +193,7 @@ def _models(declared: Declaration) -> None:
         if not spec.loads:
             raise ConformanceError(
                 f"{path}: {spec.name} defines no load(loader) — a Model constructs "
-                "through loader.construct(T, factory=…), the one construction primitive (§1.1)",
+                "through loader.construct(T, factory=…), the one construction primitive",
                 code="no_load",
             )
         if spec.arguments:

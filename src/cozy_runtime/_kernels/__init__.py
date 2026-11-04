@@ -127,18 +127,20 @@ def rms_rope_split_half(
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     stream = torch.cuda.current_stream(q.device).cuda_stream
-    _norm.rms_rope_split_half(
-        q,
-        k,
-        freqs,
-        q_scale,
-        k_scale,
-        q_out,
-        k_out,
-        epsilon,
-        stream,
-        rot_dim,
-    )
+    # It launches on the thread's current device: q's, whichever thread asks.
+    with torch.cuda.device(q.device):
+        _norm.rms_rope_split_half(
+            q,
+            k,
+            freqs,
+            q_scale,
+            k_scale,
+            q_out,
+            k_out,
+            epsilon,
+            stream,
+            rot_dim,
+        )
     return q_out, k_out
 
 

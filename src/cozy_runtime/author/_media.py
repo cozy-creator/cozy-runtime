@@ -13,8 +13,11 @@ family) refuses. Bytes no signature names keep their declaration; the decoder is
 
 **A kind is a set of media types, declared here and nowhere else.** `ImageFile` means
 exactly `KIND_MEDIA["image"]`. A package narrows that with `FileBound(media_types=…)`;
-it never widens it, because a decoder the runtime does not have is not a capability.
-
+it never widens it, because a decoder the runtime does not have is not a capability. A kind
+admits what its decoder reads, not only its own family: `AudioFile` reads the sound of a video
+file (an `.m4a` or a browser's `.webm` is often sniffed as one), `VideoFile` an animated GIF. In
+a slot of several kinds each type still binds to one (`slot_kind`): a video is a video when the
+slot takes video, and only otherwise a source of sound.
 
 It lives under `author/` because the KIND table is a fact about the author surface's own
 types, and both sides need one copy: the worker sniffs the fetched bytes before
@@ -24,6 +27,8 @@ direction that matters (`internal` may import `author`; never the reverse).
 """
 
 from __future__ import annotations
+
+from collections.abc import Iterable
 
 #: magic-number prefix -> media type. Byte signatures only: no extension, no caller hint,
 #: no libmagic. Each entry is (offset, signature, media type) so container formats whose
@@ -38,6 +43,9 @@ SIGNATURES: tuple[tuple[int, bytes, str], ...] = (
     (0, b"MM\x00*", "image/tiff"),
     (8, b"WEBP", "image/webp"),
     (4, b"ftypavif", "image/avif"),
+    (4, b"ftypheic", "image/heif"),
+    (4, b"ftypheix", "image/heif"),
+    (4, b"ftyphevc", "image/heif"),
     (4, b"ftypmif1", "image/avif"),
     (4, b"ftypisom", "video/mp4"),
     (4, b"ftypiso5", "video/mp4"),  # StreamingMP4Encoder's fragmented MP4 brand.
@@ -78,6 +86,17 @@ EXTENSIONS: dict[str, str] = {
 #: The media types each ASSET KIND admits. `file` is deliberately open: `File` is the
 #: kind that promises nothing about its contents, and pretending otherwise would make the
 #: three specific kinds mean less.
+_VIDEO: tuple[str, ...] = (
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/x-msvideo",
+    "video/x-m4v",
+    "video/mpeg",
+    "video/x-flv",
+    "video/x-ms-wmv",
+)
 KIND_MEDIA: dict[str, tuple[str, ...]] = {
     "image": (
         "image/png",
@@ -87,17 +106,11 @@ KIND_MEDIA: dict[str, tuple[str, ...]] = {
         "image/tiff",
         "image/webp",
         "image/avif",
+        "image/jp2",
+        "image/vnd.adobe.photoshop",
+        "image/vnd.microsoft.icon",
     ),
-    "video": (
-        "video/mp4",
-        "video/webm",
-        "video/quicktime",
-        "video/x-matroska",
-        "video/x-msvideo",
-        "video/x-m4v",
-        "video/mpeg",
-        "video/x-flv",
-    ),
+    "video": (*_VIDEO, "image/gif"),
     "audio": (
         "audio/wav",
         "audio/ogg",
@@ -107,6 +120,9 @@ KIND_MEDIA: dict[str, tuple[str, ...]] = {
         "audio/aac",
         "audio/opus",
         "audio/x-aiff",
+        "audio/amr",
+        "audio/x-ape",
+        *_VIDEO,
     ),
     "file": (),
 }
@@ -126,6 +142,14 @@ def admits(kind: str, media_type: str) -> bool:
     if allowed is None:
         return False
     return not allowed or media_type in allowed
+
+
+def slot_kind(kinds: Iterable[str], media_type: str) -> str | None:
+    """The one of a slot's `kinds` a file of `media_type` binds to: its own family's when the slot
+    takes that, else the first that reads it. None when only an open kind can hold it."""
+    readers = [kind for kind in kinds if media_type in KIND_MEDIA.get(kind, ())]
+    family = media_type.partition("/")[0]
+    return family if family in readers else next(iter(readers), None)
 
 
 #: Spellings people and tools use for the types above.

@@ -216,34 +216,11 @@ def fa3(
     )
 
 
-def fa3_fp8(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    *,
-    attn_mask: Tensor | None = None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    scale: float | None = None,
-    enable_gqa: bool = False,
-) -> Tensor:
-    """FA3's e4m3 forward from the same snapshot: per-(batch, head) amax quantisation per
-    call, the descales handed to the kernel, BF16/FP16 output from the kernel itself. Every
-    scale reduces within one head, so it is head-local under Ulysses."""
-    _options("flash-attn3-fp8", dropout_p, scale)
-    q8, k8, v8, descales = _e4m3(query, key, value)
-    return _first(
-        _fa3().flash_attn_func(
-            q8, k8, v8, softmax_scale=scale, causal=is_causal, num_splits=1, **descales
-        )
-    )
-
-
 def _e4m3(
     query: Tensor, key: Tensor, value: Tensor
 ) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
-    """Per-(batch, head) e4m3 Q/K/V and the `*_descale` keywords FA3 and FA4 take. Their
-    descales are per KV head, so their rows admit no grouped query."""
+    """Per-(batch, head) e4m3 Q/K/V and the `*_descale` keywords FA4 takes. Its descales are per
+    KV head, so its row admits no grouped query."""
     (q8, q), (k8, k), (v8, v) = (attention_fp8.quantise(t) for t in (query, key, value))
     return q8, k8, v8, {"q_descale": q, "k_descale": k, "v_descale": v}
 
@@ -295,7 +272,7 @@ def fa4_fp8(
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> Tensor:
-    """FlashAttention-4's SM100 e4m3 forward with FA3's per-(batch, head) descales; the kernel
+    """FlashAttention-4's SM100 e4m3 forward with per-(batch, head) descales; the kernel
     returns BF16. The public `flash_attn_func` takes no descales, so this calls the forward it
     wraps, as upstream's own FP8 benchmark does. Every scale is per head: head-local.
 
@@ -427,68 +404,6 @@ def kitchen_int8(
     return _output(output, query.transpose(1, 2)).transpose(1, 2)
 
 
-def flashinfer_mixed(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    *,
-    attn_mask: Tensor | None = None,
-    dropout_p: float = 0.0,
-    is_causal: bool = False,
-    scale: float | None = None,
-    enable_gqa: bool = False,
-) -> Tensor:
-    """Blackwell CuTe FMHA: BF16 Q/K, E4M3 V/P, BF16 output. Its V scale is one scalar over
-    every head, so V is quantised per (batch, head), the kernel's scale stays 1 and each head's
-    descale multiplies that head's output (attention is linear in V): head-local, and no host
-    synchronisation. The kernel is compiled from the installed source (CuTe JIT) and handed
-    in, so the library never fetches its prebuilt artifacts at first use."""
-    _options("flashinfer-bf16-fp8", dropout_p, scale)
-    _cuda_inputs(query, key, value, enable_gqa)
-    import torch
-
-    batch, q_length, q_heads, dim = query.shape
-    kv_length, kv_heads = key.shape[1:3]
-    if batch * max(q_length, kv_length) >= 2**31:
-        raise ValueError("FlashInfer ragged sequence offsets exceed int32")
-    compile_fmha = import_module("flashinfer.cute_dsl.attention.fmha.compile")
-    kernel = compile_fmha.compile_cute_dsl_fmha_kernel(
-        qk_dtype=torch.bfloat16,
-        v_dtype=torch.float8_e4m3fn,
-        out_dtype=torch.bfloat16,
-        num_qo_heads=q_heads,
-        num_kv_heads=kv_heads,
-        head_dim=dim,
-        head_dim_v=dim,
-        is_causal=False,
-        with_lse=False,
-        enable_sink=False,
-        enable_skip_softmax=False,
-        use_pdl=False,
-        device=query.device,
-    )
-    v8, descale = attention_fp8.quantise(value.contiguous())
-    q = query.reshape(batch * q_length, q_heads, dim).contiguous()
-    output = torch.empty_like(q)
-    offsets = torch.arange(batch + 1, device=query.device, dtype=torch.int32)
-    import_module("flashinfer.attention.cute_dsl.fmha").cute_dsl_fmha_ragged_prefill(
-        q,
-        key.reshape(batch * kv_length, kv_heads, dim).contiguous(),
-        v8.reshape(batch * kv_length, kv_heads, dim),
-        output,
-        offsets * q_length,
-        offsets * kv_length,
-        is_causal=False,
-        sm_scale=scale,
-        max_qo_len=q_length,
-        max_kv_len=kv_length,
-        kernel_fn=kernel,
-        enable_tvm_ffi=True,
-    )
-    per_head = descale.repeat_interleave(q_heads // kv_heads, dim=1)[:, None, :, None]
-    return _output(output.reshape(batch, q_length, q_heads, dim).mul_(per_head), query)
-
-
 def sage3_fp4(
     query: Tensor,
     key: Tensor,
@@ -611,7 +526,6 @@ BLOCK = 128
 SDPA = Local(sdpa, sdpa_impl, rows=BLOCK)
 CUDNN = Local(cudnn, _named("cudnn"), rows=BLOCK)
 FA3 = Local(fa3, lambda *_: f"flash_attn3 {_FA3_VARIANT}", rows=BLOCK)
-FA3_FP8 = Local(fa3_fp8, lambda *_: f"flash_attn3 {_FA3_VARIANT} e4m3 per-head")
 FA4 = Local(fa4, _named("flash_attn.cute.flash_attn_func"), rows=BLOCK)
 FA4_FP8 = Local(fa4_fp8, _named("flash_attn.cute.interface._flash_attn_fwd e4m3 per-head"))
 #: FP8 P/V, as upstream's `sageattn` dispatches it: the Hopper kernel (two-level FP32
@@ -623,12 +537,7 @@ SAGE = _sage(
         "mma.sync+fp4": ("sageattn_qk_int8_pv_fp8_cuda", "per_warp", "fp32+fp16"),
     }
 )
-#: FP16 P/V at upstream's default (and most accurate) FP32 accumulation; BF16 V is cast to FP16.
-SAGE_FP16PV = _sage({"wgmma": ("sageattn_qk_int8_pv_fp16_cuda", "per_thread", "fp32")})
 KITCHEN = Local(kitchen_int8, _named("comfy_kitchen.int8_attention"))
-FLASHINFER = Local(
-    flashinfer_mixed, _named("cute_dsl_fmha_ragged_prefill jit, e4m3 V per-head"), rows=BLOCK
-)
 SAGE3 = Local(
     sage3_fp4,
     lambda *_: f"sageattn3 {_SAGE3_VARIANT}.sageattn3_blackwell(nvfp4, per_block_mean)",

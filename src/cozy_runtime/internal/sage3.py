@@ -47,9 +47,10 @@ def group_mean_kernel(  # type: ignore[no-untyped-def]
     GROUP_SIZE: tl.constexpr,
     BF16: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_group = tl.program_id(2)
+    # int64 element offsets: a (batch, heads, tokens, dim) tensor may pass 2**31 elements.
+    pid_b = tl.program_id(0).to(tl.int64)
+    pid_h = tl.program_id(1).to(tl.int64)
+    pid_group = tl.program_id(2).to(tl.int64)
 
     group_start = pid_group * GROUP_SIZE
     offsets = group_start + tl.arange(0, GROUP_SIZE)
@@ -83,9 +84,10 @@ KERNELS = TritonKernels(
             group_mean_kernel,
             {**dict.fromkeys(("q_ptr", "q_out_ptr", "qm_out_ptr"), f"*{dtype}"),
              **dict.fromkeys(("B", "H", "L"), "i32"),
+             "D": "constexpr",
              **dict.fromkeys(("stride_qb", "stride_qh", "stride_ql", "stride_qd", "stride_qmb",
-                              "stride_qmh", "stride_qml", "stride_qmd"), "i32"),
-             "D": "constexpr", "GROUP_SIZE": "constexpr", "BF16": "constexpr"},
+                              "stride_qmh", "stride_qml", "stride_qmd"), "i64"),
+             "GROUP_SIZE": "constexpr", "BF16": "constexpr"},
             {"D": dim, "GROUP_SIZE": GROUP_SIZE, "BF16": int(dtype == "bf16")},
         )
         for dtype in ("bf16", "fp16")

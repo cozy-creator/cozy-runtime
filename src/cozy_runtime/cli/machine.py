@@ -15,12 +15,13 @@ import os
 import re
 import stat
 import sys
+import traceback
 import uuid
 from pathlib import Path
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author import AuthorError, ConformanceError
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
 from cozy_runtime.internal import static_interface
 from cozy_runtime.internal.installed import record_digest
@@ -197,8 +198,18 @@ def describe() -> int:
                 Path(request.project), environment_python=python, closures=closures
             )
             reply = Described(msgspec.Raw(msgspec.json.encode(document)), closures)
+    except AuthorError as exc:
+        reply = DescribeFailed(exc.code, exc.message)
+    except _Undescribed as exc:
+        reply = DescribeFailed(exc.code, str(exc))
     except Exception as exc:
-        reply = DescribeFailed(getattr(exc, "code", type(exc).__name__), str(exc))
+        # Neither the author's mistake nor theirs to decode: say so, and where.
+        frame = traceback.extract_tb(exc.__traceback__)[-1]
+        reply = DescribeFailed(
+            type(exc).__name__,
+            f"cozy-runtime could not read this package, which is a bug in cozy-runtime: {exc} "
+            f"({Path(frame.filename).name}:{frame.lineno})",
+        )
     sys.stdout.buffer.write(msgspec.json.encode(reply))
     return 0
 
