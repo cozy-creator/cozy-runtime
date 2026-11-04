@@ -1527,7 +1527,6 @@ class _Graph:
         self._configuration = configuration
         self._configuration_before: str | None = None
         self._observation: working_phase.Observation | None = None
-        self._footprint: Any = None
         self._replay_key: str | None = None
 
     def _overlaps(self, tensor: Any, areas: Any) -> bool:
@@ -1550,7 +1549,6 @@ class _Graph:
         self.held[id(self.index)] = self.index
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
         self._configuration_before = None if self._configuration is None else self._configuration()
-        self._footprint = vt.capture_footprint(self.device.index, self.recording._pool.handle)
         context = CURRENT.get()
         pause = context._pause_stall_watch if context is not None else None
         try:
@@ -1570,7 +1568,6 @@ class _Graph:
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
                 reserve_bytes=self.recording._working_bytes,
-                footprint=self._footprint,
             ))
             torch.cuda.set_stream(stream)
         except BaseException as error:
@@ -1650,7 +1647,6 @@ class _Graph:
             self.graph.reset()
             self.graph = None
         self.held.clear()
-        self._footprint = None
         self._replay_key = None
         self._configuration = None
 
@@ -1733,7 +1729,6 @@ class _Graph:
         )
         plan._capture_cache = {"recorded_ops": self.ops}
         parts = tuple(graph for graph in (prefix, self, suffix) if graph is not None)
-        plan._footprints = tuple(graph._footprint for graph in parts)
         if all(graph._replay_key is not None for graph in parts):
             key = working_phase.configuration((
                 "prepared-repeat/1", steps, tuple(graph._replay_key for graph in parts),

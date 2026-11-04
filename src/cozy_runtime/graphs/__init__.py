@@ -149,6 +149,10 @@ class _Recording:
         self.done: Any = None
         self.stream: Any = None
         self.fenced = True
+        # Nothing reads a pool between replays, so the core may take its pages back when idle.
+        held = [t for t in inputs if t is not None]
+        held += [t for t in torch.utils._pytree.tree_leaves(outputs) if isinstance(t, torch.Tensor)]
+        vt.pool_scratch(pool.handle, held, owner.device)
 
     def output(self) -> Any:
         """Caller-owned outputs, allocated before residency admission or graph launch."""
@@ -170,6 +174,7 @@ class _Recording:
         self.stream, self.fenced = stream, False
         copied = 0
         try:
+            vt.prepare_pool(self.pool.handle, 0, self.owner.device)
             for static, value in zip(self.inputs, leaves, strict=True):
                 # Always: a pool's contents need not survive between replays.
                 if static is not None:

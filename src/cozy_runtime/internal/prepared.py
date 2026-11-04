@@ -99,7 +99,6 @@ class PreparedRepeat:
         self._sequence_owner: Any = None
         self._landed = landed
         # Native immutable capture traces add metadata ownership, never extra physical pins.
-        self._footprints: tuple[Any, ...] = ()
         self._execution_key: str | None = None
 
     @staticmethod
@@ -193,7 +192,6 @@ class PreparedRepeat:
             except Exception as error:
                 _native_error(error)
             self._closed = True
-            self._footprints = ()
             self._execution_key = None
             self._release_owned_bindings()
             if settled_error is not None:
@@ -209,7 +207,6 @@ class PreparedRepeat:
             **self._native.facts(),
             "capture_cache": dict(self._capture_cache),
             "working_execution_key": self._execution_key,
-            "capture_footprints": [dict(footprint.facts()) for footprint in self._footprints],
         }
 
 class Execution:
@@ -590,7 +587,7 @@ class PreparedSequence:
         with weights declares the regions its phase holds; one without (an inter-block graph that
         owns scratch) only measures, and leaves the current preference plan untouched."""
         bound = stage._owned_bindings
-        if request is None or not (bound or stage._footprints):
+        if request is None or not (bound or stage._execution_key):
             return capsule
         memories = {b.model.memory for b in bound} if bound else {m.memory for m in claimed}
         if len(memories) != 1:
@@ -614,7 +611,7 @@ class PreparedSequence:
         if controller is None:
             controller = controllers[memory] = varena.PhaseController(memory.native)
         wrapped = controller.wrap(
-            capsule, *definition, footprints=stage._footprints, execution_key=stage._execution_key
+            capsule, *definition, execution_key=stage._execution_key
         )
         if stage._execution_key is not None:
             memory.remember_working_phase(

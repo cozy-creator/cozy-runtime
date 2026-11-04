@@ -273,7 +273,6 @@ def paging(module: nn.Module) -> tuple[str, list[str]]:
 
 
 #: Left free under a software cap: s8-h3 on an RTX 5090 peaked 57 MiB over 8 GiB with none.
-_CAP_SLACK = 128 << 20
 #: A paging unit larger than this is a warning: a quarter of an 8 GB card.
 _LARGEST_UNIT = 2 << 30
 #: A paging unit holding more than this splits (`split`), the same on every card.
@@ -1110,8 +1109,7 @@ class Memory:
                     raise ResidencyError("native CUDA recovery requires the CacheOwner capability")
                 if budget_bytes is not None:
                     vt.set_limit(self.device.index or 0, budget_bytes)
-                self.native = varena.Arena(self.device.index or 0)
-                self._apply_cap()
+                self.native = varena.Device(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = varena.supports_refill()
             except (ImportError, AttributeError, RuntimeError) as exc:
@@ -1157,15 +1155,6 @@ class Memory:
     def _figures(self) -> tuple[int, int, int]:
         allocated, reserved, peak, resident = self._reading()
         return allocated + resident, reserved + resident, peak + resident
-
-    def _apply_cap(self) -> None:
-        """A development cap reads as a card of that size: what the driver charges beyond working
-        memory and weight pages (contexts, kernels, anyone else's) comes out of it (cr-253)."""
-        if self.budget_bytes is None or not self.cuda:
-            return
-        free, total = torch.cuda.mem_get_info(self.device)
-        outside = max(int(total) - int(free) - self._figures()[1], 0)
-        vt.set_limit(self.device.index or 0, max(self.budget_bytes - outside - _CAP_SLACK, 0))
 
     def remember_working_phase(self, key: str, models: tuple[Model | Request, ...]) -> None:
         """A semantic observation lives with its model owners, or its componentless request."""
@@ -1729,9 +1718,7 @@ class Memory:
             kept.release()
         self._plain = {page for page in self._plain if page[0] != model.name}
 
-    def _host_read(
-        self, region: Any, kept: _HostPage, *, evict_completed: bool
-    ) -> _HostRead | None:
+    def _host_read(self, region: Any, kept: _HostPage) -> _HostRead | None:
         """A refill from a host page: the region's fill, admitted without waiting, one async DMA;
         None when the region is resident already. A fill admitted here that fails is released
         before its error leaves: a traceback holding it kept the region `already being filled`
@@ -1739,8 +1726,8 @@ class Memory:
         if self._h2d_stream is None:
             self._h2d_stream = torch.cuda.Stream(self.device)
         stream = self._h2d_stream
-        use = region.prepare(reclaim=False, evict_completed=evict_completed)
-        if not use.needs_fill:
+        use = region.prepare_prefetch_fill()
+        if use is None or not use.needs_fill:
             return None
         try:
             use.consume_on(stream.cuda_stream)  # its release fences on the copy
@@ -2213,7 +2200,7 @@ class Memory:
             try:
                 region = self._native_region(block, final=final)
                 if kept is not None:
-                    read = self._host_read(region, kept, evict_completed=queued is None)
+                    read = self._host_read(region, kept)
                     if read is None:
                         return  # resident already
                 else:
@@ -2758,7 +2745,6 @@ class Memory:
             if not depth:
                 self._declare(model)
             if outer_forward:
-                self._apply_cap()
                 if request is not None and not request.passed:
                     request.passed = True
                 self._activate_phase(model)
@@ -2825,7 +2811,6 @@ class Memory:
                     if not other.idle:
                         other.overlap = True
             self.requests.add(request)
-        self._apply_cap()
         token = _REQUEST.set(request)
         if self.cuda:
             varena.request_boundary(self.device.index or 0, begin=True)
