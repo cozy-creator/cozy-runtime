@@ -1152,9 +1152,9 @@ class Memory:
             return used, int(torch.mps.driver_allocated_memory()), used, 0
         return 0, 0, 0, 0
 
-    def _figures(self) -> tuple[int, int, int]:
-        allocated, reserved, peak, resident = self._reading()
-        return allocated + resident, reserved + resident, peak + resident
+    def _figures(self) -> tuple[int, int]:
+        allocated, reserved, _, resident = self._reading()
+        return allocated + resident, reserved + resident
 
     def remember_working_phase(self, key: str, models: tuple[Model | Request, ...]) -> None:
         """A semantic observation lives with its model owners, or its componentless request."""
@@ -1830,7 +1830,7 @@ class Memory:
         """Non-CUDA owner recovery; native CUDA allocation owns its bounded recovery."""
         if self.cuda:
             return 0
-        before_allocated, before_reserved, _ = self._figures()
+        before_allocated, before_reserved = self._figures()
         available = self._free() if need else 0
         if need and available < need:
             release_cached(torch, self.device.type)
@@ -1886,7 +1886,7 @@ class Memory:
                     enough(flush=True)
         if not need:
             release_cached(torch, self.device.type)
-        allocated, reserved, _ = self._figures()
+        allocated, reserved = self._figures()
         return max(before_allocated - allocated, before_reserved - reserved, 0)
 
     def release_host(self) -> None:
@@ -2797,11 +2797,8 @@ class Memory:
         plan: Sequence[object] = (),
         *,
         idle: bool = False,
-        others: Collection[Model] = (),
     ) -> Iterator[Request]:
-        """`others`: the process's other constructions' sets, whose cached weights are not this
-        request's working set (`Request.sample`)."""
-        request = Request(self, id, idle, others)
+        request = Request(self, id, idle)
         request.plan(plan)
         with self.lock:
             if not idle and any(not other.idle for other in self.requests):
@@ -2845,12 +2842,13 @@ class Memory:
         return self.last
 
     def torch_stats(self) -> dict[str, Any]:
-        allocated, reserved, peak = self._figures()
+        allocated, reserved = self._figures()
+        peak = self._reading()[2]
         return {
             "allocated": allocated,
             "mapped": reserved,
             "peak": peak,
-            "requests": {r.id: (allocated, max(r.peak, peak)) for r in self.requests},
+            "requests": {r.id: (allocated, max(r.torch_peak, peak)) for r in self.requests},
             "allocator_scope": "process",
             "weights": self.native.stats() if self.native is not None else None,
         }
@@ -2889,14 +2887,10 @@ class Bake:
 
 
 class Request:
-    """Request context; Torch observations are process-wide, including overlapping calls. Its
-    `peak` is its own working set: other constructions' resident sets are left out."""
+    """Request context; Torch observations are process-wide, including overlapping calls."""
 
-    def __init__(
-        self, memory: Memory, id: str, idle: bool = False, others: Collection[Model] = ()
-    ) -> None:
+    def __init__(self, memory: Memory, id: str, idle: bool = False) -> None:
         self.memory, self.id, self.idle = memory, id, idle
-        self.others = tuple(others)
         self.current: set[str] = set()
         self.last = ""  # the model it entered last: its phase streams between forwards too
         self.passed = False
@@ -2908,8 +2902,8 @@ class Request:
         self.working_splits: dict[str, dict[str, Any]] = {}
         #: refusals that took a pure site finer than its estimate chose: zero in a normal run
         self.finer_splits = 0
-        self.peak = 0
-        #: Working allocation peak over the whole request, kept across cut-site resets.
+        #: Working allocation peak over the whole request, kept across cut-site resets. Weights
+        #: are not in it, and no sum of it with them ever happened: the driver reads the card.
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         self.moved = self.read_ns = 0
@@ -2938,13 +2932,8 @@ class Request:
         return self.memory._prefetch_queued(self)
 
     def sample(self) -> None:
-        _, _, torch_peak, resident = self.memory._reading()
         if self.memory.cuda:
-            self.torch_peak = max(self.torch_peak, torch_peak)
-        peak = torch_peak + resident
-        if peak > self.peak and self.others:
-            peak -= sum(_resident_bytes(b) for m in self.others for b in m.groups())
-        self.peak = max(self.peak, peak)
+            self.torch_peak = max(self.torch_peak, self.memory._reading()[2])
 
     def plan(self, steps: Sequence[object]) -> None:
         def name(value: object) -> str:
@@ -3037,7 +3026,7 @@ class Request:
         if self.ended is not None:
             return self.ended
         self.sample()
-        allocated, reserved, _ = self.memory._figures()
+        allocated, reserved = self.memory._figures()
         out: dict[str, Any] = {
             "request": self.id,
             "allocator_scope": "process",
@@ -3072,14 +3061,9 @@ class Request:
         if self.memory.cuda and torch.cuda.is_initialized():
             groups = [b for model in self.memory.models.values() for b in model.groups()]
             out.update(
-                peak=self.peak,
                 allocated=allocated,
                 reserved=reserved,
                 working_allocator=vt.stats(self.memory.device.index or 0),
-                peak_window=(
-                    "Working high-water plus sampled native backing, carried across resets; "
-                    "other constructions' resident sets left out"
-                ),
                 weight_residency=(
                     self.memory.native.stats() if self.memory.native is not None else None
                 ),
