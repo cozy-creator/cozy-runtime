@@ -1402,9 +1402,6 @@ class Memory:
                 if budget_bytes is not None:
                     vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Arena(self.device.index or 0)
-                # One policy for this Memory lifetime. Registration, phase changes and
-                # dtype rebinding never reinstall an estimated idle-cache window.
-                self.native.clear_streaming_limit()
                 self._apply_cap()
                 self.granularity = int(self.native.granularity)
                 self.prefetch_supported = varena.supports_refill()

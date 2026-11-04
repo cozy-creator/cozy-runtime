@@ -102,7 +102,6 @@ class PreparedRepeat:
         self._load_ordering = "checked"
         self._landed = landed
         # Native immutable capture traces add metadata ownership, never extra physical pins.
-        self._footprints: tuple[Any, ...] = ()
         self._execution_key: str | None = None
 
     @staticmethod
@@ -196,7 +195,6 @@ class PreparedRepeat:
             except Exception as error:
                 _native_error(error)
             self._closed = True
-            self._footprints = ()
             self._execution_key = None
             self._release_owned_bindings()
             self._load = None
@@ -215,7 +213,6 @@ class PreparedRepeat:
             "load_ordering_requested": self._load_ordering_requested,
             "load_ordering": self._load_ordering,
             "working_execution_key": self._execution_key,
-            "capture_footprints": [dict(footprint.facts()) for footprint in self._footprints],
         }
 
 class Execution:
@@ -660,7 +657,6 @@ class PreparedSequence:
                                     phase_controllers[memory] = controller
                                 capsule = controller.wrap(
                                     capsule, *definition,
-                                    footprints=stage._footprints,
                                     execution_key=stage._execution_key,
                                 )
                                 if stage._execution_key is not None:
@@ -668,7 +664,7 @@ class PreparedSequence:
                                         stage._execution_key,
                                         tuple(model for model in claimed if model.memory is memory),
                                     )
-                    elif callable(phase_type) and request is not None and stage._footprints:
+                    elif callable(phase_type) and request is not None and stage._execution_key:
                         # An inter-block graph can own scratch without a weight binding.
                         # Observe it through the sequence's one memory owner, leaving the
                         # current preference plan untouched (None is not an empty plan).
@@ -687,7 +683,7 @@ class PreparedSequence:
                                     controller = phase_type(memory.native)
                                     phase_controllers[memory] = controller
                                 capsule = controller.wrap(
-                                    capsule, None, (), footprints=stage._footprints,
+                                    capsule, None, (),
                                     execution_key=stage._execution_key,
                                 )
                                 if stage._execution_key is not None:
@@ -993,13 +989,9 @@ class _SequenceExecution(Execution):
                     "state": "unsupported_native_admission",
                 })
                 continue
-            current_stage = self.plan.stages[index]
-            # Identity/order are the declaration. Native admission checks the active replay,
-            # its same-definition measurement and actual raw-source capacity at read time.
-            linked = bool(job.link_next(
-                next_job, execution_key=current_stage._execution_key,
-                footprints=current_stage._footprints,
-            ))
+            # Identity/order are the declaration. Native admission checks the active phase's
+            # measurement and actual capacity at read time.
+            linked = bool(job.link_next(next_job))
             self._prefetch_admission.append({
                 "from_stage": index, "to_stage": next_index,
                 "state": "linked" if linked else "native_refusal",
