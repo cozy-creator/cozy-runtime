@@ -188,6 +188,9 @@ def note(
             "capacity": selection["capacity_bytes"],
             "live": selection["live_bytes"],
             "weights": selection["phase_weight_bytes"],
+            "required": selection["required_bytes"],
+            "available": selection["available_bytes"],
+            "target": selection["eligible"][0] if selection["eligible"] else None,
         }
 
 
