@@ -30,13 +30,11 @@ class OperationFile(msgspec.Struct, kw_only=True):
 
 class Read(msgspec.Struct, kw_only=True):
     """An asset an operation mentions: what the file says of it, and its state now by role (`image`, `video`, `audio`, ...).
-    `name` is as the mention spells it, so `coast.2` for that revision. `made_by`: `org/package/function@release`. `parent_fields`:
-    for a state (`kyogre.primal`), what the file says of the asset it is a state of."""
+    `name` is as the mention spells it, so `coast.2` for that revision. `made_by`: `org/package/function@release`."""
 
     name: str
     kind: str = ""
     fields: dict[str, Any] = {}
-    parent_fields: dict[str, Any] = {}
     files: dict[str, OperationFile] = {}
     made_by: str = ""
 
@@ -189,7 +187,7 @@ _MENTION = re.compile(r"<([^<>\n]+)>")
 
 
 def spoken(text: str) -> str:
-    """A state's or a revision's mention in a text as a model reads it: `<kyogre.primal>` as `<kyogre primal>`, `<coast.2>` as `<coast 2>`."""
+    """A dotted name's mention in a text as a model reads it: `<kyogre.primordial>` as `<kyogre primordial>`, `<coast.2>` as `<coast 2>`."""
     return _MENTION.sub(lambda found: f"<{found[1].replace('.', ' ')}>", text)
 
 
