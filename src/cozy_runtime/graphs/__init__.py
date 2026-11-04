@@ -38,7 +38,7 @@ from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import Fault, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import attention_ulysses, cache_owners, kernel_ready
+from cozy_runtime.internal import attention_ulysses, kernel_ready
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
@@ -359,32 +359,6 @@ class _Recorder:
         self.replayed: _Timing = _Timing()
         #: the counters when the current attempt opened (`mark`): receipts are per request
         self.base: dict[str, Any] = {}
-        self._cache_owner: cache_owners.Registration | None = None
-
-    def _try_shrink(self) -> bool:
-        owner = self.domain
-        if owner is None:
-            return False
-        # These are the actual owner/domain gates used by replay and recording. A busy
-        # domain belongs to another sequence; never wait for it from a shrink callback.
-        with cache_owners.try_locks([owner.lock, self.lock]) as claimed:
-            if not claimed:
-                return False
-            binding = self.binding
-            locks = [] if binding is None else [binding.lock, binding.model.memory.lock]
-            with cache_owners.try_locks(locks) as bound:
-                if not bound:
-                    return False
-                if binding is not None and (
-                    binding.model.users or binding.model.retiring or binding.completion_lost
-                    or (binding.last is not None and not binding.last.query())
-                ):
-                    return False
-                if not self.recordings:
-                    if self._cache_owner is not None:
-                        self._cache_owner.suspend()
-                    return False
-                return self.forget()  # queries owned completion, then disables future replay
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -422,8 +396,6 @@ class _Recorder:
         self.failed.clear()
         self.waiting.clear()
         self.landed = LANDED[0]
-        if self._cache_owner is not None:
-            self._cache_owner.suspend()
 
 
 #: each installed component root's region
@@ -728,14 +700,9 @@ def forget_prepared(root: Any, definition: Any) -> None:
 
 def release(torch: Any, root: Any) -> None:
     """A generation's explicit teardown: finish its output copies before releasing addresses."""
-    recorder = _RECORDERS.get(root)
-    if recorder is not None and recorder._cache_owner is not None:
-        recorder._cache_owner.stop()
     retire(torch, root)
     _RECORDERS.pop(root, None)
     domain.release(root)
-    if recorder is not None and recorder._cache_owner is not None:
-        recorder._cache_owner.close()
 
 
 def mark(root: Any) -> None:
@@ -1065,8 +1032,6 @@ def _replay(
         lease.__exit__(None, None, None)
     recorder.gap = ""
     recorder.replays += 1
-    if recorder._cache_owner is not None:
-        recorder._cache_owner.touch()
     recorder.copy_bytes += entry.copied
     return result
 
@@ -1232,11 +1197,6 @@ def _record(
                     graph = None
                     return True
         recorder.recordings[key] = entry
-        if recorder._cache_owner is None:
-            device = torch.device("cuda", owner.device)
-            recorder._cache_owner = cache_owners.register(device, recorder, "_try_shrink")
-        else:
-            recorder._cache_owner.touch()
         recorder.captures += 1
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
         return True
