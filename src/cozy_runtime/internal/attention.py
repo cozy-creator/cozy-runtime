@@ -235,11 +235,6 @@ KERNELS: tuple[Candidate, ...] = (
         shapes=_FA3, artifact="flash-attn3-full", import_name="flash_attn_interface",
     ),
     Candidate(
-        "flash-attn3-fp8", "_cozy_flash_attn3_fp8", upstream.FA3_FP8, _WGMMA, level=8,
-        dtypes=_HALF, max_head_dim=128, gqa=False, artifact="flash-attn3-full",
-        import_name="flash_attn_interface", kernels=_E4M3,
-    ),
-    Candidate(
         "flash-attn4", "_cozy_flash_attn4", upstream.FA4, _WGMMA | _TCGEN05, dtypes=_HALF,
         max_head_dim=256, artifact=_PY, import_name="flash_attn.cute",
     ),
@@ -253,19 +248,9 @@ KERNELS: tuple[Candidate, ...] = (
         dtypes=_HALF, max_head_dim=128, artifact="sageattention", import_name="sageattention",
     ),
     Candidate(
-        "sageattention-fp16pv", "_cozy_sage_fp16pv", upstream.SAGE_FP16PV, _WGMMA, level=8,
-        dtypes=_HALF, max_head_dim=128, artifact="sageattention-full",
-        import_name="sageattention",
-    ),
-    Candidate(
         "kitchen-int8", "_cozy_kitchen_int8", upstream.KITCHEN, _GPU, level=8, dtypes=_HALF,
         max_head_dim=256, masks=True, causal=False, artifact=_KITCHEN,
         import_name="comfy_kitchen",
-    ),
-    Candidate(
-        "flashinfer-bf16-fp8", "_cozy_flashinfer_bf16_fp8", upstream.FLASHINFER, _TCGEN05,
-        level=8, dtypes=_BF16, max_head_dim=128, head_dims=_D128, causal=False,
-        artifact=_PY, import_name="flashinfer", kernels=_E4M3,
     ),
     Candidate(
         "sageattention3-fp4", "_cozy_sage3_fp4", upstream.SAGE3, _MMA, _FP4, level=4,
@@ -328,6 +313,17 @@ KERNELS: tuple[Candidate, ...] = (
     ),
 )  # fmt: skip
 BY_NAME: dict[str, Candidate] = {c.name: c for c in KERNELS}
+#: Kernels no longer here (Paul, 2026-11-04): a pin naming one runs the normal choice and warns,
+#: where an unknown name refuses.
+RETIRED = frozenset({"flash-attn3-fp8", "sageattention-fp16pv", "flashinfer-bf16-fp8"})
+
+
+def retired(pin: str) -> str:
+    """The removed kernel PIN names, else nothing."""
+    name = pin.rpartition("=")[2]
+    return name if name in RETIRED else ""
+
+
 
 #: Each family's kernels per attention level, best first (precision-tiers §2.4; the order is
 #: the release gate's measurements). A site walks its level's cell, each level above, then SDPA.
@@ -879,7 +875,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
                     "attention_kernel_absent",
                     f"{candidate.name}: compiled Kitchen Sol is unavailable",
                 )
-        if candidate.local in (upstream.FA3, upstream.FA3_FP8):
+        if candidate.local is upstream.FA3:
             upstream.bind_fa3(
                 cast("upstream.FlashAttn3", module), (artifact or {}).get("key", "environment")
             )

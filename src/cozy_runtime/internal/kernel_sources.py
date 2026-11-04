@@ -210,13 +210,6 @@ _PINS: tuple[Pin, ...] = (
         "9299da3524d579d84eb92954d3243aa095d55ebdafcf80d6a9766fd96fe8a562",
     ),
     Pin(
-        "flashinfer-python",
-        "0.7.0",
-        _PYPI + "55/72/0ccab3f65c91b24e42fbb9abb9453639b738cd4af90718e95ee0431ac53f/"
-        "flashinfer_python-0.7.0-py3-none-any.whl",
-        "11e564820cde80ec13d351b68fc44cb54a537268bca135204abafc5fadd50240",
-    ),
-    Pin(
         "nvidia-cutlass-dsl",
         "4.8.0",
         _PYPI + "e4/f4/e96f452f7975dd2fd4d2a4af88c63205431dad7efbe63aff6e3a4b1ada17/"
@@ -405,7 +398,7 @@ RECIPES: dict[str, Recipe] = {
             extensions=4,
             # Upstream builds every kernel family the card can run; build the one
             # `sageattention` calls on it: SM90's own, SM89's on SM89/SM120. A family not
-            # built is one upstream's `core` tolerates (`sageattention-full` builds them all).
+            # built is one upstream's `core` tolerates.
             replace_on={
                 sm: tuple(("setup.py", f"if {old}:", f"if {new}:") for old, new in fixes)
                 for sm, fixes in (
@@ -414,15 +407,6 @@ RECIPES: dict[str, Recipe] = {
                     (120, ((_SAGE_SM80, "False"),)),
                 )
             },
-        ),
-        Recipe(
-            "sageattention-full",
-            "setup",
-            ("sageattention",),
-            env=_SAGE,
-            replace=_SAGE_OFFSETS,
-            extensions=4,
-            serves=("sageattention",),
         ),
         Recipe(
             "sageattn3",
@@ -434,9 +418,8 @@ RECIPES: dict[str, Recipe] = {
             # Upstream hard-codes C++17 for both compilers and reads no append variable.
             replace=(("sageattention3_blackwell/setup.py", '"-std=c++17"', '"-std=c++20"'),),
         ),
-        # FlashAttention-3 here, every forward head dimension and dtype, FP8 included, one unit
-        # per dimension: what the `flash-attn3-fp8` pin runs, and FA3 itself on a Hopper card
-        # whose prebuilt one (`prebuilt.fa3`) did not verify.
+        # FlashAttention-3 here, every forward head dimension and dtype, one unit per dimension:
+        # FA3 itself on a Hopper card whose prebuilt one (`prebuilt.fa3`) did not verify.
         Recipe(
             "flash-attn3-full",
             "setup",

@@ -61,8 +61,8 @@ after request execution, including handler failures. An ordinary request therefo
 retains its prepared selection, without repeating resolution or a previous
 request's experimental choice.
 
-`kitchen-int8` and `flashinfer-bf16-fp8` are newly registered explicit experimental
-choices. See [upstream-attention.md](upstream-attention.md) for their actual limits.
+`kitchen-int8` is an explicit experimental choice. See
+[upstream-attention.md](upstream-attention.md) for its actual limits.
 The shared Diffusers registration bridge changes no global active backend and
 refuses collisions with another implementation.
 

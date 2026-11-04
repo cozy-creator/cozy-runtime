@@ -306,8 +306,9 @@ def _env_changes() -> tuple[str, ...]:
 
 
 def _attention_pin(kernel: str, bits: int) -> str:
-    """A request's attention override: its pin, else level 16 at 16 bits (C4)."""
-    return kernel or (attention.EXACT if bits == 16 else "")
+    """A request's attention override: its pin, else level 16 at 16 bits (C4). A pin on a kernel
+    no longer here is none (`invoke` warns)."""
+    return ("" if attention.retired(kernel) else kernel) or (attention.EXACT if bits == 16 else "")
 
 
 def _sealed_entries() -> tuple[str, ...]:
@@ -3662,6 +3663,9 @@ class Executor:
                 attention_sol.observing(ranks=sol_rank_counts, kernels=sol_kernels) as sol_counts,
                 attention_ulysses.observing() as served_impls,
             ):
+                if removed := attention.retired(command.attention_kernel):
+                    said = f"attention kernel {removed} is gone: the normal choice runs"
+                    WARNINGS.append((said, {"code": "attention_kernel_removed"}))
                 served_attention = self._attention_selection(served_attention)
                 if prepared.phases:
                     self._plan_request(command.request_id, prepared.phases)
