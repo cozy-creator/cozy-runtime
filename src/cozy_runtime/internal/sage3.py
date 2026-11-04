@@ -83,9 +83,10 @@ KERNELS = TritonKernels(
             group_mean_kernel,
             {**dict.fromkeys(("q_ptr", "q_out_ptr", "qm_out_ptr"), f"*{dtype}"),
              **dict.fromkeys(("B", "H", "L"), "i32"),
+             "D": "constexpr",
              **dict.fromkeys(("stride_qb", "stride_qh", "stride_ql", "stride_qd", "stride_qmb",
                               "stride_qmh", "stride_qml", "stride_qmd"), "i32"),
-             "D": "constexpr", "GROUP_SIZE": "constexpr", "BF16": "constexpr"},
+             "GROUP_SIZE": "constexpr", "BF16": "constexpr"},
             {"D": dim, "GROUP_SIZE": GROUP_SIZE, "BF16": int(dtype == "bf16")},
         )
         for dtype in ("bf16", "fp16")
