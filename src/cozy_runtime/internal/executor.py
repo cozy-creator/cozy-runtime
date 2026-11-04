@@ -5274,8 +5274,9 @@ def _idle(executor: Executor, order: _Order) -> None:
     """Graphs record and host pages pin off the request path (`graphs.capture_idle`,
     `Memory.pin_idle`): after a command is answered, while no other is open. One arriving makes
     either yield at its next op or stored part, and its wait goes into its call's record
-    (`IDLE_WAITED`). A device fault there poisons the executor, as one in a request does (the
-    machine ends it)."""
+    (`IDLE_WAITED`). A device fault there ends this process at once: no request caused it, and the
+    next one finds the executor gone before it entered and goes to a fresh one (TensorD's `run_on`).
+    """
     answered = 0
 
     def pins() -> bool:
@@ -5295,8 +5296,8 @@ def _idle(executor: Executor, order: _Order) -> None:
             except Exception as exc:
                 traceback.print_exc()
                 if fault(exc) in (Fault.STICKY, Fault.DEVICE):
-                    executor.poisoned = executor.poisoned or f"device fault at idle: {exc}"[:300]
-                    return
+                    print(f"device fault at idle: {exc}"[:300], file=sys.stderr, flush=True)
+                    os._exit(1)
                 row = (
                     "idle work failed: graphs or host pages stay unbuilt",
                     {"reason": type(exc).__name__},
