@@ -640,9 +640,15 @@ def _prepare_assets(
         ]
         if not options:
             options = [(cls, bound) for cls, bound in binding.kinds if cls.kind == "file"]
+        if len(options) > 1:
+            # A video is a video in a list that takes both, though an audio field reads its sound.
+            family = row.media_type.partition("/")[0]
+            options = [option for option in options if option[0].kind == family] or options[:1]
         if len(options) != 1:
             raise InvalidRequest(
-                "Files occurrence has an unsupported media type",
+                f"{input_id} is {row.media_type or 'of no recognised type'}, and "
+                f"{binding.parameter} takes {[cls.kind for cls, _ in binding.kinds]} files: "
+                "convert it and run again",
                 code="asset_media_type",
                 fields=[input_id],
             )
@@ -650,7 +656,8 @@ def _prepare_assets(
         counts[cls.kind] = counts.get(cls.kind, 0) + 1
         if cls.kind in limits and counts[cls.kind] > limits[cls.kind]:
             raise InvalidRequest(
-                "Files media kind count exceeds its declared limit",
+                f"{binding.parameter} has more than {limits[cls.kind]} {cls.kind} files, the "
+                "most this function takes: send fewer",
                 code="asset_count",
                 fields=[binding.parameter],
             )
@@ -783,26 +790,24 @@ def _check_input(
     kind = type(asset).kind
     if not admits(kind, granted.media_type):
         raise InvalidRequest(
-            f"input {granted.input_id!r} is {granted.media_type or 'of no recognised type'} "
-            f"and the field is a {type(asset).__name__}, which admits "
-            f"{list(KIND_MEDIA.get(kind, ())) or 'any recognised type'}. Input binding "
-            "metadata must satisfy the declared type; hydration also verifies its bytes",
+            f"{granted.input_id} is {granted.media_type or 'of no recognised type'}, and this "
+            f"field takes a {kind} file ({', '.join(KIND_MEDIA.get(kind, ()))}): convert it and "
+            "run again",
             code="asset_media_type",
             fields=[granted.input_id],
         )
     if bound is not None and bound.media_types and granted.media_type not in bound.media_types:
         raise InvalidRequest(
-            f"input {granted.input_id!r} is {granted.media_type!r} and this field declares "
-            f"{list(bound.media_types)}",
+            f"{granted.input_id} is {granted.media_type}, and this field takes "
+            f"{', '.join(bound.media_types)}: convert it and run again",
             code="asset_media_type",
             fields=[granted.input_id],
         )
     limits = [limit for limit in (bound.max_bytes if bound is not None else None, cap) if limit]
     if limits and granted.length > min(limits):
         raise InvalidRequest(
-            f"input {granted.input_id!r} is {granted.length} B and this field admits "
-            f"{min(limits)} B. A size bound is a TYPED property of the field, so it refuses "
-            "before the handler is entered and not inside it",
+            f"{granted.input_id} is {granted.length} bytes, and this field takes at most "
+            f"{min(limits)}: send a smaller file",
             code="asset_too_large",
             fields=[granted.input_id],
         )
@@ -888,8 +893,8 @@ def prepare_duration(asset: File, record: Attempt) -> None:
     minimum, maximum = preparation.minimum, preparation.maximum
     if minimum is not None and source < minimum:
         raise InvalidRequest(
-            f"{asset.kind} input {field_id!r} is {_seconds(source)} s; this field needs at "
-            f"least {preparation.min_seconds} s",
+            f"{field_id} is {_seconds(source)} s of {asset.kind}, and this field needs at least "
+            f"{preparation.min_seconds} s: give a longer one",
             code="media_too_short",
             fields=[field_id],
         )
@@ -898,8 +903,8 @@ def prepare_duration(asset: File, record: Attempt) -> None:
     if preparation.excess == "refuse":
         if source > maximum:
             raise InvalidRequest(
-                f"{asset.kind} input {field_id!r} is {_seconds(source)} s; this field admits "
-                f"at most {preparation.max_seconds} s",
+                f"{field_id} is {_seconds(source)} s of {asset.kind}, and this field takes at "
+                f"most {preparation.max_seconds} s: cut it and run again",
                 code="media_too_long",
                 fields=[field_id],
             )

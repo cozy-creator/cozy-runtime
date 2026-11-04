@@ -13,7 +13,9 @@ family) refuses. Bytes no signature names keep their declaration; the decoder is
 
 **A kind is a set of media types, declared here and nowhere else.** `ImageFile` means
 exactly `KIND_MEDIA["image"]`. A package narrows that with `FileBound(media_types=…)`;
-it never widens it, because a decoder the runtime does not have is not a capability.
+it never widens it, because a decoder the runtime does not have is not a capability. A kind
+admits what its decoder reads, not only its own family: `AudioFile` reads the sound of a video
+file (an `.m4a` or a browser's `.webm` is often sniffed as one), `VideoFile` an animated GIF.
 
 
 It lives under `author/` because the KIND table is a fact about the author surface's own
@@ -38,6 +40,9 @@ SIGNATURES: tuple[tuple[int, bytes, str], ...] = (
     (0, b"MM\x00*", "image/tiff"),
     (8, b"WEBP", "image/webp"),
     (4, b"ftypavif", "image/avif"),
+    (4, b"ftypheic", "image/heif"),
+    (4, b"ftypheix", "image/heif"),
+    (4, b"ftyphevc", "image/heif"),
     (4, b"ftypmif1", "image/avif"),
     (4, b"ftypisom", "video/mp4"),
     (4, b"ftypiso5", "video/mp4"),  # StreamingMP4Encoder's fragmented MP4 brand.
@@ -78,6 +83,17 @@ EXTENSIONS: dict[str, str] = {
 #: The media types each ASSET KIND admits. `file` is deliberately open: `File` is the
 #: kind that promises nothing about its contents, and pretending otherwise would make the
 #: three specific kinds mean less.
+_VIDEO: tuple[str, ...] = (
+    "video/mp4",
+    "video/webm",
+    "video/quicktime",
+    "video/x-matroska",
+    "video/x-msvideo",
+    "video/x-m4v",
+    "video/mpeg",
+    "video/x-flv",
+    "video/x-ms-wmv",
+)
 KIND_MEDIA: dict[str, tuple[str, ...]] = {
     "image": (
         "image/png",
@@ -87,17 +103,11 @@ KIND_MEDIA: dict[str, tuple[str, ...]] = {
         "image/tiff",
         "image/webp",
         "image/avif",
+        "image/jp2",
+        "image/vnd.adobe.photoshop",
+        "image/vnd.microsoft.icon",
     ),
-    "video": (
-        "video/mp4",
-        "video/webm",
-        "video/quicktime",
-        "video/x-matroska",
-        "video/x-msvideo",
-        "video/x-m4v",
-        "video/mpeg",
-        "video/x-flv",
-    ),
+    "video": (*_VIDEO, "image/gif"),
     "audio": (
         "audio/wav",
         "audio/ogg",
@@ -107,6 +117,9 @@ KIND_MEDIA: dict[str, tuple[str, ...]] = {
         "audio/aac",
         "audio/opus",
         "audio/x-aiff",
+        "audio/amr",
+        "audio/x-ape",
+        *_VIDEO,
     ),
     "file": (),
 }
