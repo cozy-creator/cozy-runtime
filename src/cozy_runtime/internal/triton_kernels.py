@@ -85,7 +85,10 @@ def _source(entry: TritonEntry) -> ASTSource:
     """The exact `ASTSource` an entry compiles from: builder and loader share it."""
     fn = entry.kernel
     attrs = {(fn.arg_names.index(name),): [["tt.divisibility", 16]] for name in entry.aligned}
-    return ASTSource(fn, dict(entry.signature), constexprs=dict(entry.constexprs), attrs=attrs)
+    # Triton compiles by name but launches by position: its launcher reads the signature's order
+    # as the call's, so a constexpr listed out of place sends every argument after it one off.
+    signature = dict(sorted(entry.signature.items(), key=lambda row: fn.arg_names.index(row[0])))
+    return ASTSource(fn, signature, constexprs=dict(entry.constexprs), attrs=attrs)
 
 
 def _backend(arch: int) -> BaseBackend:

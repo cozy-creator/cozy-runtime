@@ -193,8 +193,12 @@ def _capability(cap: _Capability) -> Iterator[None]:
         for name in ("get_device_capability", "get_device_name", "is_available", "device_count")
     }
 
-    def mark(value: object, *, read: bool = True) -> Callable[..., object]:
+    def mark(name: str, value: object, *, read: bool = True) -> Callable[..., object]:
         def answer(*args: object, **kwargs: object) -> object:
+            # The Runtime's own placement and kernel probes read the real card: under a count of
+            # 1, torch's `get_device_properties(1)` refused a group follower's probe.
+            if getattr(_PLACEMENT, "on", False):
+                return saved[name](*args, **kwargs)
             if read:
                 cap.read = True
             return value
@@ -202,10 +206,10 @@ def _capability(cap: _Capability) -> Iterator[None]:
         return answer
 
     cuda = cap.variant not in _NO_CUDA
-    torch.cuda.get_device_capability = mark(cap.major_minor)  # type: ignore[assignment]
-    torch.cuda.get_device_name = mark(cap.variant)  # type: ignore[assignment]
-    torch.cuda.is_available = mark(cuda, read=False)  # type: ignore[assignment]
-    torch.cuda.device_count = mark(1 if cuda else 0, read=False)  # type: ignore[assignment]
+    torch.cuda.get_device_capability = mark("get_device_capability", cap.major_minor)  # type: ignore[assignment]
+    torch.cuda.get_device_name = mark("get_device_name", cap.variant)  # type: ignore[assignment]
+    torch.cuda.is_available = mark("is_available", cuda, read=False)  # type: ignore[assignment]
+    torch.cuda.device_count = mark("device_count", 1 if cuda else 0, read=False)  # type: ignore[assignment]
     try:
         yield
     finally:
