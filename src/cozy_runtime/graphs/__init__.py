@@ -93,27 +93,37 @@ class Finite:
     the host is at most a step ahead and waits on no step it just sent. A sum holds no tensor of
     latents' size and carries any NaN or infinity to its end. A native loop's reads are unordered
     with its steps, which only write finite values over finite ones. A tensor not finite on entry
-    is not latents yet (SDXL's `image`, which `after` fills)."""
+    is not latents yet (SDXL's `image`, which `after` fills): its entry sum queues with the work
+    and is read with the first step's, so nothing waits before the work starts."""
 
     def __init__(self, torch: Any, tensors: tuple[Any, ...] = ()) -> None:
         self.torch, self.sums = torch, ()
-        self.tensors = tuple(t for t in tensors if t.is_floating_point() and self._sound(self._sums((t,))))
+        self.tensors = tuple(t for t in tensors if t.is_floating_point())
+        self.entry = self._sums(self.tensors)
+        self.kept: tuple[bool, ...] | None = None
 
     def _sums(self, tensors: tuple[Any, ...]) -> tuple[Any, ...]:
         return tuple(tensor.sum(dtype=self.torch.float32) for tensor in tensors)
 
     @staticmethod
-    def _sound(sums: tuple[Any, ...]) -> bool:
+    def _sound(sums: Any) -> bool:
         return all(math.isfinite(value.item()) for value in sums)
+
+    def _latents(self, sums: tuple[Any, ...]) -> Any:
+        if self.kept is None:
+            self.kept = tuple(math.isfinite(value.item()) for value in self.entry)
+        return (value for value, kept in zip(sums, self.kept, strict=False) if kept)
 
     def step(self, tensors: tuple[Any, ...] | None = None) -> bool:
         """Queues the sums of what this step wrote; whether the step before's were finite."""
         queued, self.sums = self.sums, self._sums(self.tensors if tensors is None else tensors)
-        return self._sound(queued)
+        return self._sound(queued if tensors is not None else self._latents(queued))
 
     def last(self) -> bool:
         """After the last step's completion."""
-        return self._sound(self.sums) and self._sound(self._sums(self.tensors))
+        return self._sound(self._latents(self.sums)) and self._sound(
+            self._latents(self._sums(self.tensors))
+        )
 
 
 def _same_shaped(torch: Any, args: Any, kwargs: Any, result: Any) -> tuple[Any, ...]:
@@ -1307,15 +1317,18 @@ def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
             _SETTLING.reset(settling)
 
 
-def _hooked(module: Any) -> str:
+def _hooked(module: Any, overlays: bool = False) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
     at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
     LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
-    the bound pages follow that answer: a replay would keep the captured one."""
+    the bound pages follow that answer: a replay would keep the captured one. With `overlays`, a
+    recording that finds none armed (`lora.ARMED`) records the base forward, so it is served."""
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
                 if callable(getattr(hook, "lora_factors", None)):
+                    if overlays:
+                        continue
                     return f"a LoRA overlay hook on {type(sub).__name__}"
                 if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
                     return f"a package forward hook on {type(sub).__name__}"

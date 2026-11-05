@@ -50,7 +50,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
-from cozy_runtime import graphs, stepcache
+from cozy_runtime import graphs, lora, stepcache
 from cozy_runtime.author import _loop
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import (
@@ -391,7 +391,9 @@ class Loops:
             assert ctx is not None
             site = (step.__code__, tuple(id(model) for model in scope))
             # What a call site learns (`_Site`) depends on a keyed call's layout, not its key.
-            shape = None if key is None else (_layouts(tensors), steps, loop.labels, loop.cache)
+            shape = None if key is None else (
+                _layouts(tensors), steps, loop.labels, loop.cache, _overlays(scope)
+            )
             ident = None if key is None else (key, shape)
             with self._lock:
                 known = self._sites.setdefault(site, _Site())
@@ -422,11 +424,12 @@ class Loops:
             program = None
             try:
                 with _laps(row):
-                    program = _record(loop, tensors, work, key, ctx, row)
+                    program, warmed = _record(loop, tensors, work, key, ctx, row)
                 if program is None:
                     return
                 for sequence, first, count in program.first:
                     _submit(program, sequence, range(first, first + count), loop, ctx, row)
+                warmed()
             except BaseException:
                 if program is not None:
                     program.close()
@@ -457,7 +460,7 @@ class Loops:
         program is kept for the site. Otherwise, or refused, the rest runs eagerly and the
         recording is queued for the idle period after it."""
         with _laps(row):
-            pre, body, rest = _warm(loop, tensors, scope, ctx)
+            pre, body, rest, warmed = _warm(loop, tensors, scope, ctx)
             program, refused, began = None, "", time.perf_counter()
             if rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
@@ -486,6 +489,7 @@ class Loops:
                         raise
                     sequence.close()  # later calls run `again`
                     program.first = ()
+                    warmed()
                     _back(work, program.tensors)
                     return
             row["dropped"] = why
@@ -498,6 +502,7 @@ class Loops:
                     known.unfit.add(shape)
                     known.why[shape] = refused[:400]
         loop.eager(rest, tensors, ctx)
+        warmed()
         _after(loop, tensors, scope, known, shape)
         row["eager"] = self._queue(
             site, known, loop, tensors, len(work), scope, pre, body, ident, shape
@@ -662,12 +667,16 @@ class _Loop:
             return self.steps[:1]
         return self.steps[: max(self.labels.index(label) for label in set(self.labels)) + 1]
 
-    def eager(self, indices: range, tensors: tuple[Any, ...], ctx: Context | None) -> None:
+    def eager(
+        self, indices: range, tensors: tuple[Any, ...], ctx: Context | None, settle: bool = True
+    ) -> graphs.Finite | None:
         """The steps in order, each reported (`on_step(i)`) once queued; the call returns once the
         last has run on the device. Returning with it still queued put its time into the caller's
-        next stage (Qwen-Image's last 0.9 s step into its decode)."""
+        next stage (Qwen-Image's last 0.9 s step into its decode). Unsettled, it returns with them
+        queued, so a recording overlaps them, and gives back their finite check (`Finite.last`)
+        for the caller to read once it waits anyway."""
         if not len(indices):
-            return
+            return None
         request = _REQUEST.get()
         measured = request is not None and tensors[0].is_cuda
         models = _phase_models() if measured else ()
@@ -700,6 +709,8 @@ class _Loop:
                     else:
                         with vt.external_callback(index.device.index):
                             self.on_step(i)
+            if not settle:
+                return finite
             if index.is_cuda:
                 stream = torch.cuda.current_stream(index.device)
                 stream.synchronize()
@@ -727,6 +738,7 @@ class _Loop:
             and request is not None and models
         ):
             request.memory.remember_working_phase(str(key), models)
+        return None
 
     def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
         _once(self.before, tensors)
@@ -757,18 +769,26 @@ def _entering() -> Iterator[set[Any]]:
 
 def _warm(
     loop: _Loop, tensors: tuple[Any, ...], scope: tuple[Model, ...], ctx: Context
-) -> tuple[dict[Model, tuple[str, ...]], dict[Model, tuple[str, ...]], range]:
+) -> tuple[dict[Model, tuple[str, ...]], dict[Model, tuple[str, ...]], range, Callable[[], None]]:
     """A component call's `before` and warm steps (`_Loop.warm`) eagerly, on the caller's
-    tensors: the blocks each ran, and the steps left."""
+    tensors, left queued for a recording to overlap: the blocks each ran, the steps left, and
+    their finite check, which raises once their values are in."""
     with _entering() as seen:
         _once(loop.before, tensors)
     _lap("before")
     pre = _used(seen, scope)
     warm = loop.warm()
     with _entering() as seen:
-        loop.eager(warm, tensors, ctx)
+        finite = loop.eager(warm, tensors, ctx, settle=False)
     _lap("first_step")
-    return pre, _used(seen, scope) or {model: ("",) for model in scope}, loop.steps[len(warm) :]
+    body = _used(seen, scope) or {model: ("",) for model in scope}
+    return pre, body, loop.steps[len(warm) :], partial(_finished, finite, len(warm), loop)
+
+
+def _finished(finite: graphs.Finite | None, done: int, loop: _Loop) -> None:
+    """Unsettled eager steps' finite check (`_Loop.eager`), read where the call waits anyway."""
+    if finite is not None and not finite.last():
+        raise _non_finite(done, len(loop.steps))
 
 
 def _unkept(
@@ -844,10 +864,10 @@ def _record(
     key: Hashable | None,
     ctx: Context,
     row: dict[str, Any],
-) -> _Program | None:
+) -> tuple[_Program | None, Callable[[], None]]:
     """A componentless loop: `before` and its warm steps (`_Loop.warm`) eagerly, then the rest
-    recorded; None when nothing was left or the recording was refused, after the loop ran
-    eagerly to its end."""
+    recorded, overlapping them; None when nothing was left or the recording was refused, after
+    the loop ran eagerly to its end. With it, the warm steps' finite check (`_warm`)."""
     if key is not None:  # the program owns copies; this call's values go in and out
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
@@ -855,13 +875,15 @@ def _record(
     _once(loop.before, tensors)
     _lap("before")
     warm = loop.warm()
-    loop.eager(warm, tensors, ctx)
+    finite = loop.eager(warm, tensors, ctx, settle=False)
+    warmed = partial(_finished, finite, len(warm), loop)
     _lap("first_step")
     rest = loop.steps[len(warm) :]
     if not rest:
+        warmed()
         _back(work, tensors)
         _once(loop.after, work + tensors[len(work) :])
-        return None
+        return None, warmed
     recording = PreparedSequence.record()
     recording.__enter__()
     try:
@@ -887,8 +909,9 @@ def _record(
             _abandon(recording)
             _back(work, tensors)  # the eager rest runs on the caller's tensors
             loop.eager(rest, work + tensors[len(work) :], ctx)
+            warmed()
             _once(loop.after, work + tensors[len(work) :])
-            return None
+            return None, warmed
         stages = len(made.stages)
         row.update(
             mode="resident",
@@ -900,7 +923,7 @@ def _record(
         return _Program(
             ((made, rest.start, len(rest)),), None, "resident", tensors, counter, None, stages, 0,
             verdicts=verdicts,
-        )
+        ), warmed
     finally:
         if not recording._finished:
             recording.close()
@@ -1271,6 +1294,24 @@ def _eligible(
     return models, ""
 
 
+#: each component's LoRA overlay hooks, which are permanent (`lora.Hook`)
+_HOOKS: weakref.WeakKeyDictionary[Any, tuple[lora.Hook, ...]] = weakref.WeakKeyDictionary()
+
+
+def _overlays(scope: tuple[Model, ...]) -> frozenset[int]:
+    """The LoRA overlays armed in the scope's linears now, before the loop (`lora.Hook`), by
+    identity: a program recorded under none never serves a call under one."""
+    armed: set[int] = set()
+    for model in scope:
+        if (hooks := _HOOKS.get(model.module)) is None:
+            hooks = _HOOKS[model.module] = tuple(
+                hook for sub in model.module.modules() for hook in sub._forward_hooks.values()
+                if isinstance(hook, lora.Hook)
+            )
+        armed.update(id(factors) for hook in hooks if (factors := hook.armed()) is not None)
+    return frozenset(armed)
+
+
 def _unresident(model: Model, paths: tuple[str, ...] = ("",)) -> str:
     """Why these blocks of `model` (and its common weights) are not all on the device."""
     binding = model.retain(paths)
@@ -1445,6 +1486,8 @@ def _record_resident(
             owners = tuple(bindings)
             landed = LANDED[0]
             bodies: dict[Any, _Graph] = {}
+            armed: list[str] = []
+            arming = lora.ARMED.set(armed)
             with _guarded(held, frozenset()):
                 for first, count, label in (run for each in runs for run in each):
                     if label in bodies:
@@ -1494,6 +1537,12 @@ def _record_resident(
                     provisional.append(prefix)
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
                     _lap("record_before")
+            lora.ARMED.reset(arming)
+            if armed:
+                raise CapabilityError(
+                    f"a LoRA overlay was armed on {armed[0]} as the loop recorded",
+                    code="prepared_graph_ineligible",
+                )
             _lap("record")
             _yield_point()
             parts: list[tuple[int, int]] = []
@@ -1542,7 +1591,7 @@ def _checked(model: Model) -> None:
         raise CapabilityError(
             "native loops need a fixed baked LoRA representation", code="prepared_graph_ineligible"
         )
-    if why := graphs._hooked(model.module):
+    if why := graphs._hooked(model.module, overlays=True):
         raise CapabilityError(why, code="prepared_graph_ineligible")
     if not model.memory.cuda:
         raise CapabilityError("native loops need CUDA weights", code="prepared_graph_ineligible")
@@ -1760,7 +1809,6 @@ class _Graph:
                     None if error is None else type(error), error,
                     None if error is None else error.__traceback__,
                 )
-        self.domain.control.synchronize()
         if error is None and len(self.pieces) % 3 != 1:
             raise CapabilityError(
                 "a step cache's branches do not close in its step", code="prepared_graph_ineligible"
