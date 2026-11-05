@@ -474,14 +474,14 @@ class Loops:
                 with suppress(Exception):  # refused, its own recording says why
                     opened = _opened(work)
             pre, body, rest, warmed, peak = _warm(loop, tensors, scope, ctx)
-            if peak and shape is not None:
+            if shape is not None:
                 with self._lock:
-                    known.peak[shape] = peak
+                    known.peak[shape] = max(peak, known.peak.get(shape, 0))
             program, refused, began = None, "", time.perf_counter()
             if rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
-                    _pool(peak, known.need.get(shape, 0)), opened,
+                    _reserve(known, shape, loop), opened,
                 )
             elif opened is not None:
                 opened.close()
@@ -549,7 +549,7 @@ class Loops:
             with _laps(row):
                 program = _record_whole(
                     loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident,
-                    _pool(known.peak.get(shape, 0), known.need.get(shape, 0)),
+                    _reserve(known, shape, loop),
                 )
         except Exception as error:
             with self._lock:
@@ -777,6 +777,32 @@ def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
 
 
 @contextmanager
+def _measuring() -> Iterator[list[int]]:
+    """The working peak of each eager part run inside (`_PEAKS`), as the core measured it."""
+    peaks: list[int] = []
+    token = _PEAKS.set(peaks)
+    try:
+        yield peaks
+    finally:
+        _PEAKS.reset(token)
+
+
+def _part(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
+    """`before` or `after` eagerly; under `_measuring`, one observed pass whose working peak joins
+    the steps' (its components' passes are its own: an enclosing observation owns the device)."""
+    request, peaks = _REQUEST.get(), _PEAKS.get()
+    if fn is None or request is None or peaks is None or not tensors[0].is_cuda:
+        _once(fn, tensors)
+        return
+    with working_phase.observing(
+        tensors[0].device.index, "eager", request.working_phases
+    ) as observation:
+        fn(*tensors)
+    if observation is not None and observation.result is not None:
+        peaks.append(int(observation.result.get("peak_bytes") or 0))
+
+
+@contextmanager
 def _entering() -> Iterator[set[Any]]:
     """The models whose forwards run inside: residency adds each one it opens."""
     seen: set[Any] = set()
@@ -795,18 +821,14 @@ def _warm(
     """A component call's `before` and warm steps (`_Loop.warm`) eagerly, on the caller's
     tensors, left queued for a recording to overlap: the blocks each ran, the steps left, their
     finite check, which raises once their values are in, and their working peak (`_PEAKS`)."""
-    with _entering() as seen:
-        _once(loop.before, tensors)
-    _lap("before")
-    pre = _used(seen, scope)
-    warm = loop.warm()
-    peaks: list[int] = []
-    token = _PEAKS.set(peaks)
-    try:
+    with _measuring() as peaks:
+        with _entering() as seen:
+            _part(loop.before, tensors)
+        _lap("before")
+        pre = _used(seen, scope)
+        warm = loop.warm()
         with _entering() as seen:
             finite = loop.eager(warm, tensors, ctx, settle=False)
-    finally:
-        _PEAKS.reset(token)
     _lap("first_step")
     body = _used(seen, scope) or {model: ("",) for model in scope}
     rest = loop.steps[len(warm) :]
@@ -916,15 +938,11 @@ def _record(
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    _once(loop.before, tensors)
-    _lap("before")
-    warm = loop.warm()
-    peaks: list[int] = []
-    token = _PEAKS.set(peaks)
-    try:
+    with _measuring() as peaks:
+        _part(loop.before, tensors)
+        _lap("before")
+        warm = loop.warm()
         finite = loop.eager(warm, tensors, ctx, settle=False)
-    finally:
-        _PEAKS.reset(token)
     warmed = partial(_finished, finite, len(warm), loop)
     _lap("first_step")
     rest = loop.steps[len(warm) :]
@@ -934,7 +952,7 @@ def _record(
         _once(loop.after, work + tensors[len(work) :])
         return None, warmed
     recording = PreparedSequence.record()
-    recording._reserve = _pool(max(peaks, default=0), 0)
+    recording._reserve = _pool(max(peaks, default=0), 0, loop.after is not None)
     recording.__enter__()
     try:
         why = None
@@ -1128,7 +1146,7 @@ class _IdleRecording:
                 shape = self.ident[1]  # type: ignore[index]
                 program = _record_whole(
                     self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident,
-                    _pool(self.known.peak.get(shape, 0), self.known.need.get(shape, 0)),
+                    _reserve(self.known, shape, self.loop),
                 )
         finally:
             lora.LOOP.reset(overlays)
@@ -1165,9 +1183,10 @@ def _after(
     if shape is None or shape in known.after:
         _once(loop.after, tensors)
         return
-    with _entering() as seen:
-        _once(loop.after, tensors)
+    with _entering() as seen, _measuring() as peaks:
+        _part(loop.after, tensors)
     known.after[shape] = _used(seen, scope)
+    known.peak[shape] = max([known.peak.get(shape, 0), *peaks])
 
 
 def _back(work: tuple[Any, ...], tensors: tuple[Any, ...]) -> None:
@@ -1383,11 +1402,22 @@ def _abandon(recording: _SequenceCapture, failure: BaseException | None = None) 
     gc.collect()
 
 
-def _pool(peak: int, need: int) -> int:
-    """What a recording's pool reserves: the core's size for the warm steps' own working peak
-    (`vt.pool_bytes`), not the process's (a load's transients counted there: an int8 DiT's
-    20 GB), and at least what an attempt before it lacked (`_pool_need`). 0: the process's peak."""
-    return max(vt.pool_bytes(peak) if peak else 0, need)
+def _pool(peak: int, need: int, unseen: bool = False) -> int:
+    """What a recording's pool reserves: the core's size for the working peak of the eager parts
+    it records (`vt.pool_bytes`: `before`, the warm steps, `after`), not the process's (a load's
+    transients counted there: an int8 DiT's 20 GB), and at least what an attempt before it lacked
+    (`_pool_need`). An `after` that has not run (`unseen`: a first call's) only the request's peak
+    bounds: SDXL's steps measured 0.52 GiB, a pool too small for its decode (run 34004). 0: the
+    process's peak."""
+    floor = int(vt.stats(torch.cuda.current_device())["allocated_peak"]) if unseen else 0
+    return max(vt.pool_bytes(peak) if peak else 0, need, floor)
+
+
+def _reserve(known: _Site, shape: Hashable, loop: _Loop) -> int:
+    """`_pool` for a site's recording of `shape`: what its eager parts measured, what an attempt
+    lacked, and the request's peak while its `after` has not run eagerly (`_after`)."""
+    unseen = loop.after is not None and shape not in known.after
+    return _pool(known.peak.get(shape, 0), known.need.get(shape, 0), unseen)
 
 
 def _pool_need(recording: _SequenceCapture) -> int:
@@ -1894,21 +1924,16 @@ class _Graph:
             ):
                 self._replay_key = working_phase.execution_key(actual, "runtime.graph/1")
 
-    def abort(self, error: BaseException | None = None) -> None:
-        """End a failed capture with its error so the owner cannot publish a partial graph."""
-        try:
-            self.end(error)
-        except BaseException as failure:
-            if failure is error:
-                self.reset()
-                return
+    def abort(self, error: BaseException) -> None:
+        """End a failed capture with its error so the owner cannot publish a partial graph. The
+        caller raises `error`: what ending or resetting the capture raised after it (the join of a
+        capture it invalidated: 901, run 33993) is a note on it, never in its place."""
+        for close in (partial(self.end, error), self.reset):
             try:
-                self.reset()
-            except BaseException as reset_error:
-                failure.add_note(f"Graph reset also failed: {reset_error!r}")
-            raise
-        else:
-            self.reset()
+                close()
+            except BaseException as failure:
+                if failure is not error:
+                    error.add_note(f"ending the capture also raised: {failure!r}")
 
     def nodes(self) -> int:
         """The recorded graph's node count: what it launches, whatever launched it."""
