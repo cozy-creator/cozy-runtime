@@ -1427,6 +1427,20 @@ class Memory:
         block.overlay = overlay
         block.generation += 1
 
+    def _rearm(self, model: Model) -> None:
+        """A forward armed another overlay, which H3 does inside it: all its blocks move now and the
+        phase is declared again, so the core plans from the Regions this pass will use."""
+        assert model.fill is not None
+        for block in model.groups():
+            overlay = model.fill.overlay(block.path, block.parts)
+            if overlay == block.overlay or block.count or block.retained or block.loading:
+                continue
+            if block.paged() or block.parked:
+                self._switch_overlay(block, overlay)
+            else:
+                block.overlay = overlay
+        self._activate_phase(model)
+
     def _idle(self, block: _Block) -> None:
         if self.native is not None and not (block.count or block.retained or block.loading):
             # The DLPack storage owner holds the physical pin. A surviving external alias
@@ -1669,10 +1683,9 @@ class Memory:
                 self._phase_plan_models.clear()
                 self._note_phase_plan("unplanned", reason)
 
-    def _refresh_phase_plan(self, names: frozenset[str], opening: Model) -> None:
-        """Every Region of this phase, in order: the core plans from these. A Region is an address
-        and a Source; nothing here moves bytes. `opening`'s forward has armed its overlays, so its
-        Regions are those it will use; another model's are those it used last."""
+    def _refresh_phase_plan(self, names: frozenset[str]) -> None:
+        """Every Region of this phase, in order, under the overlays its blocks last used: the core
+        plans from these. A Region is an address and a Source; nothing here moves bytes."""
         models = [model for model in self.models.values() if model.name in names]
         reason = ""
         if len(models) != len(names) or {model.name for model in models} != set(names):
@@ -1688,16 +1701,6 @@ class Memory:
                 if block.gathered is not None:
                     reason = "host_gathered_representation"
                     break
-                overlay = block.overlay
-                if model is opening and model.fill is not None:
-                    overlay = model.fill.overlay(block.path, block.parts)
-                if overlay != block.overlay:
-                    if block.count or block.retained or block.loading:
-                        reason = "overlay_in_use"
-                        break
-                    if block.paged() or block.parked:
-                        self._switch_overlay(block, overlay)
-                    block.overlay = overlay
                 raw_needed = (
                     block.aliases is None or any(block.aliases.values()) or not block.finals
                 )
@@ -1762,7 +1765,7 @@ class Memory:
                     request.phase_changes.append(
                         {"models": sorted(names), "retention": "native_demand"}
                     )
-            self._refresh_phase_plan(names, model)
+            self._refresh_phase_plan(names)
 
     def _final_views(self, block: _Block) -> None:
         if not block.finals:
@@ -1906,6 +1909,7 @@ class Memory:
         overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
         if overlay != block.overlay and (block.paged() or block.parked):
             self._switch_overlay(block, overlay)
+            self._rearm(model)
         with self.lock:
             if not model.users or model.thread != threading.get_ident():
                 raise ResidencyError("weight preparation requires an active model scope")
@@ -2120,7 +2124,7 @@ class Memory:
                 self.forget_working_phases(request)
                 if self.pages is not None:
                     request.record_fills()
-                    self.pages.request_ended()  # the pages it refilled: their worth
+                    self.pages.request_ended()  # the pages it refilled are their worth
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
@@ -2211,7 +2215,7 @@ class Request:
         self.prefetch_completed = 0
         self.ahead = _ahead(memory)
         self.allocator = _allocator(memory)
-        self.trace: list[dict[str, object]] = []
+        self._trace: list[dict[str, object]] = []
         self.ended: dict[str, Any] | None = None
         if memory.cuda and torch.cuda.is_initialized() and not memory.requests:
             # The working peak is process-wide since its reset: alone, a request starts its own,
@@ -2267,7 +2271,7 @@ class Request:
         """A block read here, outside the core: on the host, or where no core runs."""
         self.fill(block.model.name, block.index, nbytes, "store", False, ns, time.time() * 1000)
         if bake is not None:
-            self.bakes.append((self.trace[-1], bake))
+            self.bakes.append((self._trace[-1], bake))
 
     def fill(
         self, name: str, block: int, nbytes: int, origin: str, ahead: bool, ns: int, at_ms: float
@@ -2283,9 +2287,9 @@ class Request:
             self.baked_bytes += nbytes
             self.baked_ns += ns
         self.prefetch_completed += ahead
-        self.trace.append(
+        self._trace.append(
             {
-                "sequence": len(self.trace),
+                "sequence": len(self._trace),
                 "set": name,
                 "block": block,
                 "bytes": nbytes,
@@ -2294,13 +2298,19 @@ class Request:
             }
         )
         if not ahead:
-            self.trace[-1].update(ns=ns, at_unix_ms=round(at_ms, 1))
+            self._trace[-1].update(ns=ns, at_unix_ms=round(at_ms, 1))
 
     def record_fills(self) -> None:
         """The fills TensorFS logged since the last look."""
         for row in self.memory.pages.drain():
             self.fill(*row)
         self.sample()
+
+    @property
+    def trace(self) -> list[dict[str, object]]:
+        if self.memory.pages is not None:
+            self.record_fills()
+        return self._trace
 
     def _bakes(self) -> dict[str, int]:
         """The bakes this request ran after a store read: each one's host and device time onto
@@ -2316,8 +2326,7 @@ class Request:
     def stats(self) -> dict[str, Any]:
         if self.ended is not None:
             return self.ended
-        if self.memory.pages is not None:
-            self.record_fills()
+        trace = self.trace
         self.sample()
         allocated, reserved = self.memory._figures()
         out: dict[str, Any] = {
@@ -2333,7 +2342,7 @@ class Request:
                 "bake": self._bakes(),
             },
             "baked_pages": self.memory.pages.stats() if self.memory.pages is not None else None,
-            "trace": list(self.trace),
+            "trace": list(trace),
             "trace_scope": "fills",
             "phases": list(self.phase_changes),
             "working_phases": list(self.working_phases),
