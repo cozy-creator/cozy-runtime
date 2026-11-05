@@ -413,6 +413,11 @@ A package whose signature names a video or audio input must install
 static reader has no environment to check). Media inputs are handles read through the
 attempt's one budget; see [Media inputs](docs/files.md).
 
+An image function declares exactly the inputs its model uses, so a box never offers one that does
+nothing, and a caller who sends one gets the usual unknown-field warning. `ImageRequest` holds what
+every model honours (`prompt`, `aspect_ratio`, `megapixels`, `seed`), `PictureRequest` adds
+`pictures`, and `Steps`, `Guidance` and `NegativePrompt` type the knobs a function adds.
+
 Image generation uses the shared `ImageRequest` output-canvas limit: aspect ratios must be
 between **1:16 and 16:1**, inclusive. Explicit ratios outside this range are rejected during
 request decoding, before admission or model work. A canvas inferred from a reference is checked
@@ -427,18 +432,9 @@ references (xs-135, xs-139): `pictures: list[Picture]` (or a `Reference` subclas
 media and fields), and `render(prompt, references, label)` puts each mention in the model's own
 words, the label being how the model refers to the Nth reference (`lambda n, picture: f"Picture
 {n}"`). Names match in any case with `_`, `-` and space alike; a mention of no reference stays as
-written with a warning. `ImageRequest.pictures` takes these, and its first picture sets the default
-canvas. Nothing below the author library knows the convention: a package may declare any input
+written with a warning. `PictureRequest.pictures` takes these, and its first picture sets the default
+canvas; `PlacedPicture` adds the `box` a model with layout control reads. Nothing below the author library knows the convention: a package may declare any input
 shape. Attached files are `File`, `ImageFile`, `VideoFile` and `AudioFile`.
-
-Shots and upscales share a contract too (xs-139), so a project compiles a shot into any package's
-call: `ShotRequest`/`ShotResult` (`prompt`, `duration_s`, `beats`, `style`, `soundscape`,
-`references` tagged on `kind`, `plate`, `first_frame`/`last_frame`, `continue_from`,
-`aspect_ratio`, `preset`; the result's `video` and `latents`) and `UpscaleRequest`/`UpscaleResult`.
-A package subclasses them, narrows `references` to the kinds its model takes and adds its own
-fields. Nothing declares the contract: the project reads each function's request schema and sends
-the fields it declares, and a `duration_s` schema extra (`max_piece_s`, `min_piece_s`) states its
-piece limits.
 
 Image inputs can separately opt into preparation on a field or an `Files` argument:
 

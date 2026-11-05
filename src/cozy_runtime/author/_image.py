@@ -1,10 +1,11 @@
-"""cr-219 — one request and one result for every image model.
+"""What image functions share: the few inputs every model honours, and the types of the rest.
 
-The same names, types and meaning in every image package, so swapping one model for another never
-breaks a request. Every optional knob is None by default: the model's own recommended value, which
-its README and `--describe` state. A model holds an aspect ratio to its range, at most 1:16 through
-16:1 (a `clamp` row), and warns for a knob it has no use for. A package subclasses `ImageRequest`
-only to narrow `pictures` to its model's count or to add a knob no other model has.
+A function declares exactly the inputs its model uses, so what it doesn't have is an unknown field
+(a warning) and a box never offers it. `ImageRequest` is what they all honour, `PictureRequest` adds
+`pictures`, and `Steps`, `Guidance` and `NegativePrompt` type the knobs a function adds. Every
+optional input is None by default: the model's own recommended value, which its README and
+`--describe` state. A model holds an aspect ratio to its range, at most 1:16 through 16:1 (a `clamp`
+row).
 """
 
 from __future__ import annotations
@@ -33,13 +34,17 @@ AspectRatio = Annotated[
     ),
 ]
 Seed = Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)]
+#: A checkpoint's recipe may supply these three; else the model's.
+Steps = ModelDefault[Annotated[int, msgspec.Meta(ge=1)] | None]
+Guidance = ModelDefault[Annotated[float, msgspec.Meta(ge=0)] | None]
+NegativePrompt = ModelDefault[str | None]
 
 #: Pixels in one megapixel: 1024², as the image packages size their tiers.
 MEGAPIXEL = 1 << 20
 MAX_IMAGE_ASPECT_RATIO = 16
 
 
-def _ratio(value: str) -> tuple[int, int]:
+def ratio_of(value: str) -> tuple[int, int]:
     """`W:H` in lowest whole numbers, however it is written. Text that names no ratio refuses."""
     sides = re.split(r"\s*[:/xX\u00d7]\s*", value.strip())
     try:
@@ -67,11 +72,13 @@ class Picture(Reference, kw_only=True):
     upright and scaled down to 16 MP at most."""
 
     image: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
-    #: What it is, for a model that reads a picture better named in words.
-    description: str = ""
-    #: Where it goes in the output, for a model with layout control; None places it nowhere in
-    #: particular. A placed picture is an element, not the canvas: the size is the model's
-    #: text-to-image default.
+
+
+class PlacedPicture(Picture, kw_only=True):
+    """A picture for a model with layout control."""
+
+    #: Where it goes in the output; None places it nowhere in particular. A placed picture is an
+    #: element, not the canvas: the size is the model's text-to-image default.
     box: Box | None = None
 
 
@@ -138,30 +145,21 @@ class Sizes:
 
 
 class ImageRequest(msgspec.Struct):
-    #: Names pictures as `<name>`; the model reads each mention in its own words (`rendered`).
+    """What every image model honours but one, HunyuanImage 3.0, which picks its own size."""
+
+    #: A function that takes `pictures` reads each `<name>` in it in the model's own words.
     prompt: str
-    #: Images, in order, that the request edits or composes; none is text to image. A package
-    #: states its model's count with `Annotated[list[Picture], msgspec.Meta(max_length=N)]`;
-    #: a text-only model says 0.
-    pictures: Annotated[list[Picture], msgspec.Meta(max_length=16)] = msgspec.field(
-        default_factory=list
-    )
     #: W:H, held to 1:16 through 16:1. None: the first picture's, else the model's default.
     aspect_ratio: AspectRatio | None = None
     #: Any size, in 1024² pixels. None: the first picture's pixel count, else the model's default.
     megapixels: Annotated[float, msgspec.Meta(gt=0)] | None = None
-    #: A checkpoint's or adapter's recipe may supply these three (`ModelDefault`); else the model's.
-    steps: ModelDefault[Annotated[int, msgspec.Meta(ge=1)] | None] = None
-    guidance: ModelDefault[Annotated[float, msgspec.Meta(ge=0)] | None] = None
-    negative_prompt: ModelDefault[str | None] = None
     #: Given, the request is reproducible; omitted, the model draws one and returns it.
     seed: Seed | None = None
-    prompt_upsampling: bool | None = None
 
     def __post_init__(self) -> None:
         # msgspec calls this while decoding, before admission or any model work.
         if self.aspect_ratio is not None:
-            self.aspect_ratio = ":".join(map(str, _ratio(self.aspect_ratio)))
+            self.aspect_ratio = ":".join(map(str, ratio_of(self.aspect_ratio)))
 
     def target(
         self, first: tuple[int, int] | None, *, megapixels: float, ratio: str = "1:1"
@@ -170,11 +168,11 @@ class ImageRequest(msgspec.Struct):
         (`first`: its upright width and height), so an edit stays as close as possible to the image
         it edits; with no picture, the model's default (`megapixels`, `ratio`)."""
         if self.aspect_ratio is not None:
-            width, height = _ratio(self.aspect_ratio)
+            width, height = ratio_of(self.aspect_ratio)
         elif first is not None:
             width, height = first
         else:
-            width, height = _ratio(ratio)
+            width, height = ratio_of(ratio)
         if self.megapixels is not None:
             pixels = self.megapixels * MEGAPIXEL
         elif first is not None:
@@ -206,6 +204,23 @@ class ImageRequest(msgspec.Struct):
     def reference_boxes(self) -> NoReturn:
         raise _removed("reference_boxes")
 
+    def rendered(self, adj: Adjustments | AdjustmentRows) -> str:
+        """The prompt as the model reads it. With no pictures a `<name>` mention names nothing, so
+        it stays as written, with a warning."""
+        return render(self.prompt, [], adj=adj, listed="pictures")
+
+    def drawn_seed(self) -> int:
+        """The seed given, else a fresh one the result reports."""
+        return self.seed if self.seed is not None else secrets.randbits(53)
+
+
+class PictureRequest(ImageRequest):
+    #: Images, in order, that the request edits or composes; none is text to image. A package
+    #: states its model's count with `Annotated[list[Picture], msgspec.Meta(max_length=N)]`.
+    pictures: Annotated[list[Picture], msgspec.Meta(max_length=16)] = msgspec.field(
+        default_factory=list
+    )
+
     def images(self) -> list[ImageFile]:
         """The pictures' images, in order."""
         return [picture.image for picture in self.pictures]
@@ -218,30 +233,6 @@ class ImageRequest(msgspec.Struct):
         """The prompt as the model reads it: each `<name>` mention in the model's own words for
         the Nth picture (`label`); a mention of no picture stays as written, with a warning."""
         return render(self.prompt, self.pictures, label, adj=adj, listed="pictures")
-
-    def placements(self) -> list[tuple[float, float, float, float] | None]:
-        """Each picture's `box` checked (x0 < x1 and y0 < y1), or None where it has none."""
-        return [
-            None if picture.box is None else corners(picture.box, f"pictures.{index}.box")
-            for index, picture in enumerate(self.pictures)
-        ]
-
-    def unplaced(self, adj: Adjustments, reason: str) -> None:
-        """A warning for each picture's `box`, for a model with no layout control."""
-        for index, picture in enumerate(self.pictures):
-            if picture.box is not None:
-                adj.warn(f"pictures.{index}.box", f"ignored: {reason}")
-
-    def drawn_seed(self) -> int:
-        """The seed given, else a fresh one the result reports."""
-        return self.seed if self.seed is not None else secrets.randbits(53)
-
-    def ignored(self, adj: Adjustments, *fields: str, reason: str) -> None:
-        """A warning for each of `fields` the request set although this model has no use for it;
-        None, False and "" ask for nothing and pass silently."""
-        for field in fields:
-            if getattr(self, field) not in (None, False, "", []):
-                adj.warn(field, f"ignored: {reason}")
 
 
 class ImageResult(msgspec.Struct):
@@ -279,6 +270,16 @@ def corners(box: Sequence[float], field: str) -> tuple[float, float, float, floa
             fields=(field,),
         )
     return x0, y0, x1, y1
+
+
+def placements(
+    pictures: Sequence[PlacedPicture],
+) -> list[tuple[float, float, float, float] | None]:
+    """Each picture's `box` checked (x0 < x1 and y0 < y1), or None where it has none."""
+    return [
+        None if picture.box is None else corners(picture.box, f"pictures.{index}.box")
+        for index, picture in enumerate(pictures)
+    ]
 
 
 def held[T: (int, float)](

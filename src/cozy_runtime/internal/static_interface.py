@@ -322,12 +322,17 @@ _AUTHOR_TYPES = (
     "EncodingRule",
     "ImageRequest",
     "ImageResult",
+    "PictureRequest",
     "Reference",
     "Picture",
+    "PlacedPicture",
     "Box",
     "Region",
     "AspectRatio",
     "Seed",
+    "Steps",
+    "Guidance",
+    "NegativePrompt",
     "Follow",
     "Preset",
     "Latents",
@@ -336,7 +341,15 @@ _AUTHOR_TYPES = (
 )
 #: Author-surface structs a package's struct may extend: the image interface (cr-219) and the
 #: named references (xs-135, xs-139).
-_AUTHOR_STRUCTS = ("ImageRequest", "ImageResult", "Reference", "Picture", *_VIDEO_STRUCTS)
+_AUTHOR_STRUCTS = (
+    "ImageRequest",
+    "PictureRequest",
+    "ImageResult",
+    "Reference",
+    "Picture",
+    "PlacedPicture",
+    *_VIDEO_STRUCTS,
+)
 #: Author-surface callables a folded constant may reach: each validates its own arguments.
 #: `data_values` reads committed JSON through the same function as the imported app.
 _AUTHOR_VALUES = (
