@@ -12,8 +12,7 @@ F2): its eager steps cost more than the recording on a host-bound CPU (SDXL int8
 comes. Refused, its rest runs eagerly and the recording is queued for the idle period after it
 (`_IdleRecording`, xs-134 F), in the call's component scope; a command that arrives preempts it
 between its parts (never inside package code). A call that finds it unrecorded (no idle period
-yet, or preempted) records the whole call before running any of it and runs it natively from its
-start: one plan and no eager step. No idle period
+yet, or preempted) takes its place as a first call. No idle period
 opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so a call queued behind
 another never waits for idle work. One that does not fit, or whose code cannot run outside its
 request, is not tried again for that layout, and the calls say why. Other component loops stay
@@ -24,6 +23,10 @@ vs 737 s).
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
 `before` and the first step run eagerly, then the rest natively. A refusal before submission drops
 that attempt and the rest runs eagerly; nothing runs twice. After submission nothing falls back.
+
+A new program is trusted only once one native pass of it reproduces eager, bit for bit, from the
+same tensors (`_verify`); otherwise it goes and the calls stay eager. A step that leaves its
+latents non-finite ends the run (`graphs.Finite`).
 """
 
 from __future__ import annotations
@@ -102,6 +105,8 @@ _REFUSED = (
 )
 #: a refusal by one of them (`_refusal`)
 _UNRECORDABLE = "the step cannot be recorded"
+
+
 #: a refusal that says nothing against the graph (`_refusal`)
 _WAITING = "capture waits for kernel readiness"
 #: request id -> its loops, for the run record (`execution.loops`)
@@ -206,10 +211,12 @@ class _Program:
     #: its idle recording's parts and total (ms)
     recorded: dict[str, float] | None = None
     closed: bool = False
+    #: one pass of `before`, a step and `after`, until `_verify` has run it
+    check: PreparedSequence | None = None
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
-        rest = () if self.again is None else (self.again,)
-        return (*(sequence for sequence, _, _ in self.first), *rest)
+        kept = tuple(sequence for sequence in (self.again, self.check) if sequence is not None)
+        return (*(sequence for sequence, _, _ in self.first), *kept)
 
     def close(self) -> None:
         if self.closed:
@@ -219,7 +226,7 @@ class _Program:
         self.closed = True
         # Closed definitions must not keep their Python static tensors/outputs alive merely
         # because the cache dictionary has not yet removed this stale program.
-        self.first, self.again, self.tensors, self.counter = (), None, (), None
+        self.first, self.again, self.check, self.tensors, self.counter = (), None, None, (), None
 
     def bindings(self) -> tuple[Binding, ...]:
         """The weights its graphs read."""
@@ -394,12 +401,10 @@ class Loops:
                     if self._kept.get(site) is kept:
                         del self._kept[site]
                 _close_idle(kept)
-            job = None if ident is None else known.pending.get(ident)
-            if scope and job is None:
+            if scope:
+                with self._lock:  # Its idle recording has not run: this call records instead.
+                    known.pending.pop(ident, None)
                 self._first(site, known, loop, tensors, work, scope, ident, shape, ctx, row)
-                return
-            if job is not None:
-                self._take_over(site, known, job, loop, tensors, work, scope, ctx, row)
                 return
             program = None
             try:
@@ -435,38 +440,53 @@ class Loops:
     ) -> None:
         """A component call its site has no program for: `before` and its first step eagerly,
         warming their kernels and naming their blocks. A keyed whole call then records on its
-        program's own copies and runs the rest natively from its second step; the program is
-        kept for the site. Otherwise, or refused, the rest runs eagerly and the recording is
-        queued for the idle period after it."""
+        program's own copies, checks it against those eager parts (`_verify`) and runs the rest
+        natively from its second step; the program is kept for the site. Otherwise, or refused,
+        the rest runs eagerly and the recording is queued for the idle period after it."""
+        keyed = ident is not None and loop.phases is None
+        start = tuple(value.clone() for value in work) if keyed else ()
         with _laps(row):
+            landed = LANDED[0]
             pre, body = _warm(loop, tensors, scope, ctx)
             program, refused, began = None, "", time.perf_counter()
-            if not _unkept(known, loop, ident, shape, body):
+            if not _unkept(known, loop, ident, shape, body) and landed == LANDED[0]:
                 program, refused = _record_first(loop, tensors, len(work), scope, pre, body, ident)
+                if program is not None:
+                    want = _finished(loop, tensors, len(work))
         if program is not None:
-            row.update(
-                mode=program.mode,
-                stages=program.stages,
-                blocks=program.blocks,
-                whole_call="recorded on its first call, after its first step",
-                capture_ms=round((time.perf_counter() - began) * 1000, 3),
-            )
+            capture_ms = round((time.perf_counter() - began) * 1000, 3)
             self._install(site, program, scope[0].memory)
             with _taken(program.lock, ctx), _pinned(program) as why:
                 if not why:
                     ((rest, first, count),) = program.first
                     try:
-                        _submit(program, rest, range(first, first + count), loop, ctx, row)
+                        refused = _verify(program, start, want, loop, ctx)
+                        if not refused:
+                            row.update(
+                                mode=program.mode,
+                                stages=program.stages,
+                                blocks=program.blocks,
+                                whole_call="recorded on its first call, after its first step",
+                                capture_ms=capture_ms,
+                            )
+                            _submit(program, rest, range(first, first + count), loop, ctx, row)
                     except BaseException:
                         program.close()
                         raise
-                    rest.close()  # later calls run `again`
-                    program.first = ()
-                    _back(work, program.tensors)
-                    return
-            row["dropped"] = why
+                    if not refused:
+                        rest.close()  # later calls run `again`
+                        program.first = ()
+                        _back(work, program.tensors)
+                        return
+            if not refused:
+                row["dropped"] = why
+            self._discard(site, program)  # a program never kept unchecked
         if refused:
-            _refused(row, "whole call on its first call", refused)
+            if program is None:
+                _refused(row, "whole call on its first call", refused)
+            else:
+                row["refusals"].append(f"whole call on its first call: {refused}")
+                graphs.safeguard("replay_mismatch", refused)
             if refused.startswith(_UNRECORDABLE):
                 # Its idle recording would meet the same error and keep the next call waiting
                 # on it (an RTX 3060's SDXL w1 559 ms, then its own doomed recording).
@@ -478,59 +498,6 @@ class Loops:
         row["eager"] = self._queue(
             site, known, loop, tensors, len(work), scope, pre, body, ident, shape
         )
-
-    def _take_over(
-        self,
-        site: Hashable,
-        known: _Site,
-        job: _IdleRecording,
-        loop: _Loop,
-        tensors: tuple[Any, ...],
-        work: tuple[Any, ...],
-        scope: tuple[Model, ...],
-        ctx: Context,
-        row: dict[str, Any],
-    ) -> None:
-        """Its idle recording has not run (no idle period yet) or was preempted: this call
-        records the whole call before running any of it, from what its first call learned,
-        and runs it natively from its start (one plan, no eager step)."""
-        shape = job.ident[1]  # type: ignore[index]
-        with self._lock:
-            known.pending.pop(job.ident, None)
-        program, began = None, time.perf_counter()
-        try:
-            with _laps(row):
-                program = _record_whole(
-                    loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident
-                )
-        except Exception as error:
-            if isinstance(error, Building) or isinstance(error.__cause__, Building):
-                with self._lock:
-                    known.pending[job.ident] = job  # a kernel still opens: the idle period
-                graphs.IDLE.add(job)
-                row["refusals"].append("whole call: a kernel still opens")
-            elif (why := _refusal(error)) is not None:
-                _refused(row, "whole call", why)
-                with self._lock:
-                    known.unfit.add(shape)
-                    known.why[shape] = why[:400]
-            else:
-                raise
-        if program is None:
-            loop.eager_all(tensors, ctx)
-            return
-        row.update(
-            whole_call="recorded on this call, its idle recording not run",
-            capture_ms=round((time.perf_counter() - began) * 1000, 3),
-        )
-        self._install(site, program, scope[0].memory)
-        with _taken(program.lock, ctx), _pinned(program) as why:
-            why = why or _stale(program, job.ident, checked=True)
-            if not why:
-                self._reuse(program, loop, tensors, work, ctx, row)
-                return
-        row["dropped"] = why
-        loop.eager_all(tensors, ctx)
 
     def _queue(
         self,
@@ -577,6 +544,12 @@ class Loops:
             self._kept[site] = program
         if previous is not None:
             _close_idle(previous)
+
+    def _discard(self, site: Hashable, program: _Program) -> None:
+        with self._lock:
+            if self._kept.get(site) is program:
+                del self._kept[site]
+        _close_idle(program)
 
     def _reuse(
         self,
@@ -726,6 +699,51 @@ def _warm(
     return pre, _used(seen, scope) or {model: ("",) for model in scope}
 
 
+def _finished(loop: _Loop, tensors: tuple[Any, ...], nwork: int) -> tuple[Any, ...]:
+    """Eager's mutable tensors at the end of a one-step pass: its `after`, on copies of `tensors`,
+    where `before` and that step have run."""
+    work = tuple(value.clone() for value in tensors[:nwork])
+    _once(loop.after, (*work, *tensors[nwork:]))
+    return work
+
+
+def _eager_pass(
+    loop: _Loop, tensors: tuple[Any, ...], nwork: int
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """`before`, the first step and `after` eagerly on copies: where they began and ended."""
+    start = tuple(value.clone() for value in tensors[:nwork])
+    work = tuple(value.clone() for value in start)
+    copies = (*work, *tensors[nwork:])
+    _once(loop.before, copies)
+    loop.eager(loop.steps[:1], copies, None)
+    _once(loop.after, copies)
+    return start, work
+
+
+def _verify(
+    program: _Program, start: tuple[Any, ...], want: tuple[Any, ...], loop: _Loop, ctx: Any
+) -> str:
+    """A new program's one check: its `check`, natively from `start` where eager's `before`,
+    first step and `after` ended on `want`. Why it differs, "" when it doesn't, with the program's
+    tensors as they were, closed if it differs. A graph that ran wrong once is not asked twice."""
+    assert program.check is not None
+    mutable = program.tensors[: len(start)]
+    resume = tuple(value.clone() for value in mutable)
+    for slot, value in zip(mutable, start, strict=True):
+        slot.copy_(value)
+    first = loop.steps.start
+    quiet = replace(loop, on_step=None)
+    _submit(program, program.check, range(first, first + 1), quiet, ctx, {"at_ms": {}})
+    why = vt.replay_differs(want, mutable)
+    program.check.close()
+    program.check = None
+    for slot, value in zip(mutable, resume, strict=True):
+        slot.copy_(value)
+    if why:
+        program.close()
+    return f"{_UNRECORDABLE}: its replay differs from eager: {why}" if why else ""
+
+
 def _unkept(
     known: _Site,
     loop: _Loop,
@@ -785,10 +803,12 @@ def _record_first(
         if (why := _refusal(failure)) is None:
             raise failure
         return None, why
-    rest, again = made  # one pass of equal steps (no phases): its rest, then the reuse program
-    begin, end, _, first, count = parts[0]
+    check, rest, again = made  # one pass of equal steps (no phases)
+    begin, end, _, first, count = parts[1]
     first_part = ((rest, first, count),)
-    return _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks), ""
+    program = _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks)
+    program.check = check
+    return program, ""
 
 
 def _record(
@@ -808,7 +828,9 @@ def _record(
     steps = loop.steps
     _once(loop.before, tensors)
     _lap("before")
+    start = tuple(value.clone() for value in mutable)
     loop.eager(steps[:1], tensors, ctx)
+    want = tuple(value.clone() for value in mutable)
     _lap("first_step")
     rest = steps[1:]
     recording = PreparedSequence.record()
@@ -831,20 +853,34 @@ def _record(
         except BaseException as error:
             if (why := _refusal(error)) is None:
                 raise
-        if why is not None:
+        if why is None:
+            check, *runs = made
+            first = tuple(
+                (sequence, at, count)
+                for sequence, (_, _, _, at, count) in zip(runs, parts[1:], strict=True)
+            )
+            stages = sum(end - begin for begin, end, _, _, _ in parts[1:])
+            program = _Program(first, None, "resident", tensors, counter, None, stages, blocks)
+            program.check = check
+            try:
+                why = _verify(program, start, want, loop, ctx) or None
+            except BaseException:
+                program.close()
+                raise
+            if why is not None:
+                graphs.safeguard("replay_mismatch", why)
+                row["refusals"].append(f"resident: {why}")
+                program.close()
+        else:
             # Outside the handler: its traceback no longer holds the attempt's graphs, so their
             # pool returns before the eager rest.
             _refused(row, "resident", why)
             _abandon(recording)
+        if why is not None:
             _back(work, tensors)  # the eager rest runs on the caller's tensors
             loop.eager(rest, work + tensors[len(work) :], ctx)
             _once(loop.after, work + tensors[len(work) :])
             return None
-        first = tuple(
-            (sequence, start, count)
-            for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
-        )
-        stages = sum(end - begin for begin, end, _, _, _ in parts)
         row.update(
             mode="resident",
             stages=stages,
@@ -852,7 +888,7 @@ def _record(
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
             after_native=False,
         )
-        return _Program(first, None, "resident", tensors, counter, None, stages, blocks)
+        return program
     finally:
         if not recording._finished:
             recording.close()
@@ -904,11 +940,11 @@ def _record_whole(
                 True,
                 remaining=False,
             )
-        if len(parts) != 1:
+        if len(parts) != 2:
             raise CapabilityError(
                 "the whole call is not one pass of equal steps", code="prepared_graph_ineligible"
             )
-        (again,) = recording.finish_parts(
+        check, again = recording.finish_parts(
             outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
         )
         _lap("finish")
@@ -917,8 +953,10 @@ def _record_whole(
     if failure is not None:
         _abandon(recording, failure)
         raise failure
-    stages = parts[0][1] - parts[0][0]
-    return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
+    stages = parts[1][1] - parts[1][0]
+    program = _Program((), again, "resident", tensors, counter, ident, stages, blocks)
+    program.check = check
+    return program
 
 
 @dataclass(eq=False)
@@ -1014,6 +1052,27 @@ class _IdleRecording:
                 program = _record_whole(
                     self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident
                 )
+                try:
+                    with ExitStack() as held:
+                        for memory in {id(model.memory): model.memory for model in self.scope}.values():
+                            held.enter_context(memory.request(graphs.IDLE_REQUEST, idle=True))
+                        start, want = _eager_pass(self.loop, self.tensors, self.nwork)
+                    with program.lock:
+                        self.loops._install(self.site, program, self.scope[0].memory)
+                        with _pinned(program) as busy:
+                            why = "" if busy else _verify(program, start, want, self.loop, None)
+                except BaseException:
+                    self.loops._discard(self.site, program)
+                    raise
+                if busy or why:  # a program never kept unchecked
+                    self.loops._discard(self.site, program)
+                if why:
+                    graphs.safeguard("replay_mismatch", why)
+                    with self.loops._lock:
+                        self.known.unfit.add(self.ident[1])  # type: ignore[index]
+                        self.known.why[self.ident[1]] = why[:400]  # type: ignore[index]
+                if busy or why:
+                    return True
         finally:
             graphs.BYPASS.reset(bypass)
             graphs._SETTLING.reset(settling)
@@ -1022,7 +1081,6 @@ class _IdleRecording:
             _lap("release")
             _LAPS.reset(laps)
         program.recorded = parts | {"total": round((time.perf_counter() - began) * 1000, 1)}
-        self.loops._install(self.site, program, self.scope[0].memory)
         return True
 
 
@@ -1347,7 +1405,13 @@ def _record_resident(
     """One WHILE graph per run of equal phases, every component resident and held. With
     `pre`/`post` (the models `before`/`after` run, resident too), `after` is recorded as the
     last graph's suffix, and `again` also makes the reuse program: `before`, every step and
-    `after` over the same graphs. `remaining` plans the recording call's own rest too."""
+    `after` over the same graphs. `remaining` plans the recording call's own rest too. The first
+    part is always `_verify`'s: one pass over those graphs."""
+    if len(_runs(loop.steps, loop.phases, loop.steps)) != 1:  # The one eager step checks one graph.
+        raise CapabilityError(
+            f"{_UNRECORDABLE}: its phases have no eager step to check them against",
+            code="prepared_graph_ineligible",
+        )
     runs = _runs(rest, loop.phases, loop.steps)
     paths: dict[Model, set[str]] = {}
     for used in (body, pre or {}, post or {}):
@@ -1421,6 +1485,9 @@ def _record_resident(
             _lap("record")
             _yield_point()
             parts: list[_Part] = []
+            graph, first, _ = graphs_[0]  # Not last: the last stage closes the bindings.
+            _own(graph.plan(landed, 1, prefix=prefix, suffix=suffix), owners, recording)
+            parts.append((len(recording.stages) - 1, len(recording.stages), 1, first, 1))
             for number, (graph, first, count) in enumerate(graphs_ if remaining else ()):
                 last = number == len(graphs_) - 1
                 plan = graph.plan(landed, suffix=suffix if last else None)

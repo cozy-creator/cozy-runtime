@@ -1255,10 +1255,8 @@ def _record(
                 with owner.recovery_blocked(replay=True):
                     # Serve only when replay reproduces eager bit for bit.
                     vt.replay(graph, stream=torch.cuda.current_stream(owner.device))
-                pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
-                if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
-                    why = "its replay differs from the eager run on the same inputs"
-                    _failed(module, recorder, key, why, "replay_mismatch")
+                if differs := vt.replay_differs(eager, outputs[0]):
+                    _failed(module, recorder, key, differs, "replay_mismatch")
                     return True
                 entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner)
                 why, replayed = _no_gain(torch, entry, recorder.eager)
