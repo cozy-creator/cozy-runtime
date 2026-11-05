@@ -785,7 +785,7 @@ class _SequenceCapture:
         try:
             vt.pool_scratch(self._pool.handle, (), device)
         except (RuntimeError, ValueError) as exc:  # A live allocation: its pool just stays mapped.
-            graphs.say("graph-pool-not-scratch", f"a stage graph's pool stays mapped while idle: {exc}")
+            graphs.safeguard("scratch_declined", str(exc))
 
     @contextmanager
     def capturing(self) -> Iterator[None]:

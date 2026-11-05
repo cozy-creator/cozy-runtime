@@ -56,7 +56,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, say
+from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, safeguard, say
 from cozy_runtime.graphs.domain import Pool
 from cozy_runtime.internal import cache_owners
 from cozy_runtime.lm import _kernels
@@ -1947,7 +1947,7 @@ class _Engine:
                 try:
                     vt.pool_scratch(self.pool.handle, (), self.domain.device)
                 except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
-                    say("graph-pool-not-scratch", f"an LM graph's pool stays mapped while idle: {exc}")
+                    safeguard("scratch_declined", str(exc))
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
@@ -1983,7 +1983,7 @@ class _Engine:
     def _unrecorded(self, key: tuple[int, int, bool, bool], why: str) -> None:
         """That step runs eagerly from now on, with a warning on the calls it serves."""
         self.unrecorded[key] = why
-        say(f"capture:{type(self.model).__name__}", f"[lm] capture failed: {why}")
+        safeguard("capture_refused", f"{type(self.model).__name__}: {why}")
         warning = ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
         for request in {id(r.request): r.request for r in self.slots if r is not None}.values():
             if warning not in request.warnings:

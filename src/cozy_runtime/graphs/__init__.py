@@ -59,12 +59,32 @@ DECODERS: list[
 _SAID: set[str] = set()
 #: the isolated request used for idle warm-up and capture observations
 IDLE_REQUEST = "graphs-idle"
+#: what a run's record counts (`execution.safeguards`) and `cozy run show` warns of
+SAFEGUARDS = {
+    "capture_refused": "a CUDA graph was refused at capture",
+    "replay_mismatch": "a CUDA graph differed from eager and was discarded",
+    "scratch_declined": "a CUDA graph's pool stays mapped while idle",
+}
 
 
 def say(key: str, line: str) -> None:
     if key not in _SAID:
         _SAID.add(key)
         print(line, file=sys.stderr)
+
+
+def safeguard(code: str, why: str) -> None:
+    """One for this attempt's record, or the next attempt's when raised at idle."""
+    WARNINGS.append((SAFEGUARDS[code], {"code": code, "why": why.splitlines()[0][:300]}))
+
+
+def safeguards(warnings: list[Any]) -> dict[str, list[str]]:
+    """An attempt's reasons, by `SAFEGUARDS` code."""
+    found: dict[str, list[str]] = {}
+    for _, fields in warnings:
+        if fields.get("code") in SAFEGUARDS:
+            found.setdefault(fields["code"], []).append(str(fields["why"]))
+    return found
 
 
 @request_path.forbid("cuda graph capture")
@@ -154,7 +174,7 @@ class _Recording:
         try:
             vt.pool_scratch(pool.handle, held, owner.device)
         except (RuntimeError, ValueError) as exc:  # An escaped alias: its pool just stays mapped.
-            say("graph-pool-not-scratch", f"a CUDA graph's pool stays mapped while idle: {exc}")
+            safeguard("scratch_declined", str(exc))
 
     def output(self) -> Any:
         """Caller-owned outputs, allocated before residency admission or graph launch."""
@@ -1184,8 +1204,7 @@ def _record(
                 pairs = zip(*map(torch.utils._pytree.tree_leaves, (outputs[0], eager)), strict=True)
                 if not all(torch.equal(a, b) for a, b in pairs if isinstance(a, torch.Tensor)):
                     why = "its replay differs from the eager run on the same inputs"
-                    _failed(module, recorder, key, why)
-                    WARNINGS.append(("a CUDA graph was not used", {"why": why}))
+                    _failed(module, recorder, key, why, "replay_mismatch")
                     return True
                 entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner)
                 why, replayed = _no_gain(torch, entry, recorder.eager)
@@ -1483,11 +1502,17 @@ def _refused(recorder: _Recorder, placed: Any, why: str) -> None:
     say(f"refused:{why}", f"[graphs] a component runs as written: {why}")
 
 
-def _failed(module: Any, recorder: _Recorder, key: tuple[object, ...], why: str) -> None:
-    """An idle capture refused for good: the signature runs as written; the run says so once."""
+def _failed(
+    module: Any,
+    recorder: _Recorder,
+    key: tuple[object, ...],
+    why: str,
+    code: str = "capture_refused",
+) -> None:
+    """An idle capture refused for good: the signature runs as written; the run says so."""
     recorder.failed[key] = why
     recorder.gap = why
-    say(f"graph:{id(recorder)}:{why}", f"[graphs] {_name(module)} remains eager: {why}")
+    safeguard(code, f"{_name(module)}: {why}")
 
 
 def _changed(

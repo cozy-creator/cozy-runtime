@@ -102,6 +102,8 @@ _REFUSED = (
 )
 #: a refusal by one of them (`_refusal`)
 _UNRECORDABLE = "the step cannot be recorded"
+#: a refusal that says nothing against the graph (`_refusal`)
+_WAITING = "capture waits for kernel readiness"
 #: request id -> its loops, for the run record (`execution.loops`)
 ROWS: dict[str, list[dict[str, Any]]] = {}
 
@@ -146,7 +148,7 @@ def _refusal(error: BaseException) -> str | None:
     if isinstance(error, CapabilityError):
         return str(error) if error.code in _REFUSED else None
     if isinstance(error, Building):
-        return f"capture waits for kernel readiness: {error}"
+        return f"{_WAITING}: {error}"
     if isinstance(error, torch.OutOfMemoryError):
         return f"preparation exceeded capacity: {error}"
     if isinstance(error, ResidencyError):
@@ -157,6 +159,12 @@ def _refusal(error: BaseException) -> str | None:
     if isinstance(error, Exception) and fault(error) is Fault.OTHER:
         return f"recording failed: {type(error).__name__}: {error}"
     return None
+
+
+def _refused(row: dict[str, Any], where: str, why: str) -> None:
+    row["refusals"].append(f"{where}: {why}")
+    if not why.startswith(_WAITING):  # A kernel still compiling is no refusal of the graph.
+        graphs.safeguard("capture_refused", why)
 
 
 @dataclass
@@ -442,7 +450,7 @@ class Loops:
                     return
             row["dropped"] = why
         if refused:
-            row["refusals"].append(f"whole call on its first call: {refused}")
+            _refused(row, "whole call on its first call", refused)
             if refused.startswith(_UNRECORDABLE):
                 # Its idle recording would meet the same error and keep the next call waiting
                 # on it (an RTX 3060's SDXL w1 559 ms, then its own doomed recording).
@@ -486,7 +494,7 @@ class Loops:
                 graphs.IDLE.add(job)
                 row["refusals"].append("whole call: a kernel still opens")
             elif (why := _refusal(error)) is not None:
-                row["refusals"].append(f"whole call: {why}")
+                _refused(row, "whole call", why)
                 with self._lock:
                     known.unfit.add(shape)
                     known.why[shape] = why[:400]
@@ -803,7 +811,7 @@ def _record(
         if why is not None:
             # Outside the handler: its traceback no longer holds the attempt's graphs, so their
             # pool returns before the eager rest.
-            row["refusals"].append(f"resident: {why}")
+            _refused(row, "resident", why)
             _abandon(recording)
             _back(work, tensors)  # the eager rest runs on the caller's tensors
             loop.eager(rest, work + tensors[len(work) :], ctx)
@@ -939,7 +947,7 @@ class _IdleRecording:
             with self.loops._lock:
                 self.known.unfit.add(shape)
                 self.known.why[shape] = f"its idle recording failed: {why}"[:400]
-            graphs.say(f"loop:{why}", f"[loop] a whole call is not recorded: {why}"[:400])
+            graphs.safeguard("capture_refused", why)
             done = True
         if done:
             with self.loops._lock:

@@ -582,6 +582,19 @@ def adjustment_row(row: AdjustmentRow) -> dict[str, str]:
     }
 
 
+def _safeguard_rows(found: dict[str, list[str]]) -> list[dict[str, str]]:
+    """`cozy run show`'s warning line for each safeguard this attempt tripped."""
+    return [
+        adjustment_row(
+            AdjustmentRow(
+                "warn", "graphs", None, None,
+                f"{graphs.SAFEGUARDS[code]} ({len(whys)}×): {whys[0]}", "Runtime",
+            )
+        )
+        for code, whys in found.items()
+    ]
+
+
 def _granted_inputs(command: Invoke) -> dict[str, GrantedInput]:
     """Verified input paths in the attempt's spool."""
     return {input_id: row.granted(input_id) for input_id, row in command.inputs.items()}
@@ -3747,6 +3760,7 @@ class Executor:
         # path, success or fault. A failed attempt's log tail is the one triage most needs,
         # and cr-011 hoisted the record out of `invoke` precisely so it survives the failure.
         del self.handled[command.request_id]
+        safeguards = graphs.safeguards(warnings)
         return {
             "ok": True,
             "residency": residency_document,
@@ -3771,6 +3785,7 @@ class Executor:
                     served_impls.refused,
                 ),
                 "loops": self.host.loops.pop(command.request_id, []),
+                "safeguards": safeguards,
                 # When this reply was built, and (`_send_reply`) when it went on the seam: a
                 # request's time after its observations splits into this process's and the host's.
                 "reply_built_unix_ms": round(time.time() * 1000, 1),
@@ -3786,7 +3801,8 @@ class Executor:
             "result_ref": result_ref,
             "result_schema_digest": self._result_schema_digest(surface),
             "adjustments": [
-                adjustment_row(row) for row in (envelope.adjustments if envelope else ())
+                *(adjustment_row(row) for row in (envelope.adjustments if envelope else ())),
+                *_safeguard_rows(safeguards),
             ],
             "ignored": list(record.ignored),
             "oversize_result_bytes": oversize,
