@@ -25,6 +25,7 @@ import csv
 import email.parser
 import enum
 import hashlib
+import importlib.util
 import json
 import operator
 import os
@@ -502,12 +503,18 @@ class Reader:
         raise StaticRefusal(detail, code="static_module")
 
     def _load(self, name: str, path: Path, is_package: bool, trusted: bool) -> Module:
-        source = path.read_text()
         try:
+            # Decoded as Python decodes a source file: UTF-8 unless it declares its encoding.
+            source = importlib.util.decode_source(path.read_bytes())
             tree = ast.parse(source, filename=str(path))
         except SyntaxError as exc:
             raise StaticRefusal(
                 f"{self.spell(path)}:{exc.lineno}: {exc.msg}", code="static_module"
+            ) from exc
+        except UnicodeDecodeError as exc:
+            raise StaticRefusal(
+                f"{self.spell(path)}: byte {exc.start} is not {exc.encoding}: save it as UTF-8",
+                code="static_module",
             ) from exc
         module = Module(name, path, source, tree, is_package, trusted)
         self.modules[name] = module
@@ -1716,6 +1723,9 @@ def _build(
             row = _callable(reader, registration)
         except StaticRefusal:
             raise
+        except author.AuthorError as exc:
+            # The author's declaration, refused by describe's own rule: theirs, at the function.
+            reader.refuse(registration.module, registration.fn, exc.message, exc.code)
         except Exception as exc:
             # Not the author's mistake to decode: name what was being read, in their terms.
             reader.refuse(
