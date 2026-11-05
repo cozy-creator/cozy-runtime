@@ -21,7 +21,7 @@ class Loops(Protocol):
         state: tuple[Any, ...],
         carried: tuple[Any, ...],
         inputs: tuple[Any, ...],
-        phases: tuple[Hashable, ...] | None,
+        labels: tuple[Hashable, ...] | None,
         key: Hashable | None,
         on_step: Callable[[int], object] | None,
         before: Callable[..., object] | None,
@@ -45,7 +45,7 @@ def denoise_loop(
     state: Sequence[Any],
     carried: Sequence[Any] = (),
     inputs: Sequence[Any] = (),
-    phases: Sequence[Hashable] | None = None,
+    labels: Sequence[Hashable] | None = None,
     key: Hashable | None = None,
     on_step: Callable[[int], object] | None = None,
     before: Callable[..., object] | None = None,
@@ -54,18 +54,20 @@ def denoise_loop(
 ) -> None:
     """Run `step` once per index in `steps`; `state` and `carried` advance in place.
 
-    The Runtime calls `step(i, *state, *carried, *inputs)`, plus `phase=phases[k]` when phases
+    The Runtime calls `step(i, *state, *carried, *inputs)`, plus `label=labels[k]` when labels
     are declared. `i` is a one-element int64 tensor on the device holding the global step index.
     The step reads its schedule with `table.index_select(0, i)` and updates `state` and `carried`
     in place. It runs tensor operations only: no host read of a device value, no random draw
-    (noise is an input) and no host decision except one taken from its `phase`. Every mode runs
+    (noise is an input) and no host decision except one taken from its `label`. Every mode runs
     this same function, so eager and native execution compute the same values.
 
     - `state`: what the loop advances (latents). On return the tensors hold the final values.
     - `carried`: tensors one step leaves for the next that are not outputs.
     - `inputs`: read-only tensors of this call.
-    - `phases`: one hashable host-side plan per step; each run of equal phases is one captured
-      segment, and the step receives its phase.
+    - `labels`: one hashable host-side label per step, which the step receives: what differs
+      between steps (dense or sparse attention, an expert, a batch). Each distinct label records
+      one body, run for each of its steps in order; a first call runs its steps eagerly through
+      each label's first.
     - `key`: with `inputs`, lets the Runtime keep the whole call for a later call with an
       equal key and equal tensor layouts. It names everything the step bakes in that is not
       a declared tensor (a guidance float, say). `before` and `after` remain optional. The
@@ -87,13 +89,13 @@ def denoise_loop(
     state, carried, inputs = tuple(state), tuple(carried), tuple(inputs)
     if not state:
         raise ValueError("denoise_loop needs state to advance")
-    if phases is not None:
-        phases = tuple(phases)
-        if len(phases) != len(steps):
-            raise ValueError("denoise_loop declares one phase per step")
+    if labels is not None:
+        labels = tuple(labels)
+        if len(labels) != len(steps):
+            raise ValueError("denoise_loop declares one label per step")
     if key is not None:
         hash(key)
     runtime = _RUNTIME
     if runtime is None:
         raise RuntimeError("denoise_loop runs inside a Runtime executor")
-    runtime.run(step, steps, state, carried, inputs, phases, key, on_step, before, after, cache)
+    runtime.run(step, steps, state, carried, inputs, labels, key, on_step, before, after, cache)

@@ -4,26 +4,27 @@ A call runs its site's kept program natively from start to end, else eagerly, fo
 caller's stream (only recorded regions run on the recording's streams, which end with the program).
 A keyed call whose blocks all stay resident gets its whole call (`before`, the steps and `after`)
 recorded and kept for its call site, until a new key replaces it or residency retires it under
-pressure. The first call of a key and layout runs `before` and its first step eagerly, warming
-their kernels and naming their blocks, then records its whole call on copies of its tensors (every
-scope model held and loaded, its `after` not yet run) and runs the rest natively from them (xs-134
-F2): its eager steps cost more than the recording on a host-bound CPU (SDXL int8 on an RTX 4090:
-173 ms eager against 79 native, a 0.9 s recording), and the next call runs natively whenever it
-comes. Refused, its rest runs eagerly and the recording is queued for the idle period after it
-(`_IdleRecording`, xs-134 F), in the call's component scope; a command that arrives preempts it
-between its parts (never inside package code). A call that finds it unrecorded (no idle period
-yet, or preempted) records the whole call before running any of it and runs it natively from its
-start: one plan and no eager step. No idle period
-opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so a call queued behind
-another never waits for idle work. One that does not fit, or whose code cannot run outside its
-request, is not tried again for that layout, and the calls say why. Other component loops stay
-eager: recording a streamed loop did not repay its recording and extra reads (Qwen-Image int8 1 MP
-on an RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716
-vs 737 s).
+pressure. The first call of a key and layout runs `before` and its steps through each label's
+first eagerly (one step, unlabeled), warming their kernels and naming their blocks, then records
+its whole call on copies of its tensors, one graph per label (every scope model held and loaded,
+its `after` not yet run), and runs the rest natively from them (xs-134 F2): its eager steps cost
+more than the recording on a host-bound CPU (SDXL int8 on an RTX 4090: 173 ms eager against 79
+native, a 0.9 s recording), and the next call runs natively whenever it comes. Refused, its rest
+runs eagerly and the recording is queued for the idle period after it (`_IdleRecording`, xs-134
+F), in the call's component scope; a command that arrives preempts it between its parts (never
+inside package code). A call that finds it unrecorded (no idle period yet, or preempted) records
+the whole call before running any of it and runs it natively from its start: one plan and no eager
+step. No idle period opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so
+a call queued behind another never waits for idle work. One that does not fit, or whose code cannot
+run outside its request, is not tried again for that layout, and the calls say why. Other
+component loops stay eager: recording a streamed loop did not repay its recording and extra reads
+(Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s
+on an RTX 5090: 716 vs 737 s).
 
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
-`before` and the first step run eagerly, then the rest natively. A refusal before submission drops
-that attempt and the rest runs eagerly; nothing runs twice. After submission nothing falls back.
+`before` and the same warm steps run eagerly, then the rest natively. A refusal before submission
+drops that attempt and the rest runs eagerly; nothing runs twice. After submission nothing falls
+back.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ import bisect
 import ctypes
 import gc
 import hashlib
+import itertools
 import marshal
 import threading
 import time
@@ -40,7 +42,7 @@ from collections.abc import Callable, Hashable, Iterable, Iterator
 from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from functools import partial
+from functools import cached_property, partial
 from typing import Any
 
 import tensorfs.varena.torch as vt
@@ -114,21 +116,45 @@ class _Fixed(str):
     """A refusal that is a property of the code (`_REFUSED`): in the record, and no warning."""
 
 
-def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], phase: Any) -> None:
-    if phase is _NONE:
+def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], label: Any) -> None:
+    if label is _NONE:
         step(index, *tensors)
     else:
-        step(index, *tensors, phase=phase)
+        step(index, *tensors, label=label)
 
 
 _NONE = object()
-#: The recording call's phases, for the run record (`parts_ms`): [{phase: ms}, last lap's clock].
+#: The recording call's parts, for the run record (`parts_ms`): [{part: ms}, last lap's clock].
 _LAPS: ContextVar[list[Any] | None] = ContextVar("cozy_loop_laps", default=None)
+#: The call's row, for its GPU timeline (`_mark`).
+_ROW: ContextVar[dict[str, Any] | None] = ContextVar("cozy_loop_row", default=None)
+
+
+def _mark(name: str) -> None:
+    """A timed CUDA event on the current stream, for the call's GPU timeline (`_timeline`)."""
+    row = _ROW.get()
+    if row is None or not torch.cuda.is_initialized() or torch.cuda.is_current_stream_capturing():
+        return
+    event = torch.cuda.Event(enable_timing=True)
+    event.record()
+    row.setdefault("_marks", []).append((name, event))
+
+
+def _timeline(row: dict[str, Any]) -> None:
+    """The GPU's time between consecutive marks (`gpu_ms`: [mark, ms since the one before]): each
+    eager step's span, and what lies between the steps (a recording's, a native run's)."""
+    marks = row.get("_marks") or []
+    if len(marks) > 1:
+        marks[-1][1].synchronize()
+        row["gpu_ms"] = [
+            [name, round(earlier.elapsed_time(event), 2)]
+            for (_, earlier), (name, event) in itertools.pairwise(marks)
+        ]
 
 
 @contextmanager
 def _laps(row: dict[str, Any]) -> Iterator[None]:
-    """Time a recording call's phases into its row (`parts_ms`)."""
+    """Time a recording call's parts into its row (`parts_ms`)."""
     token = _LAPS.set([row.setdefault("parts_ms", {}), time.perf_counter()])
     try:
         yield
@@ -137,7 +163,7 @@ def _laps(row: dict[str, Any]) -> Iterator[None]:
 
 
 def _lap(name: str) -> None:
-    """Close the current phase of a recording call as `name` (milliseconds since the last lap)."""
+    """Close the current part of a recording call as `name` (milliseconds since the last lap)."""
     laps = _LAPS.get()
     if laps is not None:
         now = time.perf_counter()
@@ -189,9 +215,9 @@ def _refused(row: dict[str, Any], where: str, why: str) -> None:
 class _Program:
     """A recorded native loop and the tensors its graphs read.
 
-    `first` runs the steps after the eager first one (and `after` when it is recorded); `again`,
+    `first` runs the steps after the eager ones (and `after` when it is recorded); `again`,
     when recorded, runs `before`, every step and `after` for a later call, with no eager step.
-    Several runs of equal phases are several parts, submitted in order.
+    Each is one sequence: a stage per run of equal labels, its label's graph repeated.
     """
 
     first: tuple[tuple[PreparedSequence, int, int], ...]
@@ -300,7 +326,7 @@ class Loops:
         state: tuple[Any, ...],
         carried: tuple[Any, ...],
         inputs: tuple[Any, ...],
-        phases: tuple[Hashable, ...] | None,
+        labels: tuple[Hashable, ...] | None,
         key: Hashable | None,
         on_step: Callable[[int], object] | None,
         before: Callable[..., object] | None,
@@ -323,15 +349,20 @@ class Loops:
         if cache is not None and _ranks() > 1:  # each rank's verdict would differ
             row["refusals"].append("step cache: off across ranks (its sums are not all-reduced)")
             cache = None
-        bypass = graphs.BYPASS.set(True)
+        bypass, marked = graphs.BYPASS.set(True), _ROW.set(row)
         try:
-            loop = _Loop(step, steps, phases, on_step, before, after, key, len(state))
+            _mark("entered")
+            loop = _Loop(step, steps, labels, on_step, before, after, key, len(state))
             if cache is None:
                 self._run(loop, state, carried, inputs, key, row)
             else:
                 self._cached(loop, state + carried, inputs, cache, row)
+            _mark("returned")
+            _timeline(row)
         finally:
             graphs.BYPASS.reset(bypass)
+            _ROW.reset(marked)
+            row.pop("_marks", None)
             row["at_ms"]["returned"] = _now()
 
     def _cached(
@@ -365,7 +396,7 @@ class Loops:
         row: dict[str, Any],
     ) -> None:
         ctx = CURRENT.get()
-        step, steps, phases = loop.step, loop.steps, loop.phases
+        step, steps = loop.step, loop.steps
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
@@ -377,7 +408,7 @@ class Loops:
             assert ctx is not None
             site = (step.__code__, tuple(id(model) for model in scope))
             # What a call site learns (`_Site`) depends on a keyed call's layout, not its key.
-            shape = None if key is None else (_layouts(tensors), len(steps), phases)
+            shape = None if key is None else (_layouts(tensors), steps, loop.labels)
             ident = None if key is None else (key, shape)
             with self._lock:
                 known = self._sites.setdefault(site, _Site())
@@ -437,17 +468,18 @@ class Loops:
         ctx: Context,
         row: dict[str, Any],
     ) -> None:
-        """A component call its site has no program for: `before` and its first step eagerly,
-        warming their kernels and naming their blocks. A keyed whole call then records on its
-        program's own copies and runs the rest natively from its second step; the program is
-        kept for the site. Otherwise, or refused, the rest runs eagerly and the recording is
-        queued for the idle period after it."""
+        """A component call its site has no program for: `before` and its steps through each
+        label's first eagerly, warming their kernels and naming their blocks. A keyed whole call
+        with steps left then records on its program's own copies and runs them natively; the
+        program is kept for the site. Otherwise, or refused, the rest runs eagerly and the
+        recording is queued for the idle period after it."""
         with _laps(row):
-            pre, body = _warm(loop, tensors, scope, ctx)
+            pre, body, rest = _warm(loop, tensors, scope, ctx)
             program, refused, began = None, "", time.perf_counter()
-            if not _unkept(known, loop, ident, shape, body):
+            if rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
-                    loop, tensors, len(work), scope, pre, body, ident, known.need.get(shape, 0)
+                    loop, rest, tensors, len(work), scope, pre, body, ident,
+                    known.need.get(shape, 0),
                 )
                 if need:
                     with self._lock:
@@ -457,19 +489,19 @@ class Loops:
                 mode=program.mode,
                 stages=program.stages,
                 blocks=program.blocks,
-                whole_call="recorded on its first call, after its first step",
+                whole_call="recorded on its first call, after its warm steps",
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
             )
             self._install(site, program, scope[0].memory)
             with _taken(program.lock, ctx), _pinned(program) as why:
                 if not why:
-                    ((rest, first, count),) = program.first
+                    ((sequence, first, count),) = program.first
                     try:
-                        _submit(program, rest, range(first, first + count), loop, ctx, row)
+                        _submit(program, sequence, range(first, first + count), loop, ctx, row)
                     except BaseException:
                         program.close()
                         raise
-                    rest.close()  # later calls run `again`
+                    sequence.close()  # later calls run `again`
                     program.first = ()
                     _back(work, program.tensors)
                     return
@@ -482,7 +514,7 @@ class Loops:
                 with self._lock:
                     known.unfit.add(shape)
                     known.why[shape] = refused[:400]
-        loop.eager(loop.steps[1:], tensors, ctx)
+        loop.eager(rest, tensors, ctx)
         _after(loop, tensors, scope, known, shape)
         row["eager"] = self._queue(
             site, known, loop, tensors, len(work), scope, pre, body, ident, shape
@@ -563,7 +595,7 @@ class Loops:
         shape: Hashable,
     ) -> str:
         """Why the call ran eagerly: its whole call queued to record at idle, or why none does."""
-        if why := _unkept(known, loop, ident, shape, body):
+        if why := _unkept(known, ident, shape, body):
             return why
         with self._lock:
             if ident not in known.pending:
@@ -626,7 +658,7 @@ class _Loop:
 
     step: Callable[..., object]
     steps: range
-    phases: tuple[Hashable, ...] | None
+    labels: tuple[Hashable, ...] | None
     on_step: Callable[[int], object] | None
     before: Callable[..., object] | None
     after: Callable[..., object] | None
@@ -634,8 +666,15 @@ class _Loop:
     #: how many of a call's first tensors are its latents (`state`)
     latents: int = 1
 
-    def phase(self, i: int) -> Any:
-        return _NONE if self.phases is None else self.phases[i - self.steps.start]
+    def label(self, i: int) -> Any:
+        return _NONE if self.labels is None else self.labels[i - self.steps.start]
+
+    def warm(self) -> range:
+        """The steps a first call runs eagerly: through each label's first (one, unlabeled), so
+        every label's kernels and blocks have run before its body records."""
+        if self.labels is None:
+            return self.steps[:1]
+        return self.steps[: max(self.labels.index(label) for label in set(self.labels)) + 1]
 
     def eager(self, indices: range, tensors: tuple[Any, ...], ctx: Context | None) -> None:
         """The steps in order, each reported (`on_step(i)`) once queued; the call returns once the
@@ -658,13 +697,15 @@ class _Loop:
         ) as observation:
             index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
             finite = graphs.Finite(torch, tensors[: self.latents])
+            _mark("eager")
             for i in indices:
                 if ctx is not None:
                     ctx.raise_if_cancelled()
                 index.fill_(i)
                 if (cached := stepcache._RUN.get()) is not None:
                     cached.begin(i - self.steps.start)
-                _call(self.step, index, tensors, self.phase(i))
+                _call(self.step, index, tensors, self.label(i))
+                _mark(f"step {i}")
                 if not finite.step():
                     raise _non_finite(i - self.steps.start, len(self.steps))
                 if self.on_step is not None:
@@ -730,29 +771,26 @@ def _entering() -> Iterator[set[Any]]:
 
 def _warm(
     loop: _Loop, tensors: tuple[Any, ...], scope: tuple[Model, ...], ctx: Context
-) -> tuple[dict[Model, tuple[str, ...]], dict[Model, tuple[str, ...]]]:
-    """A component call's `before` and first step eagerly, on the caller's tensors: the blocks
-    each ran."""
+) -> tuple[dict[Model, tuple[str, ...]], dict[Model, tuple[str, ...]], range]:
+    """A component call's `before` and warm steps (`_Loop.warm`) eagerly, on the caller's
+    tensors: the blocks each ran, and the steps left."""
     with _entering() as seen:
         _once(loop.before, tensors)
     _lap("before")
     pre = _used(seen, scope)
+    warm = loop.warm()
     with _entering() as seen:
-        loop.eager(loop.steps[:1], tensors, ctx)
+        loop.eager(warm, tensors, ctx)
     _lap("first_step")
-    return pre, _used(seen, scope) or {model: ("",) for model in scope}
+    return pre, _used(seen, scope) or {model: ("",) for model in scope}, loop.steps[len(warm) :]
 
 
 def _unkept(
-    known: _Site,
-    loop: _Loop,
-    ident: Hashable,
-    shape: Hashable,
-    body: dict[Model, tuple[str, ...]],
+    known: _Site, ident: Hashable, shape: Hashable, body: dict[Model, tuple[str, ...]]
 ) -> str:
     """Why no call keeps this call's whole program ("" when one does)."""
     resident = all(not _unresident(model, paths) for model, paths in body.items())
-    if ident is None or loop.phases is not None or not resident:
+    if ident is None or not resident:
         return f"{'resident' if resident else 'streamed'}, and no call keeps the program"
     if shape in known.unfit:
         return f"no whole call: {known.why.get(shape, 'it did not fit')}"
@@ -761,6 +799,7 @@ def _unkept(
 
 def _record_first(
     loop: _Loop,
+    rest: range,
     tensors: tuple[Any, ...],
     nwork: int,
     scope: tuple[Model, ...],
@@ -769,8 +808,8 @@ def _record_first(
     ident: Hashable,
     reserve: int,
 ) -> tuple[_Program | None, str, int]:
-    """A first call's whole program, recorded after its first step on copies of its tensors:
-    `first` runs its rest (from its second step, `after` included), `again` a later call. Its
+    """A first call's whole program, recorded after its warm steps on copies of its tensors:
+    `first` runs its `rest` (`after` included), `again` a later call. Its
     `after` has not run, so every scope model is held, and loaded first; (None, why, need) when
     refused, its attempt gone, `need` the pool its next attempt reserves when room was why."""
     own = tuple(value.clone() for value in tensors)
@@ -790,11 +829,11 @@ def _record_first(
             recording._prepare((*mutable, counter))
             _lap("prepare")
             with recording.capturing():
-                parts, blocks = _record_resident(
-                    recording, loop, loop.steps[1:], own, mutable, counter, body, pre, every, True
+                parts = _record_resident(
+                    recording, loop, rest, own, mutable, counter, body, pre, every, True
                 )
-            made = recording.finish_parts(
-                outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
+            first, again = recording.finish_parts(
+                outputs=mutable, parts=[(b, e, 1) for b, e in parts]
             )
         _lap("finish")
     except BaseException as error:
@@ -805,10 +844,10 @@ def _record_first(
         if (why := _refusal(failure)) is None:
             raise failure
         return None, why, need
-    rest, again = made  # one pass of equal steps (no phases): its rest, then the reuse program
-    begin, end, _, first, count = parts[0]
-    first_part = ((rest, first, count),)
-    return _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks), "", 0
+    stages = len(again.stages)
+    return _Program(
+        ((first, rest.start, len(rest)),), again, "resident", own, counter, ident, stages, 0
+    ), "", 0
 
 
 def _record(
@@ -819,18 +858,23 @@ def _record(
     ctx: Context,
     row: dict[str, Any],
 ) -> _Program | None:
-    """A componentless loop: `before` and the first step eagerly, then the rest recorded; None
-    when the recording was refused, after the loop ran eagerly to its end."""
+    """A componentless loop: `before` and its warm steps (`_Loop.warm`) eagerly, then the rest
+    recorded; None when nothing was left or the recording was refused, after the loop ran
+    eagerly to its end."""
     if key is not None:  # the program owns copies; this call's values go in and out
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
-    steps = loop.steps
     _once(loop.before, tensors)
     _lap("before")
-    loop.eager(steps[:1], tensors, ctx)
+    warm = loop.warm()
+    loop.eager(warm, tensors, ctx)
     _lap("first_step")
-    rest = steps[1:]
+    rest = loop.steps[len(warm) :]
+    if not rest:
+        _back(work, tensors)
+        _once(loop.after, work + tensors[len(work) :])
+        return None
     recording = PreparedSequence.record()
     recording.__enter__()
     try:
@@ -841,12 +885,10 @@ def _record(
             began = time.perf_counter()
             ctx.raise_if_cancelled()
             with recording.capturing():
-                parts, blocks = _record_resident(
+                parts = _record_resident(
                     recording, loop, rest, tensors, mutable, counter, {}, None, None, False
                 )
-            made = recording.finish_parts(
-                outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
-            )
+            (made,) = recording.finish_parts(outputs=mutable, parts=[(b, e, 1) for b, e in parts])
             _lap("finish")
         except BaseException as error:
             if (why := _refusal(error)) is None:
@@ -860,19 +902,17 @@ def _record(
             loop.eager(rest, work + tensors[len(work) :], ctx)
             _once(loop.after, work + tensors[len(work) :])
             return None
-        first = tuple(
-            (sequence, start, count)
-            for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
-        )
-        stages = sum(end - begin for begin, end, _, _, _ in parts)
+        stages = len(made.stages)
         row.update(
             mode="resident",
             stages=stages,
-            blocks=blocks,
+            blocks=0,
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
             after_native=False,
         )
-        return _Program(first, None, "resident", tensors, counter, None, stages, blocks)
+        return _Program(
+            ((made, rest.start, len(rest)),), None, "resident", tensors, counter, None, stages, 0
+        )
     finally:
         if not recording._finished:
             recording.close()
@@ -913,26 +953,10 @@ def _record_whole(
         _lap("prepare")
         _yield_point()
         with recording.capturing():
-            parts, blocks = _record_resident(
-                recording,
-                loop,
-                loop.steps[1:],
-                tensors,
-                mutable,
-                counter,
-                body,
-                pre,
-                post,
-                True,
-                remaining=False,
+            parts = _record_resident(
+                recording, loop, loop.steps[:0], tensors, mutable, counter, body, pre, post, True
             )
-        if len(parts) != 1:
-            raise CapabilityError(
-                "the whole call is not one pass of equal steps", code="prepared_graph_ineligible"
-            )
-        (again,) = recording.finish_parts(
-            outputs=mutable, parts=[(b, e, passes) for b, e, passes, _, _ in parts]
-        )
+        (again,) = recording.finish_parts(outputs=mutable, parts=[(b, e, 1) for b, e in parts])
         _lap("finish")
     except BaseException as error:
         failure = error
@@ -940,8 +964,7 @@ def _record_whole(
         failure.pool_need = _pool_need(recording)  # type: ignore[attr-defined]
         _abandon(recording, failure)
         raise failure
-    stages = parts[0][1] - parts[0][0]
-    return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
+    return _Program((), again, "resident", tensors, counter, ident, len(again.stages), 0)
 
 
 @dataclass(eq=False)
@@ -1196,8 +1219,8 @@ def _phase_configuration(
         hashlib.sha256(marshal.dumps(code)).hexdigest(), loop.key, identities,
         tuple((tuple(t.shape), tuple(t.stride()), str(t.dtype), str(t.device),
                t.storage_offset()) for t in tensors),
-        (indices.start, indices.stop, indices.step), tuple(loop.phase(i) for i in indices)
-        if loop.phases is not None else None,
+        (indices.start, indices.stop, indices.step), tuple(loop.label(i) for i in indices)
+        if loop.labels is not None else None,
         selected.sites, selected.dense, selected.exact,
         tuple((name, row.get("artifact"), row.get("key"))
               for name, row in sorted(artifacts.items())),
@@ -1326,6 +1349,7 @@ def _submit(
     with torch.no_grad():
         program.counter.fill_(indices.start)
     row["at_ms"].setdefault("submitted", _now())
+    _mark("submit")
     execution: Any = (
         sequence.submit(ctx)
         if ctx is None or ctx._submit_prepared is None
@@ -1350,6 +1374,7 @@ def _submit(
             break
         time.sleep(0.01)
     execution.wait()
+    _mark(f"native {indices.start}-{indices[-1]}")
     row["at_ms"]["finished"] = _now()
     if ctx is not None:
         ctx.raise_if_cancelled()
@@ -1377,11 +1402,6 @@ def _submit(
 # ------------------------------------------------------------------ recording
 
 
-#: A recorded part: (first stage, end stage, passes, first step index or -1 for the reuse
-#: program, steps).
-_Part = tuple[int, int, int, int, int]
-
-
 def _record_resident(
     recording: _SequenceCapture,
     loop: _Loop,
@@ -1393,14 +1413,14 @@ def _record_resident(
     pre: dict[Model, tuple[str, ...]] | None,
     post: dict[Model, tuple[str, ...]] | None,
     again: bool,
-    *,
-    remaining: bool = True,
-) -> tuple[list[_Part], int]:
-    """One WHILE graph per run of equal phases, every component resident and held. With
-    `pre`/`post` (the models `before`/`after` run, resident too), `after` is recorded as the
-    last graph's suffix, and `again` also makes the reuse program: `before`, every step and
-    `after` over the same graphs. `remaining` plans the recording call's own rest too."""
-    runs = _runs(rest, loop.phases, loop.steps)
+) -> list[tuple[int, int]]:
+    """One graph per distinct label, every component resident and held; a run of equal labels is
+    one stage, its label's graph repeated natively. The parts are stage ranges, in order: `rest`
+    (the recording call's own steps left, when any), then with `again` the reuse program over
+    every step, `before` its first stage's prefix. With `pre`/`post` (the models `before`/`after`
+    run, resident too), `after` is each part's last stage's suffix."""
+    plans = [indices for indices, wanted in ((rest, len(rest)), (loop.steps, again)) if wanted]
+    runs = [_runs(indices, loop) for indices in plans]
     paths: dict[Model, set[str]] = {}
     for used in (body, pre or {}, post or {}):
         for model, entered in used.items():
@@ -1428,16 +1448,18 @@ def _record_resident(
             _lap("bind")
             owners = tuple(bindings)
             landed = LANDED[0]
-            graphs_: list[tuple[_Graph, int, int]] = []
+            bodies: dict[Any, _Graph] = {}
             with _guarded(held, frozenset()):
-                for first, count, phase in runs:
+                for first, count, label in (run for each in runs for run in each):
+                    if label in bodies:
+                        continue
 
-                    def advance(phase: Any = phase) -> None:
-                        _call(loop.step, counter, tensors, phase)
+                    def advance(label: Any = label) -> None:
+                        _call(loop.step, counter, tensors, label)
                         counter.add_(1)
 
                     graph = _Graph(
-                        recording, state, count, owners,
+                        recording, state, owners,
                         configuration=partial(
                             _graph_configuration, loop, range(first, first + count),
                             tensors, held, "step",
@@ -1445,13 +1467,13 @@ def _record_resident(
                     )
                     provisional.append(graph)
                     graph.record(advance)
-                    graphs_.append((graph, first, count))
+                    bodies[label] = graph
                     _lap("record_step")
                     _yield_point()
                 prefix = suffix = None
                 if loop.after is not None and post is not None:
                     suffix = _Graph(
-                        recording, state, 1, owners,
+                        recording, state, owners,
                         configuration=partial(
                             _graph_configuration, loop, loop.steps, tensors, held, "after",
                         ),
@@ -1462,7 +1484,7 @@ def _record_resident(
                     _yield_point()
                 if again and loop.before is not None and pre is not None:
                     prefix = _Graph(
-                        recording, state, 1, owners,
+                        recording, state, owners,
                         configuration=partial(
                             _graph_configuration, loop, loop.steps, tensors, held, "before",
                         ),
@@ -1472,18 +1494,19 @@ def _record_resident(
                     _lap("record_before")
             _lap("record")
             _yield_point()
-            parts: list[_Part] = []
-            for number, (graph, first, count) in enumerate(graphs_ if remaining else ()):
-                last = number == len(graphs_) - 1
-                plan = graph.plan(landed, suffix=suffix if last else None)
-                _own(plan, owners, recording)
-                parts.append((len(recording.stages) - 1, len(recording.stages), 1, first, count))
-            if again and len(graphs_) == 1:
-                graph, first, count = graphs_[0]
-                plan = graph.plan(landed, count + 1, prefix=prefix, suffix=suffix)
-                _own(plan, owners, recording)
-                parts.append((len(recording.stages) - 1, len(recording.stages), 1, -1, count + 1))
-            for done in (*(g for g, _, _ in graphs_), prefix, suffix):
+            parts: list[tuple[int, int]] = []
+            for part, each in enumerate(runs):
+                begin = len(recording.stages)
+                for number, (_, count, label) in enumerate(each):
+                    plan = bodies[label].plan(
+                        landed,
+                        count,
+                        prefix=prefix if again and part == len(runs) - 1 and not number else None,
+                        suffix=suffix if number == len(each) - 1 else None,
+                    )
+                    _own(plan, owners, recording)
+                parts.append((begin, len(recording.stages)))
+            for done in (*bodies.values(), prefix, suffix):
                 if done is not None:
                     done.done()
             _lap("plan")
@@ -1496,23 +1519,18 @@ def _record_resident(
         raise
     for binding in bindings:  # the last stage closes the bindings every stage reads
         recording.stages[-1]._binding_cleanup.callback(binding.close)
-    return parts, 0
+    return parts
 
 
-def _runs(
-    rest: range, phases: tuple[Hashable, ...] | None, steps: range
-) -> list[tuple[int, int, Any]]:
-    """(first index, count, phase) of each run of equal phases in `rest`."""
-    if phases is None:
-        return [(rest.start, len(rest), _NONE)]
+def _runs(indices: range, loop: _Loop) -> list[tuple[int, int, Any]]:
+    """(first index, count, label) of each run of equal labels in `indices`."""
     runs: list[tuple[int, int, Any]] = []
-    for i in rest:
-        phase = phases[i - steps.start]
-        if runs and runs[-1][2] == phase:
-            first, count, _ = runs[-1]
-            runs[-1] = (first, count + 1, phase)
+    for i in indices:
+        label = loop.label(i)
+        if runs and runs[-1][2] == label:
+            runs[-1] = (runs[-1][0], runs[-1][1] + 1, label)
         else:
-            runs.append((i, 1, phase))
+            runs.append((i, 1, label))
     return runs
 
 
@@ -1614,12 +1632,11 @@ class _Graph:
         self,
         recording: _SequenceCapture,
         state: tuple[Any, ...],
-        steps: int,
         bindings: tuple[Binding, ...],
         *,
         configuration: Callable[[], str | None] | None = None,
     ) -> None:
-        self.recording, self.state, self.steps, self.bindings = recording, state, steps, bindings
+        self.recording, self.state, self.bindings = recording, state, bindings
         self.device = state[0].device
         self.domain = recording._domain
         self.held: dict[int, Any] = {id(t): t for t in state}
@@ -1745,6 +1762,7 @@ class _Graph:
             self.graph.reset()
             self.graph = None
         self.held.clear()
+        self.__dict__.pop("external", None)
         self._replay_key = None
         self._configuration = None
 
@@ -1757,6 +1775,7 @@ class _Graph:
             raise
         self.end()
 
+    @cached_property
     def external(self) -> dict[int, Any]:
         """What the recorded operations read from outside this graph and its weights."""
         inside = _Spans((
@@ -1772,17 +1791,16 @@ class _Graph:
     def plan(
         self,
         landed: int,
-        steps: int | None = None,
+        steps: int,
         prefix: _Graph | None = None,
         suffix: _Graph | None = None,
     ) -> PreparedRepeat:
-        """A native owner repeating this graph `steps` times (its own count by default), with
-        one-shot `prefix` and `suffix` graphs of the same recording around the repeat."""
-        steps = self.steps if steps is None else steps
+        """A native owner repeating this graph `steps` times, with one-shot `prefix` and `suffix`
+        graphs of the same recording around the repeat."""
         held: dict[int, Any] = {}
         for graph in (self, prefix, suffix):
             if graph is not None:
-                held.update(graph.external())
+                held.update(graph.external)
         _lap("plan_held")
         phases = {
             "prefix_graph": 0 if prefix is None else prefix.graph.raw_cuda_graph(),
@@ -1839,6 +1857,7 @@ class _Graph:
     def done(self) -> None:
         """Every native owner is made: drop this graph's Python references to what it read."""
         self.held.clear()
+        self.__dict__.pop("external", None)
         self._configuration = None
 
 
