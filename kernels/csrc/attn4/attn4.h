@@ -13,12 +13,13 @@ using Strides = std::array<int64_t, 3>;
 
 // One attention call over device pointers the caller allocated (`internal.attention_int4`):
 // Q/K/V and the output in bf16 or fp16, head dimension 128; the int4 Q [B, H, Lq, 64] and
-// K [B, Hk, Lk, 64], their scales, K's channel sums [B, Hk, 128], and the INT8 V
+// K [B, Hk, Lk, 64], their scales, K's channel sums [B, Hk, 128] (int64), and the INT8 V
 // [B * Hk * 128, Lk padded to cta_k] with its channel scales.
 struct Call {
   const void *q, *k, *v;
   void *out, *q4, *k4, *v8;
-  float *q_scale, *k_scale, *v_scale, *k_sum;
+  float *q_scale, *k_scale, *v_scale;
+  int64_t *k_sum;
   int batch, heads, heads_k, len_q, len_k, cta_k;
   bool bf16;
   float scale;

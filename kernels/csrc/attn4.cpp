@@ -23,7 +23,8 @@ int attention(int device, uintptr_t q, uintptr_t k, uintptr_t v, uintptr_t out, 
   const auto floats = [](uintptr_t p) { return reinterpret_cast<float *>(p); };
   const cozy::attn4::Call call{
       at(q),         at(k),          at(v),         at(out),    at(q4),    at(k4),
-      at(v8),        floats(q_scale), floats(k_scale), floats(v_scale), floats(k_sum),
+      at(v8),        floats(q_scale), floats(k_scale), floats(v_scale),
+      reinterpret_cast<int64_t *>(k_sum),
       batch,         heads,          heads_k,       len_q,      len_k,     cta_k,
       bf16,          scale,          q_strides,     k_strides,  v_strides, out_strides};
   return cozy::attn4::attention(device, call, reinterpret_cast<cudaStream_t>(stream));

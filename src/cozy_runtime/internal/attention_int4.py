@@ -55,7 +55,7 @@ def attention(
     v8 = torch.empty(batch * heads_k * dim, blocks * cta, dtype=i8, device=device)
     q_scale = torch.empty(batch, heads, -(-len_q // 128) * 32, dtype=f32, device=device)
     k_scale = torch.empty(batch, heads_k, blocks * 4, dtype=f32, device=device)
-    k_sum = torch.empty(batch, heads_k, dim, dtype=f32, device=device)
+    k_sum = torch.empty(batch, heads_k, dim, dtype=torch.int64, device=device)
     v_scale = torch.empty(batch * heads_k * dim, dtype=f32, device=device)
 
     def strides(x: Tensor) -> tuple[int, int, int]:
