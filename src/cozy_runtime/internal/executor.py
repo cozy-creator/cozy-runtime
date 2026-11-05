@@ -1071,7 +1071,9 @@ class Executor:
         try:
             accel.bind_allocator(torch, self.device_kind)
             if self.device_kind == "cuda":
-                varena.activate(self.rank if self.world > 1 else 0, shared=owner.shared)
+                # A rank takes its own GPU; a plan that constructs nothing holds them all here.
+                for index in [self.rank] if self.world > 1 else range(len(_sealed_entries()) or 1):
+                    varena.activate(index, shared=owner.shared)
             accel.initialize(torch, self.device_kind)
             if self.device_kind == "cuda":
                 index = self.rank if self.world > 1 else 0
@@ -1688,7 +1690,7 @@ class Executor:
         cuda_start = (
             self.device_kind == "cuda" and bool(command.devices) and not command.import_only
         )
-        if degree != expected or ((degree > 1 or cuda_start) and degree != len(_sealed_entries())):
+        if degree != expected or (degree > 1 and degree != len(_sealed_entries())):
             self.poisoned = "sequence-parallel degree mismatch"
             return {
                 "ok": False,
