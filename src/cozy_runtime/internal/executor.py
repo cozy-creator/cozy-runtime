@@ -2431,11 +2431,12 @@ class Executor:
 
         stage("runtime_imports")
         _restore_seal()
-        if self.device_kind == "cuda" and self.world == 1:
+        if self.device_kind == "cuda":
             # Every encoded GEMM's kernels open from here, on threads of their own, before the
             # first construction and beside its weight fill: one first asked mid-request served
             # its whole stage on a fallback while it landed (Klein's on-demand upsampler; H3's
-            # nvfp4 layers through step 1 on an RTX 5090, cr-241). Each first ask waits for it.
+            # nvfp4 layers through step 1 on an RTX 5090, cr-241; on two 5060 Tis, cr-261). Each
+            # first ask waits for it; a group's GPUs state theirs in their load's reply.
             leaves.prime(torch, torch.cuda.current_device())
         if self.world > 1 and self.rank == 0:
             # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
@@ -2836,6 +2837,7 @@ class Executor:
             ).hexdigest()
         )
         if self.group is not None:
+            kernel_ready.settle()
             # THE FOLLOWERS BUILT THE SAME PLAN, or the group is not a group.
             try:
                 replies = self.group.collect("load")
@@ -5209,6 +5211,7 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
         return None
     reply = executor.handle(command)
     if name == "load" and executor.rank:  # what it opened loading: the group may serve it at once
+        kernel_ready.settle()
         reply["kernels"] = kernel_ready.pending()
     return reply
 

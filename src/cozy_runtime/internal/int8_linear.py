@@ -97,7 +97,7 @@ def failed(op: str, device: int, exc: Exception) -> None:
 
 
 def library(index: int) -> prebuilt.Prebuilt:
-    """The library `native` verified for this card."""
+    """The library `_library` verified for this card."""
     return _LIBS[index]
 
 
@@ -136,7 +136,6 @@ def native(torch: ModuleType, index: int) -> Op | None:
     ops = kernel_ready.serve(f"{NATIVE} cuda:{index}", partial(_library, torch, index), capturing)
     if ops is not None:  # it serves this card from here on
         _HALF[:] = (torch.bfloat16, torch.float16)
-        _LIBS[index] = ops
         op = _OPS[index] = ops.int8_linear
     return op
 
@@ -155,6 +154,7 @@ def _library(torch: ModuleType, index: int, wait: bool) -> prebuilt.Prebuilt:
         print(f"[kernels] {NATIVE} refused on sm{sm}: {detail}"[:400], file=sys.stderr)
         raise kernel_sources.Absent(detail)
     print(f"[kernels] {NATIVE} verified on sm{sm}: {detail}"[:400], file=sys.stderr)
+    _LIBS[index] = ops
     return ops
 
 
