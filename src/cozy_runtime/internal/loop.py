@@ -1752,11 +1752,19 @@ class _Graph:
             peak = int(vt.stats(self.device.index)["allocated_peak"])
             self.recording._working_bytes = max(peak, self.recording._reserve)
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
+        capture = partial(
+            vt.graph, self.graph, pool=self.recording._pool.handle, stream=control,
+            reserve_bytes=self.recording._working_bytes, primed=(stream,),
+        )
         try:
-            self._piece.enter_context(vt.graph(
-                self.graph, pool=self.recording._pool.handle, stream=control,
-                reserve_bytes=self.recording._working_bytes, primed=(stream,),
-            ))
+            try:
+                self._piece.enter_context(capture())
+            except torch.OutOfMemoryError:
+                # The pool's room is the eager steps' still running before it: once theirs.
+                if self._caller.query():
+                    raise
+                self._caller.synchronize()
+                self._piece.enter_context(capture())
             torch.cuda.set_stream(stream)
         except BaseException:
             torch.cuda.set_stream(self._caller)
