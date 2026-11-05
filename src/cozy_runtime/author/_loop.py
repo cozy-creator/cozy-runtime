@@ -70,9 +70,10 @@ def denoise_loop(
       each label's first.
     - `key`: with `inputs`, lets the Runtime keep the whole call for a later call with an
       equal key and equal tensor layouts. It names everything the step bakes in that is not
-      a declared tensor (a guidance float, say). `before` and `after` remain optional. The
-      step and any declared `before`/`after` must reach every per-call tensor through their
-      arguments; the Runtime keeps its own copies and copies values in and out.
+      a declared tensor (a guidance float, say), an overlay its step arms on only some calls
+      among them: overlays armed before the loop are its own. `before` and `after` remain
+      optional. The step and any declared `before`/`after` must reach every per-call tensor
+      through their arguments; the Runtime keeps its own copies and copies values in and out.
     - `on_step(index)`: called on the host after each completed step.
     - `before` and `after`: work that runs once before the first step and after the last,
       called like the step without its index (`before(*state, *carried, *inputs)`): a text
@@ -80,6 +81,8 @@ def denoise_loop(
       Runtime records them into the program when their components stay on the device too.
     - `cache`: a `stepcache` policy for the transformers whose stacks the package installed
       (`stepcache.install`): approximate, for a preset that asks for it, never a default.
+
+    LoRA overlays (`lora.Hook`) are armed before the loop; one a step arms raises.
 
     A step that runs components is called inside a `@uses_components` method, whose components
     they are. A step of tensor work alone may run outside one; it records resident too.
