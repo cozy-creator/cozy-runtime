@@ -1669,9 +1669,10 @@ class Memory:
                 self._phase_plan_models.clear()
                 self._note_phase_plan("unplanned", reason)
 
-    def _refresh_phase_plan(self, names: frozenset[str]) -> None:
-        """Every Region of this phase, in order, under the overlays armed now: the core plans
-        from these. A Region is an address and a Source; nothing here moves bytes."""
+    def _refresh_phase_plan(self, names: frozenset[str], opening: Model) -> None:
+        """Every Region of this phase, in order: the core plans from these. A Region is an address
+        and a Source; nothing here moves bytes. `opening`'s forward has armed its overlays, so its
+        Regions are those it will use; another model's are those it used last."""
         models = [model for model in self.models.values() if model.name in names]
         reason = ""
         if len(models) != len(names) or {model.name for model in models} != set(names):
@@ -1687,7 +1688,9 @@ class Memory:
                 if block.gathered is not None:
                     reason = "host_gathered_representation"
                     break
-                overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
+                overlay = block.overlay
+                if model is opening and model.fill is not None:
+                    overlay = model.fill.overlay(block.path, block.parts)
                 if overlay != block.overlay:
                     if block.count or block.retained or block.loading:
                         reason = "overlay_in_use"
@@ -1759,7 +1762,7 @@ class Memory:
                     request.phase_changes.append(
                         {"models": sorted(names), "retention": "native_demand"}
                     )
-            self._refresh_phase_plan(names)
+            self._refresh_phase_plan(names, model)
 
     def _final_views(self, block: _Block) -> None:
         if not block.finals:
