@@ -1617,7 +1617,6 @@ class Memory:
         field = "final_region" if final else "region"
         region = getattr(block, field)
         if region is None:
-            self._retire_phase_plan("representation_created", model=block.model)
             size = block.final_bytes if final else block.storage_bytes
             region = self.native.region(size, self._source(block, final=final))
             setattr(block, field, region)
@@ -2128,7 +2127,7 @@ class Memory:
                     if self._phase_request == request.id:
                         self._retire_phase_plan("request_ended")
                 self.forget_working_phases(request)
-                if self.pages is not None:
+                if self.pages is not None and not idle:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
                 request.sample()
@@ -2314,7 +2313,8 @@ class Request:
 
     @property
     def trace(self) -> list[dict[str, object]]:
-        if self.memory.pages is not None:
+        # An idle request opens inside a running one and fills nothing: the fills are that one's.
+        if self.memory.pages is not None and not self.idle:
             self.record_fills()
         return self._trace
 
