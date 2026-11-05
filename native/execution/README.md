@@ -21,10 +21,11 @@ import either.
   exit. Residency retires idle definitions before releasing their weights.
 - **Cancellation** is a GPU atomic written from a control stream and observed after a complete body
   or stage; it is not preemption. Progress reads device counters through an ordered snapshot.
-- **Graph contents.** Only kernel, empty, memcpy, memset, child-graph and conditional nodes are
-  accepted, a child's and a conditional's bodies by the same rules; memcpy/memset become kernel
-  nodes inside the conditional body. Host callbacks, allocations and events are refused as
-  capability refusals; real CUDA failures keep their driver codes.
+- **Graph contents.** Only kernel, empty, memcpy, memset and child-graph nodes are accepted;
+  memcpy/memset become kernel nodes inside the conditional body. Host callbacks, allocations,
+  events and a recorded graph's own conditionals are refused as capability refusals (the only
+  conditionals inside a body are the IF/ELSE nodes it builds over branches checked first); real
+  CUDA failures keep their driver codes.
 
 Build with `scripts/build-execution-native.sh INSTALL_PREFIX` and `COZY_CUDA_TOOLKIT` pointing at a
 CUDA 13 toolkit. The wheel carries eight native SASS targets, with no PTX and no serving JIT.

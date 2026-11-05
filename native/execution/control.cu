@@ -161,9 +161,10 @@ static cudaError_t ineligible(Repeat *run, const char *stage, const char *reason
 }
 
 // Reject every operation whose ownership/side effects cannot be represented by a resident body.
-// cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle.
+// cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle. Only an
+// `assembled` body holds conditional nodes: the IF/ELSE the repeat built over branches it checked.
 static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
-                           Repeat *run, const char *stage, unsigned depth = 0) {
+                           Repeat *run, const char *stage, unsigned depth = 0, bool assembled = false) {
     if (depth > 32) return ineligible(run, stage, "depth_limit", -1, depth, 0, total);
     size_t count = 0;
     auto error = cudaGraphGetNodes(graph, nullptr, &count);
@@ -181,15 +182,8 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
         if (type == cudaGraphNodeTypeGraph) {
             cudaGraph_t child;
             error = cudaGraphChildGraphNodeGetGraph(node, &child);
-            if (error == cudaSuccess) error = inspect(child, total, device, run, stage, depth + 1);
+            if (error == cudaSuccess) error = inspect(child, total, device, run, stage, depth + 1, assembled);
             if (error != cudaSuccess) return error;
-        } else if (type == cudaGraphNodeTypeConditional) {
-            cudaGraphNodeParams parameters{};
-            if ((error = cudaGraphNodeGetParams(node, &parameters)) != cudaSuccess) return error;
-            for (unsigned i = 0; i < parameters.conditional.size; ++i)
-                if ((error = inspect(parameters.conditional.phGraph_out[i], total, device, run, stage,
-                                     depth + 1)) != cudaSuccess)
-                    return error;
         } else if (type == cudaGraphNodeTypeMemcpy) {
             cudaMemcpy3DParms parameters{};
             error = cudaGraphMemcpyNodeGetParams(node, &parameters);
@@ -219,7 +213,8 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
             if (attributes.type != cudaMemoryTypeDevice || attributes.device != device)
                 return ineligible(run, stage, "memset_destination", type, depth, count, total,
                                   -1, attributes.type, attributes.device);
-        } else if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeEmpty) {
+        } else if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeEmpty
+                   && !(assembled && type == cudaGraphNodeTypeConditional)) {
             return ineligible(run, stage, "node_type", type, depth, count, total);
         }
     }
@@ -244,14 +239,6 @@ static cudaError_t lower(cudaGraph_t graph, Repeat *run, const char *stage, unsi
             cudaGraph_t child;
             if ((error = cudaGraphChildGraphNodeGetGraph(node, &child)) != cudaSuccess) return error;
             if ((error = lower(child, run, stage, depth + 1)) != cudaSuccess) return error;
-            continue;
-        }
-        if (type == cudaGraphNodeTypeConditional) {
-            cudaGraphNodeParams parameters{};
-            if ((error = cudaGraphNodeGetParams(node, &parameters)) != cudaSuccess) return error;
-            for (unsigned i = 0; i < parameters.conditional.size; ++i)
-                if ((error = lower(parameters.conditional.phGraph_out[i], run, stage, depth + 1)) != cudaSuccess)
-                    return error;
             continue;
         }
         if (type != cudaGraphNodeTypeMemset && type != cudaGraphNodeTypeMemcpy) continue;
@@ -514,7 +501,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     cudaGraphNode_t boundary;
     CHECK(cudaGraphAddKernelNode(&boundary, body, &compute, 1, &kernel));
     // Inspect the actual assembled body, including the cloned source child definition.
-    CHECK(inspect(body, run->validated_nodes, device, run, "assembled"));
+    CHECK(inspect(body, run->validated_nodes, device, run, "assembled", 0, true));
     if (suffix) {
         cudaGraphConditionalHandle finish;
         CHECK(cudaGraphConditionalHandleCreate(&finish, run->graph, 0, cudaGraphCondAssignDefault));
