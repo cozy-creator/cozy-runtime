@@ -3554,7 +3554,9 @@ class Executor:
             with (
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
-                self._request(command.request_id) as own_memory,
+                self._request(
+                    command.request_id, f"{command.construction}|{command.entrypoint}"
+                ) as own_memory,
                 self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
@@ -4703,7 +4705,7 @@ class Executor:
         return Device(placed.type, placed.index)
 
     @contextlib.contextmanager
-    def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:
+    def _request(self, request_id: str, key: str | None = None) -> Iterator[list[GpuMemory]]:
         """The request's residency scopes and pure cuts. Tensor ownership determines lifetime;
         its recorded allocator figures are process-wide, not exact per-request allocations."""
         host, rows = self.host, list[GpuMemory]()
@@ -4716,7 +4718,7 @@ class Executor:
         peak: int | None = None
         try:
             with (
-                host.memory.request(request_id) as request,
+                host.memory.request(request_id, key=key) as request,
                 host.execution.serving(request),
             ):
                 host.requests[request_id] = request

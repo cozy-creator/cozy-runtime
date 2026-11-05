@@ -2087,7 +2087,10 @@ class Memory:
         plan: Sequence[object] = (),
         *,
         idle: bool = False,
+        key: str | None = None,
     ) -> Iterator[Request]:
+        """`key` names what runs, the same in each process of it: its last process's peak lets the
+        core make room before this one loads."""
         request = Request(self, id, idle)
         request.plan(plan)
         with self.lock:
@@ -2100,7 +2103,7 @@ class Memory:
             self.requests.add(request)
         token = _REQUEST.set(request)
         if self.cuda:
-            varena.request_boundary(self.device.index or 0, begin=True)
+            varena.request_boundary(self.device.index or 0, begin=True, plan=key)
         try:
             yield request
         finally:
