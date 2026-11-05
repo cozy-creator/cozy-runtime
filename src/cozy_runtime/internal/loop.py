@@ -1566,13 +1566,8 @@ class _Graph:
             self._contexts.enter_context(kernel_ready.recording())
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
-            if self.recording._working_bytes is None:
-                # Later capture peaks include the eager snapshots still held outside this
-                # pool. They must not feed back into the next stage's reservation.
-                self.recording._working_bytes = int(vt.stats(self.device.index)["allocated_peak"])
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
-                reserve_bytes=self.recording._working_bytes,
             ))
             torch.cuda.set_stream(stream)
         except BaseException as error:
