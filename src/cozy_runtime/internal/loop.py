@@ -102,6 +102,8 @@ _REFUSED = (
 )
 #: a refusal by one of them (`_refusal`)
 _UNRECORDABLE = "the step cannot be recorded"
+#: varena's refusal of a capture's allocation outside its pool, which no capacity would serve
+_CAPTURE_MAP = "a CUDA capture cannot map"
 #: a refusal that says nothing against the graph (`_refusal`)
 _WAITING = "capture waits for kernel readiness"
 #: request id -> its loops, for the run record (`execution.loops`)
@@ -153,8 +155,8 @@ def _refusal(error: BaseException) -> str | None:
         return _Fixed(error) if error.code in _REFUSED else None
     if isinstance(error, Building):
         return f"{_WAITING}: {error}"
-    if isinstance(error, torch.OutOfMemoryError):
-        return f"preparation exceeded capacity: {error}"
+    if isinstance(error, torch.OutOfMemoryError):  # varena's CaptureMap says itself why
+        return str(error) if _CAPTURE_MAP in str(error) else f"preparation exceeded capacity: {error}"
     if isinstance(error, ResidencyError):
         return f"residency refused preparation: {error}"
     code = getattr(error, "error_code", None)
@@ -1612,7 +1614,7 @@ class _Graph:
                 self.recording._working_bytes = int(vt.stats(self.device.index)["allocated_peak"])
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
-                reserve_bytes=self.recording._working_bytes,
+                reserve_bytes=self.recording._working_bytes, primed=(stream,),
             ))
             torch.cuda.set_stream(stream)
         except BaseException as error:
