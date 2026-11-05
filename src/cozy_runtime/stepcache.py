@@ -20,8 +20,7 @@ Embeddings and the final layer run every forward; a skipped forward runs none of
 blocks after its first, so their weights, AdaLN and carried state stay as the last computed
 forward left them. State starts with every call. Each forward's verdict comes from fixed-order
 reductions on the device, so the same inputs and policy give the same verdicts and bytes. The
-loop's record carries `cache` (its forwards, computed and skipped), and each step's `plans` line
-ends `cache:compute` or `cache:skip`.
+loop's record carries `cache` (its forwards, computed and skipped).
 
 - `FirstBlockCache(t)` (NVIDIA sol-engine `first_block_cache.py`): block 0 runs, `r0 = h0 - x`;
   the rest run when there is no reference yet or `Σ|r0 - r0_ref| > t·Σ|r0_ref|`, and then
@@ -32,7 +31,11 @@ ends `cache:compute` or `cache:skip`.
   computes once `acc ≥ t`. A computed forward sets `k = mean|y - Y_c| / mean|x - X_c|`,
   `X_c = x`, `Y_c = y`, `R = y - x` and clears `acc`; a skip is `y = x + R`.
 
-A loop with a cache runs eagerly: each forward reads its verdict on the host once.
+Its state lives in device buffers updated in place. An eager step reads each forward's verdict on
+the host once; a recorded step keeps it on the device: the step's graph holds both branches, the
+rest of the stack and the cached residual, and the verdict picks one (`internal.loop`'s cut). Both
+run the same operations, so they give the same verdicts and bytes. Each step's `plans` line names
+its verdict when the step ran eagerly; the loop's `cache` counts every step's, read after the loop.
 """
 
 from __future__ import annotations
@@ -185,8 +188,14 @@ def _listed(base: type) -> type:
 
 @dataclass(slots=True)
 class _State:
-    """One slot's references (a stack forward's place within its step), on the device."""
+    """One slot's references (a stack forward's place within its step), in device buffers updated
+    in place, so a recorded step's graph reads what the last forward left. They begin unset, and
+    count only once its flags say so: `has` FirstBlockCache's has-reference, EasyCache's
+    has-computed and has-rate; `hits` EasyCache's skips in a row. The flags are a row of the
+    call's (`_Run.flags`), zeroed with every call."""
 
+    has: Any
+    hits: Any
     ref: tuple[Any, ...] = ()
     residual: tuple[Any, ...] = ()
     previous: tuple[Any, ...] = ()
@@ -194,7 +203,6 @@ class _State:
     outputs_c: tuple[Any, ...] = ()
     rate: Any = None
     acc: Any = None
-    hits: int = 0
     like: Any = None
 
 
@@ -212,19 +220,38 @@ def _diff(a: Sequence[Any], b: Sequence[Any], mean: bool = False) -> Any:
     return _mean(deltas) if mean else _sum(deltas)
 
 
+def _like(tensors: Sequence[Any]) -> tuple[Any, ...]:
+    """Unset buffers: an allocation alone, which a recording does not replay."""
+    return tuple(torch.empty_like(t) for t in tensors)
+
+
+#: The forwards a step's stacks hold state for (`_Run.flags`): every slot's row is the call's.
+SLOTS = 64
+
+
 @dataclass(slots=True)
 class _Run:
-    """One loop call's cache: its policy, its slots' state and its verdicts."""
+    """One loop call's cache: its policy, its slots' state and its verdicts. `computes` and
+    `forwards` count each step's computed and all forwards on the device, read once after the
+    loop; `flags` holds each slot's. While a step's graph records, `cut` splits it at each
+    forward's verdict (`_Graph.cut`): the rest of the stack in one branch, the cached residual in
+    the other."""
 
     policy: Policy
-    forwards: int
-    step: int = 0
+    steps: range
+    computes: Any
+    forwards: Any
+    flags: Any
+    index: Any = None
+    step: int | None = None
+    cut: Any = None
     slot: int = 0
     states: dict[tuple[int, int], _State] = field(default_factory=dict)
     verdicts: list[tuple[int, bool]] = field(default_factory=list)
 
-    def begin(self, step: int) -> None:
-        self.step, self.slot = step, 0
+    def begin(self, index: Any, step: int | None = None, cut: Any = None) -> None:
+        """A step: its device index, its host index when it runs eagerly, the recording's cut."""
+        self.index, self.step, self.cut, self.slot = index, step, cut, 0
 
     def forward(self, blocks: Any, installed: _Installed) -> Iterator[Any]:
         """An iteration of the stack. Its first item stands for block 0 (attribute reads pass
@@ -241,21 +268,42 @@ class _Run:
 
     def claim(self, blocks: Any) -> _State:
         """The state of the stack's next forward in this step (its slot)."""
-        state = self.states.setdefault((id(blocks), self.slot), _State())
+        key = (id(blocks), self.slot)
         self.slot += 1
-        return state
+        if key not in self.states:
+            if len(self.states) == SLOTS:
+                raise ValueError(f"a step cache holds at most {SLOTS} forwards a step")
+            row = self.flags[len(self.states)]
+            self.states[key] = _State(row[:3], row[3:])
+        return self.states[key]
+
+    def counted(self) -> tuple[Any, Any, Any]:
+        """What a recorded program's graphs write and a later call zeroes (`adopt`)."""
+        return self.computes, self.forwards, self.flags
+
+    def adopt(self, counted: tuple[Any, Any, Any]) -> None:
+        """A kept program's counters and flags, which its graphs write: this call's."""
+        self.computes, self.forwards, self.flags = counted
+        for tensor in counted:
+            tensor.zero_()
 
     def verdict(self) -> str:
+        if self.step is None:
+            return ""
         mine = [computed for step, computed in self.verdicts if step == self.step]
         return "" if not mine else "cache:compute" if any(mine) else "cache:skip"
 
     def document(self) -> dict[str, object]:
-        skipped = [step for step, computed in self.verdicts if not computed]
+        computes, forwards = self.computes.tolist(), self.forwards.tolist()
         return {
             **self.policy.document(),
-            "forwards": len(self.verdicts),
-            "computed": len(self.verdicts) - len(skipped),
-            "skipped_steps": skipped,
+            "forwards": sum(forwards),
+            "computed": sum(computes),
+            "skipped_steps": [
+                self.steps.start + step
+                for step, (done, total) in enumerate(zip(computes, forwards, strict=True))
+                for _ in range(total - done)
+            ],
         }
 
 
@@ -269,6 +317,7 @@ class _Gate:
         self.inputs: tuple[Any, ...] = ()
         self.head: tuple[Any, ...] = ()
         self.r0: tuple[Any, ...] = ()
+        self.merged: tuple[Any, ...] = ()
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
@@ -277,53 +326,68 @@ class _Gate:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         run, installed = self.run, self.installed
-        self.state = state = run.claim(self.blocks)
-        policy = run.policy
         self.inputs = xs = installed.inputs(args, kwargs)
-        if isinstance(policy, FirstBlockCache):
+        self.state = state = run.claim(self.blocks)
+        relative = run.index - run.steps.start
+        out = None
+        if isinstance(run.policy, FirstBlockCache):
             out = self.first(*args, **kwargs)
             self.head = installed.outputs(out)
             self.r0 = tuple(h - x for h, x in zip(self.head, xs, strict=True))
-            if state.ref:
-                verdict = _diff(self.r0, state.ref) > policy.threshold * _sum(state.ref).clamp_min(
-                    1e-8
-                )
-                self.computed = bool(verdict.item())
-            run.verdicts.append((run.step, self.computed))
-            if self.computed:  # the old references go now: the tail holds r0 and h0 alone
-                state.ref = state.residual = ()
-                return out
-            return installed.pack(
-                out, tuple(h + r for h, r in zip(self.head, state.residual, strict=True))
+            if not state.ref:
+                state.ref, state.residual = _like(self.r0), _like(self.head)
+            computed = (state.has[0] == 0) | (
+                _diff(self.r0, state.ref) > run.policy.threshold * _sum(state.ref).clamp_min(1e-8)
             )
-        self.computed = self._easy(policy, xs)
-        run.verdicts.append((run.step, self.computed))
-        state.previous = tuple(x.clone() for x in xs)
-        if self.computed:
-            return self.first(*args, **kwargs)
-        state.hits += 1
-        return installed.pack(
-            state.like, tuple(x + r for x, r in zip(xs, state.residual, strict=True))
-        )
+        else:
+            computed = self._easy(run.policy, state, xs, relative)
+        run.computes.index_add_(0, relative, computed.int().reshape(1))
+        run.forwards.index_add_(0, relative, torch.ones_like(run.forwards[:1]))
+        if run.cut is not None:  # recording: both branches, the device decides
+            self.merged = _like(self.head or xs)
+            run.cut(computed.int())
+        else:
+            self.computed = bool(computed.item())
+            run.verdicts.append((run.step, self.computed))
+            if not self.computed:
+                skipped = self.skip()
+                return installed.pack(out if out is not None else state.like, skipped)
+        return out if out is not None else self.first(*args, **kwargs)
 
-    def _easy(self, policy: EasyCache, xs: tuple[Any, ...]) -> bool:
-        state, index = self.state, self.run.step
-        assert state is not None
-        last = self.run.forwards - 1
-        if (
-            index < policy.retain
-            or index >= last - policy.cooldown
-            or state.rate is None
-            or state.hits >= policy.max_hits
-        ):
-            return True
+    def _easy(self, policy: EasyCache, state: _State, xs: tuple[Any, ...], relative: Any) -> Any:
+        if not state.previous:
+            state.previous, state.inputs_c, state.outputs_c, state.residual = (
+                _like(xs), _like(xs), _like(xs), _like(xs)
+            )
+            state.rate, state.acc = (torch.empty(1, device=xs[0].device) for _ in range(2))
+        last = len(self.run.steps) - 1
+        forced = (
+            (relative < policy.retain)
+            | (relative >= last - policy.cooldown)
+            | (state.has[2] == 0)
+            | (state.hits >= policy.max_hits)
+        )
         change = _diff(xs, state.previous, mean=True) / _mean(state.outputs_c).clamp_min(1e-8)
-        state.acc = state.acc + state.rate * change
-        return bool((state.acc >= policy.threshold).item())
+        accumulated = state.acc + state.rate * change
+        state.acc.copy_(torch.where(forced, state.acc, accumulated))
+        for previous, x in zip(state.previous, xs, strict=True):
+            previous.copy_(x)
+        return forced | (accumulated >= policy.threshold)
+
+    def skip(self) -> tuple[Any, ...]:
+        """The cached forward: block 0's output (FirstBlockCache) or its input plus the
+        residual."""
+        state = self.state
+        assert state is not None
+        if isinstance(self.run.policy, FirstBlockCache):
+            return tuple(h + r for h, r in zip(self.head, state.residual, strict=True))
+        state.hits.add_(1)
+        return tuple(x + r for x, r in zip(self.inputs, state.residual, strict=True))
 
 
 class _Last:
-    """The stack's last block on a computed forward: its output, then the references."""
+    """The stack's last block on a computed forward: its output, then the references. Recording,
+    the skipped branch follows: the stack's output is `merged` either way."""
 
     def __init__(
         self, run: _Run, state: _State, installed: _Installed, last: Any, gate: _Gate
@@ -345,30 +409,46 @@ class _Last:
         out = self.last(*args, **kwargs)
         ys, state, gate = self.installed.outputs(out), self.state, self.gate
         if isinstance(self.run.policy, FirstBlockCache):
-            state.ref = gate.r0
-            state.residual = tuple(y - h for y, h in zip(ys, gate.head, strict=True))
-            return out
-        xs = gate.inputs
-        if state.inputs_c:
-            state.rate = _diff(ys, state.outputs_c, mean=True) / _diff(
+            for ref, r0 in zip(state.ref, gate.r0, strict=True):
+                ref.copy_(r0)
+            for residual, y, h in zip(state.residual, ys, gate.head, strict=True):
+                residual.copy_(y - h)
+            state.has[0].fill_(1)
+        else:
+            xs = gate.inputs
+            rate = _diff(ys, state.outputs_c, mean=True) / _diff(
                 xs, state.inputs_c, mean=True
             ).clamp_min(1e-8)
-        state.inputs_c = tuple(x.clone() for x in xs)
-        state.outputs_c = tuple(y.clone() for y in ys)
-        state.residual = tuple(y - x for y, x in zip(ys, xs, strict=True))
-        state.acc = torch.zeros((), dtype=torch.float32, device=ys[0].device)
-        state.hits = 0
-        state.like = out
-        return out
+            state.rate.copy_(torch.where(state.has[1] != 0, rate, state.rate))
+            state.has[2].copy_(state.has[2] | state.has[1])
+            pairs = (*zip(state.inputs_c, xs, strict=True), *zip(state.outputs_c, ys, strict=True))
+            for kept, value in pairs:
+                kept.copy_(value)
+            for residual, y, x in zip(state.residual, ys, xs, strict=True):
+                residual.copy_(y - x)
+            state.acc.zero_()
+            state.hits.zero_()
+            state.has[1].fill_(1)
+            state.like = out
+        if self.run.cut is None:
+            return out
+        for merged, y in zip(gate.merged, ys, strict=True):
+            merged.copy_(y)
+        self.run.cut(None)  # the skipped branch
+        for merged, value in zip(gate.merged, gate.skip(), strict=True):
+            merged.copy_(value)
+        self.run.cut(None)  # after the branches
+        return self.installed.pack(out, gate.merged)
 
 
 _RUN: ContextVar[_Run | None] = ContextVar("cozy_stepcache", default=None)
 
 
 @contextmanager
-def running(policy: Policy, forwards: int) -> Iterator[_Run]:
+def running(policy: Policy, steps: range, device: Any) -> Iterator[_Run]:
     """A loop call under `policy` (`author.denoise_loop(cache=…)`): its stacks' forwards cache."""
-    run = _Run(policy, forwards)
+    counted = (torch.zeros(len(steps), dtype=torch.int32, device=device) for _ in range(2))
+    run = _Run(policy, steps, *counted, torch.zeros(SLOTS, 4, dtype=torch.int32, device=device))
     token = _RUN.set(run)
     try:
         yield run

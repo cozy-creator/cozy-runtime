@@ -7,7 +7,9 @@ import either.
 
 - **ResidentRepeat** clones one recorded graph into a conditional WHILE body. A device kernel
   advances the iteration index and decides whether the GPU repeats; the host launches once for any
-  number of steps.
+  number of steps. A step recorded in pieces at a step cache's verdicts (`branches`) becomes the
+  first piece, then per verdict an IF/ELSE of its two branches, which a kernel picks from the
+  verdict's flag, and the piece after them.
 - **NativeSequence** advances ordered stages from one native worker. A half-open stage range can
   repeat (`repeat=(begin, end, passes)`) without Python between passes. A stage may own a TensorFS
   input: before its graph runs, the worker loads that block's raw (or stored-INT8) bytes at the
@@ -19,10 +21,10 @@ import either.
   exit. Residency retires idle definitions before releasing their weights.
 - **Cancellation** is a GPU atomic written from a control stream and observed after a complete body
   or stage; it is not preemption. Progress reads device counters through an ordered snapshot.
-- **Graph contents.** Only kernel, empty, memcpy, memset and child-graph nodes are accepted;
-  memcpy/memset become kernel nodes inside the conditional body. Host callbacks, allocations,
-  events and nested conditionals are refused as capability refusals; real CUDA failures keep their
-  driver codes.
+- **Graph contents.** Only kernel, empty, memcpy, memset, child-graph and conditional nodes are
+  accepted, a child's and a conditional's bodies by the same rules; memcpy/memset become kernel
+  nodes inside the conditional body. Host callbacks, allocations and events are refused as
+  capability refusals; real CUDA failures keep their driver codes.
 
 Build with `scripts/build-execution-native.sh INSTALL_PREFIX` and `COZY_CUDA_TOOLKIT` pointing at a
 CUDA 13 toolkit. The wheel carries eight native SASS targets, with no PTX and no serving JIT.

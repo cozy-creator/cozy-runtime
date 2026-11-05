@@ -19,6 +19,8 @@ unsafe extern "C" {
         steps: u32,
         prefix: usize,
         suffix: usize,
+        branches: *const usize,
+        count: u32,
         out: *mut *mut c_void,
     ) -> i32;
     fn cozy_repeat_launch(run: *mut c_void, producer: usize) -> i32;
@@ -225,7 +227,8 @@ impl ResidentRepeat {
     }
 
     #[new]
-    #[pyo3(signature = (source_graph, index, device, steps, owners, *, prefix_graph=0, suffix_graph=0))]
+    #[pyo3(signature = (source_graph, index, device, steps, owners, *, prefix_graph=0, suffix_graph=0, branches=Vec::new()))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         source_graph: usize,
@@ -235,10 +238,16 @@ impl ResidentRepeat {
         owners: Vec<Py<PyAny>>,
         prefix_graph: usize,
         suffix_graph: usize,
+        branches: Vec<(usize, usize, usize, usize)>,
     ) -> PyResult<Self> {
-        if source_graph == 0 || index == 0 || steps == 0 {
+        // Each step cache verdict's flag, then its set, unset and following graphs.
+        let flat: Vec<usize> = branches
+            .iter()
+            .flat_map(|&(flag, set, unset, next)| [flag, set, unset, next])
+            .collect();
+        if source_graph == 0 || index == 0 || steps == 0 || flat.contains(&0) {
             return Err(PyRuntimeError::new_err(
-                "nonempty owned graph, GPU index and positive repeat count required",
+                "nonempty owned graphs, GPU index and positive repeat count required",
             ));
         }
         let (pointer, code) = py.detach(|| {
@@ -253,6 +262,8 @@ impl ResidentRepeat {
                     steps,
                     prefix_graph,
                     suffix_graph,
+                    flat.as_ptr(),
+                    branches.len() as u32,
                     &mut pointer,
                 )
             };
