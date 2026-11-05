@@ -1951,6 +1951,8 @@ class _Engine:
                     vt.pool_scratch(self.pool.handle, (), self.domain.device)
                 except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
                     safeguard("scratch_declined", str(exc))
+                self._verify(key, graph, size)
+                return
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
@@ -1967,6 +1969,51 @@ class _Engine:
         else:
             self._advance(size)
             self.eager += 1
+
+    def _token_state(self) -> list[Any]:
+        """What a step writes but its keys, each slot of which it writes before reading."""
+        state = [self.ids, self.mask, self.out, self.n, self.done, self.seen, self.length]
+        state.append(self.position)
+        for layer in self.cache.layers:
+            if isinstance(layer, _Keys):
+                state.append(layer.cumulative_length)
+            else:
+                held = (*layer.conv_states.values(), *layer.recurrent_states.values())
+                state += [value for value in held if value is not None]
+        return state
+
+    def _written(self, size: int, at: Any) -> list[Any]:
+        """Each row's keys and values at its slot `at`."""
+        rows = torch.arange(size, device=at.device)
+        layers = [layer for layer in self.cache.layers if isinstance(layer, _Keys)]
+        return [buffer[rows, :, at] for layer in layers for buffer in (layer.keys, layer.values)]
+
+    def _verify(self, key: tuple[int, int, bool, bool], graph: Any, size: int) -> None:
+        """A new graph's one check: its replay, then this token's eager step from the same
+        state, last so that what serves the call is eager's. A difference discards the graph."""
+        state, stream = self._token_state(), torch.cuda.current_stream(self.domain.device)
+        start, at = [value.clone() for value in state], self.length[:size].clone()
+        replayed = None
+        try:
+            vt.prepare_pool(self.pool.handle, 0, self.domain.device)
+        except torch.OutOfMemoryError:  # No room for its idle pool to come back: unproven.
+            why, code = "no room to check its replay against eager", "capture_refused"
+        else:
+            vt.replay(graph, stream=stream)
+            vt.record_pool_stream(self.pool.handle, stream, self.domain.device)
+            replayed = [*(value.clone() for value in state), *self._written(size, at)]
+            for tensor, value in zip(state, start, strict=True):
+                tensor.copy_(value)
+        self._advance(size)
+        self.eager += 1
+        if replayed is not None:
+            why = vt.replay_differs([*state, *self._written(size, at)], replayed)
+            code = "replay_mismatch"
+        if why:
+            stream.synchronize()
+            del self.graphs[key]
+            graph.reset()
+            self._unrecorded(key, why, code)
 
     def _forget(self) -> None:
         """Release recordings only at the driver's already-drained step boundary."""
