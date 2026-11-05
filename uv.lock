@@ -364,8 +364,8 @@ requires-dist = [
     { name = "packaging", specifier = ">=24" },
     { name = "peft", marker = "extra == 'adapters'", specifier = ">=0.20,<0.21" },
     { name = "pillow", specifier = ">=12" },
-    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator?subdirectory=crates%2Ftensorfs-py&rev=422df5fecbf944b98512640c8d28ac5160ad676b" },
-    { name = "tensorfs", marker = "extra == 'model-execution'", git = "https://github.com/cozy-creator/cozy-creator?subdirectory=crates%2Ftensorfs-py&rev=422df5fecbf944b98512640c8d28ac5160ad676b" },
+    { name = "tensorfs", git = "https://github.com/cozy-creator/cozy-creator?subdirectory=crates%2Ftensorfs-py&rev=da8ec7544c41aaa5573d095c209ef36ebfe3ba16" },
+    { name = "tensorfs", marker = "extra == 'model-execution'", git = "https://github.com/cozy-creator/cozy-creator?subdirectory=crates%2Ftensorfs-py&rev=da8ec7544c41aaa5573d095c209ef36ebfe3ba16" },
     { name = "tokenizers", marker = "extra == 'adapters'", specifier = ">=0.23.1" },
     { name = "torch", marker = "extra == 'adapters'", specifier = ">=2.15" },
     { name = "torch", marker = "extra == 'derive'", specifier = ">=2.15" },
@@ -1538,7 +1538,7 @@ wheels = [
 [[package]]
 name = "tensorfs"
 version = "0.19.2"
-source = { git = "https://github.com/cozy-creator/cozy-creator?subdirectory=crates%2Ftensorfs-py&rev=422df5fecbf944b98512640c8d28ac5160ad676b#422df5fecbf944b98512640c8d28ac5160ad676b" }
+source = { git = "https://github.com/cozy-creator/cozy-creator?subdirectory=crates%2Ftensorfs-py&rev=da8ec7544c41aaa5573d095c209ef36ebfe3ba16#da8ec7544c41aaa5573d095c209ef36ebfe3ba16" }
 
 [[package]]
 name = "tokenizers"
