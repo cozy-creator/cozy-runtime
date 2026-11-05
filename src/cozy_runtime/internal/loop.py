@@ -1924,16 +1924,23 @@ class _Graph:
             ):
                 self._replay_key = working_phase.execution_key(actual, "runtime.graph/1")
 
-    def abort(self, error: BaseException) -> None:
-        """End a failed capture with its error so the owner cannot publish a partial graph. The
-        caller raises `error`: what ending or resetting the capture raised after it (the join of a
-        capture it invalidated: 901, run 33993) is a note on it, never in its place."""
-        for close in (partial(self.end, error), self.reset):
+    def abort(self, error: BaseException | None = None) -> None:
+        """End a failed capture with its error so the owner cannot publish a partial graph. When
+        the capture was invalidated, its join's failure (901) is raised instead, `error` its
+        context: the step cannot be recorded (Sage2's launches on the legacy stream: run 33993)."""
+        try:
+            self.end(error)
+        except BaseException as failure:
+            if failure is error:
+                self.reset()
+                return
             try:
-                close()
-            except BaseException as failure:
-                if failure is not error:
-                    error.add_note(f"ending the capture also raised: {failure!r}")
+                self.reset()
+            except BaseException as reset_error:
+                failure.add_note(f"Graph reset also failed: {reset_error!r}")
+            raise
+        else:
+            self.reset()
 
     def nodes(self) -> int:
         """The recorded graph's node count: what it launches, whatever launched it."""
