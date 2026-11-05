@@ -1786,13 +1786,13 @@ class Executor:
                     except RuntimeError as exc:
                         # No room for a context is the device's memory, not its absence: the
                         # worker starts again once a call beside it has given the room.
+                        full = fault(exc) is Fault.OOM
+                        next_step = "Its memory is full: end what holds it" if full else "Update its driver"
                         refused = {
                             "ok": False,
-                            "code": "device_out_of_memory"
-                            if fault(exc) is Fault.OOM
-                            else "accelerator_unavailable",
+                            "code": "device_out_of_memory" if full else "accelerator_unavailable",
                             "detail": f"GPU {_SEALED.get('CUDA_VISIBLE_DEVICES')} could not be "
-                            f"started: {exc}. Update its driver, or run it --on new"[:900],
+                            f"started: {exc}. {next_step}, or run it --on new"[:900],
                         }
                     if refused is not None:
                         self.poisoned = f"start refused: {refused['code']}"
