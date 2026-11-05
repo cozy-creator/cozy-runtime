@@ -16,11 +16,13 @@ def _words(key: str, value: object) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Node:
-    """`label`: its name in the tool list, by default from its package and function. `show`: inputs on its default face beside its first
+    """`name`: what a box of it is called, numbered (`shot` makes `shot_1`, `shot_2`), by default its package. `label`:
+    its name in the tool list, by default from its package and function. `show`: inputs on its default face beside its first
     text and what's required. `hide`: inputs a box never draws, which a file or `cozy run` can still set. `fill`: input to `take`, or to
     `<input>.<member>`, which the platform fills from what that input mentions, undrawn. `reserved`: the model's own tags in a text, never
     mentions. `ui`: a component in this package that draws the box."""
 
+    name: str = ""
     label: str = ""
     show: Sequence[str] = ()
     hide: Sequence[str] = ()
@@ -29,8 +31,8 @@ class Node:
     ui: str = ""
 
     def __post_init__(self) -> None:
-        if type(self.label) is not str or type(self.ui) is not str:
-            raise ConformanceError("Node label and ui are text", code="node")
+        if type(self.name) is not str or type(self.label) is not str or type(self.ui) is not str:
+            raise ConformanceError("Node name, label and ui are text", code="node")
         if not isinstance(self.fill, Mapping) or not all(
             isinstance(key, str) and key and isinstance(value, str) and value for key, value in self.fill.items()
         ):
@@ -40,6 +42,6 @@ class Node:
 
     def document(self) -> dict[str, object]:
         """What the package interface says: only what was declared."""
-        written = {"label": self.label, "show": list(self.show), "hide": list(self.hide), "fill": dict(self.fill),
+        written = {"name": self.name, "label": self.label, "show": list(self.show), "hide": list(self.hide), "fill": dict(self.fill),
                    "reserved": list(self.reserved), "ui": self.ui}  # fmt: skip
         return {key: value for key, value in written.items() if value}
