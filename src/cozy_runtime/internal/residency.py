@@ -2296,10 +2296,11 @@ class Request:
                 "bytes": nbytes,
                 "origin": origin,
                 "speculative": ahead,
+                "at_unix_ms": round(at_ms, 1),
             }
         )
         if not ahead:
-            self._trace[-1].update(ns=ns, at_unix_ms=round(at_ms, 1))
+            self._trace[-1]["ns"] = ns
 
     def record_fills(self) -> None:
         """The fills TensorFS logged since the last look."""
