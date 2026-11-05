@@ -215,7 +215,7 @@ def release(model: Any) -> None:
         engine.where = ()
 
 
-def _graph_snapshot(model: Any) -> tuple[dict[str, int], list[Any], Any]:
+def _graph_snapshot(model: Any) -> tuple[dict[str, Any], list[Any], Any]:
     """Final-reply facts and live pool owners; no device work or per-token aggregation."""
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
@@ -229,6 +229,7 @@ def _graph_snapshot(model: Any) -> tuple[dict[str, int], list[Any], Any]:
             "retired_graphs": engine.retired_graphs,
             "replays": engine.replayed,
             "eager_steps": engine.eager,
+            "refused": sorted(set(engine.unrecorded.values())),
         },
         [engine.pool] if engine.pool is not None else [],
         engine.domain,
@@ -1902,15 +1903,17 @@ class _Engine:
             and placed is not None
             and not placed[0].graph_accounted()
         )
+        fixed = _capture_contract(self.model) or (
+            "draft head has no isolated capture contract" if drafted else ""
+        )
         reason = (
             ("driver/context memory is unmeasured" if unaccounted else "")
             or (self.domain.refusal() if cuda and self.domain is not None else "")
-            or _capture_contract(self.model)
-            or ("draft head has no isolated capture contract" if drafted else "")
+            or fixed
         )
         if cuda and reason:
             if key not in self.unrecorded:
-                self._unrecorded(key, reason)
+                self._unrecorded(key, reason, None if reason == fixed else "capture_refused")
             self._advance(size)
             self.eager += 1
             return
@@ -1980,10 +1983,15 @@ class _Engine:
             self.graphs, self.warmed, self.unrecorded = {}, set(), {}
             self.pool = None
 
-    def _unrecorded(self, key: tuple[int, int, bool, bool], why: str) -> None:
-        """That step runs eagerly from now on, with a warning on the calls it serves."""
+    def _unrecorded(
+        self, key: tuple[int, int, bool, bool], why: str, code: str | None = "capture_refused"
+    ) -> None:
+        """That step runs eagerly from now on, with a warning on the calls it serves, unless
+        `code` is None: a property of the code, in the record alone (`decode.refused`)."""
         self.unrecorded[key] = why
-        safeguard("capture_refused", f"{type(self.model).__name__}: {why}")
+        if code is None:
+            return
+        safeguard(code, f"{type(self.model).__name__}: {why}")
         warning = ("a CUDA graph was not used", {"module": type(self.model).__name__, "why": why})
         for request in {id(r.request): r.request for r in self.slots if r is not None}.values():
             if warning not in request.warnings:

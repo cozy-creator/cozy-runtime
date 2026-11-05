@@ -108,6 +108,10 @@ _WAITING = "capture waits for kernel readiness"
 ROWS: dict[str, list[dict[str, Any]]] = {}
 
 
+class _Fixed(str):
+    """A refusal that is a property of the code (`_REFUSED`): in the record, and no warning."""
+
+
 def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], phase: Any) -> None:
     if phase is _NONE:
         step(index, *tensors)
@@ -146,7 +150,7 @@ def _now() -> float:
 def _refusal(error: BaseException) -> str | None:
     """The reason a preparation error lets the loop continue in another mode, else None."""
     if isinstance(error, CapabilityError):
-        return str(error) if error.code in _REFUSED else None
+        return _Fixed(error) if error.code in _REFUSED else None
     if isinstance(error, Building):
         return f"{_WAITING}: {error}"
     if isinstance(error, torch.OutOfMemoryError):
@@ -167,10 +171,16 @@ def _non_finite(done: int, total: int) -> OutputError:
     )
 
 
+def _warn(why: str) -> None:
+    """A refusal the run hears of. A kernel still compiling says nothing against the graph, and
+    a property of the code is no run going wrong: every call would warn of it."""
+    if not why.startswith(_WAITING) and not isinstance(why, _Fixed):
+        graphs.safeguard("capture_refused", why)
+
+
 def _refused(row: dict[str, Any], where: str, why: str) -> None:
     row["refusals"].append(f"{where}: {why}")
-    if not why.startswith(_WAITING):  # A kernel still compiling is no refusal of the graph.
-        graphs.safeguard("capture_refused", why)
+    _warn(why)
 
 
 @dataclass
@@ -960,7 +970,7 @@ class _IdleRecording:
             with self.loops._lock:
                 self.known.unfit.add(shape)
                 self.known.why[shape] = f"its idle recording failed: {why}"[:400]
-            graphs.safeguard("capture_refused", why)
+            _warn(why)
             done = True
         if done:
             with self.loops._lock:
@@ -1109,6 +1119,8 @@ def _pinned(program: _Program) -> Iterator[str]:
         sequences[0].map_pool()
     except (ResidencyError, torch.OutOfMemoryError) as error:
         why = f"{type(error).__name__}: {error}"[:300]
+        if isinstance(error, torch.OutOfMemoryError):
+            graphs.safeguard("no_room", why)
     if why:
         held.close()
         yield why

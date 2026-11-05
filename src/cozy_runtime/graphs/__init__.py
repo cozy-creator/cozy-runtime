@@ -54,7 +54,7 @@ _PLAIN = (type(None), bool, int, float, str)
 #: of a component root, registered by its module when a package imports it: a Runtime serving no
 #: LM never imports Transformers for them (v7: 2.8 s of executor imports)
 DECODERS: list[
-    tuple[Callable[[Any], tuple[dict[str, int], list[Any], Any]], Callable[[Any], None]]
+    tuple[Callable[[Any], tuple[dict[str, Any], list[Any], Any]], Callable[[Any], None]]
 ] = []
 _SAID: set[str] = set()
 #: the isolated request used for idle warm-up and capture observations
@@ -64,6 +64,7 @@ SAFEGUARDS = {
     "capture_refused": "a CUDA graph was refused at capture",
     "replay_mismatch": "a CUDA graph differed from eager and was discarded",
     "scratch_declined": "a CUDA graph's pool stays mapped while idle",
+    "no_room": "a kept CUDA graph had no room and ran eagerly",
 }
 
 
@@ -1096,6 +1097,7 @@ def _replay(
         recorder.finish()
         recorder.drop()
         _refused(recorder, placed, f"its weights cannot all be resident at once ({exc})")
+        safeguard("no_room", str(exc))
         return _EAGER
     try:
         result = recorder.replayed.run(torch, lambda: entry(leaves, out))
@@ -1200,7 +1202,7 @@ def _record(
                         eager = call(module, *cargs, **ckwargs)
                         took = (time.perf_counter() - took) * 1e3
                         if not _clonable(torch, eager):
-                            _failed(module, recorder, key, "output is not a tensor tree")
+                            _failed(module, recorder, key, "output is not a tensor tree", None)
                             return True
                         # A device that kept the warm-up's host waiting half its time is the
                         # bottleneck: no busy measure, which queues the device ahead.
@@ -1245,7 +1247,7 @@ def _record(
                     graph = None
                     return True
                 if not _clonable(torch, outputs[0]):
-                    _failed(module, recorder, key, "captured output is not a tensor tree")
+                    _failed(module, recorder, key, "captured output is not a tensor tree", None)
                     return True
                 for target, value in zip(statics, inputs, strict=True):
                     if target is not None:
@@ -1559,12 +1561,14 @@ def _failed(
     recorder: _Recorder,
     key: tuple[object, ...],
     why: str,
-    code: str = "capture_refused",
+    code: str | None = "capture_refused",
 ) -> None:
-    """An idle capture refused for good: the signature runs as written; the run says so."""
+    """An idle capture refused for good: the signature runs as written; the run says so, unless
+    `code` is None: a property of the code, not a run going wrong, kept in the record alone."""
     recorder.failed[key] = why
     recorder.gap = why
-    safeguard(code, f"{_name(module)}: {why}")
+    if code is not None:
+        safeguard(code, f"{_name(module)}: {why}")
 
 
 def _changed(
