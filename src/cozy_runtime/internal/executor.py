@@ -5288,7 +5288,8 @@ def serve(executor: Executor, channel: Channel) -> int:
             return int(Exit.ok)
         name = str(frame.get("cmd", ""))
         if executor.rank > 0:  # a follower answers its GPU 0, one command at a time
-            reply = _reply(executor, frame)
+            with order.turn(order.ticket(True, name)):  # an idle period follows each, as on GPU 0
+                reply = _reply(executor, frame)
             if reply is None:
                 return _shut(executor, channel)
             _send_reply(channel, reply)
