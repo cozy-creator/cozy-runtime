@@ -12,8 +12,9 @@ import either.
   repeat (`repeat=(begin, end, passes)`) without Python between passes. A stage may own a TensorFS
   input: before its graph runs, the worker loads that block's raw (or stored-INT8) bytes at the
   block's own Varena addresses, and bounded lookahead prefetches the next reading stage.
-- **Ownership.** Each definition retains its graph, pool, external tensors and storages, and its
-  weight bindings. Every submission revalidates layouts, fill identities and the kernel epoch.
+- **Ownership.** Each definition retains its graph, pool, non-weight tensors and storages, and its
+  weight bindings, which hold addresses, not pages: `graphs.replaying` pins those for one run.
+  Every submission revalidates layouts, fill identities and the kernel epoch.
   Close cancels and joins before release; an unproven completion keeps every owner until process
   exit. Residency retires idle definitions before releasing their weights.
 - **Cancellation** is a GPU atomic written from a control stream and observed after a complete body

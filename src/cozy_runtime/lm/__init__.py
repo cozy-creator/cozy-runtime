@@ -19,9 +19,9 @@ draw depends only on its own row's scores, seed and position, so it replays insi
 not depend on what else is in the batch, and a drafted token is verified exactly as a greedy
 one. Temperature 0 is the plain argmax.
 
-A graph keeps its ordinary weight tensors and their addresses alive while cached. Offload
-retires the graph before releasing those tensors; a later call can refill and capture anew. If
-the full set cannot be prepared before execution, the call uses Transformers' loop. Errors
+A cached graph keeps only its weights' addresses; a driver's lease (`_hold`) brings their pages
+back. Offload retires the graph before those addresses change; a later call can refill and capture
+anew. If the full set cannot be prepared before execution, the call uses Transformers' loop. Errors
 after execution starts are final; package code is never restarted. On a CPU, or after a safe
 capture refusal (a run warning), the same step runs eagerly. A model this does not
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
@@ -2194,9 +2194,7 @@ class _Engine:
                 ) for binding in bindings):
                     return False
                 self._drop()
-                # Retired graphs no longer need their weight Pins. Keeping these bindings
-                # in addresses would hide idle weights from native reclamation.
-                for binding in bindings:
+                for binding in bindings:  # Retired graphs no longer read their Regions.
                     binding.close()
                 self.addresses.clear()
                 self.where = ()

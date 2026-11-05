@@ -104,7 +104,7 @@ ENTERED: ContextVar[set[Any] | None] = ContextVar("cozy_loop_entered", default=N
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
-_UNPROVEN: list[Binding] = []
+_UNPROVEN: list[Any] = []
 
 
 class Level(Enum):
@@ -391,7 +391,6 @@ class _Block:
     count: int = 0
     retained: int = 0
     loading: bool = False
-    generation: int = 0
     last: int = 0
     ready: Any = None
     region: Any = None
@@ -468,6 +467,21 @@ class _Block:
             yield from (tensor for parts in self.data.values() for tensor in parts.values())
         if self.assigned is not None:
             yield from (tensor for _, tensor in self.assigned)
+
+    def computed(self) -> Iterator[Tensor]:
+        """Its CUDA tensors over neither Region: what a binder decoded, each its own allocation."""
+        for tensor in self.tensors():
+            if tensor.is_cuda and tensor.untyped_storage().data_ptr() not in (
+                self.native_storage,
+                self.final_storage,
+            ):
+                yield tensor
+
+    def regions(self) -> list[Any]:
+        """The Regions a use of it reads."""
+        raw = self.region if self.storage_bytes and not self.final_only() else None
+        final = self.final_region if self.final_bytes else None
+        return [region for region in (raw, final) if region is not None]
 
 
 class Model:
@@ -701,7 +715,8 @@ def _state(region: Any) -> str:
 
 
 class Binding:
-    """A cached graph's owning storage, closed after its readers retire.
+    """What a cached graph reads, closed after its readers retire: Regions, whose addresses outlive
+    their pages, so a graph holds no weight bytes between uses, and a binder's computed tensors.
 
     An undeclared fill may prepare once for an ephemeral direct read. It never reports a
     valid/resident graph binding and cannot be replayed or prepared a second time.
@@ -730,7 +745,9 @@ class Binding:
         self.closed = False
         self.completion_lost = False
         self.used = False
-        self.held: list[tuple[_Block, int]] = []
+        #: from its first preparation on, what its graphs read
+        self.regions: list[Any] | None = None
+        self.computed: list[Tensor] = []
         self.lock = threading.RLock()
         self.last: Any = None
 
@@ -754,10 +771,8 @@ class Binding:
             for site, shape, dtype in self.targets
         ):
             return "target shape or dtype changed"
-        if not all(
-            b.data is not None and b.generation == generation for b, generation in self.held
-        ):
-            return "held block released"
+        if self.regions not in (None, [r for b in self.groups for r in b.regions()]):
+            return "a block's Region changed"
         return ""
 
     def resident(self) -> bool:
@@ -775,7 +790,10 @@ class Binding:
         return ""
 
     @contextmanager
-    def prepare(self, stream: Any = None) -> Iterator[Binding]:
+    def prepare(self, stream: Any = None, *, replay: bool = False) -> Iterator[dict[Any, Any]]:
+        """Its weights for one use, and no longer. A capture or an eager use binds them to the
+        modules' slots. A `replay` reads its Regions at their addresses and binds nothing: it
+        yields each Region's Use, None for one that left (`graphs.replaying` fills those)."""
         memory = self.model.memory
         if memory.capturing():
             raise ResidencyError("prepare graph weights before capture")
@@ -793,6 +811,8 @@ class Binding:
                 )
                 if not self.valid() and not ephemeral:
                     raise StaleBinding("graph weight storage or fill changed")
+                if replay and self.regions is None:
+                    raise StaleBinding("a graph's weights were never prepared")
                 request = _REQUEST.get()
                 if request is not None and request.idle and not self.resident():
                     raise StaleBinding("idle graph preparation cannot page weights in")
@@ -800,61 +820,36 @@ class Binding:
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None:
                         stream.wait_event(self.last)
-                    entered: list[_Block] = []
-                    retained: list[tuple[_Block, int]] = []
-                    published = False
-                    try:
-                        if not self.held:
-                            # Claim the complete dependency set before any preparation. Neither
-                            # another preparation nor a nested fill can evict its later blocks.
-                            with memory.lock:
-                                for block in self.groups:
-                                    block.retained += 1
-                                    retained.append((block, block.generation))
+                    # Claimed whole before any of it fills: no fill can change a later block.
+                    with memory.lock:
                         for block in self.groups:
-                            memory._enter(block)
-                            entered.append(block)
-                        if not self.held:
-                            self.held = [(block, block.generation) for block, _ in retained]
-                            published = True
-                        yield self
-                    except BaseException:
-                        if retained and not published:
-                            with memory.lock:
-                                for block, _ in retained:
-                                    block.retained -= 1
-                        raise
+                            block.retained += 1
+                    entered: list[_Block] = []
+                    uses: dict[Any, Any] = {}
+                    try:
+                        if replay:
+                            assert self.regions is not None
+                            uses.update((region, region.pin()) for region in self.regions)
+                        else:
+                            for block in self.groups:
+                                memory._enter(block)
+                                entered.append(block)
+                            if self.regions is None:
+                                self.regions = [r for b in self.groups for r in b.regions()]
+                                self.computed = [t for b in self.groups for t in b.computed()]
+                        yield uses
                     finally:
                         try:
-                            if memory.cuda and entered:
+                            if memory.cuda and (entered or uses):
                                 self._finish(stream)
                         finally:
+                            uses.clear()
                             for block in reversed(entered):
                                 memory._exit(block)
-            finally:
-                self.model._release()
-
-    @contextmanager
-    def replay_use(self, stream: Any = None) -> Iterator[Binding]:
-        """Use already-captured storage without rebinding every module or touching its weights.
-
-        The graph reads the retained allocations directly. Its complete launch/output-copy
-        interval is serialized here, and close joins the final use before releasing storage.
-        """
-        memory = self.model.memory
-        stream = memory.stream() if stream is None else stream
-        with self.lock:
-            self.model._claim()
-            try:
-                if not self.valid() or len(self.held) != len(self.groups):
-                    raise StaleBinding("graph weight storage is not retained")
-                if self.last is not None:
-                    stream.wait_event(self.last)
-                try:
-                    yield self
-                finally:
-                    if memory.cuda:
-                        self._finish(stream)
+                            with memory.lock:
+                                for block in self.groups:
+                                    block.retained -= 1
+                                    memory._idle(block)
             finally:
                 self.model._release()
 
@@ -891,11 +886,7 @@ class Binding:
                 except BaseException as incomplete:
                     self._unproven(incomplete)
             self.closed = True
-            with self.model.memory.lock:
-                for block, _ in self.held:
-                    block.retained -= 1
-                    self.model.memory._idle(block)
-                self.held.clear()
+            self.regions, self.computed = None, []
 
 
 class Region:
@@ -1425,7 +1416,6 @@ class Memory:
             block.parked.pop(next(iter(block.parked)))
         block.region, block.final_region = block.parked.pop(overlay, (None, None))
         block.overlay = overlay
-        block.generation += 1
 
     def _rearm(self, model: Model) -> None:
         """A forward armed another overlay, which H3 does inside it: all its blocks move now and the
@@ -1476,8 +1466,6 @@ class Memory:
                 block.region = None
                 block.parked.clear()
                 block.gathered = None
-            if present or forget:
-                block.generation += 1
             return block.nbytes if present else 0
 
     def _retire(self, model: Model) -> bool:
@@ -1817,7 +1805,6 @@ class Memory:
                 ready.record(self.stream())
             with self.lock:
                 block.data, block.ready = data, ready
-                block.generation += 1
         except BaseException:
             block.native_storage = block.native_use = None
             self._drop_final(block)
@@ -1888,7 +1875,6 @@ class Memory:
             block.gathered = overlay, data, finals
         with self.lock:
             block.data, block.final_data, block.ready = block.gathered[1], block.gathered[2], None
-            block.generation += 1
         if (request := _REQUEST.get()) is not None:
             request.gathered += 1
 
@@ -1971,12 +1957,8 @@ class Memory:
             for use in (block.native_use, block.final_native_use):
                 if use is not None:
                     use.consume_on(stream.cuda_stream)
-            for tensor in block.tensors():
-                if tensor.is_cuda and tensor.untyped_storage().data_ptr() not in (
-                    block.native_storage,
-                    block.final_storage,
-                ):
-                    tensor.record_stream(stream)
+            for tensor in block.computed():
+                tensor.record_stream(stream)
 
     def _exit(self, block: _Block) -> None:
         try:

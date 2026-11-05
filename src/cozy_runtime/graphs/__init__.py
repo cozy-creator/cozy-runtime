@@ -25,8 +25,8 @@ import threading
 import time
 import weakref
 from collections import deque
-from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
@@ -1214,8 +1214,7 @@ def _record(
             if not recorder.recordings:
                 recorder.pool = None
                 if recorder.binding is not None:
-                    # A stock binding owns weight storage once prepared. A rejected warm-up
-                    # must not retain a whole root when no executable uses those addresses.
+                    # A rejected warm-up keeps no Regions when no executable reads them.
                     recorder.binding.close()
                     recorder.binding = None
 
@@ -1452,14 +1451,27 @@ def _settled(event: Any) -> None:
         time.sleep(_POLL_S)
 
 
+@contextmanager
+def replaying(stream: Any, bindings: Iterable[Any]) -> Iterator[None]:
+    """A graph's weights for one replay, back at their addresses if they left, and no longer. All
+    of what is still here is pinned before any fill, which can then evict nothing the replay
+    needs; what left comes back in the core's reclaim order. It never reassigns a module slot."""
+    with ExitStack() as held:
+        taken = [held.enter_context(binding.prepare(stream, replay=True)) for binding in bindings]
+        for uses in taken:
+            for region, use in uses.items():
+                if use is None:
+                    uses[region] = region.use(stream.cuda_stream)
+        yield
+
+
 def _lease(torch: Any, placed: Any, binding: Any) -> Any:
-    """A replay uses already-retained ordinary storage; it never reassigns module slots."""
     if placed is None or binding is None:
         return nullcontext()
     stream, held = torch.cuda.current_stream(), placed[0].graph_held(placed[1])
     if held is not None and held != stream:
         stream.wait_stream(held)
-    return binding.replay_use(stream)
+    return replaying(stream, (binding,))
 
 
 def _refused(recorder: _Recorder, placed: Any, why: str) -> None:

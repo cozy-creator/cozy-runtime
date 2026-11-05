@@ -73,6 +73,7 @@ from cozy_runtime.internal.prepared import (
 )
 from cozy_runtime.internal.residency import (
     _REQUEST,
+    _UNPROVEN,
     ENTERED,
     Binding,
     Model,
@@ -196,14 +197,20 @@ class _Program:
         # because the cache dictionary has not yet removed this stale program.
         self.first, self.again, self.tensors, self.counter = (), None, (), None
 
-    def try_close(self) -> bool:
-        sequences = self.sequences()
-        stages = tuple(stage for sequence in sequences for stage in sequence.stages)
-        bindings = {id(binding): binding for stage in stages for binding in stage._owned_bindings}
+    def bindings(self) -> tuple[Binding, ...]:
+        """The weights its graphs read."""
+        stages = tuple(stage for sequence in self.sequences() for stage in sequence.stages)
+        found = {id(binding): binding for stage in stages for binding in stage._owned_bindings}
         for stage in stages:
             for reference, _ in stage._bindings:
                 if (binding := reference()) is not None:
-                    bindings[id(binding)] = binding
+                    found[id(binding)] = binding
+        return tuple(found.values())
+
+    def try_close(self) -> bool:
+        sequences = self.sequences()
+        stages = tuple(stage for sequence in sequences for stage in sequence.stages)
+        bindings = self.bindings()
         domains = {
             id(shared.domain): shared.domain for sequence in sequences
             if (shared := sequence._capture_domain) is not None and shared.domain is not None
@@ -211,8 +218,8 @@ class _Program:
         locks = [
             self.lock, *(sequence._submission for sequence in sequences),
             *(stage._submission for stage in stages), *(owner.lock for owner in domains.values()),
-            *(binding.lock for binding in bindings.values()),
-            *(binding.model.memory.lock for binding in bindings.values()),
+            *(binding.lock for binding in bindings),
+            *(binding.model.memory.lock for binding in bindings),
         ]
         with cache_owners.try_locks(locks) as claimed:
             if not claimed:
@@ -224,7 +231,7 @@ class _Program:
             for owner in domains.values():
                 if not owner.fenced or (owner.done is not None and not owner.done.query()):
                     return False
-            for binding in bindings.values():
+            for binding in bindings:
                 if binding.completion_lost or (
                     binding.last is not None and not binding.last.query()
                 ):
@@ -353,8 +360,8 @@ class Loops:
                     _close_idle(kept)
                     kept = None
             if kept is not None:
-                with _taken(kept.lock, ctx), _pinned(kept) as pinned:
-                    why = _stale(kept, ident, checked=True) if pinned else "released"
+                with _taken(kept.lock, ctx), _pinned(kept) as why:
+                    why = why or _stale(kept, ident, checked=True)
                     if not why:
                         self._reuse(kept, loop, tensors, work, ctx, row)
                         return
@@ -421,8 +428,8 @@ class Loops:
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
             )
             self._install(site, program, scope[0].memory)
-            with _taken(program.lock, ctx), _pinned(program) as pinned:
-                if pinned:
+            with _taken(program.lock, ctx), _pinned(program) as why:
+                if not why:
                     ((rest, first, count),) = program.first
                     try:
                         _submit(program, rest, range(first, first + count), loop, ctx, row)
@@ -433,7 +440,7 @@ class Loops:
                     program.first = ()
                     _back(work, program.tensors)
                     return
-            row["dropped"] = "released"
+            row["dropped"] = why
         if refused:
             row["refusals"].append(f"whole call on its first call: {refused}")
             if refused.startswith(_UNRECORDABLE):
@@ -493,11 +500,12 @@ class Loops:
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
         )
         self._install(site, program, scope[0].memory)
-        with _taken(program.lock, ctx), _pinned(program) as pinned:
-            if pinned and not _stale(program, job.ident, checked=True):
+        with _taken(program.lock, ctx), _pinned(program) as why:
+            why = why or _stale(program, job.ident, checked=True)
+            if not why:
                 self._reuse(program, loop, tensors, work, ctx, row)
                 return
-        row["dropped"] = "released"
+        row["dropped"] = why
         loop.eager_all(tensors, ctx)
 
     def _queue(
@@ -727,7 +735,7 @@ def _record_first(
         with ExitStack() as loading:
             for model in scope:
                 if _unresident(model) and (hold := model.hold()) is not None:
-                    loading.callback(hold.release)  # the recording's bindings retain them
+                    loading.callback(hold.release)  # until the recording's bindings hold them
             _lap("load")
             recording._prepare((*mutable, counter))
             _lap("prepare")
@@ -1065,23 +1073,31 @@ def _close_idle(program: _Program) -> None:
 
 
 @contextmanager
-def _pinned(program: _Program) -> Iterator[bool]:
-    """Whether the kept program is still there; held against reclaim while it runs."""
+def _pinned(program: _Program) -> Iterator[str]:
+    """Why the kept program cannot run now ("" when it can). For the run it is held against
+    reclaim, its weights and pool back on the card; no room for them and it runs eagerly. An
+    unproven run keeps them (`completion_proven`): its executor retires."""
+    if program.closed:
+        yield "released"
+        return
+    held, why, sequences = ExitStack(), "", program.sequences()
     try:
-        pin = program.region.pin()
-        pin.__enter__()
-    except ResidencyError:  # closed, or a reclaim is releasing it now
-        yield False
+        held.enter_context(program.region.pin())
+        stream = torch.cuda.current_stream(program.tensors[0].device)
+        held.enter_context(graphs.replaying(stream, program.bindings()))
+        sequences[0].map_pool()
+    except (ResidencyError, torch.OutOfMemoryError) as error:
+        why = f"{type(error).__name__}: {error}"[:300]
+    if why:
+        held.close()
+        yield why
         return
     try:
-        try:
-            program.sequences()[0].map_pool()
-        except torch.OutOfMemoryError:  # No room for its idle pool to come back: it runs eagerly.
-            yield False
-            return
-        yield True
+        yield ""
     finally:
-        pin.__exit__(None, None, None)
+        if any(s._active is not None and not s._active.completion_proven() for s in sequences):
+            _UNPROVEN.append(held.pop_all())
+        held.close()
 
 
 def _layouts(tensors: tuple[Any, ...]) -> tuple[Any, ...]:
@@ -1495,8 +1511,8 @@ class _Graph:
     """One CUDA graph recorded between begin() and end() into the recording's shared pool.
 
     Every tensor the recorded operations read that they did not produce is retained by the
-    native owner, except the loaded inputs of a streamed stage and the scratch of the same pass,
-    which the pool and the replay order keep valid.
+    native owner, except its weights: their Regions keep their addresses, and each replay takes
+    their pages (`graphs.replaying`).
     """
 
     def __init__(
@@ -1506,25 +1522,11 @@ class _Graph:
         steps: int,
         bindings: tuple[Binding, ...],
         *,
-        loaded: tuple[Any, ...] = (),
-        scratch: list[tuple[Any, int, int]] | None = None,
-        unbound: frozenset[int] = frozenset(),
-        undeclared: tuple[tuple[Any, int, int], ...] = (),
         configuration: Callable[[], str | None] | None = None,
     ) -> None:
         self.recording, self.state, self.steps, self.bindings = recording, state, steps, bindings
         self.device = state[0].device
         self.domain = recording._domain
-        self.ranges = tuple(
-            dict.fromkeys(
-                (t.device, int(s.data_ptr()), int(s.data_ptr()) + s.nbytes())
-                for t in loaded
-                if (s := t.untyped_storage()).nbytes()
-            )
-        )
-        self.loaded = bool(loaded)
-        self.scratch = [] if scratch is None else scratch
-        self.unbound, self.undeclared = unbound, undeclared
         self.held: dict[int, Any] = {id(t): t for t in state}
         self.produced: dict[int, Any] = {}
         self.generated: dict[int, tuple[Any, Any, Any, int, int]] = {}
@@ -1538,16 +1540,6 @@ class _Graph:
         self._configuration_before: str | None = None
         self._observation: working_phase.Observation | None = None
         self._replay_key: str | None = None
-
-    def _overlaps(self, tensor: Any, areas: Any) -> bool:
-        if not isinstance(tensor, torch.Tensor):
-            return False
-        storage = tensor.untyped_storage()
-        first, size = int(storage.data_ptr()), int(storage.nbytes())
-        return bool(size) and any(
-            tensor.device == device and first < end and begin < first + size
-            for device, begin, end in areas
-        )
 
     def begin(self) -> None:
         """Capture on the recording's library stream; only the recorded region runs there."""
@@ -1670,14 +1662,16 @@ class _Graph:
         self.end()
 
     def external(self) -> dict[int, Any]:
-        """What the recorded operations read from outside this graph and its pass's scratch."""
-        inside = _Spans((*self.scratch, *((d, b, e) for _, _, d, b, e in self.generated.values())))
-        loaded = _Spans(self.ranges if self.loaded else ())
-        return {
-            key: tensor
-            for key, tensor in self.held.items()
-            if not inside.overlaps(tensor) and not loaded.overlaps(tensor)
-        }
+        """What the recorded operations read from outside this graph and its weights."""
+        inside = _Spans((
+            *((d, b, e) for _, _, d, b, e in self.generated.values()),
+            *(
+                (self.device, region.ptr, region.ptr + region.allocated_bytes)
+                for binding in self.bindings
+                for region in binding.regions or ()
+            ),
+        ))
+        return {key: tensor for key, tensor in self.held.items() if not inside.overlaps(tensor)}
 
     def plan(
         self,
@@ -1694,7 +1688,6 @@ class _Graph:
             if graph is not None:
                 held.update(graph.external())
         _lap("plan_held")
-        owners = () if self.loaded else self.bindings
         phases = {
             "prefix_graph": 0 if prefix is None else prefix.graph.raw_cuda_graph(),
             "suffix_graph": 0 if suffix is None else suffix.graph.raw_cuda_graph(),
@@ -1713,7 +1706,7 @@ class _Graph:
                     self.index,
                     *held.values(),
                     *(tensor.untyped_storage() for tensor in held.values()),
-                    *owners,
+                    *self.bindings,
                     self.domain,
                     self.recording._pool,
                 ],
@@ -1763,12 +1756,6 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
     def __torch_dispatch__(self, func: Any, types: Any, args: Any = (), kwargs: Any = None) -> Any:
         g, kwargs = self.g, kwargs or {}
         leaves = tree_leaves((args, kwargs))
-        if g.unbound or g.undeclared:
-            for tensor in leaves:
-                if id(tensor) in g.unbound or g._overlaps(tensor, g.undeclared):
-                    raise CapabilityError(
-                        "a stage reads weights outside its block", code="prepared_graph_ineligible"
-                    )
         if torch.Tag.nondeterministic_seeded in func.tags and not _zero_dropout_attention(
             func, args, kwargs
         ):
@@ -1776,15 +1763,6 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
                 "native loops take noise as an input, never a random draw",
                 code="prepared_graph_ineligible",
             )
-        if g.ranges:
-            for position, argument in enumerate(func._schema.arguments):
-                if argument.alias_info is None or not argument.alias_info.is_write:
-                    continue
-                value = args[position] if position < len(args) else kwargs.get(argument.name)
-                if any(g._overlaps(tensor, g.ranges) for tensor in tree_leaves(value)):
-                    raise CapabilityError(
-                        "the step writes loaded weight storage", code="prepared_graph_ineligible"
-                    )
         inputs = set()
         for tensor in leaves:
             if isinstance(tensor, torch.Tensor):
