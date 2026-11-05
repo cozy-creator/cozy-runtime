@@ -535,7 +535,7 @@ def bind_allocator(torch: Any, kind: str) -> None:
     except (ImportError, AttributeError, RuntimeError) as exc:
         if fault(exc) is not Fault.OTHER:
             raise
-        raise ResidencyError(f"native CUDA allocator is unavailable: {exc}") from exc
+        raise ResidencyError(str(exc)) from exc
 
 
 def initialize(torch: Any, kind: str) -> None:
