@@ -352,6 +352,7 @@ class Loops:
             row["refusals"].append("step cache: off across ranks (its sums are not all-reduced)")
             cache = None
         bypass, marked = graphs.BYPASS.set(True), _ROW.set(row)
+        overlays = lora.LOOP.set(_overlays(_phase_models()))
         try:
             _mark("entered")
             loop = _Loop(step, steps, labels, on_step, before, after, key, len(state), cache)
@@ -364,6 +365,7 @@ class Loops:
             _mark("returned")
             _timeline(row)
         finally:
+            lora.LOOP.reset(overlays)
             graphs.BYPASS.reset(bypass)
             _ROW.reset(marked)
             row.pop("_marks", None)
@@ -392,7 +394,7 @@ class Loops:
             site = (step.__code__, tuple(id(model) for model in scope))
             # What a call site learns (`_Site`) depends on a keyed call's layout, not its key.
             shape = None if key is None else (
-                _layouts(tensors), steps, loop.labels, loop.cache, _overlays(scope)
+                _layouts(tensors), steps, loop.labels, loop.cache, lora.LOOP.get()
             )
             ident = None if key is None else (key, shape)
             with self._lock:
@@ -585,6 +587,8 @@ class Loops:
         """Why the call ran eagerly: its whole call queued to record at idle, or why none does."""
         if why := _unkept(known, ident, shape, body):
             return why
+        if lora.LOOP.get():
+            return "resident, and its overlays are armed only in its call"
         with self._lock:
             if ident not in known.pending:
                 job = _IdleRecording(
@@ -1061,6 +1065,7 @@ class _IdleRecording:
         laps = _LAPS.set([parts, began])
         settling = graphs._SETTLING.set(True)  # no torch op yields: only its boundaries do
         bypass = graphs.BYPASS.set(True)
+        overlays = lora.LOOP.set(frozenset())  # its call armed none, and nothing may arm one now
         try:
             with (
                 torch.cuda.device(self.tensors[0].device),
@@ -1079,6 +1084,7 @@ class _IdleRecording:
                     self.known.need.get(self.ident[1], 0),  # type: ignore[index]
                 )
         finally:
+            lora.LOOP.reset(overlays)
             graphs.BYPASS.reset(bypass)
             graphs._SETTLING.reset(settling)
             if (placement := getattr(owner, "_cozy_residency", None)) is not None:
@@ -1300,7 +1306,7 @@ _HOOKS: weakref.WeakKeyDictionary[Any, tuple[lora.Hook, ...]] = weakref.WeakKeyD
 
 def _overlays(scope: tuple[Model, ...]) -> frozenset[int]:
     """The LoRA overlays armed in the scope's linears now, before the loop (`lora.Hook`), by
-    identity: a program recorded under none never serves a call under one."""
+    identity: a kept program serves only calls that armed the same (`lora.LOOP`)."""
     armed: set[int] = set()
     for model in scope:
         if (hooks := _HOOKS.get(model.module)) is None:
