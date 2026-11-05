@@ -32,6 +32,7 @@ from cozy_runtime.author._files import (
     field_preparation,
 )
 from cozy_runtime.author._markers import FileBound, _ModelDefaultMarker
+from cozy_runtime.author._signature import AssetInputValue
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional
 from cozy_runtime.internal.canonical import CanonicalError, Json, write
 
@@ -59,17 +60,38 @@ def render(annotation: object, *, decoded_bounds: bool = False) -> Json:
 def request(payload_type: object) -> Json:
     """A callable's request: `render`, with each optional top-level field's author default.
 
-    Only the payload's own fields carry one. Nested types render exactly as `render` does,
-    because readers compare those by value (the Files occurrence record, native operations).
+    Only the payload's own fields carry one, and the members of a list of rows, which a new row
+    is made of. Other nested types render exactly as `render` does, because readers compare those
+    by value (the Files occurrence record, native operations).
     """
     doc = render(payload_type)
     base, _ = strip(payload_type)
     if isinstance(doc, dict) and isinstance(base, type) and is_struct(base):
         fields = {field.encode_name: field for field in msgspec.structs.fields(base)}
         for row in typing.cast(list[dict[str, Json]], doc["fields"]):
+            field = fields[typing.cast(str, row["name"])]
             if row.get("wire") == "optional":
-                row.update(_default(fields[typing.cast(str, row["name"])]))
+                row.update(_default(field))
+            _member_defaults(row, field)
     return doc
+
+
+def _member_defaults(row: dict[str, Json], field: msgspec.structs.FieldInfo) -> None:
+    """A list of rows' members with their defaults: any list of structs but one named by mentions."""
+    listed = strip(field.type)[0]
+    rendered = row["type"]
+    if typing.get_origin(listed) is not list or not isinstance(rendered, dict):
+        return
+    item = strip(typing.get_args(listed)[0])[0]
+    if not (isinstance(item, type) and is_struct(item)) or not isinstance(rendered.get("list"), dict):
+        return
+    members = {member.encode_name: member for member in msgspec.structs.fields(item)}
+    # A `Files` parameter's occurrence records are held to their own rendering.
+    if "name" in members or item is AssetInputValue:
+        return
+    for member in typing.cast(list[dict[str, Json]], typing.cast(dict[str, Json], rendered["list"])["fields"]):
+        if member.get("wire") == "optional":
+            member.update(_default(members[typing.cast(str, member["name"])]))
 
 
 def _default(field: msgspec.structs.FieldInfo) -> dict[str, Json]:
