@@ -126,6 +126,9 @@ def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], lab
 _NONE = object()
 #: The recording call's parts, for the run record (`parts_ms`): [{part: ms}, last lap's clock].
 _LAPS: ContextVar[list[Any] | None] = ContextVar("cozy_loop_laps", default=None)
+#: Set around eager steps whose working peak sizes a recording's pool (`_pool`): each eager pass's
+#: own peak as the core measured it (its phase's `peak_bytes`), never a load's.
+_PEAKS: ContextVar[list[int] | None] = ContextVar("cozy_loop_peaks", default=None)
 #: The call's row, for its GPU timeline (`_mark`).
 _ROW: ContextVar[dict[str, Any] | None] = ContextVar("cozy_loop_row", default=None)
 
@@ -311,6 +314,8 @@ class _Site:
     why: dict[Hashable, str] = field(default_factory=dict)
     #: the pool the next whole-call recording reserves, after one had no room (`_pool_need`)
     need: dict[Hashable, int] = field(default_factory=dict)
+    #: the working peak its first call's warm steps measured (`_PEAKS`), which sizes its pools
+    peak: dict[Hashable, int] = field(default_factory=dict)
 
 
 class Loops:
@@ -466,12 +471,15 @@ class Loops:
             if ident is not None and shape not in known.unfit:
                 with suppress(Exception):  # refused, its own recording says why
                     opened = _opened(work)
-            pre, body, rest, warmed = _warm(loop, tensors, scope, ctx)
+            pre, body, rest, warmed, peak = _warm(loop, tensors, scope, ctx)
+            if peak and shape is not None:
+                with self._lock:
+                    known.peak[shape] = peak
             program, refused, began = None, "", time.perf_counter()
             if rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
-                    known.need.get(shape, 0), opened,
+                    _pool(peak, known.need.get(shape, 0)), opened,
                 )
             elif opened is not None:
                 opened.close()
@@ -539,7 +547,7 @@ class Loops:
             with _laps(row):
                 program = _record_whole(
                     loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident,
-                    known.need.get(shape, 0),
+                    _pool(known.peak.get(shape, 0), known.need.get(shape, 0)),
                 )
         except Exception as error:
             with self._lock:
@@ -719,9 +727,7 @@ class _Loop:
                     else:
                         with vt.external_callback(index.device.index):
                             self.on_step(i)
-            if not settle:
-                return finite
-            if index.is_cuda:
+            if settle and index.is_cuda:
                 stream = torch.cuda.current_stream(index.device)
                 stream.synchronize()
                 if not finite.last():
@@ -734,7 +740,7 @@ class _Loop:
                     )
                 ):
                     observation.invalidate("completion_stream_changed")
-            if observation is not None and mode == "eager":
+            if settle and observation is not None and mode == "eager":
                 if ctx is not None and ctx.cancelled:
                     observation.invalidate("cancelled")
                 else:
@@ -742,13 +748,13 @@ class _Loop:
                     if epoch != LANDED[0] or actual != configuration:
                         observation.invalidate("dispatch_changed")
                     observation.complete()
-        if (
-            observation is not None and observation.result is not None
-            and (key := observation.result.get("key")) is not None
-            and request is not None and models
-        ):
-            request.memory.remember_working_phase(str(key), models)
-        return None
+        if observation is not None and observation.result is not None:
+            if (peaks := _PEAKS.get()) is not None:
+                peaks.append(int(observation.result.get("peak_bytes") or 0))
+            key = observation.result.get("key")
+            if settle and key is not None and request is not None and models:
+                request.memory.remember_working_phase(str(key), models)
+        return None if settle else finite
 
     def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
         _once(self.before, tensors)
@@ -779,20 +785,28 @@ def _entering() -> Iterator[set[Any]]:
 
 def _warm(
     loop: _Loop, tensors: tuple[Any, ...], scope: tuple[Model, ...], ctx: Context
-) -> tuple[dict[Model, tuple[str, ...]], dict[Model, tuple[str, ...]], range, Callable[[], None]]:
+) -> tuple[
+    dict[Model, tuple[str, ...]], dict[Model, tuple[str, ...]], range, Callable[[], None], int
+]:
     """A component call's `before` and warm steps (`_Loop.warm`) eagerly, on the caller's
-    tensors, left queued for a recording to overlap: the blocks each ran, the steps left, and
-    their finite check, which raises once their values are in."""
+    tensors, left queued for a recording to overlap: the blocks each ran, the steps left, their
+    finite check, which raises once their values are in, and their working peak (`_PEAKS`)."""
     with _entering() as seen:
         _once(loop.before, tensors)
     _lap("before")
     pre = _used(seen, scope)
     warm = loop.warm()
-    with _entering() as seen:
-        finite = loop.eager(warm, tensors, ctx, settle=False)
+    peaks: list[int] = []
+    token = _PEAKS.set(peaks)
+    try:
+        with _entering() as seen:
+            finite = loop.eager(warm, tensors, ctx, settle=False)
+    finally:
+        _PEAKS.reset(token)
     _lap("first_step")
     body = _used(seen, scope) or {model: ("",) for model in scope}
-    return pre, body, loop.steps[len(warm) :], partial(_finished, finite, len(warm), loop)
+    rest = loop.steps[len(warm) :]
+    return pre, body, rest, partial(_finished, finite, len(warm), loop), max(peaks, default=0)
 
 
 def _finished(finite: graphs.Finite | None, done: int, loop: _Loop) -> None:
@@ -901,7 +915,12 @@ def _record(
     _once(loop.before, tensors)
     _lap("before")
     warm = loop.warm()
-    finite = loop.eager(warm, tensors, ctx, settle=False)
+    peaks: list[int] = []
+    token = _PEAKS.set(peaks)
+    try:
+        finite = loop.eager(warm, tensors, ctx, settle=False)
+    finally:
+        _PEAKS.reset(token)
     warmed = partial(_finished, finite, len(warm), loop)
     _lap("first_step")
     rest = loop.steps[len(warm) :]
@@ -911,6 +930,7 @@ def _record(
         _once(loop.after, work + tensors[len(work) :])
         return None, warmed
     recording = PreparedSequence.record()
+    recording._reserve = _pool(max(peaks, default=0), 0)
     recording.__enter__()
     try:
         why = None
@@ -1101,9 +1121,10 @@ class _IdleRecording:
                     return True  # its weights left the device: the next call queues again
                 _lap("resident")
                 _yield_point()
+                shape = self.ident[1]  # type: ignore[index]
                 program = _record_whole(
                     self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident,
-                    self.known.need.get(self.ident[1], 0),  # type: ignore[index]
+                    _pool(self.known.peak.get(shape, 0), self.known.need.get(shape, 0)),
                 )
         finally:
             lora.LOOP.reset(overlays)
@@ -1356,6 +1377,13 @@ def _abandon(recording: _SequenceCapture, failure: BaseException | None = None) 
     _drop_stages(recording)
     recording.close()
     gc.collect()
+
+
+def _pool(peak: int, need: int) -> int:
+    """What a recording's pool reserves: the core's size for the warm steps' own working peak
+    (`vt.pool_bytes`), not the process's (a load's transients counted there: an int8 DiT's
+    20 GB), and at least what an attempt before it lacked (`_pool_need`). 0: the process's peak."""
+    return max(vt.pool_bytes(peak) if peak else 0, need)
 
 
 def _pool_need(recording: _SequenceCapture) -> int:
@@ -1769,10 +1797,11 @@ class _Graph:
         stream, control = self.domain.stream, self.domain.control
         control.wait_stream(stream)
         if self.recording._working_bytes is None:
-            # Later capture peaks include the eager snapshots still held outside this
-            # pool. They must not feed back into the next stage's reservation.
-            peak = int(vt.stats(self.device.index)["allocated_peak"])
-            self.recording._working_bytes = max(peak, self.recording._reserve)
+            # What the recording reserves (`_pool`), else the process's peak. Later capture peaks
+            # include the eager snapshots held outside this pool: they never feed back into it.
+            reserve = self.recording._reserve
+            peak = reserve or int(vt.stats(self.device.index)["allocated_peak"])
+            self.recording._working_bytes = peak
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
         capture = partial(
             vt.graph, self.graph, pool=self.recording._pool.handle, stream=control,
