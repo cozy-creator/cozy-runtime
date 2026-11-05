@@ -681,6 +681,8 @@ class _SequenceCapture:
         self._domain: Any = None
         self._pool: Any = None
         self._working_bytes: int | None = None
+        #: what its pool reserves at least: a refused attempt's reservation and what it lacked
+        self._reserve = 0
         self._areas: list[tuple[Any, int, int]] = []
         self._submission = threading.RLock()
         self._closing = False

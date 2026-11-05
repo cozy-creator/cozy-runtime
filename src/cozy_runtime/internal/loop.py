@@ -281,6 +281,8 @@ class _Site:
     unfit: set[Hashable] = field(default_factory=set)
     pending: dict[Hashable, _IdleRecording] = field(default_factory=dict)  # by key and layout
     why: dict[Hashable, str] = field(default_factory=dict)
+    #: the pool the next whole-call recording reserves, after one had no room (`_pool_need`)
+    need: dict[Hashable, int] = field(default_factory=dict)
 
 
 class Loops:
@@ -444,7 +446,12 @@ class Loops:
             pre, body = _warm(loop, tensors, scope, ctx)
             program, refused, began = None, "", time.perf_counter()
             if not _unkept(known, loop, ident, shape, body):
-                program, refused = _record_first(loop, tensors, len(work), scope, pre, body, ident)
+                program, refused, need = _record_first(
+                    loop, tensors, len(work), scope, pre, body, ident, known.need.get(shape, 0)
+                )
+                if need:
+                    with self._lock:
+                        known.need[shape] = need
         if program is not None:
             row.update(
                 mode=program.mode,
@@ -503,14 +510,22 @@ class Loops:
         try:
             with _laps(row):
                 program = _record_whole(
-                    loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident
+                    loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident,
+                    known.need.get(shape, 0),
                 )
         except Exception as error:
+            with self._lock:
+                grew = _grew(known, shape, error)
             if isinstance(error, Building) or isinstance(error.__cause__, Building):
                 with self._lock:
                     known.pending[job.ident] = job  # a kernel still opens: the idle period
                 graphs.IDLE.add(job)
                 row["refusals"].append("whole call: a kernel still opens")
+            elif grew:
+                with self._lock:
+                    known.pending[job.ident] = job  # its idle period reserves what it lacked
+                graphs.IDLE.add(job)
+                _refused(row, "whole call", _refusal(error) or str(error))
             elif (why := _refusal(error)) is not None:
                 _refused(row, "whole call", why)
                 with self._lock:
@@ -752,16 +767,18 @@ def _record_first(
     pre: dict[Model, tuple[str, ...]],
     body: dict[Model, tuple[str, ...]],
     ident: Hashable,
-) -> tuple[_Program | None, str]:
+    reserve: int,
+) -> tuple[_Program | None, str, int]:
     """A first call's whole program, recorded after its first step on copies of its tensors:
     `first` runs its rest (from its second step, `after` included), `again` a later call. Its
-    `after` has not run, so every scope model is held, and loaded first; (None, why) when
-    refused, its attempt gone."""
+    `after` has not run, so every scope model is held, and loaded first; (None, why, need) when
+    refused, its attempt gone, `need` the pool its next attempt reserves when room was why."""
     own = tuple(value.clone() for value in tensors)
     mutable = own[:nwork]
     counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
     every: dict[Model, tuple[str, ...]] = {model: ("",) for model in scope}
     recording = PreparedSequence.record()
+    recording._reserve = reserve
     recording.__enter__()
     failure: BaseException | None = None
     try:
@@ -783,14 +800,15 @@ def _record_first(
     except BaseException as error:
         failure = error
     if failure is not None:
+        need = _pool_need(recording)
         _abandon(recording, failure)
         if (why := _refusal(failure)) is None:
             raise failure
-        return None, why
+        return None, why, need
     rest, again = made  # one pass of equal steps (no phases): its rest, then the reuse program
     begin, end, _, first, count = parts[0]
     first_part = ((rest, first, count),)
-    return _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks), ""
+    return _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks), "", 0
 
 
 def _record(
@@ -877,6 +895,7 @@ def _record_whole(
     body: dict[Model, tuple[str, ...]],
     post: dict[Model, tuple[str, ...]],
     ident: Hashable,
+    reserve: int,
 ) -> _Program:
     """The whole call (`before`, every step and `after`) recorded on `tensors` as one program
     a later call runs natively; it yields to a command between its parts (`_yield_point`). A
@@ -886,6 +905,7 @@ def _record_whole(
     mutable = tensors[:nwork]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
     recording = PreparedSequence.record()
+    recording._reserve = reserve
     recording.__enter__()
     failure: BaseException | None = None
     try:
@@ -917,6 +937,7 @@ def _record_whole(
     except BaseException as error:
         failure = error
     if failure is not None:
+        failure.pool_need = _pool_need(recording)  # type: ignore[attr-defined]
         _abandon(recording, failure)
         raise failure
     stages = parts[0][1] - parts[0][0]
@@ -968,6 +989,10 @@ class _IdleRecording:
                 raise
             if isinstance(error, Building) or isinstance(error.__cause__, Building):
                 return False  # a kernel still opens: a later idle period
+            with self.loops._lock:
+                grew = _grew(self.known, shape, error)
+            if grew:
+                return False  # a later idle period reserves what this one lacked
             why = refused or f"{type(error).__name__}: {error}"
             with self.loops._lock:
                 self.known.unfit.add(shape)
@@ -1014,7 +1039,8 @@ class _IdleRecording:
                 _lap("resident")
                 _yield_point()
                 program = _record_whole(
-                    self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident
+                    self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident,
+                    self.known.need.get(self.ident[1], 0),  # type: ignore[index]
                 )
         finally:
             graphs.BYPASS.reset(bypass)
@@ -1248,6 +1274,30 @@ def _abandon(recording: _SequenceCapture, failure: BaseException | None = None) 
     _drop_stages(recording)
     recording.close()
     gc.collect()
+
+
+def _pool_need(recording: _SequenceCapture) -> int:
+    """A refused attempt's reservation and the largest allocation its pool had no room for, capped
+    by the card: what the next attempt reserves. 0 when room was not why. Growing by what it lacked
+    converges in an attempt or two; the eager peak before an `after` that never ran never did (an
+    H100's SDXL whole call was 1,074,921,619 bytes short every time: 32992-33010)."""
+    pool = recording._pool
+    if pool is None or recording._working_bytes is None:
+        return 0
+    device = torch.cuda.current_device()
+    short = vt.pool_short(pool.handle, device)
+    total = torch.cuda.get_device_properties(device).total_memory
+    return min(recording._working_bytes + short, total) if short else 0
+
+
+def _grew(known: _Site, shape: Hashable, error: BaseException) -> bool:
+    """Whether a refused whole call's next attempt reserves more than this one did; under the
+    site's lock."""
+    need = getattr(error, "pool_need", 0)
+    if need <= known.need.get(shape, 0):
+        return False
+    known.need[shape] = need
+    return True
 
 
 def _drop_stages(recording: _SequenceCapture) -> None:
@@ -1611,7 +1661,8 @@ class _Graph:
             if self.recording._working_bytes is None:
                 # Later capture peaks include the eager snapshots still held outside this
                 # pool. They must not feed back into the next stage's reservation.
-                self.recording._working_bytes = int(vt.stats(self.device.index)["allocated_peak"])
+                peak = int(vt.stats(self.device.index)["allocated_peak"])
+                self.recording._working_bytes = max(peak, self.recording._reserve)
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
                 reserve_bytes=self.recording._working_bytes, primed=(stream,),
