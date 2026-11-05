@@ -202,6 +202,9 @@ def describe() -> int:
         reply = DescribeFailed(exc.code, exc.message)
     except _Undescribed as exc:
         reply = DescribeFailed(exc.code, str(exc))
+    except OSError as exc:
+        # A file the package or machine holds, unreadable here: said as the system says it.
+        reply = DescribeFailed("package_unreadable", str(exc))
     except Exception as exc:
         # Neither the author's mistake nor theirs to decode: say so, and where.
         frame = traceback.extract_tb(exc.__traceback__)[-1]
