@@ -89,41 +89,59 @@ def safeguards(warnings: list[Any]) -> dict[str, list[str]]:
 
 
 class Finite:
-    """Latents checked in passing: a step's sums queue behind it, and the next step reads them, so
-    the host is at most a step ahead and waits on no step it just sent. A sum holds no tensor of
-    latents' size and carries any NaN or infinity to its end. A native loop's reads are unordered
-    with its steps, which only write finite values over finite ones. A tensor not finite on entry
-    is not latents yet (SDXL's `image`, which `after` fills): its entry sum queues with the work
-    and is read with the first step's, so nothing waits before the work starts."""
+    """Latents checked in passing: a step's sums go to pinned host memory as they are made, behind
+    an event, and the next step reads them there, so the host is at most a step ahead and waits on
+    no step it just sent, only on the copy of the one before. A non-finite step fails the call a
+    step later at worst; `last` reads the last step's. A sum holds no tensor of latents' size and
+    carries any NaN or infinity to its end. A native loop's reads are unordered with its steps,
+    which only write finite values over finite ones. A tensor not finite on entry is not latents
+    yet (SDXL's `image`, which `after` fills): its entry sum is read with the first step's."""
 
     def __init__(self, torch: Any, tensors: tuple[Any, ...] = ()) -> None:
-        self.torch, self.sums = torch, ()
+        self.torch = torch
         self.tensors = tuple(t for t in tensors if t.is_floating_point())
-        self.entry = self._sums(self.tensors)
+        self.entry, self.sums = self._queue(self.tensors), None
         self.kept: tuple[bool, ...] | None = None
 
-    def _sums(self, tensors: tuple[Any, ...]) -> tuple[Any, ...]:
-        return tuple(tensor.sum(dtype=self.torch.float32) for tensor in tensors)
+    def _queue(self, tensors: tuple[Any, ...]) -> tuple[Any, Any] | None:
+        """Their sums, on the host once the event says so (None off CUDA: read at once)."""
+        if not tensors:
+            return None
+        torch = self.torch
+        sums = torch.stack([tensor.sum(dtype=torch.float32) for tensor in tensors])
+        if not sums.is_cuda:
+            return sums, None
+        host = torch.empty(sums.shape, dtype=torch.float32, pin_memory=True)
+        host.copy_(sums, non_blocking=True)
+        event = torch.cuda.Event()
+        event.record()
+        return host, event
 
     @staticmethod
-    def _sound(sums: Any) -> bool:
-        return all(math.isfinite(value.item()) for value in sums)
+    def _read(queued: tuple[Any, Any] | None) -> list[float]:
+        if queued is None:
+            return []
+        values, event = queued
+        if event is not None:
+            event.synchronize()
+        return values.tolist()
 
-    def _latents(self, sums: tuple[Any, ...]) -> Any:
-        if self.kept is None:
-            self.kept = tuple(math.isfinite(value.item()) for value in self.entry)
-        return (value for value, kept in zip(sums, self.kept, strict=False) if kept)
+    def _sound(self, queued: tuple[Any, Any] | None, latents: bool = True) -> bool:
+        found = self._read(queued)
+        if latents:
+            if self.kept is None:
+                self.kept = tuple(math.isfinite(value) for value in self._read(self.entry))
+            found = [value for value, kept in zip(found, self.kept, strict=False) if kept]
+        return all(math.isfinite(value) for value in found)
 
     def step(self, tensors: tuple[Any, ...] | None = None) -> bool:
         """Queues the sums of what this step wrote; whether the step before's were finite."""
-        queued, self.sums = self.sums, self._sums(self.tensors if tensors is None else tensors)
-        return self._sound(queued if tensors is not None else self._latents(queued))
+        queued, self.sums = self.sums, self._queue(self.tensors if tensors is None else tensors)
+        return self._sound(queued, latents=tensors is None)
 
     def last(self) -> bool:
         """After the last step's completion."""
-        return self._sound(self._latents(self.sums)) and self._sound(
-            self._latents(self._sums(self.tensors))
-        )
+        return self._sound(self.sums) and self._sound(self._queue(self.tensors))
 
 
 def _same_shaped(torch: Any, args: Any, kwargs: Any, result: Any) -> tuple[Any, ...]:
