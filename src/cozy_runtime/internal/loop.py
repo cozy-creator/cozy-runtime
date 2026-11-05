@@ -862,7 +862,7 @@ def _record_first(
     pre: dict[Model, tuple[str, ...]],
     body: dict[Model, tuple[str, ...]],
     ident: Hashable,
-    reserve: int,
+    reserve: tuple[int, bool],
     recording: _SequenceCapture | None,
 ) -> tuple[_Program | None, str, int]:
     """A first call's whole program, recorded after its warm steps on copies of its tensors, into
@@ -877,7 +877,7 @@ def _record_first(
     if recording is None:
         recording = PreparedSequence.record()
         recording.__enter__()
-    recording._reserve = reserve
+    recording._reserve, recording._floor = reserve
     failure: BaseException | None = None
     try:
         with ExitStack() as loading:
@@ -952,7 +952,7 @@ def _record(
         _once(loop.after, work + tensors[len(work) :])
         return None, warmed
     recording = PreparedSequence.record()
-    recording._reserve = _pool(max(peaks, default=0), 0, loop.after is not None)
+    recording._reserve, recording._floor = _pool(max(peaks, default=0), 0), loop.after is not None
     recording.__enter__()
     try:
         why = None
@@ -1014,7 +1014,7 @@ def _record_whole(
     body: dict[Model, tuple[str, ...]],
     post: dict[Model, tuple[str, ...]],
     ident: Hashable,
-    reserve: int,
+    reserve: tuple[int, bool],
 ) -> _Program:
     """The whole call (`before`, every step and `after`) recorded on `tensors` as one program
     a later call runs natively; it yields to a command between its parts (`_yield_point`). A
@@ -1024,7 +1024,7 @@ def _record_whole(
     mutable = tensors[:nwork]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
     recording = PreparedSequence.record()
-    recording._reserve = reserve
+    recording._reserve, recording._floor = reserve
     recording.__enter__()
     failure: BaseException | None = None
     try:
@@ -1405,22 +1405,22 @@ def _abandon(recording: _SequenceCapture, failure: BaseException | None = None) 
     torch.cuda.empty_cache()  # Varena's trim: completed free pages, which a dead pool's now are
 
 
-def _pool(peak: int, need: int, unseen: bool = False) -> int:
+def _pool(peak: int, need: int) -> int:
     """What a recording's pool reserves: the core's size for the working peak of the eager parts
     it records (`vt.pool_bytes`: `before`, the warm steps, `after`), not the process's (a load's
     transients counted there: an int8 DiT's 20 GB), and at least what an attempt before it lacked
-    (`_pool_need`). An `after` that has not run (`unseen`: a first call's) only the request's peak
-    bounds: SDXL's steps measured 0.52 GiB, a pool too small for its decode (run 34004). 0: the
-    process's peak."""
-    floor = int(vt.stats(torch.cuda.current_device())["allocated_peak"]) if unseen else 0
-    return max(vt.pool_bytes(peak) if peak else 0, need, floor)
+    (`_pool_need`). 0: the process's peak at capture (`_Graph._open`)."""
+    return max(vt.pool_bytes(peak) if peak else 0, need)
 
 
-def _reserve(known: _Site, shape: Hashable, loop: _Loop) -> int:
-    """`_pool` for a site's recording of `shape`: what its eager parts measured, what an attempt
-    lacked, and the request's peak while its `after` has not run eagerly (`_after`)."""
-    unseen = loop.after is not None and shape not in known.after
-    return _pool(known.peak.get(shape, 0), known.need.get(shape, 0), unseen)
+def _reserve(known: _Site, shape: Hashable, loop: _Loop) -> tuple[int, bool]:
+    """`_pool` for a site's recording of `shape` from what its eager parts measured and what an
+    attempt lacked; and whether the process's peak bounds it too, as its `after` has not run
+    eagerly (`_after`): SDXL's steps measured 0.52 GiB, a pool too small for its decode (34004)."""
+    return (
+        _pool(known.peak.get(shape, 0), known.need.get(shape, 0)),
+        loop.after is not None and shape not in known.after,
+    )
 
 
 def _pool_need(recording: _SequenceCapture) -> int:
@@ -1834,11 +1834,12 @@ class _Graph:
         stream, control = self.domain.stream, self.domain.control
         control.wait_stream(stream)
         if self.recording._working_bytes is None:
-            # What the recording reserves (`_pool`), else the process's peak. Later capture peaks
-            # include the eager snapshots held outside this pool: they never feed back into it.
-            reserve = self.recording._reserve
-            peak = reserve or int(vt.stats(self.device.index)["allocated_peak"])
-            self.recording._working_bytes = peak
+            # What the recording reserves (`_pool`), and the process's peak when that is unmeasured
+            # or bounds an `after` not yet run (`_floor`). Later capture peaks include the eager
+            # snapshots held outside this pool: they never feed back into it.
+            reserve, peak = self.recording._reserve, int(vt.stats(self.device.index)["allocated_peak"])
+            floor = self.recording._floor or not reserve
+            self.recording._working_bytes = max(reserve, peak) if floor else reserve
         self.graph = torch.cuda.CUDAGraph(keep_graph=True)
         capture = partial(
             vt.graph, self.graph, pool=self.recording._pool.handle, stream=control,
