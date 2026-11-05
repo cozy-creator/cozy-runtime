@@ -15,11 +15,11 @@ F), in the call's component scope; a command that arrives preempts it between it
 inside package code). A call that finds it unrecorded (no idle period yet, or preempted) records
 the whole call before running any of it and runs it natively from its start: one plan and no eager
 step. No idle period opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so
-a call queued behind another never waits for idle work. One that does not fit, or whose code cannot
-run outside its request, is not tried again for that layout, and the calls say why. Other
-component loops stay eager: recording a streamed loop did not repay its recording and extra reads
-(Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s
-on an RTX 5090: 716 vs 737 s).
+a call queued behind another never waits for idle work. One that does not fit is not tried again for
+that layout; one whose code cannot run outside its request records only in a call; the calls say
+why. Other component loops stay eager: recording a streamed loop did not repay its recording and
+extra reads (Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s;
+MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
 
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
 `before` and the same warm steps run eagerly, then the rest natively. A refusal before submission
@@ -310,6 +310,8 @@ class _Site:
 
     after: dict[Hashable, dict[Model, tuple[str, ...]]] = field(default_factory=dict)
     unfit: set[Hashable] = field(default_factory=set)
+    #: layouts whose idle recording failed: code that runs only inside its request records there
+    inside: set[Hashable] = field(default_factory=set)
     pending: dict[Hashable, _IdleRecording] = field(default_factory=dict)  # by key and layout
     why: dict[Hashable, str] = field(default_factory=dict)
     #: the pool the next whole-call recording reserves, after one had no room (`_pool_need`)
@@ -603,6 +605,8 @@ class Loops:
             return why
         if lora.LOOP.get():
             return "resident, and its overlays are armed only in its call"
+        if shape in known.inside:
+            return f"resident, recorded only in a call: {known.why.get(shape, '')}"[:400]
         with self._lock:
             if ident not in known.pending:
                 job = _IdleRecording(
@@ -1077,7 +1081,7 @@ class _IdleRecording:
                 return False  # a later idle period reserves what this one lacked
             why = refused or f"{type(error).__name__}: {error}"
             with self.loops._lock:
-                self.known.unfit.add(shape)
+                self.known.inside.add(shape)
                 self.known.why[shape] = f"its idle recording failed: {why}"[:400]
             _warn(why)
             done = True
