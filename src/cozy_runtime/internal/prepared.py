@@ -231,13 +231,6 @@ class Execution:
         self._sequence = sequence
         self._request = _REQUEST.get()
         self._failure: Exception | None = None
-        self._queued_offered: str | None = None
-
-    def _offer_queued(self) -> None:
-        # Scratch, outputs and resident weights are already retained. This optional
-        # observer work never advances GPU execution.
-        if self.context is not None and self._queued_offered is None and self._request is not None:
-            self._queued_offered = self._request.prefetch_queued()
 
     def facts(self) -> dict[str, object]:
         return self.plan.facts()
@@ -287,7 +280,6 @@ class Execution:
                 return self._finish(completed, canceled)
             # The one queued CPU preflight can finish after submit. Re-offer only while
             # native work remains active; latching an actual assignment bounds admission.
-            self._offer_queued()
             return Progress(completed, canceled, False)
 
     def cancel(self) -> None:
@@ -547,7 +539,6 @@ class PreparedSequence:
                     stage._active = execution
                 # All Python/native owners exist before the sole native worker can start.
                 native.start()
-                execution._offer_queued()
                 return execution
             except BaseException as error:
                 if native is not None:

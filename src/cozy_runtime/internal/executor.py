@@ -254,7 +254,7 @@ else:
     import resource
 
 if TYPE_CHECKING:
-    from cozy_runtime.internal.residency import Memory, QueuedPrefetch
+    from cozy_runtime.internal.residency import Memory
     from cozy_runtime.internal.residency import Request as MemoryRequest
 
 #: The native inline-result door: a small typed result rides
@@ -3211,9 +3211,6 @@ class Executor:
             with construction._prepared_lock:
                 construction.prepared.pop(request_id, None)
                 construction.awaiting.discard(request_id)
-        if self.host.memory is not None:
-            # Never hold the prepared-record lock while touching a native read owner.
-            self.host.memory.cancel_queued(request_id)
         IDLE_WAITED.pop(request_id, None)
         if self.order is not None:
             self.order.wake()  # an idle period may open now (`awaiting_invoke`)
@@ -3375,11 +3372,7 @@ class Executor:
                     "code": "poisoned_generation" if self.poisoned else "executor_not_ready",
                     "detail": self.poisoned or "executor stopped during request preparation",
                 }
-            self.prepared[command.request_id] = replace(
-                prepared,
-                stages=waits.stages,
-                prefetch_key=(command.attention_kernel, command.bits),
-            )
+            self.prepared[command.request_id] = replace(prepared, stages=waits.stages)
             self.awaiting.add(command.request_id)
             # A prepared request never dispatched must not survive for the generation.
             for stale in list(self.prepared)[: -PREPARED_HELD or None]:
@@ -3544,7 +3537,7 @@ class Executor:
             with (
                 WARNINGS.attempt() as warnings,
                 request_path.serving() as blocking,
-                self._request(command.request_id, prepared) as own_memory,
+                self._request(command.request_id) as own_memory,
                 self._ranks_request(command.request_id) as rank_memory,
                 attention.override(self._attention_snapshot(), self._attention_roots(), swap, pin)
                 if pin
@@ -4689,57 +4682,8 @@ class Executor:
         placed = self._rank_device(self.torch)
         return Device(placed.type, placed.index)
 
-    def _queued_prefetch(self, current: str, active: PreparedRequest) -> QueuedPrefetch | None:
-        """Snapshot one exact same-construction preparation; no device work under its lock."""
-        from cozy_runtime.internal.residency import QueuedPrefetch
-
-        if self.world != 1 or self.host.in_flight.count != 1 or self.residency is None:
-            return None
-        placements = (
-            tuple(self.residency.rows.values())
-            if isinstance(self.residency, _CompositeResidency)
-            else (self.residency,)
-        )
-        if len(placements) != 1:
-            return None  # Component names must identify one actual model slot.
-        with self._prepared_lock:
-            pending = [
-                (request_id, prepared)
-                for request_id, prepared in self.prepared.items()
-                if request_id != current and not self.host.mux.cancelled(request_id)
-            ]
-            if len(pending) != 1:
-                return None
-            request_id, prepared = pending[0]
-            if (
-                not prepared.phases
-                or prepared.lora != active.lora
-                or prepared.prefetch_key != active.prefetch_key
-            ):
-                return None
-            models = placements[0].models
-            names = prepared.phases[0]
-            if any(name not in models for name in names):
-                return None
-            targets = tuple(models[name] for name in names)
-
-        def valid() -> bool:
-            with self._prepared_lock:
-                return (
-                    self.prepared.get(request_id) is prepared
-                    and not self.host.mux.cancelled(request_id)
-                    and not self.host.mux.cancelled(current)
-                    and self.host.in_flight.count == 1
-                    and self.ready
-                    and not self.poisoned
-                )
-
-        return QueuedPrefetch(request_id, targets, valid)
-
     @contextlib.contextmanager
-    def _request(
-        self, request_id: str, prepared: PreparedRequest | None = None
-    ) -> Iterator[list[GpuMemory]]:
+    def _request(self, request_id: str) -> Iterator[list[GpuMemory]]:
         """The request's residency scopes and pure cuts. Tensor ownership determines lifetime;
         its recorded allocator figures are process-wide, not exact per-request allocations."""
         host, rows = self.host, list[GpuMemory]()
@@ -4756,8 +4700,6 @@ class Executor:
                 host.execution.serving(request),
             ):
                 host.requests[request_id] = request
-                if prepared is not None:
-                    request.queued = functools.partial(self._queued_prefetch, request_id, prepared)
                 try:
                     yield rows
                 finally:
