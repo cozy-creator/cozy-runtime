@@ -541,23 +541,51 @@ class _Prefetch:
 
 
 class _HostPage:
-    """A page's bytes in host RAM, registered with CUDA (pinned) so its refill is one DMA, and
+    """A page's bytes in host RAM, registered with CUDA (pinned) so its refill is DMA, and
     unregistered when the page goes, after its last copy (`event`) completed. Registered once
-    filled: registering touched memory runs at about twice the rate of untouched memory."""
+    filled: registering touched memory runs at about twice the rate of untouched memory. It
+    registers a staging window at a time, each a point idle work yields at (`register`): H3's
+    largest page in one call made a request wait 0.6 s on an RTX 3090. A copy never spans two
+    windows, which CUDA refuses (invalid argument)."""
 
-    __slots__ = ("event", "tensor")
+    __slots__ = ("event", "registered", "tensor", "windows")
 
     def __init__(self, tensor: Tensor) -> None:
         self.tensor = tensor
         self.event: Any = None
-        code = torch.cuda.cudart().cudaHostRegister(tensor.data_ptr(), tensor.numel(), 0)
-        if int(code) != 0:
-            raise RuntimeError(f"cudaHostRegister returned {code}")
+        # Cut at host page boundaries, so no two windows share a page.
+        size, shift = tensor.numel(), -tensor.data_ptr() % 4096
+        cuts = [0, *range(shift + _HOST_STAGING, size, _HOST_STAGING), size]
+        self.windows = [(a, b) for a, b in pairwise(cuts) if b > a]
+        self.registered = 0
+
+    def register(self, waiting: Callable[[], bool] = lambda: False) -> bool:
+        """The rest registered window by window until `waiting()`: whether all of it is."""
+        for start, stop in self.windows[self.registered :]:
+            if waiting():
+                return False
+            code = torch.cuda.cudart().cudaHostRegister(
+                self.tensor.data_ptr() + start, stop - start, 0
+            )
+            if int(code) != 0:
+                raise RuntimeError(f"cudaHostRegister returned {code}")
+            self.registered += 1
+        return True
+
+    def copy_to(self, tensor: Tensor, *, non_blocking: bool = False) -> None:
+        for start, stop in self.windows:
+            tensor[start:stop].copy_(self.tensor[start:stop], non_blocking=non_blocking)
+
+    def copy_from(self, tensor: Tensor) -> None:
+        for start, stop in self.windows:
+            self.tensor[start:stop].copy_(tensor[start:stop])
 
     def release(self) -> None:
         if self.event is not None:
             self.event.synchronize()
-        torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr())
+        for start, _ in self.windows[: self.registered]:
+            torch.cuda.cudart().cudaHostUnregister(self.tensor.data_ptr() + start)
+        self.registered = 0
 
 
 class _HostRead:
@@ -1440,7 +1468,7 @@ class Memory:
         #: wanted pages whose idle read failed: their refills stay on the store
         self._pin_failed = 0
         #: a wanted page read whole when a command arrived: it registers at the next idle
-        self._filled: tuple[tuple[object, ...], _Block, Tensor] | None = None
+        self._filled: tuple[tuple[object, ...], _Block, _HostPage] | None = None
         #: each stored page's refills in the running request, and in the last request that
         #: refilled it: the bytes a kept page saves per request, per byte of host RAM it holds
         self._refills: dict[tuple[object, ...], int] = {}
@@ -2028,9 +2056,9 @@ class Memory:
             return
         if not self._admit(page, tensor.numel()):
             return
-        kept = self._pin(torch.zeros(tensor.numel(), dtype=torch.uint8))
-        if kept is not None:
-            kept.tensor.copy_(tensor)  # complete when this returns
+        kept = _HostPage(torch.zeros(tensor.numel(), dtype=torch.uint8))
+        if self._pin(kept):
+            kept.copy_from(tensor)  # complete when this returns
             self._baked[page] = kept
             self._baked_bytes += tensor.numel()
 
@@ -2043,7 +2071,7 @@ class Memory:
         if found is None or found.tensor.numel() != use.tensor.numel():
             return
         began = time.perf_counter_ns()
-        use.tensor.copy_(found.tensor)  # complete when this returns
+        found.copy_to(use.tensor)  # complete when this returns
         use.commit()
         self._baked.move_to_end(page)
         self._refills[page] = self._refills.get(page, 0) + 1
@@ -2084,11 +2112,11 @@ class Memory:
     def pin_idle(self, waiting: Callable[[], bool]) -> None:
         """Pin the wanted pages while the executor is idle, each read again from the store into
         host RAM and registered once filled, until a command arrives (`waiting`). A command waits
-        at most one staging window's read or one page's registration: the page it interrupted is
-        wanted first at the next idle, and one it found filled registers then."""
+        at most one staging window's read or registration: the page it interrupted is wanted
+        first at the next idle, and one it found filled registers the rest then."""
         if self._filled is not None and not waiting():
             filled, self._filled = self._filled, None
-            if not self._keep(*filled):
+            if not self._keep(*filled, waiting):
                 return
         while self.host_pending() and not waiting():
             with self.lock:
@@ -2133,21 +2161,29 @@ class Memory:
                     WARNINGS.append(row)
                     print(f"[residency] a host page did not pin: {exc!r}"[:300], file=sys.stderr)
                 continue
-            if waiting():
-                self._filled = (page, block, tensor)
-                return
-            if not self._keep(page, block, tensor):
+            if not self._keep(page, block, _HostPage(tensor), waiting):
                 return
 
-    def _keep(self, page: tuple[object, ...], block: _Block, tensor: Tensor) -> bool:
-        """`page`'s filled bytes registered and kept, unless the page went meanwhile; False once
-        pinning failed (the tier is off)."""
+    def _keep(
+        self,
+        page: tuple[object, ...],
+        block: _Block,
+        kept: _HostPage,
+        waiting: Callable[[], bool],
+    ) -> bool:
+        """`page`'s filled bytes registered and kept, unless the page went meanwhile; one a
+        command interrupted waits for the next idle (`_filled`). False once pinning failed (the
+        tier is off)."""
         model = block.model
         if page in self._baked or model.closed or model.identity != page[2]:
+            kept.release()
             return True
-        kept = self._pin(tensor)
-        if kept is None:
+        pinned = self._pin(kept, waiting)
+        if pinned is None:
             return False
+        if not pinned:
+            self._filled = (page, block, kept)
+            return True
         with self.lock:
             if page not in self._baked and not model.closed and model.identity == page[2]:
                 self._baked[page] = kept
@@ -2210,11 +2246,13 @@ class Memory:
             and self._baked_room - nbytes >= _BAKED_HEADROOM
         )
 
-    def _pin(self, tensor: Tensor) -> _HostPage | None:
-        """`tensor` registered as a host page; a failed pin turns the tier off, with a warning."""
+    def _pin(self, kept: _HostPage, waiting: Callable[[], bool] = lambda: False) -> bool | None:
+        """`kept` registered, or False when `waiting()` stopped it part way; None when pinning
+        failed, which turns the tier off, with a warning."""
         try:
-            return _HostPage(tensor)
+            return kept.register(waiting)
         except (RuntimeError, OSError) as error:
+            kept.release()
             self._host_tier = False
             WARNINGS.append(
                 (
@@ -2262,7 +2300,7 @@ class Memory:
         self, region: Any, kept: _HostPage, *, evict_completed: bool
     ) -> _HostRead | None:
         """A refill from a host page: the region's fill under the native prefetch's admission,
-        one async DMA; None when the region is resident already. The copy stream exists before
+        async DMA; None when the region is resident already. The copy stream exists before
         admission, and a fill admitted here that fails is released before its error leaves: a
         traceback holding it kept the region `already being filled` for the retry (cr-225)."""
         if self._h2d_stream is None:
@@ -2274,7 +2312,7 @@ class Memory:
         try:
             use.consume_on(stream.cuda_stream)  # its release fences on the copy
             with torch.cuda.stream(stream):
-                use.tensor.copy_(kept.tensor, non_blocking=True)
+                kept.copy_to(use.tensor, non_blocking=True)
                 event = torch.cuda.Event()
                 event.record(stream)
         except BaseException:
@@ -2498,6 +2536,8 @@ class Memory:
             self._baked.clear()
             self._baked_bytes = 0
             self._wanted.clear()
+            if self._filled is not None:
+                pages.append(self._filled[2])
             self._filled = None
         for page in pages:
             page.release()
@@ -3290,9 +3330,9 @@ class Memory:
                     self._trim_baked()  # host pressure gives kept pages back here
                 found = self._baked.get(page)
                 if found is not None and found.tensor.numel() == use.tensor.numel():
-                    # The page's host copy (its first store read, or bake): one DMA.
+                    # The page's host copy (its first store read, or bake): DMA.
                     kept, began = found.tensor, time.perf_counter_ns()
-                    use.tensor.copy_(kept)  # complete when this returns
+                    found.copy_to(use.tensor)  # complete when this returns
                     kept_ns = time.perf_counter_ns() - began
                     self._baked.move_to_end(page)
             offset = 0
