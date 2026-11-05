@@ -300,7 +300,7 @@ class _Run:
             "forwards": sum(forwards),
             "computed": sum(computes),
             "skipped_steps": [
-                self.steps.start + step
+                step
                 for step, (done, total) in enumerate(zip(computes, forwards, strict=True))
                 for _ in range(total - done)
             ],
