@@ -1670,6 +1670,18 @@ class Memory:
                 self._phase_plan_models.clear()
                 self._note_phase_plan("unplanned", reason)
 
+    def _next_request_starts(self) -> None:
+        """A request ended: the next one starts where it did, so the plan's first phase is active
+        and the core refills it while the GPU is idle. A different request replans."""
+        self._phase_names = self._phase_request = None
+        if self._phase_plan is None:
+            return
+        try:
+            self._phase_plan.activate(next(iter(self._phase_plan_keys.values())))
+            self._note_phase_plan("active", "request_ended")
+        except Exception:
+            self._retire_phase_plan("request_ended")
+
     def _phase_regions(self, names: frozenset[str]) -> tuple[list[Any], list[Any], str]:
         """A phase's Regions in order, under the overlays its blocks last used, what identifies
         them, and why it cannot be planned, if it can't. A Region is an address and a Source."""
@@ -2107,7 +2119,7 @@ class Memory:
             try:
                 with self.lock:
                     if self._phase_request == request.id:
-                        self._retire_phase_plan("request_ended")
+                        self._next_request_starts()
                 self.forget_working_phases(request)
                 if self.pages is not None and not idle:
                     request.record_fills()
