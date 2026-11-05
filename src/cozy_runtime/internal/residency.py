@@ -992,7 +992,7 @@ class Memory:
         self.granularity = 512
         self._phase_plan: Any = None
         self._phase_plan_signature: tuple[Any, ...] | None = None
-        self._phase_plan_key: str | None = None
+        self._phase_plan_keys: dict[frozenset[str], str] = {}
         self._phase_plan_models: set[Model] = set()
         self._phase_plan_status: tuple[object, ...] | None = None
         self._phase_names: frozenset[str] | None = None
@@ -1679,28 +1679,25 @@ class Memory:
                 self._phase_plan.deactivate()
                 self._phase_plan = None
                 self._phase_plan_signature = None
-                self._phase_plan_key = None
+                self._phase_plan_keys = {}
                 self._phase_plan_models.clear()
                 self._note_phase_plan("unplanned", reason)
 
-    def _refresh_phase_plan(self, names: frozenset[str]) -> None:
-        """Every Region of this phase, in order, under the overlays its blocks last used: the core
-        plans from these. A Region is an address and a Source; nothing here moves bytes."""
+    def _phase_regions(self, names: frozenset[str]) -> tuple[list[Any], list[Any], str]:
+        """A phase's Regions in order, under the overlays its blocks last used, what identifies
+        them, and why it cannot be planned, if it can't. A Region is an address and a Source."""
         models = [model for model in self.models.values() if model.name in names]
-        reason = ""
         if len(models) != len(names) or {model.name for model in models} != set(names):
-            reason = "unresolved_or_ambiguous_models"
+            return [], [], "unresolved_or_ambiguous_models"
         regions, signature = [], []
         for model in sorted(models, key=lambda model: model.name):
             identity = model.wanted_identity()
             if model.closed or model.retiring or identity is None or model.identity != identity:
-                reason = "representation_identity_incomplete"
-                break
+                return [], [], "representation_identity_incomplete"
             bindings = []
             for block in model.groups():
                 if block.gathered is not None:
-                    reason = "host_gathered_representation"
-                    break
+                    return [], [], "host_gathered_representation"
                 raw_needed = (
                     block.aliases is None or any(block.aliases.values()) or not block.finals
                 )
@@ -1717,35 +1714,45 @@ class Memory:
                         block.path, role, int(region.ptr), int(region.allocated_bytes),
                     ))
                     regions.append(region)
-            if reason:
-                break
             signature.append((
                 model.name, model.content, identity, model.layout_identity, tuple(bindings),
             ))
+        return regions, signature, ""
+
+    def _refresh_phase_plan(self, names: frozenset[str]) -> None:
+        """The plan the core works from: this request's phases in order, every Region of each,
+        with `names` active. Nothing here moves bytes."""
+        request = _REQUEST.get()
+        steps = [] if request is None else [frozenset(step) for step in request.steps]
+        order = list(dict.fromkeys(names if names & step else step for step in steps))
+        phases = [] if names in order else [(names, *self._phase_regions(names))]
+        phases += [(step, *self._phase_regions(step)) for step in order]
+        reason = next((why for step, _, _, why in phases if step == names), "")
         if reason:
             self._retire_phase_plan(reason)
             self._note_phase_plan("unplanned", reason)
             return
-        represented = tuple(signature)
-        if self._phase_plan is not None and represented == self._phase_plan_signature:
-            assert self._phase_plan_key is not None
-            try:
-                self._phase_plan.activate(self._phase_plan_key)
-            except NotImplementedError:
-                self._retire_phase_plan("multiple_arenas")
+        planned = [(step, regions) for step, regions, _, why in phases if not why and regions]
+        if not any(step == names for step, _ in planned):
+            self._retire_phase_plan("no_regions")  # A model with no weights plans nothing.
             return
-        self._retire_phase_plan("phase_inventory_changed")
-        key = "runtime.phase.regions/1:" + hashlib.sha256(repr(represented).encode()).hexdigest()
-        candidate = varena.Plan(self.native, [(key, regions)])
+        represented = tuple((sorted(step), *signature)
+                            for step, _, signature, why in phases if not why and signature)
+        if self._phase_plan is None or represented != self._phase_plan_signature:
+            self._retire_phase_plan("phase_inventory_changed")
+            digest = hashlib.sha256(repr(represented).encode()).hexdigest()
+            keys = {step: f"runtime.phase.regions/1:{digest}/{i}" for i, (step, _) in enumerate(planned)}
+            self._phase_plan = varena.Plan(self.native, [(keys[step], regions) for step, regions in planned])
+            self._phase_plan_signature, self._phase_plan_keys = represented, keys
+            self._phase_plan_models = {
+                model for model in self.models.values()
+                if any(model.name in step for step, _ in planned)
+            }
+            self._note_phase_plan("active", native=self._phase_plan.facts())
         try:
-            candidate.activate(key)
+            self._phase_plan.activate(self._phase_plan_keys[names])
         except NotImplementedError:
-            self._note_phase_plan("unplanned", "multiple_arenas")
-            return
-        self._phase_plan, self._phase_plan_signature = candidate, represented
-        self._phase_plan_key = key
-        self._phase_plan_models = set(models)
-        self._note_phase_plan("active", phase=key, native=candidate.facts())
+            self._retire_phase_plan("multiple_arenas")
 
     def _activate_phase(self, model: Model) -> None:
         """Declare a component-phase boundary; native policy retains/evicts actual pages."""
@@ -1759,7 +1766,6 @@ class Memory:
                 self._retire_phase_plan("overlapping_requests")
                 return
             if names != self._phase_names or request_id != self._phase_request:
-                self._retire_phase_plan("phase_boundary")
                 self._phase_names, self._phase_request = names, request_id
                 if request is not None:
                     request.phase_changes.append(
