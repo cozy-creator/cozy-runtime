@@ -12,6 +12,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
 from typing import Any, NoReturn
 
+import tensorfs.varena.torch as vt
 import torch
 from tensorfs.varena import _runtime as varena
 
@@ -425,6 +426,7 @@ class PreparedSequence:
         self._active: _SequenceExecution | None = None
         self._native: Any = None
         self._capture_domain: Any = None
+        self._pool: Any = None
         # A rejected constructor owns no definitions. In particular its destructor must
         # not close a stage already transferred to another live sequence.
         self._closed = True
@@ -476,6 +478,12 @@ class PreparedSequence:
             "native_stage_advancement": True,
         }
 
+    def map_pool(self) -> None:
+        """Its pool's pages, which the core may have taken back while it was idle. Its use ends
+        when `_SequenceExecution` checks the native run complete."""
+        if self._pool is not None:
+            vt.prepare_pool(self._pool.handle, 0, self.device)
+
     def submit(self, context: Context | None = None) -> Execution:
         if not callable(getattr(_execution, "NativeSequence", None)):
             raise CapabilityError(
@@ -496,6 +504,7 @@ class PreparedSequence:
                 stage._validate()
                 if stage._active is not None and not stage._active.poll().done:
                     raise RuntimeError("a sequence stage is already running")
+            self.map_pool()
             with torch.cuda.device(self.device):
                 outputs = tuple(torch.empty_like(value) for value in self.state)
                 readout = torch.cuda.Event()
@@ -772,9 +781,19 @@ class _SequenceCapture:
             shared = _SharedDomain(self._domain, len(made))
             for sequence in made:
                 sequence._capture_domain = shared
+                sequence._pool = self._pool
+            self._declare_scratch(made[0].device)
             self._domain = None
             self._finished = True
             return tuple(made)
+
+    def _declare_scratch(self, device: int) -> None:
+        """Nothing reads a stage's pool between runs: boundary state is the program's own storage,
+        outside it, so an idle pool's pages go before any weight."""
+        try:
+            vt.pool_scratch(self._pool.handle, (), device)
+        except (RuntimeError, ValueError) as exc:  # A live allocation: its pool just stays mapped.
+            graphs.say("graph-pool-not-scratch", f"a stage graph's pool stays mapped while idle: {exc}")
 
     @contextmanager
     def capturing(self) -> Iterator[None]:
@@ -836,6 +855,9 @@ class _SequenceExecution(Execution):
         # Base execution calls this only after checked native completion/readout. If the
         # drain is unproven, source/graph owners remain retained for retirement.
         if not self._working_phases_recorded:
+            plan = self.plan
+            if plan._pool is not None and plan._capture_domain is not None:
+                vt.record_pool_stream(plan._pool.handle, plan._capture_domain.domain.stream, plan.device)
             request = self._request
             if request is not None:
                 for controller in self._phase_controllers.values():

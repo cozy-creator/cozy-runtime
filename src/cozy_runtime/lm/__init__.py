@@ -1944,10 +1944,21 @@ class _Engine:
             if graph is not None:
                 self.graphs[key] = graph
                 self.recorded += 1
+                try:
+                    vt.pool_scratch(self.pool.handle, (), self.domain.device)
+                except (RuntimeError, ValueError) as exc:  # A live allocation: it stays mapped.
+                    say("graph-pool-not-scratch", f"an LM graph's pool stays mapped while idle: {exc}")
             elif why:
                 self._unrecorded(key, why)
         if graph is not None:
-            vt.replay(graph, stream=torch.cuda.current_stream(self.domain.device))
+            stream = torch.cuda.current_stream(self.domain.device)
+            try:
+                vt.prepare_pool(self.pool.handle, 0, self.domain.device)
+            except torch.OutOfMemoryError:  # No room for its idle pool to come back.
+                graph = None
+            else:
+                vt.replay(graph, stream=stream)
+                vt.record_pool_stream(self.pool.handle, stream, self.domain.device)
         if graph is not None:
             self.replayed += 1
         else:

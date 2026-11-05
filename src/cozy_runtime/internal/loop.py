@@ -1074,6 +1074,11 @@ def _pinned(program: _Program) -> Iterator[bool]:
         yield False
         return
     try:
+        try:
+            program.sequences()[0].map_pool()
+        except torch.OutOfMemoryError:  # No room for its idle pool to come back: it runs eagerly.
+            yield False
+            return
         yield True
     finally:
         pin.__exit__(None, None, None)
