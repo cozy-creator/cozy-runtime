@@ -483,11 +483,11 @@ class Loops:
                     loop, rest, tensors, len(work), scope, pre, body, ident,
                     _reserve(known, shape, loop), opened,
                 )
-            elif opened is not None:
-                opened.close()
                 if need:
                     with self._lock:
                         known.need[shape] = need
+            elif opened is not None:
+                _abandon(opened)
         if program is not None:
             row.update(
                 mode=program.mode,
@@ -1394,12 +1394,15 @@ def _unresident(model: Model, paths: tuple[str, ...] = ("",)) -> str:
 
 
 def _abandon(recording: _SequenceCapture, failure: BaseException | None = None) -> None:
-    """A refused recording goes as its frames, then its stages and pool, in that order."""
+    """A refused recording goes as its frames, then its stages and pool, in that order, and its
+    pools' pages and bookkeeping with them, not at the next pressure: SDXL's refused calls left
+    12 pools, 9.26 GiB mapped (34061-34065)."""
     if failure is not None:
         unwind(failure)
     _drop_stages(recording)
     recording.close()
     gc.collect()
+    torch.cuda.empty_cache()  # Varena's trim: completed free pages, which a dead pool's now are
 
 
 def _pool(peak: int, need: int, unseen: bool = False) -> int:
