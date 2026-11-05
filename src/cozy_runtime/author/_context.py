@@ -157,6 +157,10 @@ class Context:
     _pause_stall_watch: Callable[[], AbstractContextManager[None]] | None = field(
         default=None, repr=False
     )
+    #: the sums of what its last component root returned (`graphs.Finite`)
+    _finite: Any = field(default=None, repr=False)
+    #: steps reported (`on_step`): a component method that ran some handed back latents
+    _steps: int = field(default=0, repr=False)
 
     def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored

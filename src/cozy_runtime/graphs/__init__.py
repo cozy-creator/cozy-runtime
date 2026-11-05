@@ -35,7 +35,7 @@ import tensorfs.varena.torch as vt
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, fault, is_capacity
+from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, OutputError, fault, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
@@ -85,6 +85,47 @@ def safeguards(warnings: list[Any]) -> dict[str, list[str]]:
         if fields.get("code") in SAFEGUARDS:
             found.setdefault(fields["code"], []).append(str(fields["why"]))
     return found
+
+
+class Finite:
+    """Latents checked in passing: a step's sums queue behind it, and the next step reads them, so
+    the host is at most a step ahead and waits on no step it just sent. A sum holds no tensor of
+    latents' size and carries any NaN or infinity to its end. A native loop's reads are unordered
+    with its steps, which only write finite values over finite ones. A tensor not finite on entry
+    is not latents yet (SDXL's `image`, which `after` fills)."""
+
+    def __init__(self, torch: Any, tensors: tuple[Any, ...] = ()) -> None:
+        self.torch, self.sums = torch, ()
+        self.tensors = tuple(t for t in tensors if t.is_floating_point() and self._sound(self._sums((t,))))
+
+    def _sums(self, tensors: tuple[Any, ...]) -> tuple[Any, ...]:
+        return tuple(tensor.sum(dtype=self.torch.float32) for tensor in tensors)
+
+    @staticmethod
+    def _sound(sums: tuple[Any, ...]) -> bool:
+        return all(math.isfinite(value.item()) for value in sums)
+
+    def step(self, tensors: tuple[Any, ...] | None = None) -> bool:
+        """Queues the sums of what this step wrote; whether the step before's were finite."""
+        queued, self.sums = self.sums, self._sums(self.tensors if tensors is None else tensors)
+        return self._sound(queued)
+
+    def last(self) -> bool:
+        """After the last step's completion."""
+        return self._sound(self.sums) and self._sound(self._sums(self.tensors))
+
+
+def _same_shaped(torch: Any, args: Any, kwargs: Any, result: Any) -> tuple[Any, ...]:
+    """A root's float inputs and outputs of one shape: a denoiser's latents and what it returns of
+    them. Both: a quantized forward turns NaN into integers, so NaN latents can return finite."""
+
+    def floats(value: Any) -> list[Any]:
+        leaves = torch.utils._pytree.tree_leaves(value)
+        return [v for v in leaves if isinstance(v, torch.Tensor) and v.is_floating_point() and v.dim()]
+
+    inputs, outputs = floats((args, kwargs)), floats(result)
+    shared = {tuple(t.shape) for t in inputs} & {tuple(t.shape) for t in outputs}
+    return tuple(tensor for tensor in (*inputs, *outputs) if tuple(tensor.shape) in shared)
 
 
 @request_path.forbid("cuda graph capture")
@@ -841,8 +882,9 @@ def _unprepared(exc: BaseException) -> bool:
 
 
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
+    context = CURRENT.get()
     if (
-        (context := CURRENT.get()) is not None
+        context is not None
         and not (torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
         and not (torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1)
     ):
@@ -862,9 +904,19 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
         return call(module, *args, **kwargs)
     began = time.perf_counter()
     try:
-        return _region_call(torch, module, recorder, call, args, kwargs)
+        result = _region_call(torch, module, recorder, call, args, kwargs)
     finally:
         recorder.call_ms += (time.perf_counter() - began) * 1e3
+    if context is not None:
+        # A loop of the package's own: each root call is a step, and any next one reads it.
+        if context._finite is None:
+            context._finite = Finite(torch)
+        if not context._finite.step(_same_shaped(torch, args, kwargs, result)):
+            raise OutputError(
+                f"the latents went non-finite before this call of {_name(module)}",
+                code="non_finite_latents",
+            )
+    return result
 
 
 def _watch(root: Any, recorder: _Recorder) -> None:

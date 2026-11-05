@@ -161,6 +161,12 @@ def _refusal(error: BaseException) -> str | None:
     return None
 
 
+def _non_finite(done: int, total: int) -> OutputError:
+    return OutputError(
+        f"the latents went non-finite by step {done} of {total}", code="non_finite_latents"
+    )
+
+
 def _refused(row: dict[str, Any], where: str, why: str) -> None:
     row["refusals"].append(f"{where}: {why}")
     if not why.startswith(_WAITING):  # A kernel still compiling is no refusal of the graph.
@@ -305,7 +311,7 @@ class Loops:
             cache = None
         bypass = graphs.BYPASS.set(True)
         try:
-            loop = _Loop(step, steps, phases, on_step, before, after, key)
+            loop = _Loop(step, steps, phases, on_step, before, after, key, len(state))
             if cache is None:
                 self._run(loop, state, carried, inputs, key, row)
             else:
@@ -598,6 +604,8 @@ class _Loop:
     before: Callable[..., object] | None
     after: Callable[..., object] | None
     key: Hashable | None = None
+    #: how many of a call's first tensors are its latents (`state`)
+    latents: int = 1
 
     def phase(self, i: int) -> Any:
         return _NONE if self.phases is None else self.phases[i - self.steps.start]
@@ -622,6 +630,7 @@ class _Loop:
             key=working_phase.execution_key(configuration, "runtime.eager/1"),
         ) as observation:
             index = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
+            finite = graphs.Finite(torch, tensors[: self.latents])
             for i in indices:
                 if ctx is not None:
                     ctx.raise_if_cancelled()
@@ -629,6 +638,8 @@ class _Loop:
                 if (cached := stepcache._RUN.get()) is not None:
                     cached.begin(i - self.steps.start)
                 _call(self.step, index, tensors, self.phase(i))
+                if not finite.step():
+                    raise _non_finite(i - self.steps.start, len(self.steps))
                 if self.on_step is not None:
                     if observation is None:
                         self.on_step(i)
@@ -638,6 +649,8 @@ class _Loop:
             if index.is_cuda:
                 stream = torch.cuda.current_stream(index.device)
                 stream.synchronize()
+                if not finite.last():
+                    raise _non_finite(indices[-1] - self.steps.start + 1, len(self.steps))
                 if (
                     observation is not None and mode == "eager"
                     and (
@@ -1245,18 +1258,25 @@ def _submit(
     row: dict[str, Any],
 ) -> None:
     """One native submission covering `indices`; no fallback once it is accepted."""
+    finite = graphs.Finite(torch, program.tensors[: loop.latents])
     with torch.no_grad():
         program.counter.fill_(indices.start)
     row["at_ms"].setdefault("submitted", _now())
     execution: Any = (
-        sequence.submit(ctx) if ctx._submit_prepared is None else ctx._submit_prepared(sequence)
+        sequence.submit(ctx)
+        if ctx is None or ctx._submit_prepared is None
+        else ctx._submit_prepared(sequence)
     )
-    on_step, reported = loop.on_step, 0
+    on_step, reported, seen = loop.on_step, 0, 0
     while True:
-        if ctx.cancelled:
+        if ctx is not None and ctx.cancelled:
             execution.cancel()
         progress = execution.poll()
         done = int(progress.completed_steps)
+        if done > seen:
+            seen = done
+            if not finite.step():
+                execution.cancel()
         if on_step is not None:
             for i in indices[reported:done]:
                 with vt.external_callback(program.tensors[0].device.index):
@@ -1267,7 +1287,10 @@ def _submit(
         time.sleep(0.01)
     execution.wait()
     row["at_ms"]["finished"] = _now()
-    ctx.raise_if_cancelled()
+    if ctx is not None:
+        ctx.raise_if_cancelled()
+    if not finite.last():
+        raise _non_finite(indices.start - loop.steps.start + seen, len(loop.steps))
     facts = execution.facts()
     done = int(progress.completed_steps)
     if progress.canceled or done != len(indices):

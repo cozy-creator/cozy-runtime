@@ -1289,6 +1289,7 @@ class Telemetry(_Bound):
 
         def on_step(step: int) -> None:
             self._ctx.raise_if_cancelled()
+            self._ctx._steps += 1
             now = work_clock()
             mark = attempt._step_mark
             ran = clock.mark() if clock is not None else None
