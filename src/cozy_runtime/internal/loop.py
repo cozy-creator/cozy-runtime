@@ -39,7 +39,7 @@ import threading
 import time
 import weakref
 from collections.abc import Callable, Hashable, Iterable, Iterator
-from contextlib import ExitStack, contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from functools import cached_property, partial
@@ -462,13 +462,19 @@ class Loops:
         program is kept for the site. Otherwise, or refused, the rest runs eagerly and the
         recording is queued for the idle period after it."""
         with _laps(row):
+            opened = None
+            if ident is not None and shape not in known.unfit:
+                with suppress(Exception):  # refused, its own recording says why
+                    opened = _opened(work)
             pre, body, rest, warmed = _warm(loop, tensors, scope, ctx)
             program, refused, began = None, "", time.perf_counter()
             if rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
-                    known.need.get(shape, 0),
+                    known.need.get(shape, 0), opened,
                 )
+            elif opened is not None:
+                opened.close()
                 if need:
                     with self._lock:
                         known.need[shape] = need
@@ -817,18 +823,21 @@ def _record_first(
     body: dict[Model, tuple[str, ...]],
     ident: Hashable,
     reserve: int,
+    recording: _SequenceCapture | None,
 ) -> tuple[_Program | None, str, int]:
-    """A first call's whole program, recorded after its warm steps on copies of its tensors:
-    `first` runs its `rest` (`after` included), `again` a later call. Its
+    """A first call's whole program, recorded after its warm steps on copies of its tensors, into
+    `recording` when one was opened (`_opened`): `first` runs its `rest` (`after` included), `again`
+    a later call. Its
     `after` has not run, so every scope model is held, and loaded first; (None, why, need) when
     refused, its attempt gone, `need` the pool its next attempt reserves when room was why."""
     own = tuple(value.clone() for value in tensors)
     mutable = own[:nwork]
     counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
     every: dict[Model, tuple[str, ...]] = {model: ("",) for model in scope}
-    recording = PreparedSequence.record()
+    if recording is None:
+        recording = PreparedSequence.record()
+        recording.__enter__()
     recording._reserve = reserve
-    recording.__enter__()
     failure: BaseException | None = None
     try:
         with ExitStack() as loading:
@@ -859,6 +868,19 @@ def _record_first(
         ((first, rest.start, len(rest)),), again, "resident", own, counter, ident, stages, 0,
         verdicts=verdicts,
     ), "", 0
+
+
+def _opened(tensors: tuple[Any, ...]) -> _SequenceCapture:
+    """A recording with its domain made (its library streams and handles, which wait for the
+    device): before a first call's warm steps, so the recording after them overlaps them."""
+    recording = PreparedSequence.record()
+    recording.__enter__()
+    try:
+        recording._prepare(tensors)
+    except BaseException:
+        recording.close()
+        raise
+    return recording
 
 
 def _record(
