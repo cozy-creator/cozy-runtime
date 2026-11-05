@@ -1571,8 +1571,10 @@ class _Graph:
             self._contexts.enter_context(kernel_ready.recording())
             stream.wait_stream(self._caller)
             control.wait_stream(stream)
+            memory = vt.stats(self.device.index)
             self._contexts.enter_context(vt.graph(
                 self.graph, pool=self.recording._pool.handle, stream=control,
+                reserve_bytes=vt.pool_bytes(memory["capture_bytes"] or memory["allocated_peak"]),
             ))
             torch.cuda.set_stream(stream)
         except BaseException as error:
