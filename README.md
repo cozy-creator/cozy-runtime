@@ -527,7 +527,10 @@ it. Markers are `msgspec.Meta`, so they stack: `Range(min, max, step=, unit=)`, 
 `Advanced()`. Publish refuses, statically: a required field a box can't draw (an unbounded number,
 `list[str]`), two shapes or one in a group, a group holding itself, a result with no file or
 `str` for the box to show, and an imported cozy package `uv.lock` doesn't lock. An optional
-field a box can't draw keeps its default, off the box. The interface carries each tool's `tool`
+field a box can't draw keeps its default, off the box, and so does an optional group with a
+required member a box can't draw. Marker arguments are read from source: literals, arithmetic and
+module-level constants (`STRENGTHS[0]` too), never a call, so write `Snap(first=124)`, not
+`Snap(first=frames_for(5))`. An invocable's tuple fields are `tuple[int, ...]`. The interface carries each tool's `tool`
 record and each entry point's `calls`: the functions it reaches that run as calls, its own
 `@invocable`s and other packages' functions, read at the release it locked, with their models,
 `accelerator` and `gpus`.

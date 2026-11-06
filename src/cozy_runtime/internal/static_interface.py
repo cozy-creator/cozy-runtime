@@ -246,6 +246,15 @@ def fold_constant(node: ast.expr, other: Callable[[ast.expr], Any]) -> Any:
             for key, value in zip(node.keys, node.values, strict=True)
             if key is not None
         }
+    if isinstance(node, ast.Subscript):
+        # `STRENGTHS[0]`, `TIERS["2k"]`: one member of a folded tuple, list or dict.
+        value, key = fold_constant(node.value, other), fold_constant(node.slice, other)
+        if not isinstance(value, (tuple, list, dict)) or isinstance(key, (bool, slice)):
+            raise Unfolded(node, "a subscript of something not a folded tuple, list or dict")
+        try:
+            return value[key]
+        except (IndexError, KeyError, TypeError) as exc:
+            raise Unfolded(node, f"an index its value doesn't have ({exc})") from exc
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd, ast.Invert)):
         operand = fold_constant(node.operand, other)
         if isinstance(operand, bool) or not isinstance(operand, (int, float)):

@@ -122,7 +122,7 @@ def _box(declared: Declaration) -> None:
     every number is bounded, the shape is the box's own, no group holds itself, and the result
     has what the box shows. A field the box can't draw keeps its default, off the box; a
     required one refuses."""
-    shapes = _fields(declared.name, declared.payload_type, (), "", top=True)
+    shapes, _ = _fields(declared.name, declared.payload_type, (), "", top=True)
     if len(shapes) > 1:
         raise ConformanceError(
             f"{declared.name}: {', '.join(shapes)} are each an AspectRatio; a box has one shape",
@@ -148,8 +148,10 @@ def _shows(tp: object) -> bool:
 
 def _fields(
     name: str, struct: object, groups: tuple[object, ...], prefix: str, *, top: bool
-) -> list[str]:
-    """Check a group's fields, returning the names of its shapes."""
+) -> tuple[list[str], str]:
+    """Check a group's fields: the names of its shapes, and why a box can't draw the group ("":
+    it can). A group with a required member the box can't draw is one it can't draw: it stays
+    off the box when it has a default, as any such field does (a model's `regions`)."""
     shapes: list[str] = []
     for f in msgspec.structs.fields(struct):  # type: ignore[arg-type]
         path = prefix + f.name
@@ -167,7 +169,9 @@ def _fields(
                     "can't contain itself",
                     code="tool_group",
                 )
-            _fields(name, item, (*groups, struct), path + ("[]." if listed else "."), top=False)
+            member = path + ("[]." if listed else ".")
+            inner = _fields(name, item, (*groups, struct), member, top=False)[1]
+            why = f"its {inner}" if inner else ""
         elif why == "shape":
             if not top:
                 raise ConformanceError(
@@ -176,14 +180,17 @@ def _fields(
                     code="tool_shape",
                 )
             shapes.append(f.name)
-        elif why and f.required:
+            why = ""
+        if why and f.required and not top:
+            return shapes, f"{path}: {why}"
+        if why and f.required:
             raise ConformanceError(
                 f"{name}.{path}: {why}, so a box can't draw it, and it has no default: give it "
                 "one, or write a tool whose fields a box draws",
                 code="tool_field",
                 fields=[path],
             )
-    return shapes
+    return shapes, ""
 
 
 def _undrawable(tp: object, markers: Sequence[object], listed: bool) -> str:
