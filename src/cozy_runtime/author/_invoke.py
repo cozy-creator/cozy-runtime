@@ -1121,6 +1121,15 @@ def _check_result_bounds(surface: Surface, result: object, attempt: Attempt) -> 
             )
 
 
+def _fills(value: object, annotation: type) -> bool:
+    """A value of the declared type, or a file of its kind (a saved file in a `Latents` field)."""
+    if isinstance(value, annotation):
+        return True
+    return (
+        isinstance(value, File) and issubclass(annotation, File) and value.kind == annotation.kind
+    )
+
+
 def _validate_result(
     surface: Surface, result: object, attempt: Attempt, *, grant_token: object | None = None
 ) -> None:
@@ -1142,7 +1151,7 @@ def _validate_result(
         if value is None and node.optional:
             continue
         annotation = node.annotation
-        if isinstance(annotation, type) and not isinstance(value, annotation):
+        if isinstance(annotation, type) and not _fills(value, annotation):
             raise OutputError(
                 f"{surface.name}.{name} is {type(value).__name__}, declared {annotation.__name__}",
                 code="result_schema",

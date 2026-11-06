@@ -57,6 +57,8 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         "FileBound, Files, AudioPreparation, ImagePreparation, VideoPreparation, "
         "ImageFile, AudioFile, VideoFile, File, Tree",
         "from cozy_runtime.author import ModelArtifact, ModelChoice",
+        "from cozy_runtime.author import AspectRatio, Audio, Image, Latents, Pickup, Prompt, Seed",
+        "from cozy_runtime.author import Video",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "from cozy_runtime.author import PendingCall",
         "",
@@ -67,6 +69,78 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
     exports: set[str] = set()
     for entry, metadata in sorted(entries, key=lambda item: item[1].export):
         defaults, names, enums = metadata.defaults, metadata.type_names, metadata.enum_members
+
+        def struct(
+            node: Json,
+            path: str,
+            tag_field: str | None = None,
+            *,
+            base: str = "msgspec.Struct",
+            names: dict[str, str] = names,
+            defaults: dict[str, object] = defaults,
+        ) -> str:
+            """A struct's class; open wire types: a callee may add result fields a caller does
+            not read yet."""
+            name = names[path]
+            if name.startswith("__cozy_") or name in exports:
+                raise ConformanceError(
+                    "interface type collides with a generated export",
+                    code="interface_name_conflict",
+                )
+            options = ["kw_only=True", "frozen=True"]
+            if "tag" in node:
+                options += [
+                    "tag=" + repr(node["tag"]),
+                    "tag_field=" + repr(node.get("tag_field", tag_field or "type")),
+                ]
+            fields: list[str] = []
+            for field in node["fields"]:
+                field_path = path + "/" + field["name"]
+                annotation = expression(field["type"], field_path)
+                if constraints := field.get("constraints"):
+                    meta = f"msgspec.Meta(**{constraints!r})"
+                    members = (
+                        field["type"].get("union", []) if isinstance(field["type"], dict) else []
+                    )
+                    if "null" in members and len(members) == 2:
+                        # An optional value's bounds are its value's: `Annotated[T, ...] | None`.
+                        at = 1 - members.index("null")
+                        value = expression(members[at], f"{field_path}/union/{at}")
+                        annotation = f"Annotated[{value}, {meta}] | None"
+                    else:
+                        annotation = f"Annotated[{annotation}, {meta}]"
+                declared = field.get("asset_bound", {})
+                bound = {
+                    name: limit
+                    for name, limit in declared.items()
+                    if name in package_interface.ASSET_BOUND_KEYS
+                }
+                if bound:
+                    annotation = f"Annotated[{annotation}, FileBound(**{bound!r})]"
+                if (marker := _preparation(declared.get("prepare"))) is not None:
+                    annotation = f"Annotated[{annotation}, {marker}]"
+                default = ""
+                if field_path in defaults:
+                    value = defaults[field_path]
+                    default = (
+                        f" = msgspec.field(default_factory=lambda: {value!r})"
+                        if isinstance(value, (list, dict))
+                        else " = " + literal(field["type"], field_path, value)
+                    )
+                fields.append(f"    {field['name']}: {annotation}{default}")
+            source = (
+                "class "
+                + name
+                + "("
+                + base
+                + ", "
+                + ", ".join(options)
+                + "):\n"
+                + "\n".join(fields or ["    pass"])
+                + "\n"
+            )
+            _declare(declarations, name, source)
+            return name
 
         def expression(
             node: Json,
@@ -85,58 +159,16 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                     "bool": "bool",
                     "null": "None",
                 }[node]
+            if "media" in node:
+                media = _MEDIA[node["media"]]
+                return struct(node, path, tag_field, base=media) if node.get("fields") else media
+            if "pickup" in node:
+                return struct(node["pickup"], path, tag_field, base="Pickup")
+            if "prompt" in node:
+                kinds = [_MEDIA[kind] for kind in node["prompt"]]
+                return "Prompt" if len(kinds) == len(_MEDIA) else f"Prompt[{' | '.join(kinds)}]"
             if "fields" in node:
-                name = names[path]
-                if name.startswith("__cozy_") or name in exports:
-                    raise ConformanceError(
-                        "interface type collides with a generated export",
-                        code="interface_name_conflict",
-                    )
-                # Open wire types: a callee may add result fields a caller does not read yet.
-                options = ["kw_only=True", "frozen=True"]
-                if "tag" in node:
-                    options += [
-                        "tag=" + repr(node["tag"]),
-                        "tag_field=" + repr(node.get("tag_field", tag_field or "type")),
-                    ]
-                fields: list[str] = []
-                for field in node["fields"]:
-                    field_path = path + "/" + field["name"]
-                    annotation = expression(field["type"], field_path)
-                    if field.get("constraints"):
-                        annotation = (
-                            f"Annotated[{annotation}, msgspec.Meta(**{field['constraints']!r})]"
-                        )
-                    declared = field.get("asset_bound", {})
-                    bound = {
-                        name: limit
-                        for name, limit in declared.items()
-                        if name in package_interface.ASSET_BOUND_KEYS
-                    }
-                    if bound:
-                        annotation = f"Annotated[{annotation}, FileBound(**{bound!r})]"
-                    if (marker := _preparation(declared.get("prepare"))) is not None:
-                        annotation = f"Annotated[{annotation}, {marker}]"
-                    default = ""
-                    if field_path in defaults:
-                        value = defaults[field_path]
-                        default = (
-                            f" = msgspec.field(default_factory=lambda: {value!r})"
-                            if isinstance(value, (list, dict))
-                            else " = " + literal(field["type"], field_path, value)
-                        )
-                    fields.append(f"    {field['name']}: {annotation}{default}")
-                source = (
-                    "class "
-                    + name
-                    + "(msgspec.Struct, "
-                    + ", ".join(options)
-                    + "):\n"
-                    + "\n".join(fields or ["    pass"])
-                    + "\n"
-                )
-                _declare(declarations, name, source)
-                return name
+                return struct(node, path, tag_field)
             if "literal" in node:
                 if path in enums:
                     name = names[path]
@@ -173,9 +205,14 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
                     "audio": "AudioFile",
                     "video": "VideoFile",
                     "file": "File",
+                    "latents": "Latents",
                 }[node["asset"]]
             if node.get("input") == "tree":
                 return "Tree"
+            if node.get("input") == "aspect_ratio":
+                return "AspectRatio"
+            if node.get("input") == "seed":
+                return "Seed"
             if node.get("input") == "model":
                 return "ModelArtifact"
             if node.get("opaque") == "Any":
@@ -297,6 +334,9 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         + functions
         + ["__cozy_bindings__ = {", *bindings, "}", ""]
     )
+
+
+_MEDIA = {"image": "Image", "video": "Video", "audio": "Audio"}
 
 
 def _preparation(declared: object) -> str | None:

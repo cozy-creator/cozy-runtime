@@ -40,7 +40,7 @@ from cozy_runtime.author._executor_requests import (
     ModelPrefetch,
     SavedFile,
 )
-from cozy_runtime.author._files import _UNBOUND, File, Files, Tree, asset_dec_hook
+from cozy_runtime.author._files import _UNBOUND, File, Files, References, Tree, asset_dec_hook
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import WARNINGS, Model
@@ -449,6 +449,8 @@ class _Broker:
                         "ModelChoice(ref=artifact)",
                         code="child.model_artifact_required",
                     )
+                if isinstance(value, References):
+                    return value.wire()
                 if isinstance(value, Files):
                     return [
                         {"asset": item, "label": item.label, "fidelity": item.fidelity}

@@ -157,6 +157,26 @@ class WeightsOutputDeclaration(msgspec.Struct, frozen=True, kw_only=True):
     max_bytes: Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)]
 
 
+class ToolDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """`app.tool`'s own options: this entry point is a box."""
+
+    label: str = ""
+    named: str = ""
+    reserved: tuple[str, ...] = ()
+    ui: str = ""
+
+
+class Call(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
+    """A function this one calls, read from its package at the release this one locked: one
+    placement unit. `gpus`: the widths it runs at; unset, one."""
+
+    package: str
+    function: str
+    accelerator: bool
+    gpus: tuple[Annotated[int, msgspec.Meta(ge=1)], ...] | msgspec.UnsetType = msgspec.UNSET
+    models: tuple[ModelSlot, ...] = ()
+
+
 class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     name: str
     #: Its docstring's first paragraph, for people choosing a function.
@@ -171,8 +191,8 @@ class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     publishes: bool = False
     #: written only as false: CPU only. Absent: the machine's GPU when it has one.
     accelerator: bool | msgspec.UnsetType = msgspec.UNSET
-    #: What its box says that its types can't (`author.Node`).
-    node: JsonValue | msgspec.UnsetType = msgspec.UNSET
+    tool: ToolDoc | msgspec.UnsetType = msgspec.UNSET
+    calls: tuple[Call, ...] = ()
     weights_outputs: (
         Annotated[tuple[WeightsOutputDeclaration, ...], msgspec.Meta(min_length=1, max_length=16)]
         | msgspec.UnsetType
@@ -285,8 +305,8 @@ def entry(declared: Declaration) -> dict[str, Json]:
         doc["publishes"] = True
     if not declared.accelerator:
         doc["accelerator"] = False
-    if declared.node is not None:
-        doc["node"] = declared.node.document()
+    if declared.tool is not None:
+        doc["tool"] = declared.tool.document()
     if declared.weights_outputs:
         doc["weights_outputs"] = [
             {
@@ -729,10 +749,25 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
         return
     if not isinstance(value, dict):
         _invalid(source, path, "must be a scalar or schema object")
-    forms = set(value) & _SCHEMA_FORMS
+    # A media slot's `fields` are its extras, not a struct of its own.
+    forms = set(value) & _SCHEMA_FORMS - ({"fields"} if "media" in value else set())
     if len(forms) != 1:
         _invalid(source, path, "must carry exactly one schema form")
     form = next(iter(forms))
+    if form == "media":
+        if value["media"] not in ("image", "video", "audio"):
+            _invalid(source, f"{path}.media", "must be image, video or audio")
+        _schema({"fields": value.get("fields", [])}, source, path)
+        return
+    if form == "prompt":
+        kinds = value["prompt"]
+        if (
+            not isinstance(kinds, list)
+            or not kinds
+            or not set(kinds) <= {"audio", "image", "video"}
+        ):
+            _invalid(source, f"{path}.prompt", "must name the kinds it takes: audio, image, video")
+        return
     if form == "fields":
         struct = _fields(value, {"fields"}, source, path)
         tag = struct.get("tag")
@@ -807,6 +842,8 @@ def _schema(value: Json, source: str, path: str, union_tag_field: str | None = N
     child = exact[form]
     if form == "list":
         _schema(child, source, f"{path}.list")
+    elif form == "pickup":
+        _schema(child, source, f"{path}.pickup")
     elif form == "map":
         entry = _fields(child, {"key", "value"}, source, f"{path}.map")
         _schema(entry["key"], source, f"{path}.map.key")
@@ -839,8 +876,11 @@ def _invalid(source: str, path: str, detail: str) -> NoReturn:
 
 _SCALARS = frozenset({"bool", "float", "int", "null", "str"})
 _SCHEMA_FORMS = frozenset(
-    {"asset", "fields", "input", "list", "literal", "map", "opaque", "tuple", "union"}
-)
+    {
+        "asset", "fields", "input", "list", "literal", "map", "media", "opaque", "pickup", "prompt",
+        "tuple", "union",
+    }
+)  # fmt: skip
 #: The asset-bound facts this Runtime consumes; a newer writer's additional bounds are ignored.
 ASSET_BOUND_KEYS = frozenset({"max_bytes", "max_decoded_bytes", "media_types"})
 

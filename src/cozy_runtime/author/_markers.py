@@ -10,10 +10,13 @@ below exist only for facts derivation and measurement cannot know.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Annotated, Literal, TypeAlias, TypeVar
+
+import msgspec
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._media import KIND_MEDIA
@@ -410,3 +413,113 @@ class FileBound:
                 "because a type the runtime cannot decode is not a capability",
                 fields=["media_types"],
             )
+
+
+# ---------------------------------------------------------------- a tool's box
+#
+# Each returns a `msgspec.Meta`, so they stack in one `Annotated` and the binder and `fit` hold
+# a value to the same bounds the box draws. Their facts ride the interface as `extra`.
+
+
+def _meta(extra: Mapping[str, object] | None = None, **constraints: object) -> msgspec.Meta:
+    said = {key: value for key, value in (extra or {}).items() if value not in (None, "")}
+    return msgspec.Meta(**constraints, **({"extra": said} if said else {}))  # type: ignore[arg-type]
+
+
+def _number(value: object, what: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ConformanceError(f"{what} is a finite number", code="tool_marker")
+    return value
+
+
+def Range(min: float, max: float, *, step: float | None = None, unit: str = "") -> msgspec.Meta:
+    """A number's slider: `min` to `max`, on `step`, counting `unit` (`"s"`, `"MP"`)."""
+    low, high = _number(min, "Range min"), _number(max, "Range max")
+    if low >= high or (step is not None and _number(step, "Range step") <= 0):
+        raise ConformanceError(
+            "Range(min, max, step=) needs min < max and a positive step", code="tool_marker"
+        )
+    return _meta({"step": step, "unit": unit}, ge=low, le=high)
+
+
+def Count(min: int = 0, max: int | None = None) -> msgspec.Meta:
+    """How few and how many rows a list group holds."""
+    if (
+        type(min) is not int
+        or min < 0
+        or (max is not None and (type(max) is not int or max < min or max < 1))
+    ):
+        raise ConformanceError(
+            "Count(min, max) takes whole numbers, min <= max", code="tool_marker"
+        )
+    return msgspec.Meta(min_length=min or None, max_length=max)
+
+
+def Total() -> msgspec.Meta:
+    """On a number in a list group: the box shows its sum (H3's beat durations)."""
+    return _meta({"total": True})
+
+
+def Ratios(*allowed: str, min: float | None = None, max: float | None = None) -> msgspec.Meta:
+    """The shapes an `AspectRatio` takes: these ratios, or any from `min` to `max` (W/H)."""
+    for ratio in allowed:
+        sides = re.split(r"\s*[:/xX\u00d7]\s*", ratio) if isinstance(ratio, str) else []
+        try:
+            valid = len(sides) == 2 and all(Fraction(side) > 0 for side in sides)
+        except (ValueError, ZeroDivisionError):
+            valid = False
+        if not valid:
+            raise ConformanceError(f"Ratios takes W:H, not {ratio!r}", code="tool_marker")
+    bounds = {
+        k: _number(v, f"Ratios {k}") for k, v in (("min", min), ("max", max)) if v is not None
+    }
+    if not allowed and not bounds:
+        raise ConformanceError("Ratios() names ratios, or a min and max", code="tool_marker")
+    return _meta({"ratios": {**({"allowed": list(allowed)} if allowed else {}), **bounds}})
+
+
+def Snap(every: int, offset: int = 0, first: int = 0) -> msgspec.Meta:
+    """A pickup's `out_frame`: it lands on `every * k + offset`, from `first` (H3's `17k + 5`)."""
+    if not all(type(n) is int and n >= 0 for n in (every, offset, first)) or every < 1:
+        raise ConformanceError(
+            "Snap(every, offset, first) takes whole frames, every >= 1", code="tool_marker"
+        )
+    return _meta({"snap": {"every": every, "offset": offset, "first": first}})
+
+
+def Spans(rows: str) -> msgspec.Meta:
+    """A video slot whose length is the timeline of the list group `rows`: the box shows both."""
+    if not isinstance(rows, str) or not rows.isidentifier():
+        raise ConformanceError("Spans names a list group of the same struct", code="tool_marker")
+    return _meta({"spans": rows})
+
+
+def Label(text: str, options: Mapping[object, str | tuple[str, str]] | None = None) -> msgspec.Meta:
+    """A field's words on the box, and a choice's own words for its options: `{"768p": "Off"}`, or
+    `{"swap": ("Character swap", "Puts the reference in place of the person")}`, a dropdown that
+    shows each description."""
+    words: dict[str, object] = {}
+    for value, said in (options or {}).items():
+        if isinstance(said, tuple) and len(said) == 2 and all(isinstance(w, str) for w in said):
+            words[str(value)] = {"words": said[0], "description": said[1]}
+        elif isinstance(said, str):
+            words[str(value)] = said
+        else:
+            raise ConformanceError(
+                "Label options give words, or (words, description)", code="tool_marker"
+            )
+    if not isinstance(text, str):
+        raise ConformanceError("Label(text, options) is words", code="tool_marker")
+    return _meta({**({"label": text} if text else {}), **({"options": words} if words else {})})
+
+
+def Placeholder(text: str) -> msgspec.Meta:
+    """What an empty text reads."""
+    if not isinstance(text, str):
+        raise ConformanceError("Placeholder(text) is words", code="tool_marker")
+    return _meta({"placeholder": text})
+
+
+def Advanced() -> msgspec.Meta:
+    """Under More, in the collapsed Advanced section: expert settings such as steps."""
+    return _meta({"advanced": True})

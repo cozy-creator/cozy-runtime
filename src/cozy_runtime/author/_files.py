@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import stat
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from copy import copy
 from dataclasses import dataclass, is_dataclass
 from fractions import Fraction
@@ -26,13 +26,15 @@ from typing import (
     Final,
     Literal,
     Self,
+    cast,
     get_args,
+    get_origin,
     get_type_hints,
     overload,
 )
 
 import msgspec
-from PIL.Image import Image as Image
+from PIL.Image import Image
 
 from cozy_runtime.author._errors import (
     CapabilityError,
@@ -313,6 +315,13 @@ class VideoFile(File):
         return self._reads().stream(self, start=start, end=end, audio=audio, pictures=pictures)
 
 
+class Latents(File):
+    """A file kept on the machine that made it: a result field of this type stays there until a
+    call on another machine needs it. On the wire it is a file like any other."""
+
+    __slots__ = ()
+
+
 @dataclass(frozen=True, slots=True)
 class FileInfo:
     """Readonly declared input metadata; accessing it never reads or decodes bytes."""
@@ -481,6 +490,55 @@ def asset_kinds(annotation: object) -> frozenset[str]:
     return frozenset(kind for argument in get_args(base) for kind in asset_kinds(argument))
 
 
+class References[T](Mapping[str, T]):
+    """A prompt's references by mention, in order of first mention. On the wire each is its value
+    with its `key`, in a list, because a JSON object's key order isn't kept."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items: Mapping[str, T] | Iterable[tuple[str, T]] = ()) -> None:
+        self._items = dict(items)
+
+    def __getitem__(self, key: str) -> T:
+        return self._items[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __repr__(self) -> str:
+        return f"References({self._items!r})"
+
+    def wire(self) -> list[dict[str, Any]]:
+        """`[{"key", "type", "file", "description", ...}]`, its values' fields unencoded."""
+        values = cast(dict[str, msgspec.Struct], self._items)
+        return [
+            {"key": key, "type": value.__struct_config__.tag, **msgspec.structs.asdict(value)}
+            for key, value in values.items()
+        ]
+
+
+def _references(target: object, obj: Any, hook: Callable[[type, Any], Any]) -> References[Any]:
+    """References from their wire list, each value converted to the prompt's media type."""
+    (item,) = get_args(target) or (object,)
+    item = getattr(item, "__bound__", None) or item
+    if not isinstance(obj, list) or not all(
+        isinstance(e, dict) and isinstance(e.get("key"), str) for e in obj
+    ):
+        raise TypeError("a prompt's references are a list of values, each with its `key`")
+    values = [(e["key"], {k: v for k, v in e.items() if k != "key"}) for e in obj]
+    if len({key for key, _ in values}) != len(values):
+        raise ValueError("a prompt names each reference once")
+    try:
+        return References(
+            (key, msgspec.convert(value, type=item, dec_hook=hook)) for key, value in values
+        )
+    except msgspec.ValidationError as exc:
+        raise ValueError(f"a reference {exc}") from None
+
+
 class Tree:
     """A digest-verified MATERIALIZED input tree — the typed job input (jobs.md §1).
 
@@ -564,6 +622,8 @@ def asset_dec_hook(target: type, obj: Any) -> Any:
     Anything else — a mapping carrying `local`, a pre-filled digest — is refused, so the
     request cannot hand itself a hydrated handle or dictate identity-bearing fields.
     """
+    if (get_origin(target) or target) is References:
+        return _references(target, obj, asset_dec_hook)
     if isinstance(target, type) and issubclass(target, (File, Tree)):
         if not isinstance(obj, str):
             raise TypeError(
@@ -705,6 +765,9 @@ def asset_inputs(payload: object) -> list[AssetInput]:
         if isinstance(value, Tree) or id(value) in seen:
             return
         seen.add(id(value))
+        if isinstance(value, References):
+            # By position, as the wire's list spells it: `summary.references.0.file`.
+            value = list(value.values())
         if isinstance(value, (list, tuple)):
             for index, item in enumerate(value):
                 walk_value(item, (*segments, index), index, seen, bound, preparation)

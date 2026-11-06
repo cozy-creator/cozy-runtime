@@ -415,8 +415,9 @@ attempt's one budget; see [Media inputs](docs/files.md).
 
 An image function declares exactly the inputs its model uses, so a box never offers one that does
 nothing, and a caller who sends one gets the usual unknown-field warning. `ImageRequest` holds what
-every model honours (`prompt`, `aspect_ratio`, `megapixels`, `seed`), `PictureRequest` adds
-`pictures`, and `Steps`, `Guidance` and `NegativePrompt` type the knobs a function adds.
+every model honours (`prompt`, `aspect_ratio`, `megapixels`, `seed`); a model that takes pictures
+subclasses it with `prompt: Prompt[Image]` and words its references its own way. `Steps`,
+`Guidance` and `NegativePrompt` type the knobs a function adds.
 
 Image generation uses the shared `ImageRequest` output-canvas limit: aspect ratios must be
 between **1:16 and 16:1**, inclusive. Explicit ratios outside this range are rejected during
@@ -427,14 +428,13 @@ assets merely because they have unusual dimensions; an explicit valid output rat
 such a reference. Packages that preserve a reference canvas directly must still resolve it
 through `ImageRequest.target()` before choosing output dimensions.
 
-A prompt names the files guiding it as `<name>` when a package opts into the author library's
-references (xs-135, xs-139): `pictures: list[Picture]` (or a `Reference` subclass with its own
-media and fields), and `render(prompt, references, label)` puts each mention in the model's own
-words, the label being how the model refers to the Nth reference (`lambda n, picture: f"Picture
-{n}"`). Names match in any case with `_`, `-` and space alike; a mention of no reference stays as
-written with a warning. `PictureRequest.pictures` takes these, and its first picture sets the default
-canvas; `PlacedPicture` adds the `box` a model with layout control reads. Nothing below the author library knows the convention: a package may declare any input
-shape. Attached files are `File`, `ImageFile`, `VideoFile` and `AudioFile`.
+A prompt arrives as its text, as typed, and the references it mentions: `Prompt(text,
+references)`, each reference an `Image`, `Video` or `Audio` of `(file, description)` under the
+mention's own spelling (`"Amy"`, `"Amy.2"`, `"walk@48-120"`), in order of first mention.
+`text.replace(f"<{key}>", ...)` is all a package does with them. `Prompt[Image]` takes pictures
+only. On the wire the references are a list, each value with its `key`. Attached files are
+`File`, `ImageFile`, `VideoFile` and `AudioFile`; a `Latents` result field stays on the machine
+that made it.
 
 Image inputs can separately opt into preparation on a field or an `Files` argument:
 
@@ -512,7 +512,25 @@ machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`, `component
 `emits_media=`) is never memoized (`memoized_writer`); TensorFS derivation replay answers a
 repeat.
 
-**A function is a node.** Its typed inputs are its box and its result is what it makes, on a canvas, in `cozy run` and for an agent alike. `node=Node(label=, show=, hide=, fill=, reserved=, ui=)` on `app.entrypoint` says only what the types can't: its name, inputs to show or never draw, inputs the platform fills from a mention (`{"latents": "video.latents"}`) or a take (`{"continue_from": "take"}`), and the model's own tags in a text. A list of structs with a `name` member is filled from `<name>` mentions in text, each member by its name; any other list of structs is a repeating group. Hints on a field stay in `msgspec.Meta(extra={"min", "max", "step", "options", "label", "placeholder", "total", "unit"})`.
+**A tool is a struct plus a function** ([design/tools.md](https://github.com/cozy-creator/tracker/blob/master/design/tools.md)).
+`@app.tool(label=, named=, reserved=, ui=)` takes `entrypoint`'s options and registers a public
+function whose request struct is a box: `label` names it in the tool list, `named` a new box
+(`shot` makes `shot_1`), `reserved` the model's own tags in its text, and `ui` a component that
+draws it. On a model's own function it is the shortcut. A box's fields are `str`, `Prompt`,
+`bool`, a bounded `int` or `float`, a `Literal` or `Enum`, one top-level `AspectRatio`, a slot
+(`ImageFile`, `VideoFile`, `AudioFile`, or `Image`, `Video`, `Audio` and their subclasses, or a
+list of one), the package's own structs as groups (nested; `| None` for one, a list for rows),
+and `Seed`. `Pickup(take, out_frame)` is filled only by Pick up from here; a package subclasses
+it. Markers are `msgspec.Meta`, so they stack: `Range(min, max, step=, unit=)`, `Count(min, max)`,
+`Total()`, `Ratios(*allowed, min=, max=)`, `Snap(every, offset, first)`, `Spans(rows)`,
+`Label(text, options={value: words | (words, description)})`, `Placeholder(text)` and
+`Advanced()`. Publish refuses, statically: a required field a box can't draw (an unbounded number,
+`list[str]`), two shapes or one in a group, a group holding itself, a result with no file or
+`str` for the box to show, and an imported cozy package `uv.lock` doesn't lock. An optional
+field a box can't draw keeps its default, off the box. The interface carries each tool's `tool`
+record and each entry point's `calls`: the functions it reaches that run as calls, its own
+`@invocable`s and other packages' functions, read at the release it locked, with their models,
+`accelerator` and `gpus`.
 
 Model-producing functions declare `WeightsOutput` slots and use `Context.tensorfs_source`,
 `Context.output`, and `Context.adopt_model`. TensorFS owns the typed `Derivation`, `Target`,

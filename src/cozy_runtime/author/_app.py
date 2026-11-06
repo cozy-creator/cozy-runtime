@@ -25,7 +25,6 @@ from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy, one_memo
-from cozy_runtime.author._node import Node
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
@@ -36,6 +35,7 @@ from cozy_runtime.author._model_defaults import (
     model_prepared_use,
 )
 from cozy_runtime.author._signature import Surface, analyze
+from cozy_runtime.author._tool import Tool
 from cozy_runtime.author._weights import WeightsOutput
 
 P = ParamSpec("P")
@@ -92,8 +92,8 @@ class Registration:
     """Called by this installed package revision's own code only; never a root request."""
     accelerator: bool = True
     """False: CPU only. True (the default): the machine's GPU when it has one."""
-    node: Node | None = None
-    """What its box says that its types can't."""
+    tool: Tool | None = None
+    """`app.tool`'s own options: this function is a box."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
     is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
@@ -116,7 +116,7 @@ class Registration:
                 hidden=self.hidden,
                 child_task=self.child_task,
                 accelerator=self.accelerator,
-                node=self.node,
+                tool=self.tool,
                 invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
@@ -164,12 +164,9 @@ class App:
         *,
         hidden: bool = False,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
-        node: Node | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a public function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
-
-        `node=Node(...)` says what its box on a canvas needs that its types can't, read statically.
 
         `weights=` names the TensorFS model outputs it writes; `publishes=`/`emits_media=`
         declare its `Outputs`. `accelerator=False` runs it on CPU only; otherwise (`True`,
@@ -186,7 +183,60 @@ class App:
         in place of its annotation (the Runtime's own generic functions). `phases=` declares
         immutable component groups in execution order, available to queued preparation before
         handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
-        return self._register(fn, False, hidden=hidden, model_classes=model_classes, node=node, **options)
+        return self._register(fn, False, hidden=hidden, model_classes=model_classes, **options)
+
+    @overload
+    def tool(
+        self,
+        fn: Callable[P, R],
+        /,
+        *,
+        label: str = "",
+        named: str = "",
+        reserved: Sequence[str] = (),
+        ui: str = "",
+        hidden: bool = False,
+        model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        **options: Unpack[RegistrationOptions],
+    ) -> Callable[P, R]: ...
+
+    @overload
+    def tool(
+        self,
+        /,
+        *,
+        label: str = "",
+        named: str = "",
+        reserved: Sequence[str] = (),
+        ui: str = "",
+        hidden: bool = False,
+        model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        **options: Unpack[RegistrationOptions],
+    ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
+
+    def tool(
+        self,
+        fn: Callable[P, R] | None = None,
+        /,
+        *,
+        label: str = "",
+        named: str = "",
+        reserved: Sequence[str] = (),
+        ui: str = "",
+        hidden: bool = False,
+        model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        **options: Unpack[RegistrationOptions],
+    ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
+        """A public function that is a box: its request struct is the box's fields (tools.md).
+        It takes `entrypoint`'s options, and is called like one. `label`: its name in the tool
+        list. `named`: a new box's name, numbered (`shot` makes `shot_1`). `reserved`: the model's
+        own tags in its text, never mentions. `ui`: a component in this package that draws it.
+
+        Placed on a model's own function, it is the shortcut: its arguments are already the box."""
+        box = Tool(label=label, named=named, reserved=reserved, ui=ui)
+        return self._register(
+            fn, False, hidden=hidden, model_classes=model_classes, tool=box, **options
+        )
 
     @overload
     def child_task(
@@ -230,7 +280,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
-        node: Node | None = None,
+        tool: Tool | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         # Immutable CPU metadata; the source reader uses the same closed validator.
         declared_phases = model_phases(phases)
@@ -294,7 +344,7 @@ class App:
                 hidden=hidden,
                 child_task=child_task,
                 accelerator=accelerator is not False,
-                node=node,
+                tool=tool,
             )
             return target
 

@@ -106,7 +106,7 @@ from cozy_runtime.author._executor_requests import (
     Request,
 )
 from cozy_runtime.author._executor_requests import encode as encode_request
-from cozy_runtime.author._files import File, GrantedInput, Tree
+from cozy_runtime.author._files import File, GrantedInput, References, Tree
 from cozy_runtime.author._invoke import (
     Invocation,
     PreparedRequest,
@@ -5133,6 +5133,8 @@ def _serialize_result(
         if isinstance(value, (File, Tree)):
             row = value.row()
             return {"asset_ref": row.pop("ref"), **row}
+        if isinstance(value, References):
+            return value.wire()
         raise TypeError(f"{type(value).__name__} has no wire spelling in a result")
 
     document = json.loads(msgspec.json.encode(envelope.result, enc_hook=hook))

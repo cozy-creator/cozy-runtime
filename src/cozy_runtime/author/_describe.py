@@ -13,19 +13,31 @@ dtype, `class MyGan(Model): generator: nn.Module`) while preventing nothing.
 
 from __future__ import annotations
 
+import enum
+import typing
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, get_args, get_origin
+
+import msgspec
 
 from cozy_runtime.author._decode import require_decoder_dependency
 from cozy_runtime.author._demand import FeatureSpec, feature_specs
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
-from cozy_runtime.author._files import asset_kinds, field_preparation
+from cozy_runtime.author._files import (
+    AudioFile,
+    ImageFile,
+    Latents,
+    VideoFile,
+    asset_kinds,
+    field_preparation,
+)
 from cozy_runtime.author._markers import FileBound
 from cozy_runtime.author._model_defaults import check_model_arguments
 from cozy_runtime.author._prepared_use import PreparedUse
 from cozy_runtime.author._services import UNGRANTABLE
 from cozy_runtime.author._signature import Declaration, Surface, media_kinds
-from cozy_runtime.author._walker import MISSING, is_struct, walk
+from cozy_runtime.author._tool import AspectRatio, Audio, Image, Pickup, Prompt, Seed, Video
+from cozy_runtime.author._walker import MISSING, is_struct, strip, unwrap_optional, walk
 from cozy_runtime.author._weights import MAX_WEIGHTS_OUTPUTS
 
 if TYPE_CHECKING:
@@ -97,6 +109,105 @@ def validate(declared: Declaration) -> None:
         )
     _writes(declared)
     _models(declared)
+    if declared.tool is not None:
+        _box(declared)
+
+
+_FILES = (ImageFile, VideoFile, AudioFile)
+_MEDIA = (Image, Video, Audio)
+
+
+def _box(declared: Declaration) -> None:
+    """A tool's publish checks (design/tools.md): every field the box draws is one of its types,
+    every number is bounded, the shape is the box's own, no group holds itself, and the result
+    has what the box shows. A field the box can't draw keeps its default, off the box; a
+    required one refuses."""
+    shapes = _fields(declared.name, declared.payload_type, (), "", top=True)
+    if len(shapes) > 1:
+        raise ConformanceError(
+            f"{declared.name}: {', '.join(shapes)} are each an AspectRatio; a box has one shape",
+            code="tool_shape",
+        )
+    result = typing.cast(type[msgspec.Struct], declared.result_type)
+    shown = [
+        f.name
+        for f in (msgspec.structs.fields(result) if is_struct(result) else ())
+        if _shows(unwrap_optional(strip(f.type)[0])[0])
+    ]
+    if not shown:
+        raise ConformanceError(
+            f"{declared.name}: its result has nothing a box shows: give it an ImageFile, "
+            "VideoFile or AudioFile field, or a str for a text box",
+            code="tool_result",
+        )
+
+
+def _shows(tp: object) -> bool:
+    return tp is str or (isinstance(tp, type) and issubclass(tp, _FILES))
+
+
+def _fields(
+    name: str, struct: object, groups: tuple[object, ...], prefix: str, *, top: bool
+) -> list[str]:
+    """Check a group's fields, returning the names of its shapes."""
+    shapes: list[str] = []
+    for f in msgspec.structs.fields(struct):  # type: ignore[arg-type]
+        path = prefix + f.name
+        base, markers = strip(f.type)
+        inner, _ = unwrap_optional(base)
+        inner, more = strip(inner)
+        markers = (*markers, *more)
+        listed = get_origin(inner) is list
+        item = strip(get_args(inner)[0])[0] if listed and get_args(inner) else inner
+        why = _undrawable(item, markers, listed)
+        if why == "group":
+            if item in groups or item is struct:
+                raise ConformanceError(
+                    f"{name}.{path}: {getattr(item, '__name__', item)} holds itself; a group "
+                    "can't contain itself",
+                    code="tool_group",
+                )
+            _fields(name, item, (*groups, struct), path + ("[]." if listed else "."), top=False)
+        elif why == "shape":
+            if not top:
+                raise ConformanceError(
+                    f"{name}.{path}: an AspectRatio is the box's own shape, so it goes at the "
+                    "top level, not in a group",
+                    code="tool_shape",
+                )
+            shapes.append(f.name)
+        elif why and f.required:
+            raise ConformanceError(
+                f"{name}.{path}: {why}, so a box can't draw it, and it has no default: give it "
+                "one, or write a tool whose fields a box draws",
+                code="tool_field",
+                fields=[path],
+            )
+    return shapes
+
+
+def _undrawable(tp: object, markers: Sequence[object], listed: bool) -> str:
+    """Why a box can't draw a field of `tp` ("" when it can), or "group" or "shape"."""
+    slot = (
+        isinstance(tp, type) and issubclass(tp, (*_FILES, *_MEDIA)) and not issubclass(tp, Latents)
+    )
+    struct = is_struct(tp) and not slot and not issubclass(tp, (Pickup, Prompt))  # type: ignore[arg-type]
+    if listed:
+        return "" if slot else "group" if struct else "a list of anything but slots or groups"
+    if tp is AspectRatio:
+        return "shape"
+    if struct:
+        return "group"
+    if slot or tp in (str, bool, Seed) or (get_origin(tp) or tp) is Prompt:
+        return ""
+    if (isinstance(tp, type) and issubclass(tp, (Pickup, enum.Enum))) or get_origin(tp) is Literal:
+        return ""
+    if tp in (int, float):
+        meta = [m for m in markers if isinstance(m, msgspec.Meta)]
+        low = any(m.ge is not None or m.gt is not None for m in meta)
+        high = any(m.le is not None or m.lt is not None for m in meta)
+        return "" if low and high else "a number with no Range"
+    return f"{getattr(tp, '__name__', tp)} is none of a box's types"
 
 
 def _writes(declared: Declaration) -> None:

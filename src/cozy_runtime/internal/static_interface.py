@@ -296,12 +296,15 @@ _ENUM_BASES: dict[str, type[enum.Enum]] = {
     "IntEnum": enum.IntEnum,
     "StrEnum": enum.StrEnum,
 }
-#: The shot and upscale contract (xs-139): types, and bases a package's struct extends.
-_VIDEO_STRUCTS = (
-    "Plate",
-    "ContinueFrom",
-    "ShotResult",
-    "UpscaleResult",
+#: Author-surface structs a package's struct may extend: the image interface (cr-219), a box's
+#: media values and its pickup (design/tools.md).
+_AUTHOR_STRUCTS = (
+    "ImageRequest",
+    "ImageResult",
+    "Image",
+    "Video",
+    "Audio",
+    "Pickup",
     "Invocation",
 )
 #: Author-surface classes that translate to themselves in a TYPE position.
@@ -310,6 +313,7 @@ _AUTHOR_TYPES = (
     "ImageFile",
     "AudioFile",
     "VideoFile",
+    "Latents",
     "Tree",
     "ModelArtifact",
     "Context",
@@ -320,12 +324,6 @@ _AUTHOR_TYPES = (
     "QuantizationPlan",
     "SelectionPlan",
     "EncodingRule",
-    "ImageRequest",
-    "ImageResult",
-    "PictureRequest",
-    "Reference",
-    "Picture",
-    "PlacedPicture",
     "Box",
     "Region",
     "AspectRatio",
@@ -333,22 +331,9 @@ _AUTHOR_TYPES = (
     "Steps",
     "Guidance",
     "NegativePrompt",
-    "Follow",
-    "Preset",
-    "Latents",
-    *_VIDEO_STRUCTS,
+    "Prompt",
+    *_AUTHOR_STRUCTS,
     *(cls.__name__ for cls in SERVICES.values()),
-)
-#: Author-surface structs a package's struct may extend: the image interface (cr-219) and the
-#: named references (xs-135, xs-139).
-_AUTHOR_STRUCTS = (
-    "ImageRequest",
-    "PictureRequest",
-    "ImageResult",
-    "Reference",
-    "Picture",
-    "PlacedPicture",
-    *_VIDEO_STRUCTS,
 )
 #: Author-surface callables a folded constant may reach: each validates its own arguments.
 #: `data_values` reads committed JSON through the same function as the imported app.
@@ -362,7 +347,16 @@ _AUTHOR_VALUES = (
     "Bound",
     "Shape",
     "Memoize",
-    "Node",
+    "Prompt",
+    "Range",
+    "Count",
+    "Total",
+    "Ratios",
+    "Snap",
+    "Spans",
+    "Label",
+    "Placeholder",
+    "Advanced",
     "data_values",
     "QuantizationPlan",
     "SelectionPlan",
@@ -416,8 +410,11 @@ _CHILD_TASK_KEYWORDS = frozenset(
         "accelerator",
     }
 )
+#: `app.tool`'s own: the box's (`author.Tool`).
+_TOOL_KEYWORDS = frozenset({"label", "named", "reserved", "ui"})
 _APP_KEYWORDS = {
-    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden", "node"},
+    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden"},
+    "tool": _CHILD_TASK_KEYWORDS | {"hidden"} | _TOOL_KEYWORDS,
     "child_task": _CHILD_TASK_KEYWORDS,
 }
 _INVOCABLE_KEYWORDS = frozenset(
@@ -453,6 +450,10 @@ class Reader:
         self.runtime_root = Path(cozy_runtime.__file__).resolve().parent.parent
         self.installed = _installed_packages(_site_packages(self.runtime_root))
         self.modules: dict[str, Module] = {}
+        #: callee packages read so far: an unpacked wheel's root, and a package's interface
+        self.fetched: dict[str, Path] = {}
+        self.callees: dict[Path, dict[str, Json] | None] = {}
+        self.sites: dict[Path, dict[str, CozyPackage] | None] = {}
         self.structs: dict[tuple[Path, str], type[msgspec.Struct] | None] = {}
         self.enums: dict[tuple[Path, str], type[enum.Enum]] = {}
         self.models: dict[tuple[Path, str], ModelSpec] = {}
@@ -527,6 +528,7 @@ class Reader:
             raise StaticRefusal(str(exc), code="static_module") from exc
         if root is not None:
             self.roots = (*self.roots, root)
+            self.fetched[top] = root
         return root is not None
 
     def application_module(self, name: str) -> Module:
@@ -663,11 +665,13 @@ class Reader:
         """A vocabulary name, refused with its replacement when Runtime 0.36.0 removed it."""
         prefix, _, name = key.partition(".")
         if prefix == "author" and name in author._REMOVED:
+            release, instead = author._REMOVED[name]
             self.refuse(
                 module,
                 node,
-                f"cozy_runtime.author.{name} is gone in Runtime 0.36.0 ({author._REMOVED[name]} "
-                "replaces it): this package was built for Runtime < 0.36; use its newest release",
+                f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): "
+                f"this package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest "
+                "release",
                 "removed_name",
             )
         return Vocab(key)
@@ -1503,8 +1507,8 @@ class Registration:
     #: Local execution advice, not a client callable/schema field. Source identity covers it.
     phases: tuple[tuple[str, ...], ...] = ()
     model_prepared_use: Mapping[str, str] = field(default_factory=dict)
-    #: `node=`.
-    node: author.Node | None = None
+    #: `app.tool`'s own options.
+    tool: author.Tool | None = None
 
     def declaration(self, **found: Any) -> Declaration:
         """Its record, with what its signature declares (`found`)."""
@@ -1519,7 +1523,7 @@ class Registration:
             memoize=self.memoize,
             child_task=self.child_task,
             accelerator=self.accelerator,
-            node=self.node,
+            tool=self.tool,
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
@@ -1559,7 +1563,8 @@ def build(
     pinned = locked.read(project)
     roots = (*environment_roots(environment_python, project=project), *pinned.roots)
     reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels)
-    return _build(reader, application, closures=closures)
+    name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
+    return _build(reader, application, closures=closures, distribution=name, pinned=pinned)
 
 
 def build_builtin(name: str) -> dict[str, Json]:
@@ -1661,7 +1666,9 @@ def build_installed(
         raise StaticRefusal(
             "installed App source is not owned by its wheel", code="static_distribution"
         )
-    return _build(reader, application, installed=True, closures=closures)
+    return _build(
+        reader, application, installed=True, closures=closures, distribution=headers["Name"]
+    )
 
 
 def _build(
@@ -1670,7 +1677,11 @@ def _build(
     *,
     installed: bool = False,
     closures: dict[str, str] | None = None,
+    distribution: str = "",
+    pinned: locked.Locked | None = None,
 ) -> dict[str, Json]:
+    """`distribution`: this package's name, as its own calls name it. `pinned`: its lock, which
+    every cozy package it imports must be in."""
     module_name, _, attribute = application.partition(":")
     entry = reader.application_module(module_name)
     if attribute not in entry.bindings:
@@ -1691,6 +1702,8 @@ def _build(
         )
     declared: dict[str, Declaration] = {}
     modules = reader.reachable(entry)
+    if pinned is not None:
+        _check_locked(reader, modules, pinned)
     recipes, calibrated = _recipes(reader, modules)
     registrations = _registrations(reader, modules, app)
     if recipes:
@@ -1728,9 +1741,251 @@ def _build(
             if closure is not None:
                 closures[f"{registration.module.name}:{registration.fn.name}"] = closure
         declared[registration.name] = row
-    return package_interface.assemble(
+    body = package_interface.assemble(
         application, list(declared.values()), installed=installed, recipes=recipes
     )
+    _calls(reader, registrations, body, distribution)
+    return body
+
+
+# ---------------------------------------------------------------------------- calls
+
+
+@dataclass(frozen=True, slots=True)
+class CozyPackage:
+    """A cozy package as the reader finds its source: a wheel's install, or a source tree."""
+
+    distribution: str
+    application: str
+    #: what its Reader reads as its project, and its own top-level modules (None: its roots')
+    project: Path
+    own: frozenset[str] | None
+
+
+def _calls(
+    reader: Reader, registrations: Sequence[Registration], body: dict[str, Json], distribution: str
+) -> None:
+    """Each entry's `calls`: the functions it reaches, through its own package's helpers, that
+    run as their own calls. Its package's `@invocable`s, and another package's public functions,
+    read from the release this one locked (decision 5). A branch may never take one."""
+    entries = typing.cast(list[dict[str, Json]], body["entrypoints"])
+    docs = {str(doc["name"]): doc for doc in entries}
+    exported = {_export_of(doc): doc for doc in docs.values()}
+    own = {(r.module.name, r.fn.name): r for r in registrations}
+    for registration in registrations:
+        doc = docs.get(registration.name)
+        if doc is None:
+            continue
+        rows: dict[tuple[str, str], dict[str, Json]] = {}
+        for found in _callees(reader, registration, own):
+            key = (found.module.name, found.node.name)
+            if reader._own(key[0].split(".")[0]):
+                callee, package = exported.get(key), distribution
+            else:
+                where = _package_at(reader, found.module.path)
+                interface = None if where is None else _callee_interface(reader, where)
+                callee = None if interface is None else next(
+                    (d for d in typing.cast(list[dict[str, Json]], interface["entrypoints"])
+                     if _export_of(d) == key and not d.get("internal")),
+                    None,
+                )  # fmt: skip
+                package = "" if where is None else where.distribution
+            if callee is not None and callee is not doc:
+                rows[(package, str(callee["name"]))] = _call_row(package, callee)
+        if rows:
+            doc["calls"] = [rows[key] for key in sorted(rows)]
+
+
+def _export_of(doc: Mapping[str, Json]) -> tuple[str, str]:
+    invocable = doc.get("invocable")
+    if not isinstance(invocable, dict):
+        return ("", "")
+    return str(invocable.get("module", "")), str(invocable.get("export", ""))
+
+
+def _call_row(package: str, doc: Mapping[str, Json]) -> dict[str, Json]:
+    """One call: what places it, as Calcifer reads it. `gpus`, the widths it runs at, is absent
+    when it's one: the widths every constructed model shards at."""
+    accelerator = doc.get("accelerator") is not False
+    row: dict[str, Json] = {"package": package, "function": doc["name"], "accelerator": accelerator}
+    models = typing.cast(list[dict[str, Json]], doc.get("models", []))
+    widths = set(range(1, 65))
+    for model in models:
+        if not model.get("weights"):
+            parallel = typing.cast(dict[str, list[int]], model.get("sequence_parallel", {}))
+            widths &= {1, *parallel.get("degrees", [])}
+    if accelerator and len(widths) < 64 and sorted(widths) != [1]:
+        row["gpus"] = typing.cast(Json, sorted(widths))
+    if models:
+        row["models"] = typing.cast(Json, models)
+    return row
+
+
+def _callees(
+    reader: Reader, registration: Registration, own: Mapping[tuple[str, str], Registration]
+) -> list[Definition]:
+    """The functions a registration's body reaches that run as calls: its own package's
+    `@invocable`s, and functions of other cozy packages. Its own package's other functions run
+    inline, so their bodies are read too."""
+    found: list[Definition] = []
+    pending = [(registration.module, registration.fn)]
+    seen: set[tuple[Path, int]] = set()
+    while pending:
+        module, fn = pending.pop()
+        if (module.path, fn.lineno) in seen:
+            continue
+        seen.add((module.path, fn.lineno))
+        for node in (n for stmt in fn.body for n in ast.walk(stmt)):
+            target = _function(reader, module, node)
+            if target is None or target.node is fn:
+                continue
+            top = target.module.name.split(".")[0]
+            registered = own.get((target.module.name, target.node.name))
+            if top == "cozy_runtime":
+                continue
+            if not reader._own(top) or (registered is not None and registered.invocable):
+                found.append(target)
+            else:
+                pending.append((target.module, typing.cast(ast.FunctionDef, target.node)))
+    return found
+
+
+def _function(reader: Reader, module: Module, node: ast.AST) -> Definition | None:
+    """The module-level function a name or attribute in a body names, or None. Only names its
+    module binds are followed: a local is never resolved."""
+    root = node
+    while isinstance(root, ast.Attribute):
+        root = root.value
+    if not (
+        isinstance(node, (ast.Name, ast.Attribute))
+        and isinstance(node.ctx, ast.Load)
+        and isinstance(root, ast.Name)
+        and root.id in module.bindings
+    ):
+        return None
+    try:
+        found = reader.resolve(module, typing.cast(ast.expr, node))
+    except StaticRefusal:
+        return None
+    functions = (ast.FunctionDef, ast.AsyncFunctionDef)
+    return found if isinstance(found, Definition) and isinstance(found.node, functions) else None
+
+
+def _callee_interface(reader: Reader, package: CozyPackage) -> dict[str, Json] | None:
+    """Another package's interface, read from its source as this one locked it; once each."""
+    if package.project in reader.callees:
+        return reader.callees[package.project]
+    reader.callees[package.project] = None  # a package that calls back reads as no calls
+    callee = Reader(package.project, dependency_roots=reader.roots, own=package.own)
+    callee.wheels, callee.fetched, callee.callees = reader.wheels, reader.fetched, reader.callees
+    try:
+        interface = _build(
+            callee, package.application, installed=True, distribution=package.distribution
+        )
+    except StaticRefusal as exc:
+        raise StaticRefusal(
+            f"{package.distribution}, which this package calls, can't be read: {exc}",
+            code=exc.code,
+        ) from exc
+    reader.callees[package.project] = interface
+    return interface
+
+
+def _package_at(reader: Reader, path: Path) -> CozyPackage | None:
+    """The cozy package a module file is in: a wheel install's dist-info beside it, else the
+    source tree whose pyproject names its App."""
+    for directory in path.parents:
+        installed = _installed_apps(reader, directory)
+        if installed is not None:
+            relative = path.relative_to(directory).parts[0].removesuffix(".py")
+            return installed.get(relative)
+        pyproject = directory / "pyproject.toml"
+        if pyproject.is_file():
+            try:
+                project = tomllib.loads(pyproject.read_text()).get("project", {})
+                application = read_application(directory)
+            except (OSError, tomllib.TOMLDecodeError, StaticRefusal):
+                return None
+            name = project.get("name") if isinstance(project, dict) else None
+            if not isinstance(name, str):
+                return None
+            return CozyPackage(name, application, directory, None)
+    return None
+
+
+def _installed_apps(reader: Reader, directory: Path) -> dict[str, CozyPackage] | None:
+    """A site directory's cozy packages by top-level module, from each dist-info declaring an
+    App; None when the directory holds no dist-info."""
+    cached = reader.sites.get(directory)
+    if cached is not None or directory in reader.sites:
+        return cached
+    infos = sorted(directory.glob("*.dist-info"))
+    found: dict[str, CozyPackage] | None = {} if infos else None
+    for info in infos:
+        try:
+            if _APPLICATION_GROUP not in (info / "entry_points.txt").read_text():
+                continue
+            points = configparser.ConfigParser(interpolation=None)
+            points.read_string((info / "entry_points.txt").read_text())
+            entries = list(points.items("cozy.application"))
+            metadata = (info / "METADATA").read_text()
+            headers = email.parser.Parser().parsestr(metadata, headersonly=True)
+            record = (info / "RECORD").read_text().splitlines()
+        except (OSError, configparser.Error):
+            continue
+        tops = frozenset(
+            row.partition(",")[0].split("/")[0].removesuffix(".py")
+            for row in record
+            if row and not row.startswith(("/", "..")) and ".dist-info" not in row.split("/")[0]
+            and row.partition(",")[0].endswith(".py")
+        )  # fmt: skip
+        if len(entries) != 1 or not headers.get("Name") or not tops:
+            continue
+        package = CozyPackage(headers["Name"], entries[0][1].strip(), directory, tops)
+        assert found is not None
+        found.update(dict.fromkeys(tops, package))
+    reader.sites[directory] = found
+    return found
+
+
+def _check_locked(reader: Reader, modules: Sequence[Module], pinned: locked.Locked) -> None:
+    """Every cozy package the package imports is in its uv.lock: a call runs at the release it
+    locked, so an unlocked one has none."""
+    for module in modules:
+        for stmt in _module_scope(module.tree.body):
+            if isinstance(stmt, ast.Import):
+                tops = [alias.name.split(".")[0] for alias in stmt.names]
+            elif isinstance(stmt, ast.ImportFrom) and stmt.level == 0 and stmt.module:
+                tops = [stmt.module.split(".")[0]]
+            else:
+                continue
+            for top in tops:
+                if reader._own(top) or top == "cozy_runtime" or top in pinned.wheels:
+                    continue
+                if any((r / top).is_dir() or (r / f"{top}.py").is_file() for r in pinned.roots):
+                    continue
+                path = _visible(reader, top)
+                package = None if path is None else _package_at(reader, path)
+                if package is not None and (
+                    locked.distribution(package.distribution) not in pinned.names
+                ):
+                    reader.refuse(
+                        module,
+                        stmt,
+                        f"{top} is the cozy package {package.distribution}, which uv.lock doesn't "
+                        "lock: add it to [project].dependencies and run `uv lock`",
+                        "unlocked_dependency",
+                    )
+
+
+def _visible(reader: Reader, top: str) -> Path | None:
+    """Where an imported top-level module's source is, beside this package, if anywhere."""
+    for root in (*reader.roots, *reader.installed.roots):
+        for path in (root / top / "__init__.py", root / f"{top}.py"):
+            if path.is_file():
+                return path
+    installed = reader._installed((top,))
+    return None if installed is None else installed[0]
 
 
 def _recipes(
@@ -2209,7 +2464,7 @@ def _registration(
     on_demand: tuple[str, ...] = ()
     phases: tuple[tuple[str, ...], ...] = ()
     uses: dict[str, str] = {}
-    node: author.Node | None = None
+    box: dict[str, object] = {}
     for keyword in keywords:
         if keyword.arg not in _APP_KEYWORDS[method]:
             reader.refuse(
@@ -2259,10 +2514,8 @@ def _registration(
             uses = model_prepared_use(value)
         elif keyword.arg == "name":
             name = str(value)
-        elif keyword.arg == "node":
-            if not isinstance(value, author.Node):
-                reader.refuse(module, keyword.value, "node= is a Node(...)")
-            node = value
+        elif keyword.arg in _TOOL_KEYWORDS:
+            box[keyword.arg] = value
         elif keyword.arg == "hidden" and value is True:
             hidden = True
         elif keyword.arg == "accelerator":
@@ -2280,6 +2533,12 @@ def _registration(
             weights = tuple(value)
     if hidden:
         return None
+    tool: author.Tool | None = None
+    if method == "tool":
+        try:
+            tool = author.Tool(**box)  # type: ignore[arg-type]
+        except author.ConformanceError as exc:
+            reader.refuse(module, decorator or fn, exc.message, exc.code)
     return Registration(
         function_module,
         fn,
@@ -2297,7 +2556,7 @@ def _registration(
         emits_media=emits_media,
         phases=phases,
         model_prepared_use=uses,
-        node=node,
+        tool=tool,
     )
 
 

@@ -1,8 +1,9 @@
 """What image functions share: the few inputs every model honours, and the types of the rest.
 
 A function declares exactly the inputs its model uses, so what it doesn't have is an unknown field
-(a warning) and a box never offers it. `ImageRequest` is what they all honour, `PictureRequest` adds
-`pictures`, and `Steps`, `Guidance` and `NegativePrompt` type the knobs a function adds. Every
+(a warning) and a box never offers it. `ImageRequest` is what they all honour; a model that takes
+pictures declares `prompt: Prompt[Image]` and words its references its own way. `Steps`,
+`Guidance` and `NegativePrompt` type the knobs a function adds. Every
 optional input is None by default: the model's own recommended value, which its README and
 `--describe` state. A model holds an aspect ratio to its range, at most 1:16 through 16:1 (a `clamp`
 row).
@@ -13,27 +14,19 @@ from __future__ import annotations
 import math
 import re
 import secrets
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Annotated, NoReturn
+from typing import Annotated
 
 import msgspec
 
 from cozy_runtime.author._errors import InvalidRequest
 from cozy_runtime.author._files import ImageFile
-from cozy_runtime.author._markers import FileBound, ImagePreparation, ModelDefault
-from cozy_runtime.author._references import Reference, name_label, render
+from cozy_runtime.author._markers import FileBound, ModelDefault
 from cozy_runtime.author._services import AdjustmentRows, Adjustments
+from cozy_runtime.author._tool import AspectRatio, Seed
 
-AspectRatio = Annotated[
-    str,
-    msgspec.Meta(
-        description="Output aspect ratio: 16:9, 2.39:1, 16/9, 16x9 or 1.85. A model holds it to "
-        "its range, at most 1:16 through 16:1, and says so.",
-    ),
-]
-Seed = Annotated[int, msgspec.Meta(ge=0, le=(1 << 53) - 1)]
 #: A checkpoint's recipe may supply these three; else the model's.
 Steps = ModelDefault[Annotated[int, msgspec.Meta(ge=1)] | None]
 Guidance = ModelDefault[Annotated[float, msgspec.Meta(ge=0)] | None]
@@ -65,21 +58,6 @@ def ratio_of(value: str) -> tuple[int, int]:
 Box = Annotated[
     list[Annotated[float, msgspec.Meta(ge=0.0, le=1.0)]], msgspec.Meta(min_length=4, max_length=4)
 ]
-
-
-class Picture(Reference, kw_only=True):
-    """A picture the request edits or composes, named for the prompt's `<name>` mentions. Read
-    upright and scaled down to 16 MP at most."""
-
-    image: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
-
-
-class PlacedPicture(Picture, kw_only=True):
-    """A picture for a model with layout control."""
-
-    #: Where it goes in the output; None places it nowhere in particular. A placed picture is an
-    #: element, not the canvas: the size is the model's text-to-image default.
-    box: Box | None = None
 
 
 class Region(msgspec.Struct):
@@ -147,7 +125,6 @@ class Sizes:
 class ImageRequest(msgspec.Struct):
     """What every image model honours but one, HunyuanImage 3.0, which picks its own size."""
 
-    #: A function that takes `pictures` reads each `<name>` in it in the model's own words.
     prompt: str
     #: W:H, held to 1:16 through 16:1. None: the first picture's, else the model's default.
     aspect_ratio: AspectRatio | None = None
@@ -159,7 +136,7 @@ class ImageRequest(msgspec.Struct):
     def __post_init__(self) -> None:
         # msgspec calls this while decoding, before admission or any model work.
         if self.aspect_ratio is not None:
-            self.aspect_ratio = ":".join(map(str, ratio_of(self.aspect_ratio)))
+            self.aspect_ratio = AspectRatio(":".join(map(str, ratio_of(self.aspect_ratio))))
 
     def target(
         self, first: tuple[int, int] | None, *, megapixels: float, ratio: str = "1:1"
@@ -194,45 +171,9 @@ class ImageRequest(msgspec.Struct):
         target = self.target(first, megapixels=megapixels, ratio=ratio)
         return sizes.fit(adj, target.ratio, sizes.pixels(adj, target))
 
-    # Runtime 0.36.0 renamed these: a package built for an older Runtime reads them and is refused
-    # with the remedy, never an AttributeError deep in its handler.
-    @property
-    def reference_images(self) -> NoReturn:
-        raise _removed("reference_images")
-
-    @property
-    def reference_boxes(self) -> NoReturn:
-        raise _removed("reference_boxes")
-
-    def rendered(self, adj: Adjustments | AdjustmentRows) -> str:
-        """The prompt as the model reads it. With no pictures a `<name>` mention names nothing, so
-        it stays as written, with a warning."""
-        return render(self.prompt, [], adj=adj, listed="pictures")
-
     def drawn_seed(self) -> int:
         """The seed given, else a fresh one the result reports."""
         return self.seed if self.seed is not None else secrets.randbits(53)
-
-
-class PictureRequest(ImageRequest):
-    #: Images, in order, that the request edits or composes; none is text to image. A package
-    #: states its model's count with `Annotated[list[Picture], msgspec.Meta(max_length=N)]`.
-    pictures: Annotated[list[Picture], msgspec.Meta(max_length=16)] = msgspec.field(
-        default_factory=list
-    )
-
-    def images(self) -> list[ImageFile]:
-        """The pictures' images, in order."""
-        return [picture.image for picture in self.pictures]
-
-    def rendered(
-        self,
-        adj: Adjustments | AdjustmentRows,
-        label: Callable[[int, Picture], str] = name_label,
-    ) -> str:
-        """The prompt as the model reads it: each `<name>` mention in the model's own words for
-        the Nth picture (`label`); a mention of no picture stays as written, with a warning."""
-        return render(self.prompt, self.pictures, label, adj=adj, listed="pictures")
 
 
 class ImageResult(msgspec.Struct):
@@ -250,15 +191,6 @@ class ImageResult(msgspec.Struct):
     prompt: str
 
 
-def _removed(field: str) -> InvalidRequest:
-    return InvalidRequest(
-        f"{field} is gone in Runtime 0.36.0 (pictures replaces it, each with its own box): this "
-        "package was built for Runtime < 0.36; use its newest release",
-        code="removed_name",
-        fields=(field,),
-    )
-
-
 def corners(box: Sequence[float], field: str) -> tuple[float, float, float, float]:
     """A `Box` as its corners, in order whichever way it was written. One with no area refuses."""
     (x0, x1), (y0, y1) = sorted((box[0], box[2])), sorted((box[1], box[3]))
@@ -270,16 +202,6 @@ def corners(box: Sequence[float], field: str) -> tuple[float, float, float, floa
             fields=(field,),
         )
     return x0, y0, x1, y1
-
-
-def placements(
-    pictures: Sequence[PlacedPicture],
-) -> list[tuple[float, float, float, float] | None]:
-    """Each picture's `box` checked (x0 < x1 and y0 < y1), or None where it has none."""
-    return [
-        None if picture.box is None else corners(picture.box, f"pictures.{index}.box")
-        for index, picture in enumerate(pictures)
-    ]
 
 
 def held[T: (int, float)](

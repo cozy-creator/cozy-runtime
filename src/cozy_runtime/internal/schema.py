@@ -27,12 +27,15 @@ from cozy_runtime.author._files import (
     AudioFile,
     File,
     ImageFile,
+    Latents,
+    References,
     Tree,
     VideoFile,
     field_preparation,
 )
 from cozy_runtime.author._markers import FileBound, _ModelDefaultMarker
 from cozy_runtime.author._signature import AssetInputValue
+from cozy_runtime.author._tool import AspectRatio, Audio, Image, Pickup, Prompt, Seed, Video
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional
 from cozy_runtime.internal.canonical import CanonicalError, Json, write
 
@@ -45,11 +48,26 @@ _PRIMITIVES: dict[object, str] = {
 }
 
 _ASSET_KINDS: tuple[tuple[type[File], str], ...] = (
+    (Latents, "latents"),
     (ImageFile, "image"),
     (AudioFile, "audio"),
     (VideoFile, "video"),
     (File, "file"),
 )
+
+
+#: The box's own value types (design/tools.md, "On the wire"), each named by what it is.
+_INPUTS: dict[object, str] = {AspectRatio: "aspect_ratio", Seed: "seed"}
+_MEDIA = (Image, Video, Audio)
+#: A media value's own members; a subclass's others are extras of the version it holds.
+_MEDIA_MEMBERS = frozenset({"file", "description"})
+
+
+def wire(value: object) -> object:
+    """`enc_hook` for an author default: a prompt's references as their wire list."""
+    if isinstance(value, References):
+        return value.wire()
+    raise NotImplementedError(type(value).__name__)
 
 
 def render(annotation: object, *, decoded_bounds: bool = False) -> Json:
@@ -58,40 +76,40 @@ def render(annotation: object, *, decoded_bounds: bool = False) -> Json:
 
 
 def request(payload_type: object) -> Json:
-    """A callable's request: `render`, with each optional top-level field's author default.
-
-    Only the payload's own fields carry one, and the members of a list of rows, which a new row
-    is made of. Other nested types render exactly as `render` does, because readers compare those
-    by value (the Files occurrence record, native operations).
-    """
+    """A callable's request: `render`, with each optional field's author default, at any depth:
+    a box draws its groups' fields, and a new row is made of them. A `Files` parameter's
+    occurrence records are held to their own rendering, which readers compare by value."""
     doc = render(payload_type)
-    base, _ = strip(payload_type)
-    if isinstance(doc, dict) and isinstance(base, type) and is_struct(base):
-        fields = {field.encode_name: field for field in msgspec.structs.fields(base)}
-        for row in typing.cast(list[dict[str, Json]], doc["fields"]):
-            field = fields[typing.cast(str, row["name"])]
-            if row.get("wire") == "optional":
-                row.update(_default(field))
-            _member_defaults(row, field)
+    _defaults(doc, payload_type)
     return doc
 
 
-def _member_defaults(row: dict[str, Json], field: msgspec.structs.FieldInfo) -> None:
-    """A list of rows' members with their defaults: any list of structs but one named by mentions."""
-    listed = strip(field.type)[0]
-    rendered = row["type"]
-    if typing.get_origin(listed) is not list or not isinstance(rendered, dict):
+def _defaults(rendered: Json, annotation: object) -> None:
+    base, _ = strip(annotation)
+    inner, optional = unwrap_optional(base)
+    inner = strip(inner)[0]
+    if not isinstance(rendered, dict):
         return
-    item = strip(typing.get_args(listed)[0])[0]
-    if not (isinstance(item, type) and is_struct(item)) or not isinstance(rendered.get("list"), dict):
+    if optional and isinstance(rendered.get("union"), list):
+        members = [m for m in typing.cast(list[Json], rendered["union"]) if m != "null"]
+        if len(members) == 1:
+            _defaults(members[0], inner)
         return
-    members = {member.encode_name: member for member in msgspec.structs.fields(item)}
-    # A `Files` parameter's occurrence records are held to their own rendering.
-    if "name" in members or item is AssetInputValue:
+    if get_origin(inner) in (list, Sequence) and "list" in rendered:
+        _defaults(rendered["list"], get_args(inner)[0])
         return
-    for member in typing.cast(list[dict[str, Json]], typing.cast(dict[str, Json], rendered["list"])["fields"]):
-        if member.get("wire") == "optional":
-            member.update(_default(members[typing.cast(str, member["name"])]))
+    if not (is_struct(inner) and inner is not AssetInputValue):
+        return
+    rendered = rendered.get("pickup", rendered)
+    if not isinstance(rendered, dict) or not isinstance(rendered.get("fields"), list):
+        return
+    struct = typing.cast(type[msgspec.Struct], inner)
+    fields = {f.encode_name: f for f in msgspec.structs.fields(struct)}
+    for row in typing.cast(list[dict[str, Json]], rendered["fields"]):
+        field = fields[typing.cast(str, row["name"])]
+        if row.get("wire") == "optional":
+            row.update(_default(field))
+        _defaults(row["type"], field.type)
 
 
 def _default(field: msgspec.structs.FieldInfo) -> dict[str, Json]:
@@ -102,8 +120,8 @@ def _default(field: msgspec.structs.FieldInfo) -> dict[str, Json]:
             return {}
         value = field.default_factory()
     try:
-        return {"default": msgspec.json.decode(write(msgspec.to_builtins(value)))}
-    except (TypeError, CanonicalError):
+        return {"default": msgspec.json.decode(write(msgspec.to_builtins(value, enc_hook=wire)))}
+    except (TypeError, NotImplementedError, CanonicalError):
         return {}
 
 
@@ -141,7 +159,19 @@ def _render_bare(
         return {"input": "model"}
     if (name := _PRIMITIVES.get(tp)) is not None:
         return name
+    if (value := _INPUTS.get(tp)) is not None:
+        return {"input": value}
     origin = get_origin(tp)
+    if (origin or tp) is Prompt:
+        return {"prompt": _prompt_kinds(tp)}
+    if isinstance(tp, type) and issubclass(tp, _MEDIA):
+        extras = [f for f in msgspec.structs.fields(tp) if f.encode_name not in _MEDIA_MEMBERS]
+        return {
+            "media": typing.cast(str, tp.__struct_config__.tag),
+            "fields": [_field(f, seen | {tp}, decoded_bounds=decoded_bounds) for f in extras],
+        }
+    if isinstance(tp, type) and issubclass(tp, Pickup):
+        return {"pickup": _struct(tp, seen, decoded_bounds=decoded_bounds)}
     if origin is Literal:
         return _enumeration(tp, get_args(tp))
     if origin is typing.Union or origin is types.UnionType:
@@ -189,6 +219,13 @@ def _render_bare(
     # value type — msgspec still codes it and JSON still carries it. The package interface says
     # "this field exists and Creator cannot introspect it" instead of refusing the package.
     return _opaque(tp)
+
+
+def _prompt_kinds(tp: object) -> list[Json]:
+    """The kinds a prompt's references take: `Prompt[Image]` takes pictures only."""
+    (taken,) = get_args(tp) or (Image | Video | Audio,)
+    members = get_args(taken) or (taken,)
+    return sorted({typing.cast(str, m.__struct_config__.tag) for m in members})
 
 
 def _opaque(tp: object) -> Json:
@@ -324,6 +361,10 @@ def _field(
     # layer that owns both lists (`author/_describe.assert_declaration_shape`).
     name = field.encode_name
     base, markers = strip(field.type)
+    inner, optional = unwrap_optional(base)
+    if optional:
+        # `Annotated[T, Range(...)] | None`: a box's markers on an optional value are the field's.
+        markers = (*markers, *(m for m in strip(inner)[1] if isinstance(m, msgspec.Meta)))
     doc: dict[str, Json] = {
         "name": name,
         "type": _render(base, seen, decoded_bounds=decoded_bounds),

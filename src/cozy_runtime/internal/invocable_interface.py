@@ -14,6 +14,7 @@ import msgspec
 
 from cozy_runtime.author import ConformanceError, Memoize
 from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.author._tool import Prompt
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal import canonical, schema
 
@@ -42,7 +43,7 @@ def from_types(
 
     def walk(annotation: object, path: str) -> None:
         base, _ = strip(annotation)
-        if base is ModelArtifact:
+        if base is ModelArtifact or (get_origin(base) or base) is Prompt:
             return
         origin = get_origin(base)
         if isinstance(base, type) and is_struct(base):
@@ -57,7 +58,7 @@ def from_types(
                 nested = path + "/" + field.encode_name
                 walk(field.type, nested)
                 if field.default is not msgspec.NODEFAULT:
-                    default = msgspec.to_builtins(field.default)
+                    default = msgspec.to_builtins(field.default, enc_hook=schema.wire)
                     canonical.write(default)
                     defaults[nested] = default
                 elif serving and field.default_factory in (list, dict):
@@ -256,6 +257,7 @@ def validate(value: Invocable, request: object, result: object) -> None:
     def walk(node: Any, path: str) -> None:
         nodes[path] = node
         if isinstance(node, dict):
+            node = node.get("pickup", node)
             if "fields" in node:
                 if path not in value.type_names:
                     raise ConformanceError(
@@ -284,7 +286,7 @@ def validate(value: Invocable, request: object, result: object) -> None:
         if (
             not _identifier(name)
             or not isinstance(nodes[path], dict)
-            or not ("fields" in nodes[path] or "literal" in nodes[path])
+            or not ({"fields", "literal", "pickup"} & set(nodes[path]))
         ):
             raise ConformanceError(
                 "invocable type name has no matching schema", code="invocable_interface"

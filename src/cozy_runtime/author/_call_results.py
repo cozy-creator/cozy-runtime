@@ -153,7 +153,8 @@ def decode(
         if (
             isinstance(target, type)
             and issubclass(target, (File, Tree))
-            and isinstance(item, target)
+            and isinstance(item, (File, Tree))
+            and getattr(item, "kind", "tree") == getattr(target, "kind", "tree")
             and any(item is handle for handle in handles.values())
         ):
             return item

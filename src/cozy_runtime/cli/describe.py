@@ -15,6 +15,7 @@ static reader alone.
 
 from __future__ import annotations
 
+import typing
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -79,7 +80,12 @@ def _conformance(project: Path, static: Mapping[str, Json]) -> str:
     for row in recipes:
         declared_plan(row)  # the imported module binds the recipe the source reading found
     imported = package_interface.source_facts(package_interface.build(found))
-    package_interface.compare(static, imported, ("the source reading", "the imported app"))
+    # What a function calls is read from the source of the packages it locked, not imported.
+    read = {**static, "entrypoints": [
+        {key: value for key, value in entry.items() if key != "calls"}
+        for entry in typing.cast(list[dict[str, Json]], static["entrypoints"])
+    ]}  # fmt: skip
+    package_interface.compare(read, imported, ("the source reading", "the imported app"))
     return f"equal: imported {static['application']} ({environment})"
 
 
@@ -113,6 +119,11 @@ def _one_line(doc: Mapping[str, Json]) -> str:
     slots = doc.get("models", [])
     assert isinstance(slots, list)
     parts = [
+        *(
+            [f"tool {doc['tool'].get('label') or doc['name']}"]
+            if isinstance(doc.get("tool"), dict)
+            else []
+        ),
         f"{len(_as_list(request['fields']))} request fields",
         "model artifact result"
         if result.get("input") == "model"
@@ -124,6 +135,11 @@ def _one_line(doc: Mapping[str, Json]) -> str:
         parts.append("writes weights")
     if doc.get("accelerator") is False:
         parts.append("CPU only")
+    if calls := _as_list(doc.get("calls", [])):
+        parts.append(
+            "calls "
+            + ", ".join(f"{c['package']}/{c['function']}" for c in calls if isinstance(c, dict))
+        )
     return " · ".join(parts)
 
 

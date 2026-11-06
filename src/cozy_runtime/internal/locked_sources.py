@@ -46,6 +46,13 @@ class Locked:
     roots: tuple[Path, ...] = ()
     #: Published packages' pure wheels, by the module name their distribution name spells.
     wheels: Mapping[str, LockedWheel] = field(default_factory=dict)
+    #: Every locked distribution, normalized (`distribution`): what the project may import.
+    names: frozenset[str] = frozenset()
+
+
+def distribution(name: str) -> str:
+    """A distribution name as the lock compares it: `Qwen_Image.2` is `qwen-image-2`."""
+    return re.sub(r"[-_.]+", "-", name).lower()
 
 
 def read(project: Path) -> Locked:
@@ -60,9 +67,12 @@ def read(project: Path) -> Locked:
         return Locked()
     roots: list[Path] = []
     wheels: dict[str, LockedWheel] = {}
+    names: set[str] = set()
     for row in packages if isinstance(packages, list) else ():
         if not isinstance(row, dict) or not isinstance(source := row.get("source"), dict):
             continue
+        if isinstance(row.get("name"), str):
+            names.add(distribution(row["name"]))
         where = source.get("directory") or source.get("editable")
         if isinstance(where, str):
             tree = (project / where).resolve()
@@ -73,7 +83,7 @@ def read(project: Path) -> Locked:
             if len(pure) == 1 and str(pure[0].get("hash", "")).startswith("sha256:"):
                 module = re.sub(r"[-_.]+", "_", name).lower()
                 wheels[module] = LockedWheel(name, str(pure[0]["url"]), str(pure[0]["hash"]))
-    return Locked(tuple(dict.fromkeys(r for r in roots if r.is_dir())), wheels)
+    return Locked(tuple(dict.fromkeys(r for r in roots if r.is_dir())), wheels, frozenset(names))
 
 
 def _pure(wheel: dict[str, object]) -> bool:

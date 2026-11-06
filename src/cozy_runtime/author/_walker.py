@@ -12,7 +12,7 @@ import functools
 import operator
 import types
 import typing
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, is_dataclass
 from typing import Annotated, Any, Literal, TypeVar, get_args, get_origin
 
@@ -78,14 +78,19 @@ def is_struct(tp: object) -> bool:
     return isinstance(tp, type) and issubclass(tp, msgspec.Struct)
 
 
-def _annotations(tp: type) -> list[tuple[str, object, object]]:
+def is_record(tp: object) -> bool:
+    """A struct, or a generic one with its parameters (`Prompt[Image]`)."""
+    return is_struct(tp) or is_struct(get_origin(tp))
+
+
+def _annotations(tp: object) -> list[tuple[str, object, object]]:
     """(name, annotation, default) for a struct or dataclass, Annotated preserved."""
-    if is_struct(tp):
+    if is_record(tp):
         return [
             (f.name, f.type, MISSING if f.required else f.default)
             for f in msgspec.structs.fields(typing.cast(type[msgspec.Struct], tp))
         ]
-    if is_dataclass(tp):
+    if isinstance(tp, type) and is_dataclass(tp):
         hints = typing.get_type_hints(tp, include_extras=True)
         return [(n, hints.get(n, object), getattr(tp, n, MISSING)) for n in hints]
     return []
@@ -112,7 +117,7 @@ def _walk_cached(tp: object, path: str, seen: frozenset[type]) -> tuple[Node, ..
 def _walk(tp: object, path: str, _seen: frozenset[type]) -> Iterator[Node]:
     base, _ = strip(tp)
     base, _ = unwrap_optional(base)
-    if not (isinstance(base, type) and (is_struct(base) or is_dataclass(base))):
+    if not (is_record(base) or (isinstance(base, type) and is_dataclass(base))):
         # A container/union can itself be the member handed down by its parent (for example
         # ``list[ImageReference | VideoReference]``). Descend it here instead of requiring
         # every caller to rebuild the same type-tree recursion. This keeps markers,
@@ -122,18 +127,21 @@ def _walk(tp: object, path: str, _seen: frozenset[type]) -> Iterator[Node]:
         return
     if base in _seen:
         return
-    seen = _seen | {base}
+    seen = _seen | {typing.cast(type, base)}
+    owner = typing.cast(type, get_origin(base) or base)
     for name, annotation, default in _annotations(base):
         inner, markers = strip(annotation)
         inner, optional = unwrap_optional(inner)
         child = f"{path}.{name}" if path else name
-        yield Node(child, name, inner, markers, base, default, optional)
+        yield Node(child, name, inner, markers, owner, default, optional)
         for member, suffix in _members(inner):
             yield from walk(member, path=child + suffix, _seen=seen)
 
 
 def _members(tp: object) -> list[tuple[object, str]]:
     """Struct-bearing members of a container/union annotation, with their path suffix."""
+    if isinstance(tp, TypeVar):
+        return _members(tp.__bound__) if tp.__bound__ is not None else []
     origin = get_origin(tp)
     if origin is Literal or (isinstance(tp, type) and issubclass(tp, enum.Enum)):
         return []
@@ -144,7 +152,10 @@ def _members(tp: object) -> list[tuple[object, str]]:
     if origin is dict:
         args = get_args(tp)
         return [(args[1], "{}")] if len(args) == 2 else []
-    if isinstance(tp, type) and (is_struct(tp) or is_dataclass(tp)):
+    if isinstance(origin, type) and issubclass(origin, Mapping):
+        # A prompt's `References[T]`: its values.
+        return [(arg, "{}") for arg in get_args(tp)]
+    if is_record(tp) or (isinstance(tp, type) and is_dataclass(tp)):
         return [(tp, "")]
     return []
 
