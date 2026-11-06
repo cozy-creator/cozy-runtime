@@ -2261,7 +2261,8 @@ class Memory:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
                 if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
-                    request.escaped = vt.escapes_take(self.device.index or 0)
+                    failed = request.failed or sys.exc_info()[0] is not None  # or raised through here
+                    request.escaped = vt.escapes_take(self.device.index or 0, failed=failed)
                     _escaped_warnings(request.escaped)
                 request.sample()
                 request.ended = request.stats()
@@ -2392,6 +2393,8 @@ class Request:
         self.escaped: list[dict[str, Any]] = []
         self.forwards: set[Model] = set()
         self.heads: dict[Model, tuple[set[int], int]] = {}
+        #: the attempt failed (its executor says): a refused allocation in its last pass is learned
+        self.failed = False
         #: refusals that took a pure site finer than its estimate chose: zero in a normal run
         self.finer_splits = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
