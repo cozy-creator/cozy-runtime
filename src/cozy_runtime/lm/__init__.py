@@ -156,16 +156,12 @@ def generate(
     subtracts that much from every token already generated (vLLM's). `temperature` 0 is greedy;
     above it, each token is drawn from the `top_p` nucleus at that temperature, from `seed`: the
     same prompt and seed give the same tokens.
-    `draft(embeds, hidden, position_ids, past_key_values, attention_mask, rotary) -> hidden` is
-    the model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
-    model's head read before it, the state the head reads for the token after; `rotary` is the
-    model's own rotary embedding. It speeds up a
-    batch of one, each token computed as decode computes it. Without one, the head `drafting`
-    names is used.
+    Decoding never drafts: `draft` and `drafting` are unused. A drafted step is never captured,
+    and Qwen3.5-9B's plain graphed decode does the same GPU work a token without the host's
+    launches (2.3-5.5x the tokens a second on an RTX 4090, xs-138).
     `progress(tokens)` is told the tokens decoded so far (a call's longest row), at most every
     `PROGRESS_S`, for display only; one that raises is dropped, with a run warning (a cancel is
     the decode's own check's to act on)."""
-    draft = draft if draft is not None else _DRAFT.get()
     if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
         raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
     sampling = _Sampling(float(temperature), float(top_p), int(seed))
@@ -191,7 +187,7 @@ def generate(
     token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
     try:
         with torch.inference_mode():
-            return engine.generate(request, draft)
+            return engine.generate(request, None)
     finally:
         BYPASS.reset(token)
 
