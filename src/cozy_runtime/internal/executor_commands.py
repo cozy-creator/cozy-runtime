@@ -179,6 +179,14 @@ class CallInterface(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=Tru
     self_call: bool = msgspec.field(default=False, name="self")
 
 
+class DisplayPace(msgspec.Struct, frozen=True, kw_only=True):
+    """The session's GPU drives a display: pause `pause_ms` after each `work_ms` of a call
+    (`internal.pacing`)."""
+
+    work_ms: int = 80
+    pause_ms: int = 16
+
+
 class Construction(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True):
     """One constructed model slot a session will load: its checkpoint and declared components."""
 
@@ -212,6 +220,8 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     gpu_memory_limit: int | None = None
     #: The machine's mode: idle memory yields to foreign programs too. Peers donate either way.
     shared: bool = False
+    #: The session's GPU drives this computer's display (a shared machine): its calls pause for it.
+    display_pace: DisplayPace | None = None
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)
