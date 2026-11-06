@@ -525,8 +525,9 @@ def _capture_contract(model: Any, draft: Any = None) -> str:
         "Qwen3_5MoeForConditionalGeneration",
     }:
         return "no shipped decode capture contract"
+    # A component root's class is Runtime's graphed subclass (`graphs.install`): forward is Draft's.
     if draft is not None and (
-        type(draft) is not Draft
+        type(draft).forward is not Draft.forward
         or not type(draft.mtp.layers[0]).__module__.startswith("transformers.models.")
     ):
         return "no shipped draft head capture contract"
