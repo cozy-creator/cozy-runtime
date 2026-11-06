@@ -778,6 +778,24 @@ class Binding:
     def resident(self) -> bool:
         return not self.unresident()
 
+    def immutable_buffer_ids(self) -> frozenset[int]:
+        """Its model's declared checkpoint-backed buffers, in every block (an idle one's placeholder
+        too): inputs a recording checks by identity and version and never copies (cr-264). Other
+        buffers stay module state, copied and restored."""
+        model, names = self.model, set[str]()
+        for block in model.groups():
+            for key in block.parts:
+                if model.finals is not None:
+                    names.update(model.finals.layout(key) or ())
+                elif set(block.parts[key]) == {"value"}:
+                    names.add(model.source.bound.get(key, key) if model.source.bound else key)
+        return frozenset(
+            id(site.table[site.name])
+            for name in names
+            for site in model.sites.get(name, ())
+            if not site.parameter and site.table[site.name] is not None
+        )
+
     def unresident(self) -> str:
         """Why `resident()` is false: the component and its first non-resident block."""
         name = self.model.component

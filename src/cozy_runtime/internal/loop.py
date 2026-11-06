@@ -238,6 +238,8 @@ class _Program:
     recorded: dict[str, float] | None = None
     #: a step cache's device counters and flags its graphs write (`stepcache._Run.adopt`)
     verdicts: tuple[Any, ...] | None = None
+    #: what its recording's private pool holds reserved for as long as it is kept
+    pool_bytes: int = 0
     closed: bool = False
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
@@ -493,6 +495,7 @@ class Loops:
                 mode=program.mode,
                 stages=program.stages,
                 blocks=program.blocks,
+                pool_bytes=program.pool_bytes,
                 whole_call="recorded on its first call, after its warm steps",
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
             )
@@ -575,6 +578,7 @@ class Loops:
             loop.eager_all(tensors, ctx)
             return
         row.update(
+            pool_bytes=program.pool_bytes,
             whole_call="recorded on this call, its idle recording not run",
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
         )
@@ -649,7 +653,10 @@ class Loops:
         """A kept program: this call's values into its tensors, then natively `before`, every
         step and `after`, and the state back out."""
         assert kept.again is not None  # only whole calls are kept
-        row.update(mode=kept.mode, reused=True, stages=kept.stages, blocks=kept.blocks)
+        row.update(
+            mode=kept.mode, reused=True, stages=kept.stages, blocks=kept.blocks,
+            pool_bytes=kept.pool_bytes,
+        )
         if kept.recorded is not None:
             row["recorded_idle_ms"] = kept.recorded
         try:
@@ -906,7 +913,7 @@ def _record_first(
     stages = len(again.stages)
     return _Program(
         ((first, rest.start, len(rest)),), again, "resident", own, counter, ident, stages, 0,
-        verdicts=verdicts,
+        verdicts=verdicts, pool_bytes=recording._working_bytes or 0,
     ), "", 0
 
 
@@ -985,12 +992,13 @@ def _record(
             mode="resident",
             stages=stages,
             blocks=0,
+            pool_bytes=recording._working_bytes or 0,
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
             after_native=False,
         )
         return _Program(
             ((made, rest.start, len(rest)),), None, "resident", tensors, counter, None, stages, 0,
-            verdicts=verdicts,
+            verdicts=verdicts, pool_bytes=recording._working_bytes or 0,
         ), warmed
     finally:
         if not recording._finished:
@@ -1044,7 +1052,8 @@ def _record_whole(
         _abandon(recording, failure)
         raise failure
     return _Program(
-        (), again, "resident", tensors, counter, ident, len(again.stages), 0, verdicts=verdicts
+        (), again, "resident", tensors, counter, ident, len(again.stages), 0, verdicts=verdicts,
+        pool_bytes=recording._working_bytes or 0,
     )
 
 
@@ -1573,7 +1582,10 @@ def _record_resident(
             bodies: dict[Any, _Graph] = {}
             armed: list[str] = []
             arming = lora.ARMED.set(armed)
-            with _guarded(held, frozenset()):
+            # Weights are checked by identity and version, never copied: a copy of each weight
+            # buffer held SDXL's 2.7 GiB of int8 UNet twice through its recording (cr-264).
+            weights = frozenset(i for binding in bindings for i in binding.immutable_buffer_ids())
+            with _guarded(held, weights):
                 for first, count, label in (run for each in runs for run in each):
                     if label in bodies:
                         continue
