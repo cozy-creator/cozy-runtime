@@ -239,6 +239,8 @@ class _Program:
     recorded: dict[str, float] | None = None
     #: a step cache's device counters and flags its graphs write (`stepcache._Run.adopt`)
     verdicts: tuple[Any, ...] | None = None
+    #: `again` holds `before` and the steps only: its `after` runs eagerly once it has run
+    eager_after: bool = False
     closed: bool = False
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
@@ -319,6 +321,10 @@ class _Site:
     need: dict[Hashable, int] = field(default_factory=dict)
     #: the working peak its first call's warm steps measured (`_PEAKS`), which sizes its pools
     peak: dict[Hashable, int] = field(default_factory=dict)
+    #: and without its `after`, for a program whose `after` has no room beside its weights
+    steps_peak: dict[Hashable, int] = field(default_factory=dict)
+    #: layouts whose whole call has no room for its `after` in the program: it runs eagerly
+    eager_after: set[Hashable] = field(default_factory=set)
 
 
 class Loops:
@@ -418,7 +424,9 @@ class Loops:
                     why = why or _stale(kept, ident, checked=True)
                     if not why:
                         self._reuse(kept, loop, tensors, work, ctx, row)
-                        return
+                if not why:
+                    _eager_after(kept, loop, tensors, row)
+                    return
                 row["dropped"] = why
                 with self._lock:
                     if self._kept.get(site) is kept:
@@ -478,11 +486,13 @@ class Loops:
             if shape is not None:
                 with self._lock:
                     known.peak[shape] = max(peak, known.peak.get(shape, 0))
+                    known.steps_peak[shape] = max(peak, known.steps_peak.get(shape, 0))
             program, refused, began = None, "", time.perf_counter()
             if rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
-                    _reserve(known, shape), opened, loop.after is None or shape in known.after,
+                    _reserve(known, shape), opened,
+                    loop.after is None or (shape in known.after and shape not in known.eager_after),
                 )
                 if need:
                     with self._lock:
@@ -576,9 +586,9 @@ class Loops:
         program, began = None, time.perf_counter()
         try:
             with _laps(row):
-                program = _record_whole(
-                    loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident,
-                    _reserve(known, shape),
+                program = _record_kept(
+                    loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident, known,
+                    shape, self._lock,
                 )
         except Exception as error:
             with self._lock:
@@ -612,7 +622,9 @@ class Loops:
             why = why or _stale(program, job.ident, checked=True)
             if not why:
                 self._reuse(program, loop, tensors, work, ctx, row)
-                return
+        if not why:
+            _eager_after(program, loop, tensors, row)
+            return
         row["dropped"] = why
         loop.eager_all(tensors, ctx)
 
@@ -1049,8 +1061,9 @@ def _record_whole(
     ident: Hashable,
     reserve: int,
 ) -> _Program:
-    """The whole call (`before`, every step and `after`) recorded on `tensors` as one program
-    a later call runs natively; it yields to a command between its parts (`_yield_point`). A
+    """The whole call (`before`, every step and `after`, or without `after` when `post` is None)
+    recorded on `tensors` as one program a later call runs natively; it yields to a command
+    between its parts (`_yield_point`). A
     failed or preempted attempt goes as a refused one does: its frames first, then its stages and
     the tensors of its pool, then its domain (a preemption that closed the domain under its live
     frames crashed the executor)."""
@@ -1077,8 +1090,50 @@ def _record_whole(
         _abandon(recording, failure)
         raise failure
     return _Program(
-        (), again, "resident", tensors, counter, ident, len(again.stages), 0, verdicts=verdicts
+        (), again, "resident", tensors, counter, ident, len(again.stages), 0, verdicts=verdicts,
+        eager_after=loop.after is not None and post is None,
     )
+
+
+def _record_kept(
+    loop: _Loop,
+    tensors: tuple[Any, ...],
+    nwork: int,
+    pre: dict[Model, tuple[str, ...]],
+    body: dict[Model, tuple[str, ...]],
+    post: dict[Model, tuple[str, ...]],
+    ident: Hashable,
+    known: _Site,
+    shape: Hashable,
+    lock: threading.Lock,
+) -> _Program:
+    """`_record_whole`, its `after` left to run eagerly when the pool it needs has no room beside
+    the program's weights: SDXL's 1024px decode at 6 GiB holds 1.3 GiB of full-size activations at
+    any split level, and beside its 4 GiB of weights no pool for it fits the card."""
+    if loop.after is not None and shape not in known.eager_after:
+        try:
+            return _record_whole(
+                loop, tensors, nwork, pre, body, post, ident, _reserve(known, shape)
+            )
+        except torch.OutOfMemoryError as error:
+            if _CAPTURE_MAP in str(error):
+                raise
+        with lock:
+            known.eager_after.add(shape)
+            known.need.pop(shape, None)  # what the pool with `after` lacked
+    return _record_whole(
+        loop, tensors, nwork, pre, body, None if loop.after is not None else post, ident,
+        _reserve(known, shape, after=loop.after is None),
+    )
+
+
+def _eager_after(
+    program: _Program, loop: _Loop, tensors: tuple[Any, ...], row: dict[str, Any]
+) -> None:
+    """A kept program's `after` that has no room in it, eagerly on the call's tensors."""
+    if program.eager_after:
+        row["after"] = "eager: no room for it in the program beside its weights"
+        _once(loop.after, tensors)
 
 
 @dataclass(eq=False)
@@ -1176,9 +1231,9 @@ class _IdleRecording:
                 _lap("resident")
                 _yield_point()
                 shape = self.ident[1]  # type: ignore[index]
-                program = _record_whole(
+                program = _record_kept(
                     self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident,
-                    _reserve(self.known, shape),
+                    self.known, shape, self.loops._lock,
                 )
         finally:
             lora.LOOP.reset(overlays)
@@ -1439,10 +1494,11 @@ def _pool(peak: int, need: int) -> int:
     return max(vt.pool_bytes(peak) if peak else 0, need)
 
 
-def _reserve(known: _Site, shape: Hashable) -> int:
+def _reserve(known: _Site, shape: Hashable, after: bool = True) -> int:
     """`_pool` for a site's recording of `shape` from what its eager parts measured (an `after`
-    records only once it has run: `_record_first`) and what an attempt lacked."""
-    return _pool(known.peak.get(shape, 0), known.need.get(shape, 0))
+    records only once it has run: `_record_first`), with or without its `after`, and what an
+    attempt lacked."""
+    return _pool((known.peak if after else known.steps_peak).get(shape, 0), known.need.get(shape, 0))
 
 
 def _pool_need(recording: _SequenceCapture) -> int:
