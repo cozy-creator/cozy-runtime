@@ -1390,7 +1390,9 @@ class Memory:
         if stats["refused"] is not None:
             reason = {"reason": stats["refused"][:300]}
             rows.append(("weights stream from the store: pinning host memory failed", reason))
-        WARNINGS.extend(row for row in rows if row not in WARNINGS)
+        for row in rows:
+            if row not in WARNINGS:
+                WARNINGS.append(row)
 
     def _switch_overlay(self, block: _Block, overlay: Hashable) -> None:
         """`block`'s page was filled under another overlay than this use wants (a base page for
