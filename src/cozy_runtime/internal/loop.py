@@ -532,10 +532,11 @@ class Loops:
             finished = program.tensors
             program.close()  # before the eager `after` needs its pool
             if not why:
+                kept = _unkept(known, ident, shape, body)  # what `after` evicts, a replay refills
                 _after(loop, finished, scope, known, shape)
                 _back(work, finished)
                 row["eager"] = self._queue(
-                    site, known, loop, tensors, len(work), scope, pre, body, ident, shape
+                    site, known, loop, tensors, len(work), scope, pre, body, ident, shape, kept
                 )
                 return
             row["dropped"] = why
@@ -655,9 +656,11 @@ class Loops:
         body: dict[Model, tuple[str, ...]],
         ident: Hashable,
         shape: Hashable,
+        unkept: str | None = None,
     ) -> str:
-        """Why the call ran eagerly: its whole call queued to record at idle, or why none does."""
-        if why := _unkept(known, ident, shape, body):
+        """Why the call ran eagerly: its whole call queued to record at idle, or why none does;
+        `unkept`, `_unkept` read before an eager `after` that evicts what a replay refills."""
+        if why := _unkept(known, ident, shape, body) if unkept is None else unkept:
             return why
         if lora.LOOP.get():
             return "resident, and its overlays are armed only in its call"
@@ -1266,6 +1269,9 @@ class _IdleRecording:
                     scopes.enter_context(owner._cozy_scope(method, components))
                 _lap("scope")
                 _yield_point()
+                for model in self.scope:  # what an eager `after` evicted, as a replay refills it
+                    if _unresident(model) and (hold := model.hold()) is not None:
+                        scopes.callback(hold.release)
                 if any(_unresident(model, tuple(p)) for model, p in paths.items()):
                     return True  # its weights left the device: the next call queues again
                 _lap("resident")
