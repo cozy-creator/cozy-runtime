@@ -1,0 +1,1 @@
+SageAttention2's kernels launch on torch's current stream instead of the legacy default stream, so a step that reaches them records (H3 on an H200 was invalidated in `per_channel_fp8`, run 33993) and in eager no longer waits on every blocking stream. Its artifact rebuilds once per machine. `_execution`'s wait reads its control block on its own stream.

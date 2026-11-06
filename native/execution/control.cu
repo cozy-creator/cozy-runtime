@@ -651,10 +651,10 @@ static int wait(Repeat *run, unsigned *completed, unsigned *canceled) {
     cudaError_t error;
     if (!run->launched) return cudaErrorInvalidValue;
     error = cudaEventSynchronize(run->done); if (error != cudaSuccess) return error;
-    error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
     Control state;
-    error = cudaMemcpy(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost);
+    error = cudaMemcpyAsync(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost, run->control_stream);
     if (error != cudaSuccess) return error;
+    error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
     run->observed = {state.completed, state.cancel, state.suffix_completed,
                      state.body_entered, state.input_invalid};
     run->input_checked = true;

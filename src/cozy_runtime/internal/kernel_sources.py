@@ -384,6 +384,36 @@ _SAGE_OFFSETS: tuple[tuple[str, str, str], ...] = (
         for x, name in (("q", "query"), ("k", "key"), ("v", "value"), ("o", "output"))
     ),
 )
+#: SageAttention2 launches on the legacy default stream, which a capture refuses (H3 on an H200:
+#: run 33993) and every blocking stream waits on; each launch goes on torch's current stream.
+_ON = ", at::cuda::getCurrentCUDAStream()>>>"
+_SAGE_STREAM: tuple[tuple[str, str, str], ...] = (
+    (
+        "csrc/qattn/attn_utils.cuh",
+        "#include <torch/extension.h>",
+        "#include <ATen/cuda/CUDAContext.h>\n#include <torch/extension.h>",
+    ),
+    ("csrc/fused/fused.cu", "<<<grid, block>>>", "<<<grid, block, 0" + _ON),
+    (_SAGE_SM90, "<<<grid, NUM_THREADS, sMemSize>>>", "<<<grid, NUM_THREADS, sMemSize" + _ON),
+    *(
+        (f"csrc/qattn/{unit}.cu", "<<<grid, block, smem_max>>>", "<<<grid, block, smem_max" + _ON)
+        for unit in (
+            "qk_int_sv_f16_cuda_sm80",
+            *(
+                f"sm89_qk_int8_sv_f8_accum_{variant}"
+                for variant in (
+                    "f16_attn_inst_buf",
+                    "f16_fuse_v_scale_attn_inst_buf",
+                    "f32_attn",
+                    "f32_attn_inst_buf",
+                    "f32_fuse_v_scale_attn",
+                    "f32_fuse_v_scale_attn_inst_buf",
+                    "f32_fuse_v_scale_fuse_v_mean_attn",
+                )
+            ),
+        )
+    ),
+)
 #: Torch 2.14's headers need C++20; every recipe below says so in upstream's own terms.
 RECIPES: dict[str, Recipe] = {
     recipe.name: recipe
@@ -393,7 +423,7 @@ RECIPES: dict[str, Recipe] = {
             "setup",
             ("sageattention",),
             env=_SAGE,  # upstream appends these after its C++17 defaults
-            replace=_SAGE_OFFSETS,
+            replace=(*_SAGE_OFFSETS, *_SAGE_STREAM),
             # _qattn_sm80, _qattn_sm89, _qattn_sm90 (SM90 only) and _fused.
             extensions=4,
             # Upstream builds every kernel family the card can run; build the one
