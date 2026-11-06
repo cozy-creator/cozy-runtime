@@ -4761,8 +4761,9 @@ class Executor:
                     # consumer streams before retiring owners and returning allocator storage.
                     accel.drain(self.torch, self.device_kind)
                     # Every slot's decoders, graphs and holds go before any model leaves: a
-                    # language model's engine retains its weights, so an idle Klein refused
-                    # every offload and a running call beside it ran out of memory (0.36.0 gate).
+                    # language model's engine retains its drafter's weights too, and Klein's
+                    # drafter slot maps before its upsampler, so an idle Klein refused every
+                    # offload and a running call beside it ran out of memory (0.36.0 gate).
                     self._release_programs([child])
                 for member in members:
                     for model in member.backend.models.values():
