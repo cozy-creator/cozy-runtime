@@ -1646,16 +1646,18 @@ class Memory:
         return region
 
     def retained(self, nbytes: int) -> Retained | None:
-        """Where a call keeps `nbytes` of cross-step state: varena regions, each spilled to a
-        pinned host page behind compute, so they fit in the host's room plus the card's. None:
-        they do not, and the call recomputes that state instead."""
-        if self.native is None:
+        """Where a call keeps `nbytes` of cross-step state, decided once before its loop: varena
+        regions. They stay on the card where half the room nothing live holds takes them, with
+        none of it spilled; else each is spilled to a pinned host page behind compute and evicted
+        like a weight. None: the card and host RAM cannot hold them, and the call recomputes that
+        state instead. A TensorFS without retained regions holds the tensors as they are."""
+        if self.native is None or not (hasattr(varena, "Retained") and hasattr(vt, "room")):
             return Retained(None)
-        free, _ = torch.cuda.mem_get_info(self.device)
-        card = free + int(self.native.stats()["reclaimable_bytes"])
+        room = vt.room(self.device.index or 0)
+        card = room["capacity"] - room["working_live"] - room["pinned"]
         if nbytes > self.pages.retained_room() + card:
             return None
-        return Retained(self)
+        return Retained(self, spill=2 * nbytes > card - room["weights_resident"])
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
         if self.cuda:
@@ -2233,8 +2235,8 @@ class Retained:
     written on this stream, resident while there is room, else refilled from its host copy and
     filled ahead of its next use. Where no native core runs the tensors stay as they are."""
 
-    def __init__(self, memory: Memory | None) -> None:
-        self.memory = memory
+    def __init__(self, memory: Memory | None, *, spill: bool = True) -> None:
+        self.memory, self.spill = memory, spill
 
     def put(self, *tensors: Tensor) -> _retained.State:
         memory = self.memory
@@ -2249,7 +2251,7 @@ class Retained:
             views.append((end, tensor.nbytes, tensor.dtype, tensor.shape))
             end = (end + tensor.nbytes + 255) // 256 * 256
         region = varena.Retained(memory.native, memory.pages, end)
-        region.write(memory.stream().cuda_stream, parts)
+        region.write(memory.stream().cuda_stream, parts, spill=self.spill)
         del dense
         return _Kept(memory, region, views)
 
