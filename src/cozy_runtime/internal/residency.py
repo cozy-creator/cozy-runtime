@@ -31,6 +31,7 @@ from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
+from cozy_runtime.author import _retained
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import cache_owners, proctree
@@ -1644,6 +1645,18 @@ class Memory:
         self.regions.add(region)
         return region
 
+    def retained(self, nbytes: int) -> Retained | None:
+        """Where a call keeps `nbytes` of cross-step state: varena regions, each spilled to a
+        pinned host page behind compute, so they fit in the host's room plus the card's. None:
+        they do not, and the call recomputes that state instead."""
+        if self.native is None:
+            return Retained(None)
+        free, _ = torch.cuda.mem_get_info(self.device)
+        card = free + int(self.native.stats()["reclaimable_bytes"])
+        if nbytes > self.pages.retained_room() + card:
+            return None
+        return Retained(self)
+
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
         if self.cuda:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
@@ -2213,6 +2226,55 @@ class Memory:
             "allocator_scope": "process",
             "weights": self.native.stats() if self.native is not None else None,
         }
+
+
+class Retained:
+    """One call's cross-step state (`author.retained`). Each `put` is one `varena.Retained`:
+    written on this stream, resident while there is room, else refilled from its host copy and
+    filled ahead of its next use. Where no native core runs the tensors stay as they are."""
+
+    def __init__(self, memory: Memory | None) -> None:
+        self.memory = memory
+
+    def put(self, *tensors: Tensor) -> _retained.State:
+        memory = self.memory
+        if memory is None or not tensors[0].is_cuda:
+            return _Held(tensors)
+        parts, views, end = [], [], 0
+        for tensor in tensors:
+            tensor = tensor.contiguous()
+            parts.append((end, tensor.data_ptr(), tensor.nbytes))
+            views.append((end, tensor.nbytes, tensor.dtype, tensor.shape))
+            end = (end + tensor.nbytes + 255) // 256 * 256
+        region = varena.Retained(memory.native, memory.pages, end)
+        region.write(memory.stream().cuda_stream, parts)
+        return _Kept(memory, region, views)
+
+
+class _Held:
+    def __init__(self, tensors: tuple[Tensor, ...]) -> None:
+        self.tensors = tensors
+
+    def get(self) -> tuple[Tensor, ...]:
+        return self.tensors
+
+
+class _Kept:
+    def __init__(self, memory: Memory, region: Any, views: list[tuple[int, int, Any, Any]]) -> None:
+        self.memory, self.region, self.views = memory, region, views
+
+    def get(self) -> tuple[Tensor, ...]:
+        raw = self.region.use(self.memory.stream().cuda_stream).tensor
+        return tuple(raw[at:at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
+
+
+class _Retaining:
+    def retained(self, nbytes: int) -> Retained | None:
+        request = _REQUEST.get()
+        return Retained(None) if request is None else request.memory.retained(nbytes)
+
+
+_retained.install(_Retaining())
 
 
 @dataclass(slots=True)
