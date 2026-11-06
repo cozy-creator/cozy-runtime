@@ -1,0 +1,1 @@
+A whole call refused room for its program while its call ran streamed is not tried again until the card's room changes: every call of SDXL at 6 GiB on an RTX 4090 retried a recording that could not fit. The skip is a lookup at the call's entry, against the room epoch its last attempt left.
