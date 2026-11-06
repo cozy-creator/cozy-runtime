@@ -5230,7 +5230,9 @@ def _retire(why: str) -> NoReturn:
 
 def _idle(executor: Executor, order: _Order) -> None:
     """Graphs record and host pages pin off the request path (`graphs.capture_idle`,
-    `Memory.pin_idle`): after a command is answered, while no other is open. One arriving makes
+    `Memory.pin_idle`): after a command is answered, while no other is open and no follower's
+    request is: its request spans rank 0's commands, and an idle period between them registered
+    and read host pages inside the call. One arriving makes
     either yield at its next op or stored part, and its wait goes into its call's record
     (`IDLE_WAITED`). A device fault there retires this process at once (`_retire`)."""
     answered = 0
@@ -5239,7 +5241,11 @@ def _idle(executor: Executor, order: _Order) -> None:
         return executor.host.memory is not None and executor.host.memory.host_pending()
 
     def ready() -> bool:
-        return (bool(graphs.IDLE.jobs) or pins()) and not executor.awaiting_invoke()
+        return (
+            (bool(graphs.IDLE.jobs) or pins())
+            and not executor.awaiting_invoke()
+            and executor.host._rank_request is None
+        )
 
     while not executor.poisoned:  # a faulted device takes no idle work: the machine ends it
         with order.idle(answered, ready) as answered, executor._execution_context():
@@ -5288,7 +5294,7 @@ def serve(executor: Executor, channel: Channel) -> int:
             return int(Exit.ok)
         name = str(frame.get("cmd", ""))
         if executor.rank > 0:  # a follower answers its GPU 0, one command at a time
-            with order.turn(order.ticket(True, name)):  # an idle period follows each, as on GPU 0
+            with order.turn(order.ticket(True, name)):  # an idle period follows, outside a request
                 reply = _reply(executor, frame)
             if reply is None:
                 return _shut(executor, channel)
