@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import math
+import sys
 import threading
 import time
 import warnings
@@ -32,7 +33,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 from cozy_runtime import graphs
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import WARNINGS
-from cozy_runtime.internal import cache_owners
+from cozy_runtime.internal import cache_owners, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -72,8 +73,10 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
-#: Host RAM the host tier leaves free.
-_BAKED_HEADROOM = 8 << 30
+#: Host RAM that host-resident weights leave free: the host tier's pages, a CPU's held blocks.
+_HOST_HEADROOM = 8 << 30
+#: Stored float dtypes a CPU executor serves widened to float32 (`weights._float32`).
+_NARROW = ("F16", "BF16")
 _DTYPES = {
     name: kind
     for name, kind in (
@@ -434,8 +437,16 @@ class _Block:
 
     @property
     def allocation_bytes(self) -> int:
-        if self.model.memory.native is None:
-            return self.nbytes
+        """What a fill of it holds: its native backing, else its stored bytes, a CPU's 16-bit
+        floats widened to float32 (`_widened`)."""
+        memory = self.model.memory
+        if memory.native is None:
+            wide = 2 if memory.device.type == "cpu" else 1
+            return sum(
+                part.nbytes * (wide if part.dtype in _NARROW else 1)
+                for parts in self.parts.values()
+                for part in parts.values()
+            )
         granularity = self.model.memory.granularity
         return sum(
             int(region.allocated_bytes)
@@ -614,6 +625,10 @@ class Model:
                 # hold would pin idle blocks and defeat allocation-time native recovery.
                 return None
             groups = self.groups()
+            if free_only and self.memory.device.type == "cpu":
+                groups = self.memory._fitting(self, groups)
+                if not groups:
+                    return None
             missing = sum(b.allocation_bytes for b in groups if b.data is None and not b.cached())
             if self.memory.device.type == "mps" and missing:
                 missing += min(
@@ -834,6 +849,15 @@ class Binding:
                 request = _REQUEST.get()
                 if request is not None and request.idle and not self.resident():
                     raise StaleBinding("idle graph preparation cannot page weights in")
+                if not replay and memory.device.type == "cpu":
+                    # Bound whole, its blocks cannot stream: past the host's room it refuses as
+                    # an allocation would, and a decode streams them per forward instead.
+                    missing = sum(b.allocation_bytes for b in self.groups if b.data is None)
+                    if missing > memory._free() - _HOST_HEADROOM:
+                        raise torch.OutOfMemoryError(
+                            f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
+                            "weights to bind, more than the host can give"
+                        )
                 self.used = True
                 with torch.cuda.stream(stream) if memory.cuda else nullcontext():
                     if self.last is not None:
@@ -1018,7 +1042,7 @@ class Memory:
                 self.pages = varena.Pages(
                     self.device.index or 0,
                     cap=max(physical_memory(), 0) // 2,
-                    headroom=_BAKED_HEADROOM,
+                    headroom=_HOST_HEADROOM,
                 )
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
@@ -1089,14 +1113,37 @@ class Memory:
                 model.working_phase_keys.remove(key)
 
     def _free(self) -> int:
-        """Free bytes where no native owner answers (MPS, CPU)."""
+        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
+        give this process: on Linux its tightest cgroup's, page cache counted as room (a pod's
+        `memory.max` is a fraction of the host's MemAvailable)."""
         if self.device.type != "mps":
+            if sys.platform == "linux":
+                return max(proctree.available_host_bytes(), 0)
             return host_memory().free_bytes
         figures = allocation(torch, "mps")
         free = int(figures["driver_free_bytes"])
         if self.budget_bytes is not None:
             free = min(free, max(self.budget_bytes - int(figures["reserved_bytes"]), 0))
         return free
+
+    def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
+        """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
+        fit what the host can still give less `_HOST_HEADROOM`, once other models' holds outside
+        the step have gone. The rest stream, read and widened per forward (`_idle`)."""
+        request = _REQUEST.get()
+        step = request.phase(model.name) if request is not None else frozenset({model.name})
+        for other in list(self.models.values()):
+            if other.name not in step and not other.users:
+                for hold in [h for h in other.holds if h.reclaimable]:
+                    hold.shed()
+        room = self._free() - _HOST_HEADROOM
+        held: list[_Block] = []
+        for block in groups:
+            room -= 0 if block.data is not None else block.allocation_bytes
+            if room < 0:
+                break
+            held.append(block)
+        return held
 
     def load(self, module: nn.Module, level: Level | str = Level.GPU) -> Model:
         level = Level(level) if isinstance(level, str) else level
@@ -1452,7 +1499,11 @@ class Memory:
         self._activate_phase(model)
 
     def _idle(self, block: _Block) -> None:
-        if self.native is not None and not (block.count or block.retained or block.loading):
+        """An idle block's views go: a native page stays the core's cache, and a CPU's bytes are
+        copies of the store's, so there only a step's hold keeps them (`_fitting`)."""
+        if (self.native is not None or self.device.type == "cpu") and not (
+            block.count or block.retained or block.loading
+        ):
             # The DLPack storage owner holds the physical pin. A surviving external alias
             # retains it after these references disappear; native eviction waits on the
             # region's last-consumer events (`_used`). record_stream is not that ownership fence.
@@ -1960,6 +2011,8 @@ class Memory:
                     # Binding/decoding and dtype conversion may enqueue more producer work
                     # than the fill alone. Publish their owners and completion together.
                     block.assigned, block.ready = assigned, ready
+                    if self.device.type == "cpu":
+                        block.data = {}  # its widened copies serve: the stored ones go
                 for site, value in block.assigned:
                     block.saved.append((site, site.table[site.name]))
                     site.table[site.name] = value
