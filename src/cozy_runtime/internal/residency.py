@@ -2099,7 +2099,9 @@ class Memory:
                         other.overlap = True
             self.requests.add(request)
         token = _REQUEST.set(request)
-        if self.cuda:
+        # An idle period's work is no request to the core: what it records is a guess, taken from
+        # free room only (pool_reserve), and peers order it among the idle.
+        if self.cuda and not idle:
             varena.request_boundary(self.device.index or 0, begin=True)
         try:
             yield request
@@ -2121,7 +2123,7 @@ class Memory:
                         self.requests.discard(request)
                 finally:
                     _REQUEST.reset(token)
-                    if self.cuda:
+                    if self.cuda and not idle:
                         varena.request_boundary(self.device.index or 0, begin=False)
 
     def stats(self) -> dict[str, Any] | None:
