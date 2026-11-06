@@ -501,7 +501,7 @@ class Loops:
                 )
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
-                    _reserve(known, shape), opened, whole,
+                    _reserve(known, shape, after=whole), opened, whole,
                 )
                 with self._lock:
                     if need:
