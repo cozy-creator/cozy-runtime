@@ -4305,7 +4305,10 @@ class Executor:
             self.host._rank_request = None
             state.context.__exit__(None, None, None)
             own = state.rows[0] if state.rows else None
-            return RankMemory(ok=True, rank=rank, request_id=request_id, memory=own)
+            waited = IDLE_WAITED.pop("", 0.0)
+            return RankMemory(
+                ok=True, rank=rank, request_id=request_id, memory=own, idle_waited_ms=waited
+            )
         return RankMemory(ok=True, rank=rank, request_id=request_id)
 
     def _rank_memory_command(self, command: executor_commands.RequestMemory) -> list[RankMemory]:
@@ -4354,6 +4357,8 @@ class Executor:
                         self.poisoned = "a GPU rank omitted its own request memory record"
                         raise GroupRefusal(self.poisoned, code="group_broken")
                     records.extend(reply.memory for reply in replies if reply.memory is not None)
+                    if waited := sum(reply.idle_waited_ms for reply in replies):
+                        IDLE_WAITED[request_id] = IDLE_WAITED.get(request_id, 0.0) + waited
                 else:
                     # A partial begin still closes the ranks that entered; the original
                     # refusal, not an absent state on another rank, remains the failure.
@@ -5120,7 +5125,8 @@ _IDLE_WORK = "idle work"
 #: blocking (the release gate fails it): idle work yields at its next op with two ops left on
 #: the device, or after one store window's read or one page's registration.
 IDLE_BLOCKING_MS = 100.0
-#: call -> ms its commands waited for idle work, until its run's record takes it (`_Order.turn`)
+#: call -> ms its commands waited for idle work, until its run's record takes it (`_Order.turn`);
+#: on a follower "", until its request's end hands it to rank 0's record
 IDLE_WAITED: dict[str, float] = {}
 
 
@@ -5173,7 +5179,8 @@ class _Order:
                 ),
             )
             waited = self._waited.pop(ticket, 0.0)
-        if waited and (call := _CALL.get()):
+        if waited:  # a follower's commands are in no call: its request's end takes them ("")
+            call = _CALL.get()
             IDLE_WAITED[call] = IDLE_WAITED.get(call, 0.0) + waited
         try:
             yield
