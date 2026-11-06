@@ -6,15 +6,16 @@ A keyed call whose blocks all stay resident gets its whole call (`before`, the s
 recorded and kept for its call site, until a new key replaces it or residency retires it under
 pressure. The first call of a key and layout runs `before` and its steps through each label's
 first eagerly (one step, unlabeled), warming their kernels and naming their blocks, then records
-its whole call on copies of its tensors, one graph per label (every scope model held and loaded,
-its `after` not yet run), and runs the rest natively from them (xs-134 F2): its eager steps cost
-more than the recording on a host-bound CPU (SDXL int8 on an RTX 4090: 173 ms eager against 79
-native, a 0.9 s recording), and the next call runs natively whenever it comes. Refused, its rest
-runs eagerly and the recording is queued for the idle period after it (`_IdleRecording`, xs-134
-F), in the call's component scope; a command that arrives preempts it between its parts (never
-inside package code). A call that finds it unrecorded (no idle period yet, or preempted) records
-the whole call before running any of it and runs it natively from its start: one plan and no eager
-step. No idle period opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so
+its whole call on copies of its tensors, one graph per label (every scope model held and loaded),
+and runs the rest natively from them (xs-134 F2): its eager steps cost more than the recording on
+a host-bound CPU (SDXL int8 on an RTX 4090: 173 ms eager against 79 native, a 0.9 s recording),
+and the next call runs natively whenever it comes. An `after` that has never run is not recorded:
+that call records its rest, runs its `after` eagerly, which chooses its split levels and measures
+the pool, and queues the whole call for the idle period after it (`_IdleRecording`, xs-134 F), in
+the call's component scope, as a refused recording does; a command that arrives preempts it
+between its parts (never inside package code). A call that finds it unrecorded (no idle period
+yet, or preempted) records the whole call before running any of it and runs it natively from its
+start: one plan and no eager step. No idle period opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so
 a call queued behind another never waits for idle work. One that does not fit is not tried again for
 that layout; one whose code cannot run outside its request records only in a call; the calls say
 why. Other component loops stay eager: recording a streamed loop did not repay its recording and
@@ -481,13 +482,41 @@ class Loops:
             if rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
-                    _reserve(known, shape, loop), opened,
+                    _reserve(known, shape), opened, loop.after is None or shape in known.after,
                 )
                 if need:
                     with self._lock:
                         known.need[shape] = need
             elif opened is not None:
                 _abandon(opened)
+        if program is not None and program.again is None:
+            row.update(
+                mode=program.mode,
+                stages=program.stages,
+                blocks=program.blocks,
+                whole_call="its rest recorded; the whole call records once its after has run",
+                capture_ms=round((time.perf_counter() - began) * 1000, 3),
+            )
+            with _pinned(program) as why:
+                if not why:
+                    ((sequence, first, count),) = program.first
+                    try:
+                        _submit(program, sequence, range(first, first + count), loop, ctx, row)
+                    except BaseException:
+                        program.close()
+                        raise
+                    warmed()
+            finished = program.tensors
+            program.close()  # before the eager `after` needs its pool
+            if not why:
+                _after(loop, finished, scope, known, shape)
+                _back(work, finished)
+                row["eager"] = self._queue(
+                    site, known, loop, tensors, len(work), scope, pre, body, ident, shape
+                )
+                return
+            row["dropped"] = why
+            program = None
         if program is not None:
             row.update(
                 mode=program.mode,
@@ -549,7 +578,7 @@ class Loops:
             with _laps(row):
                 program = _record_whole(
                     loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident,
-                    _reserve(known, shape, loop),
+                    _reserve(known, shape),
                 )
         except Exception as error:
             with self._lock:
@@ -862,14 +891,17 @@ def _record_first(
     pre: dict[Model, tuple[str, ...]],
     body: dict[Model, tuple[str, ...]],
     ident: Hashable,
-    reserve: tuple[int, bool],
+    reserve: int,
     recording: _SequenceCapture | None,
+    whole: bool,
 ) -> tuple[_Program | None, str, int]:
-    """A first call's whole program, recorded after its warm steps on copies of its tensors, into
+    """A first call's program, recorded after its warm steps on copies of its tensors, into
     `recording` when one was opened (`_opened`): `first` runs its `rest` (`after` included), `again`
-    a later call. Its
-    `after` has not run, so every scope model is held, and loaded first; (None, why, need) when
-    refused, its attempt gone, `need` the pool its next attempt reserves when room was why."""
+    a later call, every scope model held, and loaded first. Not `whole` (its `after` has never
+    run), only its `rest`, kept by no call: an `after` records at the levels its own eager run
+    chose, into a pool its measure sized (SDXL's first decode recorded whole at 6 GiB needed a
+    2.7 GiB pool beside its weights, and every call ran eagerly). (None, why, need) when refused,
+    its attempt gone, `need` the pool its next attempt reserves when room was why."""
     own = tuple(value.clone() for value in tensors)
     mutable = own[:nwork]
     counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
@@ -877,11 +909,11 @@ def _record_first(
     if recording is None:
         recording = PreparedSequence.record()
         recording.__enter__()
-    recording._reserve, recording._floor = reserve
+    recording._reserve = reserve
     failure: BaseException | None = None
     try:
         with ExitStack() as loading:
-            for model in scope:
+            for model in scope if whole else ():
                 if _unresident(model) and (hold := model.hold()) is not None:
                     loading.callback(hold.release)  # until the recording's bindings hold them
             _lap("load")
@@ -889,9 +921,10 @@ def _record_first(
             _lap("prepare")
             with recording.capturing():
                 parts, verdicts = _record_resident(
-                    recording, loop, rest, own, mutable, counter, body, pre, every, True
+                    recording, loop, rest, own, mutable, counter, body,
+                    pre if whole else None, every if whole else None, whole,
                 )
-            first, again = recording.finish_parts(
+            first, *again = recording.finish_parts(
                 outputs=mutable, parts=[(b, e, 1) for b, e in parts]
             )
         _lap("finish")
@@ -903,10 +936,10 @@ def _record_first(
         if (why := _refusal(failure)) is None:
             raise failure
         return None, why, need
-    stages = len(again.stages)
+    stages = len((again or [first])[0].stages)
     return _Program(
-        ((first, rest.start, len(rest)),), again, "resident", own, counter, ident, stages, 0,
-        verdicts=verdicts,
+        ((first, rest.start, len(rest)),), again[0] if again else None, "resident", own, counter,
+        ident, stages, 0, verdicts=verdicts,
     ), "", 0
 
 
@@ -1014,7 +1047,7 @@ def _record_whole(
     body: dict[Model, tuple[str, ...]],
     post: dict[Model, tuple[str, ...]],
     ident: Hashable,
-    reserve: tuple[int, bool],
+    reserve: int,
 ) -> _Program:
     """The whole call (`before`, every step and `after`) recorded on `tensors` as one program
     a later call runs natively; it yields to a command between its parts (`_yield_point`). A
@@ -1024,7 +1057,7 @@ def _record_whole(
     mutable = tensors[:nwork]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
     recording = PreparedSequence.record()
-    recording._reserve, recording._floor = reserve
+    recording._reserve = reserve
     recording.__enter__()
     failure: BaseException | None = None
     try:
@@ -1145,7 +1178,7 @@ class _IdleRecording:
                 shape = self.ident[1]  # type: ignore[index]
                 program = _record_whole(
                     self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident,
-                    _reserve(self.known, shape, self.loop),
+                    _reserve(self.known, shape),
                 )
         finally:
             lora.LOOP.reset(overlays)
@@ -1249,7 +1282,8 @@ def _pinned(program: _Program) -> Iterator[str]:
         return
     held, why, sequences = ExitStack(), "", program.sequences()
     try:
-        held.enter_context(program.region.pin())
+        if program.region is not None:  # a first call's rest, kept by no call
+            held.enter_context(program.region.pin())
         stream = torch.cuda.current_stream(program.tensors[0].device)
         held.enter_context(graphs.replaying(stream, program.bindings()))
         sequences[0].map_pool()
@@ -1405,14 +1439,10 @@ def _pool(peak: int, need: int) -> int:
     return max(vt.pool_bytes(peak) if peak else 0, need)
 
 
-def _reserve(known: _Site, shape: Hashable, loop: _Loop) -> tuple[int, bool]:
-    """`_pool` for a site's recording of `shape` from what its eager parts measured and what an
-    attempt lacked; and whether the process's peak bounds it too, as its `after` has not run
-    eagerly (`_after`): SDXL's steps measured 0.52 GiB, a pool too small for its decode (34004)."""
-    return (
-        _pool(known.peak.get(shape, 0), known.need.get(shape, 0)),
-        loop.after is not None and shape not in known.after,
-    )
+def _reserve(known: _Site, shape: Hashable) -> int:
+    """`_pool` for a site's recording of `shape` from what its eager parts measured (an `after`
+    records only once it has run: `_record_first`) and what an attempt lacked."""
+    return _pool(known.peak.get(shape, 0), known.need.get(shape, 0))
 
 
 def _pool_need(recording: _SequenceCapture) -> int:
