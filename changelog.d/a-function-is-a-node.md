@@ -1,0 +1,1 @@
+A function is a node: `node=Node(...)` on `app.entrypoint` holds what its box needs beyond its types, and `App.project_adapter`, `Operation`, `Invocation`, `Read`, `Keep`, `Refuse` and the shot field structs go, with `ui=` and `reserved=`, now `Node` keys. `Picture` gains `description`. `Beat`, `ShotRequest` and `UpscaleRequest` go.

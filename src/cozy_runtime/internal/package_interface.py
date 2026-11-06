@@ -171,8 +171,8 @@ class CallableDoc(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True)
     publishes: bool = False
     #: written only as false: CPU only. Absent: the machine's GPU when it has one.
     accelerator: bool | msgspec.UnsetType = msgspec.UNSET
-    #: A project adapter's tags: what its model reads in a text, which stay text.
-    reserved: tuple[str, ...] = ()
+    #: What its box says that its types can't (`author.Node`).
+    node: JsonValue | msgspec.UnsetType = msgspec.UNSET
     weights_outputs: (
         Annotated[tuple[WeightsOutputDeclaration, ...], msgspec.Meta(min_length=1, max_length=16)]
         | msgspec.UnsetType
@@ -285,8 +285,8 @@ def entry(declared: Declaration) -> dict[str, Json]:
         doc["publishes"] = True
     if not declared.accelerator:
         doc["accelerator"] = False
-    if declared.reserved:
-        doc["reserved"] = list(declared.reserved)
+    if declared.node is not None:
+        doc["node"] = declared.node.document()
     if declared.weights_outputs:
         doc["weights_outputs"] = [
             {

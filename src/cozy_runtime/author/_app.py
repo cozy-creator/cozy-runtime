@@ -25,6 +25,7 @@ from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import Bound
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy, one_memo
+from cozy_runtime.author._node import Node
 from cozy_runtime.author._memo import declare as declare_memo
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
@@ -88,8 +89,8 @@ class Registration:
     """Called by this installed package revision's own code only; never a root request."""
     accelerator: bool = True
     """False: CPU only. True (the default): the machine's GPU when it has one."""
-    reserved: tuple[str, ...] = ()
-    """A project adapter's tags: what its model reads in a text, which stay text."""
+    node: Node | None = None
+    """What its box says that its types can't."""
     hidden: bool = False
     """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
     is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
@@ -112,7 +113,7 @@ class Registration:
                 hidden=self.hidden,
                 child_task=self.child_task,
                 accelerator=self.accelerator,
-                reserved=self.reserved,
+                node=self.node,
                 invocable=self.invocable,
                 memoize=self.memoize,
                 model_defaults=self.model_defaults,
@@ -159,9 +160,12 @@ class App:
         *,
         hidden: bool = False,
         model_classes: Mapping[str, type[Model[Any]]] | None = None,
+        node: Node | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a public function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
+
+        `node=Node(...)` says what its box on a canvas needs that its types can't, read statically.
 
         `weights=` names the TensorFS model outputs it writes; `publishes=`/`emits_media=`
         declare its `Outputs`. `accelerator=False` runs it on CPU only; otherwise (`True`,
@@ -178,7 +182,7 @@ class App:
         in place of its annotation (the Runtime's own generic functions). `phases=` declares
         immutable component groups in execution order, available to queued preparation before
         handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
-        return self._register(fn, False, hidden=hidden, model_classes=model_classes, **options)
+        return self._register(fn, False, hidden=hidden, model_classes=model_classes, node=node, **options)
 
     @overload
     def child_task(
@@ -197,24 +201,6 @@ class App:
         another package's call. It takes `entrypoint`'s options except `hidden` and
         `model_classes`."""
         return self._register(fn, True, **options)
-
-    def project_adapter(
-        self, *kinds: str, reserved: Sequence[str] = ()
-    ) -> Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register what turns one project operation producing a file of each `kind`, `image`, `video` or `audio`, into this package's
-        own calls: it reads an `author.Operation`, or a subclass typing `fields`, and answers `list[author.Invocation]`, run in order,
-        or raises `author.Refuse`. A package with no adapter for a kind can't make an asset of it. A public function per kind,
-        `project-adapter-<kind>`, on the CPU, so a machine runs it as it runs any other. `reserved` names the tags its model
-        reads in a text, such as `d` for `<d>`: Calcifer leaves them there as text, read statically with the rest of this."""
-
-        def decorate(target: Callable[P, R]) -> Callable[P, R]:
-            for kind in kinds:
-                self._register(
-                    None, False, name=f"project-adapter-{kind}", accelerator=False, reserved=tuple(reserved)
-                )(target)
-            return target
-
-        return decorate
 
     def _register(
         self,
@@ -238,7 +224,7 @@ class App:
         emits_media: bool = False,
         weights: tuple[WeightsOutput, ...] = (),
         accelerator: bool | None = None,
-        reserved: tuple[str, ...] = (),
+        node: Node | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         # Immutable CPU metadata; the source reader uses the same closed validator.
         declared_phases = model_phases(phases)
@@ -300,7 +286,7 @@ class App:
                 hidden=hidden,
                 child_task=child_task,
                 accelerator=accelerator is not False,
-                reserved=reserved,
+                node=node,
             )
             return target
 
