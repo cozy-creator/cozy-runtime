@@ -507,9 +507,10 @@ def _fused_experts(model: Any, text: Any) -> bool:
     return found
 
 
-def _capture_contract(model: Any) -> str:
-    """Shipped decode contracts, dense and with experts split (`moe`); persistent KV, positions
-    and counters are device buffers.
+def _capture_contract(model: Any, draft: Any = None) -> str:
+    """Shipped decode contracts, dense and with experts split (`moe`), and a drafted step's
+    head (`Draft` around Transformers' decoder layer); persistent KV, positions and counters
+    are device buffers.
 
     The real warm step initializes cache views and advances accepted history once. Capture
     only records the next step's device writes. Custom Python hooks and arbitrary model code
@@ -524,22 +525,28 @@ def _capture_contract(model: Any) -> str:
         "Qwen3_5MoeForConditionalGeneration",
     }:
         return "no shipped decode capture contract"
-    if model.training:
-        return "training state"
-    for sub in model.modules():
-        for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
-            if any(
-                not getattr(h, "__module__", "").startswith("cozy_runtime.internal.residency")
-                for h in hooks.values()
+    if draft is not None and (
+        type(draft) is not Draft
+        or not type(draft.mtp.layers[0]).__module__.startswith("transformers.models.")
+    ):
+        return "no shipped draft head capture contract"
+    for module in (model,) if draft is None else (model, draft):
+        if module.training:
+            return "training state"
+        for sub in module.modules():
+            for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
+                if any(
+                    not getattr(h, "__module__", "").startswith("cozy_runtime.internal.residency")
+                    for h in hooks.values()
+                ):
+                    return "custom Python hooks"
+            own = vars(sub).get("forward")
+            if (
+                own is not None
+                and own is not vars(sub).get("_cozy_execution_forward")
+                and not getattr(own, "__module__", "").startswith("cozy_runtime.")
             ):
-                return "custom Python hooks"
-        own = vars(sub).get("forward")
-        if (
-            own is not None
-            and own is not vars(sub).get("_cozy_execution_forward")
-            and not getattr(own, "__module__", "").startswith("cozy_runtime.")
-        ):
-            return "custom Python forward"
+                return "custom Python forward"
     return ""
 
 
@@ -1863,17 +1870,21 @@ class _Engine:
         for request in {id(row.request): row.request for row in self.slots if row}.values():
             request.tell(partial(tokens, request))
 
+    def _read(self, drafted: bool) -> tuple[Any, ...]:
+        """The modules a step reads: the model, and its head when the step drafts."""
+        return (self.model, self.draft) if drafted else (self.model,)
+
     @contextmanager
-    def _graph_memory(self) -> Iterator[None]:
-        """The weights' lease and the domain's side stream, joined back before the lease can
-        end."""
+    def _graph_memory(self, drafted: bool) -> Iterator[None]:
+        """The leases of the weights the step reads and the domain's side stream, joined back
+        before a lease can end."""
         current = torch.cuda.current_stream()
-        binding = self.addresses.get(id(self.model))
         side = None
         try:
             with ExitStack() as stack:
-                if binding is not None:
-                    stack.enter_context(binding.prepare(current))
+                for module in self._read(drafted):
+                    if (binding := self.addresses.get(id(module))) is not None:
+                        stack.enter_context(binding.prepare(current))
                 self.domain.initialize()
                 side = self.domain.stream
                 side.wait_stream(current)
@@ -1895,14 +1906,12 @@ class _Engine:
             cuda
             and key not in self.graphs
             and key not in self.unrecorded
-            and placed is not None
-            and not placed[0].graph_accounted()
+            and any(m in PLACED and not PLACED[m][0].graph_accounted() for m in self._read(drafted))
         )
         reason = (
             ("driver/context memory is unmeasured" if unaccounted else "")
             or (self.domain.refusal() if cuda and self.domain is not None else "")
-            or _capture_contract(self.model)
-            or ("draft head has no isolated capture contract" if drafted else "")
+            or _capture_contract(self.model, self.draft if drafted else None)
         )
         if cuda and reason:
             if key not in self.unrecorded:
@@ -1914,14 +1923,17 @@ class _Engine:
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             if key not in self.warmed:
                 # This is the caller's actual next token, never an extra speculative warmup.
-                with self._graph_memory():
+                with self._graph_memory(drafted):
                     self._advance(size)
                 self.warmed.add(key)
                 self.eager += 1
                 return
             capturing = time.perf_counter()
             try:
-                with self._graph_memory(), request_path.known("cozy_runtime.lm._Engine._replay"):
+                with (
+                    self._graph_memory(drafted),
+                    request_path.known("cozy_runtime.lm._Engine._replay"),
+                ):
                     if self.pool is None:
                         self.pool = (
                             placed[0].graph_pool(placed[1])
