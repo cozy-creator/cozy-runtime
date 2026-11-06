@@ -29,6 +29,7 @@ direction that matters (`internal` may import `author`; never the reverse).
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Literal, get_args
 
 #: magic-number prefix -> media type. Byte signatures only: no extension, no caller hint,
 #: no libmagic. Each entry is (offset, signature, media type) so container formats whose
@@ -86,7 +87,19 @@ EXTENSIONS: dict[str, str] = {
 #: The media types each ASSET KIND admits. `file` is deliberately open: `File` is the
 #: kind that promises nothing about its contents, and pretending otherwise would make the
 #: three specific kinds mean less.
-_VIDEO: tuple[str, ...] = (
+ImageMedia = Literal[
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/bmp",
+    "image/tiff",
+    "image/webp",
+    "image/avif",
+    "image/jp2",
+    "image/vnd.adobe.photoshop",
+    "image/vnd.microsoft.icon",
+]
+VideoMedia = Literal[
     "video/mp4",
     "video/webm",
     "video/quicktime",
@@ -96,34 +109,24 @@ _VIDEO: tuple[str, ...] = (
     "video/mpeg",
     "video/x-flv",
     "video/x-ms-wmv",
-)
+]
+AudioMedia = Literal[
+    "audio/wav",
+    "audio/ogg",
+    "audio/flac",
+    "audio/mpeg",
+    "audio/m4a",
+    "audio/aac",
+    "audio/opus",
+    "audio/x-aiff",
+    "audio/amr",
+    "audio/x-ape",
+]
+_VIDEO: tuple[str, ...] = get_args(VideoMedia)
 KIND_MEDIA: dict[str, tuple[str, ...]] = {
-    "image": (
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/bmp",
-        "image/tiff",
-        "image/webp",
-        "image/avif",
-        "image/jp2",
-        "image/vnd.adobe.photoshop",
-        "image/vnd.microsoft.icon",
-    ),
+    "image": get_args(ImageMedia),
     "video": (*_VIDEO, "image/gif"),
-    "audio": (
-        "audio/wav",
-        "audio/ogg",
-        "audio/flac",
-        "audio/mpeg",
-        "audio/m4a",
-        "audio/aac",
-        "audio/opus",
-        "audio/x-aiff",
-        "audio/amr",
-        "audio/x-ape",
-        *_VIDEO,
-    ),
+    "audio": (*get_args(AudioMedia), *_VIDEO),
     "file": (),
 }
 

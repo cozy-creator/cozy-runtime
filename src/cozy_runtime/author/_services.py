@@ -25,7 +25,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
-from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
+from typing import Any, Literal, Protocol, TypeVar, cast, overload, runtime_checkable
 
 import cozy_runtime.author._codec as _codec
 import cozy_runtime.author._stalls as _stalls
@@ -49,6 +49,7 @@ from cozy_runtime.author._files import (
     VideoFile,
     digest_bytes,
 )
+from cozy_runtime.author._media import AudioMedia, ImageMedia, VideoMedia, normalize, slot_kind
 from cozy_runtime.author._observations import DEVICE, Attribution, EventRing, Observation, Scalar
 
 T = TypeVar("T")
@@ -59,6 +60,13 @@ RowKind = Literal["adjusted", "clamp", "warn"]
 
 #: Default per-attempt output ceiling. The deployment lowers it; nothing raises it in code.
 MAX_OUTPUT_BYTES = 256 * 1024 * 1024
+
+#: A saved file's handle by its media type's family.
+_SAVED: dict[str, type[File]] = {"image": ImageFile, "video": VideoFile, "audio": AudioFile}
+
+
+def _saved(media_type: str) -> type[File]:
+    return _SAVED.get(slot_kind(_SAVED, normalize(media_type)) or "", File)
 
 
 @dataclass(frozen=True, slots=True)
@@ -931,8 +939,18 @@ class Outputs(_Bound):
         self._attempt.emit("log", "undeclared output dropped", "warn", output=output, reason=why)
         warnings.warn(f"publish to undeclared output {output!r} dropped: {why}", stacklevel=3)
 
+    @overload
+    def save_bytes(self, data: bytes, *, media_type: VideoMedia) -> VideoFile: ...
+    @overload
+    def save_bytes(self, data: bytes, *, media_type: ImageMedia) -> ImageFile: ...
+    @overload
+    def save_bytes(self, data: bytes, *, media_type: AudioMedia) -> AudioFile: ...
+    @overload
+    def save_bytes(self, data: bytes, *, media_type: str) -> File: ...
     def save_bytes(self, data: bytes, *, media_type: str) -> File:
-        return self._register(data, File, media_type)
+        """Encoded bytes as they are, typed by their media type: `video/mp4` is a `VideoFile`,
+        which a `VideoFile` result field takes; a type no kind reads is a `File`."""
+        return self._register(data, _saved(media_type), media_type)
 
     def save_tree(self, path: Path | str) -> Tree:
         """Snapshot regular files now; native retention commits after the handler returns."""
@@ -982,9 +1000,18 @@ class Outputs(_Bound):
             shutil.rmtree(target)
             raise
 
+    @overload
+    def save_file(self, path: Path | str, *, media_type: VideoMedia) -> VideoFile: ...
+    @overload
+    def save_file(self, path: Path | str, *, media_type: ImageMedia) -> ImageFile: ...
+    @overload
+    def save_file(self, path: Path | str, *, media_type: AudioMedia) -> AudioFile: ...
+    @overload
+    def save_file(self, path: Path | str, *, media_type: str = ...) -> File: ...
     def save_file(self, path: Path | str, *, media_type: str = "application/octet-stream") -> File:
-        """Copies immediately: a MUTABLE AUTHOR PATH is never retained (§3.4 step 2)."""
-        return self._register(Path(path).read_bytes(), File, media_type)
+        """Copies immediately: a MUTABLE AUTHOR PATH is never retained (§3.4 step 2). Typed as
+        `save_bytes` types its bytes."""
+        return self._register(Path(path).read_bytes(), _saved(media_type), media_type)
 
     def temporary_file(self, suffix: str = "") -> Path:
         """A bounded attempt-spool target for encoders that need a filesystem path.
