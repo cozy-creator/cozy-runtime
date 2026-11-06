@@ -15,12 +15,14 @@ the pool, and queues the whole call for the idle period after it (`_IdleRecordin
 the call's component scope, as a refused recording does; a command that arrives preempts it
 between its parts (never inside package code). A call that finds it unrecorded (no idle period
 yet, or preempted) records the whole call before running any of it and runs it natively from its
-start: one plan and no eager step. No idle period opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so
-a call queued behind another never waits for idle work. One that does not fit is not tried again for
-that layout; one whose code cannot run outside its request records only in a call; the calls say
-why. Other component loops stay eager: recording a streamed loop did not repay its recording and
-extra reads (Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s;
-MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
+start: one plan and no eager step. No idle period opens between a call's prepare and its invoke
+(`Executor.awaiting_invoke`), so a call queued behind another never waits for idle work. A pool
+holds what the eager parts held live; one with `after` that has no room beside the program's
+weights leaves `after` to run eagerly after each replay (`_record_kept`). One that does not fit is
+not tried again for that layout; one whose code cannot run outside its request records only in a
+call; the calls say why. Other component loops stay eager: recording a streamed loop did not
+repay its recording and extra reads (Qwen-Image int8 1 MP on an RTX 3070: eager 45.6-46.8 s,
+native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs 737 s).
 
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
 `before` and the same warm steps run eagerly, then the rest natively. A refusal before submission
@@ -107,6 +109,8 @@ _REFUSED = (
 _UNRECORDABLE = "the step cannot be recorded"
 #: varena's refusal of a capture's allocation outside its pool, which no capacity would serve
 _CAPTURE_MAP = "a CUDA capture cannot map"
+#: a refusal for room (`_refusal`)
+_CAPACITY = "preparation exceeded capacity"
 #: a refusal that says nothing against the graph (`_refusal`)
 _WAITING = "capture waits for kernel readiness"
 #: request id -> its loops, for the run record (`execution.loops`)
@@ -186,7 +190,7 @@ def _refusal(error: BaseException) -> str | None:
     if isinstance(error, Building):
         return f"{_WAITING}: {error}"
     if isinstance(error, torch.OutOfMemoryError):  # varena's CaptureMap says itself why
-        return str(error) if _CAPTURE_MAP in str(error) else f"preparation exceeded capacity: {error}"
+        return str(error) if _CAPTURE_MAP in str(error) else f"{_CAPACITY}: {error}"
     if isinstance(error, ResidencyError):
         return f"residency refused preparation: {error}"
     code = getattr(error, "error_code", None)
@@ -491,14 +495,19 @@ class Loops:
                     known.steps_peak[shape] = max(peak, known.steps_peak.get(shape, 0))
             program, refused, began = None, "", time.perf_counter()
             if rest and not _unkept(known, ident, shape, body):
+                whole = loop.after is None or (
+                    shape in known.after and shape not in known.eager_after
+                )
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
-                    _reserve(known, shape), opened,
-                    loop.after is None or (shape in known.after and shape not in known.eager_after),
+                    _reserve(known, shape), opened, whole,
                 )
-                if need:
-                    with self._lock:
+                with self._lock:
+                    if need:
                         known.need[shape] = need
+                    if whole and loop.after is not None and refused.startswith(_CAPACITY):
+                        known.eager_after.add(shape)  # as `_record_kept` learns it at idle
+                        known.need.pop(shape, None)
             elif opened is not None:
                 _abandon(opened)
         if program is not None and program.again is None:
@@ -1521,7 +1530,8 @@ def _reserve(known: _Site, shape: Hashable, after: bool = True) -> int:
     """`_pool` for a site's recording of `shape` from what its eager parts measured (an `after`
     records only once it has run: `_record_first`), with or without its `after`, and what an
     attempt lacked."""
-    return _pool((known.peak if after else known.steps_peak).get(shape, 0), known.need.get(shape, 0))
+    peak = (known.peak if after else known.steps_peak).get(shape, 0)
+    return _pool(peak, known.need.get(shape, 0))
 
 
 def _pool_need(recording: _SequenceCapture) -> int:
