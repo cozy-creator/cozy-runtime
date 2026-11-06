@@ -175,6 +175,8 @@ class _Program:
     region: Any = None
     #: its idle recording's parts and total (ms)
     recorded: dict[str, float] | None = None
+    #: what its recording's private pool holds reserved for as long as it is kept
+    pool_bytes: int = 0
 
     def sequences(self) -> tuple[PreparedSequence, ...]:
         rest = () if self.again is None else (self.again,)
@@ -368,6 +370,7 @@ class Loops:
                 mode=program.mode,
                 stages=program.stages,
                 blocks=program.blocks,
+                pool_bytes=program.pool_bytes,
                 whole_call="recorded on its first call, after its first step",
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
             )
@@ -440,6 +443,7 @@ class Loops:
             loop.eager_all(tensors, ctx)
             return
         row.update(
+            pool_bytes=program.pool_bytes,
             whole_call="recorded on this call, its idle recording not run",
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
         )
@@ -508,7 +512,13 @@ class Loops:
         """A kept program: this call's values into its tensors, then natively `before`, every
         step and `after`, and the state back out."""
         assert kept.again is not None  # only whole calls are kept
-        row.update(mode=kept.mode, reused=True, stages=kept.stages, blocks=kept.blocks)
+        row.update(
+            mode=kept.mode,
+            reused=True,
+            stages=kept.stages,
+            blocks=kept.blocks,
+            pool_bytes=kept.pool_bytes,
+        )
         if kept.recorded is not None:
             row["recorded_idle_ms"] = kept.recorded
         try:
@@ -663,7 +673,9 @@ def _record_first(
     rest, again = made  # one pass of equal steps (no phases): its rest, then the reuse program
     begin, end, _, first, count = parts[0]
     first_part = ((rest, first, count),)
-    return _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks), ""
+    program = _Program(first_part, again, "resident", own, counter, ident, end - begin, blocks)
+    program.pool_bytes = _pool_bytes(recording)
+    return program, ""
 
 
 def _record(
@@ -723,14 +735,17 @@ def _record(
             for sequence, (_, _, _, start, count) in zip(made, parts, strict=True)
         )
         stages = sum(end - begin for begin, end, _, _, _ in parts)
+        program = _Program(first, None, "resident", tensors, counter, None, stages, blocks)
+        program.pool_bytes = _pool_bytes(recording)
         row.update(
             mode="resident",
             stages=stages,
             blocks=blocks,
+            pool_bytes=program.pool_bytes,
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
             after_native=False,
         )
-        return _Program(first, None, "resident", tensors, counter, None, stages, blocks)
+        return program
     finally:
         if not recording._finished:
             recording.close()
@@ -801,7 +816,9 @@ def _record_whole(
         recording.close()
         raise failure
     stages = parts[0][1] - parts[0][0]
-    return _Program((), again, "resident", tensors, counter, ident, stages, blocks)
+    program = _Program((), again, "resident", tensors, counter, ident, stages, blocks)
+    program.pool_bytes = _pool_bytes(recording)
+    return program
 
 
 @dataclass(eq=False)
@@ -1041,6 +1058,17 @@ def _unresident(model: Model, paths: tuple[str, ...] = ("",)) -> str:
         binding.close()
 
 
+def _pool_bytes(recording: _SequenceCapture) -> int:
+    """What the recording's private pool holds reserved: its program's memory beside the eager
+    allocator's (cr-264)."""
+    pool = tuple(recording._pool.handle)
+    return sum(
+        int(segment["total_size"])
+        for segment in torch.cuda.memory_snapshot(pool, include_traces=False)
+        if tuple(segment.get("segment_pool_id", ())) == pool
+    )
+
+
 def _drop_stages(recording: _SequenceCapture) -> None:
     """A refused attempt's stages go; the recording's domain and pool stay for the next."""
     with recording._submission:
@@ -1168,7 +1196,10 @@ def _record_resident(
             owners = tuple(bindings)
             landed = LANDED[0]
             graphs_: list[tuple[_Graph, int, int]] = []
-            with _guarded(held, frozenset()):
+            # Weights are checked by identity and version, never copied: a copy of each weight
+            # buffer held SDXL's 2.7 GiB of int8 UNet twice through its recording (cr-264).
+            weights = frozenset(i for binding in bindings for i in binding.immutable_buffer_ids())
+            with _guarded(held, weights):
                 for first, count, phase in runs:
 
                     def advance(phase: Any = phase) -> None:
