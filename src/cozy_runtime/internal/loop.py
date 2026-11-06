@@ -131,8 +131,9 @@ def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], lab
 _NONE = object()
 #: The recording call's parts, for the run record (`parts_ms`): [{part: ms}, last lap's clock].
 _LAPS: ContextVar[list[Any] | None] = ContextVar("cozy_loop_laps", default=None)
-#: Set around eager steps whose working peak sizes a recording's pool (`_pool`): the bytes each
-#: eager pass held live at most (`_held`), never a load's.
+#: Set around eager steps whose working peak sizes a recording's pool (`_pool`): each eager pass's
+#: own peak as the core measured it (its phase's `peak_bytes`), an `after`'s as it held it live
+#: (`_held`), never a load's.
 _PEAKS: ContextVar[list[int] | None] = ContextVar("cozy_loop_peaks", default=None)
 #: The call's row, for its GPU timeline (`_mark`).
 _ROW: ContextVar[dict[str, Any] | None] = ContextVar("cozy_loop_row", default=None)
@@ -765,7 +766,6 @@ class _Loop:
         )
         configuration = _phase_configuration(self, indices, tensors, models) if measured else None
         epoch = LANDED[0]
-        held = _held(tensors[0])
         with working_phase.observing(
             tensors[0].device.index if measured else None, mode,
             request.working_phases if measured and request is not None else None,
@@ -811,9 +811,9 @@ class _Loop:
                     if epoch != LANDED[0] or actual != configuration:
                         observation.invalidate("dispatch_changed")
                     observation.complete()
-        if (peaks := _PEAKS.get()) is not None:
-            peaks.append(held())
         if observation is not None and observation.result is not None:
+            if (peaks := _PEAKS.get()) is not None:
+                peaks.append(int(observation.result.get("peak_bytes") or 0))
             key = observation.result.get("key")
             if settle and key is not None and request is not None and models:
                 request.memory.remember_working_phase(str(key), models)
@@ -836,10 +836,11 @@ def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
 
 
 def _held(tensor: Any) -> Callable[[], int]:
-    """From now, the working bytes held live at most (the request's peak kept first): a recording
-    reuses a freed block at once on its stream, so this sizes its pool, not the pass's charged
-    peak, which counts frees its stream had not run yet (SDXL's uncapped eager decode charged 3.5
-    GiB and held 2.4: a 4.4 GiB pool)."""
+    """From now, the working bytes held live at most (the request's peak kept first). An `after`
+    is one long pass whose frees the host issues far ahead of the device, and its charged peak
+    counts them: SDXL's uncapped decode charged 3.5 GiB and held 2.4, a 4.4 GiB pool where 3.0
+    records. The steps' charged peak is what their capture needs: live alone fell 87 MB short
+    (run 37755)."""
     request = _REQUEST.get()
     if _PEAKS.get() is None or request is None or not tensor.is_cuda:
         return lambda: 0
@@ -851,7 +852,7 @@ def _held(tensor: Any) -> Callable[[], int]:
 
 @contextmanager
 def _measuring() -> Iterator[list[int]]:
-    """The working bytes each eager part run inside held live at most (`_PEAKS`, `_held`)."""
+    """The working peak of each eager part run inside (`_PEAKS`)."""
     peaks: list[int] = []
     token = _PEAKS.set(peaks)
     try:
@@ -860,17 +861,24 @@ def _measuring() -> Iterator[list[int]]:
         _PEAKS.reset(token)
 
 
-def _part(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
+def _part(
+    fn: Callable[..., object] | None, tensors: tuple[Any, ...], live: bool = False
+) -> None:
     """`before` or `after` eagerly; under `_measuring`, one observed pass whose working peak joins
     the steps' (its components' passes are its own: an enclosing observation owns the device)."""
     request, peaks = _REQUEST.get(), _PEAKS.get()
     if fn is None or request is None or peaks is None or not tensors[0].is_cuda:
         _once(fn, tensors)
         return
-    held = _held(tensors[0])
-    with working_phase.observing(tensors[0].device.index, "eager", request.working_phases):
+    held = _held(tensors[0]) if live else None
+    with working_phase.observing(
+        tensors[0].device.index, "eager", request.working_phases
+    ) as observation:
         fn(*tensors)
-    peaks.append(held())
+    if held is not None:
+        peaks.append(held())
+    elif observation is not None and observation.result is not None:
+        peaks.append(int(observation.result.get("peak_bytes") or 0))
 
 
 @contextmanager
@@ -1304,7 +1312,7 @@ def _after(
         _once(loop.after, tensors)
         return
     with _entering() as seen, _measuring() as peaks:
-        _part(loop.after, tensors)
+        _part(loop.after, tensors, live=True)
     known.after[shape] = _used(seen, scope)
     known.peak[shape] = max([known.peak.get(shape, 0), *peaks])
 
