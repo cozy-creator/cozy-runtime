@@ -432,7 +432,8 @@ A prompt arrives as its text, as typed, and the references it mentions: `Prompt(
 references)`, each reference an `Image`, `Video` or `Audio` of `(file, description)` under the
 mention's own spelling (`"Amy"`, `"Amy.2"`, `"walk@48-120"`), in order of first mention.
 `text.replace(f"<{key}>", ...)` is all a package does with them. `Prompt[Image]` takes pictures
-only. On the wire the references are a list, each value with its `key`. Attached files are
+only. An `Image`'s file reads upright and scaled down to 16 MP at most, as `Picture`'s did;
+`file.read(max_pixels=)` reads it smaller. On the wire the references are a list, each value with its `key`. Attached files are
 `File`, `ImageFile`, `VideoFile` and `AudioFile`; a `Latents` result field stays on the machine
 that made it.
 

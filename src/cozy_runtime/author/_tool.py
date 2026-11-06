@@ -18,6 +18,7 @@ import msgspec
 
 from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._files import AudioFile, ImageFile, References, VideoFile
+from cozy_runtime.author._markers import ImagePreparation
 
 #: W:H as written: `16:9`, `2.39:1`, `16/9`. The box's own shape; `Ratios` names what it takes.
 AspectRatio = NewType("AspectRatio", str)
@@ -39,9 +40,10 @@ def spoken(text: str) -> str:
 
 
 class Image(msgspec.Struct, frozen=True, kw_only=True, tag_field="type", tag="image"):
-    """A picture and what it shows: what a mention of a picture box gives, or a slot holds."""
+    """A picture and what it shows: what a mention of a picture box gives, or a slot holds. Read
+    upright and scaled down to 16 MP at most; `file.read(max_pixels=)` reads it smaller."""
 
-    file: ImageFile
+    file: Annotated[ImageFile, ImagePreparation(max_pixels=16 << 20)]
     description: str = ""
 
 

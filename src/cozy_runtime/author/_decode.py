@@ -1206,14 +1206,21 @@ class MediaReads:
         """Bytes every `read()` of this attempt has retained so far."""
         return self._budget.used
 
-    def image(self, asset: ImageFile, mode: Literal["RGB", "RGBA"]) -> PILImage:
+    def image(
+        self, asset: ImageFile, mode: Literal["RGB", "RGBA"], max_pixels: int | None = None
+    ) -> PILImage:
         if mode not in ("RGB", "RGBA"):
             raise ValueError(f"image mode must be RGB or RGBA, not {mode!r}")
+        preparation = _image_preparation(asset)
+        if max_pixels is not None:
+            held = min(max_pixels, (preparation and preparation.max_pixels) or max_pixels)
+            edge = preparation.max_edge if preparation else None
+            preparation = ImagePreparation(max_edge=edge, max_pixels=held)
         budget, path = self._start(asset, "ImageFile.read")
         try:
             with _reading(asset, None, "image"):
                 prepared = _image(
-                    path, self._limits, budget, _image_preparation(asset), mode, self._noting(asset)
+                    path, self._limits, budget, preparation, mode, self._noting(asset)
                 )
         except BaseException:
             budget.refund()

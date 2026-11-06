@@ -245,10 +245,11 @@ class ImageFile(File):
 
     kind: ClassVar[str] = "image"
 
-    def read(self, *, mode: Literal["RGB", "RGBA"] = "RGB") -> Image:
-        """Display-oriented pixels with the field's `ImagePreparation` applied. RGB
-        composites transparency over white; RGBA keeps it (opaque sources read alpha 255)."""
-        return self._reads().image(self, mode)
+    def read(self, *, mode: Literal["RGB", "RGBA"] = "RGB", max_pixels: int | None = None) -> Image:
+        """Display-oriented pixels with the field's `ImagePreparation` applied, and scaled down
+        to `max_pixels` too when given. RGB composites transparency over white; RGBA keeps it
+        (opaque sources read alpha 255)."""
+        return self._reads().image(self, mode, max_pixels)
 
     def probe(self) -> ImageProbe:
         """Header geometry: `width`/`height` are what `read()` returns. No decode."""
