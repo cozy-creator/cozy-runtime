@@ -152,6 +152,7 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_ready,
     model_config,
+    pacing,
     package_interface,
     prebuilt,
     prepare_diagnostics,
@@ -1649,6 +1650,13 @@ class Executor:
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
         self.host.gpu_memory_limit = command.gpu_memory_limit
+        if pacing.configure(pace := command.display_pace) and pace is not None:
+            print(
+                f"[pacing] the GPU drives a display: a call pauses {pace.pause_ms} ms "
+                f"after each {pace.work_ms} ms",
+                file=sys.stderr,
+                flush=True,
+            )
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
         if self.started or (command.import_only and self.imported):

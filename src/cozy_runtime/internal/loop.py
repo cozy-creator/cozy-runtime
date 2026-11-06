@@ -53,7 +53,7 @@ from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import CapabilityError, Fault, OutputError, fault, unwind
 from cozy_runtime.author._model import _LOCAL_SCOPES, LANDED, PLACED, Building
 from cozy_runtime.graphs import domain
-from cozy_runtime.internal import accel, kernel_ready
+from cozy_runtime.internal import accel, kernel_ready, pacing
 from cozy_runtime.internal.accel import ResidencyError
 from cozy_runtime.internal.prepared import (
     PreparedRepeat,
@@ -559,6 +559,8 @@ class _Loop:
             if (cached := stepcache._RUN.get()) is not None:
                 cached.begin(i - self.steps.start)
             _call(self.step, index, tensors, self.phase(i))
+            if index.is_cuda:
+                pacing.tick()
             if self.on_step is not None:
                 self.on_step(i)
         if index.is_cuda:

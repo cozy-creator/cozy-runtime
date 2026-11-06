@@ -35,7 +35,7 @@ from cozy_runtime import graphs
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._errors import CapabilityError, Fault, fault
 from cozy_runtime.author._model import WARNINGS
-from cozy_runtime.internal import proctree
+from cozy_runtime.internal import pacing, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -4376,6 +4376,7 @@ def _hooks(model: Model) -> None:
         sub = model.module.get_submodule(block.path)
 
         def entered(*_: object, b: _Block = block) -> None:
+            pacing.tick()
             if (cut := CUTTER.get()) is not None:
                 cut.enter(b)
             if (seen := ENTERED.get()) is not None:
