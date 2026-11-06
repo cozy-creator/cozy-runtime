@@ -212,6 +212,8 @@ class Start(Command, frozen=True, kw_only=True, tag="start"):
     gpu_memory_limit: int | None = None
     #: The machine's mode: idle memory yields to foreign programs too. Peers donate either way.
     shared: bool = False
+    #: Bytes each GPU of the session keeps free at the driver for the display it drives (0: none).
+    display_reserve: tuple[int, ...] = ()
 
     def release(self) -> Release:
         return Release(application=self.application, package_interface=self.package_interface)

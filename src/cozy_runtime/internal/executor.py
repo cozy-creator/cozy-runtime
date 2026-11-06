@@ -835,6 +835,8 @@ class Executor:
         #: HOST ONLY: Start's development GPU memory limit, the memory's budget (the card's size)
         self.gpu_memory_limit: int | None = None
         self.shared = False
+        #: Bytes each GPU of the session keeps free at the driver for the display it drives.
+        self.display_reserve: tuple[int, ...] = ()
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -1112,7 +1114,7 @@ class Executor:
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
+        memory = Memory.open(device, budget_bytes=self._card_budget(torch, device), shared=host.shared)
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         PLANS[:] = [host.serving]
@@ -1187,6 +1189,26 @@ class Executor:
             # Each on-demand model's build, made inside the stage that first read it.
             "on_demand": {p: _construction_record(f) for p, f in self.built_on_demand.items()},
         }
+
+    def _card_budget(self, torch: Any, device: Any) -> int | None:
+        """The development `gpu_memory_limit`, and on a GPU that drives a display its total less
+        what the display keeps free at the driver: varena's limit counts the driver's charge."""
+        host = self.host
+        index = device.index or 0
+        reserve = host.display_reserve[index] if device.type == "cuda" and index < len(host.display_reserve) else 0
+        if not reserve:
+            return host.gpu_memory_limit
+        _, total = torch.cuda.mem_get_info(device)
+        cap = max(int(total) - int(reserve), 0)
+        budget = cap if host.gpu_memory_limit is None else min(host.gpu_memory_limit, cap)
+        print(
+            f"[memory] GPU {index} drives a display: this executor uses at most "
+            f"{budget / (1 << 30):.2f} of its {int(total) / (1 << 30):.2f} GiB, keeping "
+            f"{reserve >> 20} MiB free for it",
+            file=sys.stderr,
+            flush=True,
+        )
+        return budget
 
     def _rank_device(self, torch: Any) -> Any:
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
@@ -1674,6 +1696,8 @@ class Executor:
         degree = command.sequence_parallel_degree or 1
         self.host.shared = command.shared
         self.host.gpu_memory_limit = command.gpu_memory_limit
+        # An older machine's Start names none.
+        self.host.display_reserve = tuple(getattr(command, "display_reserve", ()) or ())
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
