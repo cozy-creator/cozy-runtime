@@ -621,7 +621,7 @@ class Loops:
                     body,
                     known.after.get(shape, {}),
                     ident,
-                    _LOCAL_SCOPES.get()[-1],
+                    _LOCAL_SCOPES.get(),
                     tuple(model.wanted_identity() for model in scope),
                 )
                 known.pending[ident] = job
@@ -1068,8 +1068,8 @@ class _IdleRecording:
     body: dict[Model, tuple[str, ...]]
     post: dict[Model, tuple[str, ...]]
     ident: Hashable
-    #: the call's innermost component scope: its owner, method and components
-    entry: tuple[Any, str, tuple[str, ...]]
+    #: the call's component scopes, outermost first: each one's owner, method and components
+    entry: tuple[tuple[Any, str, tuple[str, ...]], ...]
     identities: tuple[Any, ...]
     #: it yields between its parts (`_yield_point`), not per torch op (`graphs.IDLE`): under the
     #: per-op mode an RTX 4090's SDXL plan took 3.4 s instead of 0.46 s
@@ -1123,7 +1123,6 @@ class _IdleRecording:
         for used in (self.body, self.pre, self.post):
             for model, entered in used.items():
                 paths.setdefault(model, set()).update(entered)
-        owner, method, components = self.entry
         began = time.perf_counter()
         parts: dict[str, float] = {}
         laps = _LAPS.set([parts, began])
@@ -1131,12 +1130,12 @@ class _IdleRecording:
         bypass = graphs.BYPASS.set(True)
         overlays = lora.LOOP.set(frozenset())  # its call armed none, and nothing may arm one now
         try:
-            with (
-                torch.cuda.device(self.tensors[0].device),
-                torch.inference_mode(False),
-                torch.no_grad(),
-                owner._cozy_scope(method, components),
-            ):
+            with ExitStack() as scopes:
+                scopes.enter_context(torch.cuda.device(self.tensors[0].device))
+                scopes.enter_context(torch.inference_mode(False))
+                scopes.enter_context(torch.no_grad())
+                for owner, method, components in self.entry:
+                    scopes.enter_context(owner._cozy_scope(method, components))
                 _lap("scope")
                 _yield_point()
                 if any(_unresident(model, tuple(p)) for model, p in paths.items()):
@@ -1152,8 +1151,9 @@ class _IdleRecording:
             lora.LOOP.reset(overlays)
             graphs.BYPASS.reset(bypass)
             graphs._SETTLING.reset(settling)
-            if (placement := getattr(owner, "_cozy_residency", None)) is not None:
-                placement.release()  # the scope's holds, as a request's end gives them back
+            placements = (getattr(owner, "_cozy_residency", None) for owner, _, _ in self.entry)
+            for placement in {id(p): p for p in placements if p is not None}.values():
+                placement.release()  # the scopes' holds, as a request's end gives them back
             _lap("release")
             _LAPS.reset(laps)
         program.recorded = parts | {"total": round((time.perf_counter() - began) * 1000, 1)}
@@ -1274,16 +1274,15 @@ def _layouts(tensors: tuple[Any, ...]) -> tuple[Any, ...]:
 
 
 def _phase_models() -> tuple[Model, ...]:
-    scopes = _LOCAL_SCOPES.get()
-    if not scopes:
-        return ()
-    owner, _, components = scopes[-1]
-    placement: Any = owner._cozy_residency
-    return tuple(
-        placement.models[name]
-        for name in components
-        if placement is not None and name in placement.models
-    )
+    """The placed components of every component scope the call is in, outermost first: a step
+    reads any it holds (H3 Turbo's DiT, in its base's scope, and its overlay's factors)."""
+    models: dict[int, Model] = {}
+    for owner, _, components in _LOCAL_SCOPES.get():
+        placement: Any = owner._cozy_residency
+        for name in components:
+            if placement is not None and name in placement.models:
+                models.setdefault(id(placement.models[name]), placement.models[name])
+    return tuple(models.values())
 
 
 def _phase_configuration(
@@ -1351,16 +1350,9 @@ def _eligible(
         return (), "several ranks"
     if len(steps) < 2:
         return (), "one step"
-    scopes = _LOCAL_SCOPES.get()
-    if not scopes:
+    if not _LOCAL_SCOPES.get():
         return (), ""  # no components: tensor work only
-    owner, _, components = scopes[-1]
-    placement: Any = owner._cozy_residency
-    models = tuple(
-        placement.models[name]
-        for name in components
-        if placement is not None and name in placement.models
-    )
+    models = _phase_models()
     if not models:
         return (), "the scope's components are not placed on this device"
     return models, ""
