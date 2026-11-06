@@ -97,6 +97,18 @@ class _ProgressScope:
 
 
 _progress_scope: ContextVar[_ProgressScope | None] = ContextVar("cozy_progress_scope", default=None)
+#: The `Telemetry.stage` running on this thread, and its name.
+_stage: ContextVar[tuple[Telemetry, str] | None] = ContextVar("cozy_stage", default=None)
+
+
+def stage_progress() -> Callable[[float], None] | None:
+    """The running stage's `progress(fraction)`, for Runtime work inside it that is told no
+    progress of its own (a decode): a stage of minutes with none reads as stalled."""
+    current = _stage.get()
+    if current is None:
+        return None
+    telemetry, name = current
+    return lambda fraction: telemetry.progress(fraction, stage=name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1453,11 +1465,14 @@ class Telemetry(_Bound):
             )
         start = work_clock()
         succeeded = False
+        token = _stage.set((self, stage)) if stage is not None else None
         try:
             yield
             settle()
             succeeded = True
         finally:
+            if token is not None:
+                _stage.reset(token)
             elapsed = (work_clock() - start) * 1000
             if stage is not None:
                 self._attempt.attribution.stage(stage, elapsed)
