@@ -2307,14 +2307,17 @@ class Retained:
         memory = self.memory
         if memory is None or not tensors[0].is_cuda:
             return _Held(tensors)
+        # Each contiguous copy lives until the write is on the stream: freed in the loop, a
+        # transposed key's copy was the next value's, and HiDream-O1's prefix read back as noise.
+        dense = [tensor.contiguous() for tensor in tensors]
         parts, views, end = [], [], 0
-        for tensor in tensors:
-            tensor = tensor.contiguous()
+        for tensor in dense:
             parts.append((end, tensor.data_ptr(), tensor.nbytes))
             views.append((end, tensor.nbytes, tensor.dtype, tensor.shape))
             end = (end + tensor.nbytes + 255) // 256 * 256
         region = varena.Retained(memory.native, memory.pages, end)
         region.write(memory.stream().cuda_stream, parts)
+        del dense
         return _Kept(memory, region, views)
 
 
