@@ -106,6 +106,8 @@ _REFUSED = (
 _UNRECORDABLE = "the step cannot be recorded"
 #: varena's refusal of a capture's allocation outside its pool, which no capacity would serve
 _CAPTURE_MAP = "a CUDA capture cannot map"
+#: a refusal for room (`_refusal`)
+_CAPACITY = "preparation exceeded capacity"
 #: a refusal that says nothing against the graph (`_refusal`)
 _WAITING = "capture waits for kernel readiness"
 #: request id -> its loops, for the run record (`execution.loops`)
@@ -178,6 +180,12 @@ def _now() -> float:
     return round(time.time() * 1000, 1)
 
 
+def _room(tensor: Any) -> int:
+    """The room epoch of the tensor's card (varena's `room_moves`): it changes when the room this
+    process can have changed for a reason outside its program."""
+    return int(vt.stats(tensor.device.index)["room_moves"]) if tensor.is_cuda else 0
+
+
 def _refusal(error: BaseException) -> str | None:
     """The reason a preparation error lets the loop continue in another mode, else None."""
     if isinstance(error, CapabilityError):
@@ -185,7 +193,7 @@ def _refusal(error: BaseException) -> str | None:
     if isinstance(error, Building):
         return f"{_WAITING}: {error}"
     if isinstance(error, torch.OutOfMemoryError):  # varena's CaptureMap says itself why
-        return str(error) if _CAPTURE_MAP in str(error) else f"preparation exceeded capacity: {error}"
+        return str(error) if _CAPTURE_MAP in str(error) else f"{_CAPACITY}: {error}"
     if isinstance(error, ResidencyError):
         return f"residency refused preparation: {error}"
     code = getattr(error, "error_code", None)
@@ -320,6 +328,9 @@ class _Site:
     need: dict[Hashable, int] = field(default_factory=dict)
     #: the working peak its first call's warm steps measured (`_PEAKS`), which sizes its pools
     peak: dict[Hashable, int] = field(default_factory=dict)
+    #: layouts a whole call was refused room for while its call ran streamed, by the room epoch
+    #: then (`_room`): a later call looks this up and tries again only once the room changed
+    roomless: dict[Hashable, int] = field(default_factory=dict)
 
 
 class Loops:
@@ -471,8 +482,9 @@ class Loops:
         program is kept for the site. Otherwise, or refused, the rest runs eagerly and the
         recording is queued for the idle period after it."""
         with _laps(row):
-            opened = None
-            if ident is not None and shape not in known.unfit:
+            opened, room = None, _room(tensors[0])
+            roomless = shape is not None and known.roomless.get(shape) == room
+            if ident is not None and shape not in known.unfit and not roomless:
                 with suppress(Exception):  # refused, its own recording says why
                     opened = _opened(work)
             pre, body, rest, warmed, peak = _warm(loop, tensors, scope, ctx)
@@ -480,7 +492,9 @@ class Loops:
                 with self._lock:
                     known.peak[shape] = max(peak, known.peak.get(shape, 0))
             program, refused, began = None, "", time.perf_counter()
-            if rest and not _unkept(known, ident, shape, body):
+            if roomless:
+                row["refusals"].append("whole call: no room for its program in this room")
+            elif rest and not _unkept(known, ident, shape, body):
                 program, refused, need = _record_first(
                     loop, rest, tensors, len(work), scope, pre, body, ident,
                     _reserve(known, shape, loop), opened,
@@ -528,6 +542,11 @@ class Loops:
         row["eager"] = self._queue(
             site, known, loop, tensors, len(work), scope, pre, body, ident, shape
         )
+        if refused.startswith(_CAPACITY) and row["eager"].startswith("streamed"):
+            # Its reservation reclaims the weights the streamed steps then read again: no call
+            # tries it while the room is the same (an RTX 4090's SDXL at 6 GiB, 1.5 GB a call).
+            with self._lock:
+                known.roomless[shape] = room
 
     def _take_over(
         self,

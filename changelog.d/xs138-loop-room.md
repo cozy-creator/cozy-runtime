@@ -1,0 +1,1 @@
+A whole call refused room for its program while its call ran streamed is not tried again until the card's room changes: each call's attempt reserved a pool that reclaimed the weights its streamed steps then read again (SDXL at 6 GiB on an RTX 4090: 1.5 GB a call). The skip is a lookup at the call's entry.
