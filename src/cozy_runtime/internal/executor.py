@@ -4494,14 +4494,8 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
-            functools.partial(self._yielding, request_id),
             self.model_choices,
         )
-
-    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
-        """A wait on a child call: the attempt's step pages are taken before the child's."""
-        request = self.requests.get(request_id)
-        return request.yielding() if request is not None else contextlib.nullcontext()
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:

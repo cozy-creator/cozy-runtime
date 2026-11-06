@@ -9,10 +9,6 @@ from typing import Any
 from tensorfs.varena import _runtime as varena
 
 
-def supported() -> bool:
-    return varena.CacheOwner.capability() == 1
-
-
 @contextmanager
 def try_locks(locks: list[Any]) -> Iterator[bool]:
     """Claim actual owner/domain locks without waiting on the allocating caller."""
@@ -77,6 +73,4 @@ class Registration:
 def register(device: Any, target: Any, method: str) -> Registration | None:
     if device.type != "cuda":
         return None
-    if not supported():
-        raise RuntimeError("native CUDA recovery requires the CacheOwner protocol")
     return Registration(device.index or 0, target, method)

@@ -33,7 +33,6 @@ back.
 from __future__ import annotations
 
 import bisect
-import ctypes
 import gc
 import hashlib
 import itertools
@@ -91,13 +90,6 @@ except ModuleNotFoundError as missing:  # CPU and macOS wheels carry no native e
     if missing.name != "cozy_runtime._kernels._execution":
         raise
     _execution = None
-
-#: The CUDA driver, for a recorded graph's node count (absent without an NVIDIA driver).
-_DRIVER: Any
-try:
-    _DRIVER = ctypes.CDLL("libcuda.so.1")
-except OSError:
-    _DRIVER = None
 
 #: Codes a preparation refusal carries: the loop continues in the next mode.
 _REFUSED = (
@@ -236,7 +228,6 @@ class _Program:
     counter: Any
     ident: Hashable
     stages: int
-    blocks: int
     lock: threading.Lock = field(default_factory=threading.Lock)
     #: a kept program's cache handle: residency releases it under pressure while it is idle
     region: Any = None
@@ -515,7 +506,6 @@ class Loops:
             row.update(
                 mode=program.mode,
                 stages=program.stages,
-                blocks=program.blocks,
                 pool_bytes=program.pool_bytes,
                 whole_call="its rest recorded; the whole call records once its after has run",
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
@@ -545,7 +535,6 @@ class Loops:
             row.update(
                 mode=program.mode,
                 stages=program.stages,
-                blocks=program.blocks,
                 pool_bytes=program.pool_bytes,
                 whole_call="recorded on its first call, after its warm steps",
                 capture_ms=round((time.perf_counter() - began) * 1000, 3),
@@ -688,8 +677,7 @@ class Loops:
         return "resident: the whole call records at idle"
 
     def _install(self, site: Hashable, program: _Program, memory: Any) -> None:
-        program.region = memory.region("denoise_loop", "program", release=program.close,
-                                       shrink=program.try_close)
+        program.region = memory.region("denoise_loop", release=program.close, shrink=program.try_close)
         with self._lock:
             previous = self._kept.pop(site, None)
             self._kept[site] = program
@@ -709,8 +697,7 @@ class Loops:
         step and `after`, and the state back out."""
         assert kept.again is not None  # only whole calls are kept
         row.update(
-            mode=kept.mode, reused=True, stages=kept.stages, blocks=kept.blocks,
-            pool_bytes=kept.pool_bytes,
+            mode=kept.mode, reused=True, stages=kept.stages, pool_bytes=kept.pool_bytes,
         )
         if kept.recorded is not None:
             row["recorded_idle_ms"] = kept.recorded
@@ -992,7 +979,7 @@ def _record_first(
     stages = len((again or [first])[0].stages)
     return _Program(
         ((first, rest.start, len(rest)),), again[0] if again else None, "resident", own, counter,
-        ident, stages, 0, verdicts=verdicts, pool_bytes=recording._working_bytes or 0,
+        ident, stages, verdicts=verdicts, pool_bytes=recording._working_bytes or 0,
     ), "", 0
 
 
@@ -1070,13 +1057,12 @@ def _record(
         row.update(
             mode="resident",
             stages=stages,
-            blocks=0,
             pool_bytes=recording._working_bytes or 0,
             capture_ms=round((time.perf_counter() - began) * 1000, 3),
             after_native=False,
         )
         return _Program(
-            ((made, rest.start, len(rest)),), None, "resident", tensors, counter, None, stages, 0,
+            ((made, rest.start, len(rest)),), None, "resident", tensors, counter, None, stages,
             verdicts=verdicts, pool_bytes=recording._working_bytes or 0,
         ), warmed
     finally:
@@ -1132,7 +1118,7 @@ def _record_whole(
         _abandon(recording, failure)
         raise failure
     return _Program(
-        (), again, "resident", tensors, counter, ident, len(again.stages), 0, verdicts=verdicts,
+        (), again, "resident", tensors, counter, ident, len(again.stages), verdicts=verdicts,
         eager_after=loop.after is not None and post is None,
         pool_bytes=recording._working_bytes or 0,
     )
@@ -2073,18 +2059,6 @@ class _Graph:
             raise
         else:
             self.reset()
-
-    def nodes(self) -> int:
-        """The recorded graph's node count: what it launches, whatever launched it."""
-        total = 0
-        for piece in self.pieces:
-            count = ctypes.c_size_t(0)
-            if _DRIVER.cuGraphGetNodes(
-                ctypes.c_void_p(piece.raw_cuda_graph()), None, ctypes.byref(count)
-            ):
-                raise RuntimeError("cuGraphGetNodes failed")
-            total += int(count.value)
-        return total
 
     def reset(self) -> None:
         for piece in {id(p): p for p in (*self.pieces, self.graph) if p is not None}.values():
