@@ -1190,6 +1190,15 @@ class Executor:
             "on_demand": {p: _construction_record(f) for p, f in self.built_on_demand.items()},
         }
 
+    def _follow_display(self, command: Invoke) -> None:
+        """A display GPU's limit as its display uses it now: the machine reads it for each request
+        (an older one never sends it, and the limit stays Start's)."""
+        limits = tuple(getattr(command, "display_limit", ()) or ())
+        memory = self.host.memory
+        if limits and memory is not None and memory.cuda:
+            self.host.display_limit = limits
+            memory.limit(self._card_budget(memory.device))
+
     def _card_budget(self, device: Any) -> int | None:
         """The development `gpu_memory_limit`, and on a GPU that drives a display its limit
         while it does (varena's limit counts the driver's own charge), the lower of the two."""
@@ -3471,6 +3480,7 @@ class Executor:
                 }
             finally:
                 self._restore_attention()
+        self._follow_display(command)
         spool = Path(command.spool)
         deadline = _deadline(command.deadline_s)
         torch = self.torch

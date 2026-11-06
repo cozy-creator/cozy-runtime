@@ -1073,6 +1073,12 @@ class Memory:
             _MEMORIES[str(device)] = memory
             return memory
 
+    def limit(self, budget_bytes: int | None) -> None:
+        """A new card limit (a display GPU's follows its display): varena reclaims to it now."""
+        if self.cuda and budget_bytes != self.budget_bytes:
+            vt.set_limit(self.device.index or 0, budget_bytes)
+            self.budget_bytes = budget_bytes
+
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
 
