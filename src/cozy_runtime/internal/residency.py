@@ -2193,16 +2193,21 @@ class Memory:
 
     def _entered(self, block: _Block, request: Request) -> None:
         """Its allocations are born here. A model whose forward runs no hook of its own (its
-        package calls into its blocks) begins a pass at its first block, and at each block entered
-        before the one it entered last: a forward walks its blocks in order."""
+        package calls into its blocks) begins a pass at its first block, and at each block it enters
+        again after others: a forward enters each of its blocks once, in whatever order they were
+        registered (a mid block's attention before its resnet), and a weight read enters its block
+        again with none between."""
         model = block.model
         vt.set_site(self.device.index or 0, block.escape_site)
         if model in request.forwards:
             return
-        last = request.heads.get(model)
-        request.heads[model] = block.index
-        if last is None or block.index < last:
+        seen, last = request.heads.get(model, (None, None))
+        if seen is None or (block.index in seen and block.index != last):
+            request.heads[model] = ({block.index}, block.index)
             self._pass(model, request, 0)
+        elif block.index != last:
+            seen.add(block.index)
+            request.heads[model] = (seen, block.index)
 
     def _pass(self, model: Model, request: Request, shape: int) -> None:
         """A forward of `model` begins, a pass of its loop (`vt.pass_mark`; `shape` 0: unknown):
@@ -2382,10 +2387,11 @@ class Request:
         self.working_phase_keys: set[str] = set()
         self.working_splits: dict[str, dict[str, Any]] = {}
         #: each loop's record of what its passes left live outside any owner (`vt.escapes_take`);
-        #: the models whose forwards mark their passes, and of the others, the block each entered last
+        #: the models whose forwards mark their passes, and of the others, the blocks each entered
+        #: this pass, in order
         self.escaped: list[dict[str, Any]] = []
         self.forwards: set[Model] = set()
-        self.heads: dict[Model, int] = {}
+        self.heads: dict[Model, tuple[set[int], int]] = {}
         #: refusals that took a pure site finer than its estimate chose: zero in a normal run
         self.finer_splits = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
