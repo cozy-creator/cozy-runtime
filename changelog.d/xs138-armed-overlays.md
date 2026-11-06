@@ -1,0 +1,1 @@
+A `denoise_loop` records under the LoRA overlays (`lora.Hook`) armed before it: their factors are read in the recorded step as its other weights are, and its program serves only calls that armed the same. A loop under an overlay no longer runs eagerly for it (H3 Turbo, the Regenerate refine).

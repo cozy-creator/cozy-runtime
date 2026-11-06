@@ -64,8 +64,6 @@ class Factors(Protocol):
         ...
 
 
-#: While a `denoise_loop` records: each linear an overlay was armed on (`internal.loop`).
-ARMED: ContextVar[list[str] | None] = ContextVar("cozy_lora_armed", default=None)
 #: While a `denoise_loop` runs: the overlays armed before it began, by identity. A loop's program is
 #: recorded and kept for those, so an overlay its step arms is refused, eager or not.
 LOOP: ContextVar[frozenset[int] | None] = ContextVar("cozy_lora_loop", default=None)
@@ -88,8 +86,6 @@ class Hook:
             )
         if self._cozy_baked or factors is None:
             return  # Bound weights already contain the delta; the fill owns factor reads.
-        if (armed := ARMED.get()) is not None:
-            armed.append(type(module).__name__)
         factors(args[0], out)
 
     def lora_factors(self) -> tuple[object, torch.Tensor, torch.Tensor, float] | None:

@@ -1339,8 +1339,9 @@ def _hooked(module: Any, overlays: bool = False) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
     at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
     LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
-    the bound pages follow that answer: a replay would keep the captured one. With `overlays`, a
-    recording that finds none armed (`lora.ARMED`) records the base forward, so it is served."""
+    the bound pages follow that answer: a replay would keep the captured one. With `overlays` (a
+    `denoise_loop`), it is served: the loop's program is kept for the overlays armed before it
+    (`lora.LOOP`), their factors recorded as its other weights are."""
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():

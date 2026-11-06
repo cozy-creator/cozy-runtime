@@ -1571,8 +1571,6 @@ def _record_resident(
             owners = tuple(bindings)
             landed = LANDED[0]
             bodies: dict[Any, _Graph] = {}
-            armed: list[str] = []
-            arming = lora.ARMED.set(armed)
             with _guarded(held, frozenset()):
                 for first, count, label in (run for each in runs for run in each):
                     if label in bodies:
@@ -1622,12 +1620,6 @@ def _record_resident(
                     provisional.append(prefix)
                     prefix.record(lambda: loop.before(*tensors))  # type: ignore[misc]
                     _lap("record_before")
-            lora.ARMED.reset(arming)
-            if armed:
-                raise CapabilityError(
-                    f"a LoRA overlay was armed on {armed[0]} as the loop recorded",
-                    code="prepared_graph_ineligible",
-                )
             _lap("record")
             _yield_point()
             parts: list[tuple[int, int]] = []
