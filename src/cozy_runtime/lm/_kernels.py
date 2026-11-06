@@ -1,7 +1,6 @@
 """Kernels for a gated-delta-net layer's causal conv step and its recurrence, one launch where
 Transformers' reference path (when `causal_conv1d` and `flash-linear-attention` are absent) runs
-a few dozen small ops per layer per token; a verify pass's few drafted tokens take one launch
-for all.
+a few dozen small ops per layer per token.
 
 They follow the reference's arithmetic in f32 and round where it rounds, so they differ from it
 only in reduction order.
@@ -119,8 +118,7 @@ if not TRITON_ABSENT:
         q and k L2-normalised (q then divided by `scale`), the state decayed by exp(g), corrected
         toward v by beta, then read by q. The state after each token goes to `states`
         (`[T, B, H, DK, DV]`; `state` itself for one decoded token). g and beta are `[B, T, H]`,
-        out `[B, T, H, DV]`. Decoding and verifying both run it, so a token's bits do not depend
-        on how many come with it."""
+        out `[B, T, H, DV]`."""
         bh = tl.program_id(0)
         b = bh // heads
         h = bh % heads

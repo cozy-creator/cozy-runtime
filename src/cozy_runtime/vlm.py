@@ -14,7 +14,6 @@ split into per-expert blocks (`moe.split`): the checkpoint stores them per exper
 from __future__ import annotations
 
 import json
-import sys
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,7 +38,6 @@ from transformers.video_utils import VideoMetadata
 from cozy_runtime import lm, moe
 from cozy_runtime.author import (
     Config,
-    ConformanceError,
     Context,
     DecodedVideoFrame,
     FileBound,
@@ -223,39 +221,22 @@ def watch(
     return Watched(shown, seconds)
 
 
-def construct(
-    model_config: Mapping[str, Any], config: Config
-) -> tuple[torch.nn.Module, lm.Draft | None]:
-    """The model and its multi-token-prediction head where the checkpoint keeps it (`mtp.*`,
-    the model's `mtp` and the `lm.Draft` around it), experts split per expert; every parameter in
-    its stored dtype (Qwen3.5 keeps `A_log` and its gated norms in f32, and Runtime fills stored
-    bytes as they are)."""
+def construct(model_config: Mapping[str, Any], config: Config) -> torch.nn.Module:
+    """The model, experts split per expert; every parameter in its stored dtype (Qwen3.5 keeps
+    `A_log` and its gated norms in f32, and Runtime fills stored bytes as they are). A
+    checkpoint's multi-token-prediction head (`mtp.*`) is not built: decoding never drafts, and
+    the load skips its tensors."""
     with no_init_weights():
         model = AutoModelForImageTextToText.from_config(
             AutoConfig.for_model(**model_config), dtype=torch.bfloat16
         )
         model.tie_weights()
-        text = model.config.get_text_config(decoder=True)
-        head = None
-        drafts = getattr(text, "mtp_num_hidden_layers", 0)
-        if drafts and _held(config, f"{COMPONENT}.mtp.fc.weight"):
-            head = lm.Draft(model.config, sys.modules[type(model).__module__])
-            model.mtp = head.mtp.to(torch.bfloat16)
         moe.split(model)
     for name, parameter in model.named_parameters():
         stored = DTYPES.get(config.tensor_dtype(f"{COMPONENT}.{name}", default="bf16"))
         if stored is not None and parameter.dtype != stored:
             parameter.data = parameter.data.to(stored)
-    return model.eval(), head.eval() if head is not None else None
-
-
-def _held(config: Config, key: str) -> bool:
-    """Whether the checkpoint stores `key`: a fine-tune may leave out the multi-token-prediction
-    head its config still declares."""
-    try:
-        return bool(config.tensor_dtype(key, default=""))
-    except ConformanceError:
-        return False
+    return model.eval()
 
 
 def processor(
@@ -337,7 +318,7 @@ def processor(
 
 class Pipeline:
     def __init__(self, config: Config) -> None:
-        model, self.draft = construct(config.mapping(), config)
+        model = construct(config.mapping(), config)
         self.components: dict[str, torch.nn.Module] = {COMPONENT: model}
 
 
@@ -475,7 +456,6 @@ class VisionLM(Model[Pipeline], encoded_leaves="accept", min_bits=4, phase="deco
             inputs,
             stop=tokens,
             pad=tokenizer.pad_token_id or tokens[0],
-            draft=self.pipe.draft,
             **decoding,
         )
         return [str(reply) for reply in self.processor.batch_decode(out, skip_special_tokens=True)]

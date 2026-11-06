@@ -146,11 +146,10 @@ if not TRITON_ABSENT:
         BLOCK_W: tl.constexpr,
         SPLIT: tl.constexpr,
     ):
-        """Up to 16 rows (a decoded token, or a step's drafted ones) on the tensor cores: each
-        int32 word of 8 weights is decoded once for every row, so the weight is read once, and a
-        row's sums never depend on the rows beside it, so a drafted token keeps decode's bits
-        (a one-row FMA kernel is 7% faster on a 4090, but its sums are not these). SPLIT writes
-        f32 partials per K span."""
+        """Up to 16 rows on the tensor cores: each int32 word of 8 weights is decoded once for
+        every row, so the weight is read once, and a row's sums never depend on the rows beside
+        it (a one-row FMA kernel is 7% faster on a 4090, but its sums are not these). SPLIT
+        writes f32 partials per K span."""
         rn = tl.program_id(0) * BLOCK_N + tl.arange(0, BLOCK_N)
         rm = tl.arange(0, 16)
         rw = tl.arange(0, BLOCK_W)
