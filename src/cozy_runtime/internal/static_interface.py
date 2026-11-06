@@ -662,18 +662,10 @@ class Reader:
         self.refuse(module, stmt, "a binding form the static reader does not follow")
 
     def _vocab(self, module: Module, node: ast.AST, key: str) -> Vocab:
-        """A vocabulary name, refused with its replacement when Runtime 0.36.0 removed it."""
+        """A vocabulary name, refused with its replacement when a Runtime removed it."""
         prefix, _, name = key.partition(".")
         if prefix == "author" and name in author._REMOVED:
-            release, instead = author._REMOVED[name]
-            self.refuse(
-                module,
-                node,
-                f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): "
-                f"this package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest "
-                "release",
-                "removed_name",
-            )
+            self.refuse(module, node, author.removed(name), "removed_name")
         return Vocab(key)
 
     def _module_binding(self, module: Module, target: str, stmt: ast.stmt) -> Resolved:

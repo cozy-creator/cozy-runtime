@@ -15,7 +15,7 @@ whether it runs eagerly or as a native program. The codec
 plane is separate (cr-017). Per-service fakes live in `cozy_runtime.author.fakes`.
 """
 
-from cozy_runtime import canonical_json
+from cozy_runtime import __version__, canonical_json
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import App, Registration, RegistrationError
 from cozy_runtime.author._artifacts import Lora, ModelArtifact, ModelChoice, ObjectRef
@@ -401,9 +401,11 @@ __all__ = [
     "uses_components",
 ]
 
-#: Names a Runtime removed, the release that removed them, and what replaces each. A package built
-#: for an older Runtime imports one of them and fails here, never decoding a request with a name
-#: that now means something else.
+_REFS = "Prompt[Image]: each prompt's references, an Image(file, description) per mention"
+_SAID = "Prompt.references, keyed as the text spells each mention"
+#: Names a Runtime removed, the release that removed them ("": this one), and what replaces each.
+#: A package built for an older Runtime imports one of them and fails here, never decoding a
+#: request with a name that now means something else.
 _REMOVED = {
     "ImageAsset": ("0.36.0", "ImageFile"),
     "VideoAsset": ("0.36.0", "VideoFile"),
@@ -413,40 +415,39 @@ _REMOVED = {
     "AssetBound": ("0.36.0", "FileBound"),
     "AssetLimits": ("0.36.0", "FileLimits"),
     "AssetInfo": ("0.36.0", "FileInfo"),
-    "Node": ("0.42.0", "app.tool(label=, named=, reserved=, ui=) and the box's field types"),
-    "Reference": (
-        "0.42.0",
-        "Prompt[Image]: each prompt's references, an Image(file, description) per mention",
-    ),
-    "Picture": (
-        "0.42.0",
-        "Prompt[Image]: each prompt's references, an Image(file, description) per mention",
-    ),
-    "PlacedPicture": (
-        "0.42.0",
-        "Prompt[Image]: each prompt's references, an Image(file, description) per mention",
-    ),
-    "PictureRequest": ("0.42.0", "ImageRequest with prompt: Prompt[Image]"),
-    "Mention": ("0.42.0", "Prompt.references, keyed as the text spells each mention"),
-    "mentions": ("0.42.0", "Prompt.references, keyed as the text spells each mention"),
-    "render": ("0.42.0", "Prompt.references, keyed as the text spells each mention"),
-    "name_label": ("0.42.0", "Prompt.references, keyed as the text spells each mention"),
-    "Plate": ("0.42.0", "a VideoFile field marked Spans(...)"),
-    "ContinueFrom": ("0.42.0", "Pickup"),
-    "ShotResult": ("0.42.0", "the package's own result struct"),
-    "UpscaleResult": ("0.42.0", "the package's own result struct"),
-    "Follow": ("0.42.0", "the package's own Literal"),
-    "Preset": ("0.42.0", "the package's own Literal"),
+    "Node": ("", "app.tool(label=, named=, reserved=, ui=) and the box's field types"),
+    "Reference": ("", _REFS),
+    "Picture": ("", _REFS),
+    "PlacedPicture": ("", _REFS),
+    "PictureRequest": ("", "ImageRequest with prompt: Prompt[Image]"),
+    "Mention": ("", _SAID),
+    "mentions": ("", _SAID),
+    "render": ("", _SAID),
+    "name_label": ("", _SAID),
+    "Plate": ("", "a VideoFile field marked Spans(...)"),
+    "ContinueFrom": ("", "Pickup"),
+    "ShotResult": ("", "the package's own result struct"),
+    "UpscaleResult": ("", "the package's own result struct"),
+    "Follow": ("", "the package's own Literal"),
+    "Preset": ("", "the package's own Literal"),
 }
+
+
+def removed(name: str) -> str:
+    """Why `cozy_runtime.author.<name>` is gone, and what to use."""
+    release, instead = _REMOVED[name]
+    if not release:
+        return (
+            f"cozy_runtime.author.{name} is gone in this Runtime ({__version__}): use {instead}; "
+            "this package was built for an older Runtime, so use its newest release"
+        )
+    return (
+        f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): "
+        f"this package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest release"
+    )
 
 
 def __getattr__(name: str) -> object:
     if name in _REMOVED:
-        release, instead = _REMOVED[name]
-        raise ImportError(
-            f"cozy_runtime.author.{name} is gone in Runtime {release} ({instead} replaces it): "
-            f"this package was built for Runtime < {release.rsplit('.', 1)[0]}; use its newest "
-            "release",
-            name=name,
-        )
+        raise ImportError(removed(name), name=name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
