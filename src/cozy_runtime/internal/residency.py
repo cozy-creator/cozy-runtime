@@ -2112,6 +2112,9 @@ class Memory:
                             value = value.to(widen)
                         block.last = time.monotonic_ns()
                         progress += 1
+                        request = _REQUEST.get()
+                        if block.escape_site and request is not None and not request.idle:
+                            self._entered(block, request)  # a resident block's read is its entry
                         return nn.Parameter(value, requires_grad=False) if site.parameter else value
             self._enter(block)
             try:
