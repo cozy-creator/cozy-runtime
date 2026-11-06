@@ -1,0 +1,1 @@
+A decode tells its progress. `lm.generate` without a `progress` callback reports the tokens it has decoded as the running telemetry stage's fraction of `max_new_tokens`, so a long upsampling (Klein's on a CPU, minutes) no longer reads as a stalled run after 10 minutes.

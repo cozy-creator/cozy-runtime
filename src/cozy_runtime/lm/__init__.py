@@ -46,6 +46,7 @@ from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
+from cozy_runtime.author._services import stage_progress
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, safeguard, say
 from cozy_runtime.graphs.domain import Pool
@@ -126,9 +127,12 @@ def generate(
     same prompt and seed give the same tokens.
     `progress(tokens)` is told the tokens decoded so far (a call's longest row), at most every
     `PROGRESS_S`, for display only; one that raises is dropped, with a run warning (a cancel is
-    the decode's own check's to act on)."""
+    the decode's own check's to act on). Without one, the running telemetry stage is told them
+    as its fraction of `max_new_tokens`."""
     if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
         raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
+    if progress is None and (stage := stage_progress()) is not None:
+        progress = partial(_share, stage, max_new_tokens)
     sampling = _Sampling(float(temperature), float(top_p), int(seed))
     tell = _Tell(progress)
     stops = [int(token) for token in stop]
@@ -155,6 +159,11 @@ def generate(
             return engine.generate(request)
     finally:
         BYPASS.reset(token)
+
+
+def _share(stage: Callable[[float], None], most: int, tokens: int) -> None:
+    """`tokens` decoded of at most `most`, as the running stage's fraction."""
+    stage(min(tokens / max(most, 1), 1.0))
 
 
 def release(model: Any) -> None:
