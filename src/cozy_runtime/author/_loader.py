@@ -620,7 +620,7 @@ class DerivedCache:
         region = self._made()
         if region is not None and not self._pins:
             self.enter()  # made inside this scope: held for the rest of it
-        with region.allocating() if region is not None else nullcontext(False) as fresh:
+        with region.pin() if region is not None else nullcontext(False) as fresh:
             if fresh:
                 self.drop()
             value = build()

@@ -151,6 +151,7 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_ready,
     model_config,
+    pacing,
     package_interface,
     prebuilt,
     prepare_diagnostics,
@@ -835,6 +836,8 @@ class Executor:
         #: HOST ONLY: Start's development GPU memory limit, the memory's budget (the card's size)
         self.gpu_memory_limit: int | None = None
         self.shared = False
+        #: Each GPU's limit while it drives the display (0: none): its total less what it keeps free.
+        self.display_limit: tuple[int, ...] = ()
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -1112,7 +1115,7 @@ class Executor:
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
+        memory = Memory.open(device, budget_bytes=self._card_budget(device), shared=host.shared)
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         PLANS[:] = [host.serving]
@@ -1187,6 +1190,28 @@ class Executor:
             # Each on-demand model's build, made inside the stage that first read it.
             "on_demand": {p: _construction_record(f) for p, f in self.built_on_demand.items()},
         }
+
+    def _follow_display(self, command: Invoke) -> None:
+        """A display GPU's limit as its display uses it now: the machine reads it for each request
+        (an older one never sends it, and the limit stays Start's)."""
+        limits = tuple(getattr(command, "display_limit", ()) or ())
+        memory = self.host.memory
+        if limits and memory is not None and memory.cuda:
+            self.host.display_limit = limits
+            memory.limit(self._card_budget(memory.device))
+
+    def _card_budget(self, device: Any) -> int | None:
+        """The development `gpu_memory_limit`, and on a GPU that drives a display its limit
+        while it does (varena's limit counts the driver's own charge), the lower of the two."""
+        host = self.host
+        index = device.index or 0
+        cuda = device.type == "cuda" and index < len(host.display_limit)
+        limit = host.display_limit[index] if cuda else 0
+        if not limit:
+            return host.gpu_memory_limit
+        budget = limit if host.gpu_memory_limit is None else min(host.gpu_memory_limit, limit)
+        print(f"[memory] GPU {index} drives a display: at most {budget >> 20} MiB", file=sys.stderr)
+        return budget
 
     def _rank_device(self, torch: Any) -> Any:
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
@@ -1674,6 +1699,15 @@ class Executor:
         degree = command.sequence_parallel_degree or 1
         self.host.shared = command.shared
         self.host.gpu_memory_limit = command.gpu_memory_limit
+        # An older machine's Start names none.
+        self.host.display_limit = tuple(getattr(command, "display_limit", ()) or ())
+        if pacing.configure(pace := command.display_pace) and pace is not None:
+            print(
+                f"[pacing] the GPU drives a display: a call pauses {pace.pause_ms} ms "
+                f"after each {pace.work_ms} ms",
+                file=sys.stderr,
+                flush=True,
+            )
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
@@ -3454,6 +3488,7 @@ class Executor:
                 }
             finally:
                 self._restore_attention()
+        self._follow_display(command)
         spool = Path(command.spool)
         deadline = _deadline(command.deadline_s)
         torch = self.torch
@@ -3619,6 +3654,9 @@ class Executor:
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                     ),
                 )
+                if (memory := self.host.requests.get(command.request_id)) is not None:
+                    # A call that ran out of memory: what its memory learns from.
+                    memory.failed = outcome.code in CAPACITY_CODES
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)
@@ -4494,14 +4532,8 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
-            functools.partial(self._yielding, request_id),
             self.model_choices,
         )
-
-    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
-        """A wait on a child call: the attempt's step pages are taken before the child's."""
-        request = self.requests.get(request_id)
-        return request.yielding() if request is not None else contextlib.nullcontext()
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
@@ -4761,8 +4793,9 @@ class Executor:
                     # consumer streams before retiring owners and returning allocator storage.
                     accel.drain(self.torch, self.device_kind)
                     # Every slot's decoders, graphs and holds go before any model leaves: a
-                    # language model's engine retains its weights, so an idle Klein refused
-                    # every offload and a running call beside it ran out of memory (0.36.0 gate).
+                    # language model's engine retains its drafter's weights too, and Klein's
+                    # drafter slot maps before its upsampler, so an idle Klein refused every
+                    # offload and a running call beside it ran out of memory (0.36.0 gate).
                     self._release_programs([child])
                 for member in members:
                     for model in member.backend.models.values():
