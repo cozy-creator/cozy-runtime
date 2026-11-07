@@ -71,6 +71,13 @@ class DefaultResolutionError(InvalidRequest):
     default_code = "default_resolution"
 
 
+class ContractViolation(AuthorError):
+    """The package reached what the package contract gives the Runtime alone (a torch room
+    reader, the allocator): the message names the contract's API for it."""
+
+    default_code = "contract_violation"
+
+
 class PreflightViolation(AuthorError):
     """A preflight hook reached past its narrow contract (metadata only, never bytes)."""
 

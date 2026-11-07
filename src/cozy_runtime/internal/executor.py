@@ -143,6 +143,7 @@ from cozy_runtime.internal import (
     call_types,
     canonical,
     child_env,
+    contract,
     effect_interfaces,
     execution_evidence,
     executor_commands,
@@ -3187,6 +3188,8 @@ class Executor:
         first import on a busy host is still an import."""
         if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
+        if self.torch is not None:
+            contract.seal(self.torch)
         path = release.package_interface
         recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
         discovered = discover_installed(release.application, seconds=None, recipes=recipes)
