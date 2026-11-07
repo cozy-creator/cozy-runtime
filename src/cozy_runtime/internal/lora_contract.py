@@ -10,6 +10,8 @@ from cozy_runtime.internal.model_config import ADAPTERS
 
 GRAPH_CONFIG = ADAPTERS
 FORMAT = "cozy.model.lora/1"
+#: A graph with a DoRA layer (TensorD's `DORA_FORMAT`): a Runtime reading only `FORMAT` refuses it.
+DORA_FORMAT = "cozy.model.lora/2"
 CAPABILITY = "peft_graph/1"
 _DTYPES = {"F16", "BF16", "F32"}
 
@@ -20,7 +22,8 @@ def _refuse(code: str, detail: str) -> CapabilityError:
 
 class Layer(msgspec.Struct, frozen=True):
     """One PEFT layer's (a linear's or a 2-D convolution's) construction geometry and ordered
-    scaling."""
+    scaling. A DoRA layer (`dora`, a linear's) also holds its magnitude `m` `[out]`, grafted as
+    `<target>.lora_magnitude_vector.<adapter>.weight`."""
 
     component: str
     target: str
@@ -29,6 +32,7 @@ class Layer(msgspec.Struct, frozen=True):
     alpha: float
     strength: float
     dtype: str
+    dora: bool = False
 
 
 class Graph(msgspec.Struct, frozen=True):
@@ -43,8 +47,10 @@ def read(data: bytes) -> Graph:
         graph = msgspec.json.decode(data, type=Graph)
     except msgspec.DecodeError as exc:
         raise _refuse("graph", "malformed prepared LoRA graph") from exc
-    if graph.format != FORMAT:
+    if graph.format not in (FORMAT, DORA_FORMAT):
         raise _refuse("graph", f"unsupported prepared LoRA graph {graph.format!r}")
+    if any(row.dora for row in graph.layers) != (graph.format == DORA_FORMAT):
+        raise _refuse("graph", f"{graph.format}: DoRA layers come in {DORA_FORMAT}, and only there")
     expected = {f"adapter_{index}": reference for index, reference in enumerate(graph.adapters)}
     used: set[str] = set()
     for row in graph.layers:
