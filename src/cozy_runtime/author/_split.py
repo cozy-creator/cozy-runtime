@@ -4,6 +4,7 @@ layout that changes the result (a blended cut) comes from the shape alone (`most
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, nullcontext
@@ -62,6 +63,7 @@ def split(
     most: int | None = None,
     out: Any = None,
     holds: int = 5,
+    host: bool = False,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -75,24 +77,32 @@ def split(
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
     cut's (an `overlap`) does. Without it such a layout follows free memory.
 
-    `holds` is `fn`'s peak beside the whole output, in windows of its output: the estimate the
-    device's choice starts from before it has measured a pass."""
+    With `host`, `fn` returns its windows in host memory and the result is assembled there: the
+    whole output is no device need.
+
+    `holds` is `fn`'s device peak beside the whole output, in windows of its output: the estimate
+    the device's choice starts from before it has measured a pass."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
     # Writing windows in place (`out`) can consume its input, so that never runs twice.
     pure = out is None and getattr(fn, "PURE_WINDOWS", False)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
+    whole = 0 if out is not None or host else _bytes(shape, cuts, x)
     if most is not None and cuts:
         windows = _windows(shape, cuts, most)
         if runtime is None:
             return _run(fn, x, cuts, windows, lambda: None, out)
+        # The largest window these cuts made, not `most`: a small input cuts smaller.
+        largest = max(math.prod(b - a for a, b in w) for w in windows) * (
+            math.prod(shape) // math.prod(shape[c.dim] for c in cuts)
+        )
         return runtime.split(
             _name(fn),
             _key(fn, shape, cuts, x.dtype),
-            most,
-            most,
-            0 if out is not None else _bytes(shape, cuts, x),
+            largest,
+            largest,
+            whole,
             _item_bytes(cuts, x),
             holds,
             lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
@@ -108,7 +118,7 @@ def split(
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
-        0 if out is not None else _bytes(shape, cuts, x),
+        whole,
         _item_bytes(cuts, x),
         holds,
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
@@ -194,15 +204,20 @@ def _span(spans: Sequence[tuple[int, int]]) -> int:
 
 
 def _equal(length: int, cut: Cut, count: int) -> list[tuple[int, int]] | None:
-    """The fewest windows, at least `count`, all of one length, covering `length` exactly with
-    neighbours sharing `overlap` and starts on `align`; None when there are none."""
-    span = length - cut.overlap
-    if count <= 1 or span <= 0:
+    """The fewest windows, at least `count`, all of one length, covering `length` with starts
+    spread evenly on `align` and neighbours sharing at least `overlap`; None when there are none.
+    One length `L` keeps `L ≡ length (mod align)`, so the last window ends at `length`."""
+    if count <= 1 or length <= cut.overlap:
         return [(0, length)]
-    for k in range(count, span + 1):
-        if span % k == 0 and (span // k) % cut.align == 0:
-            step = span // k
-            return [(i * step, i * step + step + cut.overlap) for i in range(k)]
+    for k in range(count, length + 1):
+        need = -(-(length + (k - 1) * cut.overlap) // k)
+        size = need + (length - need) % cut.align
+        if size >= length:
+            continue
+        steps = (length - size) // cut.align
+        starts = [cut.align * round(i * steps / (k - 1)) for i in range(k)]
+        if all(b - a <= size - cut.overlap for a, b in itertools.pairwise(starts)):
+            return [(a, a + size) for a in starts]
     return None
 
 
