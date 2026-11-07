@@ -2362,7 +2362,10 @@ class _Kept:
 class _Retaining:
     def retained(self, nbytes: int) -> Retained | None:
         request = _REQUEST.get()
-        return Retained(None) if request is None else request.memory.retained(nbytes)
+        if request is None:
+            return Retained(None)
+        request.retained_bytes += nbytes
+        return request.memory.retained(nbytes)
 
 
 _retained.install(_Retaining())
@@ -2424,6 +2427,8 @@ class Request:
         self.finer_splits = 0
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
+        #: cross-step state its loops declared (`author.retained`)
+        self.retained_bytes = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
         #: are not in it, and no sum of it with them ever happened: the driver reads the card.
         self.torch_peak = 0
@@ -2561,6 +2566,7 @@ class Request:
             "escaped": list(self.escaped),
             "finer_splits": self.finer_splits,
             "swallowed_ooms": self.swallowed_ooms,
+            "retained_bytes": self.retained_bytes,
             "gathered": self.gathered,
             "host": None,
         }
