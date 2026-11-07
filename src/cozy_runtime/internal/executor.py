@@ -151,6 +151,7 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_ready,
     model_config,
+    pacing,
     package_interface,
     prebuilt,
     prepare_diagnostics,
@@ -1700,6 +1701,13 @@ class Executor:
         self.host.gpu_memory_limit = command.gpu_memory_limit
         # An older machine's Start names none.
         self.host.display_limit = tuple(getattr(command, "display_limit", ()) or ())
+        if pacing.configure(pace := command.display_pace) and pace is not None:
+            print(
+                f"[pacing] the GPU drives a display: a call pauses {pace.pause_ms} ms "
+                f"after each {pace.work_ms} ms",
+                file=sys.stderr,
+                flush=True,
+            )
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")

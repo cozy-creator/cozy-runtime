@@ -35,7 +35,7 @@ from cozy_runtime import graphs
 from cozy_runtime.author import _retained
 from cozy_runtime.author._errors import DoesNotFit, Fault, fault
 from cozy_runtime.author._model import WARNINGS
-from cozy_runtime.internal import cache_owners, proctree
+from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
@@ -3060,6 +3060,7 @@ def _hooks(model: Model) -> None:
             block.escape_site = vt.site_id(f"{model.component}.{_INDEX.sub('*', block.path)}")
 
         def entered(*_: object, b: _Block = block) -> None:
+            pacing.tick()
             if (seen := ENTERED.get()) is not None:
                 seen.add(b)
             model._claim()
