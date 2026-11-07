@@ -1007,10 +1007,20 @@ class Region:
             self._cache_owner.close()  # drains only after releasing the Region lock
 
 
+def _pages(index: int, shared: bool) -> Any:
+    """This GPU's host tier. A shared machine's (a person's computer) leaves free what the computer
+    keeps for its other programs, not `_HOST_HEADROOM`, and pins nothing while it stalls."""
+    cap = max(physical_memory(), 0) // 2
+    try:
+        return varena.Pages(index, cap=cap, headroom=_HOST_HEADROOM, shared=shared)
+    except TypeError:  # a TensorFS before the shared host tier
+        return varena.Pages(index, cap=cap, headroom=_HOST_HEADROOM)
+
+
 class Memory:
     """One executor's weight residency, beside Torch's activation allocator."""
 
-    def __init__(self, device: Any, budget_bytes: int | None = None) -> None:
+    def __init__(self, device: Any, budget_bytes: int | None = None, shared: bool = False) -> None:
         self.device = torch.device(device)
         self.cuda: bool = self.device.type == "cuda"
         self.budget_bytes = budget_bytes
@@ -1040,18 +1050,14 @@ class Memory:
                     vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Device(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
-                self.pages = varena.Pages(
-                    self.device.index or 0,
-                    cap=max(physical_memory(), 0) // 2,
-                    headroom=_HOST_HEADROOM,
-                )
+                self.pages = _pages(self.device.index or 0, shared)
             except (ImportError, AttributeError, RuntimeError) as exc:
                 if fault(exc) is not Fault.OTHER:
                     raise
                 raise ResidencyError(f"native CUDA weight residency is unavailable: {exc}") from exc
 
     @classmethod
-    def open(cls, gpu: Any = 0, *, budget_bytes: int | None = None) -> Memory:
+    def open(cls, gpu: Any = 0, *, budget_bytes: int | None = None, shared: bool = False) -> Memory:
         device = torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
@@ -1063,9 +1069,15 @@ class Memory:
                 if found.budget_bytes != budget_bytes:
                     raise ResidencyError("an open device cannot silently change allocator budgets")
                 return found
-            memory = cls(device, budget_bytes)
+            memory = cls(device, budget_bytes, shared)
             _MEMORIES[str(device)] = memory
             return memory
+
+    def limit(self, budget_bytes: int | None) -> None:
+        """A new card limit (a display GPU's follows its display): varena reclaims to it now."""
+        if self.cuda and budget_bytes != self.budget_bytes:
+            vt.set_limit(self.device.index or 0, budget_bytes)
+            self.budget_bytes = budget_bytes
 
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None

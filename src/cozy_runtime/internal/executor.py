@@ -835,6 +835,8 @@ class Executor:
         #: HOST ONLY: Start's development GPU memory limit, the memory's budget (the card's size)
         self.gpu_memory_limit: int | None = None
         self.shared = False
+        #: Each GPU's limit while it drives the display (0: none): its total less what it keeps free.
+        self.display_limit: tuple[int, ...] = ()
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -1112,7 +1114,7 @@ class Executor:
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
+        memory = Memory.open(device, budget_bytes=self._card_budget(device), shared=host.shared)
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
         PLANS[:] = [host.serving]
@@ -1187,6 +1189,28 @@ class Executor:
             # Each on-demand model's build, made inside the stage that first read it.
             "on_demand": {p: _construction_record(f) for p, f in self.built_on_demand.items()},
         }
+
+    def _follow_display(self, command: Invoke) -> None:
+        """A display GPU's limit as its display uses it now: the machine reads it for each request
+        (an older one never sends it, and the limit stays Start's)."""
+        limits = tuple(getattr(command, "display_limit", ()) or ())
+        memory = self.host.memory
+        if limits and memory is not None and memory.cuda:
+            self.host.display_limit = limits
+            memory.limit(self._card_budget(memory.device))
+
+    def _card_budget(self, device: Any) -> int | None:
+        """The development `gpu_memory_limit`, and on a GPU that drives a display its limit
+        while it does (varena's limit counts the driver's own charge), the lower of the two."""
+        host = self.host
+        index = device.index or 0
+        cuda = device.type == "cuda" and index < len(host.display_limit)
+        limit = host.display_limit[index] if cuda else 0
+        if not limit:
+            return host.gpu_memory_limit
+        budget = limit if host.gpu_memory_limit is None else min(host.gpu_memory_limit, limit)
+        print(f"[memory] GPU {index} drives a display: at most {budget >> 20} MiB", file=sys.stderr)
+        return budget
 
     def _rank_device(self, torch: Any) -> Any:
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
@@ -1674,6 +1698,8 @@ class Executor:
         degree = command.sequence_parallel_degree or 1
         self.host.shared = command.shared
         self.host.gpu_memory_limit = command.gpu_memory_limit
+        # An older machine's Start names none.
+        self.host.display_limit = tuple(getattr(command, "display_limit", ()) or ())
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
@@ -3454,6 +3480,7 @@ class Executor:
                 }
             finally:
                 self._restore_attention()
+        self._follow_display(command)
         spool = Path(command.spool)
         deadline = _deadline(command.deadline_s)
         torch = self.torch
