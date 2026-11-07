@@ -153,6 +153,7 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_ready,
     model_config,
+    numerical_environment,
     pacing,
     package_interface,
     prebuilt,
@@ -1073,6 +1074,7 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        numerical_environment.apply(torch, self.device_kind)
         try:
             accel.bind_allocator(torch, self.device_kind)
             if self.device_kind == "cuda":
