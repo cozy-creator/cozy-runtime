@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Callable, Hashable, Sequence
 from typing import Any, Protocol
 
+from cozy_runtime.author import _attention
+
 
 class Loops(Protocol):
     """The Runtime's side of `denoise_loop`, installed by an executor."""
@@ -82,7 +84,8 @@ def denoise_loop(
     - `cache`: a `stepcache` policy for the transformers whose stacks the package installed
       (`stepcache.install`): approximate, for a preset that asks for it, never a default.
 
-    LoRA overlays (`lora.Hook`) are armed before the loop; one a step arms raises.
+    LoRA overlays (`lora.Hook`) are armed before the loop; one a step arms raises. As it
+    returns, each attention producer's request state ends its loop (`end_loop()`).
 
     A step that runs components is called inside a `@uses_components` method, whose components
     they are. A step of tensor work alone may run outside one; it records resident too.
@@ -101,4 +104,7 @@ def denoise_loop(
     runtime = _RUNTIME
     if runtime is None:
         raise RuntimeError("denoise_loop runs inside a Runtime executor")
-    runtime.run(step, steps, state, carried, inputs, labels, key, on_step, before, after, cache)
+    try:
+        runtime.run(step, steps, state, carried, inputs, labels, key, on_step, before, after, cache)
+    finally:
+        _attention.end_loop()
