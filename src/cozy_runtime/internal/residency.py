@@ -2255,7 +2255,8 @@ class Memory:
                     self.pages.request_ended()  # the pages it refilled are their worth
                 if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
                     # or a capacity failure raised through here, never a package's own error
-                    failed = request.failed or is_capacity(sys.exc_info()[1])
+                    raised = sys.exc_info()[1]
+                    failed = request.failed or (raised is not None and is_capacity(raised))
                     request.escaped = vt.escapes_take(self.device.index or 0, failed=failed)
                     _escaped_warnings(request.escaped)
                 request.sample()

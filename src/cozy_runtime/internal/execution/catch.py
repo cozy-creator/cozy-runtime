@@ -124,7 +124,8 @@ def select(
 ) -> dict[str, Any]:
     """The level native selection takes, its room made; `DoesNotFit` where none can have it."""
     try:
-        return vt.split_select(device, key, menu, stream=stream)
+        selection: dict[str, Any] = vt.split_select(device, key, menu, stream=stream)
+        return selection
     except varena.Exhausted as exc:  # a decision, not a failure: nothing has run
         raise refuse(device, name, "its finest split", sum(menu[-1][1]), exc) from exc
 
@@ -230,7 +231,7 @@ def retry(
         return None
     _unwind(exc)
     try:
-        again = ask(device, key, str(level), stream=stream)
+        again: dict[str, Any] | None = ask(device, key, str(level), stream=stream)
     except varena.Exhausted as refused:
         raise refuse(device, name, "every finer split", sum(menu[-1][1]), refused) from exc
     if again is not None:
