@@ -427,6 +427,8 @@ class _Block:
     )
     #: where its forward's allocations are born in the escaped-memory tally (`vt.set_site`)
     escape_site: int = 0
+    #: the birth site its entry replaced, back at its exit: what runs after it is not its
+    born_before: int | None = None
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -1028,6 +1030,10 @@ class Memory:
         self._phase_names: frozenset[str] | None = None
         self._phase_request: str | None = None
         self._forward_depth = 0
+        #: models whose own forward (or a hooked child's) is running, by how many deep
+        self._executing: dict[Model, int] = {}
+        #: the birth site last set on this device (`_born`)
+        self._site = 0
         if self.cuda:
             try:
                 if budget_bytes is not None:
@@ -1995,7 +2001,7 @@ class Memory:
                 request = _REQUEST.get()
                 reclaim = reclaim and not (request is not None and request.idle)
                 if block.escape_site and request is not None and not request.idle and not capturing:
-                    self._entered(block, request)
+                    block.born_before = self._entered(block, request)
                 try:
                     self._ensure(block, reclaim, overlay)
                     block.gathered = None
@@ -2050,6 +2056,9 @@ class Memory:
                     for site, previous in reversed(block.saved):
                         site.table[site.name] = previous
                     block.saved.clear()
+                    if block.born_before is not None:
+                        self._born(block.born_before)
+                        block.born_before = None
                     block.last = time.monotonic_ns()
                     self._idle(block)
 
@@ -2117,6 +2126,7 @@ class Memory:
             with self.lock:
                 outer_forward = self._forward_depth == 0
                 self._forward_depth += 1
+                self._executing[model] = self._executing.get(model, 0) + 1
         try:
             if not depth:
                 self._declare(model)
@@ -2138,6 +2148,7 @@ class Memory:
             if executing:
                 with self.lock:
                     self._forward_depth -= 1
+                    self._leave(model)
             if request is not None and not depth:
                 request.current.discard(model.name)
             model._release()
@@ -2148,7 +2159,7 @@ class Memory:
             model.local.depth -= 1
             if model.local.depth == 0:
                 if model.escape_site:
-                    vt.set_site(self.device.index or 0, 0)
+                    self._born(0)
                 try:
                     if model.common is not None:
                         self._exit(model.common)
@@ -2161,25 +2172,47 @@ class Memory:
             if executing:
                 with self.lock:
                     self._forward_depth -= 1
+                    self._leave(model)
             model._release()
 
-    def _entered(self, block: _Block, request: Request) -> None:
-        """Its allocations are born here. A model whose forward runs no hook of its own (its
-        package calls into its blocks) begins a pass at its first block, and at each block it enters
-        again after others: a forward enters each of its blocks once, in whatever order they were
-        registered (a mid block's attention before its resnet), and a weight read enters its block
-        again with none between."""
+    def _leave(self, model: Model) -> None:
+        if (left := self._executing[model] - 1) == 0:
+            del self._executing[model]
+        else:
+            self._executing[model] = left
+
+    def _born(self, site: int) -> int:
+        """Allocations on this device are born at `site` from now; the site they were born at."""
+        before, self._site = self._site, site
+        vt.set_site(self.device.index or 0, site)
+        return before
+
+    def _entered(self, block: _Block, request: Request) -> int:
+        """Its allocations are born here (the site before it, returned, comes back at its exit). A
+        model whose forward runs no hook of its own (its package calls into its blocks) begins a
+        pass at its first block, and at each block it enters again after others: a forward enters
+        each of its blocks once, in whatever order they were registered (a mid block's attention
+        before its resnet), and a weight read enters its block again with none between. A model
+        whose blocks run inside another's forward (an overlay's tables and factors) is part of that
+        forward's pass: marking its own at its first block would count what that forward made
+        before it (its packed rows) as kept from the last pass."""
         model = block.model
-        vt.set_site(self.device.index or 0, block.escape_site)
+        before = self._born(block.escape_site)
         if model in request.forwards:
-            return
+            return before
+        with self.lock:
+            inside = any(other is not model for other in self._executing)
+        if inside:
+            return before
         seen, last = request.heads.get(model, (None, None))
         if seen is None or (block.index in seen and block.index != last):
             request.heads[model] = ({block.index}, block.index)
             self._pass(model, request, 0)
+            self._born(block.escape_site)
         elif block.index != last:
             seen.add(block.index)
             request.heads[model] = (seen, block.index)
+        return before
 
     def _pass(self, model: Model, request: Request, shape: int) -> None:
         """A forward of `model` begins, a pass of its loop (`vt.pass_mark`; `shape` 0: unknown):
@@ -2194,7 +2227,7 @@ class Memory:
             )
         device = self.device.index or 0
         refused = vt.pass_mark(device, model.escape_site, shape, model.escape_floor)
-        vt.set_site(device, model.escape_site)
+        self._born(model.escape_site)
         if refused is not None:
             raise DoesNotFit(_does_not_fit(model.component, refused))
 
