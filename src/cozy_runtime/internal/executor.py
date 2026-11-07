@@ -3655,7 +3655,8 @@ class Executor:
                     ),
                 )
                 if (memory := self.host.requests.get(command.request_id)) is not None:
-                    memory.failed = outcome.terminal == "failed"  # what its memory learns from
+                    # A call that ran out of memory: what its memory learns from.
+                    memory.failed = outcome.code in CAPACITY_CODES
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)
