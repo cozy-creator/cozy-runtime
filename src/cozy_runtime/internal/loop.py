@@ -13,11 +13,12 @@ against 79 native, a 0.9 s recording), and the next call runs natively whenever 
 `after` that has never run is not recorded: that call records its rest, runs its `after` eagerly,
 which chooses its split levels and is measured, and queues the whole call for the idle period after
 it (`_IdleRecording`, xs-134 F), in the call's component scope, as a refused recording does; a
-command that arrives preempts it between its parts (never inside package code). Its copies are a
-cache residency may drop. A call that finds it unrecorded (no idle period yet, preempted, or no
-room at idle) records the whole call before running any of it and runs it natively from its start:
-one plan and no eager step. No idle period opens between a call's prepare and its invoke
-(`Executor.awaiting_invoke`), so a call queued behind another never waits for idle work.
+command that arrives preempts it between its parts (never inside package code). Queued, it holds
+the call's layouts only: its program's tensors are made as it records. A call that finds it
+unrecorded (no idle period yet, preempted, or no room at idle) records the whole call before
+running any of it and runs it natively from its start: one plan and no eager step. No idle
+period opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so a call
+queued behind another never waits for idle work.
 
 A recording's mode is decided before anything is captured (`_admit`): its pool is `vt.pool_bytes`
 of the most any part it records held as varena measured it eagerly, and varena makes room for it
@@ -593,44 +594,33 @@ class Loops:
         """Its idle recording has not run (no idle period yet, preempted, or no room at idle):
         this call records the whole call before running any of it, from what its first call
         measured, and runs it natively from its start (one plan, no eager step). False when
-        reclaim dropped the job first: the call is its site's first again."""
+        another call took the job first."""
         shape = job.ident[1]  # type: ignore[index]
-        pin = ExitStack()
+        with self._lock:
+            if known.pending.get(job.ident) is not job:
+                return False
+            del known.pending[job.ident]
+            measured = dict(known.measured.get(shape, {}))
+        program, began = None, time.perf_counter()
         try:
-            pin.enter_context(job.region.pin())
-        except ResidencyError:
-            return False
-        program, began, taken, waiting = None, time.perf_counter(), False, False
-        try:
-            with pin:
+            with _laps(row):
+                program = _record_whole(
+                    loop, job.tensors(), job.nwork, job.pre, job.body, job.post, job.ident,
+                    measured,
+                )
+        except Exception as error:
+            if isinstance(error, Building) or isinstance(error.__cause__, Building):
                 with self._lock:
-                    if known.pending.get(job.ident) is not job:
-                        return False
-                    del known.pending[job.ident]
-                    measured, taken = dict(known.measured.get(shape, {})), True
-                try:
-                    with _laps(row):
-                        program = _record_whole(
-                            loop, job.tensors, job.nwork, job.pre, job.body, job.post, job.ident,
-                            measured,
-                        )
-                except Exception as error:
-                    if isinstance(error, Building) or isinstance(error.__cause__, Building):
-                        with self._lock:
-                            known.pending[job.ident] = job  # a kernel still opens: the idle period
-                        graphs.IDLE.add(job)
-                        waiting = True
-                        row["refusals"].append("whole call: a kernel still opens")
-                    elif (why := _refusal(error)) is not None:
-                        _refused(row, "whole call", why)
-                        with self._lock:
-                            known.unfit.add(shape)
-                            known.why[shape] = why[:400]
-                    else:
-                        raise
-        finally:
-            if taken and not waiting:
-                job.region.close()  # its copies are the program's now, or go
+                    known.pending[job.ident] = job  # a kernel still opens: the idle period
+                graphs.IDLE.add(job)
+                row["refusals"].append("whole call: a kernel still opens")
+            elif (why := _refusal(error)) is not None:
+                _refused(row, "whole call", why)
+                with self._lock:
+                    known.unfit.add(shape)
+                    known.why[shape] = why[:400]
+            else:
+                raise
         if program is None:
             loop.eager_all(tensors, ctx)
             return True
@@ -673,37 +663,28 @@ class Loops:
             return "resident, and its overlays are armed only in its call"
         if shape in known.inside:
             return f"resident, recorded only in a call: {known.why.get(shape, '')}"[:400]
+        # What the call's tensors look like, holding nothing: its program's own are made as it
+        # records, before anything of it runs, and every later call copies its values in.
+        layouts = tuple((torch.empty_like(t, device="meta"), t.device) for t in _filled(tensors))
         with self._lock:
-            if ident in known.pending:
-                return "resident: the whole call records at idle"
-        job = _IdleRecording(
-            self,
-            site,
-            known,
-            replace(loop, on_step=None, retained=False),  # its progress hook stays with the call
-            tuple(value.clone() for value in _filled(tensors)),  # the program's own copies
-            nwork,
-            scope,
-            pre,
-            body,
-            known.after.get(shape, {}),
-            ident,
-            _LOCAL_SCOPES.get(),
-            tuple(model.wanted_identity() for model in scope),
-        )
-        # Its copies wait for an idle period beside every call before it: a cache reclaim drops.
-        job.region = scope[0].memory.region(
-            "denoise_loop.pending", release=job.drop, shrink=job.shrink
-        )
-        with self._lock:
-            if ident in known.pending:
-                queued = None
-            else:
-                known.pending[ident] = queued = job
-        if queued is None:
-            job.region.close()
-        else:
-            graphs.IDLE.add(job)
+            if ident not in known.pending:
+                job = _IdleRecording(
+                    self,
+                    site,
+                    known,
+                    replace(loop, on_step=None, retained=False),  # its hook stays with the call
+                    layouts,
+                    nwork,
+                    scope,
+                    pre,
+                    body,
+                    known.after.get(shape, {}),
+                    ident,
+                    _LOCAL_SCOPES.get(),
+                    tuple(model.wanted_identity() for model in scope),
+                )
+                known.pending[ident] = job
+                graphs.IDLE.add(job)
         return "resident: the whole call records at idle"
 
     def _install(self, site: Hashable, program: _Program, memory: Any) -> None:
@@ -1201,20 +1182,21 @@ def _eager_after(
 
 @dataclass(eq=False)
 class _IdleRecording:
-    """A keyed call's whole program, recorded at an idle period (`graphs.IDLE`) on copies of its
-    tensors, in the call's component scope, and kept for its site. A command preempts it at its
-    next torch op inside the recorded code; it records again at the next idle. Its copies are a
-    cache (`region`): residency's reclaim drops the job with them. One whose models changed fill
-    or left the device goes (the next call queues again); one varena has no room for at idle,
-    which takes only free room, waits for the next call to record it (`Loops._take_over`); one
-    that cannot be recorded (its code cannot run outside its request) is ruled out for its layout,
-    and the next calls say why."""
+    """A keyed call's whole program, recorded at an idle period (`graphs.IDLE`) in the call's
+    component scope, and kept for its site. Queued, it holds no memory: its program's tensors
+    are made as it records (`tensors`), and each later call copies its values in. A command
+    preempts it at its next torch op inside the recorded code; it records again at the next idle.
+    One whose models changed fill or left the device goes (the next call queues again); one
+    varena has no room for at idle, which takes only free room, waits for the next call to record
+    it (`Loops._take_over`); one that cannot be recorded (its code cannot run outside its request)
+    is ruled out for its layout, and the next calls say why."""
 
     loops: Loops
     site: Hashable
     known: _Site
     loop: _Loop
-    tensors: tuple[Any, ...]
+    #: each of the call's tensors as a meta tensor (`empty_like`'s layout) and its device
+    layouts: tuple[tuple[Any, Any], ...]
     nwork: int
     scope: tuple[Model, ...]
     pre: dict[Model, tuple[str, ...]]
@@ -1227,69 +1209,50 @@ class _IdleRecording:
     #: it yields between its parts (`_yield_point`), not per torch op (`graphs.IDLE`): under the
     #: per-op mode an RTX 4090's SDXL plan took 3.4 s instead of 0.46 s
     yields_per_op = False
-    #: its copies' cache handle (`Loops._queue`)
-    region: Any = None
 
     def __call__(self) -> bool:
         """True once kept, gone, or left for the next call; False for a later idle period."""
         shape = self.ident[1]  # type: ignore[index]
-        pin, end = ExitStack(), False
+        with self.loops._lock:
+            if self.known.pending.get(self.ident) is not self:
+                return True
         try:
-            pin.enter_context(self.region.pin())
-        except ResidencyError:
-            return True  # reclaimed: its copies went, and the next call queues again
-        try:
-            with pin:
-                with self.loops._lock:
-                    if self.known.pending.get(self.ident) is not self:
-                        end = True
-                        return True
-                try:
-                    end = self._record()
-                except graphs.Yielded:
-                    raise
-                except Exception as error:
-                    if isinstance(error, Building) or isinstance(error.__cause__, Building):
-                        return False  # a kernel still opens: a later idle period
-                    if isinstance(error, _NoRoom):
-                        return True  # the next call records it, before running any of it
-                    # A step that cannot be recorded (an RTX 3060's SDXL step frees memory
-                    # inside the capture: 900 from cuMemFree) is refused here as on a call's
-                    # path, not a device fault: one at idle poisoned the executor and failed
-                    # every next request. Anything else fails the job, and the period says so.
-                    end = True
-                    if (why := _refusal(error)) is None:
-                        raise
-                    with self.loops._lock:
-                        self.known.inside.add(shape)
-                        self.known.why[shape] = f"its idle recording failed: {why}"[:400]
-                    _warn(why)
-                    return True
-                return end
-        finally:
-            if end:
-                self.region.close()
+            done = self._record()
+        except graphs.Yielded:
+            raise
+        except Exception as error:
+            if isinstance(error, Building) or isinstance(error.__cause__, Building):
+                return False  # a kernel still opens: a later idle period
+            if isinstance(error, _NoRoom):
+                return True  # left pending: the next call records it, before running any of it
+            # A step that cannot be recorded (an RTX 3060's SDXL step frees memory inside the
+            # capture: 900 from cuMemFree) is refused here as on a call's path, not a device
+            # fault: one at idle poisoned the executor and failed every next request. Anything
+            # else fails the job, and the period says so.
+            if (why := _refusal(error)) is None:
+                self._end()
+                raise
+            with self.loops._lock:
+                self.known.inside.add(shape)
+                self.known.why[shape] = f"its idle recording failed: {why}"[:400]
+            _warn(why)
+            done = True
+        if done:
+            self._end()
+        return done
 
-    def drop(self) -> None:
-        """Its end: the job and its copies go (a program recorded on them holds its own)."""
+    def _end(self) -> None:
         with self.loops._lock:
             if self.known.pending.get(self.ident) is self:
                 del self.known.pending[self.ident]
-            self.tensors = ()
 
-    def shrink(self) -> bool:
-        """A cache reclaim on varena's worker: a queued job goes with its copies. It declines
-        while its site's lock is held, whose holder may be the caller allocating."""
-        if not self.loops._lock.acquire(blocking=False):
-            return False
-        try:
-            if self.known.pending.get(self.ident) is not self:
-                return False
-            del self.known.pending[self.ident]
-            self.tensors = ()
-            return True
-        finally:
-            self.loops._lock.release()
+    def tensors(self) -> tuple[Any, ...]:
+        """Its program's own tensors, of the call's layouts: their values are each later call's
+        (`Loops._reuse`)."""
+        return tuple(
+            torch.empty_strided(meta.shape, meta.stride(), dtype=meta.dtype, device=device)
+            for meta, device in self.layouts
+        )
 
     def _record(self) -> bool:
         """True once kept or gone; False to try at a later idle period."""
@@ -1313,7 +1276,7 @@ class _IdleRecording:
         overlays = lora.LOOP.set(frozenset())  # its call armed none, and nothing may arm one now
         try:
             with ExitStack() as scopes:
-                scopes.enter_context(torch.cuda.device(self.tensors[0].device))
+                scopes.enter_context(torch.cuda.device(self.layouts[0][1]))
                 scopes.enter_context(torch.inference_mode(False))
                 scopes.enter_context(torch.no_grad())
                 for owner, method, components in self.entry:
@@ -1328,8 +1291,8 @@ class _IdleRecording:
                 with self.loops._lock:
                     measured = dict(self.known.measured.get(self.ident[1], {}))  # type: ignore[index]
                 program = _record_whole(
-                    self.loop, self.tensors, self.nwork, self.pre, self.body, self.post, self.ident,
-                    measured,
+                    self.loop, self.tensors(), self.nwork, self.pre, self.body, self.post,
+                    self.ident, measured,
                 )
         finally:
             lora.LOOP.reset(overlays)
