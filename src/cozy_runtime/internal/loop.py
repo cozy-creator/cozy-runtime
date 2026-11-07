@@ -28,7 +28,7 @@ one whose code cannot run outside its request records only in a call; the calls 
 catches an allocation that fails after that: it fails the call. Other component loops stay eager:
 recording a streamed loop did not repay its recording and extra reads (Qwen-Image int8 1 MP on an
 RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs
-737 s).
+737 s). So does one whose scope holds an `@uncaptured` component, and nothing queues for it.
 
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
 `before` and the same warm steps run eagerly, then the rest natively. A refusal before anything is
@@ -1512,6 +1512,9 @@ def _eligible(
         return (), "one step"
     if not _LOCAL_SCOPES.get():
         return (), ""  # no components: tensor work only
+    for owner, _, components in _LOCAL_SCOPES.get():
+        if skipped := [name for name in components if name in type(owner).__uncaptured__]:
+            return (), f"its scope holds `@uncaptured` {', '.join(skipped)}"
     models = _phase_models()
     if not models:
         return (), "the scope's components are not placed on this device"
