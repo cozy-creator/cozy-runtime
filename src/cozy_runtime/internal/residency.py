@@ -1421,6 +1421,11 @@ class Memory:
         identity = model.wanted_identity()
         if identity != model.identity or identity is None:
             graphs.retire_stale(torch, model.module)
+            if any(b.retained for b in model.groups()) and model.retire_graphs is not None:
+                # Programs recorded against the old fill (a kept loop baked, now per_step) still
+                # bind its blocks: they go, their pools with them, and record again under the new
+                # fill. Never with the metadata lock held: closing joins CUDA.
+                model.retire_graphs()
             if any(b.retained for b in model.groups()):
                 raise StaleBinding("retire old graph bindings before changing a weight fill")
             for hold in list(model.holds):
