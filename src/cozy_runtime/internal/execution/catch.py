@@ -2,14 +2,17 @@
 
 A site lists its levels' shape estimates (`sizing`); native selection chooses one, makes its room
 and observes it, all before a piece runs. A level nothing can make room for is refused there
-(`DoesNotFit`), naming the next step. Every operation runs once: nothing here catches an
-allocation failure, which is the memory manager's to prevent.
+(`DoesNotFit`), naming the next step. An allocation refused inside the leaf is varena's to answer:
+it learns the level's need and says whether a Runtime-owned pure op runs again finer (Retry) or the
+refusal stands (Final). Nothing here decides that; package code never runs twice.
 """
 
 from __future__ import annotations
 
 import functools
+import sys
 import threading
+import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
@@ -21,7 +24,7 @@ from tensorfs import varena
 from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
-from cozy_runtime.author._errors import DoesNotFit
+from cozy_runtime.author._errors import DoesNotFit, is_capacity
 from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
 from cozy_runtime.internal.residency import Request
@@ -163,10 +166,12 @@ def note(
         }
 
 
-def cut[T](name: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -> T:
+def cut[T](
+    name: str, finest: int, need: sizing.Need, run: Callable[[int], T], *, pure: bool = True
+) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
-    attention pieces, a norm's or a conv's bands, a package's split), once. Without native memory,
-    or small, it runs whole; inside a capture or another site's leaf, at this key's last level."""
+    attention pieces, a norm's or a conv's bands, a package's split). Without native memory, or
+    small, it runs whole; inside a capture or another site's leaf, at this key's last level."""
     checkpoint()
     request = CURRENT.get()
     native = request is not None and request.memory.cuda
@@ -186,19 +191,63 @@ def cut[T](name: str, finest: int, need: sizing.Need, run: Callable[[int], T]) -
         request.memory.remember_working_phase(key, owners(request))
         stream = int(torch.cuda.current_stream(device).cuda_stream)
         selection = select(device, key, name, menu, stream)
-        level = int(selection["choice_id"])
-        token = begin(device, key, name, menu, level, selection, stream)
-        LEVELS[key] = level
-        note(request, key, name, level, selection)
-        submitted = False
-        try:
-            result = run(level)
-            submitted = True
+        while True:
+            level = int(selection["choice_id"])
+            token = begin(device, key, name, menu, level, selection, stream)
+            LEVELS[key] = level
+            note(request, key, name, level, selection)
+            try:
+                result = run(level)
+            except BaseException as exc:
+                again = retry(device, key, name, menu, level, token, stream, exc, pure)
+                if again is None:
+                    raise
+                selection = again
+                continue
+            vt.split_end(device, token, submitted=True)
             return result
-        finally:
-            vt.split_end(device, token, submitted=submitted)
     finally:
         LEAF.release()
+
+
+def retry(
+    device: int,
+    key: str,
+    name: str,
+    menu: Sequence[tuple[str, Sequence[int]]],
+    level: int,
+    token: int,
+    stream: int,
+    exc: BaseException,
+    pure: bool,
+) -> dict[str, Any] | None:
+    """Close the failed leaf. For a pure op whose leaf varena refused memory, varena's answer: the
+    finer level to run again at, its room made (`stats.finer_splits`; a short estimate), or None,
+    and the failure stands. The refused attempt's frames and tensors go before it counts room."""
+    closed = vt.split_end(device, token, submitted=False)
+    ask = getattr(vt, "split_refused", None)  # a TensorFS before 0.21.3 decides nothing
+    if not (pure and closed.get("refused_bytes") and ask is not None and is_capacity(exc)):
+        return None
+    _unwind(exc)
+    try:
+        again = ask(device, key, str(level), stream=stream)
+    except varena.Exhausted as refused:
+        raise refuse(device, name, "every finer split", sum(menu[-1][1]), refused) from exc
+    if again is not None:
+        print(f"cozy-runtime: {name} refused at level {level}: a short estimate", file=sys.stderr)
+        if (request := CURRENT.get()) is not None:
+            request.finer_splits += 1
+    return again
+
+
+def _unwind(exc: BaseException) -> None:
+    seen: set[int] = set()
+    at: BaseException | None = exc
+    while at is not None and id(at) not in seen:
+        seen.add(id(at))
+        if at.__traceback__ is not None:
+            traceback.clear_frames(at.__traceback__)
+        at = at.__cause__ or at.__context__
 
 
 def _tensors(value: object, depth: int = 3) -> list[Tensor]:
