@@ -32,7 +32,6 @@ from cozy_runtime.author._model_defaults import (
     model_defaults,
     model_on_demand,
     model_phases,
-    model_prepared_use,
 )
 from cozy_runtime.author._signature import Surface, analyze
 from cozy_runtime.author._tool import Tool
@@ -48,7 +47,6 @@ class RegistrationOptions(TypedDict, total=False):
     name: str | None
     preflight: Callable[..., object] | None
     phases: Sequence[str | Collection[str]]
-    prepared_use: Mapping[str, str] | None
     demand: Bound | None
     defaults: Mapping[str, str] | None
     components: Mapping[str, Sequence[str]] | None
@@ -79,7 +77,6 @@ class Registration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
-    model_prepared_use: Mapping[str, str] = field(default_factory=dict)
     #: A model argument's class where the registration names it (`cozy_runtime.derive.recipes`).
     model_classes: Mapping[str, type[Model[Any]]] = field(default_factory=dict)
     publishes: bool = False
@@ -122,7 +119,6 @@ class Registration:
                 model_defaults=self.model_defaults,
                 model_components=self.model_components,
                 model_on_demand=self.model_on_demand,
-                model_prepared_use=self.model_prepared_use,
                 model_classes=self.model_classes,
             )
             self._surface = surface
@@ -253,8 +249,7 @@ class App:
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """Register a function only this package's own calls run: never a root request or
         another package's call. It takes `entrypoint`'s options except `hidden` and
-        `model_classes`. `prepared_use={"model": "use"}` (a child task's only) names the typed
-        field that describes its fixed repeated weight use before construction."""
+        `model_classes`."""
         return self._register(fn, True, **options)
 
     def _register(
@@ -268,7 +263,6 @@ class App:
         name: str | None = None,
         preflight: Callable[..., object] | None = None,
         phases: Sequence[str | Collection[str]] = (),
-        prepared_use: Mapping[str, str] | None = None,
         demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
@@ -295,7 +289,6 @@ class App:
         declared_defaults = model_defaults(defaults)
         declared_components = model_components(components)
         declared_on_demand = model_on_demand(on_demand)
-        declared_use = model_prepared_use(prepared_use)
 
         def decorate(target: Callable[P, R]) -> Callable[P, R]:
             if self._frozen:
@@ -333,7 +326,6 @@ class App:
                 model_components=declared_components
                 or (export.components if export is not None else {}),
                 model_on_demand=declared_on_demand,
-                model_prepared_use=declared_use,
                 model_classes=dict(model_classes or {}),
                 publishes=publishes,
                 emits_media=emits_media,

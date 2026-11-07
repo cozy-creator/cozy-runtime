@@ -30,5 +30,7 @@ class RankMemory(msgspec.Struct, frozen=True, kw_only=True):
     rank: int
     request_id: str
     memory: GpuMemory | None = None
+    #: what this rank's commands waited for its idle work since its last request ended
+    idle_waited_ms: float = 0.0
     code: str = ""
     detail: str = ""

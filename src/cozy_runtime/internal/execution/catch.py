@@ -1,78 +1,49 @@
-"""Pure-site cuts sized from their operands against executor-local residency (`sizing`).
+"""Execution naming, cancellation boundaries and the general split.
 
-A pure cut site estimates its level from live shapes (`need`) and local room (`r.room()`).
-An unexpected capacity refusal tries bounded reclamation before the full recovery fallback,
-retrying only this pure level after memory was released; otherwise it descends. Failure at the
-finest level ends the request, typed (device_out_of_memory). Model blocks and package code run once.
+A pure site lists its levels' shape estimates (`sizing`); native selection chooses one and
+observes it. An ordinary operation runs once. A refusal inside a Runtime-owned pure op selects
+a finer level before anything leaves it, and warns and counts: it should never happen, and one in
+a normal run is an estimate to fix. A package's `split` never runs again.
 """
 
 from __future__ import annotations
 
 import functools
+import sys
 import threading
 import traceback
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from typing import Any
 
-import msgspec
+import tensorfs.varena.torch as vt
 import torch
 from torch import Tensor, nn
 
-import cozy_runtime.internal.execution.sizing as sizing
 from cozy_runtime.author._context import CURRENT as ATTEMPT
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import TRANSPARENT
+from cozy_runtime.internal.execution import phase, sizing
 from cozy_runtime.internal.residency import Request
 
 type Args = Sequence[object]
 type Kwargs = Mapping[str, object]
 
-#: the request being served (`serving`): its pure cut sites size from its local room
+#: the request being served: a site's weights and the phase it runs in
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
-
-
-class Cut(msgspec.Struct, frozen=True, kw_only=True):
-    """A site's dispatch: the level its operands' need fit, that need (bytes, ungranulated),
-    the room's tier it fit in, and the levels it descended after refusals."""
-
-    site: str
-    level: int
-    need: int
-    tier: str
-    descent: int
-    #: Same-level pure retries after observed local reclamation.
-    retries: int = 0
-
-
-class Cuts(msgspec.Struct, kw_only=True):
-    """A request's cut sites (`measurements.execution.cuts`): each site's first dispatch and
-    every one that descended, each site's eager calls at levels 0, 1, ..., and the refusals at
-    the floor."""
-
-    sites: list[Cut] = msgspec.field(default_factory=list)
-    levels: dict[str, list[int]] = msgspec.field(default_factory=dict)
-    oom_floor: int = 0
-
-
-#: per request (by identity), its cuts so far
-_ROWS: dict[int, Cuts] = {}
-_ROWS_LOCK = threading.Lock()
-
-
-@dataclass(eq=False, slots=True)
-class Scope:
-    """A cut in force: its site, and how many ops of each kind its current piece ran (the sites
-    of the ops inside it: the same in every piece, whatever the level)."""
-
-    site: str
-    ordinals: dict[str, int] = field(default_factory=dict)
+#: Below this a whole op runs unasked: allocator reclaim covers it, and three native calls cost
+#: more than it could save (an SDXL UNet's hundred small convs, in every eager step).
+_SMALL = 64 << 20
+#: Native leaves do not nest and this process has one device: a site that finds this held, in
+#: another site's leaf on any thread, runs inside that leaf's observation.
+LEAF = threading.Lock()
+#: each key's last native choice, for a capture (which may not select) to record the same pieces
+LEVELS: dict[str, int] = {}
 
 
 class _Local(threading.local):
     def __init__(self) -> None:
-        self.scopes: list[Scope] = []
         self.named: str | None = None
         self.ordinals: dict[str, int] = {}
 
@@ -82,7 +53,7 @@ _local = _Local()
 
 @contextmanager
 def serving(request: Request) -> Iterator[None]:
-    """The attempt's pure cut sites size from `request`'s room while it runs."""
+    """Bind the current request for the sites it runs."""
     token = CURRENT.set(request)
     try:
         yield
@@ -90,29 +61,12 @@ def serving(request: Request) -> Iterator[None]:
         CURRENT.reset(token)
 
 
-def cut_rows(request: Request) -> Cuts:
-    """`request`'s cuts, taken at its end (`measurements.execution.cuts`)."""
-    with _ROWS_LOCK:
-        return _ROWS.pop(id(request), Cuts())
-
-
 def site(kind: str) -> str | None:
     """A known cut's stable name under the current model block."""
-    if _local.scopes:
-        scope = _local.scopes[-1]
-        n = scope.ordinals[kind] = scope.ordinals.get(kind, 0) + 1
-        return f"{scope.site}/{kind}#{n}"
     if _local.named is None:
         return None
     n = _local.ordinals[kind] = _local.ordinals.get(kind, 0) + 1
     return f"{_local.named}/{kind}#{n}"
-
-
-def piece() -> None:
-    """A cut's next piece starts: the ops inside it are numbered from the start again."""
-    checkpoint()
-    if _local.scopes:
-        _local.scopes[-1].ordinals.clear()
 
 
 def checkpoint() -> None:
@@ -129,13 +83,25 @@ def checkpoint() -> None:
     context.raise_if_cancelled()
 
 
-def short(exc: BaseException) -> bool:
-    """A pure site's allocation refusal outside capture."""
-    return fault(exc) is Fault.OOM and not _capturing()
+def _capturing() -> bool:
+    return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
 
 
-def _clear(exc: BaseException) -> None:
-    """The refused attempt's frames go, and with them its tensors."""
+def whole(like: Tensor) -> Tensor:
+    """An output like `like`, allocated before any piece runs. Every level holds it the same, so
+    its refusal is final: no finer level can shrink it."""
+    try:
+        return like.new_empty(like.shape)
+    except Exception as exc:
+        exc.whole_output = True  # type: ignore[attr-defined]
+        raise
+
+
+def refused(exc: BaseException) -> bool:
+    """An allocation refusal a finer level may clear, outside capture; the refused attempt's frames
+    and tensors go."""
+    if getattr(exc, "whole_output", False) or fault(exc) is not Fault.OOM or _capturing():
+        return False
     seen: set[int] = set()
     at: BaseException | None = exc
     while at is not None and id(at) not in seen:
@@ -143,121 +109,168 @@ def _clear(exc: BaseException) -> None:
         if at.__traceback__ is not None:
             traceback.clear_frames(at.__traceback__)
         at = at.__cause__ or at.__context__
-
-
-def _capturing() -> bool:
-    return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
-
-
-def _refused(exc: BaseException) -> bool:
-    if not short(exc):
-        return False
-    _clear(exc)
     return True
 
 
-def cut[T](
-    site: str,
-    finest: int,
-    need: sizing.Need,
-    run: Callable[[int], T],
-    *,
-    misfit: Callable[[], None] | None = None,
-) -> T:
-    """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
-    attention pieces, a package's split, a norm's or a conv's bands), at the coarsest level
-    whose `need` fits the request's room; a refusal descends. Outside a request it runs whole;
-    inside a capture at the level the room gives now (its pool was prepared for it). `misfit`
-    hears of a refusal at a level whose `need` fit the room: the estimate was short."""
-    checkpoint()
-    request = CURRENT.get()
-    if request is None:
-        return run(0)
-    scope = Scope(site)
-    _local.scopes.append(scope)
-    available: sizing.Room
-    retries = 0
+def went_finer(name: str, level: int) -> None:
+    """A refusal took this site finer than its estimate chose (`stats.finer_splits`)."""
+    print(f"cozy-runtime: {name} refused at level {level}: a short estimate", file=sys.stderr)
+    if (request := CURRENT.get()) is not None:
+        request.finer_splits += 1
 
-    def room() -> sizing.Room:
-        nonlocal available
-        available = request.room()
-        return available
 
-    def whole(level: int) -> T:
-        nonlocal retries
-        checkpoint()
-        scope.ordinals.clear()
-        # Stock Torch cannot evict live cached weights inside an allocation. A declared pure
-        # site's predicted cold/warm bytes must be reclaimed before running that site. Torch's
-        # cached bytes are room too: its activations reuse them first, and returning them at
-        # every call of a step's sites is a device sync each (Krea 2's 2048² DiT stepped 14%
-        # slower beside its resident weights, emptying the cache 28 times a step).
-        if not _capturing() and (wanted := need(level, available.granularity)) > (
-            available.free + available.cached
-        ):
-            request.reclaim(wanted)
+def _finer[T](name: str, run: Callable[[int], T], level: int, finest: int, pure: bool) -> T:
+    """`run(level)` outside a native leaf; a pure op's refusal goes one level finer."""
+    while True:
         try:
             return run(level)
         except Exception as exc:
-            if not short(exc):
+            if not pure or level >= finest or not refused(exc):
                 raise
-            _clear(exc)
-            failure: BaseException | None = exc
-        if misfit is not None and need(level, available.granularity) <= sizing.capacity(available):
-            misfit()
-        # A failed allocation can reveal pressure the shape estimate cannot predict.
-        # This also runs at the finest level, which sizing.descend cannot make smaller.
-        # First release a bounded amount, now that failed-frame pins are gone. An
-        # underestimated workspace still gets the existing full-reclaim last chance.
-        fresh = request.room()
-        target = max(need(level, fresh.granularity), fresh.free + fresh.granularity)
-        for wanted in (target, 0):
-            if request.reclaim(wanted) <= 0:
-                continue
-            retries += 1
-            checkpoint()
-            scope.ordinals.clear()
+        went_finer(name, level)
+        level += 1
+
+
+def useful(sizes: Sequence[Sequence[int]]) -> list[Sequence[int]]:
+    """The levels worth listing: down to the first within 1/64 of the finest's bytes (the whole
+    output is the need by then) or at 1/64 of the whole's. Finer only adds launches."""
+    least, whole = sum(sizes[-1]), sum(sizes[0])
+    floor = max(least + least // 64, whole // 64)
+    return list(sizes[: next(n for n, row in enumerate(sizes) if sum(row) <= floor) + 1])
+
+
+def owners(request: Request) -> tuple[Any, ...]:
+    """What a site's samples live and die with: the running models, or a componentless request."""
+    with request.memory.lock:
+        models = tuple(m for m in request.memory.models.values() if m.name in request.current)
+    return models or (request,)
+
+
+def select(
+    device: int, key: str, menu: Sequence[tuple[str, Sequence[int]]], stream: int, floor: int = 0
+) -> tuple[int, dict[str, Any] | None]:
+    """The level native selection takes, no coarser than `floor`. An estimate that nothing fits
+    is not a refusal: the finest runs, and the allocator decides."""
+    try:
+        selection = vt.split_select(device, key, menu, stream=stream)
+    except Exception as exc:
+        if fault(exc) is not Fault.OOM:
+            raise
+        return len(menu) - 1, None
+    return max(int(selection["choice_id"]), floor), selection
+
+
+def begin(
+    device: int, key: str, level: int, selection: dict[str, Any] | None, stream: int
+) -> int | None:
+    """Open `level`'s native observation, making its room; None where the estimate is refused."""
+    phase.choice()
+    if selection is None:
+        return None
+    try:
+        return phase.begin_split(device, key, str(level), selection, stream=stream)
+    except Exception as exc:
+        if fault(exc) is not Fault.OOM:
+            raise
+        return None
+
+
+def note(
+    request: Request, key: str, name: str, level: int, selection: dict[str, Any] | None = None
+) -> None:
+    """A site's calls per level and what each was last chosen against, for the run record."""
+    record = request.working_splits.setdefault(key, {"site": name, "levels": {}, "chosen": {}})
+    record["levels"][str(level)] = record["levels"].get(str(level), 0) + 1
+    if selection is not None:
+        record["chosen"][str(level)] = {
+            "full": selection["allocation_backing_bytes"],
+            "budget": selection["budget_bytes"],
+            "capacity": selection["capacity_bytes"],
+            "live": selection["live_bytes"],
+            "weights": selection["phase_weight_bytes"],
+            "required": selection["required_bytes"],
+            "available": selection["available_bytes"],
+            "target": selection["eligible"][0] if selection["eligible"] else None,
+        }
+
+
+def cut[T](
+    name: str, finest: int, need: sizing.Need, run: Callable[[int], T], *, pure: bool = True
+) -> T:
+    """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
+    attention pieces, a norm's or a conv's bands, a package's split). Without native memory, or
+    small, it runs whole; inside a capture or another site's leaf, at this key's last level."""
+    checkpoint()
+    request = CURRENT.get()
+    native = request is not None and request.memory.cuda
+    if not (native or _capturing()) or sum(need(0)) < _SMALL:
+        return _finer(name, run, 0, finest, pure)
+    menu = tuple(
+        (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
+    )
+    finest = len(menu) - 1
+    key = f"{name}:{hash(menu):x}"
+    if not native or not LEAF.acquire(blocking=False):
+        return _finer(name, run, LEVELS.get(key, 0), finest, pure)
+    assert request is not None
+    try:
+        device = request.memory.device.index or 0
+        if not vt.split_context(device)["eligible"]:
+            return _finer(name, run, LEVELS.get(key, 0), finest, pure)
+        request.memory.remember_working_phase(key, owners(request))
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
+        floor = 0
+        while True:
+            level, selection = select(device, key, menu, stream, floor)
+            token = begin(device, key, level, selection, stream)
+            LEVELS[key] = level
+            note(request, key, name, level, selection)
+            submitted = False
             try:
                 result = run(level)
-            except Exception as retry_error:
-                if not short(retry_error):
+                submitted = True
+                return result
+            except Exception as exc:
+                if not pure or level >= finest or not refused(exc):
                     raise
-                _clear(retry_error)
-                failure = retry_error
-                continue
-            # The kept failure's traceback holds this frame, and through each caller's
-            # frame every tensor their locals name, until the cyclic collector runs: a
-            # split's whole output and its input (2.5 GB at H3 15 s) outlived the call
-            # that retried and made an 8 GB card refuse the next block (xs-141, run 24683).
-            failure = None
-            return result
-        assert failure is not None
-        raise failure from None
-
-    try:
-        if _capturing():
-            available = request.room()
-            return whole(sizing.choose(finest, need, available)[0])
-        try:
-            result, level, steps, tier = sizing.descend(finest, need, room, whole, _refused)
-        except Exception as exc:
-            if short(exc):
-                with _ROWS_LOCK:
-                    _ROWS.setdefault(id(request), Cuts()).oom_floor += 1
-            raise
-        row = Cut(
-            site=site, level=level, need=need(level, 1), tier=tier, descent=steps, retries=retries
-        )
-        with _ROWS_LOCK:
-            rows = _ROWS.setdefault(id(request), Cuts())
-            calls = rows.levels.setdefault(site, [])
-            calls.extend([0] * (level + 1 - len(calls)))
-            calls[level] += 1
-            if steps or retries or all(r.site != site for r in rows.sites):
-                rows.sites.append(row)
-        return result
+                floor = level + 1
+            finally:
+                if token is not None:
+                    vt.split_end(device, token, submitted=submitted)
+            went_finer(name, level)
     finally:
-        _local.scopes.remove(scope)
+        LEAF.release()
+
+
+def _tensors(value: object, depth: int = 3) -> list[Tensor]:
+    """The tensors in `value`, `depth` levels of sequences and mappings deep."""
+    if isinstance(value, Tensor):
+        return [value]
+    if depth and isinstance(value, list | tuple | Mapping):
+        items = value.values() if isinstance(value, Mapping) else value
+        return [t for item in items for t in _tensors(item, depth - 1)]
+    return []
+
+
+@contextmanager
+def passing(module: nn.Module, args: Args, kwargs: Kwargs) -> Iterator[None]:
+    """A component's forward as one observed execution, keyed by its operands' shapes: native
+    keeps its working peak for the next pass's prefetch, and its sites' measured peaks replace
+    their estimates. An enclosing loop's observation owns the device instead."""
+    request = CURRENT.get()
+    if request is None or request.idle or not request.memory.cuda or _capturing():
+        yield
+        return
+    device = request.memory.device.index or 0
+    shapes = [(tuple(t.shape), str(t.dtype)) for t in _tensors((args, kwargs))]
+    key = phase.execution_key(f"{type(module).__qualname__}:{shapes}", "runtime.pass/1")
+    assert key is not None
+    request.memory.remember_working_phase(key, owners(request))
+    with phase.observing(device, "eager", request.working_phases, key=key) as observation:
+        yield
+        if observation is not None:
+            observation.completion_stream.synchronize()
+            observation.complete()
 
 
 def wrap(
@@ -265,7 +278,7 @@ def wrap(
     name: str,
     around: Callable[[nn.Module, Args, Kwargs], AbstractContextManager[None]] | None = None,
 ) -> None:
-    """Name a block's pure sites and enter pass agreement; invoke its forward exactly once."""
+    """Name a block's execution sites and invoke its forward exactly once."""
     forward = vars(module).get("forward") or current(module)
 
     @functools.wraps(module.forward)
@@ -293,13 +306,3 @@ def transparent[F: Callable[..., object]](forward: F) -> F:
 def current(module: nn.Module) -> Callable[..., object]:
     """`module`'s class forward as it is at each call."""
     return lambda *args, **kwargs: type(module).forward(module, *args, **kwargs)
-
-
-def tensors(value: object, depth: int = 3) -> list[Tensor]:
-    """The tensors in `value`, `depth` levels of sequences and mappings deep."""
-    if isinstance(value, Tensor):
-        return [value]
-    if depth and isinstance(value, list | tuple | Mapping):
-        items = value.values() if isinstance(value, Mapping) else value
-        return [t for item in items for t in tensors(item, depth - 1)]
-    return []

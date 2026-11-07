@@ -1,5 +1,5 @@
 """`split`: the package says how an op cuts (`Cut`); the memory says how finely (the execution
-layer's `split`, installed with it): whole, else in the windows the level Rust holds gives. A
+layer's `split`, installed with it): whole, else in the windows native selection gives. A
 layout that changes the result (a blended cut) comes from the shape alone (`most`)."""
 
 from __future__ import annotations
@@ -24,8 +24,7 @@ class Cut:
 
 class Pieces(Protocol):
     """The memory's side of `split`: `split` runs `run(most)` in windows of at most `most` of
-    `total` elements, the least `finest`, finer while out of memory; `piece` marks each window's
-    start (the ops inside are numbered per window)."""
+    `total` elements, the least `finest`, once; `piece` marks each window's start."""
 
     def split(
         self,
@@ -34,7 +33,10 @@ class Pieces(Protocol):
         total: int,
         finest: int,
         out_bytes: int,
+        item_bytes: float,
+        holds: int,
         run: Callable[[int], Any],
+        pure: bool = False,
     ) -> Any: ...
 
     def piece(self) -> None: ...
@@ -49,7 +51,12 @@ def install(runtime: Pieces | None) -> None:
 
 
 def split(
-    fn: Callable[..., Any], x: Any, *cuts: Cut, most: int | None = None, out: Any = None
+    fn: Callable[..., Any],
+    x: Any,
+    *cuts: Cut,
+    most: int | None = None,
+    out: Any = None,
+    holds: int = 5,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -61,23 +68,30 @@ def split(
 
     With `most`, the windows are the fewest of at most `most` elements, on every device and
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
-    cut's (an `overlap`) does. Without it such a layout follows free memory."""
+    cut's (an `overlap`) does. Without it such a layout follows free memory.
+
+    `holds` is `fn`'s peak beside the whole output, in windows of its output: the estimate the
+    device's choice starts from before it has measured a pass."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
+    # Writing windows in place (`out`) can consume its input, so that never runs twice.
+    pure = out is None and getattr(fn, "PURE_WINDOWS", False)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
     if most is not None and cuts:
         windows = _windows(shape, cuts, most)
         if runtime is None:
             return _run(fn, x, cuts, windows, lambda: None, out)
-        # One level: a refusal reclaims and runs the same windows again, never finer ones.
         return runtime.split(
             _name(fn),
             _key(fn, shape, cuts, x.dtype),
             most,
             most,
             0 if out is not None else _bytes(shape, cuts, x),
+            _item_bytes(cuts, x),
+            holds,
             lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
+            pure,
         )
     if runtime is None or not cuts:
         if out is None:
@@ -90,7 +104,10 @@ def split(
         math.prod(shape),
         _finest(shape, cuts),
         0 if out is not None else _bytes(shape, cuts, x),
+        _item_bytes(cuts, x),
+        holds,
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
+        pure,
     )
 
 
@@ -103,12 +120,17 @@ def _key(
     """Bytes per element depend on the op and its uncut extents."""
     cut = {c.dim % len(shape) for c in cuts}
     rest = tuple(n if i not in cut else -1 for i, n in enumerate(shape))
-    return f"{_name(fn)}{rest}:{dtype}"
+    return f"{getattr(fn, '__module__', '')}.{_name(fn)}{rest}:{dtype}"
+
+
+def _item_bytes(cuts: tuple[Cut, ...], x: Any) -> float:
+    """Output bytes per input element."""
+    return float(math.prod(c.scale for c in cuts) * x.element_size())
 
 
 def _bytes(shape: tuple[int, ...], cuts: tuple[Cut, ...], x: Any) -> int:
     """The whole output's bytes, which `split` allocates beside its windows."""
-    return int(math.prod(shape) * math.prod(c.scale for c in cuts) * x.element_size())
+    return int(math.prod(shape) * _item_bytes(cuts, x))
 
 
 def _name(fn: Callable[[Any], Any]) -> str:

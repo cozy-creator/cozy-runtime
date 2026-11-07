@@ -2,8 +2,8 @@
 
 Purity alone is insufficient: tensor-global activation scales and RNG state forbid cuts.
 Changing GEMM row geometry may change rounding; bitwise equivalence is not promised.
-The results stay on the device, at the level each call's operands need against the request's
-room (`catch`, `sizing`). Level L is 2^L pieces, down to the finest.
+The results stay on the device, at the level native selection takes from each call's operands
+(`catch`, `sizing`). Level L is 2^L pieces, down to the finest.
 
 Call cuts: Diffusers' FFNs by token, its channel RMS norms by rows, attention by head groups
 then query rows, a package's `split` by windows.
@@ -14,7 +14,6 @@ from __future__ import annotations
 import functools
 import math
 import sys
-import threading
 from collections.abc import Callable, Sequence
 from typing import cast
 
@@ -113,8 +112,8 @@ def _conv_bands(site: str, module: nn.Module, conv: Conv) -> Conv:
 def _conv_need(module: nn.Module, x: Tensor, units: int, by_images: bool) -> sizing.Per:
     """A band's bytes: the whole output, held throughout; the band's output; and, where the conv
     pads by copying (a padding mode other than zeros), the band's padded input (an image band's
-    images, or the whole input again for a channel band). cuDNN's workspace comes from the
-    agent's float (its bound is the GPU round's measure)."""
+    images, or the whole input again for a channel band). cuDNN's workspace is left to allocator
+    reclaim and the measured sample."""
     dims, b = len(module.kernel_size), x.element_size()
     spatial = [int(n) for n in x.shape[-dims:]]
     if module.padding == "same":
@@ -132,9 +131,9 @@ def _conv_need(module: nn.Module, x: Tensor, units: int, by_images: bool) -> siz
     copied = module.padding_mode != "zeros"
     whole_in = x.numel() * b
 
-    def piece(n: int, granularity: int) -> int:
+    def piece(n: int) -> tuple[int, ...]:
         copy = (n * whole_in // units if by_images else whole_in) if copied else 0
-        return sizing.peak(granularity, out, (copy, n * out // units))
+        return sizing.peak(out, (copy, n * out // units))
 
     return piece
 
@@ -152,7 +151,7 @@ def _bands(
         return conv(x, weight, bias)
     size, out, axis = pieces(units, level), None, 0 if by_images else 1
     for at in range(0, units, size):
-        catch.piece()
+        catch.checkpoint()
         if by_images:
             part = conv(x[at : at + size], weight, bias)
         else:
@@ -273,7 +272,7 @@ def _tokens(forward: Callable[..., object], x: Tensor, tokens: int, level: int) 
         return forward(x)
     size, flat, out = pieces(tokens, level), x.reshape(tokens, x.shape[-1]), None
     for at in range(0, tokens, size):
-        catch.piece()
+        catch.checkpoint()
         part = forward(flat[at : at + size])
         if not isinstance(part, Tensor):
             raise _Whole
@@ -316,7 +315,7 @@ def _rows(forward: Callable[..., object], flat: Tensor, tokens: int, level: int)
         return forward(flat)
     size, out = pieces(tokens, level), None
     for at in range(0, tokens, size):
-        catch.piece()
+        catch.checkpoint()
         part = cast(Tensor, forward(flat[at : at + size]))
         out = part.new_empty((tokens, *part.shape[1:])) if out is None else out
         out[at : at + part.shape[0]].copy_(part)
@@ -390,7 +389,7 @@ def _rms_bands(forward: Callable[..., object], x: Tensor, axis: int, level: int)
     rows, out = pieces(height, level), None
     for at in range(0, height, rows):
         length = min(rows, height - at)
-        catch.piece()
+        catch.checkpoint()
         part = forward(x.narrow(axis, at, length))
         expected = (*x.shape[:axis], length, *x.shape[axis + 1 :])
         if not isinstance(part, Tensor) or part.shape != expected:
@@ -412,14 +411,12 @@ def attend(
     *,
     rows: int = 0,
     heads: bool = True,
-    scratch: str = "flash",
 ) -> Tensor:
-    """`call(q, k, v, mask)` over [batch, sequence, heads, dim], in pieces at the level its
-    operands need against the request's room, each computed as the whole computes it. Level L is
-    2^L pieces of whole K/V groups (their query heads with them) when `heads` (the kernel reduces
-    within a head); past one group a piece, the rows halve: query rows on multiples of `rows`
-    (the kernel's query block; 0: never), each beside every key. `scratch` is the backend's
-    working memory (`sizing.Attention`): flash-like, sage's quantized q/k, or math's scores."""
+    """`call(q, k, v, mask)` over [batch, sequence, heads, dim], in pieces at the level native
+    selection takes, each computed as the whole computes it. Level L is 2^L pieces of whole K/V
+    groups (their query heads with them) when `heads` (the kernel reduces within a head); past one
+    group a piece, the rows halve: query rows on multiples of `rows` (the kernel's query block; 0:
+    never), each beside every key."""
     site = catch.site("attention")
     if site is None:
         return call(q, k, v, mask)
@@ -444,12 +441,10 @@ def attend(
         int(k.shape[1]),
         int(q.shape[3]),
         q.element_size(),
-        scratch,
-        kv_copies=1,
     )
 
-    def need(level: int, granularity: int) -> int:
-        return shape.need(*cut(level), granularity)
+    def need(level: int) -> tuple[int, ...]:
+        return shape.need(*cut(level))
 
     def piece(level: int) -> Tensor:
         return _attend(call, q, k, v, mask, group, *cut(level))
@@ -462,106 +457,48 @@ def _attend(
 ) -> Tensor:
     """Query heads [h, h + hp) with the K/V heads they read, by query rows [s, s + rp)."""
     group, hp, rp = cut
-    batch, length, count = int(q.shape[0]), int(q.shape[1]), int(q.shape[2])
+    length, count = int(q.shape[1]), int(q.shape[2])
     if hp >= count and rp >= length:
         return call(q, k, v, mask)
     whole = mask.expand(-1, count, length, -1) if mask is not None else None
-    out: Tensor | None = None
+    out = catch.whole(q)
     for h in range(0, count, hp):
         n, lo, hi = min(hp, count - h), h // group, (min(h + hp, count) - 1) // group + 1
         for s in range(0, length, rp):
-            catch.piece()
+            catch.checkpoint()
             part = whole[:, h : h + n, s : s + rp] if whole is not None else None
             piece = call(q[:, s : s + rp, h : h + n], k[:, :, lo:hi], v[:, :, lo:hi], part)
-            out = piece.new_empty((batch, length, count, *piece.shape[3:])) if out is None else out
             out[:, s : s + rp, h : h + n].copy_(piece)
             del piece
-    assert out is not None
     return out
 
 
-#: per split key, its op's measured bytes at its first two windows: (window elements, the
-#: section's peak less what was live at its start and the output). A measurement on the live
-#: tensors, never an OOM; fitted once both are in (`sizing.fitted`)
-_MEASURED: dict[str, list[tuple[int, int]]] = {}
-#: split keys whose larger measuring window the device refused: the second point is a smaller one
-_REFUSED: set[str] = set()
-_MEASURED_LOCK = threading.Lock()
-
-
 def split[T](
-    name: str, key: str, total: int, finest: int, out_bytes: int, run: Callable[[int], T]
+    name: str,
+    key: str,
+    total: int,
+    finest: int,
+    out_bytes: int,
+    item_bytes: float,
+    holds: int,
+    run: Callable[[int], T],
+    pure: bool = False,
 ) -> T:
     """A package's `split` (`cozy_runtime.author.split`): `run(most)` runs it in windows of at
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
-    Its op's bytes are measured at its first two successful window sizes, then fitted: an
-    op quadratic in its window scales as one. The first measurement groups at most 128
-    minimum windows; allocation refusals use the ordinary descent to smaller windows.
-    Like every split call, the declared operation must be safe to retry without side effects."""
+    Package code runs once: a refusal fails the call, unless `pure` says `run` is a Runtime leaf's
+    and goes finer. `out_bytes` is the whole output held beside
+    the windows, `item_bytes` a window's output per element, `holds` how many of that its op's
+    peak holds, its author's estimate: allocator reclaim covers a short one, and a completed
+    pass's measured sample replaces it."""
     deepest = levels(-(-total // max(finest, 1)))
 
     def window(level: int) -> int:
         return max(pieces(total, level), finest)
 
-    with _MEASURED_LOCK:
-        points = sorted(_MEASURED.get(key, ()))
-        refused = key in _REFUSED
-    request = catch.CURRENT.get()
-    if request is not None:
-        request.note_split(out_bytes)
-    measured: tuple[int, int] | None = None
+    def need(level: int) -> tuple[int, ...]:
+        return (out_bytes, *[int(window(level) * item_bytes)] * holds)
 
-    def at(level: int) -> T:
-        nonlocal measured
-        if len(points) == 2 or request is None or deepest == 0:
-            return run(window(level))
-        request.reset_peak()
-        start = request.reset_peak()  # Restart after each refused attempt, not before descent.
-        result = run(window(level))
-        grew = max(request.reset_peak() - start - out_bytes, 0)
-        measured = (window(level), grew)
-        return result
-
-    if len(points) == 2:
-        fit = sizing.fitted(points[0], points[1])
-
-        def need(level: int, granularity: int) -> int:
-            return sizing.peak(granularity, out_bytes, (fit(window(level)),))
-
-        def misfit() -> None:
-            # The device refused a window the fit said fits: an op the fit never measured (H3's
-            # sparse attention under its dense steps' fit), which every later call would repeat
-            # (cr-239). The next calls measure the op that runs.
-            with _MEASURED_LOCK:
-                if sorted(_MEASURED.get(key, ())) == points:
-                    del _MEASURED[key]
-                    _REFUSED.discard(key)
-
-        return catch.cut(f"split:{key}", deepest, need, at, misfit=misfit)
-    # A whole long sequence at one token per launch is expensive even when it fits.
-    # Start bounded, then measure the next larger window; where the device refused it (a short
-    # axis: H3's 56 heads start at 28 a window), the next smaller. OOM still descends.
-    if not points:
-        target = min(deepest, max(deepest - 7, 1))
-    elif refused:
-        target = next((lv for lv in range(deepest + 1) if window(lv) < points[0][0]), deepest)
-    else:
-        target = next((lv for lv in range(deepest, -1, -1) if window(lv) > points[-1][0]), 0)
-
-    def measuring(level: int, granularity: int) -> int:
-        return 0 if level >= target else sys.maxsize  # a coarser window is not yet measured
-
-    if request is None or deepest == 0:
-        return catch.cut(f"split:{key}", deepest, measuring, at)
-    result = catch.cut(f"split:{key}", deepest, measuring, at)
-    assert measured is not None
-    with _MEASURED_LOCK:
-        known = _MEASURED.setdefault(key, [])
-        if len(known) < 2 and all(measured[0] != w for w, _ in known):
-            known.append(measured)
-            known.sort()
-        elif len(known) == 1:
-            _REFUSED.add(key)  # the larger window descended to the known one
-    return result
+    return catch.cut(f"split:{key}", deepest, need, lambda level: run(window(level)), pure=pure)

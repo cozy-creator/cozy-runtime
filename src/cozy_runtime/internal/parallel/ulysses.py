@@ -1,26 +1,33 @@
 """The torch side of Runtime's Ulysses attention: the process group a parallel configuration
 names, and the exchange around a head-local kernel (`attention_ulysses`). Sequence shards cross
-to whole sequences per head subset, the kernel runs, and its output crosses back; packed H3
-lengths do not divide, so every GPU's rows are gathered once per exchange and every crossing
-uses them. The exchange's head groups are agreed once per pass (each GPU proposing what its
-room needs); an exchange is never rerun locally once any rank can have entered its collectives. Importing this module serves the torch-free
-attention dispatch boundary.
+to whole sequences per head subset, `compute` runs, and its output crosses back.
+
+Two rounds of metadata over the group's store come first. Every rank proposes its rows and the
+level native selection takes for it; every rank takes the finest proposed, admits it and allocates
+its first buffers; every rank reports ready or refused. No rank enters a collective alone, and a
+refusal there selects the next finer level on every rank. Once a tensor crosses nothing runs again.
 """
 
 from __future__ import annotations
 
+import json
+import threading
+import weakref
 from collections.abc import Callable, Sequence
-from typing import cast
+from typing import Any, cast
 
+import tensorfs.varena.torch as vt
 import torch
 import torch.distributed as dist
 from torch import Tensor
 from torch.distributed import ProcessGroup
-from torch.distributed import _functional_collectives as funcol
+from torch.distributed.distributed_c10d import _get_process_group_store
 
+from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.internal import attention_ulysses
-from cozy_runtime.internal.execution import agree, catch, sizing
+from cozy_runtime.internal.execution import catch, sizing
 from cozy_runtime.internal.parallel import copy_engine
+from cozy_runtime.internal.parallel.group import abort_process_group
 
 type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
 
@@ -41,161 +48,250 @@ def group(config: object) -> ProcessGroup:
     return cast(ProcessGroup, handle)
 
 
+class _Rendezvous:
+    """Metadata rounds over the group's store; no tensor crosses here."""
+
+    def __init__(self, handle: ProcessGroup) -> None:
+        self.store = dist.PrefixStore(
+            f"cozy.ulysses/{handle.group_name}/", _get_process_group_store(handle)
+        )
+        self.rank, self.world = dist.get_rank(handle), dist.get_world_size(handle)
+        self.sequence = 0
+        self.lock = threading.Lock()
+
+    def gather(self, stage: str, value: dict[str, Any]) -> list[dict[str, Any]]:
+        prefix = f"{self.sequence}/{stage}/"
+        keys = [f"{prefix}{rank}" for rank in range(self.world)]
+        self.store.set(keys[self.rank], json.dumps(value))
+        rows = [json.loads(data) for data in self.store.multi_get(keys)]
+        # Rank 0 deletes once every rank has read, so a long-lived group's store stays small.
+        done = [f"{prefix}read/{rank}" for rank in range(self.world)]
+        self.store.set(done[self.rank], b"1")
+        if self.rank == 0:
+            self.store.multi_get(done)
+            for key in (*keys, *done):
+                self.store.delete_key(key)
+        return rows
+
+
+_RENDEZVOUS: weakref.WeakKeyDictionary[ProcessGroup, _Rendezvous] = weakref.WeakKeyDictionary()
+_RENDEZVOUS_LOCK = threading.Lock()
+
+
+def _rendezvous(handle: ProcessGroup) -> _Rendezvous:
+    with _RENDEZVOUS_LOCK:
+        found = _RENDEZVOUS.get(handle)
+        if found is None:
+            found = _RENDEZVOUS[handle] = _Rendezvous(handle)
+        return found
+
+
+def _steps(heads: int, world: int) -> list[int]:
+    """Head groups a rank can take whole heads of, whole first."""
+    return sorted({heads, *(n for n in range(world, heads, world) if heads % n == 0)}, reverse=True)
+
+
+def _need(
+    step: int, batch: int, rows: int, heads: int, dim: int, b: int, world: int
+) -> tuple[int, ...]:
+    """A group of `step` heads: the output held throughout; its q, k and v sent and received; then
+    received beside the local attention; then the attended rows and their return. Every rank's rows
+    are taken as this one's: an estimate."""
+    total, local = rows * world, step // world
+    each = batch * rows * step * dim * b
+    attention = sizing.Attention(batch, total, local, local, total, dim, b).need(local, total)
+    return sizing.peak(
+        batch * rows * heads * dim * b,
+        (each, each, each, each, each, each),
+        (each, each, each, *attention),
+        (each, each),
+    )
+
+
+def _refusal(rows: Sequence[dict[str, Any]]) -> None:
+    """Raise a refusal some rank reported, as what it was."""
+    failed = [row for row in rows if row.get("error")]
+    if failed:
+        kind = torch.OutOfMemoryError if any(row["oom"] for row in failed) else RuntimeError
+        raise kind(f"Ulysses refused before its first crossing: {[r['error'] for r in failed]}")
+
+
+def _failure(exc: BaseException) -> dict[str, Any]:
+    return {"error": f"{type(exc).__name__}: {exc}", "oom": fault(exc) is Fault.OOM}
+
+
+def _cross(
+    handle: ProcessGroup,
+    engines: copy_engine.CopyEngineExchange | None,
+    sends: list[Tensor],
+    receives: list[Tensor],
+    matrix: list[list[int]],
+    rank: int,
+) -> None:
+    """One crossing of `matrix`'s rows, over the copy engines when the group formed over them."""
+    if engines is not None:
+        engines.all_to_all_into(sends, matrix, receives)
+        return
+    works = [
+        dist.all_to_all_single(
+            out,
+            value,
+            output_split_sizes=[row[rank] for row in matrix],
+            input_split_sizes=matrix[rank],
+            group=handle,
+            async_op=True,
+        )
+        for value, out in zip(sends, receives, strict=True)
+    ]
+    for work in works:
+        work.wait()
+
+
+def _pack(source: Tensor, target: Tensor, start: int, world: int) -> None:
+    """`source`'s heads from `start`, into send rows block per GPU; heads past its end are the
+    padding every GPU agreed."""
+    batch, rows, heads, dim = source.shape
+    local = target.shape[2]
+    grouped = target.view(world, rows, batch, local, dim)
+    if start + world * local > heads:
+        grouped.zero_()
+    for peer in range(world):
+        first = start + peer * local
+        count = min(local, max(heads - first, 0))
+        if count:
+            grouped[peer, :, :, :count].permute(1, 0, 2, 3).copy_(
+                source[:, :, first : first + count]
+            )
+
+
+def _buffers(query: Tensor, world: int, total: int, local: int) -> list[list[Tensor]]:
+    """A head group's sends and receives, for q, k and v."""
+    batch, rows, _, dim = (int(n) for n in query.shape)
+    return [
+        [query.new_empty((n, batch, local, dim)) for _ in range(3)] for n in (world * rows, total)
+    ]
+
+
 def exchange(
     query: Tensor, key: Tensor, value: Tensor, handle: ProcessGroup, compute: Compute
 ) -> Tensor:
     """`compute` over whole sequences per head subset, back to this GPU's rows of every head."""
-    heads, world = int(query.shape[2]), handle.size()
+    meet = _rendezvous(handle)
+    held = catch.LEAF.acquire(blocking=False)
+    try:
+        # One model pass owns its group's collective order.
+        with meet.lock:
+            meet.sequence += 1
+            return _exchange(meet, query, key, value, handle, compute, held)
+    finally:
+        if held:
+            catch.LEAF.release()
 
-    def gather() -> list[int]:
-        mine = torch.tensor([int(query.shape[1])], device=query.device)
-        every = [torch.empty_like(mine) for _ in range(world)]
-        dist.all_gather(every, mine, group=handle)
-        return [int(e[0]) for e in every]
 
-    sizes = agree.sizes(gather)
-    pad = -heads % world
-    if pad:
-        query, key, value = (
-            torch.nn.functional.pad(t, (0, 0, 0, pad)) for t in (query, key, value)
-        )
-    padded = heads + pad
-    groups = sorted(
-        {padded, *(n for n in range(world, padded, world) if padded % n == 0)}, reverse=True
+def _exchange(
+    meet: _Rendezvous,
+    query: Tensor,
+    key: Tensor,
+    value: Tensor,
+    handle: ProcessGroup,
+    compute: Compute,
+    held: bool,
+) -> Tensor:
+    rank, world = meet.rank, meet.world
+    batch, mine, heads, dim = (int(n) for n in query.shape)
+    padded = heads + (-heads % world)
+    steps = _steps(padded, world)
+    # What a rank's rows and heads make of a group fixes the menu; each rank's menu stays its own.
+    menu = tuple(
+        (str(at), _need(step, batch, mine, padded, dim, query.element_size(), world))
+        for at, step in enumerate(steps)
     )
-    step = groups[min(agree.agreed(), len(groups) - 1)]
-    agree.propose(_level(groups, query, sum(sizes), world))
-    engines = copy_engine.for_group(handle)
-    if step == padded:
-        out = _cross(engines, query, key, value, handle, sizes, compute)
-    else:
-        out = query.new_empty(query.shape)
-        for at in range(0, padded, step):
-            part = slice(at, at + step)
-            out[:, :, part] = _cross(
-                engines,
-                query[:, :, part],
-                key[:, :, part],
-                value[:, :, part],
-                handle,
-                sizes,
-                compute,
-            )
-    return out[:, :, :heads] if pad else out
-
-
-def _level(groups: Sequence[int], query: Tensor, rows: int, world: int) -> int:
-    """The finest head group this GPU's room needs for the exchange (P4: the gathered buffer
-    is the group's every row): q, k and v sent and received, and the output, for `step` heads.
-    Proposed for the next pass; mid-pass every GPU keeps the agreed one."""
+    site = f"ulysses:{hash(menu):x}"
+    device = query.device.index or 0
     request = catch.CURRENT.get()
-    if request is None:
-        return 0
-    room = request.room()
-    batch, local, dim, b = (
-        int(query.shape[0]),
-        int(query.shape[1]),
-        int(query.shape[3]),
-        query.element_size(),
+    native = (
+        held
+        and request is not None
+        and request.memory.cuda
+        and vt.split_context(device)["eligible"]
     )
-
-    def need(step: int) -> int:
-        sent = 4 * batch * local * step * dim * b
-        gathered = 4 * batch * rows * (step // world) * dim * b
-        return sizing.rounded(sent, room.granularity) + sizing.rounded(gathered, room.granularity)
-
-    fits = room.free + room.cold
-    return next((n for n, step in enumerate(groups) if need(step) <= fits), len(groups) - 1)
-
-
-def _cross(
-    engines: copy_engine.CopyEngineExchange | None,
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    handle: ProcessGroup,
-    sizes: Sequence[int],
-    compute: Compute,
-) -> Tensor:
-    """One exchange of whole heads per GPU, over the copy engines when the group formed over
-    them, else NCCL; its result is shaped like `query`."""
-    if engines is not None:
-        result = _copy_engines(engines, query, key, value, sizes, compute)
-    else:
-        result = _nccl(query, key, value, handle, sizes, compute)
-    if result.shape != query.shape or result.dtype != query.dtype:
-        raise ValueError("Ulysses attention returned incompatible output")
-    return result
-
-
-def _nccl(
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    handle: ProcessGroup,
-    sizes: Sequence[int],
-    compute: Compute,
-) -> Tensor:
-    """Diffusers' unequal-length exchange in both directions, at the gathered sizes: GPU p is
-    sent its head group of this GPU's rows, and gets back its rows of every head."""
-    batch, rows, heads, dim = (int(n) for n in query.shape)
-    world = len(sizes)
-    local = heads // world
-
-    def out(t: Tensor) -> Tensor:  # (B, rows, H, D) -> (S, B, H/W, D), in flight
-        laid = t.reshape(batch, rows, world, local, dim).permute(2, 1, 0, 3, 4)
-        return funcol.all_to_all_single(
-            laid.reshape(world * rows, batch, local, dim), list(sizes), [rows] * world, handle
-        )
-
-    def landed(t: Tensor) -> Tensor:
-        return _wait(t).permute(1, 0, 2, 3).contiguous()
-
-    flying = [out(t) for t in (query, key, value)]
-    q, k, v = (landed(t) for t in flying)
-    del flying
-    output = compute(q, k, v)
-    del q, k, v  # not live through the output's exchange
-    back = funcol.all_to_all_single(
-        output.permute(1, 0, 2, 3).contiguous(), [rows] * world, list(sizes), handle
-    )
-    merged = _wait(back).reshape(world, rows, batch, local, dim)
-    return merged.permute(2, 1, 0, 3, 4).reshape(batch, rows, heads, dim)
-
-
-def _wait(t: Tensor) -> Tensor:
-    return cast(Tensor, funcol.wait_tensor(t))
-
-
-def _copy_engines(
-    engines: copy_engine.CopyEngineExchange,
-    query: Tensor,
-    key: Tensor,
-    value: Tensor,
-    sizes: Sequence[int],
-    compute: Compute,
-) -> Tensor:
-    """Diffusers' two exchanges with Q, K and V in one: GPU s holds `sizes[s]` rows of every
-    head and sends each GPU its head group; the output returns each GPU its rows."""
-    batch, rows, heads, dim = (int(n) for n in query.shape)
-    world = engines.world
-    local = heads // world
-
-    def heads_first(tensor: Tensor) -> Tensor:
-        # (B, S, W, H/W, D) -> (W, S, B, H/W, D): rows for GPU p are block p
-        grouped = tensor.reshape(batch, rows, world, local, dim).permute(2, 1, 0, 3, 4)
-        return grouped.reshape(world * rows, batch, local, dim).contiguous()
-
-    sent = [[sizes[s]] * world for s in range(world)]
-    q, k, v = (
-        part.permute(1, 0, 2, 3).contiguous()
-        for part in engines.all_to_all([heads_first(t) for t in (query, key, value)], sent)
-    )
-    output = compute(q, k, v)
-    back = [[sizes[p] for p in range(world)] for _ in range(world)]
-    (returned,) = engines.all_to_all([output.permute(1, 0, 2, 3).contiguous()], back)
-    merged = cast(Tensor, returned).reshape(world, rows, batch, local, dim).permute(2, 1, 0, 3, 4)
-    return merged.reshape(batch, rows, heads, dim).contiguous()
+    stream = 0
+    if native:
+        assert request is not None
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
+        request.memory.remember_working_phase(site, catch.owners(request))
+    floor = 0
+    while True:
+        proposal: dict[str, Any] = {"rows": mine, "at": max(floor, catch.LEVELS.get(site, 0))}
+        selection = None
+        try:
+            if native:
+                proposal["at"], selection = catch.select(device, site, menu, stream, floor)
+        except Exception as exc:
+            proposal |= _failure(exc)
+        proposals = meet.gather(f"propose/{floor}", proposal)
+        _refusal(proposals)
+        sizes = [int(row["rows"]) for row in proposals]
+        at = max(int(row["at"]) for row in proposals)
+        step, total, local = steps[at], sum(sizes), steps[at] // world
+        token, buffers, ready = None, None, {}
+        try:
+            if native:
+                token = catch.begin(device, site, at, selection, stream)
+            out = query.new_empty((batch, mine, padded, dim))
+            buffers = _buffers(query, world, total, local)
+        except Exception as exc:
+            ready = _failure(exc)
+        answers = meet.gather(f"ready/{floor}", ready)
+        if not any(row.get("error") for row in answers):
+            break
+        if token is not None:
+            vt.split_end(device, token, submitted=False)
+        buffers = out = None  # type: ignore[assignment]
+        if at + 1 == len(steps) or not all(row["oom"] for row in answers if row.get("error")):
+            _refusal(answers)
+        catch.went_finer("ulysses", at)
+        floor = at + 1
+    catch.LEVELS[site] = at
+    if request is not None:
+        catch.note(request, site, "ulysses", at)
+    assert buffers is not None
+    sends, receives = buffers
+    del buffers
+    sent = [[n] * world for n in sizes]
+    back = [list(sizes) for _ in range(world)]
+    engines = copy_engine.for_group(handle)
+    crossed = submitted = False
+    try:
+        for start in range(0, padded, step):
+            for source, target in zip((query, key, value), sends, strict=True):
+                _pack(source, target, start, world)
+            crossed = True
+            _cross(handle, engines, sends, receives, sent, rank)
+            del sends
+            attended = compute(*(t.permute(1, 0, 2, 3).contiguous() for t in receives))
+            del receives
+            if attended.shape != (batch, total, local, dim) or attended.dtype != query.dtype:
+                raise ValueError("Ulysses attention returned incompatible output")
+            returned = query.new_empty((world * mine, batch, local, dim))
+            _cross(
+                handle, engines, [attended.permute(1, 0, 2, 3).contiguous()], [returned], back, rank
+            )
+            del attended
+            part = out[:, :, start : start + step].view(batch, mine, world, local, dim)
+            part.copy_(returned.view(world, mine, batch, local, dim).permute(2, 1, 0, 3, 4))
+            del returned
+            if start + step < padded:
+                sends, receives = _buffers(query, world, total, local)
+        submitted = True
+    except BaseException:
+        if crossed:
+            abort_process_group()
+        raise
+    finally:
+        if token is not None:
+            vt.split_end(device, token, submitted=submitted)
+    return out[:, :, :heads] if padded != heads else out
 
 
 attention_ulysses.serve(group, exchange)

@@ -1,0 +1,6 @@
+- GPU memory has one owner. The Runtime no longer sizes, trims or retries anything on CUDA: TensorFS's memory core decides what stays on the card, and processes on one GPU hand idle memory to each other. Packages run unchanged.
+- Any long op runs in as many pieces as the card needs, the same way on every model and card: conv bands, attention pieces, FFN tokens, norm bands and `author.split` windows. The same request picks the same pieces on every run.
+- If a Runtime op is ever refused memory it goes finer before writing any output, warns, and counts in the run's `finer_splits`. Package code never runs twice.
+- Execution and capture streams are blocking, which ends the noise and Xid 31 from kernels launched on the default stream. H3 gives real frames on an H100.
+- Ulysses works with any head-local attention, agreed across GPUs before the first exchange.
+- Needs the matching TensorFS.

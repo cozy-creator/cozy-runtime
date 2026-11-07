@@ -201,6 +201,8 @@ class Fault(Enum):
 
 #: cudaErrorMemoryAllocation
 _CUDA_OOM = 2
+#: cudaError_t stream-capture codes: an operation the graph being recorded cannot hold.
+CAPTURE_ERRORS = range(900, 909)
 #: CUDA's sticky errors (cudaError_t): ECC uncorrectable, NVLink uncorrectable, illegal
 #: address, launch timeout, context destroyed, device assert, hardware stack, illegal
 #: instruction, misaligned address, invalid address space, invalid PC, launch failure.

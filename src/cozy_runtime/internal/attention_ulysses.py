@@ -82,7 +82,7 @@ _MEMBERS: dict[str, AttentionBackendName] = {}
 
 class Execution(Protocol):
     """The execution layer's side (`internal.execution`, installed with the memory): the
-    attention cut, the pass's agreed exchange level and its exchanged sizes."""
+    attention cut."""
 
     def attend(
         self,
@@ -96,14 +96,8 @@ class Execution(Protocol):
         heads: bool = True,
     ) -> Tensor: ...
 
-    def agreed(self) -> int: ...
-
-    def sizes(self, gather: Callable[[], list[int]]) -> list[int]: ...
-
 
 _EXECUTION: Execution | None = None
-#: the exchanges' one cut site (`execution.agree.SITE`)
-SITE = "ulysses"
 
 
 def install(execution: Execution | None) -> None:

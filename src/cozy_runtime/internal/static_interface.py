@@ -65,7 +65,6 @@ from cozy_runtime.author._model_defaults import (
     model_defaults,
     model_on_demand,
     model_phases,
-    model_prepared_use,
 )
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
@@ -405,7 +404,6 @@ _CHILD_TASK_KEYWORDS = frozenset(
         "name",
         "preflight",
         "phases",
-        "prepared_use",
         "demand",
         "memoize",
         "memo_version",
@@ -1507,7 +1505,6 @@ class Registration:
     emits_media: bool = False
     #: Local execution advice, not a client callable/schema field. Source identity covers it.
     phases: tuple[tuple[str, ...], ...] = ()
-    model_prepared_use: Mapping[str, str] = field(default_factory=dict)
     #: `app.tool`'s own options.
     tool: author.Tool | None = None
 
@@ -1528,7 +1525,6 @@ class Registration:
             model_defaults=self.model_defaults,
             model_components=self.model_components,
             model_on_demand=self.model_on_demand,
-            model_prepared_use=self.model_prepared_use,
             **found,
         )
 
@@ -2464,7 +2460,6 @@ def _registration(
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
     phases: tuple[tuple[str, ...], ...] = ()
-    uses: dict[str, str] = {}
     box: dict[str, object] = {}
     for keyword in keywords:
         if keyword.arg not in _APP_KEYWORDS[method]:
@@ -2511,8 +2506,6 @@ def _registration(
             on_demand = model_on_demand(value)
         elif keyword.arg == "phases":
             phases = model_phases(value)
-        elif keyword.arg == "prepared_use":
-            uses = model_prepared_use(value)
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg in _TOOL_KEYWORDS:
@@ -2556,7 +2549,6 @@ def _registration(
         on_demand,
         emits_media=emits_media,
         phases=phases,
-        model_prepared_use=uses,
         tool=tool,
     )
 

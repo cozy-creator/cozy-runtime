@@ -20,6 +20,7 @@ import functools
 import inspect
 import json
 import logging
+import math
 import sys
 import threading
 import time
@@ -56,6 +57,7 @@ from cozy_runtime.author._errors import (
     CapabilityError,
     ConformanceError,
     InvalidRequest,
+    OutputError,
 )
 from cozy_runtime.author._loader import (
     Artifact,
@@ -326,7 +328,8 @@ class Residency(Protocol):
         ...
 
     def region(
-        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None
+        self, owner: str, kind: str, sets: Any, *, release: Callable[[], None] | None = None,
+        shrink: Callable[[], bool] | None = None,
     ) -> Any:
         """An explicitly owned cache, released only while it has no active user."""
         ...
@@ -730,8 +733,10 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
         with self._cozy_scope(fn.__name__, components):
+            steps = _steps()
             result = fn(self, *args, **kwargs)
             _refuse_lazy(fn.__name__, result)
+            _refuse_nan(fn.__name__, result, steps)
             return result
 
     return wrapper
@@ -745,8 +750,10 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     async def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> object:
         with self._cozy_scope(fn.__name__, components):
+            steps = _steps()
             result = await fn(self, *args, **kwargs)  # type: ignore[misc]
             _refuse_lazy(fn.__name__, result)
+            _refuse_nan(fn.__name__, result, steps)
             return result
 
     return cast("Callable[Concatenate[M, P], R]", wrapper)
@@ -814,6 +821,22 @@ def _refuse_lazy(method: str, result: object) -> None:
             "components after the method completes escapes its component-use lease",
             code="lazy_escape",
         )
+
+
+def _steps() -> int:
+    context = CURRENT.get()
+    return 0 if context is None else context._steps
+
+
+def _refuse_nan(method: str, result: object, before: int) -> None:
+    """A method that ran steps hands back no NaN. A package's own forward reaches no root's
+    per-step check (`graphs.Finite`): its latents pass this one, as its loop ends."""
+    if _steps() == before:
+        return
+    for value in result if isinstance(result, tuple | list) else (result,):
+        floating = getattr(value, "is_floating_point", None)
+        if floating is not None and floating() and math.isnan(float(value.float().sum())):
+            raise OutputError(f"the latents went non-finite in {method}", code="non_finite_latents")
 
 
 # --------------------------------------------------------------------------- model
@@ -1398,7 +1421,7 @@ class ModelRegistry:
                     object.__setattr__(model, "_cozy_ready", False)
                     object.__setattr__(model, "_cozy_loading", False)
                 for cache in model._cozy_caches:
-                    cache.drop()
+                    cache._close()
             self._generations.clear()
             self._by_path.clear()
 

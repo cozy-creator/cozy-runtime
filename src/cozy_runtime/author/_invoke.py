@@ -351,8 +351,6 @@ class PreparedRequest:
     stages: Mapping[str, Track] = field(default_factory=dict)
     #: Static component order is available before handler entry and queued GPU admission.
     phases: tuple[tuple[str, ...], ...] = ()
-    #: Device-selection hints used only to decline incompatible queued speculation.
-    prefetch_key: tuple[str, int] = ("", 0)
 
     def digests(self) -> dict[str, str]:
         """What a worker can hold, record and price against — never the payload."""

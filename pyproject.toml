@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.41.0"
+version = "0.42.1"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.17.13,<0.21",
+    "tensorfs>=0.21,<0.22",
     "msgspec>=0.19",
     "numpy>=1.26",
     "packaging>=24",
@@ -33,7 +33,7 @@ diffusers = [
     "peft>=0.20,<0.21",
     "diffusers>=0.40.0",
     "transformers>=5.16.1",
-    "torch>=2.14",
+    "torch>=2.15",
     "torchvision>=0.28",
     "numpy>=1.26",
     "safetensors>=0.8.0",
@@ -59,6 +59,11 @@ packages = ["src/cozy_runtime"]
 
 [tool.uv]
 package = true
+
+# rc/varena-v2 builds against its own TensorFS, which isn't published yet. The release drops this for the published
+# TensorFS and sets the ranges above. To move it: new rev, then `uv lock`.
+[tool.uv.sources]
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "b8cd8352e876f22954b2ec6810ad8d282b1c3cae", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
@@ -110,18 +115,18 @@ warn_unused_ignores = false
 [project.optional-dependencies]
 assessment = ["cozy-eval>=0.7"]
 # The derivation harness and the serving executor.
-derive = ["torch>=2.14"]
+derive = ["torch>=2.15"]
 media = [
     "av>=19.0.1",
 ]
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
-model-execution = ["tensorfs>=0.17.13,<0.21"]
+model-execution = ["tensorfs>=0.21,<0.22"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
     "peft>=0.20,<0.21",
-    "torch>=2.14",
+    "torch>=2.15",
     "transformers>=5.16.1",
     "tokenizers>=0.23.1",
 ]

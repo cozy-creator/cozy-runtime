@@ -88,6 +88,11 @@ __global__ void advance(Control *state, int64_t *index, unsigned steps,
 
 __global__ void cancel_repeat(Control *state) { atomicExch(&state->cancel, 1u); }
 
+// A step cache's verdict, written by the step's first piece, picks the branch that follows it.
+__global__ void select_branch(const int *flag, cudaGraphConditionalHandle chosen) {
+    cudaGraphSetConditional(chosen, *flag != 0);
+}
+
 // Gate entry after a prefix, and gate the suffix after the whole loop. No host decides
 // whether another phase runs, and a cancel before the suffix boundary skips it.
 __global__ void select_phase(Control *state, unsigned steps,
@@ -156,9 +161,10 @@ static cudaError_t ineligible(Repeat *run, const char *stage, const char *reason
 }
 
 // Reject every operation whose ownership/side effects cannot be represented by a resident body.
-// cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle.
+// cudaGraphAddChildGraphNode clones the accepted definition, never an executable handle. Only an
+// `assembled` body holds conditional nodes: the IF/ELSE the repeat built over branches it checked.
 static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
-                           Repeat *run, const char *stage, unsigned depth = 0) {
+                           Repeat *run, const char *stage, unsigned depth = 0, bool assembled = false) {
     if (depth > 32) return ineligible(run, stage, "depth_limit", -1, depth, 0, total);
     size_t count = 0;
     auto error = cudaGraphGetNodes(graph, nullptr, &count);
@@ -176,7 +182,7 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
         if (type == cudaGraphNodeTypeGraph) {
             cudaGraph_t child;
             error = cudaGraphChildGraphNodeGetGraph(node, &child);
-            if (error == cudaSuccess) error = inspect(child, total, device, run, stage, depth + 1);
+            if (error == cudaSuccess) error = inspect(child, total, device, run, stage, depth + 1, assembled);
             if (error != cudaSuccess) return error;
         } else if (type == cudaGraphNodeTypeMemcpy) {
             cudaMemcpy3DParms parameters{};
@@ -208,7 +214,7 @@ static cudaError_t inspect(cudaGraph_t graph, unsigned &total, int device,
                 return ineligible(run, stage, "memset_destination", type, depth, count, total,
                                   -1, attributes.type, attributes.device);
         } else if (type != cudaGraphNodeTypeKernel && type != cudaGraphNodeTypeEmpty
-                   && type != cudaGraphNodeTypeMemcpy && type != cudaGraphNodeTypeMemset) {
+                   && !(assembled && type == cudaGraphNodeTypeConditional)) {
             return ineligible(run, stage, "node_type", type, depth, count, total);
         }
     }
@@ -345,8 +351,12 @@ static cudaError_t cleanup(Repeat *run) {
     return cudaSuccess;
 }
 
+// `branches` holds four graphs' worth per step cache verdict: its flag, the piece run when it is
+// set, the one run when it is not, and the piece after both. The body is source, then each
+// branch's IF/ELSE and its next piece, in order.
 static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
-                  uintptr_t prefix, uintptr_t suffix, Repeat **out) {
+                  uintptr_t prefix, uintptr_t suffix, const uintptr_t *branches, unsigned count,
+                  Repeat **out) {
     *out = nullptr;
     if (!source || !index || !steps) return cudaErrorInvalidValue;
     cudaError_t error;
@@ -359,6 +369,12 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     auto checked = [&](cudaError_t result) { return result; };
 #define CHECK(call) do { error = checked(call); if (error != cudaSuccess) return error; } while (0)
     CHECK(inspect(reinterpret_cast<cudaGraph_t>(source), run->nodes, device, run, "source"));
+    for (unsigned i = 0; i < count; ++i) {
+        if (!branches[4 * i]) return cudaErrorInvalidValue;
+        for (unsigned piece = 1; piece < 4; ++piece)
+            CHECK(inspect(reinterpret_cast<cudaGraph_t>(branches[4 * i + piece]), run->nodes, device,
+                          run, "branch"));
+    }
     if (!run->nodes) return -101;
     unsigned total = run->nodes;
     if (prefix) {
@@ -391,6 +407,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(fill_rows)));
     CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(copy_rows)));
     if (prefix || suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_phase)));
+    if (count) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(select_branch)));
     if (suffix) CHECK(cudaFuncGetAttributes(&attributes, reinterpret_cast<const void *>(finish_suffix)));
     CHECK(cudaMalloc(&run->control, sizeof(Control)));
     CHECK(cudaMalloc(&run->device_snapshot, sizeof(Snapshot)));
@@ -447,6 +464,36 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     cudaGraph_t embedded;
     CHECK(cudaGraphChildGraphNodeGetGraph(compute, &embedded));
     CHECK(lower(embedded, run, "assembled"));
+    // Embed `graph` in `into` after `after` (none: a body's first node), its memset and memcpy
+    // nodes lowered; the new node.
+    auto embed = [&](cudaGraph_t into, cudaGraphNode_t *after, uintptr_t graph, cudaGraphNode_t *node) {
+        cudaError_t error = cudaGraphAddChildGraphNode(node, into, after, after ? 1 : 0,
+                                                       reinterpret_cast<cudaGraph_t>(graph));
+        cudaGraph_t child;
+        if (error == cudaSuccess) error = cudaGraphChildGraphNodeGetGraph(*node, &child);
+        return error == cudaSuccess ? lower(child, run, "assembled_branch") : error;
+    };
+    for (unsigned i = 0; i < count; ++i) {
+        const uintptr_t *branch = branches + 4 * i;
+        cudaGraphConditionalHandle chosen;
+        CHECK(cudaGraphConditionalHandleCreate(&chosen, run->graph, 0, cudaGraphCondAssignDefault));
+        const int *flag = reinterpret_cast<const int *>(branch[0]);
+        void *choose_args[] = {&flag, &chosen};
+        cudaKernelNodeParams choose{};
+        choose.func = reinterpret_cast<void *>(select_branch);
+        choose.gridDim = dim3(1); choose.blockDim = dim3(1); choose.kernelParams = choose_args;
+        cudaGraphNode_t chooser, split, done;
+        CHECK(cudaGraphAddKernelNode(&chooser, body, &compute, 1, &choose));
+        cudaGraphNodeParams either{};
+        either.type = cudaGraphNodeTypeConditional;
+        either.conditional.handle = chosen;
+        either.conditional.type = cudaGraphCondTypeIf;
+        either.conditional.size = 2;
+        CHECK(cudaGraphAddNode(&split, body, &chooser, nullptr, 1, &either));
+        CHECK(embed(either.conditional.phGraph_out[0], nullptr, branch[1], &done));
+        CHECK(embed(either.conditional.phGraph_out[1], nullptr, branch[2], &done));
+        CHECK(embed(body, &split, branch[3], &compute));
+    }
     void *args[] = {&run->control, &run->index, &run->steps, &condition};
     cudaKernelNodeParams kernel{};
     kernel.func = reinterpret_cast<void *>(advance);
@@ -454,7 +501,7 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
     cudaGraphNode_t boundary;
     CHECK(cudaGraphAddKernelNode(&boundary, body, &compute, 1, &kernel));
     // Inspect the actual assembled body, including the cloned source child definition.
-    CHECK(inspect(body, run->validated_nodes, device, run, "assembled"));
+    CHECK(inspect(body, run->validated_nodes, device, run, "assembled", 0, true));
     if (suffix) {
         cudaGraphConditionalHandle finish;
         CHECK(cudaGraphConditionalHandleCreate(&finish, run->graph, 0, cudaGraphCondAssignDefault));
@@ -493,9 +540,12 @@ static int create(uintptr_t source, uintptr_t index, int device, unsigned steps,
 }
 
 extern "C" int cozy_repeat_create(uintptr_t source, uintptr_t index, int device,
-                                  unsigned steps, uintptr_t prefix, uintptr_t suffix, Repeat **out) {
+                                  unsigned steps, uintptr_t prefix, uintptr_t suffix,
+                                  const uintptr_t *branches, unsigned count, Repeat **out) {
     *out = nullptr;
-    return on_device(device, [&] { return create(source, index, device, steps, prefix, suffix, out); });
+    return on_device(device, [&] {
+        return create(source, index, device, steps, prefix, suffix, branches, count, out);
+    });
 }
 
 static int arm(Repeat *run, uintptr_t producer) {
@@ -601,10 +651,10 @@ static int wait(Repeat *run, unsigned *completed, unsigned *canceled) {
     cudaError_t error;
     if (!run->launched) return cudaErrorInvalidValue;
     error = cudaEventSynchronize(run->done); if (error != cudaSuccess) return error;
-    error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
     Control state;
-    error = cudaMemcpy(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost);
+    error = cudaMemcpyAsync(&state, run->control, sizeof(state), cudaMemcpyDeviceToHost, run->control_stream);
     if (error != cudaSuccess) return error;
+    error = cudaStreamSynchronize(run->control_stream); if (error != cudaSuccess) return error;
     run->observed = {state.completed, state.cancel, state.suffix_completed,
                      state.body_entered, state.input_invalid};
     run->input_checked = true;

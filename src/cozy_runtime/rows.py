@@ -135,8 +135,10 @@ def _hooked(
 ) -> Tensor:
     """An armed overlay's update, its rows of `up` (`lora.Hook`); none once baked."""
     for hook in linear._forward_hooks.values():
+        if hook._cozy_baked:
+            continue
         armed = hook.lora_factors()
-        if armed is None or hook._cozy_baked:
+        if armed is None:
             continue
         if not isinstance(x, Tensor):
             raise ValueError("an unbaked LoRA update needs the float input, not its operand")

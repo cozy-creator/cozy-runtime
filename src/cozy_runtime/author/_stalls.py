@@ -83,5 +83,5 @@ def watch(alive: Callable[[], bool]) -> Watch | None:
     torch = sys.modules.get("torch")
     if torch is None or not torch.cuda.is_initialized():
         return None
-    stream = torch.cuda.default_stream(torch.cuda.current_device())
+    stream = torch.cuda.current_stream(torch.cuda.current_device())
     return Watch(threading.get_ident(), stream.query, alive)

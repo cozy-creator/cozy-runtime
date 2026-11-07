@@ -19,6 +19,9 @@ namespace {
 
 constexpr int D = 128;
 constexpr int SUM_ROWS = 1024;
+// A K sum's unit: integers add to one answer in any block order, as float atomics do not. |K| < 2^17
+// over 2^26 rows stays inside int64, and 2^-20 is finer than a 1024-row float sum keeps of its mean.
+constexpr float SUM_ONE = 1048576.f;
 
 __device__ __forceinline__ float value(__half x) { return __half2float(x); }
 __device__ __forceinline__ float value(__nv_bfloat16 x) { return __bfloat162float(x); }
@@ -69,7 +72,7 @@ __device__ __forceinline__ uint16_t pack(const float *v, float inv) {
 
 // K's per-channel sum over its rows, a 1024-row chunk a block.
 template <typename T>
-__global__ __launch_bounds__(128) void k_sum(const T *k, float *sum, int L, int64_t sb,
+__global__ __launch_bounds__(128) void k_sum(const T *k, int64_t *sum, int L, int64_t sb,
                                              int64_t sh, int64_t sn) {
   const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
   const T *in = k + blockIdx.z * sb + blockIdx.y * sh + lane * 4;
@@ -86,8 +89,10 @@ __global__ __launch_bounds__(128) void k_sum(const T *k, float *sum, int L, int6
   for (int c = 0; c < 4; ++c) part[warp][lane * 4 + c] = acc[c];
   __syncthreads();
   const int c = threadIdx.x;
-  atomicAdd(&sum[(static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * D + c],
-            part[0][c] + part[1][c] + part[2][c] + part[3][c]);
+  const float block = part[0][c] + part[1][c] + part[2][c] + part[3][c];
+  atomicAdd(reinterpret_cast<unsigned long long *>(
+                &sum[(static_cast<int64_t>(blockIdx.z) * gridDim.y + blockIdx.y) * D + c]),
+            static_cast<unsigned long long>(__float2ll_rn(block * SUM_ONE)));
 }
 
 // One 32-row group of Q a block; warp w quantizes its rows r = 2w, 2w + 1.
@@ -127,7 +132,7 @@ __global__ __launch_bounds__(128) void quant_q(const T *q, uint8_t *out, float *
 
 // One CTA_K-key block of K a block; warp t quantizes its keys {8j + 2t + p}.
 template <typename T, int CTA_K>
-__global__ __launch_bounds__(128) void quant_k(const T *k, const float *sum, uint8_t *out,
+__global__ __launch_bounds__(128) void quant_k(const T *k, const int64_t *sum, uint8_t *out,
                                                float *scales, int L, int64_t sb, int64_t sh,
                                                int64_t sn) {
   constexpr int J = CTA_K / 8;
@@ -137,7 +142,7 @@ __global__ __launch_bounds__(128) void quant_k(const T *k, const float *sum, uin
   uint8_t *dst = out + bh * L * (D / 2) + lane * 2;
   float mean[4];
 #pragma unroll
-  for (int c = 0; c < 4; ++c) mean[c] = sum[bh * D + lane * 4 + c] / L;
+  for (int c = 0; c < 4; ++c) mean[c] = static_cast<float>(sum[bh * D + lane * 4 + c]) / SUM_ONE / L;
   float v[J][2][4], mx = 0.f;
 #pragma unroll
   for (int j = 0; j < J; ++j) {
@@ -175,7 +180,7 @@ void launch(const Call &call, cudaStream_t stream) {
   const auto *k = static_cast<const T *>(call.k);
   const auto &qs = call.q_strides, &ks = call.k_strides;
   const int blocks_k = (call.len_k + call.cta_k - 1) / call.cta_k;
-  cudaMemsetAsync(call.k_sum, 0, sizeof(float) * call.batch * call.heads_k * D, stream);
+  cudaMemsetAsync(call.k_sum, 0, sizeof(int64_t) * call.batch * call.heads_k * D, stream);
   k_sum<T><<<dim3((call.len_k + SUM_ROWS - 1) / SUM_ROWS, call.heads_k, call.batch), 128, 0,
              stream>>>(k, call.k_sum, call.len_k, ks[0], ks[1], ks[2]);
   quant_q<T><<<dim3((call.len_q + 127) / 128 * 4, call.heads, call.batch), 128, 0, stream>>>(

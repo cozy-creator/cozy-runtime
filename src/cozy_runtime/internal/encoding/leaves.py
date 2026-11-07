@@ -195,6 +195,8 @@ def _leaf_class(torch: Any) -> Any:
 
         #: Whether `linear` takes `out` and its GEMM writes there (`forward`'s `out`).
         WRITES_INTO: ClassVar[bool] = False
+        #: A window reads its input and writes only its result, so `split` may run it again finer.
+        PURE_WINDOWS: ClassVar[bool] = True
 
         def forward(
             self, x: Any, *, prequantized: PreQuantized | None = None, out: Any = None

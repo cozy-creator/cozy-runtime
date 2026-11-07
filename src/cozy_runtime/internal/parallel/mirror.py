@@ -331,8 +331,8 @@ class GroupPlacement:
         self.group.unreserve(self.hosted[name] for name in components)
 
     def carry[T](self, call: Callable[[], T], components: tuple[str, ...]) -> Callable[[], T]:
-        """`call` under this thread's autograd, inference and autocast modes and device:
-        torch keeps all four per thread, and a new thread starts with none of them. The
+        """`call` under this thread's autograd, inference, autocast and actual CUDA stream:
+        torch keeps these per thread, and a new thread starts with none of them. The
         home ranks are reserved from here, before the thread runs, so a spread the caller
         starts next never takes them."""
         torch = self.torch
@@ -344,13 +344,13 @@ class GroupPlacement:
             for kind in ("cuda", "cpu")
             if torch.is_autocast_enabled(kind)
         ]
-        cuda = torch.cuda.current_device() if torch.cuda.is_initialized() else None
+        cuda = torch.cuda.current_stream() if torch.cuda.is_initialized() else None
 
         def carried() -> T:
             with contextlib.ExitStack() as stack:
                 stack.callback(self.leave, components)
                 if cuda is not None:
-                    stack.enter_context(torch.cuda.device(cuda))
+                    stack.enter_context(torch.cuda.stream(cuda))
                 stack.enter_context(torch.inference_mode(inference))
                 stack.enter_context(torch.set_grad_enabled(grad))
                 for kind, dtype in autocast:
