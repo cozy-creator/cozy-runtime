@@ -3646,6 +3646,8 @@ class Executor:
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                     ),
                 )
+                if (memory := self.host.requests.get(command.request_id)) is not None:
+                    memory.failed = outcome.terminal == "failed"  # what its memory learns from
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)

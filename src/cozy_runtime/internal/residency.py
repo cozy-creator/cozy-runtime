@@ -10,6 +10,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import math
+import re
 import sys
 import threading
 import time
@@ -32,7 +33,7 @@ from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
 from cozy_runtime.author import _retained
-from cozy_runtime.author._errors import Fault, fault
+from cozy_runtime.author._errors import DoesNotFit, Fault, fault
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import cache_owners, proctree
 from cozy_runtime.internal.accel import (
@@ -105,6 +106,13 @@ _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", defa
 #: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
 #: A native loop's eager call (`internal.loop`): the models and blocks it ran.
 ENTERED: ContextVar[set[Any] | None] = ContextVar("cozy_loop_entered", default=None)
+#: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
+#: one has no tally, and nothing is marked.
+_ESCAPES = hasattr(vt, "pass_mark")
+_U64 = (1 << 64) - 1
+#: Escaped bytes a run's warning names.
+_NOTED = 256 << 20
+_INDEX = re.compile(r"(?<![^.])\d+(?![^.])")
 _MEMORIES: weakref.WeakValueDictionary[str, Memory] = weakref.WeakValueDictionary()
 _OPENING = threading.Lock()
 # A failed graph completion must retain the actual storage owners until executor exit.
@@ -420,6 +428,8 @@ class _Block:
     gathered: tuple[Hashable, dict[str, dict[str, Tensor]], dict[str, dict[str, Tensor]]] | None = (
         None
     )
+    #: where its forward's allocations are born in the escaped-memory tally (`vt.set_site`)
+    escape_site: int = 0
 
     def paged(self) -> bool:
         """Whether a page a fill wrote may still serve: bound data or a native region."""
@@ -524,6 +534,9 @@ class Model:
         self.common: _Block | None = None
         self.closed = False
         self.working_phase_keys: set[str] = set()
+        #: its loop's head site in the escaped-memory tally, and one block's weights with its common
+        self.escape_site = 0
+        self.escape_floor: int | None = None
 
     def sites_in(self, groups: Iterable[_Block]) -> list[_Site]:
         """The weight sites `groups` hold, mapped once: a LoRA bake binds one source block per
@@ -2015,6 +2028,8 @@ class Memory:
             if not nested:
                 request = _REQUEST.get()
                 reclaim = reclaim and not (request is not None and request.idle)
+                if block.escape_site and request is not None and not request.idle and not capturing:
+                    self._entered(block, request)
                 try:
                     self._ensure(block, reclaim, overlay)
                     block.gathered = None
@@ -2107,6 +2122,9 @@ class Memory:
                             value = value.to(widen)
                         block.last = time.monotonic_ns()
                         progress += 1
+                        request = _REQUEST.get()
+                        if block.escape_site and request is not None and not request.idle:
+                            self._entered(block, request)  # a resident block's read is its entry
                         return nn.Parameter(value, requires_grad=False) if site.parameter else value
             self._enter(block)
             try:
@@ -2139,6 +2157,10 @@ class Memory:
         try:
             if not depth:
                 self._declare(model)
+                # Its own forward (a hooked child's is one part of a call that may run many).
+                if executing and model.escape_site and request is not None and key.startswith("|"):
+                    request.forwards.add(model)
+                    self._pass(model, request, hash(key) & _U64 or 1)
             if outer_forward:
                 if request is not None and not request.passed:
                     request.passed = True
@@ -2165,6 +2187,8 @@ class Memory:
         try:
             model.local.depth -= 1
             if model.local.depth == 0:
+                if model.escape_site:
+                    vt.set_site(self.device.index or 0, 0)
                 try:
                     if model.common is not None and not getattr(model.local, "lent", False):
                         self._exit(model.common)
@@ -2179,6 +2203,41 @@ class Memory:
                 with self.lock:
                     self._forward_depth -= 1
             model._release()
+
+    def _entered(self, block: _Block, request: Request) -> None:
+        """Its allocations are born here. A model whose forward runs no hook of its own (its
+        package calls into its blocks) begins a pass at its first block, and at each block it enters
+        again after others: a forward enters each of its blocks once, in whatever order they were
+        registered (a mid block's attention before its resnet), and a weight read enters its block
+        again with none between."""
+        model = block.model
+        vt.set_site(self.device.index or 0, block.escape_site)
+        if model in request.forwards:
+            return
+        seen, last = request.heads.get(model, (None, None))
+        if seen is None or (block.index in seen and block.index != last):
+            request.heads[model] = ({block.index}, block.index)
+            self._pass(model, request, 0)
+        elif block.index != last:
+            seen.add(block.index)
+            request.heads[model] = (seen, block.index)
+
+    def _pass(self, model: Model, request: Request, shape: int) -> None:
+        """A forward of `model` begins, a pass of its loop (`vt.pass_mark`; `shape` 0: unknown):
+        what earlier passes left live is tallied by where it was born, and a next pass that cannot
+        fit with every evictable byte gone is refused here, before it runs, never partway through it."""
+        if request.idle or self.capturing():
+            return
+        if model.escape_floor is None:
+            common = model.common.allocation_bytes if model.common is not None else 0
+            model.escape_floor = common + max(
+                (block.allocation_bytes for block in model.blocks.values()), default=0
+            )
+        device = self.device.index or 0
+        refused = vt.pass_mark(device, model.escape_site, shape, model.escape_floor)
+        vt.set_site(device, model.escape_site)
+        if refused is not None:
+            raise DoesNotFit(_does_not_fit(model.component, refused))
 
     @contextmanager
     def request(
@@ -2214,6 +2273,10 @@ class Memory:
                 if self.pages is not None and not idle:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
+                if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
+                    failed = request.failed or sys.exc_info()[0] is not None  # or raised through here
+                    request.escaped = vt.escapes_take(self.device.index or 0, failed=failed)
+                    _escaped_warnings(request.escaped)
                 request.sample()
                 request.ended = request.stats()
                 self.last = request.ended
@@ -2369,6 +2432,14 @@ class Request:
         self.working_phases: list[dict[str, Any]] = []
         self.working_phase_keys: set[str] = set()
         self.working_splits: dict[str, dict[str, Any]] = {}
+        #: each loop's record of what its passes left live outside any owner (`vt.escapes_take`);
+        #: the models whose forwards mark their passes, and of the others, the blocks each entered
+        #: this pass, in order
+        self.escaped: list[dict[str, Any]] = []
+        self.forwards: set[Model] = set()
+        self.heads: dict[Model, tuple[set[int], int]] = {}
+        #: the attempt failed (its executor says): a refused allocation in its last pass is learned
+        self.failed = False
         #: refusals that took a pure site finer than its estimate chose: zero in a normal run
         self.finer_splits = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
@@ -2518,6 +2589,7 @@ class Request:
             "phases": list(self.phase_changes),
             "working_phases": list(self.working_phases),
             "working_splits": list(self.working_splits.values()),
+            "escaped": list(self.escaped),
             "finer_splits": self.finer_splits,
             "gathered": self.gathered,
             "host": None,
@@ -2914,8 +2986,58 @@ def _assign(block: _Block) -> list[tuple[_Site, Tensor]]:
     return list(assigned.values())
 
 
+def _gib(n: int) -> str:
+    return f"{n / (1 << 30):.1f} GiB"
+
+
+def _does_not_fit(component: str, refused: dict[str, Any]) -> str:
+    """One line: the op, what it needs and of what, the card's room, and what to do."""
+    held, kept = refused["held_bytes"], refused["escaped_bytes"]
+    sites = ", ".join(site for site, _ in refused["sites"])
+    born = f" in {sites}" if sites else ""
+    if refused["learned"]:
+        when = "its first forward, as its last run of this size went,"
+        parts = f"{_gib(held)} live, {_gib(kept)} its steps keep{born}"
+    else:
+        when = "its next forward"
+        parts = f"{_gib(held)} live" + (f" ({_gib(kept)} of it kept by earlier steps{born})" if kept else "")
+    return (
+        f"{component}: {when} needs {_gib(refused['need_bytes'])} with everything evictable gone "
+        f"({parts}, {_gib(refused['transient_bytes'])} working, {_gib(refused['floor_bytes'])} of "
+        f"weights), and this card has {_gib(refused['room_bytes'])}: run it smaller, or rent a "
+        "larger card: `cozy run … --on new`"
+    )
+
+
+def _escaped_warnings(records: list[dict[str, Any]]) -> None:
+    """One line per loop whose passes kept a significant amount as plain tensors."""
+    for row in records:
+        if row["escaped_peak_bytes"] < _NOTED:
+            continue
+        sites = ", ".join(site for site, _ in row["escaped_sites"]) or row["head"]
+        said = (
+            f"{row['head']} kept {_gib(row['escaped_peak_bytes'])} across its steps outside the "
+            f"memory manager, born in {sites}: hold it in author.retained"
+        )
+        WARNINGS.append((said, {"code": "escaped_memory"}))
+
+
+def _uncached(module: nn.Module) -> None:
+    """A forward that does not ask for a cache keeps none. A text encoder's call through a library
+    (Diffusers' `encode_prompt`) left its `DynamicCache` live as plain tensors, about 1 GiB for a
+    long prompt; decoding asks with `use_cache=True` itself (`cozy_runtime.lm`, `generate`)."""
+    for sub in module.modules():
+        config = getattr(sub, "config", None)
+        if type(config).__module__.startswith("transformers.") and getattr(config, "use_cache", None):
+            config.use_cache = False
+
+
 def _hooks(model: Model) -> None:
     memory = model.memory
+    tally = _ESCAPES and memory.cuda
+    if tally:
+        model.escape_site = vt.site_id(model.component)
+    _uncached(model.module)
     for entry, sub in (("", model.module), *model.module.named_children()):
 
         def opened(args: tuple[object, ...], kwargs: dict[str, object], name: str = entry) -> None:
@@ -2934,6 +3056,8 @@ def _hooks(model: Model) -> None:
         model.handles.extend(_paired(sub, opened, lambda: memory._close(model, executing=True), model))
     for block in model.blocks.values():
         sub = model.module.get_submodule(block.path)
+        if tally:  # its index starred: one site per stack
+            block.escape_site = vt.site_id(f"{model.component}.{_INDEX.sub('*', block.path)}")
 
         def entered(*_: object, b: _Block = block) -> None:
             if (seen := ENTERED.get()) is not None:
