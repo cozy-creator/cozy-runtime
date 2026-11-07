@@ -20,11 +20,14 @@ not depend on what else is in the batch, and a drafted token is verified exactly
 one. Temperature 0 is the plain argmax.
 
 A cached graph keeps only its weights' addresses; a driver's lease (`_hold`) brings their pages
-back. Offload retires the graph before those addresses change; a later call can refill and capture
-anew. If the full set cannot be prepared before execution, the call uses Transformers' loop. A
-call's keys and state for its prompt and `max_new_tokens`, sized from the config, and the graphs'
-pool are decided before its prefill (`_Engine._enter`): allocated or mapped then, else it waits for
-decoding rows to leave, else `DoesNotFit` names what would fit; nothing after catches running out.
+back. varena admits the decode set before any of it runs: the model and its draft head, else the
+model alone (drafting off), else neither, and the call streams through Transformers' loop. Offload
+retires the graph before those addresses change; a later call can refill and capture anew. A
+call's keys and state for its prompt and `max_new_tokens`, sized from the config, are one block
+varena reserves before its prefill (`_Engine._enter`, `vt.reserve`), cut into the slots: its answer
+is the block, else wait for the decoding rows to leave, else `DoesNotFit` names what would fit. The
+graphs' pool comes back at admission too, or they go and the rows decode eagerly; nothing after
+catches running out.
 Errors after execution starts are final; package code is never restarted. On a CPU, or after a safe
 capture refusal (a run warning), the same step runs eagerly. A model this does not
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
@@ -60,11 +63,12 @@ from functools import partial
 from typing import Any, NamedTuple, Protocol
 
 import tensorfs.varena.torch as vt
-from tensorfs.varena import Exhausted
+from tensorfs import varena
+from tensorfs.varena import _runtime
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
-from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
+from cozy_runtime.author._errors import Cancelled, DoesNotFit
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author._services import stage_progress
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
@@ -75,7 +79,6 @@ from cozy_runtime.graphs import (
     capture,
     capture_domain,
     close_pool,
-    no_room,
     safeguard,
     say,
 )
@@ -100,6 +103,8 @@ except ImportError as _absent:  # pragma: no cover - the base package has neithe
 else:
     ABSENT = ""
 
+#: where each slot buffer starts in the block varena reserves for them (`_buffers`)
+_ALIGN = 512
 #: The smallest attention window; windows double from it up to the cache's capacity.
 MIN_WINDOW = 256
 #: Steps the host may queue ahead of the stop flag it last read.
@@ -1529,9 +1534,9 @@ class _Engine:
                         if self.rehold:  # another head: its blocks are held instead
                             stack.close()
                             held, self.rehold = self._hold(stack), False
-                        if held is False and self.draft is not None and not self._occupied():
-                            # The head's weights and keys cost room the model's own decode set may
-                            # need: the graphed decode without drafts beats Transformers' loop.
+                        if held == "undrafted" and not self._occupied():
+                            # varena admitted the model's decode set without the head's weights:
+                            # the graphed decode without drafts beats Transformers' loop.
                             say(
                                 f"lm:{type(self.model).__name__}:undrafted",
                                 "[lm] drafting does not fit at home",
@@ -1544,7 +1549,7 @@ class _Engine:
                         with self.cond:
                             self.incoming = list(self.pending)
                             self.pending.clear()
-                        if held is False:
+                        if held == "streamed":
                             if self._occupied():
                                 raise self.unprepared or RuntimeError("decode residency was lost")
                             for request in self.incoming:
@@ -1591,37 +1596,55 @@ class _Engine:
     def _targets(self) -> list[tuple[Any, Any]]:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
-    def _hold(self, stack: ExitStack) -> bool:
-        """Prepare the retained weight tensors while this driver runs.
-
-        A full decode that cannot prepare its dependencies refuses before model execution;
-        Transformers can then stream the blocks eagerly. The KV pin has a separate lifetime
-        so changing these bindings cannot make live decode rows reclaimable.
-        """
+    def _hold(self, stack: ExitStack) -> str:
+        """The decode set's weights held while this driver runs, as varena admits them before any
+        model code runs: the model and its draft head ("held"), else the model alone
+        ("undrafted"), else neither ("streamed": Transformers' loop streams the blocks eagerly).
+        The KV pin has a separate lifetime so changing these bindings cannot make live decode
+        rows reclaimable."""
         self.unprepared = None
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
         built = tuple(t.data_ptr() for t in derived)
+        bindings: list[tuple[Any, Any]] = []
+        for module, (residency, name) in self._targets():
+            binding = self.addresses.get(id(module))
+            if binding is not None and not binding.valid():
+                self._forget()
+                binding.close()
+                binding = None
+            if binding is None:
+                binding = self.addresses[id(module)] = residency.retain(name, ("",))
+            bindings.append((module, binding))
+        if bindings:
+            device = bindings[0][1].model.memory.device.index or 0
+            every = [r for _, binding in bindings for r in binding.native_regions()]
+            alone = [
+                r for m, binding in bindings if m is self.model for r in binding.native_regions()
+            ]
+            ways = [every, alone] if self.draft is not None else [every]
+            admitted = _runtime.admit(
+                device, [*((regions, None) for regions in ways), ([], None)],
+                stream=torch.cuda.current_stream(device).cuda_stream,
+            )
+            stack.callback(admitted.release)
+            if admitted.index == len(ways):
+                return "streamed"
+            if admitted.index == 1:
+                return "undrafted"
         identities: list[object] = []
         with ExitStack() as leases:
-            for module, (residency, name) in self._targets():
-                binding = self.addresses.get(id(module))
-                if binding is not None and not binding.valid():
-                    self._forget()
-                    binding.close()
-                    binding = None
-                if binding is None:
-                    binding = self.addresses[id(module)] = residency.retain(name, ("",))
+            for _, binding in bindings:
                 try:
                     leases.enter_context(binding.prepare())
                 except Exception as exc:
-                    if not is_capacity(exc) and getattr(exc, "code", None) != "STALE_BINDING":
+                    if getattr(exc, "code", None) != "STALE_BINDING":
                         raise
                     self.unprepared = exc
-                    return False
+                    return "streamed"
                 identities.append(binding.identity)
             self.where = (*identities, built)
             stack.enter_context(leases.pop_all())
-        return True
+        return "held"
 
     #: The retained bindings' fill generations and derived tensor addresses.
     where: tuple[object, ...] = ()
@@ -1840,15 +1863,7 @@ class _Engine:
             and reach <= self.capacity
             and len(request.stops) <= self.width
         ):
-            try:
-                self._pool(True)
-            except Exhausted as exc:  # no room for the pool to come back: nothing of it ran
-                raise DoesNotFit(
-                    f"{type(self.model).__name__} decode: its graphs' pool cannot come back "
-                    f"beside {_gib(self.held)} of keys and state, and nothing more is free on "
-                    f"this card ({exc}): run it smaller, or rent a larger card: "
-                    "`cozy run … --on new`"
-                ) from exc
+            self._pool(True)
             return True
         if occupied + rows > BUCKETS[-1]:
             request.waits = True  # slots free up as rows leave
@@ -1859,23 +1874,23 @@ class _Engine:
             size, capacity = _batch(occupied + rows), max(self.capacity, capacity)
             stops = max(stops, self.width)
         device = request.inputs["input_ids"].device
-        if device.type == "cuda" and self.model in PLACED:
-            room = self._room(device)
-            if self._need(*alone, position) > room + self.held:
-                raise DoesNotFit(self._refused(request, alone, position, room + self.held))
-            if occupied and self._need(size, capacity, stops, position) > room:
-                request.waits = True  # it fits beside the weights once these rows leave
-                return False
         if not occupied:
             self._drop()  # the idle slots go before the new ones come
-        self._grow(size, capacity, stops, position, device)
-        return True
+        releasing = self.held if occupied else 0
+        try:
+            own = self._need(*alone, position)
+            self._grow(size, capacity, stops, position, device, (releasing, own))
+        except varena.Exhausted as final:  # varena's answer for the slots' one block
+            if getattr(final, "next", "") == "wait":
+                request.waits = True  # it fits once the rows decoding now leave
+                from cozy_runtime.internal.residency import _REQUEST
 
-    def _room(self, device: Any) -> int:
-        """The most the device's reclaim could give this process now (`vt.room`, a report): the
-        card less live working memory and the weights in use."""
-        room = vt.room(device.index or 0)
-        return max(int(room["capacity"] - room["working_live"] - room["pinned"]), 0)
+                if (memory := _REQUEST.get()) is not None:  # the scope's check: not swallowed
+                    memory.answered += 1
+                return False
+            room = int(getattr(final, "refusal", {}).get("room_bytes", 0)) + releasing
+            raise DoesNotFit(self._refused(request, alone, position, room)) from final
+        return True
 
     def _refused(
         self, request: _Request, alone: tuple[int, int, int], position: Any, room: int
@@ -2034,10 +2049,16 @@ class _Engine:
         request.at = (self.captured[0], self.captured[1], self.eager)
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
 
-    def _grow(self, size: int, capacity: int, stops: int, position: Any, device: Any) -> None:
-        """Allocate the slots before the call's prefill, in the KV region."""
+    def _grow(
+        self, size: int, capacity: int, stops: int, position: Any, device: Any,
+        leaving: tuple[int, int] = (0, 0),
+    ) -> None:
+        """Allocate the slots before the call's prefill, in the KV region: on a GPU one block
+        varena reserves for all of them (`vt.reserve`), else `Final`: "wait" when the call's
+        own slots alone fit once the rows decoding now leave (`leaving`: their bytes, and the
+        call's own)."""
         with self.region.pin() if self.region is not None else nullcontext():
-            self._buffers(size, capacity, stops, position, device)
+            self._buffers(size, capacity, stops, position, device, leaving)
 
     def _layout(
         self, size: int, capacity: int, stops: int, position: Any
@@ -2130,15 +2151,31 @@ class _Engine:
                 return f"layer {where}: {found} a row, sized {row(mine, positions)}"
         return ""
 
-    def _buffers(self, size: int, capacity: int, stops: int, position: Any, device: Any) -> None:
+    def _buffers(
+        self, size: int, capacity: int, stops: int, position: Any, device: Any,
+        leaving: tuple[int, int] = (0, 0),
+    ) -> None:
         """Every slot buffer for `size` rows of `capacity` positions (`_layout`), all allocated
         before any replaces the engine's, then the rows held now moved over."""
 
+        layers, draft_specs, specs = self._layout(size, capacity, stops, position)
+        every = [*(spec for layer in layers for spec in layer), *draft_specs, *specs.values()]
+        block, at = None, [0]
+        if device.type == "cuda":
+            total = sum(-(-math.prod(sh) * dt.itemsize // _ALIGN) * _ALIGN for sh, dt, _ in every)
+            block = vt.reserve(
+                device, max(total, _ALIGN), releasing=leaving[0], then=leaving[1] or None
+            )
+
         def full(spec: _Spec) -> Any:
             shape, dtype, fill = spec
-            return torch.full(shape, fill, dtype=dtype, device=device)
+            if block is None:
+                return torch.full(shape, fill, dtype=dtype, device=device)
+            nbytes = math.prod(shape) * dtype.itemsize
+            view = block[at[0] : at[0] + nbytes].view(dtype).view(shape)
+            at[0] += -(-nbytes // _ALIGN) * _ALIGN
+            return view.fill_(fill)
 
-        layers, draft_specs, specs = self._layout(size, capacity, stops, position)
         old, held = self.cache, [row for row in self.slots if row is not None]
         cache = _StaticCache(self.text, capacity, MIN_WINDOW, rows=True)
         for mine, layer in zip(cache.layers, layers, strict=True):
@@ -2428,12 +2465,9 @@ class _Engine:
                             if placed is not None
                             else Pool(torch.cuda.graph_pool_handle())
                         )
-                    try:
-                        graph, why = capture(
-                            torch, lambda: self._advance(size), self.pool, self.domain, reserve
-                        )
-                    except Exhausted as exc:  # its pool's room, before anything was captured
-                        why = no_room(self.domain.device, "its pool", reserve, exc)
+                    graph, why = capture(
+                        torch, lambda: self._advance(size), self.pool, self.domain, reserve
+                    )
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
@@ -2531,10 +2565,10 @@ class _Engine:
             self.pool = None
 
     def _pool(self, hold: bool) -> None:
-        """Hold the graphs' pool mapped for the rows decoding (`vt.prepare_pool(pool, 0)`), or
+        """Hold the graphs' pool mapped for the rows decoding, as varena admits it (`admit`), or
         end that use so it may go idle (`vt.record_pool_stream`). Taken at a call's admission,
-        before its prefill, and after a capture; let go when no row decodes. Only an admission's
-        take can need room: it refuses there (`Exhausted`), never at a replay."""
+        before its prefill, and after a capture; let go when no row decodes. varena admitting
+        the eager way instead, the graphs go and the rows decode eagerly until one fits again."""
         if hold == self.pooled or self.pool is None:
             return
         if not self.graphs:  # nothing recorded owns it: no use to take or end
@@ -2542,7 +2576,11 @@ class _Engine:
             return
         device = self.domain.device
         if hold:
-            vt.prepare_pool(self.pool.handle, 0, device)
+            stream = torch.cuda.current_stream(device).cuda_stream
+            way = _runtime.admit(device, [([], (self.pool.handle, 0)), ([], None)], stream=stream)
+            if way.index == 1:
+                self._forget()
+                return
         else:
             vt.record_pool_stream(self.pool.handle, torch.cuda.current_stream(device), device)
         self.pooled = hold

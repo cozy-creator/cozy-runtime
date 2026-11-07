@@ -27,14 +27,13 @@ import tensorfs
 import tensorfs.varena.torch as vt
 import torch
 from tensorfs.raw import parts as stored_parts
-from tensorfs.varena import Exhausted
 from tensorfs.varena import _runtime as varena
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
 from cozy_runtime.author import _retained
-from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
+from cozy_runtime.author._errors import DoesNotFit, Fault, fault
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
@@ -778,6 +777,13 @@ class Binding:
     def resident(self) -> bool:
         return not self.unresident()
 
+    def native_regions(self) -> list[Any]:
+        """The Regions a use of it reads: what its caller asks varena to hold (`varena.admit`)."""
+        memory = self.model.memory
+        if memory.native is None:
+            return []
+        return [region for block in self.groups for _, region in memory._block_regions(block)]
+
     def immutable_buffer_ids(self) -> frozenset[int]:
         """Its model's declared checkpoint-backed buffers, in every block (an idle one's placeholder
         too): inputs a recording checks by identity and version and never copies (cr-264). Other
@@ -999,10 +1005,14 @@ def _pages(index: int, shared: bool) -> Any:
 class Memory:
     """One executor's weight residency, beside Torch's activation allocator."""
 
-    def __init__(self, device: Any, budget_bytes: int | None = None, shared: bool = False) -> None:
+    def __init__(
+        self, device: Any, cap: int | None = None, display: int | None = None, shared: bool = False
+    ) -> None:
         self.device = torch.device(device)
         self.cuda: bool = self.device.type == "cuda"
-        self.budget_bytes = budget_bytes
+        #: the machine's development cap; on a GPU varena also has its display's limit
+        self.budget_bytes = cap
+        self.display = display
         self.lock = threading.RLock()
         self.models: dict[nn.Module, Model] = {}
         self._working_phase_owners: dict[str, set[Model | Request]] = {}
@@ -1027,8 +1037,8 @@ class Memory:
         self._site = 0
         if self.cuda:
             try:
-                if budget_bytes is not None:
-                    vt.set_limit(self.device.index or 0, budget_bytes)
+                if cap is not None or display is not None:
+                    vt.configure(self.device.index or 0, cap=cap, display=display)
                 self.native = varena.Device(self.device.index or 0)
                 self.granularity = int(self.native.granularity)
                 self.pages = _pages(self.device.index or 0, shared)
@@ -1038,27 +1048,36 @@ class Memory:
                 raise ResidencyError(f"native CUDA weight residency is unavailable: {exc}") from exc
 
     @classmethod
-    def open(cls, gpu: Any = 0, *, budget_bytes: int | None = None, shared: bool = False) -> Memory:
+    def open(
+        cls,
+        gpu: Any = 0,
+        *,
+        cap: int | None = None,
+        display: int | None = None,
+        shared: bool = False,
+    ) -> Memory:
         device = torch.device("cuda", gpu) if isinstance(gpu, int) else torch.device(gpu)
         if device.type == "cuda":
             device = torch.device("cuda", device.index or 0)
-        if budget_bytes is not None and budget_bytes < 0:
+        if cap is not None and cap < 0:
             raise ResidencyError("a local allocator budget cannot be negative")
         with _OPENING:
             found = _MEMORIES.get(str(device))
             if found is not None:
-                if found.budget_bytes != budget_bytes:
+                if found.budget_bytes != cap:
                     raise ResidencyError("an open device cannot silently change allocator budgets")
+                found.configure(display)
                 return found
-            memory = cls(device, budget_bytes, shared)
+            memory = cls(device, cap, display, shared)
             _MEMORIES[str(device)] = memory
             return memory
 
-    def limit(self, budget_bytes: int | None) -> None:
-        """A new card limit (a display GPU's follows its display): varena reclaims to it now."""
-        if self.cuda and budget_bytes != self.budget_bytes:
-            vt.set_limit(self.device.index or 0, budget_bytes)
-            self.budget_bytes = budget_bytes
+    def configure(self, display: int | None) -> None:
+        """The display's limit as it uses the GPU now (None: it drives none): varena reads the
+        card as the smaller of it and the cap, and reclaims to that now."""
+        if self.cuda and display != self.display:
+            vt.configure(self.device.index or 0, cap=self.budget_bytes, display=display)
+            self.display = display
 
     def stream(self) -> Any:
         return torch.cuda.current_stream(self.device) if self.cuda else None
@@ -1758,16 +1777,7 @@ class Memory:
             for block in model.groups():
                 if block.gathered is not None:
                     return [], [], "host_gathered_representation"
-                raw_needed = (
-                    block.aliases is None or any(block.aliases.values()) or not block.finals
-                )
-                for role, needed, final in (
-                    ("raw", raw_needed and bool(block.storage_bytes), False),
-                    ("final", bool(block.final_bytes), True),
-                ):
-                    if not needed:
-                        continue
-                    region = self._native_region(block, final=final)
+                for role, region in self._block_regions(block):
                     # Native identity/size are facts, not an estimated byte reserve. The
                     # native Plan deduplicates aliases by Region identity, not these rows.
                     bindings.append((
@@ -1778,6 +1788,28 @@ class Memory:
                 model.name, model.content, identity, model.layout_identity, tuple(bindings),
             ))
         return regions, signature, ""
+
+    def _block_regions(self, block: _Block) -> list[tuple[str, Any]]:
+        """The Regions a use of `block` reads, by role: its raw bytes where a binding reads them,
+        its final bytes where it has them."""
+        raw = block.aliases is None or any(block.aliases.values()) or not block.finals
+        return [
+            (role, self._native_region(block, final=final))
+            for role, needed, final in (
+                ("raw", raw and bool(block.storage_bytes), False),
+                ("final", bool(block.final_bytes), True),
+            )
+            if needed
+        ]
+
+    def reads(self, used: Mapping[Model, Collection[str]]) -> list[Any]:
+        """The Regions a phase that runs `used` (each model's entered paths) reads: what it asks
+        varena to hold before it runs (`varena.admit`)."""
+        found: dict[int, Any] = {}
+        for model, paths in used.items():
+            for region in model.retain(tuple(sorted(paths))).native_regions():
+                found.setdefault(id(region), region)
+        return list(found.values())
 
     def _refresh_phase_plan(self, names: frozenset[str]) -> None:
         """The plan the core works from: this request's phases in order, every Region of each,
@@ -1914,6 +1946,15 @@ class Memory:
                 request.read(block, read_ns, read_bytes, bake=bake)
         return data
 
+    def _placed(self, block: _Block, reclaim: bool, capturing: bool) -> Any:
+        """Where varena places an embedding table, before its forward: asked to hold its Regions,
+        else nothing (`index` 1: its rows are gathered on the host). Any other block: None."""
+        if not (block.table and reclaim and self.cuda and not capturing and block.data is None):
+            return None
+        regions = [region for _, region in self._block_regions(block)]
+        stream = self.stream().cuda_stream
+        return varena.admit(self.device.index or 0, [(regions, None), ([], None)], stream=stream)
+
     def _gather(self, block: _Block, overlay: Hashable) -> None:
         """An embedding table that does not fit the room stays on the host: its forward looks up
         there and moves only the rows it read (`_gathering`), so a room below the table never
@@ -1991,13 +2032,16 @@ class Memory:
                 reclaim = reclaim and not (request is not None and request.idle)
                 if block.escape_site and request is not None and not request.idle and not capturing:
                     block.born_before = self._entered(block, request)
-                try:
-                    self._ensure(block, reclaim, overlay)
-                    block.gathered = None
-                except Exhausted:  # varena refused its region before its forward ran
-                    if not (block.table and reclaim and self.cuda and not capturing):
-                        raise
+                admitted = self._placed(block, reclaim, capturing)
+                if admitted is not None and admitted.index == 1:
                     self._gather(block, overlay)
+                else:
+                    try:
+                        self._ensure(block, reclaim, overlay)
+                    finally:
+                        if admitted is not None:
+                            admitted.release()  # `_ensure` holds its own Use now
+                    block.gathered = None
             # A cached Hold can keep count > 0 across sequential threads or streams.
             # Every consumer needs readiness in addition to storage ownership.
             # Capture's owner joined the prepared stream before capture began. Waiting on
@@ -2255,10 +2299,8 @@ class Memory:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
                 if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
-                    # or a capacity failure raised through here, never a package's own error
-                    raised = sys.exc_info()[1]
-                    failed = request.failed or (raised is not None and is_capacity(raised))
-                    request.escaped = vt.escapes_take(self.device.index or 0, failed=failed)
+                    # varena learns a refusal nothing answered itself, in every process
+                    request.escaped = vt.escapes_take(self.device.index or 0)
                     _escaped_warnings(request.escaped)
                 request.sample()
                 request.ended = request.stats()
@@ -2422,10 +2464,11 @@ class Request:
         self.escaped: list[dict[str, Any]] = []
         self.forwards: set[Model] = set()
         self.heads: dict[Model, tuple[set[int], int]] = {}
-        #: the attempt failed (its executor says): a refused allocation in its last pass is learned
-        self.failed = False
         #: pure ops varena told to run again finer after refusing their leaf: zero in a normal run
         self.finer_splits = 0
+        #: other refusals varena answered and the Runtime followed: an LM call that waits for rows
+        #: to leave, a recording that runs eagerly
+        self.answered = 0
         #: refusals a package scope returned past (`contract._Scopes`): zero in a conforming run
         self.swallowed_ooms = 0
         #: cross-step state its loops declared (`author.retained`)

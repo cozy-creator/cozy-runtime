@@ -14,11 +14,12 @@ import json
 import threading
 import weakref
 from collections.abc import Callable, Sequence
+from contextlib import suppress
 from typing import Any, cast
 
-import tensorfs.varena.torch as vt
 import torch
 import torch.distributed as dist
+from tensorfs import varena
 from torch import Tensor
 from torch.distributed import ProcessGroup
 from torch.distributed.distributed_c10d import _get_process_group_store
@@ -26,6 +27,7 @@ from torch.distributed.distributed_c10d import _get_process_group_store
 from cozy_runtime.author._errors import DoesNotFit, Fault, fault
 from cozy_runtime.internal import attention_ulysses
 from cozy_runtime.internal.execution import catch, sizing
+from cozy_runtime.internal.execution import phase as working_phase
 from cozy_runtime.internal.parallel import copy_engine
 from cozy_runtime.internal.parallel.group import abort_process_group
 
@@ -183,15 +185,10 @@ def exchange(
 ) -> Tensor:
     """`compute` over whole sequences per head subset, back to this GPU's rows of every head."""
     meet = _rendezvous(handle)
-    held = catch.LEAF.acquire(blocking=False)
-    try:
-        # One model pass owns its group's collective order.
-        with meet.lock:
-            meet.sequence += 1
-            return _exchange(meet, query, key, value, handle, compute, held)
-    finally:
-        if held:
-            catch.LEAF.release()
+    # One model pass owns its group's collective order.
+    with meet.lock:
+        meet.sequence += 1
+        return _exchange(meet, query, key, value, handle, compute)
 
 
 def _exchange(
@@ -201,60 +198,55 @@ def _exchange(
     value: Tensor,
     handle: ProcessGroup,
     compute: Compute,
-    held: bool,
 ) -> Tensor:
     rank, world = meet.rank, meet.world
     batch, mine, heads, dim = (int(n) for n in query.shape)
     padded = heads + (-heads % world)
     steps = _steps(padded, world)
     # What a rank's rows and heads make of a group fixes the menu; each rank's menu stays its own.
-    menu = tuple(
-        (str(at), _need(step, batch, mine, padded, dim, query.element_size(), world))
-        for at, step in enumerate(steps)
-    )
-    site = f"ulysses:{hash(menu):x}"
+    rows = [
+        _need(step, batch, mine, padded, dim, query.element_size(), world) for step in steps
+    ]
     device = query.device.index or 0
     request = catch.CURRENT.get()
-    native = (
-        held
-        and request is not None
-        and request.memory.cuda
-        and vt.split_context(device)["eligible"]
-    )
-    stream = 0
-    if native:
-        assert request is not None
-        stream = int(torch.cuda.current_stream(device).cuda_stream)
-        request.memory.remember_working_phase(site, catch.owners(request))
-    proposal: dict[str, Any] = {"rows": mine, "at": catch.LEVELS.get(site, 0)}
-    selection: dict[str, Any] = {}
+    native = request is not None and request.memory.cuda
+    site = catch.menu_site(device, "ulysses", rows) if native else None
+    stream = int(torch.cuda.current_stream(device).cuda_stream) if native else 0
+    if site is not None and request is not None:
+        request.memory.remember_working_phase(site.key, catch.owners(request))
+    # Each rank's varena chooses; the group runs the finest any chose (only that agreement is
+    # Ulysses' own), and each rank's varena opens it, or the group refuses as one.
+    proposal: dict[str, Any] = {"rows": mine, "at": 0}
     try:
-        if native:
-            selection = catch.select(device, site, "ulysses", menu, stream)
-            proposal["at"] = int(selection["choice_id"])
+        if site is not None:
+            proposal["at"] = site.choose(stream=stream).level
     except Exception as exc:
-        proposal |= _failure(exc)
+        refused = isinstance(exc, varena.Exhausted)
+        proposal |= _failure(catch.refused("ulysses", exc) if refused else exc)
     proposals = meet.gather("propose", proposal)
     _refusal(proposals)
     sizes = [int(row["rows"]) for row in proposals]
-    at = max(int(row["at"]) for row in proposals)
+    at = min(max(int(row["at"]) for row in proposals), len(steps) - 1)
     step, total, local = steps[at], sum(sizes), steps[at] // world
-    token, buffers, ready = None, None, {}
+    leaf, buffers, ready = None, None, {}
     try:
-        if native:
-            token = catch.begin(device, site, "ulysses", menu, at, selection, stream)
+        if site is not None:
+            leaf = site.enter(
+                stream=stream, owner=working_phase.completion_owner(device, stream), level=at
+            )
         out = query.new_empty((batch, mine, padded, dim))
         buffers = _buffers(query, world, total, local)
     except Exception as exc:
-        ready = _failure(exc)
+        refused = isinstance(exc, varena.Exhausted)
+        ready = _failure(catch.refused("ulysses", exc) if refused else exc)
     answers = meet.gather("ready", ready)
     if any(row.get("error") for row in answers):
-        if token is not None:
-            vt.split_end(device, token, submitted=False)
+        if leaf is not None:
+            with suppress(varena.Exhausted):  # the group's refusal below is the answer
+                leaf.exit(submitted=False)
         _refusal(answers)
-    catch.LEVELS[site] = at
-    if request is not None:
-        catch.note(request, site, "ulysses", at)
+    if request is not None and leaf is not None and site is not None:
+        catch.note(request, site.key, "ulysses", leaf)
     assert buffers is not None
     sends, receives = buffers
     del buffers
@@ -289,8 +281,9 @@ def _exchange(
             abort_process_group()
         raise
     finally:
-        if token is not None:
-            vt.split_end(device, token, submitted=submitted)
+        if leaf is not None:
+            with suppress(varena.Exhausted):  # a refusal mid-crossing fails the group as it stands
+                leaf.exit(submitted=submitted)
     return out[:, :, :heads] if padded != heads else out
 
 

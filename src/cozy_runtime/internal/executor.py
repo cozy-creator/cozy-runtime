@@ -1122,7 +1122,9 @@ class Executor:
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        memory = Memory.open(device, budget_bytes=self._card_budget(device), shared=host.shared)
+        memory = Memory.open(
+            device, cap=host.gpu_memory_limit, display=self._display(device), shared=host.shared
+        )
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
             contract.REFUSALS[0] = execution.refusals(device.index or 0)
@@ -1206,20 +1208,15 @@ class Executor:
         memory = self.host.memory
         if limits and memory is not None and memory.cuda:
             self.host.display_limit = limits
-            memory.limit(self._card_budget(memory.device))
+            memory.configure(self._display(memory.device))
 
-    def _card_budget(self, device: Any) -> int | None:
-        """The development `gpu_memory_limit`, and on a GPU that drives a display its limit
-        while it does (varena's limit counts the driver's own charge), the lower of the two."""
-        host = self.host
+    def _display(self, device: Any) -> int | None:
+        """What the display leaves of this GPU while it drives one (None: it drives none): a fact
+        for varena, which reads the card as the smaller of it and the development cap."""
         index = device.index or 0
-        cuda = device.type == "cuda" and index < len(host.display_limit)
-        limit = host.display_limit[index] if cuda else 0
-        if not limit:
-            return host.gpu_memory_limit
-        budget = limit if host.gpu_memory_limit is None else min(host.gpu_memory_limit, limit)
-        print(f"[memory] GPU {index} drives a display: at most {budget >> 20} MiB", file=sys.stderr)
-        return budget
+        if device.type != "cuda" or index >= len(self.host.display_limit):
+            return None
+        return self.host.display_limit[index] or None
 
     def _rank_device(self, torch: Any) -> Any:
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
@@ -3665,9 +3662,6 @@ class Executor:
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                     ),
                 )
-                if (memory := self.host.requests.get(command.request_id)) is not None:
-                    # A call that ran out of memory: what its memory learns from.
-                    memory.failed = outcome.code in CAPACITY_CODES
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)

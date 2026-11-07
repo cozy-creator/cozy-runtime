@@ -1,0 +1,1 @@
+The Runtime no longer decides GPU memory around varena: split levels, retries after a refusal, whether a step loop or an LM decode records, the LM's draft head and its keys, a program's own tensor copies and an embedding table's placement are all varena's answers, asked before any of it runs. A refusal names its next step. Needs the matching TensorFS.

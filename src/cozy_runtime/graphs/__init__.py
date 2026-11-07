@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
 import tensorfs.varena.torch as vt
-from tensorfs import varena
+from tensorfs.varena import _runtime
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
@@ -81,17 +81,19 @@ def safeguard(code: str, why: str) -> None:
     WARNINGS.append((SAFEGUARDS[code], {"code": code, "why": why.splitlines()[0][:300]}))
 
 
-def no_room(device: int, what: str, need: int, error: BaseException) -> str:
-    """Why varena refused room before anything ran (`varena.Exhausted`), for the run's record."""
+def no_room(device: int, what: str, need: int, error: BaseException | None) -> str:
+    """Why varena held no room before anything ran (its admission chose eager), for the run's
+    record: a report, nothing decided from it."""
     room = vt.room(device)
 
     def gib(n: int) -> str:
         return f"{n / (1 << 30):.1f} GiB"
 
+    said = f" ({error})" if error is not None else ""
     return (
         f"{what} needs {gib(need or getattr(error, 'requested_bytes', 0))} beside "
         f"{gib(room['working_live'])} live and {gib(room['pinned'])} of weights in use, of "
-        f"{gib(room['capacity'])} ({error})"
+        f"{gib(room['capacity'])}{said}"
     )
 
 
@@ -203,19 +205,20 @@ def close_pool(pool: domain.Pool, device: int) -> None:
 def capture(
     torch: Any, step: Callable[[], object], pool: domain.Pool, owner: domain.Domain, reserve: int
 ) -> tuple[Any, str]:
-    """Record a pure computation into Varena's capture pool, `reserve` bytes of it prepared first:
-    refused there (`varena.Exhausted`), nothing is captured. An allocation the capture still finds
-    no room for fails it, as a device fault does: no capacity is learned from it.
+    """Record a pure computation into Varena's capture pool, `reserve` bytes of it admitted first:
+    varena holding it or the eager way (`varena.admit`), and eager, nothing is captured and the
+    reason says what it needed. An allocation the capture still finds no room for fails it, as a
+    device fault does: no capacity is learned from it.
 
     Bindings and outputs remain caller-owned.
     """
-    try:
-        vt.prepare_pool(pool.handle, reserve, owner.device)
-    except BaseException:
-        vt.cancel_preparation(pool.handle, owner.device)
-        raise
-    graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
+    admitted = _runtime.admit(
+        owner.device, [([], (pool.handle, reserve)), ([], None)], stream=current.cuda_stream
+    )
+    if admitted.index == 1:
+        return None, no_room(owner.device, "its pool", reserve, None)
+    graph = torch.cuda.CUDAGraph()
     stream, work = owner.control, owner.stream
     stream.wait_stream(current)
     stream.wait_stream(work)
@@ -1157,12 +1160,12 @@ def _replay(
     try:
         began = time.perf_counter()
         lease = _lease(torch, placed, recorder.binding)
-        lease.__enter__()
+        why = lease.__enter__()
         recorder.prepare_ms += (time.perf_counter() - began) * 1e3
     except StaleBinding:
         return _EAGER
-    except varena.Exhausted as exc:  # before the replay
-        why = no_room(entry.owner.device, "its weights", 0, exc)
+    if why:  # varena admitted the eager way
+        lease.__exit__(None, None, None)
         _refused(recorder, placed, why)
         safeguard("no_room", why)
         return _EAGER
@@ -1251,12 +1254,18 @@ def _record(
         scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
         lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
         with ExitStack() as entered:
-            try:
-                entered.enter_context(scope)
-                entered.enter_context(lease)
-            except varena.Exhausted as exc:  # its admission: nothing ran
-                _failed(module, recorder, key, no_room(owner.device, "its weights", 0, exc))
-                return True
+            if recorder.binding is not None:  # its weights, admitted before any of it runs
+                admitted = _runtime.admit(
+                    owner.device, [(recorder.binding.native_regions(), None), ([], None)],
+                    stream=current.cuda_stream,
+                )
+                entered.callback(admitted.release)
+                if admitted.index == 1:
+                    need = admitted.needs[0] if admitted.needs else 0
+                    _failed(module, recorder, key, no_room(owner.device, "its weights", need, None))
+                    return True
+            entered.enter_context(scope)
+            entered.enter_context(lease)
             state = entered.enter_context(_capture_state(torch, module, owner.stream))
             stream = owner.stream
             stream.wait_stream(current)
@@ -1317,11 +1326,7 @@ def _record(
                     outputs.append(call(module, *sargs, **skwargs))
 
                 took = time.perf_counter_ns()
-                try:
-                    graph, why = capture(torch, step, pool, owner, reserve)
-                except varena.Exhausted as exc:  # its admission: nothing was captured
-                    _failed(module, recorder, key, no_room(owner.device, "its pool", reserve, exc))
-                    return True
+                graph, why = capture(torch, step, pool, owner, reserve)
                 if graph is None:
                     _failed(module, recorder, key, why)
                     return True
@@ -1612,22 +1617,35 @@ def _settled(event: Any) -> None:
 
 
 @contextmanager
-def replaying(stream: Any, bindings: Iterable[Any]) -> Iterator[None]:
-    """A graph's weights for one replay, back at their addresses if they left, and no longer. All
-    of what is still here is pinned before any fill, which can then evict nothing the replay
-    needs; what left comes back in the core's reclaim order. It never reassigns a module slot."""
-    with ExitStack() as held:
-        taken = [held.enter_context(binding.prepare(stream, replay=True)) for binding in bindings]
-        for uses in taken:
-            for region, use in uses.items():
-                if use is None:
-                    uses[region] = region.use(stream.cuda_stream)
-        yield
+def replaying(stream: Any, bindings: Iterable[Any], pool: Any = None) -> Iterator[str]:
+    """A graph's weights for one replay, and its `pool`'s pages, back at their addresses if they
+    left, and no longer: varena admits them together or the eager way (`varena.admit`). Yields ""
+    when it holds them, else why not (the call runs as written). It never reassigns a module
+    slot."""
+    bindings = tuple(bindings)
+    device = stream.device.index or 0
+    regions = [region for binding in bindings for region in binding.regions or ()]
+    admitted = _runtime.admit(
+        device, [(regions, None if pool is None else (pool, 0)), ([], None)],
+        stream=stream.cuda_stream,
+    )
+    if admitted.index == 1:
+        yield no_room(device, "its replay", admitted.needs[0] if admitted.needs else 0, None)
+        return
+    try:
+        with ExitStack() as held:
+            for binding in bindings:
+                uses = held.enter_context(binding.prepare(stream, replay=True))
+                if any(use is None for use in uses.values()):
+                    raise StaleBinding("a replay's admitted weights left before it pinned them")
+            yield ""
+    finally:
+        admitted.release()
 
 
 def _lease(torch: Any, placed: Any, binding: Any) -> Any:
     if placed is None or binding is None:
-        return nullcontext()
+        return nullcontext("")
     stream, held = torch.cuda.current_stream(), placed[0].graph_held(placed[1])
     if held is not None and held != stream:
         stream.wait_stream(held)

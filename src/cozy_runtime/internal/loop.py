@@ -20,12 +20,14 @@ running any of it and runs it natively from its start: one plan and no eager ste
 period opens between a call's prepare and its invoke (`Executor.awaiting_invoke`), so a call
 queued behind another never waits for idle work.
 
-A recording's mode is decided before anything is captured (`_admit`): its pool is `vt.pool_bytes`
-of the most any part it records held as varena measured it eagerly, and varena makes room for it
-beside the program's weights with `after`, else without it (`after` then runs eagerly after each
-replay), else not at all: the call runs eagerly and the run says what it needed. A part never
-measured is never recorded. A recording refused or unrecordable is not tried again for that layout;
-one whose code cannot run outside its request records only in a call; the calls say why. Nothing
+A recording's mode is varena's, decided before anything is captured (`_admit`, `varena.admit`):
+the call lists its ways to run, each the weights it reads and the most any part it records held as
+varena measured it eagerly: with `after`, without it (`after` then runs eagerly after each replay),
+and eagerly. varena holds the first it can, its weights pinned and its pool mapped; eager, the run
+says what each needed. The program's own copies of the call's tensors are one block varena
+reserves first (`_copies`). A part never measured is never recorded. A recording refused or
+unrecordable is not tried again for that layout; one whose code cannot run outside its request
+records only in a call; the calls say why. Nothing
 catches an allocation that fails after that: it fails the call. Other component loops stay eager:
 recording a streamed loop did not repay its recording and extra reads (Qwen-Image int8 1 MP on an
 RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs
@@ -60,6 +62,7 @@ from typing import Any
 import tensorfs.varena.torch as vt
 import torch
 from tensorfs import varena
+from tensorfs.varena import _runtime
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_leaves
 
@@ -123,8 +126,8 @@ class _Fixed(str):
 
 
 class _NoRoom(Exception):
-    """varena had no room for a recording's weights or pool (`varena.Exhausted` at `_admit` or a
-    hold), before anything was captured: the call runs eagerly."""
+    """varena admitted the eager way, not a recording's weights and pool (`_admit`), or reserved
+    no copies of its tensors (`_copies`), before anything was captured: the call runs eagerly."""
 
 
 def _call(step: Callable[..., object], index: Any, tensors: tuple[Any, ...], label: Any) -> None:
@@ -771,7 +774,11 @@ class _Loop:
         configuration = _phase_configuration(self, indices, shown, models) if measured else None
         del shown
         epoch = LANDED[0]
-        with working_phase.observing(
+        repeating = (
+            vt.repeating(tensors[0].device, len(self.steps)) if measured and mode == "eager"
+            else nullcontext()
+        )
+        with repeating, working_phase.observing(
             tensors[0].device.index if measured else None, mode,
             request.working_phases if measured and request is not None else None,
             key=working_phase.execution_key(configuration, "runtime.eager/1"),
@@ -901,9 +908,9 @@ def _measured(known: _Site, shape: Hashable, peaks: dict[str, int]) -> dict[str,
 
 def _menu(measured: dict[str, int], *, before: bool, after: bool) -> list[tuple[int, bool]]:
     """What a recording may hold, most first, each as (its pool, with `after`): every part, then
-    without `after`, which runs eagerly after each replay. A pool is `vt.pool_bytes` of the most
-    any part it records held (one runs at a time), and a part never measured is never recorded.
-    The core will answer this (`record(parts)`); `_admit` asks it room for each in turn."""
+    without `after`, which runs eagerly after each replay. A pool is `vt.pool_bytes` (varena's
+    rule) of the most any part it records held (one runs at a time), and a part never measured
+    is never recorded. varena chooses among them (`_admit`)."""
     parts = ("steps", "before") if before else ("steps",)
     modes = [(True, (*parts, "after"))] if after else []
     modes.append((False, parts))
@@ -989,28 +996,25 @@ def _record_first(
     own eager run chose, into a pool its measure sized (SDXL's first decode recorded whole at 6 GiB
     needed a 2.7 GiB pool beside its weights, and every call ran eagerly). (None, why) when
     refused, its attempt gone."""
-    own = tuple(value.clone() for value in _filled(tensors))
-    mutable = own[:nwork]
-    counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
     every: dict[Model, tuple[str, ...]] = {model: ("",) for model in scope}
     if recording is None:
         recording = PreparedSequence.record()
         recording.__enter__()
     failure: BaseException | None = None
     try:
-        with ExitStack() as loading:
-            _hold(scope if whole else (), loading)  # until the recording's bindings hold them
-            _lap("load")
-            recording._prepare((*mutable, counter))
-            _lap("prepare")
-            with recording.capturing():
-                parts, verdicts, with_after = _record_resident(
-                    recording, loop, rest, own, mutable, counter, body,
-                    pre if whole else None, every if whole else None, whole, menu,
-                )
-            first, *again = recording.finish_parts(
-                outputs=mutable, parts=[(b, e, 1) for b, e in parts]
+        own = _copies(_filled(tensors))
+        mutable = own[:nwork]
+        counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
+        recording._prepare((*mutable, counter))
+        _lap("prepare")
+        with recording.capturing():
+            parts, verdicts, with_after = _record_resident(
+                recording, loop, rest, own, mutable, counter, body,
+                pre if whole else None, every if whole else None, whole, menu,
             )
+        first, *again = recording.finish_parts(
+            outputs=mutable, parts=[(b, e, 1) for b, e in parts]
+        )
         _lap("finish")
     except BaseException as error:
         failure = error
@@ -1057,7 +1061,11 @@ def _record(
     given = tensors
     tensors = _filled(tensors)
     if key is not None:  # the program owns copies; this call's values go in and out
-        tensors = tuple(value.clone() for value in tensors)
+        try:
+            tensors = _copies(tensors)
+        except _NoRoom as error:  # varena reserved no copies: no program outlives this call
+            _refused(row, "resident", f"{_NO_ROOM}: {error}")
+            key = None
     mutable = tensors[: len(work)]
     counter = torch.zeros(1, dtype=torch.int64, device=tensors[0].device)
     with _measuring() as peaks:
@@ -1283,10 +1291,7 @@ class _IdleRecording:
                     scopes.enter_context(owner._cozy_scope(method, components))
                 _lap("scope")
                 _yield_point()
-                _hold(self.scope, scopes)  # what an eager `after` evicted, as a replay refills it
-                if any(_unresident(model, tuple(p)) for model, p in paths.items()):
-                    return True  # its weights left the device: the next call queues again
-                _lap("resident")
+                _lap("resident")  # what an eager `after` evicted, varena refills as it admits it
                 _yield_point()
                 with self.loops._lock:
                     measured = dict(self.known.measured.get(self.ident[1], {}))  # type: ignore[index]
@@ -1401,12 +1406,12 @@ def _pinned(program: _Program) -> Iterator[str]:
         if program.region is not None:  # a first call's rest, kept by no call
             held.enter_context(program.region.pin())
         stream = torch.cuda.current_stream(device)
-        held.enter_context(graphs.replaying(stream, program.bindings()))
-        sequences[0].map_pool()
-    except varena.Exhausted as error:
-        why = graphs.no_room(device.index, "its replay", program.pool_bytes, error)
-        graphs.safeguard("no_room", why)
-        why = f"{why}: it runs eagerly"
+        pool = sequences[0]._pool
+        if why := held.enter_context(
+            graphs.replaying(stream, program.bindings(), None if pool is None else pool.handle)
+        ):
+            graphs.safeguard("no_room", why)
+            why = f"{why}: it runs eagerly"
     except ResidencyError as error:  # released, or its weights changed
         why = f"{type(error).__name__}: {error}"[:300]
     if why:
@@ -1554,17 +1559,35 @@ def _abandon(recording: _SequenceCapture, failure: BaseException | None = None) 
         graphs.close_pool(pool, device)
 
 
-def _hold(models: Iterable[Model], stack: ExitStack) -> None:
-    """Each of `models` not resident loaded and held in `stack`; `_NoRoom` where varena has no
-    room for one, before anything is captured."""
-    for model in models:
-        if _unresident(model):
-            try:
-                hold = model.hold()
-            except varena.Exhausted as error:
-                raise _NoRoom(f"{model.component}'s weights: {error}") from error
-            if hold is not None:
-                stack.callback(hold.release)
+#: where each copy a program owns starts in its block (`_copies`)
+_ALIGN = 512
+
+
+def _copies(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    """Copies of `values` a program owns, in one block varena reserves for them now
+    (`vt.reserve`), before its weights and pool are admitted beside them: `_NoRoom` when it has
+    none, and nothing was copied."""
+    if not values[0].is_cuda:
+        return tuple(value.clone() for value in values)
+    places, total = [], 0
+    for value in values:
+        span = 1 + sum((n - 1) * step for n, step in zip(value.shape, value.stride(), strict=True))
+        nbytes = span * value.element_size() if value.numel() else 0
+        places.append((total, nbytes))
+        total += -(-nbytes // _ALIGN) * _ALIGN
+    try:
+        block = vt.reserve(values[0].device, max(total, _ALIGN))
+    except varena.Exhausted as final:  # varena's answer: no copies, so no program to keep
+        if (request := _REQUEST.get()) is not None:
+            request.answered += 1
+        raise _NoRoom(f"its tensors' copies: {final}") from final
+    copies = []
+    for value, (start, nbytes) in zip(values, places, strict=True):
+        copy = block[start : start + nbytes].view(value.dtype)
+        copy = copy.as_strided(value.shape, value.stride())
+        copy.copy_(value)
+        copies.append(copy)
+    return tuple(copies)
 
 
 def _bind(
@@ -1595,36 +1618,34 @@ def _admit(
     preparing: ExitStack,
     bindings: list[Binding],
 ) -> bool:
-    """The recording's mode, decided before anything is captured: the first of `menu` (`_menu`)
-    whose weights and pool varena makes room for, with or without `after`. Its pool is prepared
-    (`_working_bytes`), every capture of the recording takes it, and its weights stay prepared in
-    `preparing`; `_NoRoom`, naming what each needed, when none has room."""
+    """The recording's mode, varena's before anything is captured: of `menu` (`_menu`) and then
+    eager, the first it holds, its weights pinned and its pool mapped (`_working_bytes`) for
+    every capture of the recording, held in `preparing`. Eager: `_NoRoom`, naming what each
+    needed."""
     if not menu:
         raise CapabilityError(
             "its parts' working memory was never measured", code="prepared_graph_ineligible"
         )
     pool, device = recording._pool.handle, recording._domain.device
-    refused: list[str] = []
-    for need, with_after in menu:
-        attempt, held = ExitStack(), []
-        try:
-            _bind(used(with_after), attempt, held)
-            vt.prepare_pool(pool, need, device)
-        except BaseException as error:
-            attempt.close()
-            for binding in held:
-                binding.close()
-            vt.cancel_preparation(pool, device)
-            if not isinstance(error, varena.Exhausted):
-                raise
-            what = "its whole call" if with_after else "its steps, `after` eagerly,"
-            refused.append(graphs.no_room(device, what, need, error))
-            continue
-        preparing.enter_context(attempt)
-        bindings.extend(held)
-        recording._working_bytes = need
-        return with_after
-    raise _NoRoom("; ".join(refused))
+    modes = [(_regions(used(with_after)), (pool, need)) for need, with_after in menu]
+    stream = torch.cuda.current_stream(device).cuda_stream
+    admitted = _runtime.admit(device, [*modes, ([], None)], stream=stream)
+    if admitted.index == len(menu):
+        what = ("its whole call" if after else "its steps, `after` eagerly," for _, after in menu)
+        raise _NoRoom("; ".join(
+            f"{name} needs {need / (1 << 30):.1f} GiB more"
+            for name, need in zip(what, admitted.needs, strict=False)
+        ))
+    preparing.callback(admitted.release)
+    with_after = menu[admitted.index][1]
+    _bind(used(with_after), preparing, bindings)
+    recording._working_bytes = admitted.pool_bytes
+    return with_after
+
+
+def _regions(used: dict[Model, set[str]]) -> list[Any]:
+    """The Regions a recording of `used` reads (`Memory.reads`)."""
+    return next(iter(used)).memory.reads(used) if used else []
 
 
 def _drop_stages(recording: _SequenceCapture) -> None:

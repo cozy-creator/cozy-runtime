@@ -357,6 +357,12 @@ def check_flags(torch: Any, during: str) -> None:
 REFUSALS: list[Callable[[], tuple[int, Any] | None] | None] = [None]
 
 
+def _answered(request: object) -> int:
+    """Refusals varena answered that the Runtime followed: a Retry (`finer_splits`), a wait or the
+    eager way (`answered`)."""
+    return int(getattr(request, "finer_splits", 0)) + int(getattr(request, "answered", 0))
+
+
 class _Scopes:
     """Each local component scope (`author/_model.py`): at its exit the flags are put back and
     checked, and a refusal varena counted while it ran (`vt.ooms`) that the scope returned past,
@@ -381,7 +387,7 @@ class _Scopes:
         read = REFUSALS[0]() if REFUSALS[0] is not None else None
         if read is None:
             return None
-        return read[0], getattr(read[1], "finer_splits", 0), shared
+        return read[0], _answered(read[1]), shared
 
     def leave(self, entered: tuple[int, int, int] | None, method: str, ok: bool) -> None:
         thread = threading.get_ident()
@@ -399,7 +405,7 @@ class _Scopes:
             assert entered is not None
             ooms, request = read
             since = max(entered[0], self._accounted.get())
-            swallowed = ooms - since - (getattr(request, "finer_splits", 0) - entered[1])
+            swallowed = ooms - since - (_answered(request) - entered[1])
             self._accounted.set(ooms)
             if swallowed > 0:
                 if request is not None and hasattr(request, "swallowed_ooms"):

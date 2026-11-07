@@ -489,8 +489,8 @@ def split[T](
     most `most` of its `total` elements; `finest` is the least a window can hold. Its author
     must preserve global statistics/quantizers and declare any overlap approximation; merely
     having no side effects does not make differently sized windows numerically equivalent.
-    Package code runs once; `pure` says `run` is a Runtime leaf's, which runs again finer only
-    when varena answers a refusal in it so (`catch.retry`). `out_bytes` is the whole output held
+    Package code runs once; `pure` says `run` is a Runtime leaf's, which runs again only when
+    varena answers a refusal in it with Retry (`vt.Leaf.exit`). `out_bytes` is the whole output held
     beside the windows, `item_bytes` a window's output per element, `holds` how many of that its
     op's peak holds: its author's estimate, which a completed pass's measured sample replaces."""
     deepest = levels(-(-total // max(finest, 1)))

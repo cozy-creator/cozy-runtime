@@ -1,10 +1,11 @@
 """Execution naming, cancellation boundaries and the general split.
 
-A site lists its levels' shape estimates (`sizing`); native selection chooses one, makes its room
-and observes it, all before a piece runs. A level nothing can make room for is refused there
-(`DoesNotFit`), naming the next step. An allocation refused inside the leaf is varena's to answer:
-it learns the level's need and says whether a Runtime-owned pure op runs again finer (Retry) or the
-refusal stands (Final). Nothing here decides that; package code never runs twice.
+A cut registers its levels' shape estimates (`sizing`) once as a varena site; varena chooses each
+op's level, makes its room and observes it, all before a piece runs, and runs a small op or one
+inside another's leaf unobserved. A level nothing can make room for is refused there (`Final`),
+naming the next step. An allocation refused inside the leaf is varena's to answer: a Runtime-owned
+pure op runs again (Retry) at the level it gives, anything else's refusal stands (Final). Nothing
+here decides that; package code never runs twice.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from tensorfs import varena
 from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
-from cozy_runtime.author._errors import DoesNotFit, is_capacity
+from cozy_runtime.author._errors import DoesNotFit
 from cozy_runtime.author._model import TRANSPARENT
 from cozy_runtime.internal.execution import phase, sizing
 from cozy_runtime.internal.residency import Request
@@ -34,14 +35,8 @@ type Kwargs = Mapping[str, object]
 
 #: the request being served: a site's weights and the phase it runs in
 CURRENT: ContextVar[Request | None] = ContextVar("cozy_execution_request", default=None)
-#: Below this a whole op runs unasked: the allocator's reclaim makes its room, and three native
-#: calls cost more than a cut could save (an SDXL UNet's hundred small convs, in every eager step).
-_SMALL = 64 << 20
-#: Native leaves do not nest and this process has one device: a site that finds this held, in
-#: another site's leaf on any thread, runs inside that leaf's observation.
-LEAF = threading.Lock()
-#: each key's last native choice, for a capture (which may not select) to record the same pieces
-LEVELS: dict[str, int] = {}
+#: each cut's varena site, by its name and operands' extent
+SITES: dict[tuple[str, int, tuple[int, ...]], vt.Site] = {}
 
 
 class _Local(threading.local):
@@ -89,14 +84,6 @@ def _capturing() -> bool:
     return bool(torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing())
 
 
-def useful(sizes: Sequence[Sequence[int]]) -> list[Sequence[int]]:
-    """The levels worth listing: down to the first within 1/64 of the finest's bytes (the whole
-    output is the need by then) or at 1/64 of the whole's. Finer only adds launches."""
-    least, whole = sum(sizes[-1]), sum(sizes[0])
-    floor = max(least + least // 64, whole // 64)
-    return list(sizes[: next(n for n, row in enumerate(sizes) if sum(row) <= floor) + 1])
-
-
 def owners(request: Request) -> tuple[Any, ...]:
     """What a site's samples live and die with: the running models, or a componentless request."""
     with request.memory.lock:
@@ -108,54 +95,50 @@ def _gib(n: int) -> str:
     return f"{n / (1 << 30):.1f} GiB"
 
 
-def refuse(device: int, name: str, level: str, need: int, exc: BaseException) -> DoesNotFit:
-    """Native selection cannot make room for `name` at `level` (`need` bytes) with everything
-    evictable gone, before any piece ran."""
-    room = vt.room(device)
+def refused(name: str, exc: BaseException) -> DoesNotFit:
+    """varena's final answer for `name` (`varena.Final`), as one line naming the next step."""
+    answer = getattr(exc, "refusal", {})
+    level = "its finest split" if answer.get("finest") else f"split level {answer.get('level', 0)}"
+    held = (
+        f"{_gib(answer.get('live_bytes', 0))} live and "
+        f"{_gib(answer.get('pinned_bytes', 0))} of weights in use"
+    )
+    if answer.get("next") == "again":
+        then = "varena learned what it needs: run it again and it splits finer"
+    else:
+        then = "run it smaller, or rent a larger card: `cozy run … --on new`"
     return DoesNotFit(
-        f"{name}: {level} needs {_gib(need)} beside {_gib(room['working_live'])} live and "
-        f"{_gib(room['pinned'])} of weights in use, and this card has {_gib(room['capacity'])} "
-        f"({exc}): run it smaller, or rent a larger card: `cozy run … --on new`"
+        f"{name}: {level} needs {_gib(answer.get('need_bytes', 0))} beside {held}, and this card "
+        f"has {_gib(answer.get('capacity_bytes', 0))}: {then}"
     )
 
 
-def select(
-    device: int, key: str, name: str, menu: Sequence[tuple[str, Sequence[int]]], stream: int
-) -> dict[str, Any]:
-    """The level native selection takes, its room made; `DoesNotFit` where none can have it."""
-    try:
-        selection: dict[str, Any] = vt.split_select(device, key, menu, stream=stream)
-        return selection
-    except varena.Exhausted as exc:  # a decision, not a failure: nothing has run
-        raise refuse(device, name, "its finest split", sum(menu[-1][1]), exc) from exc
+def _site(device: int, name: str, finest: int, need: sizing.Need, pure: bool) -> vt.Site:
+    """`name`'s varena site for these operands: registered at its first call, keyed by its whole
+    level's bytes; varena keeps the levels worth having."""
+    whole = tuple(need(0))
+    found = SITES.get((name, finest, whole))
+    if found is None:
+        menu = [need(n) for n in range(finest + 1)]
+        found = SITES[(name, finest, whole)] = vt.Site(
+            device, f"{name}:{hash(tuple(menu)):x}", menu, pure=pure
+        )
+    return found
 
 
-def begin(
-    device: int,
-    key: str,
-    name: str,
-    menu: Sequence[tuple[str, Sequence[int]]],
-    level: int,
-    selection: dict[str, Any],
-    stream: int,
-) -> int:
-    """Open `level`'s native observation; `DoesNotFit` where its room is gone since selection
-    (another program took it, and the core's wait for it ran out)."""
-    phase.choice()
-    try:
-        return phase.begin_split(device, key, str(level), selection, stream=stream)
-    except varena.Exhausted as exc:  # before the op runs
-        raise refuse(device, name, f"split level {level}", sum(menu[level][1]), exc) from exc
+def menu_site(device: int, name: str, menu: Sequence[Sequence[int]]) -> vt.Site:
+    """`name`'s varena site for an explicit menu (each level's allocations, largest first): an
+    op no varena answer may run again (a group's collective)."""
+    return _site(device, name, len(menu) - 1, lambda level: tuple(menu[level]), False)
 
 
-def note(
-    request: Request, key: str, name: str, level: int, selection: dict[str, Any] | None = None
-) -> None:
+def note(request: Request, key: str, name: str, leaf: vt.Leaf) -> None:
     """A site's calls per level and what each was last chosen against, for the run record."""
     record = request.working_splits.setdefault(key, {"site": name, "levels": {}, "chosen": {}})
-    record["levels"][str(level)] = record["levels"].get(str(level), 0) + 1
-    if selection is not None:
-        record["chosen"][str(level)] = {
+    level = str(leaf.level)
+    record["levels"][level] = record["levels"].get(level, 0) + 1
+    if (selection := leaf.selection) is not None:
+        record["chosen"][level] = {
             "full": selection["allocation_backing_bytes"],
             "budget": selection["budget_bytes"],
             "capacity": selection["capacity_bytes"],
@@ -167,79 +150,59 @@ def note(
         }
 
 
+def _device() -> int | None:
+    """The device a cut runs on: the request's native one, a capture's, else none (whole)."""
+    request = CURRENT.get()
+    if request is not None and request.memory.cuda:
+        return request.memory.device.index or 0
+    return int(torch.cuda.current_device()) if _capturing() else None
+
+
 def cut[T](
     name: str, finest: int, need: sizing.Need, run: Callable[[int], T], *, pure: bool = True
 ) -> T:
     """`run(level)` for a call that cuts itself into 2^level pieces down to `finest` (FFN tokens,
-    attention pieces, a norm's or a conv's bands, a package's split). Without native memory, or
-    small, it runs whole; inside a capture or another site's leaf, at this key's last level."""
+    attention pieces, a norm's or a conv's bands, a package's split), at the level varena gives
+    it. Without native memory it runs whole."""
     checkpoint()
-    request = CURRENT.get()
-    native = request is not None and request.memory.cuda
-    if not (native or _capturing()) or sum(need(0)) < _SMALL:
+    device = _device()
+    if device is None:
         return run(0)
-    menu = tuple(
-        (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
-    )
-    key = f"{name}:{hash(menu):x}"
-    if not native or not LEAF.acquire(blocking=False):
-        return run(LEVELS.get(key, 0))
-    assert request is not None
+    site = _site(device, name, finest, need, pure)
+    stream = int(torch.cuda.current_stream(device).cuda_stream)
+    request = CURRENT.get()
+    if request is not None:
+        request.memory.remember_working_phase(site.key, owners(request))
     try:
-        device = request.memory.device.index or 0
-        if not vt.split_context(device)["eligible"]:
-            return run(LEVELS.get(key, 0))
-        request.memory.remember_working_phase(key, owners(request))
-        stream = int(torch.cuda.current_stream(device).cuda_stream)
-        selection = select(device, key, name, menu, stream)
-        while True:
-            level = int(selection["choice_id"])
-            token = begin(device, key, name, menu, level, selection, stream)
-            LEVELS[key] = level
-            note(request, key, name, level, selection)
+        leaf = site.enter(stream=stream, owner=phase.completion_owner(device, stream))
+    except varena.Exhausted as exc:  # varena's Final: nothing has run
+        raise refused(name, exc) from exc
+    while True:
+        if leaf.token is not None:
+            phase.choice()
+            if request is not None:
+                note(request, site.key, name, leaf)
+        try:
+            result = run(leaf.level)
+        except BaseException as exc:
+            _unwind(exc)  # the attempt's frames and tensors go before varena counts room
             try:
-                result = run(level)
-            except BaseException as exc:
-                again = retry(device, key, name, menu, level, token, stream, exc, pure)
-                if again is None:
-                    if is_capacity(exc):  # the run record names it: a package's `holds` was short
-                        request.working_splits[key]["refused"] = {"level": level, "pure": pure}
-                    raise
-                selection = again
-                continue
-            vt.split_end(device, token, submitted=True)
-            return result
-    finally:
-        LEAF.release()
-
-
-def retry(
-    device: int,
-    key: str,
-    name: str,
-    menu: Sequence[tuple[str, Sequence[int]]],
-    level: int,
-    token: int,
-    stream: int,
-    exc: BaseException,
-    pure: bool,
-) -> dict[str, Any] | None:
-    """Close the failed leaf. For a pure op whose leaf varena refused memory, varena's answer: the
-    finer level to run again at, its room made (`stats.finer_splits`; a short estimate), or None,
-    and the failure stands. The refused attempt's frames and tensors go before it counts room."""
-    closed = vt.split_end(device, token, submitted=False)
-    if not (pure and closed.get("refused_bytes") and is_capacity(exc)):
-        return None
-    _unwind(exc)
-    try:
-        again: dict[str, Any] | None = vt.split_refused(device, key, str(level), stream=stream)
-    except varena.Exhausted as refused:
-        raise refuse(device, name, "every finer split", sum(menu[-1][1]), refused) from exc
-    if again is not None:
-        print(f"cozy-runtime: {name} refused at level {level}: a short estimate", file=sys.stderr)
-        if (request := CURRENT.get()) is not None:
-            request.finer_splits += 1
-    return again
+                again = leaf.exit(submitted=False)
+            except varena.Exhausted as final:
+                if request is not None:  # the run record names it: a package's `holds` was short
+                    level = getattr(final, "refusal", {}).get("level")
+                    request.working_splits[site.key]["refused"] = {"level": level, "pure": pure}
+                raise refused(name, final) from exc
+            if again is None:
+                raise
+            print(f"cozy-runtime: {name} refused at level {leaf.level}: varena runs it again "
+                  f"at level {again.level}", file=sys.stderr)
+            if request is not None:
+                request.finer_splits += 1
+            leaf = again
+            continue
+        leaf.exit(submitted=True)
+        return result
 
 
 def refusals(device: int) -> Callable[[], tuple[int, Request | None]]:
@@ -260,69 +223,57 @@ def _unwind(exc: BaseException) -> None:
 
 class Fixed:
     """A cut's level chosen once, before a loop runs its pieces (`author.windows`): `piece()`
-    around each piece's work observes it, so the level is measured for the next call."""
+    around each piece's work observes it at that level, so it is measured for the next call. A
+    refusal inside a piece is Final: the layout is the package's loop's."""
 
-    def __init__(
-        self,
-        level: int,
-        key: str | None = None,
-        name: str = "",
-        menu: Sequence[tuple[str, Sequence[int]]] = (),
-        device: int = 0,
-    ) -> None:
-        self.level, self.key, self.name, self.menu, self.device = level, key, name, menu, device
+    def __init__(self, level: int, site: vt.Site | None = None, name: str = "") -> None:
+        self.level, self.site, self.name = level, site, name
 
     @contextmanager
     def piece(self) -> Iterator[None]:
         checkpoint()
-        if self.key is None or _capturing() or not LEAF.acquire(blocking=False):
+        if self.site is None:
             yield
             return
+        device = self.site.device
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
         try:
-            stream = int(torch.cuda.current_stream(self.device).cuda_stream)
-            # The plan generation now; the level stays the loop's.
-            selection = select(self.device, self.key, self.name, self.menu, stream)
-            token = begin(
-                self.device, self.key, self.name, self.menu, self.level, selection, stream
+            leaf = self.site.enter(
+                stream=stream, owner=phase.completion_owner(device, stream), level=self.level
             )
-            submitted = False
+        except varena.Exhausted as exc:
+            raise refused(self.name, exc) from exc
+        try:
+            yield
+        except BaseException as exc:
+            _unwind(exc)
             try:
-                yield
-                submitted = True
-            finally:
-                vt.split_end(self.device, token, submitted=submitted)
-        finally:
-            LEAF.release()
+                leaf.exit(submitted=False)
+            except varena.Exhausted as final:
+                raise refused(self.name, final) from exc
+            raise
+        leaf.exit(submitted=True)
 
 
 def fixed(name: str, finest: int, need: sizing.Need) -> Fixed:
     """The level of a cut into 2^level pieces down to `finest` that a loop keeps throughout,
-    chosen now by native selection, its room made; `DoesNotFit` where none can have it. Without
-    native memory, or small, whole; inside a capture or another site's leaf, the key's last."""
+    chosen now by varena, its room made; `DoesNotFit` where none can have it. Without native
+    memory, whole."""
     checkpoint()
-    request = CURRENT.get()
-    native = request is not None and request.memory.cuda
-    if not (native or _capturing()) or sum(need(0)) < _SMALL:
+    device = _device()
+    if device is None:
         return Fixed(0)
-    menu = tuple(
-        (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
-    )
-    key = f"{name}:{hash(menu):x}"
-    if not native or not LEAF.acquire(blocking=False):
-        return Fixed(LEVELS.get(key, 0))
-    assert request is not None
+    site = _site(device, name, finest, need, False)
+    request = CURRENT.get()
+    if request is not None:
+        request.memory.remember_working_phase(site.key, owners(request))
     try:
-        device = request.memory.device.index or 0
-        if not vt.split_context(device)["eligible"]:
-            return Fixed(LEVELS.get(key, 0))
-        request.memory.remember_working_phase(key, owners(request))
-        stream = int(torch.cuda.current_stream(device).cuda_stream)
-        selection = select(device, key, name, menu, stream)
-        level = LEVELS[key] = int(selection["choice_id"])
-        note(request, key, name, level, selection)
-        return Fixed(level, key, name, menu, device)
-    finally:
-        LEAF.release()
+        leaf = site.choose(stream=int(torch.cuda.current_stream(device).cuda_stream))
+    except varena.Exhausted as exc:
+        raise refused(name, exc) from exc
+    if request is not None:
+        note(request, site.key, name, leaf)
+    return Fixed(leaf.level, site, name)
 
 
 def _tensors(value: object, depth: int = 3) -> list[Tensor]:
