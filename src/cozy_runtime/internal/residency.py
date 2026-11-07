@@ -31,6 +31,7 @@ from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
+from cozy_runtime.author import _retained
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import cache_owners, proctree
@@ -1644,6 +1645,20 @@ class Memory:
         self.regions.add(region)
         return region
 
+    def retained(self, nbytes: int) -> Retained | None:
+        """Where a call keeps `nbytes` of cross-step state, decided once before its loop: varena
+        regions. They stay on the card where half the room nothing live holds takes them, with
+        none of it spilled; else each is spilled to a pinned host page behind compute and evicted
+        like a weight. None: the card and host RAM cannot hold them, and the call recomputes that
+        state instead. A TensorFS without retained regions holds the tensors as they are."""
+        if self.native is None or not (hasattr(varena, "Retained") and hasattr(vt, "room")):
+            return Retained(None)
+        room = vt.room(self.device.index or 0)
+        card = room["capacity"] - room["working_live"] - room["pinned"]
+        if nbytes > self.pages.retained_room() + card:
+            return None
+        return Retained(self, spill=2 * nbytes > card - room["weights_resident"])
+
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
         if self.cuda:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
@@ -2213,6 +2228,87 @@ class Memory:
             "allocator_scope": "process",
             "weights": self.native.stats() if self.native is not None else None,
         }
+
+
+class Retained:
+    """One loop's cross-step state (`author.retained`). Each `put` is one `varena.Retained`:
+    written on this stream, resident while there is room, else refilled from its host copy and
+    filled ahead of its next use. Where no native core runs the tensors stay as they are. `close`
+    (or leaving its `with`) ends it with the loop: its regions go then, whoever still holds a state.
+    """
+
+    def __init__(self, memory: Memory | None, *, spill: bool = True) -> None:
+        self.memory, self.spill = memory, spill
+        self.states: list[_Held | _Kept] = []
+
+    def __enter__(self) -> Retained:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """The loop that reads this state is done. Kept on the card, the edit's K/V stayed pinned
+        through the VAE decode after it, which then had no room (run 41362)."""
+        for state in self.states:
+            state.close()
+        self.states.clear()
+
+    def put(self, *tensors: Tensor) -> _retained.State:
+        memory = self.memory
+        if memory is None or not tensors[0].is_cuda:
+            self.states.append(_Held(tensors))
+            return self.states[-1]
+        # Each contiguous copy lives until the write is on the stream: freed in the loop, a
+        # transposed key's copy was the next value's, and HiDream-O1's prefix read back as noise.
+        dense = [tensor.contiguous() for tensor in tensors]
+        parts, views, end = [], [], 0
+        for tensor in dense:
+            parts.append((end, tensor.data_ptr(), tensor.nbytes))
+            views.append((end, tensor.nbytes, tensor.dtype, tensor.shape))
+            end = (end + tensor.nbytes + 255) // 256 * 256
+        region = varena.Retained(memory.native, memory.pages, end)
+        region.write(memory.stream().cuda_stream, parts, spill=self.spill)
+        del dense
+        self.states.append(_Kept(memory, region, views))
+        return self.states[-1]
+
+
+class _Held:
+    def __init__(self, tensors: tuple[Tensor, ...]) -> None:
+        self.tensors: tuple[Tensor, ...] | None = tensors
+
+    def get(self) -> tuple[Tensor, ...]:
+        if self.tensors is None:
+            raise RuntimeError("retained state read after its loop ended")
+        return self.tensors
+
+    def close(self) -> None:
+        self.tensors = None
+
+
+class _Kept:
+    def __init__(self, memory: Memory, region: Any, views: list[tuple[int, int, Any, Any]]) -> None:
+        self.memory, self.region, self.views = memory, region, views
+
+    def close(self) -> None:
+        # The last reference to its region: it is released now, and views still out keep their pins.
+        self.region = None
+
+    def get(self) -> tuple[Tensor, ...]:
+        if self.region is None:
+            raise RuntimeError("retained state read after its loop ended")
+        raw = self.region.use(self.memory.stream().cuda_stream).tensor
+        return tuple(raw[at:at + n].view(dtype).view(shape) for at, n, dtype, shape in self.views)
+
+
+class _Retaining:
+    def retained(self, nbytes: int) -> Retained | None:
+        request = _REQUEST.get()
+        return Retained(None) if request is None else request.memory.retained(nbytes)
+
+
+_retained.install(_Retaining())
 
 
 @dataclass(slots=True)
