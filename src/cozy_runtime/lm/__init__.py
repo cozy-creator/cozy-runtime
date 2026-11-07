@@ -68,7 +68,17 @@ from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author._services import stage_progress
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, safeguard, say
+from cozy_runtime.graphs import (
+    BYPASS,
+    DECODERS,
+    _measured,
+    capture,
+    capture_domain,
+    close_pool,
+    no_room,
+    safeguard,
+    say,
+)
 from cozy_runtime.graphs.domain import Pool
 from cozy_runtime.internal import cache_owners
 from cozy_runtime.lm import _kernels
@@ -1377,8 +1387,10 @@ class _Engine:
         self.cache: Any = None
         self.views: dict[int, Any] = {}
         self.graphs: dict[_Key, Any] = {}
-        #: Full shape variants whose real accepted step preseeded their capture pool.
+        #: Full shape variants whose real accepted step preseeded their capture pool, and the
+        #: working peak varena measured it at: the pool its capture prepares first.
         self.warmed: set[_Key] = set()
+        self.peaks: dict[_Key, int] = {}
         self.layout: tuple[object, ...] | None = None
         #: its decode graphs' capture pool (`domain.Pool`): the model's graph region, or a
         #: torch pool of its own with no varena memory
@@ -2389,13 +2401,22 @@ class _Engine:
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             if key not in self.warmed:
-                # This is the caller's actual next token, never an extra speculative warmup.
-                with self._graph_memory(drafted):
+                # This is the caller's actual next token, never an extra speculative warmup; its
+                # working peak, as varena measured it, is what its capture's pool takes.
+                with self._graph_memory(drafted), _measured(self.domain.device) as peak:
                     self._advance(size)
                 self.warmed.add(key)
+                if peak:
+                    self.peaks[key] = peak[0]
+                self.eager += 1
+                return
+            if key not in self.peaks:  # a step never measured is never recorded
+                self._unrecorded(key, "its warm-up's working memory was not measured")
+                self._advance(size)
                 self.eager += 1
                 return
             capturing = time.perf_counter()
+            reserve, why = vt.pool_bytes(self.peaks[key]), ""
             try:
                 with (
                     self._graph_memory(drafted),
@@ -2407,12 +2428,17 @@ class _Engine:
                             if placed is not None
                             else Pool(torch.cuda.graph_pool_handle())
                         )
-                    pool = self.pool
-                    graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
+                    try:
+                        graph, why = capture(
+                            torch, lambda: self._advance(size), self.pool, self.domain, reserve
+                        )
+                    except Exhausted as exc:  # its pool's room, before anything was captured
+                        why = no_room(self.domain.device, "its pool", reserve, exc)
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
                 if graph is None and not self.graphs and self.pool is not None:
+                    close_pool(self.pool, self.domain.device)
                     self.pool = None
             if graph is not None:
                 self.graphs[key] = graph
@@ -2479,6 +2505,9 @@ class _Engine:
                 self._pool(False)  # the pool's last graph goes: its use ends while it owns it
             del self.graphs[key]
             graph.reset()
+            if not self.graphs:
+                close_pool(self.pool, self.domain.device)
+                self.pool = None
             self._unrecorded(key, why, "replay_mismatch")
 
     def _forget(self) -> None:
@@ -2495,7 +2524,9 @@ class _Engine:
             self.retired_graphs += len(self.graphs)
             for graph in self.graphs.values():
                 graph.reset()
-            self.graphs, self.warmed, self.unrecorded = {}, set(), {}
+            if self.pool is not None:
+                close_pool(self.pool, self.domain.device)
+            self.graphs, self.warmed, self.unrecorded, self.peaks = {}, set(), {}, {}
             self.undrafted = False
             self.pool = None
 
