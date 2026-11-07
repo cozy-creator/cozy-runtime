@@ -43,7 +43,6 @@ from cozy_runtime.internal.accel import (
     host_memory,
     release_cached,
 )
-from cozy_runtime.internal.hostfacts import physical_memory
 
 __all__ = [
     "Binding",
@@ -994,13 +993,10 @@ class Region:
 
 
 def _pages(index: int, shared: bool) -> Any:
-    """This GPU's host tier. A shared machine's (a person's computer) leaves free what the computer
-    keeps for its other programs, not `_HOST_HEADROOM`, and pins nothing while it stalls."""
-    cap = max(physical_memory(), 0) // 2
-    try:
-        return varena.Pages(index, cap=cap, headroom=_HOST_HEADROOM, shared=shared)
-    except TypeError:  # a TensorFS before the shared host tier
-        return varena.Pages(index, cap=cap, headroom=_HOST_HEADROOM)
+    """This GPU's host tier. TensorFS sizes it and shares the host with every executor's tiers
+    through the host's ledger page; on a shared machine (a person's computer) it pins nothing
+    while the host stalls."""
+    return varena.Pages(index, shared=shared)
 
 
 class Memory:
