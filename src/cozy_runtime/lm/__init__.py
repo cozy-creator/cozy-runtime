@@ -21,10 +21,12 @@ one. Temperature 0 is the plain argmax.
 
 A cached graph keeps only its weights' addresses; a driver's lease (`_hold`) brings their pages
 back. Offload retires the graph before those addresses change; a later call can refill and capture
-anew. If the full set cannot be prepared before execution, the call uses Transformers' loop. A
-call's keys and state for its prompt and `max_new_tokens`, sized from the config, and the graphs'
-pool are decided before its prefill (`_Engine._enter`): allocated or mapped then, else it waits for
-decoding rows to leave, else `DoesNotFit` names what would fit; nothing after catches running out.
+anew. A set that cannot be held at home (a card or cap below the model) streams: each step runs
+eagerly, its weights filled as its layers reach them, and drafts, so one pass over the weights
+serves each token it keeps (`_home`). A call's keys and state for its prompt and
+`max_new_tokens`, sized from the config, and the graphs' pool are decided before its prefill
+(`_Engine._enter`): allocated or mapped then, else it waits for decoding rows to leave, else
+`DoesNotFit` names what would fit; nothing after catches running out.
 Errors after execution starts are final; package code is never restarted. On a CPU, or after a safe
 capture refusal (a run warning), the same step runs eagerly. A model this does not
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
@@ -38,10 +40,10 @@ the mask after it is written.
 
 With a `draft` (a model's multi-token-prediction head) a step drafts `DEPTH` tokens, the model
 verifies them and the token after them in one pass, and the step keeps the prefix the model
-agrees with and the model's own token after it: the greedy tokens the model alone gives, one to
-`DEPTH + 1` of them a replay. Keys past the kept prefix are masked and overwritten, and every
-linear-attention layer's state goes back to the kept prefix's end (the pass keeps its state
-after each token).
+agrees with and the model's own token after it: the tokens the model alone gives, one to
+`DEPTH + 1` of them a replay or a pass over streamed weights. Keys past the kept prefix are
+masked and overwritten, and every linear-attention layer's state goes back to the kept prefix's
+end (the pass keeps its state after each token).
 """
 
 from __future__ import annotations
@@ -203,9 +205,9 @@ def generate(
     the model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
     model's head read before it, the state the head reads for the token after; `rotary` is the
     model's own rotary embedding. It speeds up a
-    batch of one, each token computed as decode computes it, and only where its step is captured
-    (else decode goes plain). Without one, the head `drafting` names, else the model's own
-    (`HEADS`).
+    batch of one, each token computed as decode computes it, where its step is captured or its
+    weights stream (else decode goes plain). Without one, the head `drafting` names, else the
+    model's own (`HEADS`).
     `progress(tokens)` is told the tokens decoded so far (a call's longest row), at most every
     `PROGRESS_S`, for display only; one that raises is dropped, with a run warning (a cancel is
     the decode's own check's to act on). Without one, the running telemetry stage is told them
@@ -1370,6 +1372,8 @@ class _Engine:
         self.unfit: set[int] = set()
         #: a drafted step could not be captured: drafting pays only replayed, so steps go plain
         self.undrafted = False
+        #: the decode set is not held at home: steps run eagerly as their weights fill, drafting
+        self.streamed = False
         #: captures recorded in this engine's life and their seconds, steps run eagerly
         self.captured = [0, 0.0]
         self.eager = 0
@@ -1488,6 +1492,8 @@ class _Engine:
         mode = "eager" if self.cache_device.type != "cuda" else "graphs"
         if eager:
             mode = "partly eager" if mode == "graphs" else mode
+        if self.streamed:
+            mode = "streamed"
         if self.draft is not None:
             mode += f", drafting {DEPTH}: {looped / max(request.steps, 1):.2f} tokens a step"
         mode += f", {request.live / max(request.steps, 1):.1f} rows a step"
@@ -1524,32 +1530,15 @@ class _Engine:
                 ):
                     self._drop()
                 with ExitStack() as stack:
-                    held = self._hold(stack)
+                    self._home(stack)
                     while True:
                         if self.rehold:  # another head: its blocks are held instead
                             stack.close()
-                            held, self.rehold = self._hold(stack), False
-                        if held is False and self.draft is not None and not self._occupied():
-                            # The head's weights and keys cost room the model's own decode set may
-                            # need: the graphed decode without drafts beats Transformers' loop.
-                            say(
-                                f"lm:{type(self.model).__name__}:undrafted",
-                                "[lm] drafting does not fit at home",
-                            )
-                            self.unfit.add(id(self.draft))
-                            self._drop()
-                            self.draft = None
-                            stack.close()
-                            held = self._hold(stack)
+                            self._home(stack)
+                            self.rehold = False
                         with self.cond:
                             self.incoming = list(self.pending)
                             self.pending.clear()
-                        if held is False:
-                            if self._occupied():
-                                raise self.unprepared or RuntimeError("decode residency was lost")
-                            for request in self.incoming:
-                                request.fallback = "its decode set does not fit at home"
-                            self.incoming = []
                         if self.incoming or self.retire:
                             self._settle(self.incoming)
                             self.incoming = []
@@ -1591,26 +1580,64 @@ class _Engine:
     def _targets(self) -> list[tuple[Any, Any]]:
         return [(m, PLACED[m]) for m in (self.model, self.draft) if m is not None and m in PLACED]
 
-    def _hold(self, stack: ExitStack) -> bool:
-        """Prepare the retained weight tensors while this driver runs.
+    def _home(self, stack: ExitStack) -> None:
+        """Hold the decode set at home, else stream it (`streamed`). Graphed without its head
+        beats streaming with it, so a head that alone keeps the set from home goes; where the
+        model's own set does not fit either, its steps stream the weights and draft: a pass over
+        them costs what moving them costs, whatever it verifies (run 42124: Qwen-Image-2.1's
+        rewriter at 7578 MiB moved 8.7 GiB a token through Transformers' loop, 179 s)."""
+        held = self._hold(stack)
+        if not held and self.draft is not None and not self._occupied():
+            head = self.draft
+            self._drop()
+            self.draft = None
+            stack.close()
+            held = self._hold(stack)
+            if held:
+                say(
+                    f"lm:{type(self.model).__name__}:undrafted",
+                    "[lm] drafting does not fit at home",
+                )
+                self.unfit.add(id(head))
+            else:
+                self.draft = head
+        if not held and not self.streamed:
+            say(
+                f"lm:{type(self.model).__name__}:streamed",
+                f"[lm] {type(self.model).__name__}'s decode set does not fit at home: it streams"
+                + (", drafting" if self.draft is not None else ""),
+            )
+        self.streamed = not held
+        if self.streamed:
+            self.where = ("streamed",)  # what a graph recorded no longer holds
 
-        A full decode that cannot prepare its dependencies refuses before model execution;
-        Transformers can then stream the blocks eagerly. The KV pin has a separate lifetime
-        so changing these bindings cannot make live decode rows reclaimable.
+    def _hold(self, stack: ExitStack) -> bool:
+        """Prepare the retained weight tensors while this driver runs. False: they do not fit
+        at home, and the steps stream them; a set larger than the card is not tried. The KV pin
+        has a separate lifetime so changing these bindings cannot make live decode rows
+        reclaimable.
         """
         self.unprepared = None
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
         built = tuple(t.data_ptr() for t in derived)
         identities: list[object] = []
+        bindings = []
+        for module, (residency, name) in self._targets():
+            binding = self.addresses.get(id(module))
+            if binding is not None and not binding.valid():
+                self._forget()
+                binding.close()
+                binding = None
+            if binding is None:
+                binding = self.addresses[id(module)] = residency.retain(name, ("",))
+            bindings.append(binding)
+        device = self.model.device
+        if device.type == "cuda" and bindings:
+            weights = sum(block.allocation_bytes for b in bindings for block in b.groups)
+            if weights + self.held > int(vt.room(device.index or 0)["capacity"]):
+                return False
         with ExitStack() as leases:
-            for module, (residency, name) in self._targets():
-                binding = self.addresses.get(id(module))
-                if binding is not None and not binding.valid():
-                    self._forget()
-                    binding.close()
-                    binding = None
-                if binding is None:
-                    binding = self.addresses[id(module)] = residency.retain(name, ("",))
+            for binding in bindings:
                 try:
                     leases.enter_context(binding.prepare())
                 except Exception as exc:
@@ -2365,6 +2392,10 @@ class _Engine:
                 current.wait_stream(side)
 
     def _replay(self, size: int, cuda: bool) -> None:
+        if self.streamed:  # its weights move under it: no graph keeps their addresses
+            self._advance(size)
+            self.eager += 1
+            return
         drafted = self._drafting(size)
         constrained = self._constrained()
         part = self.part if drafted else -1
