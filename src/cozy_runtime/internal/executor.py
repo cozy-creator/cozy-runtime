@@ -84,9 +84,11 @@ from cozy_runtime.author._demand import shape_cell
 from cozy_runtime.author._errors import (
     DEVICE_FAULT,
     DEVICE_OOM,
+    DOES_NOT_FIT,
     MEMORY_EXHAUSTED,
     CapabilityError,
     ConformanceError,
+    DoesNotFit,
     Fault,
     InvalidRequest,
     Outcome,
@@ -265,7 +267,7 @@ if TYPE_CHECKING:
 INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: Outcomes that are capacity, not broken state: they fail the attempt and keep the executor.
-CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED})
+CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, DOES_NOT_FIT})
 
 #: Calls this executor runs at once: its pool's workers. More wait their turn in the pool.
 CALLS_IN_FLIGHT = 16
@@ -1530,10 +1532,11 @@ class Executor:
         }
 
     def _declines(self, exc: Exception, ending: str | None) -> str | None:
-        """Why a spread call is declined rather than failed: this GPU ran short of memory in
-        it (`mirror.ending`)."""
-        if ending == MEMORY_EXHAUSTED:
-            return f"{getattr(exc, 'code', DEVICE_OOM)}: {exc}"[:300]
+        """Why a spread call is declined rather than failed: this GPU's memory refused it up front
+        (`DoesNotFit`, before the pass that would run out), so another GPU takes it. An allocation
+        that failed partway fails the call: nothing runs again for it."""
+        if isinstance(exc, DoesNotFit):
+            return f"{DOES_NOT_FIT}: {exc}"[:300]
         return None
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:

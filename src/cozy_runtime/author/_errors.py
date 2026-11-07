@@ -62,6 +62,9 @@ class DoesNotFit(UnsupportedInput):
     default_code = "does_not_fit"
 
 
+DOES_NOT_FIT = DoesNotFit.default_code
+
+
 class DefaultResolutionError(InvalidRequest):
     """The ModelDefault overlay could not be resolved: a package's model slots, not a recipe."""
 
