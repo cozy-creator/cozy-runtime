@@ -131,11 +131,13 @@ ENCODED_LEAVES: Mapping[str, str] = {
     "linear op may be replaced by a module whose weight is the stored role set",
 }
 
-#: `min_bits=`: the lowest weight precision the machine's lane rules may pick by themselves.
+#: `min_bits=`: the fewest weight bits the machine may pick by itself; when no lane has that
+#: many, it serves the widest that runs and warns. Free VRAM never lowers a lane.
 MIN_BITS: Mapping[int, str] = {
-    16: "16-bit unless the request asks for fewer bits",
+    16: "16-bit unless the request pins a lane",
     8: "8-bit by default (the default)",
-    4: "4-bit for a decode slot, or when the 8-bit weights exceed the GPU budget",
+    4: "4-bit for a decode slot, on FP4 tensor cores, or when the 8-bit lane is larger than the "
+    "GPU; else 8-bit",
 }
 
 #: `phase=`: what bounds the slot's time, so the lane rules know when bytes matter most.
