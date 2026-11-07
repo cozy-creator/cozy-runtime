@@ -28,9 +28,11 @@ one whose code cannot run outside its request records only in a call; the calls 
 catches an allocation that fails after that: it fails the call. Other component loops stay eager:
 recording a streamed loop did not repay its recording and extra reads (Qwen-Image int8 1 MP on an
 RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs
-737 s). So does one whose scope holds an `@uncaptured` component, and nothing queues for it. An
-unkeyed component loop whose inputs hold `retained` States runs eagerly, reading them again each
-step; any other reads them once and holds them pinned for the call.
+737 s). So does one whose scope holds an `@uncaptured` component, and nothing queues for it. A
+`retained` State among a call's inputs is read again by each eager step (`_filled`), so varena
+may evict it between steps, keyed or not; a recording reads it once, into copies the program
+owns or (componentless and unkeyed) held pinned for its program, and `_admit` decides with those
+bytes on the card.
 
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
 `before` and the same warm steps run eagerly, then the rest natively. A refusal before anything is
@@ -373,17 +375,9 @@ class Loops:
         overlays = lora.LOOP.set(_overlays(_phase_models()))
         try:
             _mark("entered")
-            # `retained` States among its inputs: one unkeyed in a component scope never records,
-            # so each step reads them again (`_Loop.refills`) and their regions may leave between
-            # steps. Any other reads them once, held for the call: a program recorded on them
-            # reads them only while they stay pinned, or reads its own copies.
-            refills = False
-            if any(not isinstance(value, torch.Tensor) for value in inputs):
-                refills = key is None and bool(_LOCAL_SCOPES.get())
-                if not refills:
-                    inputs = _filled(inputs)
+            retained = any(not isinstance(value, torch.Tensor) for value in inputs)
             loop = _Loop(
-                step, steps, labels, on_step, before, after, key, len(state), cache, refills
+                step, steps, labels, on_step, before, after, key, len(state), cache, retained
             )
             with (
                 nullcontext() if cache is None else stepcache.running(cache, steps, state[0].device)
@@ -414,11 +408,7 @@ class Loops:
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
-            scope, why = (
-                ((), "its retained inputs are read again each step")
-                if loop.refills
-                else _eligible(ctx, steps, tensors)
-            )
+            scope, why = _eligible(ctx, steps, _filled(tensors))
             if why:
                 row["refusals"].append(why)
                 loop.eager_all(tensors, ctx)
@@ -427,7 +417,7 @@ class Loops:
             site = (step.__code__, tuple(id(model) for model in scope))
             # What a call site learns (`_Site`) depends on a keyed call's layout, not its key.
             shape = None if key is None else (
-                _layouts(tensors), steps, loop.labels, loop.cache, lora.LOOP.get()
+                _layouts(_filled(tensors)), steps, loop.labels, loop.cache, lora.LOOP.get()
             )
             ident = None if key is None else (key, shape)
             with self._lock:
@@ -690,8 +680,8 @@ class Loops:
             self,
             site,
             known,
-            replace(loop, on_step=None),  # the call's progress hook stays with the call
-            tuple(value.clone() for value in tensors),  # the program's own copies
+            replace(loop, on_step=None, retained=False),  # its progress hook stays with the call
+            tuple(value.clone() for value in _filled(tensors)),  # the program's own copies
             nwork,
             scope,
             pre,
@@ -742,7 +732,7 @@ class Loops:
         if kept.recorded is not None:
             row["recorded_idle_ms"] = kept.recorded
         try:
-            for slot, value in zip(kept.tensors, tensors, strict=True):
+            for slot, value in zip(kept.tensors, _filled(tensors), strict=True):
                 slot.copy_(value)
             if kept.verdicts is not None and (run := stepcache._RUN.get()) is not None:
                 run.adopt(kept.verdicts)
@@ -767,9 +757,8 @@ class _Loop:
     #: how many of a call's first tensors are its latents (`state`)
     latents: int = 1
     cache: stepcache.Policy | None = None
-    #: its inputs hold `retained` States, read again (`get`, which fills and pins them) for each
-    #: step and for `before` and `after`: it only runs eagerly (`Loops.run`)
-    refills: bool = False
+    #: its inputs hold `retained` States, which each eager step reads again (`_filled`)
+    retained: bool = False
 
     def label(self, i: int) -> Any:
         return _NONE if self.labels is None else self.labels[i - self.steps.start]
@@ -797,7 +786,9 @@ class _Loop:
         mode: working_phase.Mode = (
             "preparation" if request is not None and request.idle else "eager"
         )
-        configuration = _phase_configuration(self, indices, tensors, models) if measured else None
+        shown = _filled(tensors) if self.retained else tensors
+        configuration = _phase_configuration(self, indices, shown, models) if measured else None
+        del shown
         epoch = LANDED[0]
         with working_phase.observing(
             tensors[0].device.index if measured else None, mode,
@@ -813,7 +804,7 @@ class _Loop:
                 index.fill_(i)
                 if (cached := stepcache._RUN.get()) is not None:
                     cached.begin(index, i - self.steps.start)
-                read = _filled(tensors) if self.refills else tensors
+                read = _filled(tensors) if self.retained else tensors
                 _call(self.step, index, read, self.label(i))
                 _mark(f"step {i}")
                 if index.is_cuda:
@@ -843,7 +834,9 @@ class _Loop:
                 if ctx is not None and ctx.cancelled:
                     observation.invalidate("cancelled")
                 else:
-                    actual = _phase_configuration(self, indices, tensors, models)
+                    actual = _phase_configuration(
+                        self, indices, _filled(tensors) if self.retained else tensors, models
+                    )
                     if epoch != LANDED[0] or actual != configuration:
                         observation.invalidate("dispatch_changed")
                     observation.complete()
@@ -855,9 +848,9 @@ class _Loop:
         return None if settle else finite
 
     def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
-        _once(self.before, _filled(tensors) if self.refills else tensors)
+        _once(self.before, tensors)
         self.eager(self.steps, tensors, ctx)
-        _once(self.after, _filled(tensors) if self.refills else tensors)
+        _once(self.after, tensors)
 
 
 def _ranks() -> int:
@@ -867,12 +860,13 @@ def _ranks() -> int:
 
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
     if fn is not None:
-        fn(*tensors)
+        fn(*_filled(tensors))
 
 
 def _filled(values: tuple[Any, ...]) -> tuple[Any, ...]:
     """`values` with each `retained` State in it replaced by the tensors its `get` returns now,
-    filled and pinned while they live."""
+    filled and pinned while they live: an eager use reads them again, so between uses varena
+    may evict them, and a recording takes copies, or holds them for its program (`_record`)."""
     return tuple(
         tensor for value in values
         for tensor in ((value,) if isinstance(value, torch.Tensor) else value.get())
@@ -911,7 +905,7 @@ def _part(fn: Callable[..., object] | None, tensors: tuple[Any, ...], part: str)
     with working_phase.observing(
         tensors[0].device.index, "eager", request.working_phases
     ) as observation:
-        fn(*tensors)
+        fn(*_filled(tensors))
     _peak(part, observation)
 
 
@@ -1014,7 +1008,7 @@ def _record_first(
     own eager run chose, into a pool its measure sized (SDXL's first decode recorded whole at 6 GiB
     needed a 2.7 GiB pool beside its weights, and every call ran eagerly). (None, why) when
     refused, its attempt gone."""
-    own = tuple(value.clone() for value in tensors)
+    own = tuple(value.clone() for value in _filled(tensors))
     mutable = own[:nwork]
     counter = torch.zeros(1, dtype=torch.int64, device=own[0].device)
     every: dict[Model, tuple[str, ...]] = {model: ("",) for model in scope}
@@ -1076,7 +1070,11 @@ def _record(
 ) -> tuple[_Program | None, Callable[[], None]]:
     """A componentless loop: `before` and its warm steps (`_Loop.warm`) eagerly, then the rest
     recorded, overlapping them; None when nothing was left or the recording was refused, after
-    the loop ran eagerly to its end. With it, the warm steps' finite check (`_warm`)."""
+    the loop ran eagerly to its end. With it, the warm steps' finite check (`_warm`). Its
+    `retained` inputs are read once: the program reads them pinned for the call or, keyed, its
+    own copies; refused, the rest reads them again each step."""
+    given = tensors
+    tensors = _filled(tensors)
     if key is not None:  # the program owns copies; this call's values go in and out
         tensors = tuple(value.clone() for value in tensors)
     mutable = tensors[: len(work)]
@@ -1119,9 +1117,10 @@ def _record(
             raise failure
         _refused(row, "resident", why)
         _back(work, tensors)  # the eager rest runs on the caller's tensors
-        loop.eager(rest, work + tensors[len(work) :], ctx)
+        tensors = given
+        loop.eager(rest, tensors, ctx)
         warmed()
-        _once(loop.after, work + tensors[len(work) :])
+        _once(loop.after, tensors)
         return None, warmed
     stages = len(made.stages)
     row.update(
@@ -2269,7 +2268,8 @@ class _Owners(TorchDispatchMode):  # type: ignore[misc]
             func, args, kwargs
         ):
             raise CapabilityError(
-                "native loops take noise as an input, never a random draw",
+                "native loops take noise as an input or draw it with `rng.counter_noise` from "
+                "the step's `i`, never a random draw",
                 code="prepared_graph_ineligible",
             )
         inputs = set()
