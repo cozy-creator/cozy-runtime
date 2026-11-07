@@ -35,12 +35,11 @@ from cozy_runtime import graphs
 from cozy_runtime.author import _retained
 from cozy_runtime.author._errors import DoesNotFit, Fault, fault
 from cozy_runtime.author._model import WARNINGS
-from cozy_runtime.internal import cache_owners, pacing, proctree
+from cozy_runtime.internal import cache_owners, pacing
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
     allocation,
-    host_memory,
     release_cached,
 )
 
@@ -71,8 +70,6 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
 _HOST_STAGING = 64 << 20
-#: Host RAM that host-resident weights leave free: the host tier's pages, a CPU's held blocks.
-_HOST_HEADROOM = 8 << 30
 #: Stored float dtypes a CPU executor serves widened to float32 (`weights._float32`).
 _NARROW = ("F16", "BF16")
 _DTYPES = {
@@ -838,10 +835,11 @@ class Binding:
                 if request is not None and request.idle and not self.resident():
                     raise StaleBinding("idle graph preparation cannot page weights in")
                 if not replay and memory.device.type == "cpu":
-                    # Bound whole, its blocks cannot stream: past the host's room it refuses as
-                    # an allocation would, and a decode streams them per forward instead.
+                    # Bound whole, its blocks cannot stream: past varena's host number it refuses
+                    # as an allocation would, and a decode streams them per forward instead.
                     missing = sum(b.allocation_bytes for b in self.groups if b.data is None)
-                    if missing > memory._free() - _HOST_HEADROOM:
+                    if missing > memory._free():
+                        varena.host_short(missing - memory._free())
                         raise torch.OutOfMemoryError(
                             f"{self.model.component}: {missing / (1 << 30):.1f} GiB of float32 "
                             "weights to bind, more than the host can give"
@@ -1106,13 +1104,11 @@ class Memory:
                 model.working_phase_keys.remove(key)
 
     def _free(self) -> int:
-        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what the host can still
-        give this process: on Linux its tightest cgroup's, page cache counted as room (a pod's
-        `memory.max` is a fraction of the host's MemAvailable)."""
+        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what varena's host
+        number still leaves this process (`varena.host_room`): one owner of host RAM for every
+        executor, its cgroup as the kernel accounts it, page cache counted as room."""
         if self.device.type != "mps":
-            if sys.platform == "linux":
-                return max(proctree.available_host_bytes(), 0)
-            return host_memory().free_bytes
+            return max(varena.host_room(), 0)
         figures = allocation(torch, "mps")
         free = int(figures["driver_free_bytes"])
         if self.budget_bytes is not None:
@@ -1121,19 +1117,21 @@ class Memory:
 
     def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
         """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
-        fit what the host can still give less `_HOST_HEADROOM`, once other models' holds outside
-        the step have gone. The rest stream, read and widened per forward (`_idle`)."""
+        fit what varena's host number leaves this process, once other models' holds outside the
+        step have gone. The rest stream, read and widened per forward (`_idle`); what they lack is
+        asked of idle peers (`varena.host_short`), so a later step may hold more."""
         request = _REQUEST.get()
         step = request.phase(model.name) if request is not None else frozenset({model.name})
         for other in list(self.models.values()):
             if other.name not in step and not other.users:
                 for hold in [h for h in other.holds if h.reclaimable]:
                     hold.shed()
-        room = self._free() - _HOST_HEADROOM
+        room = self._free()
         held: list[_Block] = []
         for block in groups:
             room -= 0 if block.data is not None else block.allocation_bytes
             if room < 0:
+                varena.host_short(-room)
                 break
             held.append(block)
         return held
@@ -2217,6 +2215,8 @@ class Memory:
         # free room only (pool_reserve), and peers order it among the idle.
         if self.cuda and not idle:
             varena.request_boundary(self.device.index or 0, begin=True)
+        elif self.device.type == "cpu" and not idle:
+            varena.host_boundary(begin=True)  # its row in the host's ledger page: in a request
         try:
             yield request
         finally:
@@ -2243,6 +2243,8 @@ class Memory:
                     _REQUEST.reset(token)
                     if self.cuda and not idle:
                         varena.request_boundary(self.device.index or 0, begin=False)
+                    elif self.device.type == "cpu" and not idle:
+                        varena.host_boundary(begin=False)
 
     def stats(self) -> dict[str, Any] | None:
         return self.last
