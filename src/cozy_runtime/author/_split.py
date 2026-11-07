@@ -140,15 +140,15 @@ def windows(
     shape: Sequence[int],
     cut: Cut,
     *,
-    holds: float,
+    per_element_bytes: float,
     most: int | None = None,
     equal: bool = False,
 ) -> Windows:
     """The fewest windows along `cut` of a tensor of `shape` that fit the device, chosen once
     for a whole loop, as `split` chooses a call's: a layout the loop's tables and labels are
-    built for before it starts. `holds` is the bytes a window's work holds at its peak per
-    element of the window (every axis but the cut's whole); the device's choice starts from it
-    and then from what earlier calls measured. Starts fall on `cut.align`, neighbours share
+    built for before it starts. `per_element_bytes` is what a window's work holds at its peak, in
+    bytes per element of the window (every axis whole but the cut's); the device's choice starts
+    from it and then from what earlier calls measured. Starts fall on `cut.align`, neighbours share
     `cut.overlap`, and with `equal` every window has one length (the fewest equal windows at
     least as many as chosen). With `most`, the fewest of at most `most` elements, from the shape
     alone, on every device. Without a managing memory, one window unless `most` says more."""
@@ -168,8 +168,8 @@ def windows(
     runtime = _RUNTIME
     if runtime is None or len(layouts) == 1:
         return Windows(tuple(layouts[0]))
-    needs = [int(_span(w) * rest * holds) for w in layouts]
-    key = f"{name}{shape}:{cut}:{holds}:{equal}"
+    needs = [int(_span(w) * rest * per_element_bytes) for w in layouts]
+    key = f"{name}{shape}:{cut}:{per_element_bytes}:{equal}"
     at, piece = runtime.windows(name, key, needs)
     return Windows(tuple(layouts[at]), piece)
 
