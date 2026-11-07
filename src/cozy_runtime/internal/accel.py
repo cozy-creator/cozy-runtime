@@ -32,7 +32,7 @@ import tensorfs.varena.torch as vt
 from tensorfs.varena import _runtime as varena
 
 from cozy_runtime.author._errors import Fault, fault
-from cozy_runtime.internal.config import inherited_environment, sees_no_gpu
+from cozy_runtime.internal.config import sees_no_gpu
 from cozy_runtime.internal.hostfacts import available_memory, physical_memory
 
 
@@ -61,7 +61,6 @@ BACKENDS = ("cuda", "mps")
 #: branches on.
 _NVML_SUCCESS = 0
 _NVML_ERROR_NOT_SUPPORTED = 3
-_NVML_ERROR_INSUFFICIENT_SIZE = 7
 
 
 class AcceleratorUnsupported(Exception):
@@ -76,14 +75,6 @@ class AcceleratorUnsupported(Exception):
         self.operation = operation
 
 
-@dataclass(frozen=True, slots=True)
-class ProcessMemory:
-    """The driver's observation of one process, with absence distinct from unreadable."""
-
-    state: Literal["absent", "present", "unreadable"]
-    bytes: int = -1
-
-
 def _smi(*query: str) -> subprocess.CompletedProcess[str]:
     """One `nvidia-smi` query, run to completion. A process that sees no GPU has no driver to
     ask, as on a host without the tool."""
@@ -94,48 +85,6 @@ def _smi(*query: str) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         check=True,
-    )
-
-
-def process_memories(pids: set[int], kind: str) -> dict[int, ProcessMemory]:
-    """One coherent driver-table read for all requested process IDs.
-
-    The ANSWER decides, never its arrival time. NVML is asked in-process first — a library
-    call that answers in milliseconds and needs no fork on a host already under load — and
-    `nvidia-smi` is the fallback where the library is absent, run to completion: a query
-    that took four seconds on a busy eight-GPU host used to be reported UNREADABLE at two,
-    and an unreadable row blocks every successor spawn. UNREADABLE now means exactly what it
-    says — no driver answered — and never "the driver was slow".
-    """
-    if not pids:
-        return {}
-    if kind in ("mps", "cpu"):
-        return {pid: ProcessMemory("unreadable") for pid in pids}
-    table = _nvml_compute_table()
-    if table is None:
-        try:
-            out = _smi("--query-compute-apps=pid,used_memory")
-        except (OSError, subprocess.SubprocessError):
-            return {pid: ProcessMemory("unreadable") for pid in pids}
-        table = {}
-        for line in out.stdout.strip().splitlines():
-            parts = [part.strip() for part in line.split(",")]
-            if len(parts) == 2 and parts[0].isdigit():
-                try:
-                    table[int(parts[0])] = int(parts[1]) * 1024 * 1024
-                except ValueError:
-                    table[int(parts[0])] = -1
-    return _table_rows(pids, table)
-
-
-class _NvmlProcessInfo(ctypes.Structure):
-    """`nvmlProcessInfo_t` as `nvmlDeviceGetComputeRunningProcesses_v3` fills it."""
-
-    _fields_ = (
-        ("pid", ctypes.c_uint),
-        ("usedGpuMemory", ctypes.c_ulonglong),
-        ("gpuInstanceId", ctypes.c_uint),
-        ("computeInstanceId", ctypes.c_uint),
     )
 
 
@@ -187,125 +136,6 @@ def _nvml_handle(library: ctypes.CDLL, device: str) -> ctypes.c_void_p | None:
     return handle if answer == _NVML_SUCCESS else None
 
 
-def _nvml_device_compute_table(
-    library: ctypes.CDLL, handle: ctypes.c_void_p
-) -> dict[int, int] | None:
-    """One device's compute processes: pid -> used bytes (-1 when the driver does not
-    account it). None when the driver would not answer for this device."""
-    table: dict[int, int] = {}
-    rows = ctypes.c_uint(0)
-    answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), None)
-    if answer == _NVML_SUCCESS:
-        return table
-    if answer != _NVML_ERROR_INSUFFICIENT_SIZE:
-        return None
-    # The count is a snapshot; a process can start between the two calls. Ask for room.
-    rows = ctypes.c_uint(rows.value * 2 + 8)
-    infos = (_NvmlProcessInfo * rows.value)()
-    answer = library.nvmlDeviceGetComputeRunningProcesses_v3(handle, ctypes.byref(rows), infos)
-    if answer != _NVML_SUCCESS:
-        return None
-    for info in infos[: rows.value]:
-        used = int(info.usedGpuMemory)
-        # NVML reports "not available" as all bits set.
-        table[int(info.pid)] = -1 if used == (1 << 64) - 1 else used
-    return table
-
-
-def _nvml_compute_table() -> dict[int, int] | None:
-    """Every compute process on every device: pid -> used bytes (-1 when the driver does
-    not account it). None when NVML is unavailable, so the caller falls back."""
-    library = _nvml_library()
-    if library is None:
-        return None
-    table: dict[int, int] = {}
-    count = ctypes.c_uint(0)
-    if library.nvmlDeviceGetCount_v2(ctypes.byref(count)) != _NVML_SUCCESS:
-        return None
-    for index in range(count.value):
-        handle = ctypes.c_void_p()
-        if library.nvmlDeviceGetHandleByIndex_v2(index, ctypes.byref(handle)) != _NVML_SUCCESS:
-            return None
-        rows = _nvml_device_compute_table(library, handle)
-        if rows is None:
-            return None
-        table.update(rows)
-    return table
-
-
-def compute_processes(device: str) -> dict[int, int] | None:
-    """`device`'s compute processes as NVML counts them: pid -> used bytes (-1 unaccounted).
-    None where the driver will not say."""
-    library = _nvml_library()
-    handle = _nvml_handle(library, device) if library is not None and device else None
-    return (
-        _nvml_device_compute_table(library, handle)
-        if library is not None and handle is not None
-        else None
-    )
-
-
-def _table_rows(pids: set[int], table: dict[int, int]) -> dict[int, ProcessMemory]:
-    return {
-        pid: (
-            ProcessMemory("absent", 0)
-            if pid not in table
-            else ProcessMemory("present", table[pid])
-            if table[pid] >= 0
-            else ProcessMemory("unreadable")
-        )
-        for pid in pids
-    }
-
-
-def process_memories_by_device(
-    pids: set[int], kind: str, devices: tuple[str, ...]
-) -> dict[str, dict[int, ProcessMemory]]:
-    """`process_memories`, PER DEVICE of a lane (cr-068): entry -> pid -> the driver's row.
-
-    A group lane's executor is K processes over K cards, and its reclaim is proved absent
-    on every one of them. The merged table is what the reclaim loop waits on (absent on
-    every device the driver has is absent on these); this is the per-entry evidence the
-    record carries. An entry the driver does not have, or a query it refuses, is
-    UNREADABLE for every pid - never absent by omission. In a PID namespace the driver
-    reports HOST pids, so a row here can only ever confirm the OS-state half, never
-    replace it.
-    """
-    if not pids or kind in ("mps", "cpu"):
-        return {device: {pid: ProcessMemory("unreadable") for pid in pids} for device in devices}
-    library = _nvml_library()
-    out: dict[str, dict[int, ProcessMemory]] = {}
-    for device in devices:
-        table: dict[int, int] | None = None
-        if library is not None:
-            handle = _nvml_handle(library, device)
-            table = _nvml_device_compute_table(library, handle) if handle is not None else None
-        else:
-            try:
-                lines = (
-                    _smi(f"--id={device}", "--query-compute-apps=pid,used_memory")
-                    .stdout.strip()
-                    .splitlines()
-                )
-            except (OSError, subprocess.SubprocessError):
-                lines = None
-            if lines is not None:
-                table = {}
-                for line in lines:
-                    parts = [part.strip() for part in line.split(",")]
-                    if len(parts) == 2 and parts[0].isdigit():
-                        try:
-                            table[int(parts[0])] = int(parts[1]) * 1024 * 1024
-                        except ValueError:
-                            table[int(parts[0])] = -1
-        out[device] = (
-            {pid: ProcessMemory("unreadable") for pid in pids}
-            if table is None
-            else _table_rows(pids, table)
-        )
-    return out
-
-
 @dataclass(frozen=True, slots=True)
 class DeviceMemory:
     """The driver's view of ONE device's memory, read from outside any CUDA context."""
@@ -315,42 +145,9 @@ class DeviceMemory:
     total_bytes: int = -1
 
 
-class _NvmlMemory(ctypes.Structure):
-    """`nvmlMemory_t` as `nvmlDeviceGetMemoryInfo` fills it: bytes, not MiB."""
-
-    _fields_ = (
-        ("total", ctypes.c_ulonglong),
-        ("free", ctypes.c_ulonglong),
-        ("used", ctypes.c_ulonglong),
-    )
-
-
-def _nvml_device_memory(device: str) -> DeviceMemory | None:
-    """One envelope entry's free/total through NVML, or None where NVML is absent.
-
-    An index resolves by index, anything else (`GPU-…`, `MIG-…`) by UUID — the two
-    spellings `CUDA_VISIBLE_DEVICES` admits. An entry the driver does not have is
-    UNREADABLE, not None: NVML answered, and its answer is that there is no such device.
-    """
-    library = _nvml_library()
-    if library is None:
-        return None
-    handle = _nvml_handle(library, device)
-    if handle is None:
-        return DeviceMemory("unreadable")
-    memory = _NvmlMemory()
-    answer = library.nvmlDeviceGetMemoryInfo(handle, ctypes.byref(memory))
-    if answer == _NVML_ERROR_NOT_SUPPORTED:
-        return _host_pool()
-    if answer != _NVML_SUCCESS:
-        return DeviceMemory("unreadable")
-    return _device_memory_of(int(memory.free), int(memory.total))
-
-
 def _host_pool() -> DeviceMemory:
-    """An integrated GPU's memory (GB10, Jetson): it has no framebuffer and allocates from the
-    host's RAM, so the driver answers Not Supported / `[N/A]` and its free and total are the
-    host's MemAvailable and MemTotal."""
+    """Linux's MemAvailable and MemTotal, for a CPU device's report. (An integrated GPU's room
+    is varena's `room()`, from the platform's reading of the host.)"""
     try:
         rows = dict(row.split(":", 1) for row in Path("/proc/meminfo").read_text().splitlines())
         free, total = (int(rows[key].split()[0]) * 1024 for key in ("MemAvailable", "MemTotal"))
@@ -423,24 +220,6 @@ def driver_version() -> str:
     return ""
 
 
-def drives_display(index: int) -> bool:
-    """Whether a display is initialized on CUDA device `index` of this process (NVML's display
-    active state: a display server holds memory for a screen there); False where NVML cannot
-    say. A connector with a display attached (NVML's display mode: a dummy plug on many
-    datacenter GPUs) is not one."""
-    visible = inherited_environment().get("CUDA_VISIBLE_DEVICES", "")
-    entries = [e.strip() for e in visible.split(",")]
-    entries = [e for e in entries if e]
-    library = _nvml_library()
-    entry = entries[index] if index < len(entries) else str(index)
-    handle = _nvml_handle(library, entry) if library is not None else None
-    if library is None or handle is None:
-        return False
-    state = ctypes.c_int()
-    active = library.nvmlDeviceGetDisplayActive(handle, ctypes.byref(state))
-    return bool(active == _NVML_SUCCESS and state.value == 1)
-
-
 def host_memory() -> DeviceMemory:
     """The host's RAM as a CPU device's memory: what the OS can give now, and all of it."""
     if sys.platform == "darwin":
@@ -454,39 +233,6 @@ def _device_memory_of(free: int, total: int) -> DeviceMemory:
     if total <= 0 or free < 0 or free > total:
         return DeviceMemory("unreadable")
     return DeviceMemory("measured", free, total)
-
-
-def device_memory(device: str, kind: str) -> DeviceMemory:
-    """Free and total bytes of one envelope entry, measured by the DRIVER, torch-free.
-
-    The worker assigns residence ceilings from this number (cr-066): it is the only view
-    that sees every process on the device, and it is readable before any executor exists.
-    `device` is one `CUDA_VISIBLE_DEVICES` entry verbatim — an index or a GPU UUID.
-
-    NVML in-process first (xs-007 row 19's rule: the ANSWER decides, never its arrival
-    time): `nvmlDeviceGetMemoryInfo` is the exact byte count `nvidia-smi` rounds to MiB,
-    measured at 0.02 ms against the subprocess's 22 ms on the 4070. `nvidia-smi --id` is
-    the fallback where the library is absent, run to completion. UNREADABLE means neither
-    answered, or the driver has no such device — never a zero and never a guess: a lane
-    whose capacity cannot be read cannot be shown to fit anything. MPS has no per-device
-    driver query.
-    """
-    if kind == "cpu":
-        return host_memory()
-    if kind == "mps" or not device:
-        return DeviceMemory("unreadable")
-    through_nvml = _nvml_device_memory(device)
-    if through_nvml is not None:
-        return through_nvml
-    try:
-        out = _smi(f"--id={device}", "--query-gpu=memory.free,memory.total")
-        line = out.stdout.strip().splitlines()[0]
-        if line.replace(" ", "") == "[N/A],[N/A]":
-            return _host_pool()
-        free, total = (int(part.strip()) * 1024 * 1024 for part in line.split(","))
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
-        return DeviceMemory("unreadable")
-    return _device_memory_of(free, total)
 
 
 def synchronize(torch: Any, kind: str) -> None:
@@ -524,8 +270,6 @@ def bind_allocator(torch: Any, kind: str) -> None:
     """Select Runtime's allocator without device activation or standalone defaults."""
     if kind != "cuda":
         return
-    # Preserve Torch 2.15 per-stream library workspace custody before first use.
-    os.environ["TORCH_CUBLAS_WORKSPACE_CACHE"] = "1"
     # A request never compiles; keep the existing native-op override selection.
     native = getattr(torch, "_native", None)
     if native is not None:
@@ -611,21 +355,13 @@ def initialized(torch: Any, kind: str) -> bool:
     return False
 
 
-def oom_error(torch: Any, kind: str) -> type[BaseException]:
-    """The OOM exception CLASS, for an `except` clause that must name the type before an
-    instance exists. An instance is classified by `author._errors.fault`."""
-    cls = getattr(torch, "OutOfMemoryError", None)
-    if not isinstance(cls, type):  # pragma: no cover - a torch without the class
-        raise AcceleratorUnsupported(kind, "oom_error")
-    return cls
-
-
 def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) -> dict[str, int]:
-    """The allocator's live numbers plus the driver's own view — the only number that sees
-    other processes. CUDA figures include working allocations and native weight backing. On unified
-    memory the device is this process's
-    budget (`unified_budget`) and the driver's figure counts this process's Metal buffers only.
-    A CPU's device memory is the host's RAM, and no allocator of ours holds any of it."""
+    """The allocator's live numbers, and the card as varena's `room()` reports it: capacity (the
+    card or its cap, less what other processes hold) and what maps free. A report, never sizing.
+    CUDA figures include working allocations and native weight backing. On unified memory the
+    device is this process's budget (`unified_budget`) and the driver's figure counts this
+    process's Metal buffers only. A CPU's device memory is the host's RAM, and no allocator of
+    ours holds any of it."""
     if kind == "cpu":
         host = host_memory()
         return {
@@ -642,14 +378,14 @@ def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) ->
             "driver_free_bytes": max(total - driver, 0),
             "driver_total_bytes": total,
         }
-    free, total = torch.cuda.mem_get_info(device)
+    room = vt.room(device)
     weights = _weight_bytes(memory)
     working = vt.stats(device)
     return {
         "allocated_bytes": int(working["allocated_bytes"]) + weights,
         "reserved_bytes": int(working["mapped_bytes"]) + weights,
-        "driver_free_bytes": int(free),
-        "driver_total_bytes": int(total),
+        "driver_free_bytes": int(room["free"]),
+        "driver_total_bytes": int(room["capacity"]),
     }
 
 
@@ -688,22 +424,10 @@ def allocator_peak(memory: Any, request: str | None = None) -> int:
     return max(int(figures["peak"]), int(carried))
 
 
-#: This process's own cache releases that returned something, by the function that asked:
-#: how many, and the bytes. (The caller's name is read off its frame: no call site says it.)
-RELEASED: dict[str, list[int]] = {}
-
-
 def release_cached(torch: Any, kind: str) -> None:
     """MPS's unused allocator blocks back to its driver. On CUDA the native core alone does this."""
-    if kind != "mps":
-        return
-    before = reserved(torch, kind)
-    torch.mps.empty_cache()
-    freed = before - reserved(torch, kind)
-    if freed > 0:
-        row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
-        row[0] += 1
-        row[1] += freed
+    if kind == "mps":
+        torch.mps.empty_cache()
 
 
 def completion_event(torch: Any, kind: str) -> Any:
@@ -794,13 +518,6 @@ def host_backend_family() -> Literal["cuda", "mps", "cpu"]:
     return "cpu" if sees_no_gpu() else "cuda"
 
 
-def child_env_law(kind: str) -> dict[str, str]:
-    """Backend-mandated child-env impositions, merged into the reviewed seal (§3.5)."""
-    if kind == "mps":
-        return dict((MPS_CHILD_ENV_LAW,))
-    return {}
-
-
 def qualification_gate(kind: str) -> None:
     """Refuses qualification on a backend with no probe suite. The decode suite is the same
     arithmetic on every backend, so it qualifies `cuda`, `mps` and `cpu` alike and mints
@@ -821,19 +538,6 @@ def memory_class(kind: str) -> Literal["discrete", "unified"]:
     Apple GPUs are unified; CUDA cards are discrete here (coherent and integrated CUDA
     machines are TensorD's to detect). A CPU's device memory is the host's own: unified."""
     return "unified" if kind in ("mps", "cpu") else "discrete"
-
-
-#: torch's own MPS high watermark, as a fraction of Metal's recommended working set
-MPS_WATERMARK = 1.7
-
-
-def hold_pool(torch: ModuleType, cap: int) -> None:
-    """Hold MPS's allocator, which also holds a unified plane's regions, to an owner's cap of
-    `cap` bytes; -1 gives torch its own watermark back (past the budget the system pages)."""
-    recommended = max(int(torch.mps.recommended_max_memory()), 1)
-    torch.mps.set_per_process_memory_fraction(
-        min(cap / recommended, 2.0) if cap >= 0 else MPS_WATERMARK
-    )
 
 
 def unified_ceiling(torch: ModuleType) -> int:

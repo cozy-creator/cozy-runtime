@@ -2349,11 +2349,6 @@ class Executor:
         }
 
     def residency_document(self) -> dict[str, Any]:
-        free = -1
-        if self.torch is not None and accel.present(self.torch, self.device_kind):
-            free = accel.allocation(self.torch, self.device_kind, self.host.memory)[
-                "driver_free_bytes"
-            ]
         return {
             "ok": True,
             "constructions": [
@@ -2365,7 +2360,6 @@ class Executor:
                 for key, child in self.constructions.items()
             ],
             "active": self.active,
-            "free_bytes": free,
         }
 
     def _prepare_first(self, command: Load) -> dict[str, Any]:
