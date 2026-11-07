@@ -71,6 +71,7 @@ from cozy_runtime.internal.residency import (
     Weights,
     paging,
     split,
+    uncached,
 )
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 from tensorfs.raw import parts as stored_parts
@@ -374,6 +375,7 @@ class Backend:
         self.gemm_sites = leaf_sites(self.leaves)
         leg = self._leg("leaves", leg)
         for name, root in self.roots.items():
+            uncached(root)  # every component the loader built, weights or none
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
                 self.models[name] = self._register(name, root, keys)

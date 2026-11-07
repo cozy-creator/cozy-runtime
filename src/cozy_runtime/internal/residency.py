@@ -2979,13 +2979,14 @@ def _escaped_warnings(records: list[dict[str, Any]]) -> None:
         WARNINGS.append((said, {"code": "escaped_memory"}))
 
 
-def _uncached(module: nn.Module) -> None:
+def uncached(module: nn.Module) -> None:
     """A forward that does not ask for a cache keeps none. A text encoder's call through a library
     (Diffusers' `encode_prompt`) left its `DynamicCache` live as plain tensors, about 1 GiB for a
     long prompt; decoding asks with `use_cache=True` itself (`cozy_runtime.lm`, `generate`)."""
     for sub in module.modules():
         config = getattr(sub, "config", None)
-        if type(config).__module__.startswith("transformers.") and getattr(config, "use_cache", None):
+        transformers = any(c.__module__.startswith("transformers.") for c in type(config).__mro__)
+        if transformers and getattr(config, "use_cache", None):
             config.use_cache = False
 
 
@@ -2994,7 +2995,6 @@ def _hooks(model: Model) -> None:
     tally = _ESCAPES and memory.cuda
     if tally:
         model.escape_site = vt.site_id(model.component)
-    _uncached(model.module)
     for entry, sub in (("", model.module), *model.module.named_children()):
 
         def opened(args: tuple[object, ...], kwargs: dict[str, object], name: str = entry) -> None:
