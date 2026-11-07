@@ -1,0 +1,1 @@
+Residency code with no caller or reader is gone (the varena v2 audit's list): unused helpers, fields written and never read, the no-op wait relay to child calls, the loop rows' `blocks` (always 0), and the CacheOwner capability check. No behaviour changes.

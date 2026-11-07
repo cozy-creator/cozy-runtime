@@ -71,6 +71,7 @@ from cozy_runtime.author._errors import (
     ConformanceError,
     DeadlineExceeded,
     DefaultResolutionError,
+    DoesNotFit,
     InvalidRequest,
     Outcome,
     OutputError,
@@ -164,6 +165,7 @@ from cozy_runtime.author._model import (
     uncaptured,
     uses_components,
 )
+from cozy_runtime.author._retained import retained
 from cozy_runtime.author._recipes import (
     DerivationHook,
     EncodingRule,
@@ -187,7 +189,7 @@ from cozy_runtime.author._services import (
     VideoJoin,
 )
 from cozy_runtime.author._signature import ModelBinding, Surface
-from cozy_runtime.author._split import Cut, split
+from cozy_runtime.author._split import Cut, Windows, split, windows
 from cozy_runtime.author._spread import spread
 from cozy_runtime.author._tool import (
     MENTION,
@@ -270,6 +272,7 @@ __all__ = [
     "DerivationHook",
     "DerivedCache",
     "Device",
+    "DoesNotFit",
     "Egress",
     "EgressResponse",
     "EncodingRule",
@@ -363,6 +366,7 @@ __all__ = [
     "VideoProbe",
     "Weights",
     "WeightsOutput",
+    "Windows",
     "active_attention_layout",
     "assert_declaration_shape",
     "attach_assessment",
@@ -392,6 +396,7 @@ __all__ = [
     "register_adapter",
     "register_attention",
     "registered_adapters",
+    "retained",
     "sequence_parallel",
     "split",
     "spoken",
@@ -399,6 +404,7 @@ __all__ = [
     "uncaptured",
     "upload_checkpoint",
     "uses_components",
+    "windows",
 ]
 
 _REFS = "Prompt[Image]: each prompt's references, an Image(file, description) per mention"

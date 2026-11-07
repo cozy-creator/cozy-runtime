@@ -1,0 +1,1 @@
+A request's record counts its weight fills by origin (`moved`): the store, a kept page (`baked`), and another set's stored bytes on the GPU (`resident`) or in its kept host page (`host`), each with bytes, fills and time.

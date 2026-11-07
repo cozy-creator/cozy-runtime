@@ -45,6 +45,7 @@ import cozy_runtime
 import cozy_runtime.internal.locked_sources as locked
 import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
+import cozy_runtime.internal.static_contract as static_contract
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
@@ -1699,6 +1700,7 @@ def _build(
         )
     declared: dict[str, Declaration] = {}
     modules = reader.reachable(entry)
+    static_contract.check(reader, modules)
     if pinned is not None:
         _check_locked(reader, modules, pinned)
     recipes, calibrated = _recipes(reader, modules)
