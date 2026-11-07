@@ -7,6 +7,10 @@ rotated basis, `nvfp4` its E2M1 values under refitted block scales; the rounding
 because a delta below half a grid step vanishes under nearest rounding. `Stats` is what a
 quality gate reads: how much of the delta survived and how much rounding error the bake added.
 
+A DoRA term bakes as a row gain beside its delta (`dora`): each output row of the stored weight
+times `g` (a row-scaled weight's scale times it, exactly), then the delta added; its norms are
+taken in f32 from the decoded rows (`norms`).
+
 On a GPU, `bake` is one fused Triton kernel per weight (`_bake_kernel`): it reads each stored
 byte once, adds the rank-r product computed in its tile, rounds and writes the byte back, with
 counter-based noise (one stream per weight, by element index). Its forms are a Runtime kernel
@@ -47,6 +51,8 @@ How = Literal["fused", "eager"]
 #: Names this module's bake to other executors: the same factors and scales baked by the same
 #: rule are the same bytes (one seed per weight). Changed whenever the bytes a bake writes do.
 VARIANT = "cozy.lora-bake/2"
+#: Names the DoRA terms' rule (`dora`), in every fill identity of a component that has one.
+DORA = "cozy.dora/1"
 Rounding = Literal["nearest", "stochastic", "feedback"]
 ROUNDINGS: tuple[Rounding, ...] = ("nearest", "stochastic", "feedback")
 #: A rowwise row's scale after a bake: unchanged, what its new maximum needs, or that moved
@@ -227,8 +233,10 @@ def bake_plain(
     rounding: Rounding = "nearest",
     generator: Generator | None = None,
     stats: Stats | None = None,
+    gain: Tensor | None = None,
 ) -> None:
-    """`weight += alpha * up @ down`, computed in f32 and rounded once to its dtype.
+    """`weight = gain * weight + alpha * up @ down` (`gain` f32 per row, else 1), computed in f32
+    and rounded once to its dtype.
 
     A bf16 weight has 8 significant bits, so a small delta vanishes under nearest rounding
     there too; `stochastic` keeps it in expectation. Other dtypes round to nearest.
@@ -239,6 +247,8 @@ def bake_plain(
     down_fp32 = down.float()
     for start, stop in _chunks(*weight.shape):
         base = weight[start:stop].to(torch.float32, copy=True)
+        if gain is not None:
+            base.mul_(gain[start:stop, None])
         delta = _delta(up, down_fp32, alpha, start, stop)
         target = base + delta
         if rounding == "stochastic" and weight.dtype == torch.bfloat16:
@@ -410,6 +420,7 @@ def bake_nvfp4(
     grid: Grid = "keep",
     generator: Generator | None = None,
     stats: Stats | None = None,
+    gain: Tensor | None = None,
 ) -> None:
     """Bake into canonical `nvfp4` (`NVFP4_PARAMS`): `weight` u8 `[out, in/2]`, `scale` E4M3
     `[out, in/16]`, `scale_2` the f32 second level, written in place.
@@ -419,22 +430,27 @@ def bake_nvfp4(
     element rounds on the grid it was quantized to and a value just past 6 saturates. `refit`
     sets the second level from the baked tensor's amax and every block's scale from its baked
     amax, saturation-free, so every element rounds afresh (H3's turbo LoRA: retention 1.00 but
-    18.2 dB rounding SNR, against `keep`'s 0.945 and 30.6 dB)."""
+    18.2 dB rounding SNR, against `keep`'s 0.945 and 30.6 dB). `gain` (f32 per row) scales each
+    decoded row first."""
     began = time.perf_counter()
     raw, blocks = weight.view(torch.uint8), scale.view(torch.uint8)
     rows, cols = raw.shape[0], 2 * raw.shape[1]
     down_fp32 = down.float()
     magnitudes = _magnitudes(torch, raw.device)
     stored_second = second = float(scale_2.float().reshape(-1)[0])
+
+    def decoded(start: int, stop: int) -> Tensor:
+        base = _nvfp4_decode(torch, raw[start:stop], blocks[start:stop], stored_second)
+        return base if gain is None else base.mul_(gain[start:stop, None])
+
     if grid != "keep":
         amax = 0.0
         for start, stop in _chunks(rows, cols):
-            base = _nvfp4_decode(torch, raw[start:stop], blocks[start:stop], stored_second)
-            target = base + _delta(up, down_fp32, alpha, start, stop)
+            target = decoded(start, stop) + _delta(up, down_fp32, alpha, start, stop)
             amax = max(amax, float(target.abs().amax()))
         second = amax / NVFP4_LEVELS if amax > 0 else 1.0
     for start, stop in _chunks(rows, cols):
-        base = _nvfp4_decode(torch, raw[start:stop], blocks[start:stop], stored_second)
+        base = decoded(start, stop)
         delta = _delta(up, down_fp32, alpha, start, stop)
         target = (base + delta).view(stop - start, -1, NVFP4_BLOCK)
         need = target.abs().amax(dim=-1) / (6.0 * second)
@@ -495,6 +511,7 @@ def bake(
     seed: int,
     stats: Stats | None = None,
     how: How | None = "eager",
+    gain: Tensor | None = None,
 ) -> None:
     """Bake `up @ down` into one stored weight by its roles: plain floats, `fp8.rowwise`
     (E4M3 data, f32 row scale), `int8-convrot256/1` (int8 data, f32 row scale) or `nvfp4`
@@ -503,10 +520,16 @@ def bake(
     (MEASURE.md, TensorD #26). `seed` names the weight's noise. A GPU bakes fused when `how`
     says its kernels serve (`serving`), unless `stats` are asked for (the eager reference
     measures them). A convolution's weight and factors bake as matrices, each kernel tap one
-    more input column."""
+    more input column. `gain` (f32 per output row, a DoRA's) scales the stored rows first: a
+    row-scaled weight's scale exactly (then fused where it serves), a plain or `nvfp4` one's
+    values in the eager reference, rounded once with the delta."""
     if down.dim() > 2:
         stored = {role: t.view(t.shape[0], -1) if t.dim() > 2 else t for role, t in stored.items()}
         down, up = down.flatten(1), up.flatten(1)
+    if gain is not None and "value" not in stored and "scale_2" not in stored:
+        stored["scale"].view(-1).mul_(gain)
+        gain = None
+    how = "eager" if gain is not None else how
     device = next(iter(stored.values())).device
     if stats is None and device.type == "cuda" and how == "fused":
         fused(torch, _launch(device.index or 0), stored, down, up, seed)
@@ -523,12 +546,21 @@ def bake(
             1.0,
             generator=generator,
             stats=stats,
+            gain=gain,
         )
     elif set(stored) == {"value"}:
         weight = stored["value"]
         rounding: Rounding = "stochastic" if weight.dtype == torch.bfloat16 else "nearest"
         bake_plain(
-            torch, weight, down, up, 1.0, rounding=rounding, generator=generator, stats=stats
+            torch,
+            weight,
+            down,
+            up,
+            1.0,
+            rounding=rounding,
+            generator=generator,
+            stats=stats,
+            gain=gain,
         )
     elif stored["weight"].dtype == torch.int8:
         bake_int8_convrot(
@@ -555,6 +587,105 @@ def bake(
             generator=generator,
             stats=stats,
         )
+
+
+def norms(torch: ModuleType, stored: Mapping[str, Tensor], down: Tensor, up: Tensor) -> Tensor:
+    """Each output row's L2 norm of a linear's stored weight plus `up @ down`, f32 `[out]`, its
+    rows decoded a chunk at a time. An `int8-convrot256/1` weight's rows are rotated, and so is
+    the delta here: the rotation is orthonormal, so the norm is the unrotated weight's."""
+    if "scale_2" in stored:
+        raw, blocks = stored["weight"].view(torch.uint8), stored["scale"].view(torch.uint8)
+        second = float(stored["scale_2"].float().reshape(-1)[0])
+        rows, cols = raw.shape[0], 2 * raw.shape[1]
+
+        def rows_of(start: int, stop: int) -> Tensor:
+            return _nvfp4_decode(torch, raw[start:stop], blocks[start:stop], second)
+
+    elif "value" in stored:
+        value = stored["value"]
+        rows, cols = value.shape
+
+        def rows_of(start: int, stop: int) -> Tensor:
+            return value[start:stop].to(torch.float32, copy=True)
+
+    else:
+        data, scales = stored["weight"], stored["scale"].reshape(-1, 1)
+        rows, cols = data.shape
+        rotated = data.dtype == torch.int8
+        if rotated:
+            down = rotate_factor(torch, down)
+
+        def rows_of(start: int, stop: int) -> Tensor:
+            code = data[start:stop]
+            values = code.float() if rotated else decode_e4m3(torch, code.view(torch.uint8))
+            return values.mul_(scales[start:stop].float())
+
+    down_fp32 = down.float()
+    out = torch.empty(rows, dtype=torch.float32, device=down.device)
+    for start, stop in _chunks(rows, cols):
+        target = rows_of(start, stop).add_(_delta(up, down_fp32, 1.0, start, stop))
+        out[start:stop] = torch.linalg.vector_norm(target, dim=1)
+    return out
+
+
+def dora_ratio(torch: ModuleType, magnitude: Tensor, norm: Tensor) -> Tensor:
+    """`m / ||V||` per output row, f32; 0 where `V`'s row is 0 (`D`'s row is then 0 too)."""
+    tiny = torch.finfo(torch.float32).tiny
+    return torch.where(norm > 0, magnitude.float() / norm.clamp_min(tiny), 0.0)
+
+
+def dora_weight(
+    torch: ModuleType,
+    weight: Tensor,
+    down: Tensor,
+    up: Tensor,
+    magnitude: Tensor,
+    s: float,
+    t: float,
+) -> Tensor:
+    """PEFT's DoRA weight at strength `t`, f32 `[out, in]`: `W + t * (m * V / ||V|| - W)` per output
+    row, `V = W + s * B @ A`, from f32 rows of `W` (`weight`) and their rows of B and m. At t = 1
+    it is PEFT's merged weight; at 0, `W`."""
+    v = weight + (up.float() @ down.float()) * s
+    ratio = dora_ratio(torch, magnitude, torch.linalg.vector_norm(v, dim=1))
+    return weight + (v * ratio[:, None] - weight) * t
+
+
+def dora(
+    torch: ModuleType,
+    stored: Mapping[str, Tensor],
+    terms: list[tuple[Tensor, Tensor, Tensor, float, float]],
+) -> tuple[Tensor, list[Tensor]]:
+    """A stored linear's DoRA terms, each `(A, B, m, s, t)`, as its row gain and each term's B
+    scale (f32 `[out]`): `dora_weight` is `g * W + c * (B @ A)` with `r = m / ||V||`,
+    `g = 1 + t * (r - 1)` and `c = t * s * r`, its norms taken from the stored rows (`norms`).
+    Terms add as PEFT's adapters do: each against the stored `W` alone."""
+    gain = torch.ones_like(terms[0][2], dtype=torch.float32)
+    scales = []
+    for down, up, magnitude, s, t in terms:
+        ratio = dora_ratio(torch, magnitude, norms(torch, stored, down, up.float() * s))
+        gain.add_(ratio - 1, alpha=t)
+        scales.append(ratio.mul_(t * s))
+    return gain, scales
+
+
+def gain_rows(torch: ModuleType, stored: dict[str, Tensor], gain: Tensor) -> None:
+    """Each output row of a stored weight times `gain` (f32 `[out]`), in place: a row-scaled
+    weight's scale exactly, a plain one's values rounded once to nearest, an `nvfp4` one's
+    re-encoded (`bake_nvfp4` with no delta, nearest)."""
+    if "scale_2" in stored:
+        cols = 2 * stored["weight"].shape[1]
+        down, up = gain.new_zeros((0, cols)), gain.new_zeros((gain.shape[0], 0))
+        bake_nvfp4(
+            torch, stored["weight"], stored["scale"], stored["scale_2"], down, up, 1.0,
+            rounding="nearest", gain=gain,
+        )  # fmt: skip
+    elif "value" in stored:
+        value = stored["value"]
+        for start, stop in _chunks(*value.shape):
+            value[start:stop].copy_(value[start:stop].float().mul_(gain[start:stop, None]))
+    else:
+        stored["scale"].view(-1).mul_(gain)
 
 
 def accumulate(
