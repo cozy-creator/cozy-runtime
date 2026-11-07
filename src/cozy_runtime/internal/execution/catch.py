@@ -17,6 +17,7 @@ from typing import Any
 
 import tensorfs.varena.torch as vt
 import torch
+from tensorfs import varena
 from torch import Tensor, nn
 
 from cozy_runtime.author._context import CURRENT as ATTEMPT
@@ -121,7 +122,7 @@ def select(
     """The level native selection takes, its room made; `DoesNotFit` where none can have it."""
     try:
         return vt.split_select(device, key, menu, stream=stream)
-    except torch.OutOfMemoryError as exc:  # varena's `Exhausted`: a decision, not a failure
+    except varena.Exhausted as exc:  # a decision, not a failure: nothing has run
         raise refuse(device, name, "its finest split", sum(menu[-1][1]), exc) from exc
 
 
@@ -139,7 +140,7 @@ def begin(
     phase.choice()
     try:
         return phase.begin_split(device, key, str(level), selection, stream=stream)
-    except torch.OutOfMemoryError as exc:  # varena's `Exhausted`, before the op runs
+    except varena.Exhausted as exc:  # before the op runs
         raise refuse(device, name, f"split level {level}", sum(menu[level][1]), exc) from exc
 
 
