@@ -63,7 +63,11 @@ def denoise_loop(
 
     - `state`: what the loop advances (latents). On return the tensors hold the final values.
     - `carried`: tensors one step leaves for the next that are not outputs.
-    - `inputs`: read-only tensors of this call.
+    - `inputs`: read-only tensors of this call, and `retained` States (a prefix's K/V): the
+      step receives the tensors a State's `get()` returns in its place. An unkeyed loop in a
+      component scope reads each State again for every step, and its memory may leave the card
+      between steps; any other loop reads it once and keeps it on the card for the call, which
+      its recorded program may then read. Never call `get()` inside the step.
     - `labels`: one hashable host-side label per step, which the step receives: what differs
       between steps (dense or sparse attention, an expert, a batch). Each distinct label records
       one body, run for each of its steps in order; a first call runs its steps eagerly through

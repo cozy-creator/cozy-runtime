@@ -28,7 +28,9 @@ one whose code cannot run outside its request records only in a call; the calls 
 catches an allocation that fails after that: it fails the call. Other component loops stay eager:
 recording a streamed loop did not repay its recording and extra reads (Qwen-Image int8 1 MP on an
 RTX 3070: eager 45.6-46.8 s, native 49.3-50.7 s; MiniMax-H3 FL2VA 15 s on an RTX 5090: 716 vs
-737 s). So does one whose scope holds an `@uncaptured` component, and nothing queues for it.
+737 s). So does one whose scope holds an `@uncaptured` component, and nothing queues for it. An
+unkeyed component loop whose inputs hold `retained` States runs eagerly, reading them again each
+step; any other reads them once and holds them pinned for the call.
 
 A loop outside any component scope (tensor work only) records resident every call and is never kept:
 `before` and the same warm steps run eagerly, then the rest natively. A refusal before anything is
@@ -371,7 +373,18 @@ class Loops:
         overlays = lora.LOOP.set(_overlays(_phase_models()))
         try:
             _mark("entered")
-            loop = _Loop(step, steps, labels, on_step, before, after, key, len(state), cache)
+            # `retained` States among its inputs: one unkeyed in a component scope never records,
+            # so each step reads them again (`_Loop.refills`) and their regions may leave between
+            # steps. Any other reads them once, held for the call: a program recorded on them
+            # reads them only while they stay pinned, or reads its own copies.
+            refills = False
+            if any(not isinstance(value, torch.Tensor) for value in inputs):
+                refills = key is None and bool(_LOCAL_SCOPES.get())
+                if not refills:
+                    inputs = _filled(inputs)
+            loop = _Loop(
+                step, steps, labels, on_step, before, after, key, len(state), cache, refills
+            )
             with (
                 nullcontext() if cache is None else stepcache.running(cache, steps, state[0].device)
             ) as run:
@@ -401,7 +414,11 @@ class Loops:
         mutable = state + carried
         with torch.inference_mode(False), torch.no_grad(), _owned(mutable) as work:
             tensors = work + inputs
-            scope, why = _eligible(ctx, steps, tensors)
+            scope, why = (
+                ((), "its retained inputs are read again each step")
+                if loop.refills
+                else _eligible(ctx, steps, tensors)
+            )
             if why:
                 row["refusals"].append(why)
                 loop.eager_all(tensors, ctx)
@@ -750,6 +767,9 @@ class _Loop:
     #: how many of a call's first tensors are its latents (`state`)
     latents: int = 1
     cache: stepcache.Policy | None = None
+    #: its inputs hold `retained` States, read again (`get`, which fills and pins them) for each
+    #: step and for `before` and `after`: it only runs eagerly (`Loops.run`)
+    refills: bool = False
 
     def label(self, i: int) -> Any:
         return _NONE if self.labels is None else self.labels[i - self.steps.start]
@@ -793,7 +813,8 @@ class _Loop:
                 index.fill_(i)
                 if (cached := stepcache._RUN.get()) is not None:
                     cached.begin(index, i - self.steps.start)
-                _call(self.step, index, tensors, self.label(i))
+                read = _filled(tensors) if self.refills else tensors
+                _call(self.step, index, read, self.label(i))
                 _mark(f"step {i}")
                 if index.is_cuda:
                     pacing.tick()
@@ -834,9 +855,9 @@ class _Loop:
         return None if settle else finite
 
     def eager_all(self, tensors: tuple[Any, ...], ctx: Context | None) -> None:
-        _once(self.before, tensors)
+        _once(self.before, _filled(tensors) if self.refills else tensors)
         self.eager(self.steps, tensors, ctx)
-        _once(self.after, tensors)
+        _once(self.after, _filled(tensors) if self.refills else tensors)
 
 
 def _ranks() -> int:
@@ -847,6 +868,15 @@ def _ranks() -> int:
 def _once(fn: Callable[..., object] | None, tensors: tuple[Any, ...]) -> None:
     if fn is not None:
         fn(*tensors)
+
+
+def _filled(values: tuple[Any, ...]) -> tuple[Any, ...]:
+    """`values` with each `retained` State in it replaced by the tensors its `get` returns now,
+    filled and pinned while they live."""
+    return tuple(
+        tensor for value in values
+        for tensor in ((value,) if isinstance(value, torch.Tensor) else value.get())
+    )
 
 
 @contextmanager
