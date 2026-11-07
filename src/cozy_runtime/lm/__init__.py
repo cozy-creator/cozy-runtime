@@ -156,6 +156,7 @@ def generate(
     presence_penalty: float = 0.0,
     temperature: float = 0.0,
     top_p: float = 1.0,
+    top_k: int = 0,
     seed: int = 0,
     draft: Any = None,
     progress: Callable[[int], None] | None = None,
@@ -165,7 +166,8 @@ def generate(
     row that stopped early continues as `pad` (default: the first stop). `presence_penalty`
     subtracts that much from every token already generated (vLLM's). `temperature` 0 is greedy;
     above it, each token is drawn from the `top_p` nucleus at that temperature, from `seed`: the
-    same prompt and seed give the same tokens.
+    same prompt and seed give the same tokens. `top_k` above 0 first keeps a sampling row's `top_k`
+    largest logits, before the presence penalty; greedy decoding ignores it.
     `draft(embeds, hidden, position_ids, past_key_values, attention_mask, rotary) -> hidden` is
     the model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
     model's head read before it, the state the head reads for the token after; `rotary` is the
@@ -181,11 +183,13 @@ def generate(
         if named is not None:
             draft = named
             break
-    if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63):
-        raise ValueError(f"temperature {temperature}, top_p {top_p}, seed {seed}: out of range")
+    if not (temperature >= 0 and 0 < top_p <= 1 and 0 <= seed < 1 << 63 and top_k >= 0):
+        raise ValueError(
+            f"temperature {temperature}, top_p {top_p}, top_k {top_k}, seed {seed}: out of range"
+        )
     if progress is None and (stage := stage_progress()) is not None:
         progress = partial(_share, stage, max_new_tokens)
-    sampling = _Sampling(float(temperature), float(top_p), int(seed))
+    sampling = _Sampling(float(temperature), float(top_p), int(seed), int(top_k))
     tell = _Tell(progress)
     stops = [int(token) for token in stop]
     filler = stops[0] if pad is None else int(pad)
@@ -623,6 +627,17 @@ class _Sampling(NamedTuple):
     temperature: float
     top_p: float
     seed: int
+    top_k: int = 0
+
+
+#: A step's graph: (rows, window, drafted, sampled, the most logits a sampling row keeps).
+_Key = tuple[int, int, bool, bool, int]
+
+
+def _top_k(scores: Any, k: int) -> Any:
+    """`scores` (`[..., vocab]`) with all but each row's `k` largest at -inf (ties kept)."""
+    kth = scores.topk(min(k, scores.shape[-1]), dim=-1).values[..., -1:]
+    return scores.masked_fill(scores < kth, float("-inf"))
 
 
 _LOW32 = 0xFFFFFFFF
@@ -686,6 +701,16 @@ def _per_row(sampling: _Sampling, rows: int, device: Any) -> tuple[Any, Any, Any
     )
 
 
+class _TopK:
+    """`top_k` as a Transformers logits processor, for `_transformers`."""
+
+    def __init__(self, k: int) -> None:
+        self.k = k
+
+    def __call__(self, input_ids: Any, scores: Any) -> Any:
+        return _top_k(scores, self.k)
+
+
 class _Presence:
     """`presence_penalty` as a Transformers logits processor, for `_transformers`."""
 
@@ -711,7 +736,11 @@ def _transformers(
     tell: _Tell,
 ) -> Any:
     prompt = int(inputs["input_ids"].shape[1])
-    processors: list[Any] = [_Presence(prompt, penalty)] if penalty else []
+    processors: list[Any] = []
+    if sampling.temperature > 0 and sampling.top_k:
+        processors.append(_TopK(sampling.top_k))
+    if penalty:
+        processors.append(_Presence(prompt, penalty))
     if sampling.temperature > 0:
         processors.append(_Draw(prompt, sampling))
     context = CURRENT.get()
@@ -1237,6 +1266,7 @@ class _Engine:
     penalty: torch.Tensor
     temperature: torch.Tensor
     top_p: torch.Tensor
+    top_k: torch.Tensor
     seed: torch.Tensor
     seen: torch.Tensor
     position: torch.Tensor
@@ -1273,9 +1303,9 @@ class _Engine:
         self.width = 0
         self.cache: Any = None
         self.views: dict[int, Any] = {}
-        self.graphs: dict[tuple[int, int, bool, bool], Any] = {}
+        self.graphs: dict[_Key, Any] = {}
         #: Full shape variants whose real accepted step preseeded their capture pool.
-        self.warmed: set[tuple[int, int, bool, bool]] = set()
+        self.warmed: set[_Key] = set()
         self.layout: tuple[object, ...] | None = None
         #: its decode graphs' capture pool (`domain.Pool`): the model's graph region, or a
         #: torch pool of its own with no varena memory
@@ -1285,8 +1315,8 @@ class _Engine:
         self.completions: dict[Any, Any] = {}
         self.unfenced: set[Any] = set()
         self.domain: Any = None
-        #: (bucket, window, drafted, sampled) -> why that step runs eagerly
-        self.unrecorded: dict[tuple[int, int, bool, bool], str] = {}
+        #: a step's graph key (`_Key`) -> why that step runs eagerly
+        self.unrecorded: dict[_Key, str] = {}
         #: the graphs recorded a path that changed since (a kernel landed in `install`)
         self.stale = False
         #: seconds the last admission took: decoding gets as long before the next one
@@ -1634,7 +1664,7 @@ class _Engine:
                 yield from (s for s in layer.recurrent_states.values() if s is not None)
         yield from (self.ids, self.length, self.mask, self.out, self.n, self.done, self.limit)
         yield from (self.stops, self.pad, self.penalty, self.seen, self.position)
-        yield from (self.temperature, self.top_p, self.seed)
+        yield from (self.temperature, self.top_p, self.seed, self.top_k)
         if self.draft is not None:
             yield from (self.dkeys.keys, self.dkeys.values, self.dmask, self.hidden)
 
@@ -1786,11 +1816,14 @@ class _Engine:
             logits = model(**prepared, return_dict=True).logits[:, -1]
         hidden = taken[-1]
         with _disable_current_modes():
-            token = logits.float().argmax(-1)
+            scores = logits.float()
+            token = scores.argmax(-1)
             if request.sampling.temperature > 0:
+                if request.sampling.top_k:
+                    scores = _top_k(scores, request.sampling.top_k)
                 rows = int(ids.shape[0])
                 first = torch.zeros((rows,), dtype=torch.long, device=ids.device)
-                token = _draw(logits.float(), *_per_row(request.sampling, rows, ids.device), first)
+                token = _draw(scores, *_per_row(request.sampling, rows, ids.device), first)
             drafted = None
             if self.draft is not None:
                 drafted = self._drafted_prompt(ids, token, hidden, position)
@@ -1859,6 +1892,7 @@ class _Engine:
                 self.penalty[slot] = request.penalty
                 self.temperature[slot] = request.sampling.temperature
                 self.top_p[slot] = request.sampling.top_p
+                self.top_k[slot] = request.sampling.top_k if request.sampling.temperature > 0 else 0
                 self.seed[slot] = request.sampling.seed
                 self.seen[slot].zero_()
                 self.seen[slot, token] = 1.0
@@ -1918,6 +1952,7 @@ class _Engine:
             "penalty": ((size,), f32, 0),
             "temperature": ((size,), f32, 0),
             "top_p": ((size,), f32, 1),
+            "top_k": ((size,), long, 0),
             "seed": ((size,), long, 0),
             "seen": ((size, self.vocab), f32, 0),
             "position": ((size, *lead, 1), long, 0),
@@ -2146,7 +2181,7 @@ class _Engine:
 
     def _replay(self, size: int, cuda: bool) -> None:
         drafted = self._drafting(size)
-        key = (size, self.cache.window, drafted, self._sampled())
+        key = (size, self.cache.window, drafted, self._sampled(), self._kept())
         placed = PLACED.get(self.model)
         unaccounted = (
             cuda
@@ -2250,7 +2285,7 @@ class _Engine:
         layers = [layer for layer in self.cache.layers if isinstance(layer, _Keys)]
         return [buffer[rows, :, at] for layer in layers for buffer in (layer.keys, layer.values)]
 
-    def _verify(self, key: tuple[int, int, bool, bool], graph: Any, size: int) -> None:
+    def _verify(self, key: _Key, graph: Any, size: int) -> None:
         """A new graph's one check: its replay, then this token's eager step from the same
         state, last so that what serves the call is eager's. A difference discards the graph."""
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(self.domain.device)
@@ -2305,9 +2340,7 @@ class _Engine:
             vt.record_pool_stream(self.pool.handle, torch.cuda.current_stream(device), device)
         self.pooled = hold
 
-    def _unrecorded(
-        self, key: tuple[int, int, bool, bool], why: str, code: str | None = "capture_refused"
-    ) -> None:
+    def _unrecorded(self, key: _Key, why: str, code: str | None = "capture_refused") -> None:
         """That step runs eagerly from now on, with a warning on the calls it serves, unless
         `code` is None: a property of the code, in the record alone (`decode.refused`)."""
         self.unrecorded[key] = why
@@ -2336,6 +2369,23 @@ class _Engine:
         """Whether a held row samples: such a step draws, an all-greedy one only takes argmaxes."""
         return any(row is not None and row.request.sampling.temperature > 0 for row in self.slots)
 
+    def _kept(self) -> int:
+        """The most logits a held sampling row keeps (`top_k`), 0 when none cuts: a step's
+        constant, so its graph takes `topk` of that many."""
+        rows = [row.request.sampling for row in self.slots if row is not None]
+        return min(max((s.top_k for s in rows if s.temperature > 0), default=0), self.vocab)
+
+    def _keep(self, scores: Any, size: int) -> Any:
+        """`scores` (`[size, ..., vocab]`, before the presence penalty) with each sampling row's
+        logits below its `top_k`th largest at -inf; a greedy row's (`top_k` 0) as they are."""
+        if not (most := self._kept()):
+            return scores
+        lead = (-1, *[1] * (scores.dim() - 1))
+        rows = self.top_k[:size]
+        at = (rows - 1).clamp(0, most - 1).view(lead).expand(*scores.shape[:-1], 1)
+        kth = scores.topk(most, dim=-1).values.gather(-1, at)
+        return scores.masked_fill((rows > 0).view(lead) & (scores < kth), float("-inf"))
+
     def _pick(self, scores: Any, size: int, index: Any, sampled: bool) -> Any:
         """Each row's token from `scores` (`[size, ..., vocab]`): its argmax, or a sampling row's
         draw (`_draw`) for the token at `index`."""
@@ -2355,7 +2405,7 @@ class _Engine:
     def _select(self, logits: Any, size: int) -> Any:
         """Each live row's next token, on the device, in `ids` and `out`; a row that stops (a
         stop token, or its limit) is done. Returns the rows live before it."""
-        scores = logits.float() - self.penalty[:size, None] * self.seen[:size]
+        scores = self._keep(logits.float(), size) - self.penalty[:size, None] * self.seen[:size]
         done = self.done[:size]
         live = ~done
         n = self.n[:size]
@@ -2419,7 +2469,8 @@ class _Engine:
                 mask = torch.where(open_[:, None, None], self.open, dmask)
                 at = (position + i).movedim(0, -2) if self.positional else (length + i)[:, None]
                 hidden = self.draft(embed(token), hidden, at, view.draft, mask, rotary)
-            scores = head(hidden)[:, -1].float() - self.penalty[:size, None] * seen
+            scores = self._keep(head(hidden)[:, -1].float(), size)
+            scores = scores - self.penalty[:size, None] * seen
             token = self._pick(scores, size, n + i, sampled)[:, None]
             drafts.append(token)
             seen = seen.scatter(1, token, 1.0)
@@ -2444,7 +2495,7 @@ class _Engine:
         reset = _VERIFY.set(verify)
         try:
             with _taking(model) as taken, _RowByRow():
-                scores = model(**kwargs).logits[:, -span:].float()
+                scores = self._keep(model(**kwargs).logits[:, -span:].float(), size)
         finally:
             _VERIFY.reset(reset)
         # row j has seen the drafts before it
