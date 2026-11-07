@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
 import tensorfs.varena.torch as vt
+from tensorfs import varena
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
@@ -39,6 +40,7 @@ from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, OutputError, faul
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building, Yielded
 from cozy_runtime.graphs import domain
 from cozy_runtime.internal import attention_ulysses, kernel_ready
+from cozy_runtime.internal.accel import StaleBinding
 
 BYPASS: contextvars.ContextVar[bool] = contextvars.ContextVar("cozy_graphs_bypass", default=False)
 #: Set while a region warms up its capture: the regions under it run as written.
@@ -77,6 +79,20 @@ def say(key: str, line: str) -> None:
 def safeguard(code: str, why: str) -> None:
     """One for this attempt's record, or the next attempt's when raised at idle."""
     WARNINGS.append((SAFEGUARDS[code], {"code": code, "why": why.splitlines()[0][:300]}))
+
+
+def no_room(device: int, what: str, need: int, error: BaseException) -> str:
+    """Why varena refused room before anything ran (`varena.Exhausted`), for the run's record."""
+    room = vt.room(device)
+
+    def gib(n: int) -> str:
+        return f"{n / (1 << 30):.1f} GiB"
+
+    return (
+        f"{what} needs {gib(need or getattr(error, 'requested_bytes', 0))} beside "
+        f"{gib(room['working_live'])} live and {gib(room['pinned'])} of weights in use, of "
+        f"{gib(room['capacity'])} ({error})"
+    )
 
 
 def safeguards(warnings: list[Any]) -> dict[str, list[str]]:
@@ -157,15 +173,48 @@ def _same_shaped(torch: Any, args: Any, kwargs: Any, result: Any) -> tuple[Any, 
     return tuple(tensor for tensor in (*inputs, *outputs) if tuple(tensor.shape) in shared)
 
 
+@contextmanager
+def _measured(device: int) -> Iterator[list[int]]:
+    """The working peak varena charged what runs inside, once it ran: none where another
+    observation owns the device."""
+    peak: list[int] = []
+    try:
+        token = vt.phase_enter(device, None, mode="preparation")
+    except vt.PhaseOverlapError:
+        yield peak
+        return
+    ran = False
+    try:
+        yield peak
+        ran = True
+    finally:
+        record = vt.phase_leave(device, token, completed=ran)
+    if ran and record.get("peak_bytes") is not None:
+        peak.append(int(record["peak_bytes"]))
+
+
+def close_pool(pool: domain.Pool, device: int) -> None:
+    """A pool none of its owner's graphs use any more, told varena (`vt.pool_close`): its pages
+    go at the next reclaim. An older TensorFS only drops its preparation, and a capture whose
+    end failed keeps its reference there."""
+    (getattr(vt, "pool_close", None) or vt.cancel_preparation)(pool.handle, device)
+
+
 @request_path.forbid("cuda graph capture")
 def capture(
-    torch: Any, step: Callable[[], object], pool: domain.Pool, owner: domain.Domain
+    torch: Any, step: Callable[[], object], pool: domain.Pool, owner: domain.Domain, reserve: int
 ) -> tuple[Any, str]:
-    """Record a pure computation after preparing Varena's mapped capture pool.
+    """Record a pure computation into Varena's capture pool, `reserve` bytes of it prepared first:
+    refused there (`varena.Exhausted`), nothing is captured. An allocation the capture still finds
+    no room for fails it, as a device fault does: no capacity is learned from it.
 
-    Bindings and outputs remain caller-owned. The measured eager working peak seeds pool
-    capacity; a larger actual capture refuses cleanly instead of mapping inside capture.
+    Bindings and outputs remain caller-owned.
     """
+    try:
+        vt.prepare_pool(pool.handle, reserve, owner.device)
+    except BaseException:
+        vt.cancel_preparation(pool.handle, owner.device)
+        raise
     graph = torch.cuda.CUDAGraph()
     current = torch.cuda.current_stream()
     stream, work = owner.control, owner.stream
@@ -176,7 +225,7 @@ def capture(
         with (
             kernel_ready.recording(),
             torch.utils._python_dispatch._disable_current_modes(),
-            vt.graph(graph, pool=pool.handle, stream=stream, primed=(work,)),
+            vt.graph(graph, pool=pool.handle, stream=stream, reserve_bytes=reserve, primed=(work,)),
         ):
             owner.fork.record(stream)
             work.wait_event(owner.fork)
@@ -191,6 +240,7 @@ def capture(
     current.wait_stream(stream)
     current.wait_stream(work)
     if failure is not None:
+        vt.cancel_preparation(pool.handle, owner.device)
         try:
             graph.reset()
         except Exception as cleanup:
@@ -202,7 +252,7 @@ def capture(
             )
             error.error_code = 999
             raise error from failure
-    if isinstance(failure, Building | Yielded):
+    if isinstance(failure, Building | Yielded) or (failure is not None and is_capacity(failure)):
         raise failure
     if failure is not None:
         if fault(failure) in (Fault.STICKY, Fault.DEVICE):
@@ -241,6 +291,10 @@ class _Recording:
         # Nothing reads a pool between replays, so the core may take its pages back when idle.
         held = [t for t in inputs if t is not None]
         held += [t for t in torch.utils._pytree.tree_leaves(outputs) if isinstance(t, torch.Tensor)]
+        #: what it holds in its pool for as long as it lives, beside any later capture's room
+        self.held_bytes = sum(
+            {t.untyped_storage().data_ptr(): t.untyped_storage().nbytes() for t in held}.values()
+        )
         try:
             vt.pool_scratch(pool.handle, held, owner.device)
         except (RuntimeError, ValueError) as exc:  # An escaped alias: its pool just stays mapped.
@@ -516,8 +570,8 @@ _POLL_S = 0.0002
 
 class _Idle:
     """Work for the device's idle periods, in the order it queued (`capture_idle`): a job answers
-    whether it is done; one that is not (its region measured once, its pages not resident, no
-    free room) waits for the next period. `check`, before each torch op of a job (`_yielding`)
+    whether it is done; one that is not (its region measured once, its pages not resident, a
+    kernel building) waits for the next period. `check`, before each torch op of a job (`_yielding`)
     and at each region boundary, yields to a command that arrived: the job ends there, a capture
     discarded, first again next period. The longest stretch between checks is the longest a
     command waited for the host (v17: 386 ms when it was the whole UNet's capture); `meter`
@@ -906,10 +960,6 @@ def _receipt(recorder: _Recorder) -> dict[str, Any]:
     }
 
 
-def _unprepared(exc: BaseException) -> bool:
-    return is_capacity(exc) or getattr(exc, "code", None) == "STALE_BINDING"
-
-
 def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwargs: Any) -> Any:
     context = CURRENT.get()
     if (
@@ -1102,30 +1152,20 @@ def _replay(
 ) -> Any:
     """The call replayed, or `_EAGER`. Its results leave the component (a package's loop may
     keep them past its next call): they are copied out, allocated before the physical lease so
-    admission sees their segments."""
-    try:
-        out = entry.output()
-    except Exception as exc:
-        if not _unprepared(exc):
-            raise
-        # No replay launched. The cached private pool can itself be why ordinary outputs
-        # do not fit, so drain and retire it before the eager path allocates those outputs.
-        recorder.finish()
-        recorder.drop()
-        return _EAGER
+    admission sees their segments. varena refusing its weights room, this call runs as written
+    and its graphs stay; weights that changed retire them at the next call (`_replay_call`)."""
+    out = entry.output()
     try:
         began = time.perf_counter()
         lease = _lease(torch, placed, recorder.binding)
         lease.__enter__()
         recorder.prepare_ms += (time.perf_counter() - began) * 1e3
-    except Exception as exc:
-        if not _unprepared(exc):
-            raise
-        del out
-        recorder.finish()
-        recorder.drop()
-        _refused(recorder, placed, f"its weights cannot all be resident at once ({exc})")
-        safeguard("no_room", str(exc))
+    except StaleBinding:
+        return _EAGER
+    except varena.Exhausted as exc:  # before the replay
+        why = no_room(entry.owner.device, "its weights", 0, exc)
+        _refused(recorder, placed, why)
+        safeguard("no_room", why)
         return _EAGER
     try:
         result = recorder.replayed.run(torch, lambda: entry(leaves, out))
@@ -1140,7 +1180,7 @@ def _replay(
 def _capture_pending(pending: _Pending) -> bool:
     """An idle period's job: `pending`'s signature recorded, or ruled out (`_record`). False
     waits for a later period: only its first call measured, or a placed region's pages not
-    resident or no free room for it."""
+    resident. Anything else that fails it ends it, and the run says why: never retried."""
     torch, module = pending.torch, pending.module()
     recorder = _RECORDERS.get(module) if module is not None else None
     if recorder is None or recorder.queued.get(pending.key) is not pending:
@@ -1172,8 +1212,6 @@ def _capture_pending(pending: _Pending) -> bool:
         except Exception as exc:  # the signature runs as written; the period goes on
             if isinstance(exc, Yielded) or fault(exc) in (Fault.STICKY, Fault.DEVICE):
                 raise
-            if is_capacity(exc):
-                return False
             _failed(module, recorder, pending.key, f"{type(exc).__name__}: {exc}"[:300])
             done = True
         if done:
@@ -1190,12 +1228,14 @@ def _record(
     submit: float,
 ) -> bool:
     """Records `pending`'s signature at idle on seeded inputs of its layout, in the device's
-    capture pool: a warm-up run, its device-busy time (`_busy`), then the capture only when its
-    eager calls were launch-bound: their host submission took longer than the device's work, so
-    the device sat idle inside them. False tries again at a later period (no free room, a kernel
-    building)."""
-    # This path is restricted to the shipped pure contracts. Warmup discovers capacity in
-    # the exact capture pool; it does not time or select kernels, or run arbitrary package code.
+    capture pool: a warm-up run, measured, its device-busy time (`_busy`), then the capture only
+    when its eager calls were launch-bound: their host submission took longer than the device's
+    work, so the device sat idle inside them. Its pool is `vt.pool_bytes` of the warm-up's peak
+    beside what the pool holds already; varena refusing it or its weights room, it runs as
+    written, and the run says what it needed. False tries again at a later period (a kernel
+    building, its weights left)."""
+    # This path is restricted to the shipped pure contracts. It does not time or select kernels,
+    # or run arbitrary package code.
     key, call, owner = pending.key, pending.call, recorder.domain
     assert owner is not None
     current = torch.cuda.current_stream()
@@ -1210,25 +1250,32 @@ def _record(
             _failed(module, recorder, key, "driver/context memory is unmeasured")
             return True
         scope = placed[0].graph_pass(placed[1], "") if placed is not None else nullcontext()
-        # Discovery owns the complete range set and then the admitted free headroom.
         lease = recorder.binding.prepare(current) if recorder.binding is not None else nullcontext()
-        with scope, lease, _capture_state(torch, module, owner.stream) as state:
+        with ExitStack() as entered:
+            try:
+                entered.enter_context(scope)
+                entered.enter_context(lease)
+            except varena.Exhausted as exc:  # its admission: nothing ran
+                _failed(module, recorder, key, no_room(owner.device, "its weights", 0, exc))
+                return True
+            state = entered.enter_context(_capture_state(torch, module, owner.stream))
             stream = owner.stream
             stream.wait_stream(current)
             with torch.cuda.stream(stream):
                 # Warm-up runs with ordinary Torch allocations, before graph-private storage.
                 seeded = torch.Generator(device=current.device).manual_seed(_SEED)
-                inputs = [
-                    _input(torch, v, seeded) if isinstance(v, _Leaf) else None
-                    for v in pending.leaves
-                ]
-                cargs, ckwargs = _arguments(torch, pending, inputs)
                 warming = _WARMING.set(True)
                 try:
                     with attention_ulysses.observing() as served:
-                        took, metered = time.perf_counter(), IDLE.metered_ms
-                        eager = call(module, *cargs, **ckwargs)
-                        took = (time.perf_counter() - took) * 1e3
+                        with _measured(owner.device) as peak:  # what its capture allocates
+                            inputs = [
+                                _input(torch, v, seeded) if isinstance(v, _Leaf) else None
+                                for v in pending.leaves
+                            ]
+                            cargs, ckwargs = _arguments(torch, pending, inputs)
+                            took, metered = time.perf_counter(), IDLE.metered_ms
+                            eager = call(module, *cargs, **ckwargs)
+                            took = (time.perf_counter() - took) * 1e3
                         if not _clonable(torch, eager):
                             _failed(module, recorder, key, "output is not a tensor tree", None)
                             return True
@@ -1245,6 +1292,12 @@ def _record(
                 if why := _device_bound(submit, busy):
                     recorder.judged[key] = why
                     return True
+                if not peak:
+                    recorder.judged[key] = "its warm-up's working memory was not measured"
+                    return True
+                reserve = vt.pool_bytes(peak[0]) + sum(
+                    entry.held_bytes for entry in recorder.recordings.values()
+                )
                 if recorder.pool is None:
                     recorder.pool = (
                         placed[0].graph_pool(placed[1])
@@ -1265,7 +1318,11 @@ def _record(
                     outputs.append(call(module, *sargs, **skwargs))
 
                 took = time.perf_counter_ns()
-                graph, why = capture(torch, step, pool, owner)
+                try:
+                    graph, why = capture(torch, step, pool, owner, reserve)
+                except varena.Exhausted as exc:  # its admission: nothing was captured
+                    _failed(module, recorder, key, no_room(owner.device, "its pool", reserve, exc))
+                    return True
                 if graph is None:
                     _failed(module, recorder, key, why)
                     return True
@@ -1299,8 +1356,8 @@ def _record(
         recorder.capture_each.append(round((time.perf_counter() - began) * 1e3, 3))
         return True
     except Exception as exc:
-        if is_capacity(exc) or _unprepared(exc) or isinstance(exc, Building):
-            return False
+        if isinstance(exc, Building | StaleBinding):
+            return False  # a kernel still building, or its weights left: a later period
         if not isinstance(exc, domain.Unavailable):
             raise
         _failed(module, recorder, key, f"{type(exc).__name__}: {exc}".splitlines()[0][:300])
@@ -1311,6 +1368,8 @@ def _record(
             if graph is not None:
                 graph.reset()
             if not recorder.recordings:
+                if recorder.pool is not None:
+                    close_pool(recorder.pool, owner.device)
                 recorder.pool = None
                 if recorder.binding is not None:
                     # A rejected warm-up keeps no Regions when no executable reads them.
