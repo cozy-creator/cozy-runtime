@@ -4,9 +4,10 @@ A Diffusers `step` keeps host state (its step index and sigmas) and may draw noi
 step may do neither. `scheduled` runs the scheduler's own `scale_model_input` and `step` once
 per step on the host beforehand, on probe values, and keeps what each computes: the model's
 input as `scale * sample`, the next sample as `a * sample + b * output + c * noise`. The loop's
-step reads its row by its index tensor, and the noise is drawn before the loop.
+step reads its row by its index tensor and draws its noise from the request's seed and its index
+(`rng.counter_noise`, stream 0), eager or recorded.
 
-    schedule = scheduled(scheduler, latents, generator, eta=1.0)
+    schedule = scheduled(scheduler, latents, seed, eta=1.0)
     def step(i, latents, *tables):
         s = Schedule(*tables)
         s.update(i, latents, model(s.scale(i, latents), s.timestep(i)))
@@ -37,12 +38,12 @@ _BASIS = ((1.0, 0.0), (0.0, 1.0), (0.0, 0.0), (6.0, -8.0))
 class Schedule:
     """`timesteps`: the model's timestep per step, as the scheduler gives it. `scales`: what
     `scale_model_input` multiplies the sample by. `table`: (a, b, c) per step, float32.
-    `noise`: one draw per step, of the sample's shape; None when no step draws."""
+    `seed`: the noise's `rng.counter_seed`; None when no step draws."""
 
     timesteps: torch.Tensor
     scales: torch.Tensor
     table: torch.Tensor
-    noise: torch.Tensor | None = None
+    seed: torch.Tensor | None = None
 
     def __len__(self) -> int:
         return int(self.table.shape[0])
@@ -51,7 +52,7 @@ class Schedule:
     def inputs(self) -> tuple[torch.Tensor, ...]:
         """Its tensors, for `denoise_loop(inputs=)`; `Schedule(*inputs)` in the step."""
         tables = (self.timesteps, self.scales, self.table)
-        return tables if self.noise is None else (*tables, self.noise)
+        return tables if self.seed is None else (*tables, self.seed)
 
     def timestep(self, i: torch.Tensor) -> torch.Tensor:
         return self.timesteps.index_select(0, i)
@@ -65,17 +66,17 @@ class Schedule:
         differently on CPU and CUDA."""
         a, b, c = self.table.index_select(0, i)[0].unbind(0)
         nxt = sample.float() * a + output.float() * b
-        if self.noise is not None:
-            nxt = nxt + self.noise.index_select(0, i)[0] * c
+        if self.seed is not None:
+            nxt = nxt + rng.counter_noise(sample.shape, self.seed, i, device=sample.device) * c
         sample.copy_(nxt)
 
 
 def scheduled(
-    scheduler: Any, sample: torch.Tensor, generator: torch.Generator | None = None, **step: Any
+    scheduler: Any, sample: torch.Tensor, seed: int | None = None, **step: Any
 ) -> Schedule:
     """`scheduler` after its `set_timesteps`, for loops over samples like `sample`, on its
     device. `step`: what the package passes its `step` (DDIM's `eta`). A scheduler that draws
-    noise takes `generator` for it. The scheduler itself does not advance."""
+    noise takes the request's `seed` for it. The scheduler itself does not advance."""
     clone = copy.deepcopy(scheduler)
     for name, value in list(vars(clone).items()):
         if isinstance(value, torch.Tensor):
@@ -88,15 +89,15 @@ def scheduled(
     for k, t in enumerate(clone.timesteps):
         x, eps, tested = _probe(k, draws)
         shape = (1, 1, 1, x.numel())  # a latent's (batch, channels, height, width)
-        seed = int(torch.randint(1 << 62, (1,), generator=draws))
-        options = {**step, "generator": torch.Generator().manual_seed(seed)} if takes else step
+        probe = int(torch.randint(1 << 62, (1,), generator=draws))
+        options = {**step, "generator": torch.Generator().manual_seed(probe)} if takes else step
         try:
             scaled = x if scaling is None else scaling(x.view(shape), t).flatten()
             out = clone.step(eps.view(shape), t, x.view(shape), return_dict=False, **options)[0]
         except Exception as exc:
             raise ValueError(f"{name} step {k} does not run on a probe: {exc}") from exc
         out = out.float().flatten()
-        n = torch.randn(shape, generator=torch.Generator().manual_seed(seed)).flatten()
+        n = torch.randn(shape, generator=torch.Generator().manual_seed(probe)).flatten()
         c = out[2] / n[2]
         a, b = out[0] - c * n[0], out[1] - c * n[1]
         terms = (a * x, b * eps, c * n)
@@ -110,17 +111,17 @@ def scheduled(
             )
         rows.append(torch.stack((a, b, c)))
         scales.append(scale)
-    table = torch.stack(rows).to(sample.device)
-    noise = None
+    table = torch.stack(rows)
+    drawn = None
     if bool(table[:, 2].ne(0).any()):
-        if generator is None:
-            raise ValueError(f"{name} draws noise: pass the request's generator to `scheduled`")
-        noise = rng.noise((len(rows), *sample.shape), generator, device=sample.device)
+        if seed is None:
+            raise ValueError(f"{name} draws noise: pass the request's seed to `scheduled`")
+        drawn = rng.counter_seed(seed, sample.device)
     return Schedule(
         torch.as_tensor(scheduler.timesteps).to(sample.device),
         torch.stack(scales).to(sample.device),
-        table,
-        noise,
+        table.to(sample.device),
+        drawn,
     )
 
 
