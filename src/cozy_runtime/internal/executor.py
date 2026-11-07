@@ -157,6 +157,7 @@ from cozy_runtime.internal import (
     numerical_environment,
     pacing,
     package_interface,
+    philox,
     prebuilt,
     prepare_diagnostics,
     proctree,
@@ -2484,8 +2485,10 @@ class Executor:
             # first construction and beside its weight fill: one first asked mid-request served
             # its whole stage on a fallback while it landed (Klein's on-demand upsampler; H3's
             # nvfp4 layers through step 1 on an RTX 5090, cr-241; on two 5060 Tis, cr-261). Each
-            # first ask waits for it; a group's GPUs state theirs in their load's reply.
+            # first ask waits for it; a group's GPUs state theirs in their load's reply. So does
+            # counter noise's kernel, which a recorded step's draw needs before its capture.
             leaves.prime(torch, torch.cuda.current_device())
+            philox.prime(torch.cuda.current_device())
         if self.world > 1 and self.rank == 0:
             # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
             # before this one reads a header, and the plans are compared at the residence
