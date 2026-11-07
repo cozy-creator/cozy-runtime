@@ -4,8 +4,10 @@ layout that changes the result (a blended cut) comes from the shape alone (`most
 
 from __future__ import annotations
 
+import itertools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -41,6 +43,10 @@ class Pieces(Protocol):
 
     def piece(self) -> None: ...
 
+    def windows(
+        self, name: str, key: str, needs: Sequence[int]
+    ) -> tuple[int, Callable[[], AbstractContextManager[None]]]: ...
+
 
 _RUNTIME: Pieces | None = None
 
@@ -57,6 +63,7 @@ def split(
     most: int | None = None,
     out: Any = None,
     holds: int = 5,
+    host: bool = False,
 ) -> Any:
     """`fn(x)`, whole or in the fewest pieces along `cuts` that fit the device; `fn` maps each
     window of `x` to that window of its result. Without a managing memory it runs whole.
@@ -70,24 +77,32 @@ def split(
     request, managed or not: the layout for an `fn` whose result depends on it, as a blended
     cut's (an `overlap`) does. Without it such a layout follows free memory.
 
-    `holds` is `fn`'s peak beside the whole output, in windows of its output: the estimate the
-    device's choice starts from before it has measured a pass."""
+    With `host`, `fn` returns its windows in host memory and the result is assembled there: the
+    whole output is no device need.
+
+    `holds` is `fn`'s device peak beside the whole output, in windows of its output: the estimate
+    the device's choice starts from before it has measured a pass."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
     # Writing windows in place (`out`) can consume its input, so that never runs twice.
     pure = out is None and getattr(fn, "PURE_WINDOWS", False)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
+    whole = 0 if out is not None or host else _bytes(shape, cuts, x)
     if most is not None and cuts:
         windows = _windows(shape, cuts, most)
         if runtime is None:
             return _run(fn, x, cuts, windows, lambda: None, out)
+        # The largest window these cuts made, not `most`: a small input cuts smaller.
+        largest = max(math.prod(b - a for a, b in w) for w in windows) * (
+            math.prod(shape) // math.prod(shape[c.dim] for c in cuts)
+        )
         return runtime.split(
             _name(fn),
             _key(fn, shape, cuts, x.dtype),
-            most,
-            most,
-            0 if out is not None else _bytes(shape, cuts, x),
+            largest,
+            largest,
+            whole,
             _item_bytes(cuts, x),
             holds,
             lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
@@ -103,12 +118,107 @@ def split(
         _key(fn, shape, cuts, x.dtype),
         math.prod(shape),
         _finest(shape, cuts),
-        0 if out is not None else _bytes(shape, cuts, x),
+        whole,
         _item_bytes(cuts, x),
         holds,
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
         pure,
     )
+
+
+@dataclass(frozen=True)
+class Windows:
+    """A window layout a loop keeps throughout (`windows`): `spans`, the `(start, stop)` of each
+    window along its cut. Run each window's work inside `piece()`, so the layout's memory is
+    measured and the next call chooses from what it held."""
+
+    spans: tuple[tuple[int, int], ...]
+    _piece: Callable[[], AbstractContextManager[None]] = nullcontext
+
+    def piece(self) -> AbstractContextManager[None]:
+        return self._piece()
+
+    def __len__(self) -> int:
+        return len(self.spans)
+
+    def __iter__(self) -> Iterator[tuple[int, int]]:
+        return iter(self.spans)
+
+
+def windows(
+    name: str,
+    shape: Sequence[int],
+    cut: Cut,
+    *,
+    per_element_bytes: float,
+    most: int | None = None,
+    equal: bool = False,
+) -> Windows:
+    """The fewest windows along `cut` of a tensor of `shape` that fit the device, chosen once
+    for a whole loop, as `split` chooses a call's: a layout the loop's tables and labels are
+    built for before it starts. `per_element_bytes` is what a window's work holds at its peak, in
+    bytes per element of the window (every axis whole but the cut's); the device's choice starts
+    from it and then from what earlier calls measured. Starts fall on `cut.align`, neighbours share
+    `cut.overlap`, and with `equal` every window has one length (the fewest equal windows at
+    least as many as chosen). With `most`, the fewest of at most `most` elements, from the shape
+    alone, on every device. Without a managing memory, one window unless `most` says more."""
+    shape = tuple(int(n) for n in shape)
+    length = shape[cut.dim]
+    rest = math.prod(shape) // max(length, 1)
+    layouts: list[list[tuple[int, int]]] = []
+    count = 1  # level L asks for about 2^L windows, as `split` does
+    while count <= max(length, 1):
+        spans = _equal(length, cut, count) if equal else _spans(length, cut, count)
+        if spans is None or (layouts and _span(spans) >= _span(layouts[-1])):
+            break  # no shorter window: finer only adds launches
+        layouts.append(spans)
+        count = max(2 * count, len(spans) + 1)
+    if most is not None:
+        return Windows(tuple(_fewest(length, cut, equal, most // max(rest, 1))))
+    runtime = _RUNTIME
+    if runtime is None or len(layouts) == 1:
+        return Windows(tuple(layouts[0]))
+    needs = [int(_span(w) * rest * per_element_bytes) for w in layouts]
+    key = f"{name}{shape}:{cut}:{per_element_bytes}:{equal}"
+    at, piece = runtime.windows(name, key, needs)
+    return Windows(tuple(layouts[at]), piece)
+
+
+def _fewest(length: int, cut: Cut, equal: bool, longest: int) -> list[tuple[int, int]]:
+    """The fewest windows no longer than `longest`, else the finest there are."""
+    count, spans = 1, [(0, length)]
+    while _span(spans) > longest:
+        more = (len(spans) + 1) if equal else _finer(length, cut, count)
+        if not more:
+            break
+        found = _equal(length, cut, more) if equal else _spans(length, cut, more)
+        if found is None:
+            break
+        count, spans = more, found
+    return spans
+
+
+def _span(spans: Sequence[tuple[int, int]]) -> int:
+    """The longest window's length."""
+    return max(b - a for a, b in spans)
+
+
+def _equal(length: int, cut: Cut, count: int) -> list[tuple[int, int]] | None:
+    """The fewest windows, at least `count`, all of one length, covering `length` with starts
+    spread evenly on `align` and neighbours sharing at least `overlap`; None when there are none.
+    One length `L` keeps `L ≡ length (mod align)`, so the last window ends at `length`."""
+    if count <= 1 or length <= cut.overlap:
+        return [(0, length)]
+    for k in range(count, length + 1):
+        need = -(-(length + (k - 1) * cut.overlap) // k)
+        size = need + (length - need) % cut.align
+        if size >= length:
+            continue
+        steps = (length - size) // cut.align
+        starts = [cut.align * round(i * steps / (k - 1)) for i in range(k)]
+        if all(b - a <= size - cut.overlap for a, b in itertools.pairwise(starts)):
+            return [(a, a + size) for a in starts]
+    return None
 
 
 type Window = tuple[tuple[int, int], ...]

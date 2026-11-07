@@ -62,10 +62,20 @@ class DoesNotFit(UnsupportedInput):
     default_code = "does_not_fit"
 
 
+DOES_NOT_FIT = DoesNotFit.default_code
+
+
 class DefaultResolutionError(InvalidRequest):
     """The ModelDefault overlay could not be resolved: a package's model slots, not a recipe."""
 
     default_code = "default_resolution"
+
+
+class ContractViolation(AuthorError):
+    """The package reached what the package contract gives the Runtime alone (a torch room
+    reader, the allocator): the message names the contract's API for it."""
+
+    default_code = "contract_violation"
 
 
 class PreflightViolation(AuthorError):

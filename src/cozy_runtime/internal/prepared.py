@@ -680,11 +680,8 @@ class _SequenceCapture:
         self.stages: list[PreparedRepeat] = []
         self._domain: Any = None
         self._pool: Any = None
+        #: the pool its mode reserved before any capture (`loop._admit`), which each one prepares
         self._working_bytes: int | None = None
-        #: what its pool reserves at least: a refused attempt's reservation and what it lacked
-        self._reserve = 0
-        #: and at least the process's peak at capture (`loop._reserve`)
-        self._floor = False
         self._areas: list[tuple[Any, int, int]] = []
         self._submission = threading.RLock()
         self._closing = False

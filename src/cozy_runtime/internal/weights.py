@@ -26,6 +26,7 @@ from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from cozy_runtime import graphs
+from cozy_runtime.author import CapabilityError
 from cozy_runtime.author._loader import (
     TENSORFS_NAMES,
     Census,
@@ -71,6 +72,7 @@ from cozy_runtime.internal.residency import (
     Weights,
     paging,
     split,
+    uncached,
 )
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 from tensorfs.raw import parts as stored_parts
@@ -374,6 +376,7 @@ class Backend:
         self.gemm_sites = leaf_sites(self.leaves)
         leg = self._leg("leaves", leg)
         for name, root in self.roots.items():
+            uncached(root)  # every component the loader built, weights or none
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
                 self.models[name] = self._register(name, root, keys)
@@ -819,6 +822,8 @@ class _Bake:
     encoding: str = ""
     layer: LoRALayer | None = None
     factors: list[tuple[str, str, float]] = field(default_factory=list)
+    #: each DoRA pair's magnitude and (s, t), by its place in `factors` (`lora_bake.dora`)
+    dora: dict[int, tuple[str, float, float]] = field(default_factory=dict)
     hooks: list[LoRASource] = field(default_factory=list)
     #: An svdq.nvfp4 leaf: its LoRAs join its low-rank branch as more ranks when it runs
     #: (`SvdqLinear.adopt`), never its bytes, so no page refills for them.
@@ -869,17 +874,39 @@ class _Bakes:
             target = site.removesuffix(".base_layer")
             if target != site:
                 layer = cast(LoRALayer, root.get_submodule(target))
+                dora = getattr(layer, "_cozy_dora", {})
                 for adapter in getattr(layer, "active_adapters", ()):
                     a = names.get(f"{target}.lora_A.{adapter}.weight")
                     b = names.get(f"{target}.lora_B.{adapter}.weight")
-                    if a is None or b is None:
+                    m = names.get(f"{target}.lora_magnitude_vector.{adapter}.weight")
+                    if a is None or b is None or (adapter in dora and m is None):
                         break
+                    if adapter in dora:
+                        bake.dora[len(bake.factors)] = (cast(str, m), *dora[adapter])
                     bake.factors.append((a, b, float(layer.scaling[adapter])))
                 else:
                     if bake.factors:
                         bake.layer = layer
+                if bake.dora and (leaf is not None or bake.layer is None):
+                    raise CapabilityError(
+                        f"{target}: a DoRA on a weight stored {encoded.scheme} that serves through "
+                        "its own low-rank branch",
+                        code="adapter_dora_target",
+                    )
             if bake.layer is not None or bake.hooks:
                 self.bakes[stored] = bake
+        held = {b.weight for b in self.bakes.values() if b.dora}
+        for path, module in root.named_modules():
+            if getattr(module, "_cozy_dora", None) and not any(
+                rows[w].key.partition(".")[2].startswith(path + ".") for w in held
+            ):
+                raise CapabilityError(
+                    f"{path}: a DoRA applies to a weight stored plain, fp8.rowwise, int8.convrot "
+                    "or nvfp4, and this one is stored otherwise",
+                    code="adapter_dora_target",
+                )
+        #: a fill identity names `lora_bake.DORA` when a DoRA's rows fill by its rule
+        self.dora = bool(held)
         if self.bakes:
             self.choose("bake")  # A lazily constructed model's first attempt uses the default.
 
@@ -961,13 +988,18 @@ class _Bakes:
         """`identity`, or with `armed` each hook's armed delta too: what seeds a bake's rounding."""
         torch = self.torch
         if self.serving != "bake":
-            return repr((self.serving,))
+            return repr((self.serving, lora_bake.DORA) if self.dora else (self.serving,))
         held: list[object] = [lora_bake.recipe(self.how == "fused"), torch.__version__]
+        if self.dora:
+            held.append(lora_bake.DORA)
         held.append(torch.cuda.get_device_capability(self.gpu) if self.gpu is not None else "cpu")
         for stored, bake in sorted(self.bakes.items()):
             if bake.leaf is not None:
                 continue
-            deltas: list[object] = [(a, b, repr(scale)) for a, b, scale in bake.factors]
+            deltas: list[object] = [
+                (a, b, repr(scale), *map(repr, bake.dora.get(i, ())))
+                for i, (a, b, scale) in enumerate(bake.factors)
+            ]
             for hook in bake.hooks if armed else ():
                 delta = self._delta(hook)
                 if delta is None:
@@ -978,20 +1010,59 @@ class _Bakes:
             held.append((stored, bake.encoding, deltas))
         return repr(held)
 
+    def _dora(
+        self, bake: _Bake, weight: Mapping[str, Tensor], parts: Mapping[str, Mapping[str, Tensor]]
+    ) -> tuple[Tensor, dict[int, Tensor]]:
+        """`bake`'s DoRA terms from the stored bytes: its row gain and each DoRA pair's B scale."""
+        value = {name: roles["value"] for name, roles in parts.items() if "value" in roles}
+        terms = [
+            (value[bake.factors[i][0]], value[bake.factors[i][1]], value[m], s, t)
+            for i, (m, s, t) in bake.dora.items()
+        ]
+        gain, scales = lora_bake.dora(self.torch, weight, terms)
+        return gain, dict(zip(bake.dora, scales, strict=True))
+
+    def _per_step(self, parts: Mapping[str, Mapping[str, Tensor]]) -> bool:
+        """A per-step fill of a DoRA's rows: each weight's rows times its gain and each DoRA pair's
+        B times its scale, in the page, so its forward adds `B' @ A` at scale 1."""
+        changed = False
+        for stored, bake in self.bakes.items():
+            weight = parts.get(stored)
+            if not bake.dora or weight is None or not all(n in parts for n in self._held(bake)):
+                continue
+            gain, scales = self._dora(bake, weight, parts)
+            lora_bake.gain_rows(self.torch, dict(weight), gain)
+            for i, c in scales.items():
+                up = parts[bake.factors[i][1]]["value"]
+                up.copy_(up.float().mul_(c[:, None]))
+            changed = True
+        return changed
+
+    @staticmethod
+    def _held(bake: _Bake) -> list[str]:
+        """The stored factor tensors (and magnitudes) a bake of `bake` reads."""
+        factors = [n for a, b, _ in bake.factors for n in (a, b)]
+        return factors + [m for m, _, _ in bake.dora.values()]
+
     def __call__(self, block: object, parts: Mapping[str, Mapping[str, Tensor]]) -> bool:
         """Bake `block`'s LoRA'd weights in place; whether any was baked."""
         if self.serving != "bake":
-            return False
+            return self._per_step(parts)
         baked = self.baked
         identity = self._described(armed=True)
         for stored, bake in self.bakes.items():
             weight = parts.get(stored)
             if bake.leaf is not None or weight is None:
                 continue
-            if any(a not in parts or b not in parts for a, b, _ in bake.factors):
+            if any(n not in parts for n in self._held(bake)):
                 continue
             downs = [parts[a]["value"] for a, _, _ in bake.factors]
             ups = [parts[b]["value"] * scale for _, b, scale in bake.factors]
+            gain = None
+            if bake.dora:
+                gain, scales = self._dora(bake, weight, parts)
+                for i, c in scales.items():
+                    ups[i] = parts[bake.factors[i][1]]["value"].float() * c[:, None]
             torch, named, got = self.torch, None, None
             # A hook's factors are another model's tensors, read here outside its forward: each
             # bound as its own piece only while copied (a few MB each, not the source whole),
@@ -1021,6 +1092,7 @@ class _Bakes:
                 up,
                 seed=zlib.crc32(f"{identity}\0{stored}".encode()),
                 how=self.how,
+                gain=gain,
             )
             self.baked += 1
         return self.baked > baked
