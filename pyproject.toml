@@ -1,6 +1,6 @@
 [project]
 name = "cozy-runtime"
-version = "0.42.1"
+version = "0.43.0"
 description = "Cozy author surface and device executor"
 # The native wheels carry the kernels (`kernels/`): derived from comfy-kitchen, vLLM and SGLang
 # (Apache-2.0, comfy-kitchen's NOTICE), with CUTLASS and FlashAttention-3 (BSD-3-Clause). The
@@ -13,7 +13,7 @@ license-files = [
 ]
 requires-python = ">=3.12"
 dependencies = [
-    "tensorfs>=0.21,<0.22",
+    "tensorfs>=0.22,<0.23",
     "msgspec>=0.19",
     "numpy>=1.26",
     "packaging>=24",
@@ -63,7 +63,7 @@ package = true
 # rc/varena-v2 builds against its own TensorFS, which isn't published yet. The release drops this for the published
 # TensorFS and sets the ranges above. To move it: new rev, then `uv lock`.
 [tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "b8cd8352e876f22954b2ec6810ad8d282b1c3cae", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "09f1df7e73ddba045a4937378fa27944b6982bd5", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
@@ -121,7 +121,7 @@ media = [
 ]
 # Executors read and place weights through TensorFS (`tensorfs`, `tensorfs.varena`). Local
 # package environments select this capability; worker images provide the same range.
-model-execution = ["tensorfs>=0.21,<0.22"]
+model-execution = ["tensorfs>=0.22,<0.23"]
 # peft takes any transformers. Without these floors a resolver that picks huggingface-hub 2.x
 # first backtracks to transformers 4.12, whose tokenizers has no wheel.
 adapters = [
