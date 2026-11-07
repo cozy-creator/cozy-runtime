@@ -76,15 +76,16 @@ JIT_DSLS = ("triton", "cutedsl", "helion")
 
 
 def apply(torch: Any, kind: str) -> None:
-    """The policy, set once per executor before CUDA init and its first op: float32 matmuls
-    and cuDNN in full IEEE precision, never TF32; `deterministic=True` scopes' cuDNN mode;
+    """The policy, set once per executor before CUDA init and its first op: torch's own
+    defaults, pinned so no package moves them (float32 matmuls in full precision, no TF32;
+    cuDNN convolutions with TF32, as torch has them); `deterministic=True` scopes' cuDNN mode;
     and on CUDA no JIT DSL op override, since a request never compiles (the native-op
     selection is kept). TF32 goes through the `allow_tf32` setters: in torch 2.15 setting
     `fp32_precision` makes the `cudnn.allow_tf32` getter raise, and stage memos and recorded
     loops read it."""
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = True
     _model.DETERMINISTIC[0] = functools.partial(_DETERMINISM.held, torch)
     native = getattr(torch, "_native", None)
     if kind == "cuda" and native is not None:

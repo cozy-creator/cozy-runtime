@@ -659,8 +659,8 @@ def uses_components(
     `deterministic=True`: the method's scope, and what it calls on this GPU, runs with cuDNN
     deterministic and without benchmarking, as do its component calls on a group's other
     GPUs; the setting is restored when the scope closes, and stage memos key on it. Every
-    other global numeric setting is the Runtime's policy (float32 at "highest", no TF32); a
-    package never sets `torch.backends.*`.
+    other global numeric setting is the Runtime's policy, torch's defaults pinned (float32
+    matmuls at "highest" without TF32, cuDNN with it); a package never sets `torch.backends.*`.
     """
     components = component_set(
         names, memoize=memoize, memo=memo_version is not None or bool(memo_dependencies)
