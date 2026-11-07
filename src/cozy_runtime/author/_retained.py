@@ -4,7 +4,8 @@ A step that reads again what an earlier step wrote (a prefix's K/V, computed in 
 by every later step) puts it here instead of keeping the tensors. Each `put` becomes memory the
 Runtime manages like weights: resident while the card has room, else evicted and refilled from a
 pinned host copy taken behind compute, and filled ahead of its next use. Its bytes count in the
-room every other decision sees.
+room every other decision sees. The state dies with the loop that made it: the store is closed
+(or left as a `with`) when that loop returns, and its memory is free for what comes after.
 """
 
 from __future__ import annotations
@@ -25,6 +26,14 @@ class Store(Protocol):
         """Hold `tensors` from now on: the caller drops its own and keeps the returned `State`."""
         ...
 
+    def close(self) -> None:
+        """The loop is done: every state goes now, whoever still holds one."""
+        ...
+
+    def __enter__(self) -> Store: ...
+
+    def __exit__(self, *_: object) -> None: ...
+
 
 class Memory(Protocol):
     def retained(self, nbytes: int) -> Store | None: ...
@@ -39,9 +48,10 @@ def install(runtime: Memory | None) -> None:
 
 
 def retained(nbytes: int) -> Store | None:
-    """Where a call keeps `nbytes` of cross-step state, decided once, before its loop: None when
-    neither the card nor host RAM has room for them, and the call recomputes that state instead
-    of keeping it (the general fallback, never a model's special case)."""
+    """Where a loop keeps `nbytes` of cross-step state, decided once, before it: None when
+    neither the card nor host RAM has room for them, and the loop recomputes that state instead
+    of keeping it (the general fallback, never a model's special case). Close the store when the
+    loop returns."""
     if _RUNTIME is None:
         raise RuntimeError("retained state is held inside a Runtime executor")
     return _RUNTIME.retained(nbytes)
