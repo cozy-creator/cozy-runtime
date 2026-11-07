@@ -36,7 +36,6 @@ class Pieces(Protocol):
         item_bytes: float,
         holds: int,
         run: Callable[[int], Any],
-        pure: bool = False,
     ) -> Any: ...
 
     def piece(self) -> None: ...
@@ -74,8 +73,6 @@ def split(
     device's choice starts from before it has measured a pass."""
     runtime = _RUNTIME
     shape = tuple(int(n) for n in x.shape)
-    # Writing windows in place (`out`) can consume its input, so that never runs twice.
-    pure = out is None and getattr(fn, "PURE_WINDOWS", False)
     if out is not None and any(c.scale != 1 or c.overlap for c in cuts):
         raise ValueError("split(out=) writes windows in place: its cuts take no scale or overlap")
     if most is not None and cuts:
@@ -91,7 +88,6 @@ def split(
             _item_bytes(cuts, x),
             holds,
             lambda _: _run(fn, x, cuts, windows, runtime.piece, out),
-            pure,
         )
     if runtime is None or not cuts:
         if out is None:
@@ -107,7 +103,6 @@ def split(
         _item_bytes(cuts, x),
         holds,
         lambda most: _run(fn, x, cuts, _windows(shape, cuts, most), runtime.piece, out),
-        pure,
     )
 
 

@@ -2397,8 +2397,6 @@ class Request:
         self.heads: dict[Model, tuple[set[int], int]] = {}
         #: the attempt failed (its executor says): a refused allocation in its last pass is learned
         self.failed = False
-        #: refusals that took a pure site finer than its estimate chose: zero in a normal run
-        self.finer_splits = 0
         #: Working allocation peak over the whole request, kept across cut-site resets. Weights
         #: are not in it, and no sum of it with them ever happened: the driver reads the card.
         self.torch_peak = 0
@@ -2534,7 +2532,6 @@ class Request:
             "working_phases": list(self.working_phases),
             "working_splits": list(self.working_splits.values()),
             "escaped": list(self.escaped),
-            "finer_splits": self.finer_splits,
             "gathered": self.gathered,
             "host": None,
         }
