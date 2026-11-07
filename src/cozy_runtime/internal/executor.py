@@ -1077,6 +1077,7 @@ class Executor:
                 "allocator boundary; package execution is refused",
             }
         numerical_environment.apply(torch, self.device_kind)
+        contract.pin(torch)
         try:
             accel.bind_allocator(torch, self.device_kind)
             if self.device_kind == "cuda":
@@ -1124,6 +1125,7 @@ class Executor:
         memory = Memory.open(device, budget_bytes=self._card_budget(device), shared=host.shared)
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
+            contract.REFUSALS[0] = execution.refusals(device.index or 0)
         PLANS[:] = [host.serving]
         _split.install(execution)
         attention_ulysses.install(execution)
@@ -3191,11 +3193,15 @@ class Executor:
         first import on a busy host is still an import."""
         if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
-        if self.torch is not None:
-            contract.seal(self.torch)
+        # An import-only zygote seals too: its forks inherit the seal and never import again.
+        if (torch := sys.modules.get("torch")) is not None:
+            contract.seal(torch, release.application)
         path = release.package_interface
         recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
         discovered = discover_installed(release.application, seconds=None, recipes=recipes)
+        if torch is not None:
+            contract.seal_libraries()
+            contract.check_flags(torch, f"the import of {release.application}")
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
@@ -5117,6 +5123,8 @@ def main(argv: list[str] | None = None) -> int:
     sandbox.refuse_network(
         "a package can't use the network while it runs: take what it needs as an input file",
         allow_unix_seam=True,
+        also=contract.AUDITED,
+        judge=contract.audit,
     )
     channel = (
         connect(args.socket)

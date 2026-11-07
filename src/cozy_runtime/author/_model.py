@@ -620,6 +620,16 @@ _DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 DETERMINISTIC: list[Callable[[], AbstractContextManager[None]]] = [nullcontext]
 
 
+class Sealed(Protocol):
+    def enter(self) -> Any: ...
+    def leave(self, entered: Any, method: str, ok: bool) -> None: ...
+
+
+#: The package contract's checks at each local scope (`internal/contract._Scopes`: the flags a
+#: package may not move, a refusal it returned past), installed when the executor seals torch.
+CONTRACT: list[Sealed | None] = [None]
+
+
 def deterministic(model: object, method: str) -> bool:
     """Whether `model.method` runs under deterministic cuDNN: it declares `deterministic=True`,
     or it is called inside a scope that does. Stage memos key on it."""
@@ -1198,6 +1208,7 @@ class _ComponentScope:
         "_caches",
         "_call",
         "_components",
+        "_contract",
         "_local",
         "_method",
         "_model",
@@ -1216,6 +1227,7 @@ class _ComponentScope:
         self._using: AbstractContextManager[None] | None = None
         self._numerics: AbstractContextManager[None] | None = None
         self._caches: list[DerivedCache] = []
+        self._contract: tuple[Sealed, object] | None = None
 
     def __enter__(self) -> None:
         model = self._model
@@ -1261,6 +1273,8 @@ class _ComponentScope:
         # A scope that fails to open gets no `__exit__` from its `with`: it gives back the turn
         # and context it took here, or the next call on this executor waits on it forever.
         try:
+            if (sealed := CONTRACT[0]) is not None:
+                self._contract = (sealed, sealed.enter())
             self._enter_numerics(device=True)
             if model._cozy_residency is not None:
                 using = model._cozy_residency.using(self._method, self._components)
@@ -1295,7 +1309,11 @@ class _ComponentScope:
         numerics, self._numerics = self._numerics, None
         local, self._local = self._local, None
         call, self._call = self._call, None
+        sealed, self._contract = self._contract, None
         with ExitStack() as releases:
+            if sealed is not None:  # last: once its numerics and passes are put back
+                method = f"{type(model).__name__}.{self._method}"
+                releases.callback(sealed[0].leave, sealed[1], method, failed[0] is None)
             if call is not None:
                 releases.callback(SCOPES.leave)
             if local is not None:

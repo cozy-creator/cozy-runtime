@@ -16,46 +16,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cozy_runtime.internal.static_interface as static_interface
+from cozy_runtime.internal.contract import USE
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.static_interface import Module, Reader
 
 CONSTRUCT_CHARS = 72
-
-
-@dataclass(frozen=True, slots=True)
-class Rule:
-    code: str
-    use: str
-
-
-RULES = {
-    rule.code: rule
-    for rule in (
-        Rule("oom_catch", "author.split(fn, x, Cut(...)): varena picks a level that fits"),
-        Rule("room_query", "author.split or author.retained: a package never asks for room"),
-        Rule("allocator", "nothing: varena owns the allocator and reclaims"),
-        Rule("env_write", "Config or Settings: TensorD seals the environment"),
-        Rule(
-            "global_flag",
-            "the Runtime's numerics policy, hold_dtype, @uses_components(deterministic=True)",
-        ),
-        Rule("own_stream", "denoise_loop, uncaptured, graph_keys: the Runtime owns streams"),
-        Rule("compile", "author.kernels.TritonKernels, prebuilt"),
-        Rule("weights_io", "loader.construct or loader.load, loader.assets.read or .open"),
-        Rule("own_decode", "lm.generate (allowed=lm.Constraint for a constrained decode)"),
-        Rule("global_rng", "rng.noise, rng.generator(seed), view.generator"),
-        Rule("process", "concurrently, spread or an invocable child call"),
-        Rule("thread", "author.ThreadPoolExecutor"),
-        Rule("internal_import", "the public names (CONTRACT.md); a package split is Final"),
-        Rule("host_sync_in_step", "a step label, or compute it before the loop"),
-        Rule(
-            "attention",
-            "cozy_runtime.attention.Attention(heads, head_dim, dtype, causal=) or a Diffusers "
-            "attention module",
-        ),
-    )
-}
 
 
 def _words(names: str) -> frozenset[str]:
@@ -175,11 +141,11 @@ _LOOP = frozenset({"cozy_runtime.author.denoise_loop", "cozy_runtime.author._loo
 class Finding:
     path: str
     line: int
-    rule: Rule
+    code: str
     construct: str
 
     def __str__(self) -> str:
-        return f"{self.path}:{self.line}: {self.rule.code}: {self.construct}: use {self.rule.use}"
+        return f"{self.path}:{self.line}: {self.code}: {self.construct}: use {USE[self.code]}"
 
 
 def check(reader: Reader, modules: Sequence[Module]) -> None:
@@ -575,7 +541,7 @@ class _File:
         line = getattr(node, "lineno", 0)
         if len(construct) > CONSTRUCT_CHARS:
             construct = construct[:CONSTRUCT_CHARS] + "…"
-        self.found.setdefault((line, code), Finding(self.path, line, RULES[code], construct))
+        self.found.setdefault((line, code), Finding(self.path, line, code, construct))
 
 
 def _unpacked(target: ast.expr) -> Iterator[ast.expr]:
