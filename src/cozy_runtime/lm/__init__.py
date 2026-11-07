@@ -1373,7 +1373,10 @@ class _Engine:
         #: a drafted step could not be captured: drafting pays only replayed, so steps go plain
         self.undrafted = False
         #: the decode set is not held at home: steps run eagerly as their weights fill, drafting
+        #: where the model is dense (a mixture's pass reads the experts of every token it verifies)
         self.streamed = False
+        experts = (int(getattr(self.text, f, 0) or 0) for f in ("num_experts", "num_local_experts"))
+        self.dense = max(experts) <= 1
         #: captures recorded in this engine's life and their seconds, steps run eagerly
         self.captured = [0, 0.0]
         self.eager = 0
@@ -1605,7 +1608,7 @@ class _Engine:
             say(
                 f"lm:{type(self.model).__name__}:streamed",
                 f"[lm] {type(self.model).__name__}'s decode set does not fit at home: it streams"
-                + (", drafting" if self.draft is not None else ""),
+                + (", drafting" if self.draft is not None and self.dense else ""),
             )
         self.streamed = not held
         if self.streamed:
@@ -2609,6 +2612,7 @@ class _Engine:
             and size <= DRAFT_ROWS
             and not self.undrafted
             and self.cache_device.type == "cuda"
+            and (self.dense or not self.streamed)
         )
 
     def _sampled(self) -> bool:
