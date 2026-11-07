@@ -27,13 +27,14 @@ import tensorfs
 import tensorfs.varena.torch as vt
 import torch
 from tensorfs.raw import parts as stored_parts
+from tensorfs.varena import Exhausted
 from tensorfs.varena import _runtime as varena
 from torch import Tensor, nn
 from torch.utils._pytree import tree_leaves, tree_map
 
 from cozy_runtime import graphs
 from cozy_runtime.author import _retained
-from cozy_runtime.author._errors import DoesNotFit, Fault, fault
+from cozy_runtime.author._errors import DoesNotFit, Fault, fault, is_capacity
 from cozy_runtime.author._model import WARNINGS
 from cozy_runtime.internal import cache_owners, pacing, proctree
 from cozy_runtime.internal.accel import (
@@ -645,12 +646,6 @@ class Model:
                 for block in groups:
                     self.memory._enter(block, reclaim=not free_only)
                     entered.append(block)
-            except torch.OutOfMemoryError:
-                for block in reversed(entered):
-                    self.memory._exit(block)
-                if free_only:
-                    return None
-                raise
             except BaseException:
                 for block in reversed(entered):
                     self.memory._exit(block)
@@ -1666,19 +1661,12 @@ class Memory:
             need = nbytes + min(nbytes, _HOST_STAGING)
             if need > self._free():
                 self.reclaim(need)
-        try:
-            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        except RuntimeError as error:
-            # MPS reports allocator refusal as RuntimeError. Classify only this failed
-            # allocation; reads, transforms and model execution are outside the retry.
-            if not isinstance(error, torch.OutOfMemoryError) and not (
-                self.device.type == "mps" and fault(error) is Fault.OOM
-            ):
-                raise
-            if not reclaim or self.capturing() or not self.reclaim():
-                raise
-            # Only the failed allocation is retried. No read, fill transform or forward ran.
-            return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
+            if need > (free := self._free()):
+                raise DoesNotFit(
+                    f"weights need {_gib(need)} on this Mac's GPU and {_gib(free)} is free with "
+                    "everything evictable gone: rent a card: `cozy run … --on new`"
+                )
+        return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
 
     def _active_beside(self, request: Request | None) -> bool:
         """Live request concurrency; the caller holds lock across its policy decision."""
@@ -2005,7 +1993,7 @@ class Memory:
                 try:
                     self._ensure(block, reclaim, overlay)
                     block.gathered = None
-                except torch.OutOfMemoryError:
+                except Exhausted:  # varena refused its region before its forward ran
                     if not (block.table and reclaim and self.cuda and not capturing):
                         raise
                     self._gather(block, overlay)
@@ -2266,7 +2254,8 @@ class Memory:
                     request.record_fills()
                     self.pages.request_ended()  # the pages it refilled are their worth
                 if _ESCAPES and self.cuda and not idle and torch.cuda.is_initialized():
-                    failed = request.failed or sys.exc_info()[0] is not None  # or raised through here
+                    # or a capacity failure raised through here, never a package's own error
+                    failed = request.failed or is_capacity(sys.exc_info()[1])
                     request.escaped = vt.escapes_take(self.device.index or 0, failed=failed)
                     _escaped_warnings(request.escaped)
                 request.sample()
