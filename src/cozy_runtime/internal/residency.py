@@ -63,9 +63,6 @@ __all__ = [
     "unpaged",
 ]
 
-progress = 0
-
-
 def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
     """Working allocation demand/backing/peak; native weight bytes are counted separately."""
     stats = vt.stats(device.index or 0)
@@ -527,8 +524,6 @@ class Model:
         self.sites = _sites(module)
         self._block_sites: dict[str, list[_Site]] | None = None
         self.handles: list[Any] = []
-        # Exact source-lifecycle callbacks accepted by explicit closed producers.
-        self.source_hooks: set[Callable[..., Any]] = set()
         self.holds: list[Hold] = []
         self.blocks: dict[str, _Block] = {}
         self.common: _Block | None = None
@@ -591,25 +586,6 @@ class Model:
             yield self
         finally:
             self.memory._close(self, executing=executing)
-
-    @contextmanager
-    def lending(self) -> Iterator[None]:
-        """This thread's open pass lends its common block to a native stage preparation, which
-        needs every input idle, and takes it back after. A failed take-back stays lent."""
-        if (
-            not getattr(self.local, "depth", 0)
-            or self.common is None
-            or getattr(self.local, "lent", False)
-        ):
-            yield
-            return
-        self.memory._exit(self.common)
-        self.local.lent = True
-        try:
-            yield
-        finally:
-            self.memory._enter(self.common)
-            self.local.lent = False
 
     def retain(self, paths: Collection[str] = ("",)) -> Binding:
         self._claim()
@@ -696,7 +672,6 @@ class Model:
             for handle in self.handles:
                 handle.remove()
             self.handles.clear()
-            self.source_hooks.clear()
             for block in self.groups():
                 self.memory._discard(block, forget=True)
             self.memory._forget_pages(self)
@@ -980,8 +955,6 @@ class Region:
                 if self._cache_owner is not None:
                     self._cache_owner.touch()
 
-    allocating = pin
-
     def discard(self) -> bool:
         if not self.lock.acquire(blocking=False):
             return False
@@ -1057,8 +1030,6 @@ class Memory:
         self._forward_depth = 0
         if self.cuda:
             try:
-                if not cache_owners.supported():
-                    raise ResidencyError("native CUDA recovery requires the CacheOwner capability")
                 if budget_bytes is not None:
                     vt.set_limit(self.device.index or 0, budget_bytes)
                 self.native = varena.Device(self.device.index or 0)
@@ -1658,14 +1629,10 @@ class Memory:
     def region(
         self,
         owner: str,
-        kind: str,
-        sets: object = (),
-        spill: bool = False,
         *,
         release: Callable[[], None] | None = None,
         shrink: Callable[[], bool] | None = None,
     ) -> Region:
-        del kind, sets, spill  # Cache semantics belong to its explicit owner, not an allocator.
         region = Region(self, owner, release, shrink)
         self.regions.add(region)
         return region
@@ -2006,7 +1973,6 @@ class Memory:
             raw[offset:stop].copy_(view, non_blocking=False)
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
-        global progress
         model = block.model
         overlay = None if model.fill is None else model.fill.overlay(block.path, block.parts)
         if overlay != block.overlay and (block.paged() or block.parked):
@@ -2062,7 +2028,6 @@ class Memory:
         except BaseException:
             self._exit(block)
             raise
-        progress += 1
 
     def _used(self, block: _Block) -> None:
         if self.cuda:
@@ -2091,7 +2056,6 @@ class Memory:
     def _read(
         self, block: _Block, site: _Site, raw_view: tuple[int, _Part] | None = None
     ) -> Tensor:
-        global progress
         model = block.model
         model._claim()
         try:
@@ -2121,7 +2085,6 @@ class Memory:
                         if widen is not None:
                             value = value.to(widen)
                         block.last = time.monotonic_ns()
-                        progress += 1
                         request = _REQUEST.get()
                         if block.escape_site and request is not None and not request.idle:
                             self._entered(block, request)  # a resident block's read is its entry
@@ -2162,15 +2125,12 @@ class Memory:
                     request.forwards.add(model)
                     self._pass(model, request, hash(key) & _U64 or 1)
             if outer_forward:
-                if request is not None and not request.passed:
-                    request.passed = True
                 self._activate_phase(model)
             if depth:
                 return
             model.local.request = request
             if request is not None:
                 request.current.add(model.name)
-                request.last = model.name
             if model.common is not None:
                 self._enter(model.common)
         except BaseException:
@@ -2190,9 +2150,8 @@ class Memory:
                 if model.escape_site:
                     vt.set_site(self.device.index or 0, 0)
                 try:
-                    if model.common is not None and not getattr(model.local, "lent", False):
+                    if model.common is not None:
                         self._exit(model.common)
-                    model.local.lent = False
                 finally:
                     request = getattr(model.local, "request", None)
                     if request is not None:
@@ -2424,8 +2383,6 @@ class Request:
     def __init__(self, memory: Memory, id: str, idle: bool = False) -> None:
         self.memory, self.id, self.idle = memory, id, idle
         self.current: set[str] = set()
-        self.last = ""  # the model it entered last: its phase streams between forwards too
-        self.passed = False
         self.steps: list[set[str]] = []
         self.declared_steps: list[set[str]] = []
         self.phase_changes: list[dict[str, Any]] = []
@@ -2494,19 +2451,6 @@ class Request:
     def phase(self, name: str) -> frozenset[str]:
         matching = [step for step in self.steps if name in step]
         return frozenset().union(*matching) if matching else frozenset({name})
-
-    @contextmanager
-    def on_thread(self) -> Iterator[Request]:
-        token = _REQUEST.set(self)
-        try:
-            yield self
-        finally:
-            _REQUEST.reset(token)
-
-    @contextmanager
-    def yielding(self) -> Iterator[None]:
-        # A child wait does not prove this entire invocation is idle or release live tensors.
-        yield
 
     def read(self, block: _Block, ns: int, nbytes: int, *, bake: Bake | None = None) -> None:
         """A block read here, outside the core: on the host, or where no core runs."""
@@ -2659,15 +2603,6 @@ def _ahead(memory: Memory) -> dict[str, int]:
         "failed": int(stats["ahead_failed"]),
         "declined_native": int(vt.stats(memory.device.index or 0)["prefetch_declines"]),
     }
-
-
-def _resident_bytes(block: _Block) -> int:
-    """The native backing `block` holds on the device now, raw and final."""
-    return sum(
-        int(region.allocated_bytes)
-        for region in (block.region, block.final_region)
-        if region is not None and region.resident
-    )
 
 
 def _block_of(name: str, paths: Sequence[str]) -> str:
@@ -3130,7 +3065,6 @@ def _paired(
             owed.count -= 1
             leave()
 
-    owner.source_hooks.update((pre, post))
     return [
         module.register_forward_pre_hook(pre, with_kwargs=True),
         module.register_forward_hook(post, always_call=True),

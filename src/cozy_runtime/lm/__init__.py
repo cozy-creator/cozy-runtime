@@ -1718,7 +1718,7 @@ class _Engine:
     def _grow(self, size: int, capacity: int, fresh: _Prefill) -> None:
         """Allocate slots after prefill, in the KV region; a refusal is final, never a repeated
         prefill."""
-        with self.region.allocating() if self.region is not None else nullcontext():
+        with self.region.pin() if self.region is not None else nullcontext():
             self._buffers(size, capacity, fresh)
 
     def _buffers(self, size: int, capacity: int, fresh: _Prefill) -> None:
