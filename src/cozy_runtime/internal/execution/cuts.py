@@ -15,6 +15,7 @@ import functools
 import math
 import sys
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from typing import cast
 
 import torch
@@ -499,3 +500,13 @@ def split[T](
         return (out_bytes, *[int(window(level) * item_bytes)] * holds)
 
     return catch.cut(f"split:{key}", deepest, need, lambda level: run(window(level)))
+
+
+def windows(
+    name: str, key: str, needs: Sequence[int]
+) -> tuple[int, Callable[[], AbstractContextManager[None]]]:
+    """A package's `windows` (`cozy_runtime.author.windows`): which of its layouts, fewest
+    windows first, a loop keeps (`needs`: each one's peak bytes), chosen once before it, and the
+    context its every window's work runs in, so the choice is measured for the next call."""
+    chosen = catch.fixed(f"windows:{key}", len(needs) - 1, lambda n: (needs[n],))
+    return chosen.level, chosen.piece

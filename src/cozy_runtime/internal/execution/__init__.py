@@ -12,11 +12,11 @@ from torch import nn
 from cozy_runtime.internal.execution import catch, cuts
 from cozy_runtime.internal.execution.catch import checkpoint as piece
 from cozy_runtime.internal.execution.catch import serving
-from cozy_runtime.internal.execution.cuts import attend, split
+from cozy_runtime.internal.execution.cuts import attend, split, windows
 from cozy_runtime.internal.executor_replies import Ceiling, GpuMemory
 from cozy_runtime.internal.residency import Request, blocks_of
 
-__all__ = ["Steps", "attend", "install", "piece", "record", "serving", "split"]
+__all__ = ["Steps", "attend", "install", "piece", "record", "serving", "split", "windows"]
 
 
 def install(module: nn.Module) -> None:

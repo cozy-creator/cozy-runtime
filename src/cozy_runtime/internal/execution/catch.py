@@ -250,6 +250,73 @@ def _unwind(exc: BaseException) -> None:
         at = at.__cause__ or at.__context__
 
 
+class Fixed:
+    """A cut's level chosen once, before a loop runs its pieces (`author.windows`): `piece()`
+    around each piece's work observes it, so the level is measured for the next call."""
+
+    def __init__(
+        self,
+        level: int,
+        key: str | None = None,
+        name: str = "",
+        menu: Sequence[tuple[str, Sequence[int]]] = (),
+        device: int = 0,
+    ) -> None:
+        self.level, self.key, self.name, self.menu, self.device = level, key, name, menu, device
+
+    @contextmanager
+    def piece(self) -> Iterator[None]:
+        checkpoint()
+        if self.key is None or _capturing() or not LEAF.acquire(blocking=False):
+            yield
+            return
+        try:
+            stream = int(torch.cuda.current_stream(self.device).cuda_stream)
+            # The plan generation now; the level stays the loop's.
+            selection = select(self.device, self.key, self.name, self.menu, stream)
+            token = begin(
+                self.device, self.key, self.name, self.menu, self.level, selection, stream
+            )
+            submitted = False
+            try:
+                yield
+                submitted = True
+            finally:
+                vt.split_end(self.device, token, submitted=submitted)
+        finally:
+            LEAF.release()
+
+
+def fixed(name: str, finest: int, need: sizing.Need) -> Fixed:
+    """The level of a cut into 2^level pieces down to `finest` that a loop keeps throughout,
+    chosen now by native selection, its room made; `DoesNotFit` where none can have it. Without
+    native memory, or small, whole; inside a capture or another site's leaf, the key's last."""
+    checkpoint()
+    request = CURRENT.get()
+    native = request is not None and request.memory.cuda
+    if not (native or _capturing()) or sum(need(0)) < _SMALL:
+        return Fixed(0)
+    menu = tuple(
+        (str(level), row) for level, row in enumerate(useful([need(n) for n in range(finest + 1)]))
+    )
+    key = f"{name}:{hash(menu):x}"
+    if not native or not LEAF.acquire(blocking=False):
+        return Fixed(LEVELS.get(key, 0))
+    assert request is not None
+    try:
+        device = request.memory.device.index or 0
+        if not vt.split_context(device)["eligible"]:
+            return Fixed(LEVELS.get(key, 0))
+        request.memory.remember_working_phase(key, owners(request))
+        stream = int(torch.cuda.current_stream(device).cuda_stream)
+        selection = select(device, key, name, menu, stream)
+        level = LEVELS[key] = int(selection["choice_id"])
+        note(request, key, name, level, selection)
+        return Fixed(level, key, name, menu, device)
+    finally:
+        LEAF.release()
+
+
 def _tensors(value: object, depth: int = 3) -> list[Tensor]:
     """The tensors in `value`, `depth` levels of sequences and mappings deep."""
     if isinstance(value, Tensor):
