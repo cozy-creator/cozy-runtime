@@ -2404,8 +2404,7 @@ class Request:
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
         #: origin -> [bytes, fills, ns]: the store, a kept page (`baked`), or another set's stored
-        #: bytes on this GPU (`resident`) or in its kept page (`host`); `warm`: bytes read ahead into
-        #: the page cache for a derive's fill
+        #: bytes on this GPU (`resident`) or in its kept page (`host`)
         self.moved = {origin: [0, 0, 0] for origin in ("store", "baked", "resident", "host")}
         #: each baked fill's trace entry and its bake (`Bake`), resolved when the request ends
         self.bakes: list[tuple[dict[str, object], Bake]] = []
@@ -2470,8 +2469,6 @@ class Request:
         moved[0] += nbytes
         moved[1] += 1
         moved[2] += ns
-        if origin == "warm":  # read ahead into the page cache for a fill to come, none itself
-            return
         self.prefetch_completed += ahead
         self._trace.append(
             {
