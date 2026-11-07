@@ -160,6 +160,7 @@ from cozy_runtime.author._model import (
     uncaptured,
     uses_components,
 )
+from cozy_runtime.author._retained import retained
 from cozy_runtime.author._recipes import (
     DerivationHook,
     EncodingRule,
@@ -396,6 +397,7 @@ __all__ = [
     "register_adapter",
     "register_attention",
     "registered_adapters",
+    "retained",
     "render",
     "sequence_parallel",
     "split",

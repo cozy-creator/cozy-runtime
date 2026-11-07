@@ -1,6 +1,7 @@
 """Kernels for a gated-delta-net layer's causal conv step and its recurrence, one launch where
 Transformers' reference path (when `causal_conv1d` and `flash-linear-attention` are absent) runs
-a few dozen small ops per layer per token.
+a few dozen small ops per layer per token; a verify pass's few drafted tokens take one launch
+for all.
 
 They follow the reference's arithmetic in f32 and round where it rounds, so they differ from it
 only in reduction order.
@@ -58,6 +59,37 @@ if not TRITON_ABSENT:
         tl.store(out_ptr + b * channels + c, (y * tl.sigmoid(y)).to(tl.bfloat16), mask=ok)
 
     @triton.jit  # type: ignore[untyped-decorator]
+    def conv_steps_kernel(  # type: ignore[no-untyped-def]
+        x_ptr,
+        weight_ptr,
+        out_ptr,
+        channels,
+        tokens,
+        x_stride_b,
+        x_stride_c,
+        out_stride_b,
+        out_stride_t,
+        CONV: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        """`conv_step_kernel` for each of `tokens` tokens after a `CONV`-wide window, x being the
+        window then the tokens (`[B, C, CONV + T]`, contiguous over T): the same arithmetic per
+        token, one launch for all, the window left as it was."""
+        b = tl.program_id(0)
+        c = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        ok = c < channels
+        row = x_ptr + b * x_stride_b + c * x_stride_c
+        for t in range(tokens):
+            acc = tl.zeros([BLOCK], dtype=tl.float32)
+            for j in tl.static_range(CONV):
+                held = tl.load(row + t + 1 + j, mask=ok, other=0.0)
+                weight = tl.load(weight_ptr + c * CONV + j, mask=ok, other=0.0)
+                acc += weight.to(tl.float32) * held.to(tl.float32)
+            y = acc.to(tl.bfloat16).to(tl.float32)
+            at = out_ptr + b * out_stride_b + t * out_stride_t + c
+            tl.store(at, (y * tl.sigmoid(y)).to(tl.bfloat16), mask=ok)
+
+    @triton.jit  # type: ignore[untyped-decorator]
     def recurrent_steps_kernel(  # type: ignore[no-untyped-def]
         q_ptr,
         k_ptr,
@@ -87,7 +119,8 @@ if not TRITON_ABSENT:
         q and k L2-normalised (q then divided by `scale`), the state decayed by exp(g), corrected
         toward v by beta, then read by q. The state after each token goes to `states`
         (`[T, B, H, DK, DV]`; `state` itself for one decoded token). g and beta are `[B, T, H]`,
-        out `[B, T, H, DV]`."""
+        out `[B, T, H, DV]`. Decoding and verifying both run it, so a token's bits do not depend
+        on how many come with it."""
         bh = tl.program_id(0)
         b = bh // heads
         h = bh % heads
@@ -132,6 +165,12 @@ def entries() -> list[TritonEntry]:
         {"CONV": CONV, "BLOCK": CONV_BLOCK},
         num_warps=4,
     )
+    conv_steps = TritonEntry(
+        conv_steps_kernel,
+        _signature(conv_steps_kernel),
+        {"CONV": CONV, "BLOCK": CONV_BLOCK},
+        num_warps=4,
+    )
     recurrent_steps = TritonEntry(
         recurrent_steps_kernel,
         _signature(
@@ -144,4 +183,4 @@ def entries() -> list[TritonEntry]:
         {"DK": KEY_DIM, "DV": VALUE_DIM, "BV": VALUE_BLOCK},
         num_warps=4,
     )
-    return [conv, recurrent_steps]
+    return [conv, conv_steps, recurrent_steps]
