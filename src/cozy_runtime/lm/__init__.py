@@ -21,8 +21,11 @@ one. Temperature 0 is the plain argmax.
 
 A cached graph keeps only its weights' addresses; a driver's lease (`_hold`) brings their pages
 back. Offload retires the graph before those addresses change; a later call can refill and capture
-anew. If the full set cannot be prepared before execution, the call uses Transformers' loop. Errors
-after execution starts are final; package code is never restarted. On a CPU, or after a safe
+anew. If the full set cannot be prepared before execution, the call uses Transformers' loop. A
+call's keys and state for its prompt and `max_new_tokens`, sized from the config, and the graphs'
+pool are decided before its prefill (`_Engine._enter`): allocated or mapped then, else it waits for
+decoding rows to leave, else `DoesNotFit` names what would fit; nothing after catches running out.
+Errors after execution starts are final; package code is never restarted. On a CPU, or after a safe
 capture refusal (a run warning), the same step runs eagerly. A model this does not
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
 generation config that adds logits processors) generates through Transformers, said once.
@@ -39,6 +42,7 @@ from __future__ import annotations
 
 import contextvars
 import inspect
+import math
 import sys
 import threading
 import time
@@ -50,10 +54,11 @@ from functools import partial
 from typing import Any, NamedTuple
 
 import tensorfs.varena.torch as vt
+from tensorfs.varena import Exhausted
 
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
-from cozy_runtime.author._errors import Cancelled, is_capacity
+from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author._services import stage_progress
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
@@ -497,12 +502,48 @@ def _unsupported(model: Any) -> str:
     other = sorted(set(types) - {"full_attention", "linear_attention"})
     if other:
         return f"layer types {other}"
+    if why := _shapes(text)[1]:
+        return why
     extras = [
         name
         for name, idle in _PROCESSORS.items()
         if getattr(model.generation_config, name, None) not in idle
     ]
     return f"its generation config adds {extras}" if extras else ""
+
+
+#: A gated delta net's sizes in its config (`linear_*`): conv kernel, key heads and width, value
+#: heads and width.
+_DELTA_NET = (
+    "conv_kernel_dim",
+    "num_key_heads",
+    "key_head_dim",
+    "num_value_heads",
+    "value_head_dim",
+)
+
+
+def _shapes(text: Any) -> tuple[list[tuple[Any, ...]], str]:
+    """Each cache layer's state for one row, from the config alone, before any forward: a
+    full-attention layer's `("keys", heads, key width, value width)`, a gated delta net's
+    `("state", (conv channels, kernel), (heads, key width, value width))`. "" or why not."""
+    types, kwargs = get_layer_types_and_kwargs(text)
+    if isinstance(kwargs, dict):  # Transformers before 5.19: one set for every layer
+        kwargs = [kwargs] * len(types)
+    heads = getattr(text, "num_key_value_heads", None) or text.num_attention_heads
+    width = getattr(text, "head_dim", None) or text.hidden_size // text.num_attention_heads
+    linear = [getattr(text, f"linear_{name}", None) for name in _DELTA_NET]
+    layers: list[tuple[Any, ...]] = []
+    for kind, extra in zip(types, kwargs, strict=True):
+        if kind == "full_attention":
+            layers.append(("keys", int(heads), int(width), int(width)))
+        elif None in linear or extra.get("number_of_states", 1) != 1:
+            return [], "its linear-attention state is not a gated delta net's (Qwen3-Next, Qwen3.5)"
+        else:
+            kernel, k_heads, k_width, v_heads, v_width = (int(x) for x in linear)
+            conv = (2 * k_heads * k_width + v_heads * v_width, kernel)
+            layers.append(("state", conv, (v_heads, k_width, v_width)))
+    return layers, ""
 
 
 #: Models whose experts were found fused (Transformers' host loop) or split (`moe.split`).
@@ -570,6 +611,10 @@ def _capture_contract(model: Any, draft: Any = None) -> str:
             ):
                 return "custom Python forward"
     return ""
+
+
+#: A buffer as `_Engine._layout` gives it: shape, dtype, fill.
+_Spec = tuple[tuple[int, ...], Any, Any]
 
 
 class _Sampling(NamedTuple):
@@ -725,6 +770,20 @@ class _Tell:
             WARNINGS.append(
                 ("decode progress stopped: its report failed", {"error": str(exc)[:200]})
             )
+
+
+def _batch(rows: int) -> int:
+    """The smallest batch a step records that holds `rows` (at most the largest)."""
+    return next((b for b in BUCKETS if b >= rows), BUCKETS[-1])
+
+
+def _windows(length: int) -> int:
+    """`length` positions, whole windows of `MIN_WINDOW`."""
+    return -(-length // MIN_WINDOW) * MIN_WINDOW
+
+
+def _gib(n: float) -> str:
+    return f"{n / (1 << 30):.1f} GiB"
 
 
 def window(length: int, capacity: int) -> int:
@@ -1124,6 +1183,9 @@ class _Request:
         #: the attempt it serves (cancellation), and whether its rows left for it
         self.context: Context | None = CURRENT.get()
         self.cut = False
+        #: it waits for decoding rows to leave (their slots, or the memory a larger batch needs):
+        #: it asks again at the next boundary a row's end makes, never one of its own
+        self.waits = False
 
     @property
     def finished(self) -> bool:
@@ -1234,6 +1296,16 @@ class _Engine:
         self.region_use: ExitStack | None = None
         self.retire = False
         self.cache_device: Any = None
+        self.vocab = int(model.get_output_embeddings().out_features)  # an int8 head: no .weight
+        #: the device bytes of the slot buffers (`_need`), and whether the graphs' pool is held
+        #: mapped for the rows decoding (`_pool`)
+        self.held = 0
+        self.pooled = False
+        #: how a prefill's state differed from the slots its config sized: later calls decode
+        #: through Transformers
+        self.misfit = ""
+        #: `_capture_contract` with and without the head, until the graphs are next forgotten
+        self.contracts: dict[bool, str] = {}
         self.open: bool | float
         self.closed: bool | float
         if self.text._attn_implementation == "sdpa":
@@ -1245,13 +1317,19 @@ class _Engine:
 
     def generate(self, request: _Request, draft: Any) -> Any:
         request.draft = draft if draft is not None and self._speculable() else None
-        with self.cond:
-            self.pending.append(request)
-            self.cond.notify_all()
-            while not request.finished and self.driver is not None:
-                self.cond.wait()
-            if not request.finished:
-                self.driver = threading.get_ident()
+        rows = len(request.tokens)
+        if rows > BUCKETS[-1]:
+            request.fallback = f"{rows} rows: the engine decodes at most {BUCKETS[-1]} at once"
+        elif self.misfit:
+            request.fallback = self.misfit
+        if not request.finished:
+            with self.cond:
+                self.pending.append(request)
+                self.cond.notify_all()
+                while not request.finished and self.driver is not None:
+                    self.cond.wait()
+                if not request.finished:
+                    self.driver = threading.get_ident()
         if not request.finished:
             self._drive(request)
         for warning in request.warnings:
@@ -1369,6 +1447,8 @@ class _Engine:
                 self._fail(exc)
                 raise
             finally:
+                if not self._occupied():
+                    self._pool(False)  # no row decodes: its graphs' pool may go idle
                 with self.cond:
                     if self.region is not None and (self._occupied() or self.pending):
                         # A waiting caller takes the driver next. These rows are still live;
@@ -1436,7 +1516,7 @@ class _Engine:
         return sum(row is not None for row in self.slots)
 
     def _bucket(self) -> int:
-        return next(b for b in BUCKETS if b >= self._occupied())
+        return _batch(self._occupied())
 
     def _one(self, size: int, run: Callable[[int], None]) -> None:
         """One step at `size` rows, and what the host knows of the rows after it."""
@@ -1492,7 +1572,11 @@ class _Engine:
             if waiting or (admitted and self._occupied()):
                 waiting.append(request)
                 continue
-            joined = self._admit(request)
+            try:
+                joined = self._admit(request)
+            except DoesNotFit as exc:  # refused at its entry: this call alone, before it ran
+                request.error = exc
+                continue
             if joined:
                 admitted = True
             else:
@@ -1501,8 +1585,8 @@ class _Engine:
         with self.cond:
             self.pending.extendleft(reversed(waiting))
             if waiting and not self._occupied() and not admitted and not self.rehold:
-                for request in waiting:  # nothing will retire to make room
-                    request.fallback = "its decode set does not fit beside the weights"
+                for request in waiting:  # nothing decodes that could leave: never spin on it
+                    request.error = RuntimeError("[lm] decode admission made no progress")
                 self.pending.clear()
             self.cond.notify_all()
 
@@ -1569,10 +1653,9 @@ class _Engine:
     # ------------------------------------------------------------------ admission
 
     def _admit(self, request: _Request) -> bool:
-        """`request`'s prompt through the model's own forward into a cache of its own, unpadded,
-        then its rows into free slots, with their first token. False when there is no room."""
-        rows = int(request.inputs["input_ids"].shape[0])
-        reach = request.prompt + request.max_new + DEPTH * (LAG + 2)
+        """`request` decided (`_enter`), then run: its prompt through the model's own forward
+        into a cache of its own, unpadded, and its rows into free slots, with their first token.
+        False: it waits for decoding rows to leave."""
         free = [slot for slot, row in enumerate(self.slots) if row is None]
         if request.draft is not None and id(request.draft) in self.unfit:
             request.draft = None
@@ -1585,22 +1668,95 @@ class _Engine:
             self._drop()  # the engine takes this head (its keys' shapes) when idle
             self.draft, self.rehold = request.draft, True
             return False  # admitted once its blocks are held
-        if self.cache is not None and len(free) >= rows and reach <= self.capacity:
-            fresh = self._prefill(request)
-            self._splice(request, fresh, free)
-            return True
-        occupied = len(self.slots) - len(free)
-        size = next((b for b in BUCKETS if b >= occupied + rows), 0)
-        if not size:
+        kwargs, mask, position = self._inputs(request)
+        if not self._enter(request, position):
             return False
-        capacity = max(self.capacity, -(-reach // MIN_WINDOW) * MIN_WINDOW)
-        fresh = self._prefill(request)
-        self._grow(size, capacity, fresh)
+        fresh = self._prefill(request, kwargs, mask, position)
+        if why := self._misfit(fresh):
+            self.misfit = f"its decode state is not what its config gives ({why})"
+            request.error = RuntimeError(f"[lm] {type(self.model).__name__}: {self.misfit}")
+            return True
         self._splice(request, fresh, [slot for slot, row in enumerate(self.slots) if row is None])
         return True
 
-    def _prefill(self, request: _Request) -> Any:
-        started = time.perf_counter()
+    def _enter(self, request: _Request, position: Any) -> bool:
+        """Whether `request`'s rows have their decode memory, decided before its prefill, the one
+        place it is: the slots held now where they can take it (the decode graphs' pool mapped
+        back for them), else slots for every row's prompt and `max_new_tokens` allocated now
+        (`_buffers`; `_need` is what they take). False: it fits once the rows decoding now leave.
+        `DoesNotFit` where it would not fit with the engine's own slots gone too, before anything
+        of it ran."""
+        rows = len(request.tokens)
+        reach = request.prompt + request.max_new + DEPTH * (LAG + 2)
+        free = sum(row is None for row in self.slots)
+        occupied = len(self.slots) - free
+        request.waits = False
+        if (
+            self.cache is not None
+            and free >= rows
+            and reach <= self.capacity
+            and len(request.stops) <= self.width
+        ):
+            try:
+                self._pool(True)
+            except Exhausted as exc:  # no room for the pool to come back: nothing of it ran
+                raise DoesNotFit(
+                    f"{type(self.model).__name__} decode: its graphs' pool cannot come back "
+                    f"beside {_gib(self.held)} of keys and state, and nothing more is free on "
+                    f"this card ({exc}): run it smaller, or rent a larger card: "
+                    "`cozy run … --on new`"
+                ) from exc
+            return True
+        if occupied + rows > BUCKETS[-1]:
+            request.waits = True  # slots free up as rows leave
+            return False
+        alone = (_batch(rows), _windows(reach), max(8, len(request.stops)))
+        size, capacity, stops = alone
+        if occupied:
+            size, capacity = _batch(occupied + rows), max(self.capacity, capacity)
+            stops = max(stops, self.width)
+        device = request.inputs["input_ids"].device
+        if device.type == "cuda" and self.model in PLACED:
+            room = self._room(device)
+            if self._need(*alone, position) > room + self.held:
+                raise DoesNotFit(self._refused(request, alone, position, room + self.held))
+            if occupied and self._need(size, capacity, stops, position) > room:
+                request.waits = True  # it fits beside the weights once these rows leave
+                return False
+        if not occupied:
+            self._drop()  # the idle slots go before the new ones come
+        self._grow(size, capacity, stops, position, device)
+        return True
+
+    def _room(self, device: Any) -> int:
+        """The most the device's reclaim could give this process now (`vt.room`, a report): the
+        card less live working memory and the weights in use."""
+        room = vt.room(device.index or 0)
+        return max(int(room["capacity"] - room["working_live"] - room["pinned"]), 0)
+
+    def _refused(
+        self, request: _Request, alone: tuple[int, int, int], position: Any, room: int
+    ) -> str:
+        """`DoesNotFit`'s line for slots the card cannot hold, with the longest that it could."""
+        rows, prompt = len(request.tokens), request.prompt
+        size, _, stops = alone
+        # The bytes grow by the same amount each window of positions.
+        one = self._need(size, MIN_WINDOW, stops, position)
+        per = (self._need(size, 2 * MIN_WINDOW, stops, position) - one) / MIN_WINDOW
+        fits = int(MIN_WINDOW + (room - one) / per) // MIN_WINDOW * MIN_WINDOW
+        most = fits - prompt - DEPTH * (LAG + 2)
+        smaller = f"max_new_tokens ≤ {most}" if most > 0 else "a shorter prompt"
+        if rows > 1:
+            smaller += " or fewer rows"
+        return (
+            f"{type(self.model).__name__} decode: {rows} row{'s' * (rows > 1)} of {prompt} + "
+            f"{request.max_new} tokens need {_gib(self._need(*alone, position))} of keys and "
+            f"state, and this card has {_gib(room)} beside the weights in use and live memory: "
+            f"run it smaller ({smaller}), or rent a larger card: `cozy run … --on new`"
+        )
+
+    def _inputs(self, request: _Request) -> tuple[dict[str, Any], Any, Any]:
+        """The prefill's arguments, its attention mask and positions: no forward."""
         model, inputs = self.model, request.inputs
         ids = inputs["input_ids"]
         kwargs = {key: value for key, value in inputs.items() if key != "input_ids"}
@@ -1616,6 +1772,11 @@ class _Engine:
             kwargs["attention_mask"] = None
         if self.keep:
             kwargs["logits_to_keep"] = 1
+        return kwargs, mask, position
+
+    def _prefill(self, request: _Request, kwargs: dict[str, Any], mask: Any, position: Any) -> Any:
+        started = time.perf_counter()
+        model, ids = self.model, request.inputs["input_ids"]
         fresh = _StaticCache(self.text, request.prompt, request.prompt)
         prepared = model.prepare_inputs_for_generation(
             ids, past_key_values=fresh, use_cache=True, is_first_iteration=True, **kwargs
@@ -1715,73 +1876,127 @@ class _Engine:
         request.at = (self.captured[0], self.captured[1], self.eager)
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
 
-    def _grow(self, size: int, capacity: int, fresh: _Prefill) -> None:
-        """Allocate slots after prefill, in the KV region; a refusal is final, never a repeated
-        prefill."""
+    def _grow(self, size: int, capacity: int, stops: int, position: Any, device: Any) -> None:
+        """Allocate the slots before the call's prefill, in the KV region."""
         with self.region.pin() if self.region is not None else nullcontext():
-            self._buffers(size, capacity, fresh)
+            self._buffers(size, capacity, stops, position, device)
 
-    def _buffers(self, size: int, capacity: int, fresh: _Prefill) -> None:
-        device = fresh.token.device
-        old, held = self.cache, [row for row in self.slots if row is not None]
-        cache = _StaticCache(self.text, capacity, MIN_WINDOW, rows=True)
-        for mine, theirs in zip(cache.layers, fresh.cache.layers, strict=True):
-            if isinstance(mine, _Keys):
-                k, v = theirs.keys, theirs.values
-                mine.dtype, mine.device = k.dtype, k.device
-                mine.keys = k.new_zeros((size, k.shape[1], capacity, k.shape[3]))
-                mine.values = v.new_zeros((size, v.shape[1], capacity, v.shape[3]))
-                mine.cumulative_length = torch.zeros(size, dtype=torch.long, device=device)
-                mine.is_initialized = True
+    def _layout(
+        self, size: int, capacity: int, stops: int, position: Any
+    ) -> tuple[list[list[_Spec]], list[_Spec], dict[str, _Spec]]:
+        """What `size` slots of `capacity` positions hold, from the config alone (`_shapes`),
+        each tensor as (shape, dtype, fill): every cache layer's, the head's keys, the rest."""
+        dtype, long, f32 = self.model.dtype, torch.long, torch.float32
+        shapes = _shapes(self.text)[0]
+        layers: list[list[_Spec]] = []
+        for kind, *dims in shapes:
+            if kind == "keys":
+                heads, k_width, v_width = dims
+                layers.append(
+                    [
+                        ((size, heads, capacity, k_width), dtype, 0),
+                        ((size, heads, capacity, v_width), dtype, 0),
+                        ((size,), long, 0),
+                    ]
+                )
             else:
-                mine.dtype, mine.device = theirs.dtype, theirs.device
-                for i, state in theirs.conv_states.items():
-                    if state is not None:
-                        mine.conv_states[i] = state.new_zeros((size, *state.shape[1:]))
-                        mine.conv_kernel_size[i] = theirs.conv_kernel_size[i]
-                        mine.is_conv_states_initialized[i] = True
-                        mine.has_previous_state[i] = True
-                for i, state in theirs.recurrent_states.items():
-                    if state is not None:
-                        mine.recurrent_states[i] = state.new_zeros((size, *state.shape[1:]))
-                        mine.is_recurrent_states_initialized[i] = True
-        kind = torch.bool if self.closed is False else self.model.dtype
-        mask = torch.full((size, 1, 1, capacity), self.closed, dtype=kind, device=device)
-        stops = max(8, max((len(r.request.stops) for r in held), default=0))
-        vocab = int(self.model.get_output_embeddings().out_features)  # an int8 head: no .weight
-        long = {"dtype": torch.long, "device": device}
-        fields = {
-            "ids": torch.zeros((size, 1), **long),
-            "length": torch.zeros((size,), **long),
+                conv, recurrent = dims
+                layers.append([((size, *conv), dtype, 0), ((size, *recurrent), f32, 0)])
+        kind = torch.bool if self.closed is False else dtype
+        mask: _Spec = ((size, 1, 1, capacity), kind, self.closed)
+        lead = tuple(position.shape[:-2]) if position is not None else ()
+        fields: dict[str, _Spec] = {
+            "ids": ((size, 1), long, 0),
+            "length": ((size,), long, 0),
             "mask": mask,
-            "out": torch.zeros((size, capacity), **long),
-            "n": torch.zeros((size,), **long),
-            "done": torch.ones((size,), dtype=torch.bool, device=device),
-            "limit": torch.zeros((size,), **long),
-            "stops": torch.full((size, stops), -1, **long),
-            "pad": torch.zeros((size,), **long),
-            "penalty": torch.zeros((size,), dtype=torch.float32, device=device),
-            "temperature": torch.zeros((size,), dtype=torch.float32, device=device),
-            "top_p": torch.ones((size,), dtype=torch.float32, device=device),
-            "seed": torch.zeros((size,), **long),
-            "seen": torch.zeros((size, vocab), dtype=torch.float32, device=device),
-            "position": torch.zeros(
-                (size, *(fresh.position.shape[:-2] if fresh.position is not None else ()), 1),
-                **long,
-            ),
+            "out": ((size, capacity), long, 0),
+            "n": ((size,), long, 0),
+            "done": ((size,), torch.bool, True),
+            "limit": ((size,), long, 0),
+            "stops": ((size, stops), long, -1),
+            "pad": ((size,), long, 0),
+            "penalty": ((size,), f32, 0),
+            "temperature": ((size,), f32, 0),
+            "top_p": ((size,), f32, 1),
+            "seed": ((size,), long, 0),
+            "seen": ((size, self.vocab), f32, 0),
+            "position": ((size, *lead, 1), long, 0),
         }
+        draft: list[_Spec] = []
+        if self.draft is not None:
+            # `Draft`'s one layer is the model's own full attention: its keys are as the model's.
+            heads, width = next((dims[1], dims[2]) for dims in shapes if dims[0] == "keys")
+            keys: _Spec = ((size, heads, capacity, width), dtype, 0)
+            draft = [keys, keys, ((size,), long, 0)]
+            fields["dmask"] = mask
+            fields["hidden"] = ((size, 1, int(self.text.hidden_size)), dtype, 0)
+        return layers, draft, fields
+
+    def _need(self, size: int, capacity: int, stops: int, position: Any) -> int:
+        """The device bytes `_buffers` allocates for these slots."""
+        layers, draft, fields = self._layout(size, capacity, stops, position)
+        specs = [*(spec for layer in layers for spec in layer), *draft, *fields.values()]
+        each = sum(math.prod(shape) * dtype.itemsize for shape, dtype, _ in specs)
+        return each + capacity * torch.long.itemsize  # and `rows_index`
+
+    def _misfit(self, fresh: _Prefill) -> str:
+        """How a row of the prefill's state differs from the slots sized from the config, ""
+        when it does not: a copy into a slot of another dtype would cast it silently."""
+        pairs: list[tuple[object, Any, Any, int]] = []
+        for j, (mine, theirs) in enumerate(zip(self.cache.layers, fresh.cache.layers, strict=True)):
+            if isinstance(mine, _Keys):
+                pairs += [(j, mine.keys, theirs.keys, 2), (j, mine.values, theirs.values, 2)]
+            else:
+                pairs += [
+                    (j, mine.conv_states[0], theirs.conv_states.get(0), -1),
+                    (j, mine.recurrent_states[0], theirs.recurrent_states.get(0), -1),
+                ]
         if self.draft is not None:
             keys, last = fresh.drafted
-            # A head of its own keys (`Draft`) writes them; another reads none (shape 1, 1).
-            like = keys.keys if keys.keys is not None else last.new_zeros((1, 1, 1, 1))
+            if keys.keys is not None:  # `Draft` writes keys; a head of none reads none
+                pairs += [("head", self.dkeys.keys, keys.keys, 2)]
+                pairs += [("head", self.dkeys.values, keys.values, 2)]
+            pairs.append(("head", self.hidden, last, -1))
+
+        def row(t: Any, positions: int) -> tuple[object, ...]:
+            return (*(n for d, n in enumerate(t.shape) if d not in (0, positions)), t.dtype)
+
+        for where, mine, theirs, positions in pairs:
+            if theirs is None or row(mine, positions) != row(theirs, positions):
+                found = "nothing" if theirs is None else row(theirs, positions)
+                return f"layer {where}: {found} a row, sized {row(mine, positions)}"
+        return ""
+
+    def _buffers(self, size: int, capacity: int, stops: int, position: Any, device: Any) -> None:
+        """Every slot buffer for `size` rows of `capacity` positions (`_layout`), all allocated
+        before any replaces the engine's, then the rows held now moved over."""
+
+        def full(spec: _Spec) -> Any:
+            shape, dtype, fill = spec
+            return torch.full(shape, fill, dtype=dtype, device=device)
+
+        layers, draft_specs, specs = self._layout(size, capacity, stops, position)
+        old, held = self.cache, [row for row in self.slots if row is not None]
+        cache = _StaticCache(self.text, capacity, MIN_WINDOW, rows=True)
+        for mine, layer in zip(cache.layers, layers, strict=True):
+            tensors = [full(spec) for spec in layer]
+            mine.dtype, mine.device = tensors[0].dtype, device
+            if isinstance(mine, _Keys):
+                mine.keys, mine.values, mine.cumulative_length = tensors
+                mine.is_initialized = True
+            else:
+                mine.conv_states[0], mine.recurrent_states[0] = tensors
+                mine.conv_kernel_size[0] = int(tensors[0].shape[-1])
+                mine.is_conv_states_initialized[0] = True
+                mine.has_previous_state[0] = True
+                mine.is_recurrent_states_initialized[0] = True
+        fields = {name: full(spec) for name, spec in specs.items()}
+        if self.draft is not None:
             draft = _Keys([MIN_WINDOW], capacity, rows=True)
-            draft.dtype, draft.device = like.dtype, device
-            draft.keys = like.new_zeros((size, like.shape[1], capacity, like.shape[3]))
-            draft.values = like.new_zeros((size, like.shape[1], capacity, like.shape[3]))
-            draft.cumulative_length = torch.zeros(size, dtype=torch.long, device=device)
+            draft.keys, draft.values, draft.cumulative_length = (full(s) for s in draft_specs)
+            draft.dtype, draft.device = draft.keys.dtype, device
             draft.is_initialized = True
-            fields["dmask"] = torch.full_like(mask, self.closed)
-            fields["hidden"] = last.new_zeros((size, *last.shape[1:]))
+        rows_index = torch.arange(capacity, device=device)
         moving = list(self._rows()) if old is not None else []
         self.cache, self.capacity, self.cache_device = cache, capacity, device
         for name, tensor in fields.items():
@@ -1800,11 +2015,12 @@ class _Engine:
         self.slots = held + [None] * (size - len(held))
         for slot in range(len(held), size):
             self._empty(slot)
-        self.rows_index = torch.arange(capacity, device=device)
+        self.rows_index = rows_index
         self.flag = torch.zeros((size,), dtype=torch.bool, pin_memory=device.type == "cuda")
         self.views = {}
         self._forget()
         self.width = stops
+        self.held = self._need(size, capacity, stops, position)
 
     # ------------------------------------------------------------------ steps
 
@@ -1855,7 +2071,12 @@ class _Engine:
         began = time.perf_counter()
 
         def joining() -> bool:  # a waiting call joins once decoding had its prefill's time
-            return bool(self.pending) and time.perf_counter() - began >= self.debt
+            # (one waiting for rows to leave, and those behind it, ask at a row's end instead)
+            return (
+                bool(self.pending)
+                and not self.pending[0].waits
+                and time.perf_counter() - began >= self.debt
+            )
 
         with _disable_current_modes():
             while True:
@@ -1933,7 +2154,11 @@ class _Engine:
             and key not in self.unrecorded
             and any(m in PLACED and not PLACED[m][0].graph_accounted() for m in self._read(drafted))
         )
-        fixed = _capture_contract(self.model, self.draft if drafted else None)
+        fixed = self.contracts.get(drafted)
+        if fixed is None:  # its hooks and forwards, walked once per recorded layout
+            fixed = self.contracts[drafted] = _capture_contract(
+                self.model, self.draft if drafted else None
+            )
         reason = (
             ("driver/context memory is unmeasured" if unaccounted else "")
             or (self.domain.refusal() if cuda and self.domain is not None else "")
@@ -1979,10 +2204,15 @@ class _Engine:
             finally:
                 if graph is None and not self.graphs and self.pool is not None:
                     self.pool = None
+            if graph is not None:
+                self.graphs[key] = graph
+            # A capture's end, recorded or not, ends the pool's use: held again for the rows
+            # decoding while its pages are still mapped, so no replay maps.
+            self.pooled = False
+            self._pool(True)
             self.captured[0] += 1
             self.captured[1] += time.perf_counter() - capturing
             if graph is not None:
-                self.graphs[key] = graph
                 self.recorded += 1
                 try:
                     vt.pool_scratch(self.pool.handle, (), self.domain.device)
@@ -1992,16 +2222,8 @@ class _Engine:
                 return
             elif why:
                 self._unrecorded(key, why)
-        if graph is not None:
-            stream = torch.cuda.current_stream(self.domain.device)
-            try:
-                vt.prepare_pool(self.pool.handle, 0, self.domain.device)
-            except torch.OutOfMemoryError:  # No room for its idle pool to come back.
-                graph = None
-            else:
-                vt.replay(graph, stream=stream)
-                vt.record_pool_stream(self.pool.handle, stream, self.domain.device)
-        if graph is not None:
+        if graph is not None:  # its pool is held (`_pool`): the replay maps nothing
+            vt.replay(graph, stream=torch.cuda.current_stream(self.domain.device))
             self.replayed += 1
         else:
             self._advance(size)
@@ -2033,30 +2255,24 @@ class _Engine:
         state, last so that what serves the call is eager's. A difference discards the graph."""
         state, stream = self._token_state(key[2]), torch.cuda.current_stream(self.domain.device)
         start, at = [value.clone() for value in state], self.length[:size].clone()
-        replayed = None
-        try:
-            vt.prepare_pool(self.pool.handle, 0, self.domain.device)
-        except torch.OutOfMemoryError:  # No room for its idle pool to come back: unproven.
-            why, code = "no room to check its replay against eager", "capture_refused"
-        else:
-            vt.replay(graph, stream=stream)
-            vt.record_pool_stream(self.pool.handle, stream, self.domain.device)
-            replayed = [*(value.clone() for value in state), *self._written(size, at)]
-            for tensor, value in zip(state, start, strict=True):
-                tensor.copy_(value)
+        vt.replay(graph, stream=stream)  # its pool is held since its capture
+        replayed = [*(value.clone() for value in state), *self._written(size, at)]
+        for tensor, value in zip(state, start, strict=True):
+            tensor.copy_(value)
         self._advance(size)
         self.eager += 1
-        if replayed is not None:
-            why = vt.replay_differs([*state, *self._written(size, at)], replayed)
-            code = "replay_mismatch"
+        why = vt.replay_differs([*state, *self._written(size, at)], replayed)
         if why:
             stream.synchronize()
+            if len(self.graphs) == 1:
+                self._pool(False)  # the pool's last graph goes: its use ends while it owns it
             del self.graphs[key]
             graph.reset()
-            self._unrecorded(key, why, code)
+            self._unrecorded(key, why, "replay_mismatch")
 
     def _forget(self) -> None:
         """Release recordings only at the driver's already-drained step boundary."""
+        self.contracts = {}
         if self.graphs or self.pool is not None:
             for stream in self.unfenced:
                 stream.synchronize()
@@ -2064,12 +2280,30 @@ class _Engine:
             for event in self.completions.values():
                 event.synchronize()
             self.completions.clear()
+            self._pool(False)
             self.retired_graphs += len(self.graphs)
             for graph in self.graphs.values():
                 graph.reset()
             self.graphs, self.warmed, self.unrecorded = {}, set(), {}
             self.undrafted = False
             self.pool = None
+
+    def _pool(self, hold: bool) -> None:
+        """Hold the graphs' pool mapped for the rows decoding (`vt.prepare_pool(pool, 0)`), or
+        end that use so it may go idle (`vt.record_pool_stream`). Taken at a call's admission,
+        before its prefill, and after a capture; let go when no row decodes. Only an admission's
+        take can need room: it refuses there (`Exhausted`), never at a replay."""
+        if hold == self.pooled or self.pool is None:
+            return
+        if not self.graphs:  # nothing recorded owns it: no use to take or end
+            self.pooled = False
+            return
+        device = self.domain.device
+        if hold:
+            vt.prepare_pool(self.pool.handle, 0, device)
+        else:
+            vt.record_pool_stream(self.pool.handle, torch.cuda.current_stream(device), device)
+        self.pooled = hold
 
     def _unrecorded(
         self, key: tuple[int, int, bool, bool], why: str, code: str | None = "capture_refused"
@@ -2305,7 +2539,7 @@ class _Engine:
         if self.cache_device is not None and self.cache_device.type == "cuda":
             self._forget()
         self.cache, self.views = None, {}
-        self.slots, self.capacity = [], 0
+        self.slots, self.capacity, self.held = [], 0, 0
         self.layout = None
         # In particular, the pinned host flag must free while the domain stream is alive:
         # Torch's host allocator records that stream's completion when freeing the tensor.
