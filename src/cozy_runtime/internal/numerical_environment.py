@@ -71,15 +71,24 @@ def fingerprint(
     ).digest()
 
 
-def apply(torch: Any) -> None:
-    """The policy, set once per executor before any package code runs on its device: float32
-    matmuls and cuDNN in full IEEE precision, never TF32, and `deterministic=True` scopes'
-    cuDNN mode. Through the `allow_tf32` setters: in torch 2.15 setting `fp32_precision`
-    makes the `cudnn.allow_tf32` getter raise, and stage memos and recorded loops read it."""
+#: torch `_native`'s DSLs that compile at an op's first call.
+JIT_DSLS = ("triton", "cutedsl", "helion")
+
+
+def apply(torch: Any, kind: str) -> None:
+    """The policy, set once per executor before CUDA init and its first op: float32 matmuls
+    and cuDNN in full IEEE precision, never TF32; `deterministic=True` scopes' cuDNN mode;
+    and on CUDA no JIT DSL op override, since a request never compiles (the native-op
+    selection is kept). TF32 goes through the `allow_tf32` setters: in torch 2.15 setting
+    `fp32_precision` makes the `cudnn.allow_tf32` getter raise, and stage memos and recorded
+    loops read it."""
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     _model.DETERMINISTIC[0] = functools.partial(_DETERMINISM.held, torch)
+    native = getattr(torch, "_native", None)
+    if kind == "cuda" and native is not None:
+        native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
 
 
 class _Determinism:

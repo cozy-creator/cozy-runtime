@@ -1074,6 +1074,7 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        numerical_environment.apply(torch, self.device_kind)
         try:
             accel.bind_allocator(torch, self.device_kind)
             if self.device_kind == "cuda":
@@ -1095,7 +1096,6 @@ class Executor:
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
-        numerical_environment.apply(torch)
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
         place(self._device())

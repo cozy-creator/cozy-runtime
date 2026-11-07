@@ -262,18 +262,10 @@ def drain(torch: Any, kind: str) -> None:
         completion_event(torch, kind).synchronize()
 
 
-#: torch `_native`'s DSLs that compile at an op's first call.
-JIT_DSLS = ("triton", "cutedsl", "helion")
-
-
 def bind_allocator(torch: Any, kind: str) -> None:
     """Select Runtime's allocator without device activation or standalone defaults."""
     if kind != "cuda":
         return
-    # A request never compiles; keep the existing native-op override selection.
-    native = getattr(torch, "_native", None)
-    if native is not None:
-        native.registry.deregister_op_overrides(disable_dsl_names=list(JIT_DSLS))
     try:
         varena.bind_torch_allocator()
     except (ImportError, AttributeError, RuntimeError) as exc:
