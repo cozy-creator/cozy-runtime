@@ -164,12 +164,14 @@ def check(reader: Reader, modules: Sequence[Module]) -> None:
 
 
 def _files(reader: Reader, modules: Sequence[Module]) -> list[Module]:
-    """Every module under the import roots of the package's own reachable modules."""
-    tops = sorted({m.name.partition(".")[0] for m in modules if not m.trusted} - {"cozy_runtime"})
+    """Every module under the package's own import roots its reachable modules import: its own
+    tree, never a dependency's (`Reader.own`, in its project roots)."""
+    reached = {m.name.partition(".")[0] for m in modules if not m.trusted}
+    tops = sorted(reached & reader.own - {"cozy_runtime"})
     loaded = {m.path.resolve(): m for m in reader.modules.values()}
     seen: dict[Path, Module] = {}
     for top in tops:
-        for root in reader.roots:
+        for root in reader.project_roots:
             single = root / f"{top}.py"
             paths = sorted((root / top).rglob("*.py")) if (root / top).is_dir() else []
             for path in paths or ([single] if single.is_file() else []):

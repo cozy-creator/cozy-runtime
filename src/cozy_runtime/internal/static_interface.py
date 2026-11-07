@@ -446,11 +446,13 @@ class Reader:
         *,
         dependency_roots: Sequence[Path] = (),
         wheels: Mapping[str, locked.LockedWheel] | None = None,
-        own: frozenset[str] | None = None,
+        own: frozenset[str],
     ) -> None:
         self.project = project
         self.project_roots = (project / "src", project)
-        #: top-level import names that are this package's own; None: whatever its roots hold
+        #: the package's own top-level import names: only these are its modules, read for its
+        #: registrations and held to its contract. Never whatever a root holds: a root can be
+        #: site-packages.
         self.own = own
         self.roots = (*self.project_roots, *dependency_roots)
         #: published callees, read from the wheels the project's uv.lock pins when needed
@@ -589,11 +591,7 @@ class Reader:
             return None
 
     def _own(self, top: str) -> bool:
-        if self.own is not None:
-            return top in self.own
-        return any(
-            (root / top).is_dir() or (root / f"{top}.py").is_file() for root in self.project_roots
-        )
+        return top in self.own
 
     def _tree_tops(self, name: str) -> set[str]:
         top = name.split(".")[0]
@@ -1560,16 +1558,31 @@ def build(
     # uv.lock names, a published one from the exact wheel it pins (cr-114).
     pinned = locked.read(project)
     roots = (*environment_roots(environment_python, project=project), *pinned.roots)
-    reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels)
+    own = source_tops(project)
+    reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels, own=own)
     name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
     return _build(reader, application, closures=closures, distribution=name, pinned=pinned)
+
+
+def source_tops(project: Path) -> frozenset[str]:
+    """A source tree's own top-level modules: each module file and package directory in `src/`
+    and the project root."""
+    tops: set[str] = set()
+    for root in (project / "src", project):
+        for entry in root.iterdir() if root.is_dir() else ():
+            name = entry.name.removesuffix(".py") if entry.is_file() else entry.name
+            if name.isidentifier() and (entry.is_dir() or entry.suffix == ".py"):
+                tops.add(name)
+    return frozenset(tops)
 
 
 def build_builtin(name: str) -> dict[str, Json]:
     """Read only the explicitly selected Runtime-owned App, never caller source."""
     if name != "operations":
         raise StaticRefusal("unknown Runtime builtin surface", code="static_builtin")
-    reader = Reader(Path(cozy_runtime.__file__).resolve().parent.parent)
+    # Its project root is site-packages: only cozy_runtime is its own, never what sits beside it.
+    site = Path(cozy_runtime.__file__).resolve().parent.parent
+    reader = Reader(site, own=frozenset({"cozy_runtime"}))
     application = "cozy_runtime.derive.operations:app"
     # Ordinary caller discovery must keep skipping Runtime registrations. Only
     # this reader instance's selected built-in module becomes an App root.
@@ -1756,9 +1769,9 @@ class CozyPackage:
 
     distribution: str
     application: str
-    #: what its Reader reads as its project, and its own top-level modules (None: its roots')
+    #: what its Reader reads as its project, and its own top-level modules
     project: Path
-    own: frozenset[str] | None
+    own: frozenset[str]
 
 
 def _calls(
@@ -1908,7 +1921,7 @@ def _package_at(reader: Reader, path: Path) -> CozyPackage | None:
             name = project.get("name") if isinstance(project, dict) else None
             if not isinstance(name, str):
                 return None
-            return CozyPackage(name, application, directory, None)
+            return CozyPackage(name, application, directory, source_tops(directory))
     return None
 
 
