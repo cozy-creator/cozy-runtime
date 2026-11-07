@@ -40,6 +40,7 @@ from cozy_runtime.internal import (
     kernel_sources,
     lora_bake,
     nvfp4_linear,
+    philox,
     prebuilt,
     svdq_linear,
     triton_kernels,
@@ -69,12 +70,13 @@ def boot(row: arch.Row) -> list[attention.Candidate]:
 
 def triton_sets(row: arch.Row) -> list[TritonKernels]:
     """The Runtime's own Triton sets this row runs: its boot kernels' (`Candidate.kernels`, named
-    as `attention` opens them: Sage3's fixed means, Sage2's fixed K mean, the E4M3 quantizers) and
-    the encoded linears' (nvfp4 on every row, SVDQuant on FP4 rows). None without Triton."""
+    as `attention` opens them: Sage3's fixed means, Sage2's fixed K mean, the E4M3 quantizers),
+    the encoded linears' (nvfp4 on every row, SVDQuant on FP4 rows) and counter noise's
+    (`philox`). None without Triton."""
     if triton_kernels.TRITON_ABSENT:
         return []
     found = [import_module(c.kernels).KERNELS for c in boot(row) if c.kernels]
-    found += [nvfp4_linear.KERNELS, *([svdq_linear.KERNELS] if row.fp4 else [])]
+    found += [nvfp4_linear.KERNELS, *([svdq_linear.KERNELS] if row.fp4 else []), philox.KERNELS]
     return list({kernels.name: kernels for kernels in found if kernels.entries}.values())
 
 

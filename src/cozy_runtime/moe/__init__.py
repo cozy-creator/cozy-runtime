@@ -13,10 +13,12 @@ serves it (int8.convrot, w4a8, nvfp4) and varena pages it on its own (`RoutedExp
 uploads at ingest).
 
 A few rows (decode, a verify pass) run as one grouped GEMV per projection over every (token,
-expert) pair, reading each expert's weight through a table of addresses (`install`, bf16 and
-int8.convrot): routing stays on the device, so a decode step records as one graph. It serves
-only while every expert is bound (an all-resident model, its blocks leased by lm's loop);
-otherwise, and for many rows, each hit expert runs its own Linears after one stable sort.
+expert) pair; more (a prefill, a denoise step) as one grouped GEMM per projection over the pairs
+sorted by expert on the device. Each reads its expert's weight through a table of addresses
+(`install`, bf16 and int8.convrot): routing stays on the device, so a decode or denoise step
+records as one graph. They serve only while every expert is bound (an all-resident model, its
+blocks leased by a loop); otherwise each hit expert runs its own Linears after one stable sort,
+the host reading the counts, and a capture refuses there, typed.
 
 `Routing` records which experts each forward used and replays expert caches over that sequence:
 least recently used, and next use (Belady's MIN, the fewest bytes any cache of that size moves).
@@ -29,10 +31,13 @@ import statistics
 from array import array
 from collections import OrderedDict
 from collections.abc import Callable, Iterable
+from functools import partial
 
 import torch
 from torch import nn
 
+from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._model import Building
 from cozy_runtime.author.kernels import (
     INT8_CONVROT,
     KernelsUnavailable,
@@ -41,17 +46,19 @@ from cozy_runtime.author.kernels import (
     TritonKernels,
 )
 from cozy_runtime.graphs import say
-from cozy_runtime.internal.int8_linear import quantize_rows
+from cozy_runtime.internal import int8_linear
 from cozy_runtime.moe import _kernels
 
 #: Routed-expert caches a `Routing` replays, in experts.
 CACHES = (256, 512, 1024)
-#: The most (token, expert) pairs a layer runs as one grouped launch per projection: decode's
-#: and a verify pass's largest batches (16 rows of 8 experts).
+#: The most (token, expert) pairs a layer runs as a grouped GEMV per projection: decode's and a
+#: verify pass's largest batches (16 rows of 8 experts). More run as a grouped GEMM.
 GROUPED = 128
 KERNELS = TritonKernels("cozy-moe-experts", _kernels.entries(), origin=__name__)
-#: The grouped kernels' launcher once they serve.
-_LAUNCH: list[Launch | None] = [None]
+#: While the grouped kernels build, a capture waits for them (`Building`).
+COMPILING = "compiling: it serves from the next request"
+#: The grouped kernels' launcher once they serve, else why they do not.
+_LAUNCH: list[Launch | str] = ["the model's execution plan installs no grouped kernels"]
 
 
 class RoutedExpert(nn.Module):  # type: ignore[misc]
@@ -82,28 +89,50 @@ class RoutedExpert(nn.Module):  # type: ignore[misc]
 
 class Experts(nn.ModuleList):  # type: ignore[misc]
     """A layer's routed experts. `forward(hidden [T, H], index [T, k], weights [T, k])`: each
-    expert multiplies its rows, gathered by one stable sort of the flat top-k index (ascending
-    (token, k)), experts in index order; the outputs return to their (token, k) slots and are
-    summed by `weights` in the outputs' dtype. The host waits once a layer, for the counts."""
+    (token, k) pair's expert output, summed by `weights` in the outputs' dtype.
 
-    #: Set to `trace(layer, counts)` to observe routing: tokens per expert, every forward.
+    While every expert is bound and of one kind the grouped kernels serve (`install`), routed on
+    the device so a step records as a graph: a GEMV per projection for up to `GROUPED` pairs,
+    else a GEMM over the pairs sorted by expert. Otherwise each hit expert multiplies its rows,
+    gathered by one stable sort of the flat top-k index (ascending (token, k)), experts in index
+    order, and the outputs return to their (token, k) slots: the host waits once a layer, for
+    the counts, so a capture refuses that path."""
+
+    #: Set to `trace(layer, counts)` to observe routing: tokens per expert, every forward. The
+    #: counts are read on the host, so a traced layer records no graph.
     trace: Callable[[int, list[int]], None] | None = None
 
     def __init__(self, experts: Iterable[RoutedExpert], *, layer: int) -> None:
         super().__init__(experts)
         self.layer = layer
-        #: The grouped kernel's address table on the device, and the addresses it holds.
+        #: The grouped kernels' address table on the device, the addresses it holds, and whether
+        #: they and the experts' widths take the GEMM's 16-byte reads.
         self._table: torch.Tensor | None = None
         self._addresses: list[int] = []
+        self._aligned = False
 
     def forward(
         self, hidden: torch.Tensor, index: torch.Tensor, weights: torch.Tensor
     ) -> torch.Tensor:
         tokens, k = index.shape
-        out = self._grouped(hidden, index) if tokens * k <= GROUPED else None
-        if out is None:
+        out = self._grouped(hidden, index)
+        if isinstance(out, str):
+            self._uncaptured(hidden, out)
             out = self._sorted(hidden, index)
+        elif self.trace is not None:
+            self._uncaptured(hidden, "a routing trace reads the counts on the host")
+            self.trace(self.layer, torch.bincount(index.reshape(-1), minlength=len(self)).tolist())
         return (out.view(tokens, k, -1) * weights.unsqueeze(-1)).sum(dim=1)
+
+    def _uncaptured(self, hidden: torch.Tensor, why: str) -> None:
+        """Inside a CUDA graph capture, the host read `why` names refused before it runs:
+        `Building` while the grouped kernels compile, else a refusal no retry changes."""
+        if not (hidden.is_cuda and torch.cuda.is_current_stream_capturing()):
+            return
+        detail = f"moe layer {self.layer}: {why}"
+        if why == COMPILING:
+            raise Building(detail)
+        raise CapabilityError(detail, code="prepared_graph_ineligible")
 
     def _sorted(self, hidden: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
         k = index.shape[1]
@@ -122,42 +151,51 @@ class Experts(nn.ModuleList):  # type: ignore[misc]
         out[order] = torch.cat(outputs)
         return out
 
-    def _grouped(self, hidden: torch.Tensor, index: torch.Tensor) -> torch.Tensor | None:
-        """Each (token, expert) pair's expert output, `[T * k, H]`, by the grouped kernels; None
-        where they do not serve (not built, a trace, not bf16 on a GPU, an expert not bound or of
-        another kind)."""
+    def _grouped(self, hidden: torch.Tensor, index: torch.Tensor) -> torch.Tensor | str:
+        """Each (token, expert) pair's expert output, `[T * k, H]`, by the grouped kernels; else
+        why they do not serve (not built, not bf16 on a GPU, an expert not bound or of another
+        kind, the GEMM's reads not aligned)."""
         launch = _LAUNCH[0]
-        if launch is None or self.trace is not None or not hidden.is_cuda:
-            return None
-        if hidden.dtype != torch.bfloat16:
-            return None
-        return self._run(launch, hidden, index)
+        if isinstance(launch, str):
+            return launch
+        if not hidden.is_cuda or hidden.dtype != torch.bfloat16:
+            return f"the grouped kernels take bf16 on a GPU, not {hidden.dtype} on {hidden.device}"
+        found = self._operands(hidden.device)
+        if isinstance(found, str):
+            return found
+        if index.numel() > GROUPED and not self._aligned:
+            return "an expert's operand or width is not 16-byte aligned, as the grouped GEMM reads"
+        return self._run(launch, *found, hidden, index)
 
     def _run(
-        self, launch: Launch, hidden: torch.Tensor, index: torch.Tensor
-    ) -> torch.Tensor | None:
-        """Two grouped launches with the gate between them as `RoutedExpert.forward` computes it."""
-        found = self._operands(hidden.device)
-        if found is None:
-            return None
-        kind, table = found
-        first = self[0]
-        size, inner = first.down_proj.out_features, first.down_proj.in_features
-        pairs, k = index.numel(), index.shape[1]
-        experts = index.reshape(-1).to(torch.int64)
-        up = self._project(launch, kind, table, 0, hidden.reshape(-1, size), experts, 2 * inner, k)
-        a, b = up.chunk(2, dim=-1)
-        gated = first.act(a) * b if first.gate_first else a * first.act(b)
-        return self._project(launch, kind, table, 1, gated, experts, size, 1).view(pairs, size)
-
-    def _project(
         self,
         launch: Launch,
         kind: str,
         table: torch.Tensor,
+        hidden: torch.Tensor,
+        index: torch.Tensor,
+    ) -> torch.Tensor:
+        """Two grouped launches with the gate between them as `RoutedExpert.forward` computes it:
+        GEMVs for up to `GROUPED` pairs, else GEMMs over the pairs sorted by expert."""
+        first = self[0]
+        size, inner = first.down_proj.out_features, first.down_proj.in_features
+        if index.numel() <= GROUPED:
+            project = partial(self._gemv, launch, kind, table, index.reshape(-1).to(torch.int64))
+        else:
+            project = partial(self._gemm, launch, kind, table, *self._tiles(index))
+        up = project(0, hidden.reshape(-1, size), 2 * inner, index.shape[1])
+        a, b = up.chunk(2, dim=-1)
+        gated = first.act(a) * b if first.gate_first else a * first.act(b)
+        return project(1, gated, size, 1)
+
+    def _gemv(
+        self,
+        launch: Launch,
+        kind: str,
+        table: torch.Tensor,
+        experts: torch.Tensor,
         which: int,
         x: torch.Tensor,
-        experts: torch.Tensor,
         n: int,
         div: int,
     ) -> torch.Tensor:
@@ -172,36 +210,98 @@ class Experts(nn.ModuleList):  # type: ignore[misc]
             launch(_kernels.experts_bf16_kernel, grid, x, table[which], experts, out, n, width,
                    div, *blocks)  # fmt: skip
         else:
-            rows, scales = quantize_rows(torch, x)
+            rows, scales = int8_linear.quantize_rows(torch, x)
             launch(_kernels.experts_int8_kernel, grid, rows, scales, table[2 * which],
                    table[2 * which + 1], experts, out, n, width, div, *blocks)  # fmt: skip
         return out
 
-    def _operands(self, device: torch.device) -> tuple[str, torch.Tensor] | None:
+    def _gemm(
+        self,
+        launch: Launch,
+        kind: str,
+        table: torch.Tensor,
+        order: torch.Tensor,
+        spans: torch.Tensor,
+        tiles: int,
+        which: int,
+        x: torch.Tensor,
+        n: int,
+        div: int,
+    ) -> torch.Tensor:
+        """`[pairs, n]`: projection `which` of the pairs sorted by expert (`_tiles`), a program
+        per (row tile, `GEMM_N` outputs). Gate-and-up reads token row `order[r] // div` and
+        writes sorted row r; down reads sorted row r and writes pair `order[r]`'s row. int8 rows
+        quantize as an int8.convrot leaf's own forward does: the op's kernel where it serves."""
+        x = x.contiguous()
+        if kind == "bf16" and x.data_ptr() % 16:  # read in 16-byte vectors
+            x = x.clone()
+        pairs, width = int(order.numel()), int(x.shape[-1])
+        out = torch.empty((pairs, n), dtype=torch.bfloat16, device=x.device)
+        grid = (tiles * -(-n // _kernels.GEMM_N), 1, 1)
+        rest = (order, spans, out, n, width, div, tiles, _kernels.GEMM_M, _kernels.GEMM_N,
+                _kernels.GEMM_K[kind], _kernels.GROUP, 1 - which)  # fmt: skip
+        if kind == "bf16":
+            launch(_kernels.grouped_bf16_kernel, grid, x, table[which], *rest)
+        else:
+            found = int8_linear.quantize(torch, x)
+            if found is None:
+                rows, scales = int8_linear.quantize_rows(torch, x)
+            else:
+                rows, scales = found.payload, found.scale
+            launch(_kernels.grouped_int8_kernel, grid, rows, scales, table[2 * which],
+                   table[2 * which + 1], *rest)  # fmt: skip
+        return out
+
+    def _tiles(self, index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+        """The GEMM's routing on the device, no count read: each sorted pair's flat (token, k)
+        slot (one stable sort: ascending (token, k) within an expert, experts in index order);
+        the `[3, tiles]` spans of its `GEMM_M`-row tiles (expert, or -1 past the routing's tiles;
+        first sorted row; its expert's end); and `tiles`, the most any routing of these pairs
+        needs: the full tiles and one ragged per expert hit."""
+        experts, pairs, m = len(self), index.numel(), _kernels.GEMM_M
+        keys, order = torch.sort(index.reshape(-1), stable=True)
+        edges = torch.arange(experts + 1, device=keys.device, dtype=keys.dtype)
+        starts = torch.searchsorted(keys, edges)  # each expert's first sorted pair; then all
+        per = (starts.diff() + (m - 1)).div(m, rounding_mode="floor")  # each expert's tiles
+        ends = per.cumsum(0)
+        tiles = -(-pairs // m) + min(experts, pairs)
+        tile = torch.arange(tiles, device=keys.device)
+        owner = torch.searchsorted(ends, tile, right=True)  # `experts`: past the last tile
+        expert = owner.clamp(max=experts - 1)
+        first = starts[expert] + (tile - ends[expert] + per[expert]) * m
+        spans = torch.stack((torch.where(owner < experts, expert, -1), first, starts[expert + 1]))
+        return order, spans, tiles
+
+    def _operands(self, device: torch.device) -> tuple[str, torch.Tensor] | str:
         """The kind ("bf16": plain Linears; "int8": int8.convrot leaves) and the address table
         (bf16: weights of gate-and-up, of down; int8: data and scale of each), when every
-        expert's operands are bound, contiguous and of that kind on `device`. Outside a capture
-        a changed address set is written to the table; inside one it is a refusal (None)."""
-        kind = _kind(self[0].gate_and_up_proj)
+        expert's operands are bound, contiguous and of that kind on `device`; else why not.
+        Outside a capture a changed address set is written to the table; inside one it is a
+        refusal."""
+        head = self[0].gate_and_up_proj
+        kind = _kind(head)
         if kind is None:
-            return None
+            name = getattr(head, "provider", None) or type(head).__name__
+            return f"its experts are {name}: the grouped kernels take bf16 and int8.convrot"
         rows: list[list[int]] = [[] for _ in range(2 if kind == "bf16" else 4)]
         for expert in self:
             for which, linear in enumerate((expert.gate_and_up_proj, expert.down_proj)):
                 if _kind(linear) != kind:
-                    return None
+                    return "its experts are not all of one kind"
                 operands = (linear.weight,) if kind == "bf16" else (linear.data, linear.scale)
                 for role, tensor in enumerate(operands):
                     address = _address(tensor, device)
                     if not address:
-                        return None
+                        return f"an expert's operand is not bound, contiguous and on {device}"
                     rows[len(operands) * which + role].append(address)
         addresses = [a for row in rows for a in row]
         if addresses != self._addresses:
             if torch.cuda.is_current_stream_capturing():
-                return None
+                return "an expert's operands moved inside a capture"
             self._table = torch.tensor(rows, dtype=torch.int64, device=device)
             self._addresses = addresses
+            widths = (self[0].down_proj.in_features, self[0].down_proj.out_features)
+            self._aligned = all(a % 16 == 0 for a in (*addresses, *widths))
         assert self._table is not None
         return kind, self._table
 
@@ -226,8 +326,8 @@ def install(plan: Plan, model: nn.Module) -> str:
         if plan.when_ready is None:
             activate(plan.load(KERNELS))
         elif not plan.when_ready(KERNELS, activate):
-            say(KERNELS.name, f"[moe] {KERNELS.name} compiling: it serves from the next request")
-            _report(plan, "compiling: it serves from the next request")
+            say(KERNELS.name, f"[moe] {KERNELS.name} {COMPILING}")
+            _report(plan, COMPILING)
     except KernelsUnavailable as exc:
         say(KERNELS.name, f"[moe] each expert runs its own Linears: {exc.code}: {exc}")
         return _report(plan, f"{exc.code}: {exc}")
@@ -236,8 +336,11 @@ def install(plan: Plan, model: nn.Module) -> str:
 
 def _report(plan: Plan, reason: str = "") -> str:
     """The plan's outcome under its kernel set's name, as `fusion` reports it: applied, or why
-    each expert runs its own Linears. Returns the plan's identity when refused: ""."""
+    each expert runs its own Linears, which a capture's refusal names until a launcher serves.
+    Returns the plan's identity when refused: ""."""
     plan.report(KERNELS.name, {"applied": not reason, **({"reason": reason} if reason else {})})
+    if reason and isinstance(_LAUNCH[0], str):
+        _LAUNCH[0] = reason
     return ""
 
 

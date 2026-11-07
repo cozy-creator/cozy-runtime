@@ -27,7 +27,7 @@ import time
 import weakref
 from collections import deque
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from types import MappingProxyType
@@ -285,6 +285,7 @@ class _Declared(Protocol):
     """A declared method carries its component set as interface content (§1.1)."""
 
     __uses_components__: tuple[str, ...]
+    __deterministic__: bool
 
 
 class _Scope(Protocol):
@@ -609,6 +610,24 @@ _REMOTE_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, .
 _LOCAL_SCOPES: contextvars.ContextVar[tuple[tuple[Model[Any], str, tuple[str, ...]], ...]] = (
     contextvars.ContextVar("cozy_local_scopes", default=())
 )
+#: Whether a `deterministic=True` scope is open in this context.
+_DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cozy_deterministic_scope", default=False
+)
+#: How a local `deterministic=True` scope sets deterministic cuDNN on this process's device:
+#: the Runtime's numerics policy (`internal/numerical_environment.apply`) installs it at
+#: executor start. Unset (`for_test`, no Torch), a scope changes nothing.
+DETERMINISTIC: list[Callable[[], AbstractContextManager[None]]] = [nullcontext]
+
+
+def deterministic(model: object, method: str) -> bool:
+    """Whether `model.method` runs under deterministic cuDNN: it declares `deterministic=True`,
+    or it is called inside a scope that does. Stage memos key on it."""
+    return _DETERMINISTIC_SCOPE.get() or _declares_deterministic(model, method)
+
+
+def _declares_deterministic(model: object, method: str) -> bool:
+    return getattr(getattr(type(model), method, None), "__deterministic__", False) is True
 
 
 def remote_scope(model: object) -> tuple[str, tuple[str, ...]] | None:
@@ -624,6 +643,7 @@ def uses_components(
     memoize: bool = False,
     memo_version: str | None = None,
     memo_dependencies: tuple[MemoDependency, ...] = (),
+    deterministic: bool = False,
 ) -> Callable[[Callable[Concatenate[M, P], R]], Callable[Concatenate[M, P], R]]:
     """Declare the possible heavyweight component set of ONE public `Model` method.
 
@@ -635,10 +655,21 @@ def uses_components(
     code, declared helpers (`memo_dependencies`, `memo_version` as on `@invocable`), the
     components' weights, its arguments and the numerics it runs under. The Runtime checks
     for a stored result before the scope opens, so a hit stages nothing.
+
+    `deterministic=True`: the method's scope, and what it calls on this GPU, runs with cuDNN
+    deterministic and without benchmarking, as do its component calls on a group's other
+    GPUs; the setting is restored when the scope closes, and stage memos key on it. Every
+    other global numeric setting is the Runtime's policy, torch's defaults pinned (float32
+    matmuls at "highest" without TF32, cuDNN with it); a package never sets `torch.backends.*`.
     """
     components = component_set(
         names, memoize=memoize, memo=memo_version is not None or bool(memo_dependencies)
     )
+    if not isinstance(deterministic, bool):
+        raise ConformanceError(
+            f"@uses_components(deterministic={deterministic!r}): True or False",
+            code="deterministic_value",
+        )
 
     def decorate(fn: Callable[Concatenate[M, P], R]) -> Callable[Concatenate[M, P], R]:
         component_method(fn.__qualname__, inspect.signature(fn).parameters)
@@ -648,6 +679,7 @@ def uses_components(
             wrapper = memoized(fn, wrapper, components, is_async=_is_async(fn))
         declared: _Declared = cast("_Declared", wrapper)
         declared.__uses_components__ = components
+        declared.__deterministic__ = deterministic
         return wrapper
 
     return decorate
@@ -1169,6 +1201,7 @@ class _ComponentScope:
         "_local",
         "_method",
         "_model",
+        "_numerics",
         "_remote",
         "_using",
     )
@@ -1181,6 +1214,7 @@ class _ComponentScope:
         self._local: contextvars.Token[Any] | None = None
         self._call: Context | None = None
         self._using: AbstractContextManager[None] | None = None
+        self._numerics: AbstractContextManager[None] | None = None
         self._caches: list[DerivedCache] = []
 
     def __enter__(self) -> None:
@@ -1207,6 +1241,7 @@ class _ComponentScope:
             self._remote = _REMOTE_SCOPES.set(
                 (*_REMOTE_SCOPES.get(), (model, self._method, self._components))
             )
+            self._enter_numerics(device=False)
             if model._cozy_harness is not None:
                 model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
             return
@@ -1226,6 +1261,7 @@ class _ComponentScope:
         # A scope that fails to open gets no `__exit__` from its `with`: it gives back the turn
         # and context it took here, or the next call on this executor waits on it forever.
         try:
+            self._enter_numerics(device=True)
             if model._cozy_residency is not None:
                 using = model._cozy_residency.using(self._method, self._components)
                 using.__enter__()
@@ -1242,6 +1278,9 @@ class _ComponentScope:
     def __exit__(self, *exc: object) -> None:
         model = self._model
         if self._remote is not None:
+            numerics, self._numerics = self._numerics, None
+            if numerics is not None:
+                numerics.__exit__(None, None, None)
             _REMOTE_SCOPES.reset(self._remote)
             self._remote = None
             placement = model._cozy_placement
@@ -1253,6 +1292,7 @@ class _ComponentScope:
         failed = sys.exc_info()  # a raise in the scope ends its passes as failed
         caches, self._caches = self._caches, []
         using, self._using = self._using, None
+        numerics, self._numerics = self._numerics, None
         local, self._local = self._local, None
         call, self._call = self._call, None
         with ExitStack() as releases:
@@ -1260,10 +1300,31 @@ class _ComponentScope:
                 releases.callback(SCOPES.leave)
             if local is not None:
                 releases.callback(_LOCAL_SCOPES.reset, local)
+            if numerics is not None:
+                releases.callback(numerics.__exit__, None, None, None)
             if using is not None:
                 releases.callback(using.__exit__, *failed)
             for cache in caches:
                 releases.callback(cache.leave)
+
+    def _enter_numerics(self, *, device: bool) -> None:
+        """A `deterministic=True` scope's numerics: marked in this context, and set on this
+        process's device when the scope runs here. A remote scope's calls set it on their home
+        GPU, whose executor enters this method's scope for them."""
+        if _declares_deterministic(self._model, self._method):
+            numerics = _deterministic_numerics(device=device)
+            numerics.__enter__()
+            self._numerics = numerics
+
+
+@contextmanager
+def _deterministic_numerics(*, device: bool) -> Iterator[None]:
+    token = _DETERMINISTIC_SCOPE.set(True)
+    try:
+        with DETERMINISTIC[0]() if device else nullcontext():
+            yield
+    finally:
+        _DETERMINISTIC_SCOPE.reset(token)
 
 
 # --------------------------------------------------------------------------- identity

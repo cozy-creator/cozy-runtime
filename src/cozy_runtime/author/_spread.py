@@ -16,8 +16,9 @@ def spread(
     The author's statement: the method is a pure function of its tensor and JSON arguments
     and returns one tensor. Inside a sequence-parallel group the runtime offers the calls to
     the idle GPUs, this one included, a round at a time; each result is what one GPU alone
-    computes on an identical card. A GPU without room for the call declines it and the call
-    runs on another. Elsewhere they run here, one after another.
+    computes on an identical card. A GPU whose memory refuses the call up front declines it
+    and the call runs on another; one that runs out partway fails the call. Elsewhere they run
+    here, one after another.
 
     `spare=True`: no other GPU may free anything to take a call, because the attempt still
     needs what they hold (a spread before the sharded denoise). A GPU homing a `placeable`
