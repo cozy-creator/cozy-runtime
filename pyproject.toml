@@ -63,7 +63,7 @@ package = true
 # rc/varena-v2 builds against its own TensorFS, which isn't published yet. The release drops this for the published
 # TensorFS and sets the ranges above. To move it: new rev, then `uv lock`.
 [tool.uv.sources]
-tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "09f1df7e73ddba045a4937378fa27944b6982bd5", subdirectory = "crates/tensorfs-py" }
+tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "7956c48e26c35a6a2ce47d52b273e5b1cd298e1b", subdirectory = "crates/tensorfs-py" }
 
 [tool.mypy]
 python_version = "3.12"
