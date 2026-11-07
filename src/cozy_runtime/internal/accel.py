@@ -634,14 +634,6 @@ def allocation(torch: Any, kind: str, memory: Any = None, device: Any = None) ->
             "driver_free_bytes": host.free_bytes,
             "driver_total_bytes": host.total_bytes,
         }
-    if kind == "mps":
-        driver, total = int(torch.mps.driver_allocated_memory()), unified_budget(torch)
-        return {
-            "allocated_bytes": int(torch.mps.current_allocated_memory()),
-            "reserved_bytes": driver,
-            "driver_free_bytes": max(total - driver, 0),
-            "driver_total_bytes": total,
-        }
     free, total = torch.cuda.mem_get_info(device)
     weights = _weight_bytes(memory)
     working = vt.stats(device)
@@ -660,18 +652,14 @@ def _weight_bytes(memory: Any) -> int:
 
 def allocated(torch: Any, kind: str, memory: Any = None) -> int:
     """Process-local live allocations, without querying the driver."""
-    if kind == "mps":
-        return int(torch.mps.current_allocated_memory())
-    if kind == "cpu":
+    if kind != "cuda":
         return 0
     return int(vt.stats(getattr(memory, "device", None))["allocated_bytes"]) + _weight_bytes(memory)
 
 
 def reserved(torch: ModuleType, kind: str, memory: Any = None) -> int:
     """Process-local allocator storage, including unused cached blocks."""
-    if kind == "mps":
-        return int(torch.mps.driver_allocated_memory())
-    if kind == "cpu":
+    if kind != "cuda":
         return 0
     return int(vt.stats(getattr(memory, "device", None))["mapped_bytes"]) + _weight_bytes(memory)
 
@@ -686,24 +674,6 @@ def allocator_peak(memory: Any, request: str | None = None) -> int:
     figures = memory.torch_stats()
     carried = figures["requests"].get(request, (0, 0))[1] if request is not None else 0
     return max(int(figures["peak"]), int(carried))
-
-
-#: This process's own cache releases that returned something, by the function that asked:
-#: how many, and the bytes. (The caller's name is read off its frame: no call site says it.)
-RELEASED: dict[str, list[int]] = {}
-
-
-def release_cached(torch: Any, kind: str) -> None:
-    """MPS's unused allocator blocks back to its driver. On CUDA the native core alone does this."""
-    if kind != "mps":
-        return
-    before = reserved(torch, kind)
-    torch.mps.empty_cache()
-    freed = before - reserved(torch, kind)
-    if freed > 0:
-        row = RELEASED.setdefault(sys._getframe(1).f_code.co_name, [0, 0])
-        row[0] += 1
-        row[1] += freed
 
 
 def completion_event(torch: Any, kind: str) -> Any:
@@ -811,43 +781,12 @@ def qualification_gate(kind: str) -> None:
 
 # ------------------------------------------------------------------- memory classes
 
-#: What macOS and the user's other apps keep of a unified pool, beside Metal's own limit.
-HOST_RESERVE = 2 << 30
-
-
 def memory_class(kind: str) -> Literal["discrete", "unified"]:
     """How the device's memory relates to the host's (design §6.2). `unified`: one pool, so
     weights never page between a host and a device tier and "offload to CPU" frees nothing.
     Apple GPUs are unified; CUDA cards are discrete here (coherent and integrated CUDA
     machines are TensorD's to detect). A CPU's device memory is the host's own: unified."""
     return "unified" if kind in ("mps", "cpu") else "discrete"
-
-
-#: torch's own MPS high watermark, as a fraction of Metal's recommended working set
-MPS_WATERMARK = 1.7
-
-
-def hold_pool(torch: ModuleType, cap: int) -> None:
-    """Hold MPS's allocator, which also holds a unified plane's regions, to an owner's cap of
-    `cap` bytes; -1 gives torch its own watermark back (past the budget the system pages)."""
-    recommended = max(int(torch.mps.recommended_max_memory()), 1)
-    torch.mps.set_per_process_memory_fraction(
-        min(cap / recommended, 2.0) if cap >= 0 else MPS_WATERMARK
-    )
-
-
-def unified_ceiling(torch: ModuleType) -> int:
-    """The most one unified-memory process may ever hold: Metal's recommended working set,
-    within physical RAM less what the system keeps."""
-    ram = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-    return max(min(int(torch.mps.recommended_max_memory()), ram - HOST_RESERVE), 0)
-
-
-def unified_budget(torch: ModuleType) -> int:
-    """What it may hold now: the ceiling, within what it holds plus what the system has
-    available (shared mode follows memory pressure: past it, macOS swaps)."""
-    held = int(torch.mps.driver_allocated_memory())
-    return max(min(unified_ceiling(torch), held + _available()), 0)
 
 
 class _VmStatistics64(ctypes.Structure):

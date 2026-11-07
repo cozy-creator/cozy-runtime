@@ -2582,17 +2582,6 @@ class Executor:
         present = [name for name in names if checkpoints[name].has(name)]
         rows = [r for name in present for r in checkpoints[name].rows(name)]
         stage("checkpoint_headers")
-        if self.device_kind == "mps":
-            # One pool, every weight resident (cr-021): past the GPU's working set never fits.
-            # A CPU's weights are host memory, which pages: it is never refused here.
-            need, room = sum(r.stored_nbytes for r in rows), accel.unified_ceiling(torch)
-            if need > room:
-                return self._refusal(
-                    MEMORY_EXHAUSTED,
-                    f"{binding.model or reference.snapshot} keeps {need / 2**30:.1f} GiB of "
-                    f"weights on the GPU, and {device_facts.name} holds {room / 2**30:.1f} GiB: "
-                    "run it on a Mac with more memory, or --on new",
-                )
         # NVML is queried with the sealed device (#549.9): inside the seal, card zero IS the
         # lane's card, so a multi-GPU pod's plan names the card the fill actually uses.
         runtime_identity = measure_runtime(torch, binding.release)

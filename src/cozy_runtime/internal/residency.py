@@ -2,7 +2,7 @@
 
 CUDA weights use TensorFS's process-local Rust reservations. A view owns its physical pin
 through the Torch storage lifetime, including escaped aliases. Runtime drops idle views while
-the native manager keeps eligible backing cached. CPU and MPS use Torch-owned storage.
+the native manager keeps eligible backing cached. A CPU uses Torch-owned storage.
 """
 
 from __future__ import annotations
@@ -39,8 +39,6 @@ from cozy_runtime.internal import cache_owners, pacing
 from cozy_runtime.internal.accel import (
     ResidencyError,
     StaleBinding,
-    allocation,
-    release_cached,
 )
 
 __all__ = [
@@ -69,7 +67,6 @@ def _torch_bytes(device: torch.device) -> tuple[int, int, int]:
 
 #: Other overlays' pages a block keeps parked: base and a LoRA alternate with one.
 _PARKED = 2
-_HOST_STAGING = 64 << 20
 #: Stored float dtypes a CPU executor serves widened to float32 (`weights._float32`).
 _NARROW = ("F16", "BF16")
 _DTYPES = {
@@ -616,24 +613,8 @@ class Model:
                 if not groups:
                     return None
             missing = sum(b.allocation_bytes for b in groups if b.data is None and not b.cached())
-            if self.memory.device.type == "mps" and missing:
-                missing += min(
-                    max(
-                        (
-                            part.nbytes
-                            for b in groups
-                            if b.data is None
-                            for p in b.parts.values()
-                            for part in p.values()
-                        ),
-                        default=0,
-                    ),
-                    _HOST_STAGING,
-                )
             if free_only and missing > self.memory._free():
-                release_cached(torch, self.memory.device.type)
-                if missing > self.memory._free():
-                    return None
+                return None
             entered: list[_Block] = []
             try:
                 for block in groups:
@@ -1002,6 +983,12 @@ class Memory:
 
     def __init__(self, device: Any, budget_bytes: int | None = None, shared: bool = False) -> None:
         self.device = torch.device(device)
+        if self.device.type not in ("cuda", "cpu"):
+            # Paul 11-07 (REVIEW #4): MPS's memory paths are gone; it returns as a varena backend.
+            raise ResidencyError(
+                f"{self.device.type} has no memory backend in this Runtime: run on a CUDA machine "
+                "(`cozy run … --on <rental>`) or on the CPU"
+            )
         self.cuda: bool = self.device.type == "cuda"
         self.budget_bytes = budget_bytes
         self.lock = threading.RLock()
@@ -1070,9 +1057,6 @@ class Memory:
         if self.cuda and torch.cuda.is_initialized():
             resident = int(self.native.stats()["resident_bytes"]) if self.native is not None else 0
             return (*_torch_bytes(self.device), resident)
-        if self.device.type == "mps":
-            used = int(torch.mps.current_allocated_memory())
-            return used, int(torch.mps.driver_allocated_memory()), used, 0
         return 0, 0, 0, 0
 
     def _figures(self) -> tuple[int, int]:
@@ -1104,16 +1088,10 @@ class Memory:
                 model.working_phase_keys.remove(key)
 
     def _free(self) -> int:
-        """Free bytes where no native owner answers (MPS, CPU). A CPU's is what varena's host
-        number still leaves this process (`varena.host_room`): one owner of host RAM for every
-        executor, its cgroup as the kernel accounts it, page cache counted as room."""
-        if self.device.type != "mps":
-            return max(varena.host_room(), 0)
-        figures = allocation(torch, "mps")
-        free = int(figures["driver_free_bytes"])
-        if self.budget_bytes is not None:
-            free = min(free, max(self.budget_bytes - int(figures["reserved_bytes"]), 0))
-        return free
+        """Free bytes where no native owner answers (a CPU): what varena's host number still leaves
+        this process (`varena.host_room`), one owner of host RAM for every executor, its cgroup as
+        the kernel accounts it, page cache counted as room."""
+        return max(varena.host_room(), 0)
 
     def _fitting(self, model: Model, groups: list[_Block]) -> list[_Block]:
         """A CPU step's hold, decided once: the longest prefix of `groups` whose bytes as served
@@ -1550,9 +1528,6 @@ class Memory:
             return 0
         before_allocated, before_reserved = self._figures()
         available = self._free() if need else 0
-        if need and available < need:
-            release_cached(torch, self.device.type)
-            available = self._free()
         dropped = 0
 
         def enough(released: int = 0, *, flush: bool = False) -> bool:
@@ -1562,9 +1537,6 @@ class Memory:
             dropped += released
             if flush or dropped >= max(need - available, 1):
                 available = self._free()
-                if available < need:
-                    release_cached(torch, self.device.type)
-                    available = self._free()
                 dropped = 0
             return available >= need
 
@@ -1602,8 +1574,6 @@ class Memory:
                     break
                 if region.discard():
                     enough(flush=True)
-        if not need:
-            release_cached(torch, self.device.type)
         allocated, reserved = self._figures()
         return max(before_allocated - allocated, before_reserved - reserved, 0)
 
@@ -1648,21 +1618,11 @@ class Memory:
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
         if self.cuda:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        if self.device.type == "mps" and reclaim:
-            # TensorFS reads into bounded host staging; account for that transient beside
-            # the retained MPS part before asking Torch for its destination allocation.
-            need = nbytes + min(nbytes, _HOST_STAGING)
-            if need > self._free():
-                self.reclaim(need)
         try:
             return torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-        except RuntimeError as error:
-            # MPS reports allocator refusal as RuntimeError. Classify only this failed
-            # allocation; reads, transforms and model execution are outside the retry.
-            if not isinstance(error, torch.OutOfMemoryError) and not (
-                self.device.type == "mps" and fault(error) is Fault.OOM
-            ):
-                raise
+        except torch.OutOfMemoryError:
+            # Only this failed allocation is retried; reads, transforms and model execution are
+            # outside the retry.
             if not reclaim or self.capturing() or not self.reclaim():
                 raise
             # Only the failed allocation is retried. No read, fill transform or forward ran.
@@ -1888,7 +1848,7 @@ class Memory:
     def _read_host(
         self, block: _Block, reclaim: bool, overlay: Hashable
     ) -> dict[str, dict[str, Tensor]]:
-        """Where no native core runs (MPS, CPU): Torch-owned storage, read and baked here."""
+        """Where no native core runs (a CPU): Torch-owned storage, read and baked here."""
         source = block.model.source
         tensors = source.ck.components[source.component].tensors
         data: dict[str, dict[str, Tensor]] = {}
@@ -1951,20 +1911,7 @@ class Memory:
             request.gathered += 1
 
     def _read_into(self, tensors: Any, key: str, raw: Tensor, role: str | None) -> None:
-        if self.device.type != "mps":
-            tensors.read_into(key, raw, role=role)
-            return
-        length = raw.numel()  # Stored carriers are contiguous U8, including packed parts.
-        if not length:
-            return
-        host = torch.empty(min(length, _HOST_STAGING), dtype=torch.uint8, device="cpu")
-        for offset in range(0, length, host.numel()):
-            stop = min(offset + host.numel(), length)
-            view = host[: stop - offset]
-            tensors.read_into(key, view, role=role, offset=offset)
-            # TensorFS owns only the CPU read. Torch owns MPS transfer and completion;
-            # a blocking copy lets the next window reuse this same host allocation safely.
-            raw[offset:stop].copy_(view, non_blocking=False)
+        tensors.read_into(key, raw, role=role)
 
     def _enter(self, block: _Block, reclaim: bool = True) -> None:
         model = block.model
@@ -2572,8 +2519,6 @@ class Request:
                     "scope": "the core's fills ahead of demand",
                 },
             )
-        elif self.memory.device.type == "mps":
-            out.update(allocated=allocated, reserved=reserved, measurement="observed_current")
         return out
 
 
