@@ -24,6 +24,7 @@ import msgspec
 from cozy_runtime.author import AuthorError, ConformanceError
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
 from cozy_runtime.internal import static_interface
+from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.installed import record_digest
 
 # --------------------------------------------------------------------------- machine-describe
@@ -166,11 +167,15 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
         own = msgspec.json.encode(built).decode()
     elif request.closures:
         # Closures only narrow memo keys: a root they cannot be read for keys on its whole source.
+        # TensorD's install asks this alone (the Hub holds the interface), so the package
+        # contract's refusal stands here: swallowed, a refused package installed and ran.
         try:
             static_interface.build_installed(
                 request.root, environment_python=Path(sys.executable), closures=closures
             )
-        except ConformanceError:
+        except ConformanceError as exc:
+            if exc.code == "package_contract":
+                raise
             closures = {}
     return DescribedEnvironment(
         record_digest(found.get(_normalized(request.root))), callees, own, closures
@@ -178,7 +183,8 @@ def _environment(request: DescribeEnvironment) -> DescribedEnvironment:
 
 
 def describe() -> int:
-    """`machine-describe`: one request on stdin, its reply on stdout; a failure is a reply."""
+    """`machine-describe`: one request on stdin, its reply on stdout; a failure is a reply, and
+    its exit is `validation`."""
     reply: Described | DescribedEnvironment | DescribeFailed
     try:
         request = msgspec.json.decode(
@@ -214,7 +220,7 @@ def describe() -> int:
             f"({Path(frame.filename).name}:{frame.lineno})",
         )
     sys.stdout.buffer.write(msgspec.json.encode(reply))
-    return 0
+    return int(Exit.validation) if isinstance(reply, DescribeFailed) else 0
 
 
 # --------------------------------------------------------------------------- frame-codec

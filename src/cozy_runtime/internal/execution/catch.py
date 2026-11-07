@@ -202,6 +202,8 @@ def cut[T](
             except BaseException as exc:
                 again = retry(device, key, name, menu, level, token, stream, exc, pure)
                 if again is None:
+                    if is_capacity(exc):  # the run record names it: a package's `holds` was short
+                        request.working_splits[key]["refused"] = {"level": level, "pure": pure}
                     raise
                 selection = again
                 continue
@@ -239,6 +241,13 @@ def retry(
         if (request := CURRENT.get()) is not None:
             request.finer_splits += 1
     return again
+
+
+def refusals(device: int) -> Callable[[], tuple[int, Request | None]] | None:
+    """varena's count of allocations it refused on `device`, with the request whose Retries it
+    excludes, for the package contract's scopes; None from a TensorFS that counts none."""
+    count = getattr(vt, "ooms", None)
+    return None if count is None else lambda: (count(device), CURRENT.get())
 
 
 def _unwind(exc: BaseException) -> None:

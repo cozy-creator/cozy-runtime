@@ -121,3 +121,8 @@ class _Determinism:
 
 
 _DETERMINISM = _Determinism()
+
+
+def deterministic_open() -> bool:
+    """Whether a `deterministic=True` scope of this process holds cuDNN's mode now."""
+    return _DETERMINISM._open > 0

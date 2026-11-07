@@ -80,7 +80,7 @@ from cozy_runtime.graphs import (
     say,
 )
 from cozy_runtime.graphs.domain import Pool
-from cozy_runtime.internal import cache_owners
+from cozy_runtime.internal import cache_owners, contract
 from cozy_runtime.lm import _kernels
 
 try:
@@ -232,9 +232,9 @@ def generate(
         row = ("decode ran through Transformers' loop", {"why": why})
         if row not in WARNINGS:
             WARNINGS.append(row)
-        return _transformers(
-            model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell, allowed
-        )
+        with contract.owned():  # the Runtime's own use of Transformers' loop and caches
+            said = (model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell)
+            return _transformers(*said, allowed)
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
         if engine is None:
@@ -244,7 +244,7 @@ def generate(
     )
     token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
     try:
-        with torch.inference_mode():
+        with torch.inference_mode(), contract.owned():
             return engine.generate(request, draft)
     finally:
         BYPASS.reset(token)
