@@ -1,20 +1,16 @@
 """An attention call a package writes itself, as one site the Runtime manages: the Runtime picks
 its kernel (FA3, Sage, Sol or SDPA) per site and honours `--attention-kernel`, as on Diffusers'
-own attention modules. It holds no parameters, so adding one changes no state dict."""
+own attention modules. It imports no Diffusers, and holds no parameters, so adding one changes
+no state dict."""
 
 from __future__ import annotations
 
-from typing import Any
-
 import torch
-from diffusers.models.attention import AttentionModuleMixin
-from diffusers.models.attention_dispatch import dispatch_attention_fn
+
+from cozy_runtime.internal.attention_site import Site
 
 
-class Processor:
-    _attention_backend: Any = None
-    _parallel_config: Any = None
-
+class Processor(Site):
     def __call__(
         self,
         attn: Attention,
@@ -25,20 +21,9 @@ class Processor:
         bias: torch.Tensor | None = None,
         causal: bool = False,
     ) -> torch.Tensor:
-        backend = self._attention_backend
-        # Diffusers' own default backend (no Runtime site) aligns unequal causal top-left.
-        unaligned = causal and backend is None and q.shape[1] != k.shape[1]
-        if mask is not None or bias is not None or unaligned:
+        if mask is not None or bias is not None:
             mask, causal = _joined(q, k, mask, bias, causal), False
-        return dispatch_attention_fn(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            is_causal=causal,
-            backend=backend,
-            parallel_config=self._parallel_config,
-        )
+        return self.dispatch(q, k, v, attn_mask=mask, is_causal=causal)
 
 
 def _joined(
@@ -69,7 +54,7 @@ def _joined(
     return torch.where(allowed, added, float("-inf"))
 
 
-class Attention(torch.nn.Module, AttentionModuleMixin):
+class Attention(torch.nn.Module):
     """Attention over `(batch, tokens, heads, head_dim)` queries, keys and values, in `dtype`;
     keys and values may be longer than queries (a cached prefix).
 
@@ -85,16 +70,12 @@ class Attention(torch.nn.Module, AttentionModuleMixin):
     all on the quantized and sparse kernels) leaves that call to SDPA, and the run's record
     counts it. With a mask or bias, causal is folded into that mask."""
 
-    _default_processor_cls = Processor
-    _available_processors = [Processor]  # noqa: RUF012 (Diffusers' class attribute)
-
     def __init__(
         self, heads: int, head_dim: int, dtype: torch.dtype = torch.bfloat16, causal: bool = False
     ) -> None:
         super().__init__()
         self.heads, self.head_dim, self.activation_dtype = heads, head_dim, dtype
-        self.causal = causal
-        self.set_processor(Processor())
+        self.causal, self.processor = causal, Processor()
 
     def forward(
         self,

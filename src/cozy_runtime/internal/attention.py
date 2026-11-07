@@ -1,7 +1,9 @@
-"""Select and install attention backends for constructed diffusers modules.
+"""Select and install attention backends for constructed modules: Diffusers' attention modules
+and the Runtime's own sites (`attention_site`), which need no Diffusers.
 
 Every kernel is a Runtime-local forward (`attention_upstream`, `attention_sol`) that
-`attention_ulysses` registers with Diffusers, so one wrapper serves every degree. A site takes
+`attention_ulysses` makes one call of, so one wrapper serves every degree: a Runtime site calls
+it, and it is registered with Diffusers for a Diffusers site. A site takes
 the first kernel of its GPU family's cell (`DENSE`, `SPARSE`, by `arch` row) at its attention
 level that serves it here: 16 for a request at 16 bits (`EXACT`), else the model's
 `attention_bits` for the site (default 16). A kernel that is not part of torch is compiled on
@@ -61,6 +63,7 @@ from cozy_runtime.internal import (
     verify,
 )
 from cozy_runtime.internal import attention_upstream as upstream
+from cozy_runtime.internal.attention_site import Site
 from cozy_runtime.internal.attention_ulysses import Local
 from cozy_runtime.internal.encoding.formats import Tensor
 from cozy_runtime.internal.encoding.selection import DeviceFacts
@@ -510,10 +513,11 @@ type _Record = tuple[str, str, Any, Any]
 
 @dataclass(frozen=True, slots=True)
 class Ready:
-    """One candidate compiled, imported and launched on this device, with Diffusers' member."""
+    """One candidate compiled, imported and launched on this device, with its backend's call
+    (`attention_ulysses.function`), which Diffusers' member and a Runtime site both reach."""
 
     candidate: Candidate
-    member: Any
+    function: Any
     #: The compiled artifact serving it: flat string fields, as an observation row carries them.
     artifact: dict[str, str] | None = None
 
@@ -537,6 +541,17 @@ def _registry() -> Any:
 def _member(candidate: Candidate) -> Any:
     """The Diffusers member serving this candidate, registered on first use."""
     return attention_ulysses.member(candidate.backend, _local(candidate))
+
+
+def _function(candidate: Candidate) -> Any:
+    """This candidate's backend call, with no Diffusers."""
+    return attention_ulysses.function(candidate.backend, _local(candidate))
+
+
+def _handle(processor: object, entry: Ready) -> Any:
+    """What a site's processor dispatches by: a Runtime site its backend's name, a Diffusers
+    processor Diffusers' member."""
+    return entry.candidate.backend if isinstance(processor, Site) else _member(entry.candidate)
 
 
 #: backend -> the kernel its Diffusers member calls (`_local`)
@@ -713,11 +728,10 @@ def _launch(ready: Ready, device: DeviceFacts) -> None:
     if not candidate.artifact or candidate.sparse or device.kind != "cuda" or not cases:
         return
     import torch
-    from diffusers.models.attention_dispatch import dispatch_attention_fn
 
     def call(q: Tensor, k: Tensor, v: Tensor, causal: bool) -> Tensor:
-        out: object = dispatch_attention_fn(q, k, v, backend=ready.member, is_causal=causal)
-        return out[0] if isinstance(out, tuple) else out
+        out: Tensor = ready.function(q, k, v, is_causal=causal)
+        return out
 
     probe = partial(prebuilt.attention_probe, torch, device.index, call, candidate.exact, cases)
     key = (ready.artifact or {}).get("key", "") or _environment_key(candidate)
@@ -769,7 +783,7 @@ def _prebuilt_fa3(candidate: Candidate, device: DeviceFacts) -> Ready | None:
     digest = prebuilt.artifact("_fa3").partition(":")[2][:16]
     upstream.bind_fa3(kernel, f"prebuilt {digest}")
     _STATES[candidate.name] = kernel_compile.State("prebuilt", "ready")
-    return Ready(candidate, _member(candidate), {"artifact": "prebuilt", "key": digest})
+    return Ready(candidate, _function(candidate), {"artifact": "prebuilt", "key": digest})
 
 
 def _compile_dependencies(
@@ -843,7 +857,6 @@ def _open(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready | None
 def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
     """One candidate compiled, imported and launched on this device, or a typed refusal; its
     build waited for when `wait`."""
-    _registry()
     if candidate.producer is not None:
         base = (_waited if wait else _opened)(BY_NAME[candidate.producer.base], device)
         kernel = _import(base.candidate)
@@ -853,7 +866,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
                 "attention_kernel_absent",
                 f"{candidate.name}: {base.candidate.import_name} lacks {', '.join(missing)}",
             )
-        return Ready(candidate, _member(candidate), base.artifact)
+        return Ready(candidate, _function(candidate), base.artifact)
     prebuilt_ready = _prebuilt_fa3(candidate, device)
     if prebuilt_ready is not None:
         return prebuilt_ready
@@ -897,7 +910,7 @@ def _resolve(candidate: Candidate, device: DeviceFacts, wait: bool) -> Ready:
         _sol_route(device, wait)
         if device.kind == "cuda":
             attention_sol.submit_card(device.index)
-    ready = Ready(candidate, _member(candidate), artifact)
+    ready = Ready(candidate, _function(candidate), artifact)
     try:
         _launch(ready, device)
     except AttentionRefusal as exc:
@@ -1064,11 +1077,10 @@ _EXACT_AT = "; exact="
 
 def _bind_sol_dense(chosen: tuple[Ready, Ready | None]) -> None:
     dense, exact = chosen
-    backends = _registry()._backends
     attention_sol.bind_dense(
-        backends[dense.member],
+        dense.function,
         dense.name if exact is None else f"{dense.name}{_EXACT_AT}{exact.name}",
-        None if exact is None else backends[exact.member],
+        None if exact is None else exact.function,
     )
 
 
@@ -1124,21 +1136,24 @@ def _trees(roots: Mapping[str, object]) -> Iterator[tuple[str, Any]]:
 
 
 def _attention_records(roots: Mapping[str, object]) -> Iterator[_Record]:
-    """All Diffusers attention processors, including those with no backend dispatch."""
+    """Every Runtime site (`attention_site.Site`) and Diffusers attention processor, including
+    Diffusers' with no backend dispatch. An environment without Diffusers has only the first."""
     trees = list(_trees(roots))
     if not trees:  # a weightless call has none, and imports no Diffusers (or torch) to say so
         return
-    try:
+    classes: tuple[type, ...] = ()
+    with suppress(ImportError):
         from diffusers.models.attention import AttentionModuleMixin
         from diffusers.models.attention_processor import Attention, MochiAttention
-    except ImportError:
-        return
-    classes = (Attention, MochiAttention, AttentionModuleMixin)
+
+        classes = (Attention, MochiAttention, AttentionModuleMixin)
     seen: set[int] = set()
     for component, tree in trees:
         for path, module in tree.named_modules():
             processor = getattr(module, "processor", None)
-            if id(module) not in seen and isinstance(module, classes) and processor is not None:
+            if id(module) in seen or processor is None:
+                continue
+            if isinstance(processor, Site) or isinstance(module, classes):
                 seen.add(id(module))
                 yield component, path, module, processor
 
@@ -1317,15 +1332,6 @@ def _projections(module: object) -> tuple[object, ...]:
     if q is not None and k is not None and v is not None:
         return (q, k, v)
     return ()
-
-
-def _context_parallel(member: Any) -> bool:
-    """Does diffusers' registry mark this backend as one it can shard? Read at the pin and
-    never restated on a row: the backend's own registration is the authority, and a static
-    copy of it would be the drift `_admit_arch` exists to refuse."""
-    from diffusers.models.attention_dispatch import _AttentionBackendRegistry
-
-    return bool(_AttentionBackendRegistry._is_context_parallel_available(member))
 
 
 @dataclass(frozen=True, slots=True)
@@ -1531,12 +1537,13 @@ def _unfit(
     invalid = _invalid(candidate.producer, module)
     if invalid:
         return invalid
+    if degree > 1 and not _local(candidate).head_local:
+        return f"{candidate.name} cannot shard sequence-parallel degree {degree}"
+    if isinstance(getattr(module, "processor", None), Site):
+        return ""
     try:
-        member = _member(candidate)
-        if member not in _registry()._backends:
+        if _member(candidate) not in _registry()._backends:
             return f"{candidate.name} is not registered with Diffusers"
-        if degree > 1 and not _context_parallel(member):
-            return f"{candidate.name} cannot shard sequence-parallel degree {degree}"
     except Exception as exc:
         return f"{type(exc).__name__}: {exc}"[:300]
     return ""
@@ -1701,7 +1708,7 @@ def install(
         ]
     )
     for _component, _path, _module, processor, entry in assignments:
-        processor._attention_backend = entry.member
+        processor._attention_backend = _handle(processor, entry)
     if skipped is not None:
         skipped.update(refused)
     artifacts = {name: entry.artifact for name, entry in resolved.items() if entry.artifact}
@@ -1940,7 +1947,7 @@ class Swap:
             _bind_sol_dense(self.dense)
         hosts: dict[str, dict[str, int]] = {}
         for component, _, _, processor, entry in self.sites:
-            processor._attention_backend = entry.member
+            processor._attention_backend = _handle(processor, entry)
             hosts.setdefault(component, {})
             hosts[component][entry.name] = hosts[component].get(entry.name, 0) + 1
         served = {entry.name: entry for *_, entry in self.sites}
@@ -1974,14 +1981,12 @@ def admit(pin: str, degree: int) -> None:
             "attention_kernel_unknown",
             f"unknown attention kernel {name!r}; this runtime knows {sorted(known())}",
         )
-    if degree > 1:
-        _registry()
-        if not _context_parallel(_member(candidate)):
-            raise AttentionRefusal(
-                "attention_kernel_unsupported",
-                f"{name} does not support context parallelism, which this sequence-parallel "
-                f"degree {degree} construction requires",
-            )
+    if degree > 1 and not _local(candidate).head_local:
+        raise AttentionRefusal(
+            "attention_kernel_unsupported",
+            f"{name} does not support context parallelism, which this sequence-parallel "
+            f"degree {degree} construction requires",
+        )
 
 
 def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: int = 1) -> Swap:
@@ -1996,7 +2001,7 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
     records = list(_attention_records(selected))
     if not records:
         raise AttentionRefusal(
-            "attention_kernel_unsupported", f"{name} matches no diffusers attention site"
+            "attention_kernel_unsupported", f"{name} matches no attention site"
         )
     if backend == EXACT:  # a compiled module keeps the kernel it was compiled with
         return exact(device, [] if _baked_in(selected) else records, name, degree)
@@ -2005,10 +2010,8 @@ def plan(device: DeviceFacts, roots: Mapping[str, object], name: str, degree: in
     why = _baked_in(selected)
     why = why and f"{why}; a compiled module keeps the kernel it was compiled with"
     entry = None
-    if not why and degree > 1:
-        _registry()
-        if not _context_parallel(_member(candidate)):
-            why = f"{backend} cannot shard sequence-parallel degree {degree}"
+    if not why and degree > 1 and not _local(candidate).head_local:
+        why = f"{backend} cannot shard sequence-parallel degree {degree}"
     if not why:
         try:
             entry = pinned(backend, device)[0]
