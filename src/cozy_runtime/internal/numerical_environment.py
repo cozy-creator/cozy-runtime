@@ -1,4 +1,5 @@
-"""Cheap numerical execution policy, independent of SDK and package inventories.
+"""The Runtime's numerics policy, the one owner of Torch's global numerics (CONTRACT §9), and
+its cheap salt, independent of SDK and package inventories.
 
 Callee implementation declarations own Python helpers, data, and installed native
 build identities. This salt carries only the execution device and imposed numeric
@@ -7,10 +8,15 @@ policy; it must never inspect distributions, RECORD files, or native binaries.
 
 from __future__ import annotations
 
+import functools
 import hashlib
-from collections.abc import Mapping
+import threading
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from typing import Any
 
 from cozy_runtime import canonical_json
+from cozy_runtime.author import _model
 from cozy_runtime.internal.hostfacts import HostFacts
 
 
@@ -63,3 +69,45 @@ def fingerprint(
     return hashlib.sha256(
         b"cozy.runtime.numerical-environment/4\0" + canonical_json.encode(facts)
     ).digest()
+
+
+def apply(torch: Any) -> None:
+    """The policy, set once per executor before any package code runs on its device: float32
+    matmuls and cuDNN in full IEEE precision, never TF32, and `deterministic=True` scopes'
+    cuDNN mode. Through the `allow_tf32` setters: in torch 2.15 setting `fp32_precision`
+    makes the `cudnn.allow_tf32` getter raise, and stage memos and recorded loops read it."""
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    _model.DETERMINISTIC[0] = functools.partial(_DETERMINISM.held, torch)
+
+
+class _Determinism:
+    """cuDNN deterministic, without benchmarking, while any `deterministic=True` scope of this
+    process is open; the settings before the first come back after the last. Counted rather
+    than saved per scope, because scopes on two threads (a remote scope beside a local one)
+    may close in either order: a deterministic scope never runs with the flag cleared."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._open = 0
+        self._before = (False, False)
+
+    @contextmanager
+    def held(self, torch: Any) -> Iterator[None]:
+        cudnn = torch.backends.cudnn
+        with self._lock:
+            if not self._open:
+                self._before = (bool(cudnn.deterministic), bool(cudnn.benchmark))
+                cudnn.deterministic, cudnn.benchmark = True, False
+            self._open += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._open -= 1
+                if not self._open:
+                    cudnn.deterministic, cudnn.benchmark = self._before
+
+
+_DETERMINISM = _Determinism()

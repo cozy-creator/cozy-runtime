@@ -153,6 +153,7 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_ready,
     model_config,
+    numerical_environment,
     pacing,
     package_interface,
     prebuilt,
@@ -1094,6 +1095,7 @@ class Executor:
             self._open_memory(torch)
         except ResidencyError as exc:
             return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+        numerical_environment.apply(torch)
         accel.first_launches(torch, self.device_kind)
         self._device_ready = True
         place(self._device())
