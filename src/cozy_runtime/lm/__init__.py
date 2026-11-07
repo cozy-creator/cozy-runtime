@@ -1610,6 +1610,13 @@ class _Engine:
         self.streamed = not held
         if self.streamed:
             self.where = ("streamed",)  # what a graph recorded no longer holds
+            self._host(True)
+
+    def _host(self, on: bool) -> None:
+        """While `on`, the model's token tables gather their rows on the host: streamed, a table on
+        the card holds its whole size of the room for one row a token."""
+        if (placed := PLACED.get(self.model)) is not None:
+            placed[0].host_tables(placed[1], on)
 
     def _hold(self, stack: ExitStack) -> bool:
         """Prepare the retained weight tensors while this driver runs. False: they do not fit
@@ -1621,7 +1628,7 @@ class _Engine:
         derived = _derived(m for m in (self.model, self.draft) if m is not None)
         built = tuple(t.data_ptr() for t in derived)
         identities: list[object] = []
-        bindings = []
+        bindings: list[Any] = []
         for module, (residency, name) in self._targets():
             binding = self.addresses.get(id(module))
             if binding is not None and not binding.valid():
@@ -1636,6 +1643,7 @@ class _Engine:
             weights = sum(block.allocation_bytes for b in bindings for block in b.groups)
             if weights + self.held > int(vt.room(device.index or 0)["capacity"]):
                 return False
+        self._host(False)  # a held set is captured: its tables are on the card
         with ExitStack() as leases:
             for binding in bindings:
                 try:

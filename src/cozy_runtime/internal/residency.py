@@ -422,6 +422,8 @@ class _Block:
     parked: dict[Hashable, tuple[Any, Any]] = field(default_factory=dict)
     #: an `nn.Embedding`'s table: one that does not fit the room gathers its rows on the host
     table: bool = False
+    #: a table that gathers on the host whatever the room (`Memory.host_tables`)
+    hosted: bool = False
     #: its host copy while it gathers, by overlay: (overlay, raw views, final views)
     gathered: tuple[Hashable, dict[str, dict[str, Tensor]], dict[str, dict[str, Tensor]]] | None = (
         None
@@ -1443,6 +1445,18 @@ class Memory:
         if self.pages is not None:
             self.pages.forget(model.name)
 
+    def host_tables(self, model: Model, on: bool) -> None:
+        """While `on`, `model`'s embedding tables gather their rows on the host (`_gather`), and
+        the plan names none of them. A decode whose weights stream reads one row of a table a
+        token, and the table on the card held its whole size of the room, or moved it, every pass
+        (Qwen3.5-9B's 1.94 GiB, run 42124)."""
+        with self.lock:
+            tables = [b for b in model.blocks.values() if b.table and b.hosted != on]
+            for block in tables:
+                block.hosted = on
+            if tables and self._phase_names and model in self._phase_plan_models:
+                self._refresh_phase_plan(self._phase_names)
+
     def host_pending(self) -> bool:
         """Whether pages wait for an idle executor to pin them (`pin_idle`)."""
         return self.pages is not None and self.pages.pending()
@@ -1760,6 +1774,8 @@ class Memory:
                 return [], [], "representation_identity_incomplete"
             bindings = []
             for block in model.groups():
+                if block.hosted:
+                    continue  # it serves from the host: the phase reads no Region of it
                 if block.gathered is not None:
                     return [], [], "host_gathered_representation"
                 raw_needed = (
@@ -1923,8 +1939,10 @@ class Memory:
         there and moves only the rows it read (`_gathering`), so a room below the table never
         fails the call (Qwen-Image's 1.2 GB text-encoder table beside a 5 GB game on 8 GB). The
         copy is the host tier's page when it keeps one, else read once and held while the table
-        gathers; each entry tries the device first."""
-        self._retire_phase_plan("host_gathered_representation", model=block.model)
+        gathers; each entry tries the device first, unless the table is `hosted`, which no plan
+        names."""
+        if not block.hosted:
+            self._retire_phase_plan("host_gathered_representation", model=block.model)
         if block.gathered is None or block.gathered[0] != overlay:
             block.gathered = None
             model = block.model
@@ -1996,8 +2014,11 @@ class Memory:
                 if block.escape_site and request is not None and not request.idle and not capturing:
                     block.born_before = self._entered(block, request)
                 try:
-                    self._ensure(block, reclaim, overlay)
-                    block.gathered = None
+                    if block.hosted and self.cuda and not capturing:
+                        self._gather(block, overlay)
+                    else:
+                        self._ensure(block, reclaim, overlay)
+                        block.gathered = None
                 except Exhausted:  # varena refused its region before its forward ran
                     if not (block.table and reclaim and self.cuda and not capturing):
                         raise

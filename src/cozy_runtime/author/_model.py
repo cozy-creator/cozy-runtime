@@ -359,6 +359,10 @@ class Residency(Protocol):
         """Every page a retained region covers is on the device now."""
         ...
 
+    def host_tables(self, component: str, on: bool) -> None:
+        """While `on`, `component`'s token tables gather their rows on the host."""
+        ...
+
     def lora_choices(self, components: tuple[str, ...]) -> dict[str, LoRAServing]:
         """The attempt's selected serving recipe, carried with each mirrored scope."""
         ...

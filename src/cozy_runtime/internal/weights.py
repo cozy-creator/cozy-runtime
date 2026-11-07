@@ -1286,6 +1286,11 @@ class Placement:
         """An idle capture's request: it fills free bytes only and never evicts."""
         return self.memory.request(graphs.IDLE_REQUEST, idle=True)
 
+    def host_tables(self, component: str, on: bool) -> None:
+        """While `on`, `component`'s token tables serve from the host (`Memory.host_tables`)."""
+        model = self.models[component]
+        model.memory.host_tables(model, on)
+
     def graph_resident(self, binding: Binding) -> bool:
         """Every page `binding` covers is on the device now (an idle capture never fills one)."""
         return binding.resident()
