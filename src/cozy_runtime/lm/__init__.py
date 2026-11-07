@@ -30,6 +30,12 @@ capture refusal (a run warning), the same step runs eagerly. A model this does n
 serve (a layer type other than full or linear attention, an attention other than SDPA or eager, a
 generation config that adds logits processors) generates through Transformers, said once.
 
+With `allowed` (a `Constraint`), each step's tokens are read back to the host, which asks the
+constraint what may follow and writes that into a bit mask the next step's graph reads: one sync a
+step, as the stop flag is, but caught up with each step rather than a few behind. A drafted
+constrained step runs its drafts and its verify as separate graphs, each draft read back before
+the mask after it is written.
+
 With a `draft` (a model's multi-token-prediction head) a step drafts `DEPTH` tokens, the model
 verifies them and the token after them in one pass, and the step keeps the prefix the model
 agrees with and the model's own token after it: the greedy tokens the model alone gives, one to
@@ -51,7 +57,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, Protocol
 
 import tensorfs.varena.torch as vt
 from tensorfs.varena import Exhausted
@@ -62,7 +68,17 @@ from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author._services import stage_progress
 from cozy_runtime.author.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
-from cozy_runtime.graphs import BYPASS, DECODERS, capture, capture_domain, safeguard, say
+from cozy_runtime.graphs import (
+    BYPASS,
+    DECODERS,
+    _measured,
+    capture,
+    capture_domain,
+    close_pool,
+    no_room,
+    safeguard,
+    say,
+)
 from cozy_runtime.graphs.domain import Pool
 from cozy_runtime.internal import cache_owners
 from cozy_runtime.lm import _kernels
@@ -146,6 +162,16 @@ _PROCESSORS: dict[str, tuple[object, ...]] = {
 }
 
 
+class Constraint(Protocol):
+    """What may follow a row's tokens (`generate`'s `allowed`), an outlines Guide's shape."""
+
+    def allowed(self, tokens: Sequence[int]) -> Sequence[int]:
+        """The ids that may follow `tokens`, one row's generated ids (its prompt excluded); once
+        the grammar is complete, its stop token. Pure in `tokens`: a draft is checked as
+        `allowed(prefix + draft[:k])` for each k, with nothing to undo."""
+        ...
+
+
 def generate(
     model: Any,
     inputs: Mapping[str, Any],
@@ -159,6 +185,7 @@ def generate(
     top_k: int = 0,
     seed: int = 0,
     draft: Any = None,
+    allowed: Constraint | None = None,
     progress: Callable[[int], None] | None = None,
 ) -> Any:
     """Tokens after the prompt, `[batch, n]` (`model.generate(...)`'s tail): `inputs` as the
@@ -168,6 +195,10 @@ def generate(
     above it, each token is drawn from the `top_p` nucleus at that temperature, from `seed`: the
     same prompt and seed give the same tokens. `top_k` above 0 first keeps a sampling row's `top_k`
     largest logits, before the presence penalty; greedy decoding ignores it.
+    `allowed` (`Constraint`) constrains every row: each token outside
+    `allowed.allowed(its tokens so far)` is out before `top_k`, the presence penalty, temperature
+    and top-p, greedy or sampled, drafted or not. The host asks it between steps, so a
+    constrained batch's steps do not queue ahead of it.
     `draft(embeds, hidden, position_ids, past_key_values, attention_mask, rotary) -> hidden` is
     the model's multi-token-prediction head (`Draft`): from a token's embedding and the state the
     model's head read before it, the state the head reads for the token after; `rotary` is the
@@ -202,13 +233,15 @@ def generate(
         if row not in WARNINGS:
             WARNINGS.append(row)
         return _transformers(
-            model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell
+            model, inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell, allowed
         )
     with _ENGINES_LOCK:
         engine = _ENGINES.get(model)
         if engine is None:
             engine = _ENGINES[model] = _Engine(model)
-    request = _Request(inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell)
+    request = _Request(
+        inputs, max_new_tokens, stops, filler, presence_penalty, sampling, tell, allowed
+    )
     token = BYPASS.set(True)  # the component's calls are this loop's, its graphs its own
     try:
         with torch.inference_mode():
@@ -630,14 +663,34 @@ class _Sampling(NamedTuple):
     top_k: int = 0
 
 
-#: A step's graph: (rows, window, drafted, sampled, the most logits a sampling row keeps).
-_Key = tuple[int, int, bool, bool, int]
+#: A step's graph: (rows, window, drafted, sampled, the most logits a sampling row keeps,
+#: constrained, and a constrained drafted step's part: each draft, then the verify; else -1).
+_Key = tuple[int, int, bool, bool, int, bool, int]
 
 
 def _top_k(scores: Any, k: int) -> Any:
     """`scores` (`[..., vocab]`) with all but each row's `k` largest at -inf (ties kept)."""
     kth = scores.topk(min(k, scores.shape[-1]), dim=-1).values[..., -1:]
     return scores.masked_fill(scores < kth, float("-inf"))
+
+
+def _ids(constraint: Constraint, tokens: Sequence[int], vocab: int) -> Any:
+    """`constraint.allowed(tokens)` as a host index tensor: some, each in the vocabulary."""
+    ids = torch.as_tensor(constraint.allowed(tokens)).to("cpu", torch.long).reshape(-1)
+    if not ids.numel() or int(ids.min()) < 0 or int(ids.max()) >= vocab:
+        raise ValueError(
+            f"allowed() after {len(tokens)} tokens gave {ids.numel()} ids: it gives at least one, "
+            f"each below the vocabulary's {vocab} (a complete grammar, its stop token)"
+        )
+    return ids
+
+
+def _pack(ids: Any, out: Any) -> None:
+    """`ids` as bits of `out` (`[ceil(vocab / 8)]` uint8, on the host): token 8i + j is bit j of
+    byte i."""
+    bits = torch.zeros(out.numel() * 8, dtype=torch.uint8)
+    bits[ids] = 1
+    out.copy_((bits.view(-1, 8) << torch.arange(8, dtype=torch.uint8)).sum(-1, dtype=torch.uint8))
 
 
 _LOW32 = 0xFFFFFFFF
@@ -701,6 +754,22 @@ def _per_row(sampling: _Sampling, rows: int, device: Any) -> tuple[Any, Any, Any
     )
 
 
+class _Allowed:
+    """`allowed` as a Transformers logits processor, for `_transformers`: each row's tokens
+    after the prompt, until a stop."""
+
+    def __init__(self, prompt: int, constraint: Constraint, stops: list[int]) -> None:
+        self.prompt, self.constraint, self.stops = prompt, constraint, set(stops)
+
+    def __call__(self, input_ids: Any, scores: Any) -> Any:
+        keep = torch.ones(scores.shape, dtype=torch.bool)
+        for row, tokens in enumerate(input_ids[:, self.prompt :].tolist()):
+            if not self.stops.intersection(tokens):  # a finished row continues as padding
+                keep[row] = False
+                keep[row, _ids(self.constraint, tokens, int(scores.shape[-1]))] = True
+        return scores.masked_fill(~keep.to(scores.device), float("-inf"))
+
+
 class _TopK:
     """`top_k` as a Transformers logits processor, for `_transformers`."""
 
@@ -734,9 +803,10 @@ def _transformers(
     penalty: float,
     sampling: _Sampling,
     tell: _Tell,
+    allowed: Constraint | None = None,
 ) -> Any:
     prompt = int(inputs["input_ids"].shape[1])
-    processors: list[Any] = []
+    processors: list[Any] = [] if allowed is None else [_Allowed(prompt, allowed, stops)]
     if sampling.temperature > 0 and sampling.top_k:
         processors.append(_TopK(sampling.top_k))
     if penalty:
@@ -1185,7 +1255,9 @@ class _Request:
         penalty: float,
         sampling: _Sampling,
         tell: _Tell,
+        allowed: Constraint | None = None,
     ) -> None:
+        self.allowed = allowed
         self.inputs, self.max_new, self.stops, self.pad, self.penalty, self.sampling = (
             inputs,
             max_new,
@@ -1239,6 +1311,14 @@ class _Row:
         self.request, self.row, self.length = request, row, length
         #: the most tokens it can hold after the steps queued so far (the window's bound)
         self.reach = length + 1
+        #: a constrained row's tokens as the host knows them (`_took`), and this step's drafts
+        self.generated: list[int] | None = None
+        self.drafts: list[int] = []
+
+    def ended(self) -> bool:
+        """A constrained row the host knows done: at a stop token, or its limit."""
+        said, request = self.generated or [], self.request
+        return bool(said) and (said[-1] in request.stops or len(said) >= request.max_new)
 
 
 class _Engine:
@@ -1272,6 +1352,9 @@ class _Engine:
     position: torch.Tensor
     dmask: torch.Tensor
     hidden: torch.Tensor
+    drafts: torch.Tensor
+    dhidden: torch.Tensor
+    allow: torch.Tensor
 
     def __init__(self, model: Any) -> None:
         self.model = model
@@ -1304,8 +1387,10 @@ class _Engine:
         self.cache: Any = None
         self.views: dict[int, Any] = {}
         self.graphs: dict[_Key, Any] = {}
-        #: Full shape variants whose real accepted step preseeded their capture pool.
+        #: Full shape variants whose real accepted step preseeded their capture pool, and the
+        #: working peak varena measured it at: the pool its capture prepares first.
         self.warmed: set[_Key] = set()
+        self.peaks: dict[_Key, int] = {}
         self.layout: tuple[object, ...] | None = None
         #: its decode graphs' capture pool (`domain.Pool`): the model's graph region, or a
         #: torch pool of its own with no varena memory
@@ -1336,6 +1421,8 @@ class _Engine:
         self.misfit = ""
         #: `_capture_contract` with and without the head, until the graphs are next forgotten
         self.contracts: dict[bool, str] = {}
+        #: the part of a constrained drafted step being run (`_one`), -1 for a whole step
+        self.part = -1
         self.open: bool | float
         self.closed: bool | float
         if self.text._attn_implementation == "sdpa":
@@ -1383,6 +1470,7 @@ class _Engine:
                 request.penalty,
                 request.sampling,
                 request.tell,
+                request.allowed,
             )
         self._report(request)
         return request.result()
@@ -1539,8 +1627,13 @@ class _Engine:
     where: tuple[object, ...] = ()
 
     def _cancelled(self) -> bool:
-        """Whether a held row's call was cancelled: the host stops queueing steps for it."""
-        return any(row.request.cancelled for row in self.slots if row is not None)
+        """Whether a held row's call was cancelled or failed (its constraint raised): the host
+        stops queueing steps for it."""
+        return any(
+            row.request.cancelled or row.request.error is not None
+            for row in self.slots
+            if row is not None
+        )
 
     def _occupied(self) -> int:
         return sum(row is not None for row in self.slots)
@@ -1548,10 +1641,13 @@ class _Engine:
     def _bucket(self) -> int:
         return _batch(self._occupied())
 
-    def _one(self, size: int, run: Callable[[int], None]) -> None:
-        """One step at `size` rows, and what the host knows of the rows after it."""
+    def _one(self, size: int, cuda: bool) -> None:
+        """One step at `size` rows, and what the host knows of the rows after it. A constrained
+        step's host work comes between its parts, outside the graph domain: what each row may
+        take, before each part (`_fill`); a drafted step's each draft, read back after it."""
         rows = [row for row in self.slots if row is not None]
-        per = DEPTH + 1 if self._drafting(size) else 1
+        drafting, constrained = self._drafting(size), self._constrained()
+        per = DEPTH + 1 if drafting else 1
         self.cache.window = window(max(row.reach for row in rows) + per, self.capacity)
         stream, event = None, None
         if self.cache_device.type == "cuda":
@@ -1569,9 +1665,19 @@ class _Engine:
                 event.record(stream)  # instantiate before any accepted step can run
             self.unfenced.add(stream)
         try:
-            with self.domain.using() if stream is not None else nullcontext():
-                run(size)
+            for part in range(DEPTH + 1) if drafting and constrained else (-1,):
+                self.part = part
+                if constrained:
+                    self._fill(size, max(part, 0))
+                with self.domain.using() if stream is not None else nullcontext():
+                    self._replay(size, cuda)
+                if part < 0 or part == DEPTH or not self._drafting(size):
+                    break  # the whole step, its verify, or a plain step for a part not recorded
+                if stream is not None:
+                    stream.synchronize()
+                self._drafted(size, part)
         finally:
+            self.part = -1
             if event is not None:
                 event.record(stream)
                 self.unfenced.discard(stream)
@@ -1624,7 +1730,9 @@ class _Engine:
         n = self.n.tolist()
         done = self.done.tolist()
         for slot, row in enumerate(self.slots):
-            if row is None or not (done[slot] or row.request.cancelled):
+            if row is None or not (
+                done[slot] or row.request.cancelled or row.request.error is not None
+            ):
                 continue
             request = row.request
             request.cut = request.cut or request.cancelled
@@ -1698,10 +1806,15 @@ class _Engine:
             self._drop()  # the engine takes this head (its keys' shapes) when idle
             self.draft, self.rehold = request.draft, True
             return False  # admitted once its blocks are held
+        try:
+            first = None if request.allowed is None else _ids(request.allowed, [], self.vocab)
+        except Exception as exc:  # the call's own constraint, asked before anything of it ran
+            request.error = exc
+            return True
         kwargs, mask, position = self._inputs(request)
         if not self._enter(request, position):
             return False
-        fresh = self._prefill(request, kwargs, mask, position)
+        fresh = self._prefill(request, kwargs, mask, position, first)
         if why := self._misfit(fresh):
             self.misfit = f"its decode state is not what its config gives ({why})"
             request.error = RuntimeError(f"[lm] {type(self.model).__name__}: {self.misfit}")
@@ -1804,7 +1917,11 @@ class _Engine:
             kwargs["logits_to_keep"] = 1
         return kwargs, mask, position
 
-    def _prefill(self, request: _Request, kwargs: dict[str, Any], mask: Any, position: Any) -> Any:
+    def _prefill(
+        self, request: _Request, kwargs: dict[str, Any], mask: Any, position: Any, first: Any
+    ) -> Any:
+        """The prompt through the model's own forward into a cache of its own, and each row's
+        first token, from what `first` (the constraint's ids for no tokens) allows."""
         started = time.perf_counter()
         model, ids = self.model, request.inputs["input_ids"]
         fresh = _StaticCache(self.text, request.prompt, request.prompt)
@@ -1817,6 +1934,10 @@ class _Engine:
         hidden = taken[-1]
         with _disable_current_modes():
             scores = logits.float()
+            if first is not None:
+                allowed = torch.zeros(scores.shape[-1], dtype=torch.bool, device=scores.device)
+                allowed[first.to(scores.device)] = True
+                scores = scores.masked_fill(~allowed, float("-inf"))
             token = scores.argmax(-1)
             if request.sampling.temperature > 0:
                 if request.sampling.top_k:
@@ -1862,6 +1983,7 @@ class _Engine:
         prompt = request.prompt
         stops = torch.full((self.stops.shape[1],), -1, dtype=torch.long)
         stops[: len(request.stops)] = torch.tensor(request.stops, dtype=torch.long)
+        firsts = fresh.token.tolist() if request.allowed is not None else []
         with _disable_current_modes():
             for row in range(int(fresh.token.shape[0])):
                 slot = free[row]
@@ -1906,6 +2028,8 @@ class _Engine:
                     self.dmask[slot, ..., 1 : prompt + 1] = self.open
                     self.hidden[slot].copy_(last[row])
                 self.slots[slot] = _Row(request, row, prompt)
+                if firsts:
+                    self.slots[slot].generated = [firsts[row]]
         request.began = time.perf_counter()
         request.at = (self.captured[0], self.captured[1], self.eager)
         self.retire = self.retire or bool(self.done[free[: int(fresh.token.shape[0])]].any())
@@ -1956,6 +2080,8 @@ class _Engine:
             "seed": ((size,), long, 0),
             "seen": ((size, self.vocab), f32, 0),
             "position": ((size, *lead, 1), long, 0),
+            # each step position's allowed tokens, as bits the host writes (`_fill`)
+            "allow": ((DEPTH + 1, size, -(-self.vocab // 8)), torch.uint8, 255),
         }
         draft: list[_Spec] = []
         if self.draft is not None:
@@ -1965,6 +2091,8 @@ class _Engine:
             draft = [keys, keys, ((size,), long, 0)]
             fields["dmask"] = mask
             fields["hidden"] = ((size, 1, int(self.text.hidden_size)), dtype, 0)
+            fields["drafts"] = ((size, DEPTH), long, 0)  # a step's drafts, between its parts
+            fields["dhidden"] = fields["hidden"]
         return layers, draft, fields
 
     def _need(self, size: int, capacity: int, stops: int, position: Any) -> int:
@@ -1972,7 +2100,7 @@ class _Engine:
         layers, draft, fields = self._layout(size, capacity, stops, position)
         specs = [*(spec for layer in layers for spec in layer), *draft, *fields.values()]
         each = sum(math.prod(shape) * dtype.itemsize for shape, dtype, _ in specs)
-        return each + capacity * torch.long.itemsize  # and `rows_index`
+        return each + capacity * torch.long.itemsize + 8  # and `rows_index`, `bit`
 
     def _misfit(self, fresh: _Prefill) -> str:
         """How a row of the prefill's state differs from the slots sized from the config, ""
@@ -2032,6 +2160,7 @@ class _Engine:
             draft.dtype, draft.device = draft.keys.dtype, device
             draft.is_initialized = True
         rows_index = torch.arange(capacity, device=device)
+        bit = torch.arange(8, dtype=torch.uint8, device=device)
         moving = list(self._rows()) if old is not None else []
         self.cache, self.capacity, self.cache_device = cache, capacity, device
         for name, tensor in fields.items():
@@ -2050,8 +2179,15 @@ class _Engine:
         self.slots = held + [None] * (size - len(held))
         for slot in range(len(held), size):
             self._empty(slot)
-        self.rows_index = rows_index
-        self.flag = torch.zeros((size,), dtype=torch.bool, pin_memory=device.type == "cuda")
+        self.rows_index, self.bit = rows_index, bit
+        pinned = device.type == "cuda"
+        self.flag = torch.zeros((size,), dtype=torch.bool, pin_memory=pinned)
+        # What a constrained step's host reads back (`_took`, `_drafted`) and writes (`_fill`).
+        self.took = torch.zeros(((DEPTH + 2) * size,), dtype=torch.long, pin_memory=pinned)
+        self.dtook = torch.zeros((DEPTH * size,), dtype=torch.long, pin_memory=pinned)
+        self.allow_host = torch.full(
+            tuple(self.allow.shape), 255, dtype=torch.uint8, pin_memory=pinned
+        )
         self.views = {}
         self._forget()
         self.width = stops
@@ -2095,7 +2231,8 @@ class _Engine:
         return view
 
     def _steps(self) -> None:
-        """Steps until a row is done or a call waits to join, queued `LAG` ahead of the host."""
+        """Steps until a row is done or a call waits to join, queued `LAG` ahead of the host; a
+        constrained batch's each caught up with before the next, whose mask its tokens decide."""
         cuda = self.cache_device.type == "cuda"
         if cuda and (self.where != self.layout or self.landed != LANDED[0] or self.stale):
             # The weights moved, or a kernel landed (the graphs recorded its stand-in).
@@ -2103,7 +2240,14 @@ class _Engine:
             self.layout, self.landed, self.stale = self.where, LANDED[0], False
         queued: deque[Any] = deque()
         size = self._bucket()
+        held = [slot for slot, row in enumerate(self.slots[:size]) if row is not None]
+        constrained = self._constrained()
+        lag = 0 if constrained else LAG
         began = time.perf_counter()
+
+        def ended() -> bool:  # a held row is done (a free slot in the bucket is, always)
+            flags = self.flag[:size].tolist()
+            return any(flags[slot] for slot in held)
 
         def joining() -> bool:  # a waiting call joins once decoding had its prefill's time
             # (one waiting for rows to leave, and those behind it, ask at a row's end instead)
@@ -2115,23 +2259,64 @@ class _Engine:
 
         with _disable_current_modes():
             while True:
-                self._one(size, lambda size: self._replay(size, cuda))
+                self._one(size, cuda)
                 if not cuda:
-                    if bool(self.flag[:size].any()) or joining() or self._cancelled():
+                    if constrained:
+                        self._took(size)
+                    if ended() or joining() or self._cancelled():
                         break
                     self._tell()
                     continue
                 event = torch.cuda.Event()
                 event.record()
                 queued.append(event)
-                if len(queued) > LAG:
+                if len(queued) > lag:
                     queued.popleft().synchronize()
-                    if bool(self.flag[:size].any()) or joining() or self._cancelled():
+                    if constrained:
+                        self._took(size)
+                    if ended() or joining() or self._cancelled():
                         break
                     self._tell()
             if cuda:
                 torch.cuda.current_stream().synchronize()
         self.retire = True
+
+    def _fill(self, size: int, at: int) -> None:
+        """What each held row may take at position `at` of the step (0: its next token; k: the
+        one after its first k drafts), packed on the host from its constraint and copied to the
+        device ahead of the part that reads it. A row with none, done, or whose drafts stopped
+        takes any; one whose constraint raises fails its call alone."""
+        host = self.allow_host[at, :size]
+        for slot, row in enumerate(self.slots[:size]):
+            free = True
+            if row is not None and row.generated is not None:
+                if not at:
+                    row.drafts = []
+                tokens, stops = [*row.generated, *row.drafts[:at]], row.request.stops
+                if not row.ended() and not any(t in stops for t in row.drafts[:at]):
+                    try:
+                        _pack(_ids(row.request.allowed, tokens, self.vocab), host[slot])
+                        free = False
+                    except Exception as exc:  # the call's own constraint: only it fails
+                        row.request.error = row.request.error or exc
+            if free:
+                host[slot].fill_(255)
+        self.allow[at, :size].copy_(host, non_blocking=True)
+
+    def _drafted(self, size: int, part: int) -> None:
+        """Each constrained row's draft from part `part`, which the host has caught up with."""
+        drafted = self.dtook[part * size : (part + 1) * size].tolist()
+        for slot, row in enumerate(self.slots[:size]):
+            if row is not None and row.generated is not None:
+                row.drafts.append(drafted[slot])
+
+    def _took(self, size: int) -> None:
+        """Each constrained row's tokens from the step the host has just caught up with (`took`:
+        how many it made, then each one)."""
+        took = self.took[: (DEPTH + 2) * size].tolist()
+        for slot, row in enumerate(self.slots[:size]):
+            if row is not None and row.generated is not None:
+                row.generated += [took[(1 + j) * size + slot] for j in range(took[slot])]
 
     def _tell(self) -> None:
         """Each held call's progress, its longest row's tokens: drafting decodes several a step. The
@@ -2181,7 +2366,9 @@ class _Engine:
 
     def _replay(self, size: int, cuda: bool) -> None:
         drafted = self._drafting(size)
-        key = (size, self.cache.window, drafted, self._sampled(), self._kept())
+        constrained = self._constrained()
+        part = self.part if drafted else -1
+        key = (size, self.cache.window, drafted, self._sampled(), self._kept(), constrained, part)
         placed = PLACED.get(self.model)
         unaccounted = (
             cuda
@@ -2214,13 +2401,22 @@ class _Engine:
         graph = self.graphs.get(key)
         if graph is None and cuda and key not in self.unrecorded and self.building != LANDED[0]:
             if key not in self.warmed:
-                # This is the caller's actual next token, never an extra speculative warmup.
-                with self._graph_memory(drafted):
+                # This is the caller's actual next token, never an extra speculative warmup; its
+                # working peak, as varena measured it, is what its capture's pool takes.
+                with self._graph_memory(drafted), _measured(self.domain.device) as peak:
                     self._advance(size)
                 self.warmed.add(key)
+                if peak:
+                    self.peaks[key] = peak[0]
+                self.eager += 1
+                return
+            if key not in self.peaks:  # a step never measured is never recorded
+                self._unrecorded(key, "its warm-up's working memory was not measured")
+                self._advance(size)
                 self.eager += 1
                 return
             capturing = time.perf_counter()
+            reserve, why = vt.pool_bytes(self.peaks[key]), ""
             try:
                 with (
                     self._graph_memory(drafted),
@@ -2232,12 +2428,17 @@ class _Engine:
                             if placed is not None
                             else Pool(torch.cuda.graph_pool_handle())
                         )
-                    pool = self.pool
-                    graph, why = capture(torch, lambda: self._advance(size), pool, self.domain)
+                    try:
+                        graph, why = capture(
+                            torch, lambda: self._advance(size), self.pool, self.domain, reserve
+                        )
+                    except Exhausted as exc:  # its pool's room, before anything was captured
+                        why = no_room(self.domain.device, "its pool", reserve, exc)
             except Building:  # eager until a kernel lands
                 graph, why, self.building = None, "", LANDED[0]
             finally:
                 if graph is None and not self.graphs and self.pool is not None:
+                    close_pool(self.pool, self.domain.device)
                     self.pool = None
             if graph is not None:
                 self.graphs[key] = graph
@@ -2271,6 +2472,7 @@ class _Engine:
         state.append(self.position)
         if drafted:
             state += [self.hidden, self.dmask, self.dkeys.cumulative_length]
+            state += [self.drafts, self.dhidden]
         for layer in self.cache.layers:
             if isinstance(layer, _Keys):
                 state.append(layer.cumulative_length)
@@ -2303,6 +2505,9 @@ class _Engine:
                 self._pool(False)  # the pool's last graph goes: its use ends while it owns it
             del self.graphs[key]
             graph.reset()
+            if not self.graphs:
+                close_pool(self.pool, self.domain.device)
+                self.pool = None
             self._unrecorded(key, why, "replay_mismatch")
 
     def _forget(self) -> None:
@@ -2319,7 +2524,9 @@ class _Engine:
             self.retired_graphs += len(self.graphs)
             for graph in self.graphs.values():
                 graph.reset()
-            self.graphs, self.warmed, self.unrecorded = {}, set(), {}
+            if self.pool is not None:
+                close_pool(self.pool, self.domain.device)
+            self.graphs, self.warmed, self.unrecorded, self.peaks = {}, set(), {}, {}
             self.undrafted = False
             self.pool = None
 
@@ -2369,6 +2576,22 @@ class _Engine:
         """Whether a held row samples: such a step draws, an all-greedy one only takes argmaxes."""
         return any(row is not None and row.request.sampling.temperature > 0 for row in self.slots)
 
+    def _constrained(self) -> bool:
+        """Whether a held row has a constraint: its step reads `allow` and reports its tokens."""
+        return any(row is not None and row.request.allowed is not None for row in self.slots)
+
+    def _allowed(self, scores: Any, size: int, at: int | slice) -> Any:
+        """`scores` (`[size, ..., vocab]`) with what a constrained row may not take at -inf: the
+        host's bits (`allow`) for position `at` of the step (a slice: `[size, positions, vocab]`);
+        as they are where no held row is constrained."""
+        if not self._constrained():
+            return scores
+        allowed = ((self.allow[at, :size, :, None] >> self.bit) & 1).flatten(-2)
+        allowed = allowed[..., : self.vocab].bool()
+        if isinstance(at, slice):
+            allowed = allowed.movedim(0, 1)
+        return scores.masked_fill(~allowed, float("-inf"))
+
     def _kept(self) -> int:
         """The most logits a held sampling row keeps (`top_k`), 0 when none cuts: a step's
         constant, so its graph takes `topk` of that many."""
@@ -2405,11 +2628,15 @@ class _Engine:
     def _select(self, logits: Any, size: int) -> Any:
         """Each live row's next token, on the device, in `ids` and `out`; a row that stops (a
         stop token, or its limit) is done. Returns the rows live before it."""
-        scores = self._keep(logits.float(), size) - self.penalty[:size, None] * self.seen[:size]
+        scores = self._keep(self._allowed(logits.float(), size, 0), size)
+        scores = scores - self.penalty[:size, None] * self.seen[:size]
         done = self.done[:size]
         live = ~done
         n = self.n[:size]
         token = torch.where(done, self.pad[:size], self._pick(scores, size, n, self._sampled()))
+        if self._constrained():  # what the host reads back: how many, then the token
+            made = torch.stack([live.long(), token])
+            self.took[: 2 * size].view(2, size).copy_(made, non_blocking=True)
         self.out[:size].scatter_(1, n[:, None], token[:, None])
         n.add_(live.long())
         stopped = (token[:, None] == self.stops[:size]).any(-1) | (n >= self.limit[:size])
@@ -2445,36 +2672,63 @@ class _Engine:
     def _speculate(self, size: int) -> None:
         """`DEPTH` drafted tokens a row, verified with the row's token before them in one pass:
         each row keeps its tokens up to and including its first disagreement with the model,
-        and its states go back to the kept tokens' end."""
+        and its states go back to the kept tokens' end. A constrained step runs one part at a
+        time (`part`: each draft, then the verify), so the host says what may follow each draft
+        before the part after it reads that."""
+        for part in range(DEPTH + 1) if self.part < 0 else (self.part,):
+            if part < DEPTH:
+                self._draft(size, part)
+            else:
+                self._commit(size)
+
+    def _draft(self, size: int, i: int) -> None:
+        """Each row's `i`th draft, into `drafts`: the head's token from its state for it (the
+        first's, `hidden`, the step before left; a later one's from the draft before it)."""
+        model, w = self.model, self.cache.window
+        view, length = self._view(size), self.length[:size]
+        if not i:
+            view.draft.layers[0].cumulative_length.copy_(length + 1)
+            hidden = self.hidden[:size]
+        else:
+            L, keys = length[:, None], self.rows_index[:w]
+            open_ = (keys[None] > L) & (keys[None] <= L + i)
+            mask = torch.where(open_[:, None, None], self.open, self.dmask[:size, ..., :w])
+            position = self.position[:size]
+            at = (position + i).movedim(0, -2) if self.positional else (length + i)[:, None]
+            embed, rotary = model.get_input_embeddings(), model.get_decoder().rotary_emb
+            before = self.hidden[:size] if i == 1 else self.dhidden[:size]
+            token = self.drafts[:size, i - 1 : i]
+            hidden = self.draft(embed(token), before, at, view.draft, mask, rotary)
+            if i + 1 < DEPTH:
+                self.dhidden[:size].copy_(hidden)
+        seen = self.seen[:size]
+        if i:  # and the drafts before it
+            seen = seen.scatter(1, self.drafts[:size, :i], 1.0)
+        logits = model.get_output_embeddings()(hidden)[:, -1].float()
+        scores = self._keep(self._allowed(logits, size, i), size)
+        scores = scores - self.penalty[:size, None] * seen
+        token = self._pick(scores, size, self.n[:size] + i, self._sampled())
+        self.drafts[:size, i].copy_(token)
+        if self._constrained():  # the host's, for what may follow it
+            self.dtook[i * size : (i + 1) * size].copy_(token, non_blocking=True)
+
+    def _commit(self, size: int) -> None:
+        """The drafts verified with the row's token before them in one pass, what it keeps
+        written, and the head's keys and state and the model's states put at its end."""
         model, depth, w = self.model, DEPTH, self.cache.window
         view = self._view(size)
         span = depth + 1
-        embed, head = model.get_input_embeddings(), model.get_output_embeddings()
-        rotary = model.get_decoder().rotary_emb
+        embed, rotary = model.get_input_embeddings(), model.get_decoder().rotary_emb
         keys, steps = self.rows_index[:w], self.rows_index[:span]
         length = self.length[:size]
         L = length[:, None]
         done = self.done[:size]
         live = ~done
         dkeys = view.draft.layers[0]
-        dkeys.cumulative_length.copy_(length + 1)
         dmask = self.dmask[:size, ..., :w]
         position = self.position[:size]
-        token, hidden, drafts = self.ids[:size], self.hidden[:size], []
-        seen = self.seen[:size]
         sampled, n = self._sampled(), self.n[:size]
-        for i in range(depth):
-            if i:
-                open_ = (keys[None] > L) & (keys[None] <= L + i)
-                mask = torch.where(open_[:, None, None], self.open, dmask)
-                at = (position + i).movedim(0, -2) if self.positional else (length + i)[:, None]
-                hidden = self.draft(embed(token), hidden, at, view.draft, mask, rotary)
-            scores = self._keep(head(hidden)[:, -1].float(), size)
-            scores = scores - self.penalty[:size, None] * seen
-            token = self._pick(scores, size, n + i, sampled)[:, None]
-            drafts.append(token)
-            seen = seen.scatter(1, token, 1.0)
-        drafted = torch.cat(drafts, dim=1)
+        drafted = self.drafts[:size]
         # Verify: each row attends to its committed keys and this pass's up to its own.
         open_ = (keys[None, None] >= L[..., None]) & (
             keys[None, None] <= (L + steps[None])[..., None]
@@ -2495,7 +2749,8 @@ class _Engine:
         reset = _VERIFY.set(verify)
         try:
             with _taking(model) as taken, _RowByRow():
-                scores = self._keep(model(**kwargs).logits[:, -span:].float(), size)
+                scores = model(**kwargs).logits[:, -span:].float()
+            scores = self._keep(self._allowed(scores, size, slice(0, span)), size)
         finally:
             _VERIFY.reset(reset)
         # row j has seen the drafts before it
@@ -2554,6 +2809,9 @@ class _Engine:
             (every[None] > L) & (every[None] <= ended[:, None]), self.open
         )
         self.length[:size].copy_(ended)
+        if self._constrained():  # what the host reads back: how many, then each token
+            told = torch.cat([made[None], tokens.T])
+            self.took[: (span + 1) * size].view(span + 1, size).copy_(told, non_blocking=True)
         n.add_(made)
         self.position[:size].add_(made.view(size, *[1] * (self.position.dim() - 1)))
         done |= stopped.any(-1)
@@ -2594,7 +2852,8 @@ class _Engine:
         self.layout = None
         # In particular, the pinned host flag must free while the domain stream is alive:
         # Torch's host allocator records that stream's completion when freeing the tensor.
-        for name in (*type(self).__annotations__, "flag", "rows_index", "dkeys", "dcache"):
+        pinned = ("flag", "allow_host", "took", "dtook")
+        for name in (*type(self).__annotations__, *pinned, "rows_index", "bit", "dkeys", "dcache"):
             vars(self).pop(name, None)
 
 
@@ -2603,6 +2862,7 @@ __all__ = [
     "DEPTH",
     "KERNELS",
     "MIN_WINDOW",
+    "Constraint",
     "Draft",
     "drafting",
     "generate",
