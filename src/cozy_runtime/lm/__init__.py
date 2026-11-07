@@ -2103,7 +2103,12 @@ class _Engine:
             self.layout, self.landed, self.stale = self.where, LANDED[0], False
         queued: deque[Any] = deque()
         size = self._bucket()
+        held = [slot for slot, row in enumerate(self.slots[:size]) if row is not None]
         began = time.perf_counter()
+
+        def ended() -> bool:  # a held row is done (a free slot in the bucket is, always)
+            flags = self.flag[:size].tolist()
+            return any(flags[slot] for slot in held)
 
         def joining() -> bool:  # a waiting call joins once decoding had its prefill's time
             # (one waiting for rows to leave, and those behind it, ask at a row's end instead)
@@ -2117,7 +2122,7 @@ class _Engine:
             while True:
                 self._one(size, lambda size: self._replay(size, cuda))
                 if not cuda:
-                    if bool(self.flag[:size].any()) or joining() or self._cancelled():
+                    if ended() or joining() or self._cancelled():
                         break
                     self._tell()
                     continue
@@ -2126,7 +2131,7 @@ class _Engine:
                 queued.append(event)
                 if len(queued) > LAG:
                     queued.popleft().synchronize()
-                    if bool(self.flag[:size].any()) or joining() or self._cancelled():
+                    if ended() or joining() or self._cancelled():
                         break
                     self._tell()
             if cuda:
