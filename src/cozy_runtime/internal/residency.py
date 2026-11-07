@@ -782,7 +782,12 @@ class Binding:
         memory = self.model.memory
         if memory.native is None:
             return []
-        return [region for block in self.groups for _, region in memory._block_regions(block)]
+        return [
+            region
+            for block in self.groups
+            if block.gathered is None  # a table varena placed on the host stays there
+            for _, region in memory._block_regions(block)
+        ]
 
     def immutable_buffer_ids(self) -> frozenset[int]:
         """Its model's declared checkpoint-backed buffers, in every block (an idle one's placeholder

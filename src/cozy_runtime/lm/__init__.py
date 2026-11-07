@@ -1549,7 +1549,7 @@ class _Engine:
                         with self.cond:
                             self.incoming = list(self.pending)
                             self.pending.clear()
-                        if held == "streamed":
+                        if held != "held":
                             if self._occupied():
                                 raise self.unprepared or RuntimeError("decode residency was lost")
                             for request in self.incoming:
