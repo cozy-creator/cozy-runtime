@@ -115,11 +115,13 @@ class Candidate:
     max_head_dim: int = 0
     #: the exact (head dimension, dtype) pairs its build serves; empty is every pair above
     shapes: frozenset[tuple[int, str]] = frozenset()
-    #: what a call may carry besides one shape of Q/K/V: a mask, causal attention, fewer K/V
-    #: heads than Q heads, a query length other than the keys', several batch rows, and a
-    #: softmax scale other than D^-1/2
+    #: what a call may carry besides one shape of Q/K/V: a mask, causal attention, causal
+    #: attention at a query length other than the keys' (aligned bottom-right: the queries are
+    #: the keys' last, as flash-attention aligns it), fewer K/V heads than Q heads, a query
+    #: length other than the keys', several batch rows, and a softmax scale other than D^-1/2
     masks: bool = False
     causal: bool = True
+    causal_cross: bool = False
     gqa: bool = True
     cross: bool = True
     batches: bool = True
@@ -186,6 +188,12 @@ class Candidate:
             (not self.admits(dtype, dim), f"{dtype} activations at head dimension {dim}"),
             (options.get("attn_mask") is not None and not self.masks, "an attention mask"),
             (bool(options.get("is_causal")) and not self.causal, "causal attention"),
+            (
+                bool(options.get("is_causal"))
+                and query.shape[1] != key.shape[1]
+                and not self.causal_cross,
+                "causal attention at a query length other than K's",
+            ),
             (query.shape[2] != key.shape[2] and not self.gqa, "fewer K/V heads than Q heads"),
             (query.shape[1] != key.shape[1] and not self.cross, "a query length other than K's"),
             (query.shape[0] != 1 and not self.batches, "more than one batch row"),
@@ -226,22 +234,23 @@ _SOL: dict[str, Any] = dict(
 )  # fmt: skip
 
 KERNELS: tuple[Candidate, ...] = (
-    Candidate("sdpa", "_cozy_sdpa", upstream.SDPA, masks=True),
+    Candidate("sdpa", "_cozy_sdpa", upstream.SDPA, masks=True, causal_cross=True),
     Candidate(
         "cudnn", "_cozy_cudnn", upstream.CUDNN, _GPU, dtypes=_HALF, max_head_dim=128, masks=True,
     ),
     Candidate(
         "flash-attn3", "_cozy_flash_attn3", upstream.FA3, _WGMMA, dtypes=_HALF, max_head_dim=256,
-        shapes=_FA3, artifact="flash-attn3-full", import_name="flash_attn_interface",
+        shapes=_FA3, causal_cross=True, artifact="flash-attn3-full",
+        import_name="flash_attn_interface",
     ),
     Candidate(
         "flash-attn4", "_cozy_flash_attn4", upstream.FA4, _WGMMA | _TCGEN05, dtypes=_HALF,
-        max_head_dim=256, artifact=_PY, import_name="flash_attn.cute",
+        max_head_dim=256, causal_cross=True, artifact=_PY, import_name="flash_attn.cute",
     ),
     Candidate(
         "flash-attn4-fp8", "_cozy_flash_attn4_fp8", upstream.FA4_FP8, _TCGEN05, level=8,
-        dtypes=_BF16, head_dims=_D64_128, max_head_dim=128, gqa=False, artifact=_PY,
-        import_name="flash_attn.cute", kernels=_E4M3,
+        dtypes=_BF16, head_dims=_D64_128, max_head_dim=128, causal_cross=True, gqa=False,
+        artifact=_PY, import_name="flash_attn.cute", kernels=_E4M3,
     ),
     Candidate(
         "sageattention", "_cozy_sage_int8_fp8", upstream.SAGE, _MMA | _WGMMA, _FP8, level=8,
