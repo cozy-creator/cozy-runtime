@@ -2438,8 +2438,9 @@ class Request:
         #: are not in it, and no sum of it with them ever happened: the driver reads the card.
         self.torch_peak = 0
         self.overlap = False  # Historical measurement attribution, never a live policy gate.
-        self.moved = self.read_ns = 0
-        self.baked_hits = self.baked_bytes = self.baked_ns = 0
+        #: origin -> [bytes, fills, ns]: the store, a kept page (`baked`), or another set's stored
+        #: bytes on this GPU (`resident`) or in its kept page (`host`)
+        self.moved = {origin: [0, 0, 0] for origin in ("store", "baked", "resident", "host")}
         #: each baked fill's trace entry and its bake (`Bake`), resolved when the request ends
         self.bakes: list[tuple[dict[str, object], Bake]] = []
         self.final_fills = self.final_hits = 0
@@ -2496,16 +2497,13 @@ class Request:
     def fill(
         self, name: str, block: int, nbytes: int, origin: str, ahead: bool, ns: int, at_ms: float
     ) -> None:
-        """A block filled: from the store, or (`baked`) from its kept bytes. A demand fill's
-        entry carries its read's host time and when it ended, so a step's fills and bakes are
-        told apart (cr-242). `ahead`: the core filled it before any use asked."""
-        if origin == "store":
-            self.moved += nbytes
-            self.read_ns += ns
-        else:
-            self.baked_hits += 1
-            self.baked_bytes += nbytes
-            self.baked_ns += ns
+        """A block's bytes filled from one origin (`moved`). A demand fill's entry carries its
+        read's host time and when it ended, so a step's fills and bakes are told apart (cr-242).
+        `ahead`: the core filled it before any use asked."""
+        moved = self.moved.setdefault(origin, [0, 0, 0])
+        moved[0] += nbytes
+        moved[1] += 1
+        moved[2] += ns
         self.prefetch_completed += ahead
         self._trace.append(
             {
@@ -2558,8 +2556,10 @@ class Request:
                 m.name: sum(b.nbytes for b in m.groups()) for m in self.memory.models.values()
             },
             "moved": {
-                "store": {"bytes": self.moved, "ns": self.read_ns},
-                "baked": {"bytes": self.baked_bytes, "fills": self.baked_hits, "ns": self.baked_ns},
+                **{
+                    origin: {"bytes": nbytes, "fills": fills, "ns": ns}
+                    for origin, (nbytes, fills, ns) in self.moved.items()
+                },
                 "bake": self._bakes(),
             },
             "baked_pages": self.memory.pages.stats() if self.memory.pages is not None else None,
