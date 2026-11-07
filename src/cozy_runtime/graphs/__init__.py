@@ -195,9 +195,8 @@ def _measured(device: int) -> Iterator[list[int]]:
 
 def close_pool(pool: domain.Pool, device: int) -> None:
     """A pool none of its owner's graphs use any more, told varena (`vt.pool_close`): its pages
-    go at the next reclaim. An older TensorFS only drops its preparation, and a capture whose
-    end failed keeps its reference there."""
-    (getattr(vt, "pool_close", None) or vt.cancel_preparation)(pool.handle, device)
+    go at the next reclaim."""
+    vt.pool_close(pool.handle, device)
 
 
 @request_path.forbid("cuda graph capture")

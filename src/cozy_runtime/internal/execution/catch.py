@@ -228,12 +228,11 @@ def retry(
     finer level to run again at, its room made (`stats.finer_splits`; a short estimate), or None,
     and the failure stands. The refused attempt's frames and tensors go before it counts room."""
     closed = vt.split_end(device, token, submitted=False)
-    ask = getattr(vt, "split_refused", None)  # a TensorFS before 0.21.3 decides nothing
-    if not (pure and closed.get("refused_bytes") and ask is not None and is_capacity(exc)):
+    if not (pure and closed.get("refused_bytes") and is_capacity(exc)):
         return None
     _unwind(exc)
     try:
-        again: dict[str, Any] | None = ask(device, key, str(level), stream=stream)
+        again: dict[str, Any] | None = vt.split_refused(device, key, str(level), stream=stream)
     except varena.Exhausted as refused:
         raise refuse(device, name, "every finer split", sum(menu[-1][1]), refused) from exc
     if again is not None:
@@ -243,11 +242,10 @@ def retry(
     return again
 
 
-def refusals(device: int) -> Callable[[], tuple[int, Request | None]] | None:
+def refusals(device: int) -> Callable[[], tuple[int, Request | None]]:
     """varena's count of allocations it refused on `device`, with the request whose Retries it
-    excludes, for the package contract's scopes; None from a TensorFS that counts none."""
-    count = getattr(vt, "ooms", None)
-    return None if count is None else lambda: (count(device), CURRENT.get())
+    excludes, for the package contract's scopes."""
+    return lambda: (vt.ooms(device), CURRENT.get())
 
 
 def _unwind(exc: BaseException) -> None:
