@@ -2119,6 +2119,7 @@ class Executor:
                     return self._close_after(
                         self._refusal("cuda_initialized_before_runtime", self.poisoned)
                     )
+                zygote.settle()
             else:
                 warmup_error = self._warm_package()
                 stage("package_warmup")
@@ -2776,6 +2777,7 @@ class Executor:
         # TensorFS read its headers and assets on its fetch runtime and dropped natives on its
         # release worker: their threads end here, or it can't fork.
         tensorfs.release_threads()
+        zygote.settle()
         unsafe = zygote.unsafe(torch)
         said = (
             f"built ahead {kept or 'nothing'} in {(time.perf_counter() - started) * 1000:.0f} ms"
@@ -3543,7 +3545,8 @@ class Executor:
         }
         settled = time.perf_counter()
         self._settle_leaves(self.model_executors)
-        self.facts["stages"].append(("leaves_settle", round((time.perf_counter() - settled) * 1e3, 1)))
+        settled = round((time.perf_counter() - settled) * 1000, 1)
+        self.facts["stages"].append(("leaves_settle", settled))
         self.ready = True
         return {
             "ok": True,

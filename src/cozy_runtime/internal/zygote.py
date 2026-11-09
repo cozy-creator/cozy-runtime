@@ -156,11 +156,17 @@ def collect(children: set[int]) -> set[int]:
     return reaped
 
 
+def settle() -> None:
+    """The heap the forks share, collected and frozen once it is built (the imports, each build
+    ahead), not on a call's fork: their pages stay shared, as the collector never writes them."""
+    gc.collect()
+    gc.freeze()
+
+
 def fork(environment: Mapping[str, str], child: Callable[[], int], *, group: bool = True) -> int:
     """The child's pid. The child seals itself, runs `child` and exits; it never returns.
     `group`: it leads its own process group; a group's follower stays in its leader's."""
-    gc.collect()
-    gc.freeze()  # imported objects stay shared: the collector never writes their pages
+    gc.freeze()  # what came since the last `settle` stays shared too
     parent = os.getpid()
     pid = os.fork()
     if pid:

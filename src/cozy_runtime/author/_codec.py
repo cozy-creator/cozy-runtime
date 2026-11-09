@@ -147,12 +147,14 @@ def encode_webp(width: int, height: int, pixels: bytes, mode: str = "RGB") -> by
 
     Lossless and exact at every setting: effort trades only bytes for time. On three
     1024px SDXL outputs, method 5 at quality 100 took 1.15 s for 1.07 MB; method 0 at
-    quality 50 took 0.12 s for 1.20 MB. Packaging is on every image run's critical path.
+    quality 50 took 0.12 s for 1.20 MB. On a 2048px Qwen-Image 2 output quality 0 took 0.16 s
+    against quality 50's 0.33 s, for 0.5% more bytes. Packaging is on every image run's
+    critical path.
     """
 
     encoded = io.BytesIO()
     _image(width, height, pixels, mode).save(
-        encoded, format="WEBP", lossless=True, method=0, quality=50, exact=True
+        encoded, format="WEBP", lossless=True, method=0, quality=0, exact=True
     )
     body = encoded.getvalue()
     if len(body) < 12 or body[:4] != b"RIFF" or body[8:12] != b"WEBP":

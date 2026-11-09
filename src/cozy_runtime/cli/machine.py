@@ -278,7 +278,10 @@ def _encode(request: dict[str, object], directory: int) -> dict[str, object]:
 
 def frame_codec() -> int:
     """`frame-codec`: `{spool, frames}` per stdin line, `{media}` or `{error}` per stdout line,
-    until stdin ends. One refused output never ends the encoder."""
+    until stdin ends. One refused output never ends the encoder. Its encoders load before the
+    first frame: TensorD starts it before the call's work."""
+    from PIL import PngImagePlugin, WebPImagePlugin  # noqa: F401
+
     for line in sys.stdin:
         answer: dict[str, object]
         try:
