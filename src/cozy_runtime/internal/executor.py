@@ -72,7 +72,7 @@ from tensorfs.varena import _runtime as varena
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
 from cozy_runtime import graphs, stepcache, weights_store
-from cozy_runtime.author import ModelRegistry, _activity, _split, describe
+from cozy_runtime.author import ModelRegistry, _activity, _split
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
@@ -81,12 +81,15 @@ from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
 from cozy_runtime.author._demand import shape_cell
+from cozy_runtime.author._describe import freeze
 from cozy_runtime.author._errors import (
     DEVICE_FAULT,
     DEVICE_OOM,
+    DOES_NOT_FIT,
     MEMORY_EXHAUSTED,
     CapabilityError,
     ConformanceError,
+    DoesNotFit,
     Fault,
     InvalidRequest,
     Outcome,
@@ -141,6 +144,7 @@ from cozy_runtime.internal import (
     call_types,
     canonical,
     child_env,
+    contract,
     effect_interfaces,
     execution_evidence,
     executor_commands,
@@ -151,7 +155,10 @@ from cozy_runtime.internal import (
     kernel_compile,
     kernel_ready,
     model_config,
+    numerical_environment,
+    pacing,
     package_interface,
+    philox,
     prebuilt,
     prepare_diagnostics,
     proctree,
@@ -264,7 +271,7 @@ if TYPE_CHECKING:
 INLINE_RESULT_MAX = 4 * 1024 * 1024
 
 #: Outcomes that are capacity, not broken state: they fail the attempt and keep the executor.
-CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED})
+CAPACITY_CODES = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, DOES_NOT_FIT})
 
 #: Calls this executor runs at once: its pool's workers. More wait their turn in the pool.
 CALLS_IN_FLIGHT = 16
@@ -835,6 +842,8 @@ class Executor:
         #: HOST ONLY: Start's development GPU memory limit, the memory's budget (the card's size)
         self.gpu_memory_limit: int | None = None
         self.shared = False
+        #: Each GPU's limit while it drives the display (0: none): its total less what it keeps free.
+        self.display_limit: tuple[int, ...] = ()
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
@@ -1068,6 +1077,8 @@ class Executor:
                 "detail": "Torch CUDA was already initialized before Runtime's explicit "
                 "allocator boundary; package execution is refused",
             }
+        numerical_environment.apply(torch, self.device_kind)
+        contract.pin(torch)
         try:
             accel.bind_allocator(torch, self.device_kind)
             if self.device_kind == "cuda":
@@ -1112,9 +1123,10 @@ class Executor:
         if host.memory is not None:
             return
         device = self._rank_device(torch)
-        memory = Memory.open(device, budget_bytes=host.gpu_memory_limit)
+        memory = Memory.open(device, budget_bytes=self._card_budget(device), shared=host.shared)
         if device.type == "cuda":  # steps report the device's time beside the host's
             DEVICE[:] = [execution.Steps()]
+            contract.REFUSALS[0] = execution.refusals(device.index or 0)
         PLANS[:] = [host.serving]
         _split.install(execution)
         attention_ulysses.install(execution)
@@ -1187,6 +1199,28 @@ class Executor:
             # Each on-demand model's build, made inside the stage that first read it.
             "on_demand": {p: _construction_record(f) for p, f in self.built_on_demand.items()},
         }
+
+    def _follow_display(self, command: Invoke) -> None:
+        """A display GPU's limit as its display uses it now: the machine reads it for each request
+        (an older one never sends it, and the limit stays Start's)."""
+        limits = tuple(getattr(command, "display_limit", ()) or ())
+        memory = self.host.memory
+        if limits and memory is not None and memory.cuda:
+            self.host.display_limit = limits
+            memory.limit(self._card_budget(memory.device))
+
+    def _card_budget(self, device: Any) -> int | None:
+        """The development `gpu_memory_limit`, and on a GPU that drives a display its limit
+        while it does (varena's limit counts the driver's own charge), the lower of the two."""
+        host = self.host
+        index = device.index or 0
+        cuda = device.type == "cuda" and index < len(host.display_limit)
+        limit = host.display_limit[index] if cuda else 0
+        if not limit:
+            return host.gpu_memory_limit
+        budget = limit if host.gpu_memory_limit is None else min(host.gpu_memory_limit, limit)
+        print(f"[memory] GPU {index} drives a display: at most {budget >> 20} MiB", file=sys.stderr)
+        return budget
 
     def _rank_device(self, torch: Any) -> Any:
         if self.device_kind == "cuda" and accel.present(torch, self.device_kind):
@@ -1505,10 +1539,11 @@ class Executor:
         }
 
     def _declines(self, exc: Exception, ending: str | None) -> str | None:
-        """Why a spread call is declined rather than failed: this GPU ran short of memory in
-        it (`mirror.ending`)."""
-        if ending == MEMORY_EXHAUSTED:
-            return f"{getattr(exc, 'code', DEVICE_OOM)}: {exc}"[:300]
+        """Why a spread call is declined rather than failed: this GPU's memory refused it up front
+        (`DoesNotFit`, before the pass that would run out), so another GPU takes it. An allocation
+        that failed partway fails the call: nothing runs again for it."""
+        if isinstance(exc, DoesNotFit):
+            return f"{DOES_NOT_FIT}: {exc}"[:300]
         return None
 
     def _group_refusal(self, exc: GroupRefusal, *, closing: bool = True) -> dict[str, Any]:
@@ -1674,6 +1709,15 @@ class Executor:
         degree = command.sequence_parallel_degree or 1
         self.host.shared = command.shared
         self.host.gpu_memory_limit = command.gpu_memory_limit
+        # An older machine's Start names none.
+        self.host.display_limit = tuple(getattr(command, "display_limit", ()) or ())
+        if pacing.configure(pace := command.display_pace) and pace is not None:
+            print(
+                f"[pacing] the GPU drives a display: a call pauses {pace.pause_ms} ms "
+                f"after each {pace.work_ms} ms",
+                file=sys.stderr,
+                flush=True,
+            )
         if command.memo is not None:
             stage_memo.ENGINE.configure(command.memo)
         sealed_devices = _SEALED.get("CUDA_VISIBLE_DEVICES", "")
@@ -2312,11 +2356,6 @@ class Executor:
         }
 
     def residency_document(self) -> dict[str, Any]:
-        free = -1
-        if self.torch is not None and accel.present(self.torch, self.device_kind):
-            free = accel.allocation(self.torch, self.device_kind, self.host.memory)[
-                "driver_free_bytes"
-            ]
         return {
             "ok": True,
             "constructions": [
@@ -2328,7 +2367,6 @@ class Executor:
                 for key, child in self.constructions.items()
             ],
             "active": self.active,
-            "free_bytes": free,
         }
 
     def _prepare_first(self, command: Load) -> dict[str, Any]:
@@ -2450,8 +2488,10 @@ class Executor:
             # first construction and beside its weight fill: one first asked mid-request served
             # its whole stage on a fallback while it landed (Klein's on-demand upsampler; H3's
             # nvfp4 layers through step 1 on an RTX 5090, cr-241; on two 5060 Tis, cr-261). Each
-            # first ask waits for it; a group's GPUs state theirs in their load's reply.
+            # first ask waits for it; a group's GPUs state theirs in their load's reply. So does
+            # counter noise's kernel, which a recorded step's draw needs before its capture.
             leaves.prime(torch, torch.cuda.current_device())
+            philox.prime(torch.cuda.current_device())
         if self.world > 1 and self.rank == 0:
             # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
             # before this one reads a header, and the plans are compared at the residence
@@ -3154,9 +3194,15 @@ class Executor:
         first import on a busy host is still an import."""
         if not release.application or not release.package_interface:
             raise RuntimeError("executor requires the canonical installed release identity")
+        # An import-only zygote seals too: its forks inherit the seal and never import again.
+        if (torch := sys.modules.get("torch")) is not None:
+            contract.seal(torch, release.application)
         path = release.package_interface
         recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
-        discovered = discover_installed(release.application, seconds=None, recipes=recipes)
+        discovered = discover_installed(release.application, recipes=recipes)
+        if torch is not None:
+            contract.seal_libraries()
+            contract.check_flags(torch, f"the import of {release.application}")
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
@@ -3229,6 +3275,7 @@ class Executor:
                 construction.prepared.pop(request_id, None)
                 construction.awaiting.discard(request_id)
         IDLE_WAITED.pop(request_id, None)
+        IDLE_STAGE.pop(request_id, None)
         if self.order is not None:
             self.order.wake()  # an idle period may open now (`awaiting_invoke`)
 
@@ -3454,6 +3501,7 @@ class Executor:
                 }
             finally:
                 self._restore_attention()
+        self._follow_display(command)
         spool = Path(command.spool)
         deadline = _deadline(command.deadline_s)
         torch = self.torch
@@ -3619,6 +3667,9 @@ class Executor:
                         calls=self.host._call_broker(command.request_id, self.host.call_interfaces),
                     ),
                 )
+                if (memory := self.host.requests.get(command.request_id)) is not None:
+                    # A call that ran out of memory: what its memory learns from.
+                    memory.failed = outcome.code in CAPACITY_CODES
         except Exception as exc:
             envelope, outcome = None, classify(exc)
             unwind(exc)
@@ -3643,8 +3694,9 @@ class Executor:
                 )
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
+            on = IDLE_STAGE.pop(command.request_id, (0.0, ""))[1]
             if (waited := IDLE_WAITED.pop(command.request_id, 0.0)) >= 1:
-                record.emit("confession", "idle.waited", _IDLE_WORK, ms=round(waited, 1))
+                record.emit("confession", "idle.waited", _IDLE_WORK, ms=round(waited, 1), on=on)
                 if waited >= IDLE_BLOCKING_MS:
                     blocking[_IDLE_WORK] = (waited, 1)
             for work, (ms, times) in blocking.items():
@@ -4494,14 +4546,8 @@ class Executor:
             self._bound_calls[1],
             exchange,
             lambda: self._child_events(exchange),
-            functools.partial(self._yielding, request_id),
             self.model_choices,
         )
-
-    def _yielding(self, request_id: str) -> contextlib.AbstractContextManager[None]:
-        """A wait on a child call: the attempt's step pages are taken before the child's."""
-        request = self.requests.get(request_id)
-        return request.yielding() if request is not None else contextlib.nullcontext()
 
     def _call_bindings(self, rows: tuple[CallInterface, ...]) -> CallBindings:
         if len(rows) > 256:
@@ -4519,7 +4565,7 @@ class Executor:
                 if row.builtin != "operations":
                     raise CapabilityError("unknown Runtime builtin", code="child_interface")
                 builtin_operations.validate_binding(module, export)
-                describe(builtin_operations_app)
+                freeze(builtin_operations_app)
                 builtin = builtin_operations_app.get(export).surface
                 bindings[(module, export)] = _serving(module, export, builtin)
             elif row.self_call:
@@ -4761,8 +4807,9 @@ class Executor:
                     # consumer streams before retiring owners and returning allocator storage.
                     accel.drain(self.torch, self.device_kind)
                     # Every slot's decoders, graphs and holds go before any model leaves: a
-                    # language model's engine retains its weights, so an idle Klein refused
-                    # every offload and a running call beside it ran out of memory (0.36.0 gate).
+                    # language model's engine retains its drafter's weights too, and Klein's
+                    # drafter slot maps before its upsampler, so an idle Klein refused every
+                    # offload and a running call beside it ran out of memory (0.36.0 gate).
                     self._release_programs([child])
                 for member in members:
                     for model in member.backend.models.values():
@@ -5081,6 +5128,8 @@ def main(argv: list[str] | None = None) -> int:
     sandbox.refuse_network(
         "a package can't use the network while it runs: take what it needs as an input file",
         allow_unix_seam=True,
+        also=contract.AUDITED,
+        judge=contract.audit,
     )
     channel = (
         connect(args.socket)
@@ -5129,6 +5178,8 @@ IDLE_BLOCKING_MS = 100.0
 #: call -> ms its commands waited for idle work, until its run's record takes it (`_Order.turn`);
 #: on a follower "", until its request's end hands it to rank 0's record
 IDLE_WAITED: dict[str, float] = {}
+#: call -> the idle work its longest wait was on (`_Order.stage`), for its record
+IDLE_STAGE: dict[str, tuple[float, str]] = {}
 
 
 class _Order:
@@ -5147,17 +5198,24 @@ class _Order:
         self.answered = 0
         #: the idle holder's ticket while it holds the order, and when each command since came
         self._idle: int | None = None
-        self._arrived: dict[int, float] = {}
-        #: ticket -> ms it waited for the idle holder
-        self._waited: dict[int, float] = {}
+        #: what the idle holder does now (`stage`), and each command's arrival and the work then
+        self._stage = _IDLE_WORK
+        self._arrived: dict[int, tuple[float, str]] = {}
+        #: ticket -> ms it waited for the idle holder, and on what
+        self._waited: dict[int, tuple[float, str]] = {}
 
     def ticket(self, alone: bool, what: str) -> int:
         with self._changed:
             self._next += 1
             self._open[self._next] = (alone, what)
             if self._idle is not None:
-                self._arrived[self._next] = time.perf_counter()
+                self._arrived[self._next] = (time.perf_counter(), self._stage)
             return self._next
+
+    def stage(self, what: str) -> None:
+        """The idle holder moves on to `what`: a command arriving now waits on it."""
+        with self._changed:
+            self._stage = what
 
     def first(self, ticket: int) -> bool:
         with self._changed:
@@ -5179,10 +5237,12 @@ class _Order:
                     "",
                 ),
             )
-            waited = self._waited.pop(ticket, 0.0)
+            waited, on = self._waited.pop(ticket, (0.0, ""))
         if waited:  # a follower's commands are in no call: its request's end takes them ("")
             call = _CALL.get()
             IDLE_WAITED[call] = IDLE_WAITED.get(call, 0.0) + waited
+            if waited > IDLE_STAGE.get(call, (0.0, ""))[0]:
+                IDLE_STAGE[call] = (waited, on)
         try:
             yield
         finally:
@@ -5209,9 +5269,10 @@ class _Order:
                 del self._open[ticket]
                 self._idle = None
                 now = time.perf_counter()
-                for came, at in self._arrived.items():
-                    self._waited[came] = (now - at) * 1e3
+                for came, (at, on) in self._arrived.items():
+                    self._waited[came] = ((now - at) * 1e3, on)
                 self._arrived.clear()
+                self._stage = _IDLE_WORK
                 self._changed.notify_all()
 
     def holders(self) -> list[str]:
@@ -5260,8 +5321,10 @@ def _idle(executor: Executor, order: _Order) -> None:
             if executor.poisoned:
                 return
             try:
+                order.stage("idle graph capture")
                 graphs.capture_idle(order.waiting)
                 if (memory := executor.host.memory) is not None and memory.host_pending():
+                    order.stage("idle host page pin")
                     memory.pin_idle(order.waiting)
             except Exception as exc:
                 traceback.print_exc()

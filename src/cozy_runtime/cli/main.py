@@ -55,8 +55,6 @@ global flags:
                    describe one installed wheel in --environment-python, without imports
   --builtin operations
                    describe Runtime's fixed managed operation surface, without imports
-  --conformance    describe only: also IMPORT the app in this interpreter — which must be
-                   the package's own locked venv — and refuse unless it matches the source
   -h, --help       this text
 """
 
@@ -72,7 +70,7 @@ _VALUE_FLAGS = (
 
 def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
     """Split argv into (verb, args, options, help). Unknown flags refuse with exit 2."""
-    as_json = full = want_help = conformance = False
+    as_json = full = want_help = False
     fields: tuple[str, ...] = ()
     directory = "."
     package_interface = ""
@@ -91,8 +89,6 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             as_json = True
         elif item == "--full":
             full = True
-        elif item == "--conformance":
-            conformance = True
         elif item.startswith("--") and item.split("=")[0] in _VALUE_FLAGS:
             flag, _, inline = item.partition("=")
             if not inline:
@@ -136,7 +132,6 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
             fields,
             directory,
             package_interface,
-            conformance,
             environment_python,
             distribution,
             builtin,
@@ -147,11 +142,7 @@ def parse(argv: Sequence[str]) -> tuple[str | None, list[str], Options, bool]:
 
 def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -> Result:
     if opts.builtin and (
-        verb != "describe"
-        or opts.distribution
-        or opts.environment_python
-        or opts.package_interface
-        or opts.conformance
+        verb != "describe" or opts.distribution or opts.environment_python or opts.package_interface
     ):
         raise CliError(
             "usage",
@@ -160,10 +151,7 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             Exit.usage,
         )
     if opts.distribution and (
-        verb != "describe"
-        or not opts.environment_python
-        or opts.package_interface
-        or opts.conformance
+        verb != "describe" or not opts.environment_python or opts.package_interface
     ):
         raise CliError(
             "usage",
@@ -185,20 +173,13 @@ def dispatch(verb: str, args: list[str], opts: Options, config: RuntimeConfig) -
             "use --package-interface <exact-package-interface> with cozy-runtime describe",
             Exit.usage,
         )
-    if opts.conformance and verb != "describe":
-        raise CliError(
-            "usage",
-            "--conformance belongs only to describe",
-            "cozy-runtime --conformance describe, from the package's locked venv",
-            Exit.usage,
-        )
     if verb == "describe":
         if len(args) > 1:
             raise CliError(
                 "usage",
                 f"describe takes at most one function name, got {len(args)}",
                 "cozy-runtime [--json] [--dir <path>] [--package-interface <path>] "
-                "[--conformance] describe [<function>]",
+                "describe [<function>]",
                 Exit.usage,
             )
         return describe_verb.run(args[0] if args else None, opts)

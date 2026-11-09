@@ -8,9 +8,9 @@ for `cozy_runtime.derive.*`), folds constants with a shared
 evaluator over literal and arithmetic nodes and values of the package's committed JSON files
 (`author.data_values`), and translates every interface-bearing declaration into real types built
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
-`Annotated`, cozy-runtime's own file, marker and service classes. Rendering is then
-`schema.render`, the SAME renderer the import path uses, so the two derivations cannot drift
-by construction.
+`Annotated`, cozy-runtime's own file, marker and service classes, then renders them with
+`schema.render`. This is the ONLY describer: nothing else derives a package interface, and no
+caller falls back to importing the package.
 
 Anything outside the closed vocabulary — a name bound to no definition in the tree, a
 computed value (call, comprehension, unknown attribute) in an interface position, a dynamic
@@ -45,6 +45,7 @@ import cozy_runtime
 import cozy_runtime.internal.locked_sources as locked
 import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
+import cozy_runtime.internal.static_contract as static_contract
 import cozy_runtime.internal.static_invocable as static_invocable
 from cozy_runtime import _interpreter, author
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
@@ -134,8 +135,8 @@ class Installed:
 
     A package may build its surface out of a dependency's declarations — a `Model` subclass,
     a shared request struct — and that dependency's source ships in its wheel. So the reader
-    reads it, confined to distributions declaring a `cozy.application` entry point: the same
-    fact `discovery.py` calls an app. torch declares none, so torch is never in the tree, and
+    reads it, confined to distributions declaring a `cozy.application` entry point, which
+    is what makes one an app. torch declares none, so torch is never in the tree, and
     site-packages is never a root. Their modules are followed for TYPES only, never scanned
     for registrations: another package's callables are its own.
     """
@@ -283,7 +284,7 @@ def _trusted_module(name: str) -> bool:
     return any(name == root or name.startswith(root + ".") for root in _TRUSTED_ROOTS)
 
 
-#: The entry-point group `discovery.py` reads. A distribution that declares one IS a cozy
+#: The entry-point group that names an app. A distribution that declares one IS a cozy
 #: package; every other distribution beside it — torch included — is not, and is never read.
 _APPLICATION_GROUP = "[cozy.application]"
 _BUILTIN_TYPES: dict[str, object] = {
@@ -445,11 +446,13 @@ class Reader:
         *,
         dependency_roots: Sequence[Path] = (),
         wheels: Mapping[str, locked.LockedWheel] | None = None,
-        own: frozenset[str] | None = None,
+        own: frozenset[str],
     ) -> None:
         self.project = project
         self.project_roots = (project / "src", project)
-        #: top-level import names that are this package's own; None: whatever its roots hold
+        #: the package's own top-level import names: only these are its modules, read for its
+        #: registrations and held to its contract. Never whatever a root holds: a root can be
+        #: site-packages.
         self.own = own
         self.roots = (*self.project_roots, *dependency_roots)
         #: published callees, read from the wheels the project's uv.lock pins when needed
@@ -588,11 +591,7 @@ class Reader:
             return None
 
     def _own(self, top: str) -> bool:
-        if self.own is not None:
-            return top in self.own
-        return any(
-            (root / top).is_dir() or (root / f"{top}.py").is_file() for root in self.project_roots
-        )
+        return top in self.own
 
     def _tree_tops(self, name: str) -> set[str]:
         top = name.split(".")[0]
@@ -1472,7 +1471,7 @@ def read_application(project: Path) -> str:
     if len(objects) != 1 or not isinstance(objects[0], str) or not objects[0]:
         raise StaticRefusal(
             f'{path} names {len(objects)} [project.entry-points."cozy.application"] entries; '
-            "discovery reads exactly one",
+            "a package names exactly one",
             code="application_entrypoint_count",
         )
     obj = objects[0]
@@ -1559,16 +1558,31 @@ def build(
     # uv.lock names, a published one from the exact wheel it pins (cr-114).
     pinned = locked.read(project)
     roots = (*environment_roots(environment_python, project=project), *pinned.roots)
-    reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels)
+    own = source_tops(project)
+    reader = Reader(project, dependency_roots=roots, wheels=pinned.wheels, own=own)
     name = tomllib.loads((project / "pyproject.toml").read_text())["project"]["name"]
     return _build(reader, application, closures=closures, distribution=name, pinned=pinned)
+
+
+def source_tops(project: Path) -> frozenset[str]:
+    """A source tree's own top-level modules: each module file and package directory in `src/`
+    and the project root."""
+    tops: set[str] = set()
+    for root in (project / "src", project):
+        for entry in root.iterdir() if root.is_dir() else ():
+            name = entry.name.removesuffix(".py") if entry.is_file() else entry.name
+            if name.isidentifier() and (entry.is_dir() or entry.suffix == ".py"):
+                tops.add(name)
+    return frozenset(tops)
 
 
 def build_builtin(name: str) -> dict[str, Json]:
     """Read only the explicitly selected Runtime-owned App, never caller source."""
     if name != "operations":
         raise StaticRefusal("unknown Runtime builtin surface", code="static_builtin")
-    reader = Reader(Path(cozy_runtime.__file__).resolve().parent.parent)
+    # Its project root is site-packages: only cozy_runtime is its own, never what sits beside it.
+    site = Path(cozy_runtime.__file__).resolve().parent.parent
+    reader = Reader(site, own=frozenset({"cozy_runtime"}))
     application = "cozy_runtime.derive.operations:app"
     # Ordinary caller discovery must keep skipping Runtime registrations. Only
     # this reader instance's selected built-in module becomes an App root.
@@ -1699,6 +1713,7 @@ def _build(
         )
     declared: dict[str, Declaration] = {}
     modules = reader.reachable(entry)
+    static_contract.check(reader, modules)
     if pinned is not None:
         _check_locked(reader, modules, pinned)
     recipes, calibrated = _recipes(reader, modules)
@@ -1754,9 +1769,9 @@ class CozyPackage:
 
     distribution: str
     application: str
-    #: what its Reader reads as its project, and its own top-level modules (None: its roots')
+    #: what its Reader reads as its project, and its own top-level modules
     project: Path
-    own: frozenset[str] | None
+    own: frozenset[str]
 
 
 def _calls(
@@ -1906,7 +1921,7 @@ def _package_at(reader: Reader, path: Path) -> CozyPackage | None:
             name = project.get("name") if isinstance(project, dict) else None
             if not isinstance(name, str):
                 return None
-            return CozyPackage(name, application, directory, None)
+            return CozyPackage(name, application, directory, source_tops(directory))
     return None
 
 
@@ -2057,9 +2072,9 @@ def _recipes_registration(
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:
-    """A memoized callable's operation identity read from installed source alone: the same key
-    `memo_implementation.describe` computes by import. None when any part of its declaration
-    cannot be read statically; its machine then keys the memo by its package's files."""
+    """A memoized callable's operation identity read from installed source alone. None when any
+    part of its declaration cannot be read statically; its machine then keys the memo by its
+    package's files."""
     fn = registration.fn
     own = (f"{registration.module.name}.{fn.name}", memo_identity.normalized_definition(fn))
     return _declared_identity(reader, registration, [own])

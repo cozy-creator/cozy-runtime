@@ -47,7 +47,7 @@ from cozy_runtime.author._executor_requests import (
     StageMemoStore,
 )
 from cozy_runtime.author._files import File
-from cozy_runtime.author._model import WARNINGS
+from cozy_runtime.author._model import WARNINGS, deterministic
 from cozy_runtime.author._stage_memo import exactness
 from cozy_runtime.internal import attention, hostfacts, installed
 from cozy_runtime.internal.executor_commands import MemoSettings
@@ -606,7 +606,9 @@ class GenerationMemo:
     sites: Mapping[str, tuple[object, ...]]
     engine: Engine = dataclasses.field(default_factory=lambda: ENGINE)
 
-    def numerics(self, components: tuple[str, ...]) -> str:
+    def numerics(self, components: tuple[str, ...], deterministic_cudnn: bool) -> str:
+        """What changes a call's arithmetic. Its cuDNN mode is the call's own (`deterministic`),
+        not the process flag a scope on another thread may hold."""
         backends = self.torch.backends
         matmul = backends.cuda.matmul
         return _hash(
@@ -617,7 +619,7 @@ class GenerationMemo:
                 bool(matmul.allow_fp16_reduced_precision_reduction),
                 bool(matmul.allow_bf16_reduced_precision_reduction),
                 bool(self.torch.are_deterministic_algorithms_enabled()),
-                bool(backends.cudnn.deterministic),
+                deterministic_cudnn,
                 str(self.torch.get_float32_matmul_precision()),
                 [
                     [str(getattr(p, "_attention_backend", "")) for p in self.sites.get(name, ())]
@@ -647,7 +649,7 @@ class GenerationMemo:
             bound = signature.bind(model, *args, **kwargs)
             bound.apply_defaults()
             arguments = arguments_digest(dict(list(bound.arguments.items())[1:]), self.torch)
-            numerics = self.numerics(components)
+            numerics = self.numerics(components, deterministic(model, fn.__name__))
             if (stage, numerics) in engine.disputed:
                 raise Unmemoizable("disputed")
         except Unmemoizable as exc:

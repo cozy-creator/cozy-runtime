@@ -1,0 +1,1 @@
+The Runtime no longer sizes the host tier: TensorFS 0.21.2 sizes it from the run's cgroup and shares host RAM with every executor through the host ledger page (cozy-creator `claude/xs138-host-owner`).
