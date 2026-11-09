@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, get_args
 
 import msgspec
+from tensorfs.executor import Answer, Publish
 
 from cozy_runtime.author._activity import asides
 from cozy_runtime.author._app import Registration
@@ -57,7 +58,6 @@ from cozy_runtime.author._errors import (
     classify,
     unwind,
 )
-from cozy_runtime.author._executor_requests import Publish, Published
 from cozy_runtime.author._files import (
     File,
     Files,
@@ -131,7 +131,7 @@ class Invocation:
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
     calls: _Broker | None = None
-    publish: Callable[[Publish], Published] | None = None
+    publish: Callable[[Publish], Answer] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
     #: No worker settles this attempt's frames (the fakes), so each encodes at its save.
     settle_at_save: bool = False

@@ -184,11 +184,10 @@ class Broadcast:
                     value = value if device is None else value.to(device)
                     torch.distributed.broadcast(_bytes(value.contiguous()), src=0, group=pg)
 
-    def receive(self, command: Mapping[str, object], pg: Any, device: Any) -> Broadcast:
+    def receive(self, run: RunCommand, pg: Any, device: Any) -> Broadcast:
         """A follower's side: every tensor the command names, in GPU 0's order, onto `device`."""
         import torch
 
-        run = RunCommand.read(command)
         specs = sorted((int(t.v), t.dtype, t.shape) for t in _tensors([run.args, run.kwargs]))
         with torch.utils._python_dispatch._disable_current_modes():
             for index, (at, dtype, shape) in enumerate(specs):
@@ -383,18 +382,17 @@ class RunReply(msgspec.Struct, frozen=True):
 
 
 def run_call(
-    command: Mapping[str, object], spool: TensorSpool | Broadcast, *, device: Any
+    run: RunCommand, spool: TensorSpool | Broadcast, *, device: Any
 ) -> tuple[tuple[object, ...], dict[str, object]]:
     """A follower's side of a `RunCommand`: its arguments on THIS rank's device."""
-    run = RunCommand.read(command)
     args = tuple(unmarshal(a, spool, device=device) for a in run.args)
     return args, {k: unmarshal(v, spool, device=device) for k, v in run.kwargs.items()}
 
 
 @contextmanager
-def attention_context(command: Mapping[str, object]) -> Iterator[None]:
+def attention_context(run: RunCommand) -> Iterator[None]:
     """Recreate only the leader's closed attention layout, never ambient Python context."""
-    token = _ACTIVE_LAYOUT.set(RunCommand.read(command).attention_layout)
+    token = _ACTIVE_LAYOUT.set(run.attention_layout)
     try:
         yield
     finally:

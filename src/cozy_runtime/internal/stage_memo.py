@@ -37,20 +37,12 @@ from typing import TYPE_CHECKING, Protocol, cast
 import msgspec
 import numpy as np
 from PIL import Image
+from tensorfs.executor import Answer, MemoSettings, Request, StageMemoLookup, StageMemoStore
 
-from cozy_runtime.author._executor_requests import (
-    Answer,
-    MemoEntry,
-    MemoStored,
-    Request,
-    StageMemoLookup,
-    StageMemoStore,
-)
 from cozy_runtime.author._files import File
 from cozy_runtime.author._model import WARNINGS, deterministic
 from cozy_runtime.author._stage_memo import exactness
 from cozy_runtime.internal import attention, hostfacts, installed, memo_implementation
-from cozy_runtime.internal.executor_commands import MemoSettings
 from cozy_runtime.internal.hostfacts import HostFacts
 from cozy_runtime.internal.numerical_environment import fingerprint
 
@@ -81,7 +73,7 @@ _DTYPES = {
     "bool": "BOOL",
 }
 
-type Exchange = Callable[[Request, type[Answer]], Answer]
+type Exchange = Callable[[Request], Answer]
 
 
 class Tensor(Protocol):
@@ -524,8 +516,8 @@ class Engine:
         exchange = self.exchange
         if exchange is None:
             return None
-        answer = exchange(StageMemoLookup(key=key, stage=stage, numerics=numerics), MemoEntry)
-        if not isinstance(answer, MemoEntry) or not answer.ok:
+        answer = exchange(StageMemoLookup(key=key, stage=stage, numerics=numerics))
+        if not answer.ok:
             return None
         if answer.disputed:
             self.disputed.add((stage, numerics))
@@ -561,16 +553,15 @@ class Engine:
                 length=entry.nbytes if entry is not None else 0,
                 cost_ms=round(entry.cost_s * 1000, 3) if entry is not None else 0.0,
                 reason=reason,
-            ),
-            MemoStored,
+            )
         )
-        stored = isinstance(answer, MemoStored) and answer.ok and answer.stored
-        if isinstance(answer, MemoStored) and answer.disputed:
+        stored = answer.ok and answer.stored
+        if answer.disputed:
             self.disputed.add((stage, numerics))
         if not local:
             return reason
         Path(local).unlink(missing_ok=True)  # the Worker keeps its own copy
-        return "" if stored else getattr(answer, "reason", "") or "worker_declined"
+        return "" if stored else answer.reason or "worker_declined"
 
     def worth_storing(self, stats: MethodStats, entry: Entry) -> str:
         """Why not to write this entry to disk, or "" to write it."""

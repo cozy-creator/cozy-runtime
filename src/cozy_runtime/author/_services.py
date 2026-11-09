@@ -27,6 +27,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Any, Literal, Protocol, TypeVar, cast, overload, runtime_checkable
 
+from tensorfs.executor import Answer, Publish, PublishPart
+
 import cozy_runtime.author._codec as _codec
 import cozy_runtime.author._stalls as _stalls
 from cozy_runtime.author._activity import settle, work_clock
@@ -40,7 +42,6 @@ from cozy_runtime.author._decode import (
     MediaReads,
 )
 from cozy_runtime.author._errors import AuthorError, CapabilityError, OutputError
-from cozy_runtime.author._executor_requests import Publish, Published, PublishPart
 from cozy_runtime.author._files import (
     AudioFile,
     File,
@@ -207,7 +208,7 @@ class Attempt:
     _stall_watch: _stalls.Watch | None = None
     #: Sends one publish to the worker, which journals it on the run's output log. None in a
     #: harness with no worker: `published` then records what would have been shown.
-    publish: Callable[[Publish], Published] | None = None
+    publish: Callable[[Publish], Answer] | None = None
     published: list[Publish] = field(default_factory=list)
     #: The result fields `Outputs.publish` may name (`Surface.outputs`); None: not known here.
     outputs: frozenset[str] | None = None
