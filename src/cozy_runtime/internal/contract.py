@@ -50,7 +50,6 @@ USE = {
     "process": "concurrently, spread or an invocable child call",
     "thread": "author.ThreadPoolExecutor",
     "internal_import": "the public names (CONTRACT.md); a package split is Final",
-    "host_sync_in_step": "a step label, or compute it before the loop",
     "attention": "cozy_runtime.attention.Attention(heads, head_dim, dtype, causal=) or a "
     "Diffusers attention module",
 }

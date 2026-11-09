@@ -133,8 +133,6 @@ _CACHES = _words(
 )
 _ENVIRON_WRITES = frozenset({"setdefault", "update", "pop", "popitem", "clear", "__setitem__"})
 _WEIGHT_FILES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
-_HOST_READS = frozenset({"item", "tolist", "cpu", "numpy"})
-_LOOP = frozenset({"cozy_runtime.author.denoise_loop", "cozy_runtime.author._loop.denoise_loop"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -410,8 +408,6 @@ class _File:
                 self._add(node, "own_decode", f"{dotted.rsplit('.', 1)[-1]}(...)")
             if dotted == "torch.Generator" and self._device_generator(node):
                 self._add(node, "global_rng", "torch.Generator(device=<not cpu>)")
-            if dotted in _LOOP:
-                self._loop(node)
         name = func.id if isinstance(func, ast.Name) and func.id not in self.aliases else None
         opens = name == "open" or dotted in ("io.open", "builtins.open")
         if opens and node.args and (suffix := _literal_suffix(node.args[0])) is not None:
@@ -485,60 +481,6 @@ class _File:
             device = device.args[0] if device.args else device
         return not (isinstance(device, ast.Constant) and device.value == "cpu")
 
-    # ------------------------------------------------------------- the step loop
-
-    def _loop(self, node: ast.Call) -> None:
-        """`denoise_loop(step, ..., before=, after=)`: the step and its hooks read no device
-        value on the host."""
-        given = [node.args[0]] if node.args else []
-        given += [k.value for k in node.keywords if k.arg in ("step", "before", "after")]
-        for argument in given:
-            body = self._function(node, argument)
-            if body is None:
-                continue
-            for inner in ast.walk(body):
-                if not isinstance(inner, ast.Call):
-                    continue
-                func = inner.func
-                if isinstance(func, ast.Attribute) and func.attr in _HOST_READS and not inner.args:
-                    self._add(inner, "host_sync_in_step", f".{func.attr}()")
-                elif (
-                    isinstance(func, ast.Name)
-                    and func.id in ("bool", "int", "float")
-                    and func.id not in self.aliases
-                    and len(inner.args) == 1
-                    and isinstance(inner.args[0], ast.Call)
-                    and isinstance(inner.args[0].func, ast.Attribute)
-                ):
-                    self._add(
-                        inner,
-                        "host_sync_in_step",
-                        f"{func.id}(<tensor>.{inner.args[0].func.attr}())",
-                    )
-
-    def _function(self, at: ast.AST, argument: ast.expr) -> ast.AST | None:
-        if isinstance(argument, ast.Lambda):
-            return argument
-        if isinstance(argument, ast.Call) and argument.args:
-            if self._resolve(argument.func) == "functools.partial":
-                return self._function(at, argument.args[0])
-            return None
-        method = isinstance(argument, ast.Attribute) and isinstance(argument.value, ast.Name)
-        if not (method or isinstance(argument, ast.Name)):
-            return None
-        scope: ast.AST | None = at
-        while (scope := self.parents.get(id(scope))) is not None:
-            if method and isinstance(scope, ast.ClassDef):
-                assert isinstance(argument, ast.Attribute)
-                return _defined(scope.body, argument.attr)
-            if not method and isinstance(
-                scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Module)
-            ):
-                assert isinstance(argument, ast.Name)
-                if (found := _defined(list(ast.walk(scope))[1:], argument.id)) is not None:
-                    return found
-        return None
-
     def _add(self, node: ast.AST, code: str, construct: str) -> None:
         line = getattr(node, "lineno", 0)
         if len(construct) > CONSTRUCT_CHARS:
@@ -552,13 +494,6 @@ def _unpacked(target: ast.expr) -> Iterator[ast.expr]:
             yield from _unpacked(element)
     else:
         yield target
-
-
-def _defined(nodes: Sequence[ast.AST], name: str) -> ast.AST | None:
-    for node in nodes:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
-            return node
-    return None
 
 
 def _literal_suffix(node: ast.expr) -> str | None:
