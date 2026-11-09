@@ -22,6 +22,8 @@ import re
 import subprocess
 import sys
 import threading
+import time
+from collections.abc import Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -320,23 +322,42 @@ def destroy_stream(torch: Any, stream: Any) -> None:
         raise error
 
 
-def first_launches(torch: ModuleType, kind: str) -> None:
+#: The first launches a convolution weight's rank calls for.
+CONVOLUTIONS = {3: "conv1d", 4: "conv2d", 5: "conv3d"}
+
+
+def first_launches(
+    torch: ModuleType, kind: str, ops: Iterable[tuple[str, Any]] | None = None
+) -> dict[str, float]:
     """Create the GPU libraries' handles, workspaces and first kernels while the device has
     room. cuBLAS and cuDNN take device memory for themselves at a first launch, and inside a
     stage whose budget left none they fail under names that are not out-of-memory (run 3095:
-    CUBLAS_STATUS_INTERNAL_ERROR in a block's first Linear, beside another model's weights)."""
+    CUBLAS_STATUS_INTERNAL_ERROR in a block's first Linear, beside another model's weights).
+    `ops`: `(mm | conv1d | conv2d | conv3d, dtype)`, what a plan computes; None, every one in
+    bf16, f16 and f32. Each launch's ms, by `op.dtype`."""
     if kind != "cuda":
-        return
+        return {}
+    if ops is None:
+        dtypes = (torch.bfloat16, torch.float16, torch.float32)
+        ops = [(op, d) for d in dtypes for op in ("mm", "conv2d", "conv3d")]
     conv = torch.nn.functional
+    took: dict[str, float] = {}
     with torch.inference_mode():
-        for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        for op, dtype in ops:
+            began = time.perf_counter()
             a = torch.ones(8, 8, dtype=dtype, device="cuda")
-            kernel = a[:3, :3]
             with suppress(RuntimeError):  # a card without this dtype
-                torch.mm(a, a)
-                conv.conv2d(a.view(1, 1, 8, 8), kernel.reshape(1, 1, 3, 3))
-                conv.conv3d(a.view(1, 1, 1, 8, 8), kernel.reshape(1, 1, 1, 3, 3))
-        completion_event(torch, kind).synchronize()
+                if op == "mm":
+                    torch.mm(a, a)
+                else:
+                    rank = {v: k for k, v in CONVOLUTIONS.items()}[op] - 2
+                    shape = (1, 1, *(1,) * (rank - 1), 8)
+                    getattr(conv, op)(a[0].reshape(shape), a[0, :3].reshape(*shape[:-1], 3))
+            completion_event(torch, kind).synchronize()
+            took[f"{op}.{str(dtype).removeprefix('torch.')}"] = round(
+                (time.perf_counter() - began) * 1000, 1
+            )
+    return took
 
 
 def initialized(torch: Any, kind: str) -> bool:

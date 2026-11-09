@@ -175,6 +175,7 @@ from cozy_runtime.internal.config import inherited_environment, restore_seal, se
 from cozy_runtime.internal.derive import Observations, serving_substrate
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.encoding import leaves
+from cozy_runtime.internal.encoding.formats import TORCH_DTYPES
 from cozy_runtime.internal.encoding.leaves import FORMATS, serving
 from cozy_runtime.internal.encoding.selection import (
     launch_providers,
@@ -505,13 +506,16 @@ class _InFlight:
 
 class _DeviceStart:
     """The device coming up on its own thread while Start replies and construction does its CPU
-    work (`Executor._start_device`). `ready`: its context, stream and memory serve; `warm`: its
-    libraries' first launches are made too. Torch's device answers and its lazy init wait for
-    `ready` on any other thread until then (`zygote.driverless`)."""
+    work (`Executor._start_device`). `ready`: its context, stream and memory serve. Torch's device
+    answers and its lazy init wait for it on any other thread until then (`zygote.driverless`).
+    The libraries' first launches follow each plan, once each (`Executor._warm`)."""
 
     def __init__(self) -> None:
         self.ready = threading.Event()
-        self.warm = threading.Event()
+        #: the first launches begun, and the (op, dtype) pairs they make
+        self.warming: list[threading.Thread] = []
+        self.warmed: set[tuple[str, Any]] = set()
+        self.lock = threading.Lock()
         self.refused: dict[str, Any] | None = None
         self.raised: BaseException | None = None
         #: each step's ms on the device thread, the executor record's `cuda_init.*` legs
@@ -536,6 +540,25 @@ class _DeviceStart:
 
     def serving(self) -> bool:
         return self.ready.is_set() and self.refused is None and self.raised is None
+
+
+def _failed(starting: _DeviceStart, exc: BaseException) -> None:
+    """A device start's or first launch's fault, as the refusal its first await returns."""
+    if isinstance(exc, ResidencyError):
+        starting.refused = {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+    elif isinstance(exc, RuntimeError):
+        # No room for a context is the device's memory, not its absence: the worker starts
+        # again once a call beside it has given the room.
+        full = fault(exc) is Fault.OOM
+        next_step = "Its memory is full: end what holds it" if full else "Update its driver"
+        starting.refused = {
+            "ok": False,
+            "code": "device_out_of_memory" if full else "accelerator_unavailable",
+            "detail": f"GPU {_SEALED.get('CUDA_VISIBLE_DEVICES')} could not be started: {exc}. "
+            f"{next_step}, or run it --on new"[:900],
+        }
+    else:
+        starting.raised = exc
 
 
 def _distribution_version(name: str) -> str:
@@ -1149,7 +1172,6 @@ class Executor:
         except BaseException as exc:
             starting.raised = exc
             starting.serve()
-            starting.warm.set()
             raise
         return None
 
@@ -1166,7 +1188,7 @@ class Executor:
 
     def _bring_up(self, torch: Any, starting: _DeviceStart) -> None:
         """The device thread: varena's context and ledger row, torch's CUDA, the execution
-        stream and the memory (`ready`), then the GPU libraries' first launches (`warm`)."""
+        stream and the memory (`ready`)."""
         mark = starting.began
         try:
             if self.device_kind == "cuda":
@@ -1188,42 +1210,68 @@ class Executor:
                 )
                 _activity.WORKER_CONTEXT = lambda: torch.cuda.stream(torch.cuda.current_stream())
             self._open_memory(torch)
-            mark = starting.leg("memory", mark)
-            starting.serve()
-            accel.first_launches(torch, self.device_kind)
-            starting.leg("first_launches", mark)
-        except ResidencyError as exc:
-            starting.refused = {
-                "ok": False,
-                "code": "weight_residency_unavailable",
-                "detail": str(exc),
-            }
-        except RuntimeError as exc:
-            # No room for a context is the device's memory, not its absence: the worker
-            # starts again once a call beside it has given the room.
-            full = fault(exc) is Fault.OOM
-            next_step = "Its memory is full: end what holds it" if full else "Update its driver"
-            starting.refused = {
-                "ok": False,
-                "code": "device_out_of_memory" if full else "accelerator_unavailable",
-                "detail": f"GPU {_SEALED.get('CUDA_VISIBLE_DEVICES')} could not be "
-                f"started: {exc}. {next_step}, or run it --on new"[:900],
-            }
+            starting.leg("memory", mark)
         except BaseException as exc:
-            starting.raised = exc
+            _failed(starting, exc)
         finally:
             starting.serve()
             starting.legs["cuda_init"] = round((time.perf_counter() - starting.began) * 1000, 1)
-            starting.warm.set()
+
+    def _warm(self, torch: Any, plan: Any) -> None:
+        """HOST ONLY. The GPU libraries' first launches for what `plan` computes in floats, each
+        once per process, on a thread beside the construction, which awaits them before its
+        figures (`_await_device(warm=True)`): a matmul per dtype its float linear rows hold, a
+        convolution per rank and dtype its kernels hold, and at least one bf16 matmul."""
+        starting = self._starting
+        if starting is None or self.device_kind != "cuda":
+            return
+        found: dict[tuple[str, Any], None] = {}
+        for row in plan.tensors:
+            dtype = getattr(torch, TORCH_DTYPES.get(row.output_dtype, row.output_dtype), None)
+            rank = len(row.geometry)
+            if row.route == "encoded_gemm" or not row.key.endswith(".weight"):
+                continue
+            if dtype in (torch.bfloat16, torch.float16, torch.float32):
+                op = "mm" if rank == 2 else accel.CONVOLUTIONS.get(rank)
+                if op:
+                    found[(op, dtype)] = None
+        if not any(op == "mm" for op, _ in found):
+            found[("mm", torch.bfloat16)] = None
+        with starting.lock:
+            ops = [op for op in found if op not in starting.warmed]
+            starting.warmed.update(ops)
+            if not ops:
+                return
+            thread = threading.Thread(
+                target=self._first_launches,
+                args=(torch, starting, ops),
+                name="device-warm",
+                daemon=True,
+            )
+            starting.warming.append(thread)
+        thread.start()
+
+    def _first_launches(self, torch: Any, starting: _DeviceStart, ops: list[Any]) -> None:
+        try:
+            torch.cuda.set_stream(self.execution_stream)
+            took = accel.first_launches(torch, self.device_kind, ops)
+            starting.legs.update({f"warm.{op}": ms for op, ms in took.items()})
+        except BaseException as exc:
+            _failed(starting, exc)
 
     def _await_device(self, *, warm: bool = False) -> dict[str, Any] | None:
-        """HOST ONLY. The device Start began, once it serves (`warm`: with its libraries' first
-        launches made), current on this thread with the execution stream. Its refusal poisons
+        """HOST ONLY. The device Start began, once it serves (`warm`: with the first launches its
+        plans began), current on this thread with the execution stream. Its refusal poisons
         the process; what its thread raised raises here. The device thread never waits."""
         starting = self._starting
         if starting is None or threading.current_thread() is starting.thread:
             return None
-        (starting.warm if warm else starting.ready).wait()
+        starting.ready.wait()
+        if warm:
+            with starting.lock:
+                warming = list(starting.warming)
+            for thread in warming:
+                thread.join()
         if starting.refused is not None:
             self.poisoned = self.poisoned or f"start refused: {starting.refused['code']}"
             return starting.refused
@@ -1231,9 +1279,7 @@ class Executor:
             self.poisoned = self.poisoned or "device start raised"
             raise RuntimeError(f"the device start raised: {starting.raised!r}") from starting.raised
         self._device_ready = True
-        legs = self.boot.setdefault("legs_ms", {})
-        if "cuda_init" not in legs:
-            legs.update(starting.legs)
+        self.boot.setdefault("legs_ms", {}).update(starting.legs)
         if self.execution_stream is not None:
             if self.world > 1:
                 self.torch.cuda.set_device(self.rank)
@@ -1243,7 +1289,10 @@ class Executor:
     def _device_settled(self) -> bool:
         """HOST ONLY. No device is starting: it started (warm) or none was asked for."""
         starting = self._starting
-        return starting is None or (starting.warm.is_set() and starting.serving())
+        with contextlib.nullcontext() if starting is None else starting.lock:
+            return starting is None or (
+                starting.serving() and not any(t.is_alive() for t in starting.warming)
+            )
 
     def _execution_context(self, *, settle: bool = True) -> contextlib.AbstractContextManager[Any]:
         """Enter the process's CUDA stream on a command, idle or readiness worker; `settle`: once
@@ -2795,6 +2844,8 @@ class Executor:
                 "detail": str(exc).splitlines()[0][:900],
                 "plan": {"walk": msgspec.to_builtins(exc.steps)},
             }
+        # The libraries' first launches this plan needs, beside the rest of the construction.
+        self.host._warm(torch, plan)
         stage("resolve")
         mine = GroupPlan(
             degree=self.world,
