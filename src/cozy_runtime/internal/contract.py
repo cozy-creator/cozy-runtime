@@ -1,7 +1,8 @@
 """The package contract's seal (CONTRACT §9, ENFORCEMENT §2): what harms the process a package
 shares raises `ContractViolation` naming the rule and the harm. Applied once per executor before
 its package imports (a zygote's forks inherit it); nothing is checked per op. A package's own
-code shape is not judged: its loops, attention calls, host reads, threads and library decode pass.
+code shape is not judged: its loops, attention calls, host reads, waits (`synchronize`), threads
+and library decode pass.
 
 A call is the package's when the innermost frame that is not the standard library or a library
 (a distribution other than the package's) is package code; the Runtime's own frames, and anything
@@ -54,6 +55,7 @@ WHY = {
     "weights_io": "weights come only from the bound artifact through TensorFS, where their "
     "memory is counted",
     "global_rng": "the global RNG is process-wide; seed a generator of your own",
+    "device_rng": "a CUDA generator's draws depend on the card; use rng.generator(seed)",
     "process": "a child process is outside the sandbox and holds memory varena cannot see",
     "internal_import": "Runtime internals bypass the contract and move without notice",
 }
@@ -205,8 +207,7 @@ def seal(torch: Any, application: str = "") -> None:
                 setattr(module, name, _raiser(name))
     cuda, graphs = torch.cuda, getattr(torch.cuda, "graphs", None)
     _replace("allocator", (cuda, cuda.memory), "empty_cache", "torch.cuda.empty_cache")
-    for name in ("synchronize", "set_device"):
-        _replace("own_stream", (cuda,), name, f"torch.cuda.{name}")
+    _replace("own_stream", (cuda,), "set_device", "torch.cuda.set_device")
     _replace("own_stream", (cuda, graphs), "make_graphed_callables", "make_graphed_callables")
     # `current_stream()` and `default_stream()` wrap a stream that exists: they make none.
     _construction(
@@ -219,10 +220,6 @@ def seal(torch: Any, application: str = "") -> None:
     ):
         _construction("own_stream", cls, spelled)
     _construction("own_stream", getattr(cuda, "graph", None), "torch.cuda.graph", "__init__")
-    for cls in (getattr(cuda, "Stream", None), getattr(cuda, "Event", None)):
-        _construction(
-            "own_stream", cls, f"{getattr(cls, '__name__', '')}.synchronize", "synchronize"
-        )
     _replace("compile", (torch,), "compile", "torch.compile")
     _construction("compile", torch.nn.Module, "nn.Module.compile", "compile")
     random = getattr(cuda, "random", None)

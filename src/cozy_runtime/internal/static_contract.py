@@ -3,7 +3,7 @@ roots, read as `ast` like the rest of the static reader, executing nothing of it
 
 A construct that harms the process a package shares is refused in one line, `file:line: <rule>:
 <construct>: <the harm>`. Only harm is judged, never the shape of the code: loops, attention
-calls, host reads, threads and library decode are the author's. Names resolve through each
+calls, host reads and waits, threads and library decode are the author's. Names resolve through each
 file's imports, its own package's re-exports and single-assignment aliases; an attribute of an
 object (`self.vae.decode`) is not judged here: the executor's seal catches those calls."""
 
@@ -75,12 +75,12 @@ _NAMED: dict[str, str] = {
     **_names(
         "own_stream",
         """torch.cuda.Stream torch.cuda.Event torch.cuda.ExternalStream torch.cuda.StreamContext
-        torch.cuda.stream torch.cuda.streams torch.cuda.set_stream torch.cuda.synchronize
+        torch.cuda.stream torch.cuda.streams torch.cuda.set_stream
         torch.cuda.CUDAGraph torch.cuda.graph torch.cuda.graphs torch.cuda.graph_pool_handle
         torch.cuda.make_graphed_callables torch.cuda.set_device torch.cuda.device
         torch.cuda.device_of torch.Stream torch.Event
-        torch.accelerator.set_stream torch.accelerator.synchronize
-        torch.accelerator.set_device_index torch.accelerator.set_device_idx torch.mps.synchronize
+        torch.accelerator.set_stream
+        torch.accelerator.set_device_index torch.accelerator.set_device_idx
         torch.mps.Event cuda.bindings cuda.cuda cuda.cudart cuda.core pycuda""",
     ),
     **_names("compile", "torch.compile torch._dynamo torch._inductor triton.autotune"),
@@ -374,7 +374,7 @@ class _File:
         if isinstance(func, ast.Attribute):
             if func.attr in ("from_pretrained", "from_single_file"):
                 self._add(node, "weights_io", f".{func.attr}(...)")
-            if func.attr in ("synchronize", "wait_stream", "wait_event", "record_event") and (
+            if func.attr in ("wait_stream", "wait_event", "record_event") and (
                 isinstance(func.value, ast.Call)
                 and self._resolve(func.value.func)
                 in ("torch.cuda.current_stream", "torch.cuda.default_stream")
@@ -383,7 +383,7 @@ class _File:
             if func.attr in _ENVIRON_WRITES and self._resolve(func.value) == "os.environ":
                 self._add(node, "env_write", f"os.environ.{func.attr}(...)")
         if dotted == "torch.Generator" and self._device_generator(node):
-            self._add(node, "global_rng", "torch.Generator(device=<not cpu>)")
+            self._add(node, "device_rng", "torch.Generator(device=<not cpu>)")
         name = func.id if isinstance(func, ast.Name) and func.id not in self.aliases else None
         opens = name == "open" or dotted in ("io.open", "builtins.open")
         if opens and node.args and (suffix := _literal_suffix(node.args[0])) is not None:
