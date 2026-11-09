@@ -8,9 +8,9 @@ for `cozy_runtime.derive.*`), folds constants with a shared
 evaluator over literal and arithmetic nodes and values of the package's committed JSON files
 (`author.data_values`), and translates every interface-bearing declaration into real types built
 from the CLOSED author vocabulary — `msgspec.defstruct`, `enum.Enum`, `typing.Literal`/
-`Annotated`, cozy-runtime's own file, marker and service classes. Rendering is then
-`schema.render`, the SAME renderer the import path uses, so the two derivations cannot drift
-by construction.
+`Annotated`, cozy-runtime's own file, marker and service classes, then renders them with
+`schema.render`. This is the ONLY describer: nothing else derives a package interface, and no
+caller falls back to importing the package.
 
 Anything outside the closed vocabulary — a name bound to no definition in the tree, a
 computed value (call, comprehension, unknown attribute) in an interface position, a dynamic
@@ -134,8 +134,8 @@ class Installed:
 
     A package may build its surface out of a dependency's declarations — a `Model` subclass,
     a shared request struct — and that dependency's source ships in its wheel. So the reader
-    reads it, confined to distributions declaring a `cozy.application` entry point: the same
-    fact `discovery.py` calls an app. torch declares none, so torch is never in the tree, and
+    reads it, confined to distributions declaring a `cozy.application` entry point, which
+    is what makes one an app. torch declares none, so torch is never in the tree, and
     site-packages is never a root. Their modules are followed for TYPES only, never scanned
     for registrations: another package's callables are its own.
     """
@@ -283,7 +283,7 @@ def _trusted_module(name: str) -> bool:
     return any(name == root or name.startswith(root + ".") for root in _TRUSTED_ROOTS)
 
 
-#: The entry-point group `discovery.py` reads. A distribution that declares one IS a cozy
+#: The entry-point group that names an app. A distribution that declares one IS a cozy
 #: package; every other distribution beside it — torch included — is not, and is never read.
 _APPLICATION_GROUP = "[cozy.application]"
 _BUILTIN_TYPES: dict[str, object] = {
@@ -1472,7 +1472,7 @@ def read_application(project: Path) -> str:
     if len(objects) != 1 or not isinstance(objects[0], str) or not objects[0]:
         raise StaticRefusal(
             f'{path} names {len(objects)} [project.entry-points."cozy.application"] entries; '
-            "discovery reads exactly one",
+            "a package names exactly one",
             code="application_entrypoint_count",
         )
     obj = objects[0]
@@ -2057,9 +2057,9 @@ def _recipes_registration(
 
 
 def _operation_identity(reader: Reader, registration: Registration) -> str | None:
-    """A memoized callable's operation identity read from installed source alone: the same key
-    `memo_implementation.describe` computes by import. None when any part of its declaration
-    cannot be read statically; its machine then keys the memo by its package's files."""
+    """A memoized callable's operation identity read from installed source alone. None when any
+    part of its declaration cannot be read statically; its machine then keys the memo by its
+    package's files."""
     fn = registration.fn
     own = (f"{registration.module.name}.{fn.name}", memo_identity.normalized_definition(fn))
     return _declared_identity(reader, registration, [own])

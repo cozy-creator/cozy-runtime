@@ -217,7 +217,7 @@ A package may build its surface out of an INSTALLED cozy package's declarations 
 subclass, a shared request struct; `diagnostics/h3-vae-roundtrip` subclasses MiniMax-H3's
 `H3Model` and reuses its request type. That dependency's source ships in its wheel, so the
 reader reads it out of the environment it is itself installed in, confined to distributions
-declaring a `cozy.application` entry point — the same fact `discovery.py` calls an app. torch
+declaring a `cozy.application` entry point, which is what makes one an app. torch
 declares none, site-packages is never a root, and a sibling package supplies TYPES only: its
 own callables are its own, never scanned as registrations (cr-117).
 
@@ -229,12 +229,9 @@ The reader is also what the DEVELOPMENT placement is built from (the worker sess
 staging): it supervises and does not execute, so it reads the source and takes its model
 slots off the interface document.
 
-`internal/discovery.py` is the import path and the static reader's ORACLE: it imports exactly
-the ONE `App` export that entry point names, freezes it, and stops. `cozy-runtime --conformance
-describe` runs both and refuses unless they are byte-identical — and refuses outright unless
-the running interpreter is the package's own locked environment (its distribution, at
-pyproject's version, resolves there), because importing package code is running it. That is
-the check a package's own CI runs from its locked venv; publish runs the static reader alone.
+The static reader is the only describer: publish, install, Calcifer and TensorD all take its
+document, and nothing derives an interface by importing a package. `internal/discovery.py` is
+the executor's import of the ONE installed `App` export, to serve it; it describes nothing.
 
 `internal/package_interface.py` is the schema home for `PackageInterface`: only
 the launch and invocation facts with current readers. It carries no Runtime-global service
@@ -305,7 +302,6 @@ describe disagrees with them. `package_interface_digest` is SHA-256 over those c
     uv run cozy-runtime new <name>       # scaffold a minimal valid package
     uv run cozy-runtime describe              # the surface, from source alone
     uv run cozy-runtime --json describe       # canonical publication bytes on stdout
-    uv run --locked cozy-runtime --conformance describe   # + import the app here; equal or refuse
 
 ### Per-package uv environments
 
@@ -409,9 +405,9 @@ policy input, not duplicated per tensor. A non-`ok` verdict is the typed prepare
 never from the header.
 
 A package whose signature names a video or audio input must install
-`cozy-runtime[media]`; `--conformance describe` refuses the release if PyAV is absent (the
-static reader has no environment to check). Media inputs are handles read through the
-attempt's one budget; see [Media inputs](docs/files.md).
+`cozy-runtime[media]`; the executor refuses its import (`media_decoder_dependency`) if PyAV is
+absent, since the static reader has no environment to check. Media inputs are handles read
+through the attempt's one budget; see [Media inputs](docs/files.md).
 
 An image function declares exactly the inputs its model uses, so a box never offers one that does
 nothing, and a caller who sends one gets the usual unknown-field warning. `ImageRequest` holds what
