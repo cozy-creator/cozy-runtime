@@ -570,10 +570,8 @@ class RankGroup:
                 ) from exc
 
     def start(self, command: Mapping[str, object]) -> None:
-        """Hand every follower rank 0's Start. The descriptors that follow TensorD's Start are
-        rank 0's: the Start a follower gets names none, or it would wait for descriptors nobody
-        sends."""
-        self.broadcast({**command, "ledgers": 0})
+        """Hand every follower rank 0's Start."""
+        self.broadcast(command)
 
     def collect(self, name: str, shown: bool = True) -> list[dict[str, Any]]:
         """One reply named `name` from every follower, in rank order. Each wait ends with the

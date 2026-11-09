@@ -67,7 +67,7 @@ from cozy_runtime.internal.attention_site import Site
 from cozy_runtime.internal.attention_ulysses import Local
 from cozy_runtime.internal.encoding.formats import Tensor
 from cozy_runtime.internal.encoding.selection import DeviceFacts
-from cozy_runtime.internal.executor_commands import Choice
+from cozy_runtime.internal.parallel.commands import Choice
 
 # Tensors, torch modules and Diffusers' registry, backend members and processors are `Any`:
 # neither torch nor diffusers is installed in the check venv.
