@@ -11,19 +11,22 @@ Outside an executor (plain Python) the store holds the tensors as they are.
 
 from __future__ import annotations
 
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 class State(Protocol):
     """What one `put` holds."""
 
-    def get(self) -> tuple[Any, ...]:
+    def get(self) -> tuple[Tensor, ...]:
         """The tensors `put` was given, as read-only views valid while they live."""
         ...
 
 
 class Store(Protocol):
-    def put(self, *tensors: Any) -> State:
+    def put(self, *tensors: Tensor) -> State:
         """Hold `tensors` from now on: the caller drops its own and keeps the returned `State`."""
         ...
 
@@ -41,10 +44,10 @@ class Memory(Protocol):
 
 
 class _Held:
-    def __init__(self, tensors: tuple[Any, ...]) -> None:
-        self.tensors: tuple[Any, ...] | None = tensors
+    def __init__(self, tensors: tuple[Tensor, ...]) -> None:
+        self.tensors: tuple[Tensor, ...] | None = tensors
 
-    def get(self) -> tuple[Any, ...]:
+    def get(self) -> tuple[Tensor, ...]:
         if self.tensors is None:
             raise RuntimeError("retained state read after its loop ended")
         return self.tensors
@@ -56,7 +59,7 @@ class Plain:
     def __init__(self) -> None:
         self.states: list[_Held] = []
 
-    def put(self, *tensors: Any) -> State:
+    def put(self, *tensors: Tensor) -> State:
         self.states.append(_Held(tensors))
         return self.states[-1]
 

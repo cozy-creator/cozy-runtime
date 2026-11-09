@@ -236,8 +236,8 @@ class Run:
 
     policy: Policy
     steps: int
-    flags: Any
-    index: Any = None
+    flags: torch.Tensor
+    index: torch.Tensor | None = None
     current: int | None = None
     slot: int = 0
     states: dict[tuple[int, int], _State] = field(default_factory=dict)
