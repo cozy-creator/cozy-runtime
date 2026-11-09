@@ -183,7 +183,7 @@ def producer_sites(root: Any) -> tuple[ProducerSite, ...]:
     for module in root.modules():
         processor = getattr(module, "processor", None)
         producer = getattr(processor, "serving", None)
-        if isinstance(producer, AttentionProducer):
+        if processor is not None and isinstance(producer, AttentionProducer):
             sites.append(ProducerSite(module, processor.component, processor.path, producer))
     return tuple(sites)
 

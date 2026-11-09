@@ -393,9 +393,16 @@ _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_
 #: `app.entrypoint`'s closed keyword set (`author.App`).
 _ENTRYPOINT_KEYWORDS = frozenset(
     {
-        "name", "defaults", "components", "memoize", "on_demand", "accelerator", "weights",
-        "private", "preflight",
-    }  # fmt: skip
+        "name",
+        "defaults",
+        "components",
+        "memoize",
+        "on_demand",
+        "accelerator",
+        "weights",
+        "private",
+        "preflight",
+    }
 )
 #: `app.tool`'s own: the box's (`author.Tool`).
 _TOOL_KEYWORDS = frozenset({"label", "named", "reserved", "ui"})

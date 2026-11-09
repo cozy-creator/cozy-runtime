@@ -55,7 +55,8 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         "import msgspec",
         "from cozy_runtime.fields import "
         "FileBound, AudioPreparation, ImagePreparation, VideoPreparation",
-        "from cozy_runtime.media import Files, ImageFile, AudioFile, VideoFile, File, Tree, Latents",
+        "from cozy_runtime.media import "
+        "Files, ImageFile, AudioFile, VideoFile, File, Tree, Latents",
         "from cozy_runtime.author import ModelArtifact, ModelChoice, Seed",
         "from cozy_runtime.fields import AspectRatio, Audio, Image, Pickup, Prompt, Video",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",

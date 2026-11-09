@@ -588,7 +588,7 @@ _FUSED: weakref.WeakKeyDictionary[Any, bool] = weakref.WeakKeyDictionary()
 
 
 def _fused_experts(model: Any, text: Any) -> bool:
-    """A mixture of experts whose experts are not all `cozy_runtime.accel.moe.Experts`: Transformers'
+    """A mixture of experts whose experts are not all `accel.moe.Experts`: Transformers'
     routes each in a host loop. Split ones decode in two launches a layer (`moe`)."""
     found = _FUSED.get(model)
     if found is None:
