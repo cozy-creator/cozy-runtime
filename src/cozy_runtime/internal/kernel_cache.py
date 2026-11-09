@@ -314,16 +314,26 @@ def from_sealed(sealed: Mapping[str, str]) -> Store | None:
 
 
 _MACHINE_STORE: list[Store | None] = [None]
+#: The configured store's namespaces, each ending in a separator.
+_ROOTS: list[tuple[str, ...]] = [()]
 
 
 def configure(store: Store | None) -> None:
     """Set once by the executor entrypoint from its sealed configuration."""
     _MACHINE_STORE[0] = store
+    namespaces = () if store is None else (store.own, store.trusted)
+    _ROOTS[0] = tuple(os.path.join(os.path.abspath(n), "") for n in namespaces if n is not None)
 
 
 def configured() -> Store | None:
     """This process's store, or None: kernels then compile in-process as upstream does."""
     return _MACHINE_STORE[0]
+
+
+def holds(filename: str) -> bool:
+    """Whether `filename` is in this process's store: code the Runtime built and loads (a kernel
+    tree's `site`), never a package's."""
+    return filename.startswith(_ROOTS[0])
 
 
 #: Where this executor writes compiled kernel objects: its own uid's namespace.
