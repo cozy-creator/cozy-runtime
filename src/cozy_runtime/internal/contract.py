@@ -6,18 +6,22 @@ A call is the package's when the innermost frame that is not the standard librar
 (a distribution other than the package's) is package code; the Runtime's own frames, and anything
 under `owned()`, pass. So a library's call on the package's behalf is the package's, and a
 library's call under a Runtime frame is the Runtime's. The room readers raise for every caller:
-the Runtime reads varena (`vt.stats`, `vt.room`).
+the Runtime reads varena (`vt.stats`, `vt.room`). An env write that leaves the variable as it
+is passes for every caller, since it changes nothing: torch's `cache_dir()` writes TensorD's own
+`TORCHINDUCTOR_CACHE_DIR` back at import.
 
 Behaviour found after the fact warns instead (a swallowed OOM, a package's thread), since its
 output is already made; the release gate fails on those warnings."""
 
 from __future__ import annotations
 
+import ctypes
 import functools
 import importlib.metadata
+import os
 import sys
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from types import FrameType
@@ -429,15 +433,49 @@ _SPAWNS = frozenset(
         "pty.spawn",
     }
 )
+_ENV_WRITES = frozenset({"os.putenv", "os.unsetenv"})
 #: The events `audit` judges, folded into the executor's one audit hook (`sandbox.refuse_network`).
-AUDITED = _SPAWNS | {"os.putenv", "os.unsetenv", "open", "_thread.start_new_thread"}
+AUDITED = _SPAWNS | _ENV_WRITES | {"open", "_thread.start_new_thread"}
 _WEIGHT_FILES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
 _READ_ONLY = ("r", "rb", "rt", "br", "tr")
 
 
+# `_COPY` is `os.environ` keyed as `putenv` and `unsetenv` are audited (bytes on POSIX); `_held`
+# reads the process's own environment, which they write and `os.environ` only copies.
+if sys.platform == "win32":
+    _COPY: Mapping[Any, Any] = os.environ
+
+    def _held(key: str) -> str | None:
+        get = ctypes.WinDLL("kernel32").GetEnvironmentVariableW
+        if not (size := get(key, None, 0)):
+            return None
+        value = ctypes.create_unicode_buffer(size)
+        get(key, value, size)
+        return value.value
+
+else:
+    _COPY: Mapping[Any, Any] = os.environb
+
+    @functools.cache
+    def _getenv() -> Callable[[bytes], bytes | None]:
+        getenv = ctypes.CDLL(None).getenv
+        getenv.argtypes, getenv.restype = (ctypes.c_char_p,), ctypes.c_char_p
+        return getenv
+
+    def _held(key: bytes) -> bytes | None:
+        return _getenv()(key)
+
+
+def _unchanged(event: str, args: tuple[Any, ...]) -> bool:
+    """An env write (`putenv(key, value)`, `unsetenv(key)`) that leaves `key` as it is, both in
+    `os.environ` and in the process's environment: it changes nothing."""
+    key, value = args[0], args[1] if event == "os.putenv" else None
+    return _COPY.get(key) == value and _held(key) == value
+
+
 def audit(event: str, args: tuple[Any, ...]) -> None:
     """One of `AUDITED`, called by the audit hook itself (its frame and the hook's are skipped):
-    refuse the package's env write, spawn or weight read; warn on its thread. The Runtime's own
+    refuse the package's env change, spawn or weight read; warn on its thread. The Runtime's own
     (zygote forks, compile children, media encodes) pass."""
     if _LIBRARIES[0] is None or OWNED.get():
         return
@@ -462,5 +500,7 @@ def audit(event: str, args: tuple[Any, ...]) -> None:
             if row not in WARNINGS:
                 WARNINGS.append(row)
     elif (site := _site(sys._getframe(2))) is not None:
-        rule = "env_write" if event in ("os.putenv", "os.unsetenv") else "process"
-        _refuse(rule, f"{event}({str(args[:1])[1:-2][:80]})", site)
+        if event not in _ENV_WRITES:
+            _refuse("process", f"{event}({str(args[:1])[1:-2][:80]})", site)
+        if not _unchanged(event, args):
+            _refuse("env_write", f"{event}({str(args[:1])[1:-2][:80]}) changing it", site)
