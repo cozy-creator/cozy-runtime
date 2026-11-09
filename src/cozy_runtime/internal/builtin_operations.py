@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author._errors import ConformanceError
 
 MODULE = "cozy_runtime.derive.operations"
 EXPORTS = ("quantize",)

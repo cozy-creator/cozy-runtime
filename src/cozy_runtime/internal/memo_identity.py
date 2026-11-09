@@ -49,6 +49,15 @@ def definitions_identity(version: str, definitions: list[tuple[str, str]]) -> st
     return "sha256:" + hashlib.sha256(document).hexdigest()
 
 
+def release_identity(name: str, distribution: str, build: str | None) -> str | None:
+    """A callable's operation identity: its qualified name and the build of the distribution
+    that ships it (`distribution_identity`). None when that build is unreadable."""
+    if build is None:
+        return None
+    owner = re.sub(r"[-_.]+", "-", distribution).lower()
+    return definitions_identity("", [(name, ""), ("distribution:" + owner, build)])
+
+
 def normalized(source: str | bytes, *, callable_only: bool = False) -> str:
     node = ast.parse(source)
     if callable_only:

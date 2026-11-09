@@ -14,9 +14,8 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import TYPE_CHECKING, Protocol
 
-from cozy_runtime.author._attention import AttentionProducer, ProducerCall
-from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
-from cozy_runtime.author.kernels import PreQuantized
+from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionProducer, ProducerCall
+from cozy_runtime.accel.kernels import PreQuantized
 from cozy_runtime.internal import attention_sol, attention_ulysses, fp8_linear
 
 if TYPE_CHECKING:

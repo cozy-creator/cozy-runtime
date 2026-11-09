@@ -6,11 +6,25 @@ import contextvars
 import functools
 import threading
 from collections.abc import Callable
-from typing import Any
+from typing import Any, overload
 
 from cozy_runtime.author._model import Model
 
 
+@overload
+def concurrently[A](a: Callable[[], A], /) -> tuple[A]: ...
+@overload
+def concurrently[A, B](a: Callable[[], A], b: Callable[[], B], /) -> tuple[A, B]: ...
+@overload
+def concurrently[A, B, C](
+    a: Callable[[], A], b: Callable[[], B], c: Callable[[], C], /
+) -> tuple[A, B, C]: ...
+@overload
+def concurrently[A, B, C, D](
+    a: Callable[[], A], b: Callable[[], B], c: Callable[[], C], d: Callable[[], D], /
+) -> tuple[A, B, C, D]: ...
+@overload
+def concurrently[T](*calls: Callable[[], T]) -> tuple[T, ...]: ...
 def concurrently(*calls: Callable[[], Any]) -> tuple[Any, ...]:
     """Run independent calls; the results, in call order, once every call has finished.
 

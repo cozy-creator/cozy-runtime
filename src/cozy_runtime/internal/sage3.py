@@ -22,7 +22,7 @@ from torch import Tensor
 from torch.nn.functional import scaled_dot_product_attention as sdpa
 
 from cozy_runtime import _kernels
-from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.accel.kernels import Launch, TritonEntry, TritonKernels
 
 GROUP_SIZE = 128
 

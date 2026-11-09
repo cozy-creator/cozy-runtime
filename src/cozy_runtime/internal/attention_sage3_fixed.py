@@ -15,7 +15,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.accel.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import attention_sage2_fixed_mean as means
 
 CENTER_TILE = 16

@@ -45,7 +45,7 @@ from cozy_runtime.author._markers import (
 )
 from cozy_runtime.author._media import KIND_MEDIA, slot_kind
 from cozy_runtime.author._memo import Memoize
-from cozy_runtime.author._model import Model, component_use
+from cozy_runtime.author._model import Model, component_use, undeclared_methods
 from cozy_runtime.author._services import SERVICES, Secrets, Settings
 from cozy_runtime.author._tool import Tool
 from cozy_runtime.author._walker import is_struct, strip, unwrap_optional, walk
@@ -274,7 +274,7 @@ class ModelBinding:
 
     @property
     def encoded_leaves(self) -> str:
-        return str(getattr(self.model_class, "__encoded_leaves__", "refuse"))
+        return str(getattr(self.model_class, "__encoded_leaves__", "accept"))
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,7 +282,7 @@ class ModelSpec:
     """A Model class's facts, read by import (`of`) or from source alone."""
 
     name: str
-    encoded_leaves: str = "refuse"
+    encoded_leaves: str = "accept"
     min_bits: int = 8
     phase: str = "compute"
     sequence_parallel: tuple[int, ...] = ()
@@ -292,6 +292,16 @@ class ModelSpec:
     """It defines `load(loader)`."""
     arguments: tuple[str, ...] = ()
     """What its constructor requires."""
+    undeclared: tuple[str, ...] = ()
+    """Its public methods with no `@uses_components` hint."""
+
+    @property
+    def selects(self) -> tuple[str, ...]:
+        """The components a slot of this class fetches: those its hints name, when every public
+        method has one; empty means all of them."""
+        if self.undeclared:
+            return ()
+        return tuple(sorted({c for names in self.components.values() for c in names}))
 
     @classmethod
     def of(cls, model: type[Model[Any]]) -> ModelSpec:
@@ -310,6 +320,7 @@ class ModelSpec:
                 for p in parameters
                 if p.default is p.empty and p.kind not in (p.VAR_POSITIONAL, p.VAR_KEYWORD)
             ),
+            undeclared_methods(model),
         )
 
 

@@ -21,7 +21,7 @@ from typing import Any
 
 import msgspec
 
-from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._model import LoRAServing
 from cozy_runtime.internal import execution_evidence
 from cozy_runtime.internal.canonical import Json

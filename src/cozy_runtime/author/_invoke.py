@@ -24,7 +24,7 @@ import asyncio
 import functools
 import hashlib
 import sys
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
@@ -130,7 +130,6 @@ class Invocation:
     progress: Callable[[ProgressFrame | Observation], None] | None = None
     """The runtime's lossy LIVE sink (cr-007/cr-011): progress frames and retained
     observations alike. Best-effort, never authoritative."""
-    plan: Callable[[Sequence[str | Collection[str]]], None] | None = None
     calls: _Broker | None = None
     publish: Callable[[Publish], Published] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
@@ -184,8 +183,6 @@ class PreparedRequest:
     lora: str = "bake"
     #: what preparing it waited for (its attention kernel's compile): its attempt's first stages
     stages: Mapping[str, Track] = field(default_factory=dict)
-    #: Static component order is available before handler entry and queued GPU admission.
-    phases: tuple[tuple[str, ...], ...] = ()
 
     def digests(self) -> dict[str, str]:
         """What a worker can hold, record and price against — never the payload."""
@@ -216,7 +213,6 @@ def prepare(
         facts_digest=facts_digest,
         asset_bounds=asset_bounds,
         lora=lora,
-        phases=registration.phases,
     )
 
 
@@ -305,7 +301,6 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     attempt.outputs = surface.outputs
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
     ctx._recipes = inv.recipes
-    ctx._plan = inv.plan
     ctx._progress, ctx._called = Telemetry(record, ctx).loop_progress()
     handles = ExitStack()
     _bind_tensorfs(ctx, record, inv, surface, handles)

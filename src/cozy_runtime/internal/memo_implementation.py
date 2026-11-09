@@ -1,94 +1,59 @@
-"""Operation cache invalidation, independent of package installation and routing."""
+"""A memoized callable's code identity is its release: the build of the distribution that
+ships it. Nothing is declared by the author."""
 
 from __future__ import annotations
 
-import hashlib
+import functools
 import importlib.metadata
-import importlib.resources
-import importlib.util
-import inspect
 import sys
-import textwrap
 from collections.abc import Callable
-from pathlib import Path, PurePosixPath
 
-from cozy_runtime.author._memo import MemoDependency, MemoDistribution, MemoResource
-
-from cozy_runtime.internal.memo_identity import (
-    MAX_SOURCE_BYTES,
-    definitions_identity,
-    distribution_identity,
-    normalized,
-)
+from cozy_runtime.internal import installed
+from cozy_runtime.internal.memo_identity import distribution_identity, release_identity
 
 
 def describe(fn: Callable[..., object]) -> dict[str, str]:
-    """Hash Python behavior; authors may salt external behavior and declare helpers.
-
-    Only this callable and those declared helpers enter its key. Install handles,
-    caller scripts, package inventories and client SDKs never participate. Missing
-    source disables the shortcut; it cannot refuse an otherwise valid invocation.
-    """
-    declaration: tuple[str, tuple[MemoDependency, ...]] = getattr(
-        fn, "_cozy_memo_declaration", ("", ())
-    )
-    version, dependencies = declaration
-    try:
-        definitions = [_definition(fn)]
-        for dependency in dependencies:
-            if isinstance(dependency, MemoResource):
-                name = PurePosixPath(dependency.name)
-                if name.is_absolute() or ".." in name.parts:
-                    return {"operation_identity_unavailable": "operation_resource_unavailable"}
-                digest = hashlib.sha256()
-                try:
-                    with (
-                        importlib.resources.files(dependency.package)
-                        .joinpath(dependency.name)
-                        .open("rb") as stream
-                    ):
-                        for chunk in iter(lambda: stream.read(1 << 20), b""):
-                            digest.update(chunk)
-                except (ImportError, OSError, TypeError, ValueError):
-                    return {"operation_identity_unavailable": "operation_resource_unavailable"}
-                definitions.append(
-                    ("resource:" + dependency.package + "/" + dependency.name, digest.hexdigest())
-                )
-            elif isinstance(dependency, MemoDistribution):
-                identity = _native_identity(dependency.name)
-                if identity is None:
-                    return {
-                        "operation_identity_unavailable": "operation_native_identity_unavailable"
-                    }
-                definitions.append(("distribution:" + dependency.name, identity))
-            elif isinstance(dependency, str):
-                spec = importlib.util.find_spec(dependency)
-                if spec is None or spec.origin is None or not spec.origin.endswith(".py"):
-                    raise ValueError("helper source unavailable")
-                with Path(spec.origin).open("rb") as stream:
-                    source = stream.read(MAX_SOURCE_BYTES + 1)
-                if len(source) > MAX_SOURCE_BYTES:
-                    raise ValueError("helper source exceeds bound")
-                definitions.append((dependency, normalized(source)))
-            else:
-                definitions.append(_definition(dependency))
-    except (ImportError, OSError, TypeError, ValueError, SyntaxError):
-        return {"operation_identity_unavailable": "operation_source_unavailable"}
-    return {"operation_identity": definitions_identity(version, definitions)}
-
-
-def _definition(fn: Callable[..., object]) -> tuple[str, str]:
+    """The operation identity of an entrypoint: its name and its distribution's build, as the
+    static reader computes it (`static_interface._operation_identity`). An unreadable build (an
+    editable install) disables the shortcut; it never refuses an invocation."""
     export = getattr(fn, "_cozy_export", None)
     if export is not None:
         fn = export.implementation
-    source = textwrap.dedent(inspect.getsource(fn))
-    if len(source.encode()) > MAX_SOURCE_BYTES:
-        raise ValueError("operation source exceeds bound")
-    return (fn.__module__ + "." + fn.__qualname__, normalized(source, callable_only=True))
+    owner = _owner(fn.__module__.split(".")[0])
+    identity = release_identity(
+        f"{fn.__module__}.{fn.__qualname__}", owner or "", _build(owner) if owner else None
+    )
+    if identity is None:
+        return {"operation_identity_unavailable": "operation_release_unavailable"}
+    return {"operation_identity": identity}
 
 
-def _native_identity(name: str) -> str | None:
-    """Cheap explicit native metadata; never enumerate RECORD or hash binaries."""
+def stage(fn: Callable[..., object]) -> str | None:
+    """A memoized Model method's code identity in this process: its name and its distribution's
+    installed files by their recorded hashes. None for an editable or unrecorded install."""
+    owner = _owner(fn.__module__.split(".")[0])
+    if owner is None:
+        return None
+    try:
+        files = installed.record_digest(importlib.metadata.distribution(owner))
+    except importlib.metadata.PackageNotFoundError:
+        return None
+    return f"{fn.__module__}.{fn.__qualname__}@{files}" if files else None
+
+
+@functools.cache
+def _owners() -> dict[str, list[str]]:
+    return dict(importlib.metadata.packages_distributions())
+
+
+def _owner(top: str) -> str | None:
+    """The one distribution that ships the top-level module `top`."""
+    found = sorted(set(_owners().get(top, ())))
+    return found[0] if len(found) == 1 else None
+
+
+def _build(name: str) -> str | None:
+    """Explicit build metadata; never enumerate RECORD or hash binaries."""
     try:
         distribution = importlib.metadata.distribution(name)
         return distribution_identity(

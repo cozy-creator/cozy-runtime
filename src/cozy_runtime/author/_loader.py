@@ -5,7 +5,7 @@ construction records `describe` and exact binding read.
 `ctx` always means the request Context). Using the loader at request time, or a request
 service at load time, is a type error rather than a footnote (§1.3).
 
-`construct(T, factory=)` is the ONE construction primitive and does exactly four things
+`construct(factory)` is the ONE construction primitive and does exactly four things
 (§1.1): (1) hands the factory a typed READ-ONLY config capability — never a path; (2) runs
 the SAME factory under derive and under serve; (3) censuses the returned object and asks
 the backend for the ONE fit verdict (`tensorfs.fit` over the census and the checkpoint
@@ -21,15 +21,17 @@ ref, device/dtype override, offload/pin/eviction knob, compile hook or selection
 
 from __future__ import annotations
 
+import functools
 import io
 import time
+import typing
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
+from typing import Any, Literal, NoReturn, Protocol, TypeVar, cast, final, runtime_checkable
 
 import msgspec
 
@@ -321,7 +323,7 @@ class Config:
     def as_bool(self, name: str, default: bool | None = None) -> bool:
         return self._scalar(name, bool, default)
 
-    def mapping(self) -> dict[str, object]:
+    def mapping(self) -> dict[str, Any]:
         """The whole section as a plain, canonically ordered COPY.
 
         The typed accessors are the door for the author's own code; this one is the door
@@ -743,31 +745,6 @@ class _ScopeHost(Protocol):
     def _cozy_require_scope(self, what: str) -> None: ...
 
 
-# --------------------------------------------------------------------------- adapters
-
-_ADAPTERS: dict[type, Callable[[Config], object]] = {}
-
-
-def register_adapter[T](cls: type[T], factory: Callable[[Config], T]) -> None:
-    """Register the EXACT construction adapter for a pipeline class, making `load(T)` legal.
-
-    A library ships this beside the class it constructs (the runtime ships the diffusers
-    one outside the author fence). There is no reflective fallback: an unregistered class
-    refuses, and so does a `from_pretrained` that performs I/O.
-    """
-    if cls in _ADAPTERS:
-        raise ConformanceError(
-            f"{cls.__name__} already has a registered construction adapter: two producers of "
-            "one construction is exactly the drift this fence exists for",
-            code="duplicate_adapter",
-        )
-    _ADAPTERS[cls] = cast("Callable[[Config], object]", factory)
-
-
-def registered_adapters() -> tuple[str, ...]:
-    return tuple(sorted(c.__name__ for c in _ADAPTERS))
-
-
 # --------------------------------------------------------------------------- record
 
 
@@ -856,10 +833,12 @@ class Loader:
         self._require_open("loader.assets")
         return self._assets
 
-    def construct(self, t: type[T], *, factory: Callable[[Config], T]) -> T:
-        """THE construction primitive: typed config in, walk and match, then one fill path."""
+    def construct(self, factory: Callable[[Config], T]) -> T:
+        """Build one object from the bound artifact's config, then fill its tensors. `factory`
+        is a class or a function taking the `Config`; a function's return annotation, when it
+        names a class, is checked against what it returns."""
         self._require_open("loader.construct")
-        identity = factory_identity(factory)
+        t = factory_type(factory)
         _legs: list[tuple[str, float]] = []
         _t0 = time.perf_counter()
         config = self._artifact.config
@@ -887,10 +866,10 @@ class Loader:
             CONSTRUCTION.reset(construction)
         _legs.append(("factory", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
-        if not isinstance(obj, t):
+        if t is not None and not isinstance(obj, t):
             raise ConformanceError(
-                f"factory {identity} returned {type(obj).__name__}, declared {t.__name__} — "
-                "a factory returns ONE whole object; no partial-binding tier exists",
+                f"{factory_name(factory)} returned {type(obj).__name__}, annotated "
+                f"{t.__name__}",
                 code="factory_result",
             )
         if self._artifact._prepare is not None:
@@ -929,25 +908,6 @@ class Loader:
         self._records.append(record)
         self._objects.append(obj)
         return obj
-
-    def load(self, t: type[T]) -> T:
-        """Sugar over a REGISTERED exact adapter. Never a `from_pretrained` duck-type."""
-        self._require_open("loader.load")
-        adapter = _ADAPTERS.get(t)
-        if adapter is None:
-            hint = (
-                f" — {t.__name__}.from_pretrained exists, but a reflective fallback is exactly "
-                "what this refusal deletes: it would hand a filesystem path to third-party "
-                "code and desynchronize derive from serve"
-                if hasattr(t, "from_pretrained")
-                else ""
-            )
-            raise ConformanceError(
-                f"load({t.__name__}) has no registered construction adapter{hint}. Name the "
-                "factory explicitly: loader.construct(T, factory=...)",
-                code="unregistered_adapter",
-            )
-        return self.construct(t, factory=cast("Callable[[Config], T]", adapter))
 
     def cache(self, name: str, *, max_entries: int = 64, max_bytes: int = 1 << 30) -> DerivedCache:
         """Declare a model-generation-scoped derived cache. Memory-only, by construction."""
@@ -1150,22 +1110,26 @@ class Scheduler(Protocol):
     def clone(self, sampler: str | None = None) -> Scheduler: ...
 
 
-def factory_identity(factory: Callable[[Config], object]) -> str:
-    """The derive/serve fence's first term. Closure values are part of it, so a ROLE-SCOPED
-    lambda (`task="fl2va"`) is a different factory from its twin (§1.1)."""
-    code = getattr(factory, "__code__", None)
+def factory_name(factory: Callable[[Config], object]) -> str:
+    """`module:qualname` of a construction factory, read through `functools.partial`."""
+    while isinstance(factory, functools.partial):
+        factory = factory.func
     where = getattr(factory, "__qualname__", type(factory).__name__)
-    module = getattr(factory, "__module__", "?")
-    parts = [f"{module}:{where}"]
-    if code is not None:
-        closure = getattr(factory, "__closure__", None) or ()
-        for name, cell in zip(code.co_freevars, closure, strict=True):
-            try:
-                parts.append(f"{name}={cell.cell_contents!r}")
-            except ValueError:  # an unset cell: identity falls back to code position
-                parts.append(f"{name}=<unset>")
-        parts.append(f"@{code.co_firstlineno}")
-    return "|".join(parts)
+    return f"{getattr(factory, '__module__', '?')}:{where}"
+
+
+def factory_type(factory: Callable[[Config], object]) -> type | None:
+    """The class a factory builds: itself, or its return annotation when that names a class."""
+    while isinstance(factory, functools.partial):
+        factory = factory.func
+    if isinstance(factory, type):
+        return factory
+    try:
+        declared = typing.get_type_hints(factory).get("return")
+    except Exception:  # an annotation that does not resolve here checks nothing
+        return None
+    declared = typing.get_origin(declared) or declared
+    return declared if isinstance(declared, type) else None
 
 
 @contextmanager

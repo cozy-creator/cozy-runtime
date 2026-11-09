@@ -1,4 +1,4 @@
-"""A package's Triton kernels (`author.kernels.TritonKernels`): built when its executor starts,
+"""A package's Triton kernels (`accel.kernels.TritonKernels`): built when its executor starts,
 for each sealed GPU's architecture, and loaded at construction.
 
 Each entry compiles into Triton's own keyed cache (`TRITON_CACHE_DIR`, inside the machine's
@@ -40,9 +40,7 @@ from typing import Any, cast
 import msgspec
 from msgspec import Struct
 
-from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author._model import LANDED
-from cozy_runtime.author.kernels import (
+from cozy_runtime.accel.kernels import (
     KernelsUnavailable,
     Launch,
     TritonEntry,
@@ -50,6 +48,8 @@ from cozy_runtime.author.kernels import (
     entry_key,
     readable,
 )
+from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._model import LANDED
 from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_ready, tools, verify
 
 try:

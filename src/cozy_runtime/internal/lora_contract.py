@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import math
+
 import msgspec
 
-from cozy_runtime.author import AdapterRef, CapabilityError
+from cozy_runtime.author._context import AdapterRef
+from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.internal.model_config import ADAPTERS
 
 GRAPH_CONFIG = ADAPTERS

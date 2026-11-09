@@ -27,8 +27,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType, ModuleType
 
-from cozy_runtime.author import App, ConformanceError, Surface, describe
+from cozy_runtime.author import App
+from cozy_runtime.author._describe import describe
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._recipes import DeclaredRecipe
+from cozy_runtime.author._signature import Surface
 from cozy_runtime.derive import recipes as declared_recipes
 from cozy_runtime.internal.static_interface import missing_app, read_application
 

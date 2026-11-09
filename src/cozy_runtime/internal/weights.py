@@ -25,8 +25,10 @@ from dataclasses import dataclass, field
 from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
+from tensorfs.raw import parts as stored_parts
+
 from cozy_runtime import graphs
-from cozy_runtime.author import CapabilityError
+from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._loader import (
     TENSORFS_NAMES,
     Census,
@@ -75,7 +77,6 @@ from cozy_runtime.internal.residency import (
     uncached,
 )
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
-from tensorfs.raw import parts as stored_parts
 
 if TYPE_CHECKING:
     import torch

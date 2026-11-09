@@ -30,8 +30,9 @@ import triton
 from triton.runtime.build import compile_so_from_file
 from triton.runtime.cache import get_cache_manager
 
-from cozy_runtime import lm, moe
-from cozy_runtime.author.kernels import _SETS, TritonKernels
+from cozy_runtime import lm
+from cozy_runtime.accel import moe
+from cozy_runtime.accel.kernels import _SETS, TritonKernels
 from cozy_runtime.internal import (
     arch,
     attention_sol_fa4,

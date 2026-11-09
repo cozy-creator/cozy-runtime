@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import torch
 
+from cozy_runtime.accel.attention import AttentionLayout, attention_scope
 from cozy_runtime.internal.attention_site import Site
 
 
@@ -68,7 +69,10 @@ class Attention(torch.nn.Module):
     The Runtime picks each call's kernel from its site's: one that cannot serve the call (a
     mask or bias where it serves none, causal at unequal lengths on Sage or cuDNN, causal at
     all on the quantized and sparse kernels) leaves that call to SDPA, and the run's record
-    counts it. With a mask or bias, causal is folded into that mask."""
+    counts it. With a mask or bias, causal is folded into that mask.
+
+    `layout`: this call's sparse layout (`accel.attention.AttentionLayout`), for a site whose
+    kernel is a sparse one; without it every row attends dense."""
 
     def __init__(
         self, heads: int, head_dim: int, dtype: torch.dtype = torch.bfloat16, causal: bool = False
@@ -86,8 +90,11 @@ class Attention(torch.nn.Module):
         mask: torch.Tensor | None = None,
         bias: torch.Tensor | None = None,
         causal: bool = False,
+        layout: AttentionLayout | None = None,
     ) -> torch.Tensor:
         dtype = self.activation_dtype
-        return self.processor(
-            self, q.to(dtype), k.to(dtype), v.to(dtype), mask, bias, self.causal or causal
-        )
+        q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+        if layout is None:
+            return self.processor(self, q, k, v, mask, bias, self.causal or causal)
+        with attention_scope(layout):
+            return self.processor(self, q, k, v, mask, bias, self.causal or causal)

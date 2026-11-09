@@ -36,7 +36,7 @@ import types
 import typing
 from collections.abc import Callable, Mapping, Sequence, Set
 from dataclasses import dataclass, field, replace
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Annotated, Any, Literal
 
 import msgspec
@@ -47,25 +47,14 @@ import cozy_runtime.internal.memo_identity as memo_identity
 import cozy_runtime.internal.package_interface as package_interface
 import cozy_runtime.internal.static_contract as static_contract
 import cozy_runtime.internal.static_invocable as static_invocable
-from cozy_runtime import _interpreter, author
+from cozy_runtime import _interpreter
 from cozy_runtime.author._markers import MODEL_DEFAULT, PREFLIGHT
 from cozy_runtime.author._memo import memo_policy, one_memo
-from cozy_runtime.author._model import (
-    ENCODED_LEAVES,
-    MIN_BITS,
-    PHASES,
-    Model,
-    attention_bits,
-    closed,
-    component_method,
-    component_set,
-    coverage_patterns,
-)
+from cozy_runtime.author._model import Model, component_method, component_set
 from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
     model_on_demand,
-    model_phases,
 )
 from cozy_runtime.author._recipes import CALIBRATED_ENTRYPOINT, canonical, fingerprint, outputs
 from cozy_runtime.author._recipes import ENTRYPOINT as RECIPES_ENTRYPOINT
@@ -81,6 +70,7 @@ from cozy_runtime.author._signature import (
     described,
 )
 from cozy_runtime.author._walker import is_struct
+from cozy_runtime.internal import vocabulary as author
 from cozy_runtime.internal.canonical import Json
 
 CONSTRUCT_CHARS = 96
@@ -162,6 +152,7 @@ class ModuleRef:
 @dataclass(frozen=True, slots=True)
 class VocabModule:
     prefix: str
+    module: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,7 +169,7 @@ _VOCAB_MODULES = {
     "typing": "typing",
     "collections.abc": "abc",
     "enum": "enum",
-    "cozy_runtime.author": "author",
+    **dict.fromkeys(author.MODULES, "author"),
 }
 #: Runtime modules a package builds its surface from: followed for types, models and constants.
 _TRUSTED_ROOTS = ("cozy_runtime.derive", "cozy_runtime.vlm")
@@ -399,35 +390,31 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
-#: Each App registration method's closed keyword set (`author.App`).
-_CHILD_TASK_KEYWORDS = frozenset(
+#: Method decorators that make something other than a plain function on the class.
+_DESCRIPTORS = frozenset(
+    {"property", "staticmethod", "classmethod", "cached_property", "setter", "getter", "deleter"}
+)
+#: `app.entrypoint`'s closed keyword set (`author.App`).
+_ENTRYPOINT_KEYWORDS = frozenset(
     {
         "name",
-        "preflight",
-        "phases",
-        "demand",
-        "memoize",
-        "memo_version",
-        "memo_dependencies",
         "defaults",
         "components",
+        "memoize",
         "on_demand",
-        "publishes",
-        "emits_media",
-        "weights",
         "accelerator",
+        "weights",
+        "private",
+        "preflight",
     }
 )
 #: `app.tool`'s own: the box's (`author.Tool`).
 _TOOL_KEYWORDS = frozenset({"label", "named", "reserved", "ui"})
 _APP_KEYWORDS = {
-    "entrypoint": _CHILD_TASK_KEYWORDS | {"hidden"},
-    "tool": _CHILD_TASK_KEYWORDS | {"hidden"} | _TOOL_KEYWORDS,
-    "child_task": _CHILD_TASK_KEYWORDS,
+    "entrypoint": _ENTRYPOINT_KEYWORDS,
+    "tool": _ENTRYPOINT_KEYWORDS | _TOOL_KEYWORDS,
 }
-_INVOCABLE_KEYWORDS = frozenset(
-    {"memoize", "defaults", "components", "memo_version", "memo_dependencies"}
-)
+_INVOCABLE_KEYWORDS = frozenset({"memoize", "defaults", "components"})
 
 
 # -------------------------------------------------------------------------- the reader
@@ -620,7 +607,7 @@ class Reader:
             if isinstance(base, ModuleRef):
                 return self.lookup(base.module, node.attr, node, origin=module)
             if isinstance(base, VocabModule):
-                return self._vocab(module, node, f"{base.prefix}.{node.attr}")
+                return self._vocab(module, node, f"{base.prefix}.{node.attr}", base.module)
             if isinstance(base, External):
                 return External(f"{base.spelling}.{node.attr}")
             self.refuse(module, node, "an attribute of something that is not a module")
@@ -667,16 +654,22 @@ class Reader:
             return Assigned(module, stmt, stmt.value)
         self.refuse(module, stmt, "a binding form the static reader does not follow")
 
-    def _vocab(self, module: Module, node: ast.AST, key: str) -> Vocab:
-        """A vocabulary name, refused with its replacement when a Runtime removed it."""
-        prefix, _, name = key.partition(".")
-        if prefix == "author" and name in author._REMOVED:
-            self.refuse(module, node, author.removed(name), "removed_name")
+    def _vocab(self, module: Module, node: ast.AST, key: str, source: str = "") -> Vocab:
+        """A vocabulary name. One its module does not export is refused, with its home."""
+        name = key.partition(".")[2]
+        if source in author.MODULES and name not in author.MODULES[source]:
+            home = author.home(name)
+            self.refuse(
+                module,
+                node,
+                f"{source} has no {name}" + (f": import it from {home}" if home else ""),
+                "removed_name",
+            )
         return Vocab(key)
 
     def _module_binding(self, module: Module, target: str, stmt: ast.stmt) -> Resolved:
         if target in _VOCAB_MODULES:
-            return VocabModule(_VOCAB_MODULES[target])
+            return VocabModule(_VOCAB_MODULES[target], target)
         if _trusted_module(target) or self._tree_tops(target):
             return ModuleRef(self.module(target, where=(module, stmt)))
         return External(target)
@@ -686,8 +679,10 @@ class Reader:
     ) -> Resolved:
         if base is None:
             self.refuse(module, stmt, "a relative import above the package", "static_module")
+        if base == "cozy_runtime.accel" and name not in author.MODULES[base]:
+            return External(f"{base}.{name}")  # its modules: kernels, fusion, stepcache, ...
         if base in _VOCAB_MODULES:
-            return self._vocab(module, stmt, f"{_VOCAB_MODULES[base]}.{name}")
+            return self._vocab(module, stmt, f"{_VOCAB_MODULES[base]}.{name}", base)
         if base.startswith("cozy_runtime.") and not _trusted_module(base):
             return External(f"{base}.{name}")
         if not (_trusted_module(base) or self._tree_tops(base)):
@@ -1158,27 +1153,18 @@ class Reader:
                 spec = self.model(found.module, found.node)
                 components.update(spec.components)
         encoded_leaves, min_bits, phase = spec.encoded_leaves, spec.min_bits, spec.phase
+        undeclared = set(spec.undeclared)
         degrees, placeable = spec.sequence_parallel, spec.placeable
         for keyword in node.keywords:
-            value = self.fold(module, keyword.value)
-            if keyword.arg == "encoded_leaves" and closed(ENCODED_LEAVES, value):
-                encoded_leaves = typing.cast(str, value)
-            elif keyword.arg == "min_bits" and closed(MIN_BITS, value):
-                min_bits = typing.cast(int, value)
-            elif keyword.arg == "phase" and closed(PHASES, value):
-                phase = typing.cast(str, value)
-            elif keyword.arg == "attention_bits":
-                try:  # Runtime reads it at selection; the interface does not carry it
-                    attention_bits(node.name, value)
-                except author.ConformanceError as exc:
-                    self.refuse(module, keyword, str(exc))
-            elif keyword.arg in ("unloaded", "derived"):
-                try:  # Runtime reads them at load; the interface does not carry them
-                    coverage_patterns(node.name, keyword.arg, value)
-                except author.ConformanceError as exc:
-                    self.refuse(module, keyword, str(exc))
-            else:
-                self.refuse(module, keyword, "a Model class keyword outside the closed set")
+            self.refuse(
+                module,
+                keyword,
+                "a Model class takes no keywords: its serving facts are `serving = Serving(...)`",
+            )
+        serving = self._serving(module, node)
+        if serving is not None:
+            encoded_leaves = "accept" if serving.encoded_leaves else "refuse"
+            min_bits, phase = serving.min_bits, serving.phase
         for decorator in node.decorator_list:
             call = decorator if isinstance(decorator, ast.Call) else None
             found = self.resolve(module, call.func if call else decorator)
@@ -1211,20 +1197,37 @@ class Reader:
                 continue
             if stmt.name in ("__new__", "__init__"):
                 constructors[stmt.name] = stmt
+            public = not (stmt.name.startswith("_") or stmt.name in _MODEL_MEMBERS)
+            hinted = False
             for decorator in stmt.decorator_list:
-                if not isinstance(decorator, ast.Call):
+                target = decorator.func if isinstance(decorator, ast.Call) else decorator
+                if not isinstance(target, (ast.Name, ast.Attribute)):
                     continue
-                found = self.resolve(module, decorator.func)
+                if (target.id if isinstance(target, ast.Name) else target.attr) in _DESCRIPTORS:
+                    public = False  # not a plain function on the class: `Model` skips it too
+                    continue
+                try:
+                    found = self.resolve(module, target)
+                except StaticRefusal:
+                    continue  # any other decorator: ordinary Python, nothing the interface reads
                 if not (isinstance(found, Vocab) and found.key == "author.uses_components"):
                     continue
+                if not isinstance(decorator, ast.Call):
+                    self.refuse(module, decorator, "@uses_components names its components")
                 names = self._components(module, node, stmt, decorator)
-                if not (stmt.name.startswith("_") or stmt.name in _MODEL_MEMBERS):
+                hinted = True
+                if public:
                     components[stmt.name] = names
+            if public and hinted:
+                undeclared.discard(stmt.name)
+            elif public:
+                undeclared.add(stmt.name)
+                components.pop(stmt.name, None)
         if constructors:
             arguments = _required(constructors.get("__new__") or constructors["__init__"])
         spec = ModelSpec(
             node.name, encoded_leaves, min_bits, phase, degrees, components, placeable, loads,
-            arguments,
+            arguments, tuple(sorted(undeclared)),
         )  # fmt: skip
         self.models[key] = spec
         return spec
@@ -1236,27 +1239,47 @@ class Reader:
         method: ast.FunctionDef | ast.AsyncFunctionDef,
         decorator: ast.Call,
     ) -> tuple[str, ...]:
-        """One `@uses_components` declaration, by the rules its decorator applies at import."""
-        keywords = {keyword.arg: keyword.value for keyword in decorator.keywords}
-        helpers = keywords.get("memo_dependencies")
-        memo = "memo_version" in keywords or not (
-            helpers is None or (isinstance(helpers, (ast.Tuple, ast.List)) and not helpers.elts)
-        )
+        """One `@uses_components` hint, by the rules its decorator applies at import."""
         signature = method.args
         parameters = (
             *signature.posonlyargs, *signature.args, signature.vararg, *signature.kwonlyargs,
             signature.kwarg,
         )  # fmt: skip
         try:
-            names = component_set(
-                [self.fold(module, arg) for arg in decorator.args],
-                memoize="memoize" in keywords and bool(self.fold(module, keywords["memoize"])),
-                memo=memo,
-            )
+            if unknown := sorted({k.arg or "**" for k in decorator.keywords} - {"deterministic"}):
+                raise author.ConformanceError(
+                    f"@uses_components({unknown[0]}=): it takes component names and "
+                    "deterministic=; method memo is a plain @memoize",
+                    code="component_hint",
+                )
+            names = component_set([self.fold(module, arg) for arg in decorator.args])
             component_method(f"{cls.name}.{method.name}", [p.arg for p in parameters if p])
         except author.ConformanceError as exc:
             self.refuse(module, decorator, exc.message, exc.code)
         return names
+
+    def _serving(self, module: Module, cls: ast.ClassDef) -> author.Serving | None:
+        """The class body's `serving = Serving(...)`, by the rules `Serving` applies at import."""
+        for stmt in cls.body:
+            value = stmt.value if isinstance(stmt, (ast.Assign, ast.AnnAssign)) else None
+            if value is None or "serving" not in _bound_names(stmt):
+                continue
+            found = self.resolve(module, value.func) if isinstance(value, ast.Call) else None
+            if not (isinstance(found, Vocab) and found.key == "author.Serving"):
+                self.refuse(module, stmt, "serving is a Serving(...)")
+            assert isinstance(value, ast.Call)
+            try:
+                if value.args:
+                    raise TypeError("Serving takes keywords only")
+                facts: dict[str, Any] = {
+                    str(k.arg): self.fold(module, k.value) for k in value.keywords
+                }
+                return author.Serving(**facts)
+            except author.ConformanceError as exc:
+                self.refuse(module, value, exc.message, exc.code)
+            except TypeError as exc:
+                self.refuse(module, value, str(exc), "static_unsupported")
+        return None
 
     def declared(self, module: Module, call: ast.Call, factory: Callable[..., object]) -> None:
         """Refuse a declaration its author factory refuses: the import-time rule, applied to
@@ -1488,22 +1511,16 @@ class Registration:
     module: Module
     fn: ast.FunctionDef | ast.AsyncFunctionDef
     name: str
-    publishes: bool
     weights: tuple[author.WeightsOutput, ...]
     invocable: bool = False
     memoize: author.Memoize | None = None
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     child_task: bool = False
     accelerator: bool = True
-    #: `memo_version=` / `memo_dependencies=` as written, and the module they are read in.
-    memo_declaration: tuple[tuple[str, Module, ast.expr], ...] = ()
-    model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
+    model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     #: A model argument's class where the registration names it, not its annotation.
     model_classes: Mapping[str, ModelSpec] = field(default_factory=dict)
-    emits_media: bool = False
-    #: Local execution advice, not a client callable/schema field. Source identity covers it.
-    phases: tuple[tuple[str, ...], ...] = ()
     #: `app.tool`'s own options.
     tool: author.Tool | None = None
 
@@ -1514,8 +1531,6 @@ class Registration:
             module=self.module.name,
             export=self.fn.name,
             description=described(ast.get_docstring(self.fn, clean=False)),
-            publishes=self.publishes,
-            emits_media=self.emits_media,
             weights_outputs=self.weights,
             memoize=self.memoize,
             child_task=self.child_task,
@@ -1745,7 +1760,7 @@ def _build(
                 "static_unsupported",
             )
         if installed and (registration.memoize or registration.weights):
-            identity = _operation_identity(reader, registration)
+            identity = _operation_identity(reader, registration, distribution)
             if identity is not None:
                 row = replace(row, identity={"operation_identity": identity})
         if closures is not None and registration.memoize:
@@ -2071,13 +2086,17 @@ def _recipes_registration(
     )  # fmt: skip
 
 
-def _operation_identity(reader: Reader, registration: Registration) -> str | None:
-    """A memoized callable's operation identity read from installed source alone: the same key
-    `memo_implementation.describe` computes by import. None when any part of its declaration
-    cannot be read statically; its machine then keys the memo by its package's files."""
-    fn = registration.fn
-    own = (f"{registration.module.name}.{fn.name}", memo_identity.normalized_definition(fn))
-    return _declared_identity(reader, registration, [own])
+def _operation_identity(reader: Reader, registration: Registration, package: str) -> str | None:
+    """A memoized callable's operation identity read from installed files alone: the same key
+    `memo_implementation.describe` computes by import, its name and the build of the
+    distribution that ships it. None when that build is unreadable (an editable install); its
+    machine then keys the memo by its package's files."""
+    owner = "cozy-runtime" if registration.module.trusted else package
+    return memo_identity.release_identity(
+        f"{registration.module.name}.{registration.fn.name}",
+        owner,
+        memo_identity.installed_distribution_identity(owner, reader.roots, _interpreter.CACHE_TAG),
+    )
 
 
 #: What runs code other than by its imports.
@@ -2098,8 +2117,8 @@ def _code_closure(reader: Reader, registration: Registration) -> str | None:
     """A memoized callable of the package's own code keyed on that code: its module and every
     module of its package that module imports at module scope, transitively, each with the
     package `__init__`s Python runs first; every file of those modules' packages that is not
-    Python source (what a module reads beside itself); and its declared memo version and
-    dependencies. An edit to any other file leaves it unchanged. None when those do not bound
+    Python source (what a module reads beside itself). An edit to any other file leaves it
+    unchanged. None when those do not bound
     what it runs (an import elsewhere, a dynamic import, `exec`/`eval`, a top-level module's own
     path, a module that is not Python source); its machine then keys the memo by the package's
     whole source."""
@@ -2122,7 +2141,7 @@ def _code_closure(reader: Reader, registration: Registration) -> str | None:
         return None
     definitions = [(name, memo_identity.normalized(seen[name].source)) for name in sorted(seen)]
     definitions += _data_files(reader, {name.split(".")[0] for name in seen})
-    return _declared_identity(reader, registration, definitions)
+    return memo_identity.definitions_identity("", definitions)
 
 
 def _data_files(reader: Reader, packages: Set[str]) -> list[tuple[str, str]]:
@@ -2201,79 +2220,6 @@ def _submodule(reader: Reader, package: str, name: str) -> bool:
         if any(path.suffix in (".so", ".pyd") for path in directory.glob(f"{name}.*")):
             raise _Unbounded
     return False
-
-
-def _declared_identity(
-    reader: Reader, registration: Registration, definitions: list[tuple[str, str]]
-) -> str | None:
-    """`definitions` with the registration's declared memo version and dependencies, as one
-    identity; None when any of its declaration cannot be read statically."""
-    version: object = ""
-    dependencies: list[tuple[Module, ast.expr]] = []
-    try:
-        for argument, module, node in registration.memo_declaration:
-            if argument == "memo_version":
-                version = reader.fold(module, node)
-            elif isinstance(node, (ast.Tuple, ast.List)):
-                dependencies.extend((module, element) for element in node.elts)
-            elif isinstance(found := reader.resolve(module, node), Assigned) and isinstance(
-                found.value, (ast.Tuple, ast.List)
-            ):
-                # A name bound to the tuple at module scope (`_MEMO = ("pkg", "pkg.model")`).
-                dependencies.extend((found.module, element) for element in found.value.elts)
-            else:
-                return None
-        if not isinstance(version, str):
-            return None
-        definitions = list(definitions)
-        for module, node in dependencies:
-            definition = _memo_dependency(reader, module, node)
-            if definition is None:
-                return None
-            definitions.append(definition)
-    except (StaticRefusal, OSError, SyntaxError, UnicodeDecodeError, ValueError):
-        return None
-    return memo_identity.definitions_identity(version, definitions)
-
-
-def _memo_dependency(reader: Reader, module: Module, node: ast.expr) -> tuple[str, str] | None:
-    """One declared memo dependency as `describe` names and hashes it, or None."""
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        path = _installed_source(reader, node.value.split("."))
-        if path is None or path.stat().st_size > memo_identity.MAX_SOURCE_BYTES:
-            return None
-        return node.value, memo_identity.normalized(path.read_bytes())
-    if isinstance(node, ast.Call):
-        found = reader.resolve(module, node.func)
-        arguments = [reader.fold(module, a) for a in node.args] + [
-            reader.fold(module, k.value) for k in node.keywords
-        ]
-        if not isinstance(found, Vocab) or not all(isinstance(a, str) for a in arguments):
-            return None
-        if found.key == "author.MemoDistribution" and len(arguments) == 1:
-            name = typing.cast(str, arguments[0])
-            # Each environment root once: the reader names its site-packages more than one way.
-            built = memo_identity.installed_distribution_identity(
-                name, reader.roots, _interpreter.CACHE_TAG
-            )
-            return None if built is None else ("distribution:" + name, built)
-        if found.key == "author.MemoResource" and len(arguments) == 2:
-            package, name = typing.cast(list[str], arguments)
-            relative = PurePosixPath(name)
-            if relative.is_absolute() or ".." in relative.parts:
-                return None
-            for root in reader.roots:
-                resource = root.joinpath(*package.split("."), *relative.parts)
-                if resource.is_file():
-                    digest = hashlib.sha256(resource.read_bytes()).hexdigest()
-                    return f"resource:{package}/{name}", digest
-        return None
-    found = reader.resolve(module, node)
-    if isinstance(found, Definition):
-        return f"{found.module.name}.{found.node.name}", memo_identity.normalized_definition(
-            found.node
-        )
-    return None
 
 
 def _installed_source(reader: Reader, parts: Sequence[str]) -> Path | None:
@@ -2420,7 +2366,6 @@ def _registration(
     memoize: author.Memoize | None = None
     default_models: dict[str, str] = {}
     used_components: dict[str, tuple[str, ...]] = {}
-    memo_declaration: list[tuple[str, Module, ast.expr]] = []
     for index, export in enumerate(fn.decorator_list):
         target = export.func if isinstance(export, ast.Call) else export
         if not _is_invocable(reader, function_module, target):
@@ -2440,15 +2385,10 @@ def _registration(
                 reader.refuse(
                     function_module,
                     export,
-                    "@invocable accepts memoize, memo_version, memo_dependencies, defaults "
-                    "and components",
+                    "@invocable accepts memoize, defaults and components",
                     "static_unsupported",
                 )
             for keyword in export.keywords:
-                if keyword.arg in {"memo_version", "memo_dependencies"}:
-                    # Operation identity is an installed environment's fact (build_installed).
-                    memo_declaration.append((keyword.arg, function_module, keyword.value))
-                    continue
                 value = reader.fold(function_module, keyword.value)
                 if keyword.arg == "defaults":
                     default_models = model_defaults(value)
@@ -2469,12 +2409,9 @@ def _registration(
                 )
     module = declaration or module
     name = fn.name
-    publishes = emits_media = False
-    accelerator = True
-    hidden = False
+    accelerator, private = True, False
     weights: tuple[author.WeightsOutput, ...] = ()
     on_demand: tuple[str, ...] = ()
-    phases: tuple[tuple[str, ...], ...] = ()
     box: dict[str, object] = {}
     for keyword in keywords:
         if keyword.arg not in _APP_KEYWORDS[method]:
@@ -2494,14 +2431,6 @@ def _registration(
                     module, keyword.value, "preflight= must name a function defined in the tree"
                 )
             continue
-        if keyword.arg == "demand":
-            reader.fold(module, keyword.value)
-            continue
-        if keyword.arg in {"memo_version", "memo_dependencies"}:
-            # Like @invocable options, installed-environment memo identities
-            # are not part of the source-stable client contract.
-            memo_declaration.append((keyword.arg, module, keyword.value))
-            continue
         value = reader.fold(module, keyword.value)
         if keyword.arg == "defaults":
             declared_defaults = model_defaults(value)
@@ -2519,29 +2448,22 @@ def _registration(
             used_components = declared_components or used_components
         elif keyword.arg == "on_demand":
             on_demand = model_on_demand(value)
-        elif keyword.arg == "phases":
-            phases = model_phases(value)
         elif keyword.arg == "name":
             name = str(value)
         elif keyword.arg in _TOOL_KEYWORDS:
             box[keyword.arg] = value
-        elif keyword.arg == "hidden" and value is True:
-            hidden = True
-        elif keyword.arg == "accelerator":
+        elif keyword.arg in ("accelerator", "private"):
             if type(value) is not bool:
-                reader.refuse(module, keyword.value, "accelerator is True or False")
-            accelerator = value
-        elif keyword.arg == "publishes":
-            publishes = bool(value)
-        elif keyword.arg == "emits_media":
-            emits_media = bool(value)
+                reader.refuse(module, keyword.value, f"{keyword.arg} is True or False")
+            if keyword.arg == "private":
+                private = value
+            else:
+                accelerator = value
         elif keyword.arg == "memoize":
             memoize = _memoize(reader, module, keyword.value, value)
         elif keyword.arg == "weights":
             assert isinstance(value, tuple)
             weights = tuple(value)
-    if hidden:
-        return None
     tool: author.Tool | None = None
     if method == "tool":
         try:
@@ -2552,18 +2474,14 @@ def _registration(
         function_module,
         fn,
         name,
-        publishes,
         weights,
         invocable,
         one_memo(exported, memoize),
         default_models,
-        method == "child_task",
+        private,
         accelerator,
-        tuple(memo_declaration),
-        used_components,
         on_demand,
-        emits_media=emits_media,
-        phases=phases,
+        model_components=used_components,
         tool=tool,
     )
 

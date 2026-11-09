@@ -12,8 +12,9 @@ from typing import Any, get_args, get_origin
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError, Memoize
+from cozy_runtime.author import Memoize
 from cozy_runtime.author._artifacts import ModelArtifact
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._tool import Prompt
 from cozy_runtime.author._walker import is_struct, strip
 from cozy_runtime.internal import canonical, schema

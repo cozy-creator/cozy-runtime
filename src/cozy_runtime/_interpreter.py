@@ -5,7 +5,6 @@ import sys
 import sysconfig
 from pathlib import Path
 
-
 CACHE_TAG = sys.implementation.cache_tag
 
 

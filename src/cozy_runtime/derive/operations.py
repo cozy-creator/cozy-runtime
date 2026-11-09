@@ -15,7 +15,6 @@ from cozy_runtime.author import (
     App,
     Context,
     DerivationHook,
-    MemoDistribution,
     Model,
     ModelArtifact,
     QuantizationPlan,
@@ -179,21 +178,7 @@ def _selection(source: Checkpoint, plan: QuantizationPlan) -> ArtifactQuantizati
     return selection
 
 
-@invocable(
-    memo_version="quantize/1",
-    memo_dependencies=(
-        _selection,
-        "cozy_runtime.derive.facade",
-        "cozy_runtime.derive.quantization",
-        "cozy_runtime.derive.native_quantization",
-        "cozy_runtime.derive.microscale",
-        "cozy_runtime.derive.safetensors_io",
-        "cozy_runtime.weights_store",
-        MemoDistribution("tensorfs"),
-        MemoDistribution("numpy"),
-        MemoDistribution("msgspec"),
-    ),
-)
+@invocable
 async def quantize(
     ctx: Context,
     *,

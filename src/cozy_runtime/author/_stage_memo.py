@@ -1,6 +1,6 @@
 """Memoized Model methods: the author's mark and the wrapper's seam to the Runtime (#298).
 
-`@uses_components(..., memoize=True)` marks ONE method as eligible: its result is a pure
+`@memoize` marks ONE method as eligible: its result is a pure
 function of its code, declared helpers, component weights, arguments and numerics. Whether a
 call is served from memory, from the machine's store or computed is the Runtime's decision,
 made before the component scope opens, so a hit stages nothing. Nothing here names a package,
@@ -62,7 +62,7 @@ def memoized(
     """Wrap `scoped` (the scope-opening wrapper) so the lookup runs BEFORE admission."""
     if is_async:
         raise ConformanceError(
-            f"{fn.__qualname__}: memoize=True needs a synchronous method; an encoder returns "
+            f"{fn.__qualname__}: @memoize needs a synchronous method; an encoder returns "
             "its result, it does not stream it",
             code="memo_async",
         )

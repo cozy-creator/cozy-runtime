@@ -148,8 +148,8 @@ and leaving it records the fence and makes the bytes evictable. Eviction FREES; 
 host residence tier, and a re-stage is an ordinary cr-005 fill from the page-cached CAS
 mapping. The vocabulary is unreachable from package code rather than merely unused.
 
-**Encoder results are memoized by marking the method.** `@uses_components(..., memoize=True)`
-(with `memo_dependencies`/`memo_version` as on `@invocable`) makes a method eligible; the
+**Encoder results are memoized by marking the method.** `@memoize`
+makes a method eligible; the
 Runtime looks the call up before the scope opens, so a hit stages nothing. The key is the
 method's code and declared helpers, the environment, the components' weights, the
 arguments (values: strings, numbers, host tensors, arrays, images, assets, records) and the
@@ -441,7 +441,8 @@ Image inputs can separately opt into preparation on a field or an `Files` argume
 
 ```python
 from typing import Annotated
-from cozy_runtime.author import FileLimits, Files, ImageFile, ImagePreparation
+from cozy_runtime.fields import FileLimits, ImagePreparation
+from cozy_runtime.media import Files, ImageFile
 
 Pictures = Annotated[
     Files[ImageFile],
@@ -505,7 +506,7 @@ fill without the reader is a typed `reader_unavailable` refusal naming the insta
 `examples/marco-polo` is the weightless reference package — two functions, one CPU-only, no
 model — and it is what the end-to-end suite builds, installs and runs.
 
-**Registration (xs-040).** `@app.entrypoint` registers a public function and `@app.child_task`
+**Registration (xs-040).** `@app.entrypoint` registers a public function and `@app.entrypoint(private=True)`
 one only its own package's calls run ([docs/child-tasks.md](docs/child-tasks.md)). Both take
 `weights=`, `publishes=`/`emits_media=`, `accelerator=` (False: CPU only; True or absent: the
 machine's GPU when it has one), `preflight=`, `demand=`, `defaults=`, `components=` and

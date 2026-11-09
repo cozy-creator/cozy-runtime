@@ -2,7 +2,7 @@
 result (`AskResult`), the model class (`VisionLM`) and the call (`ask`) a package's entrypoint
 returns. Qwen3.5 and Qwen3.6, dense and mixture-of-experts, load through it.
 
-    @app.entrypoint(defaults={"model": "qwen3.6-35b-a3b@0.1.0"}, memoize=True, memo_version="v1")
+    @app.entrypoint(defaults={"model": "qwen3.6-35b-a3b@0.1.0"}, memoize=True)
     def ask(ctx: Context, payload: AskRequest, model: VisionLM, tel: Telemetry) -> AskResult:
         return vlm.ask(ctx, payload, model, tel)
 
@@ -36,24 +36,24 @@ from transformers import (
 from transformers.initialization import no_init_weights
 from transformers.video_utils import VideoMetadata
 
-from cozy_runtime import lm, moe
+from cozy_runtime import lm
+from cozy_runtime.accel import moe
 from cozy_runtime.author import (
     Config,
-    ConformanceError,
     Context,
-    DecodedVideoFrame,
-    FileBound,
-    ImageFile,
     InvalidRequest,
     Loader,
     Model,
     ModelAssets,
+    Serving,
     Telemetry,
     UnsupportedInput,
-    VideoFile,
     uses_components,
 )
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._model import WARNINGS
+from cozy_runtime.fields import FileBound
+from cozy_runtime.media import DecodedVideoFrame, ImageFile, VideoFile
 
 COMPONENT = "model"
 DTYPES = {"bf16": torch.bfloat16, "f16": torch.float16, "f32": torch.float32}
@@ -341,15 +341,17 @@ class Pipeline:
         self.components: dict[str, torch.nn.Module] = {COMPONENT: model}
 
 
-class VisionLM(Model[Pipeline], encoded_leaves="accept", min_bits=4, phase="decode"):
+class VisionLM(Model[Pipeline]):
     """A Qwen-VL model answering questions about text, images and videos, greedily or sampled
     from a seed. Runtime may serve encoded lanes' linears natively."""
+
+    serving = Serving(min_bits=4, phase="decode")
 
     pipe: Pipeline
     processor: Any
 
     def load(self, loader: Loader) -> None:
-        self.pipe = loader.construct(Pipeline, factory=Pipeline)
+        self.pipe = loader.construct(Pipeline)
         self.processor = processor(loader.assets)
         if "generation_config.json" in loader.assets.names():
             model = self.pipe.components[COMPONENT]

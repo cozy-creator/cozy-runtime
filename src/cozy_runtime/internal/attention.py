@@ -41,10 +41,9 @@ from typing import Any, cast
 
 import msgspec
 
-from cozy_runtime.author._attention import _PRODUCERS, AttentionProducer
-from cozy_runtime.author._attention_scope import _EXPECTED
+from cozy_runtime.accel.attention import _EXPECTED, _PRODUCERS, AttentionProducer
+from cozy_runtime.accel.kernels import KernelsUnavailable, Launch, quantize_once
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.author.kernels import KernelsUnavailable, Launch, quantize_once
 from cozy_runtime.internal import (
     arch,
     attention_int4,

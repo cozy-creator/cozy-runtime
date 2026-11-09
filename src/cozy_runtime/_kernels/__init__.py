@@ -4,7 +4,7 @@ and CPU, every GPU target inside. The pure wheel carries none (`ABSENT` says why
 Kernel modules use nanobind, the static CUDA runtime and Python's stable ABI. A module
 carries a cubin for each target in `ARCHS` and PTX that the driver compiles for a card none names.
 Runtime verifies every kernel on the device before it serves (`internal.prebuilt`); package
-authors reach `_norm` through `author.kernels`.
+authors reach `_norm` through `accel.kernels`.
 """
 
 # SPDX-License-Identifier: Apache-2.0
@@ -139,5 +139,5 @@ def rms_rope_split_half(
     return q_out, k_out
 
 
-# The modules are `internal.prebuilt`'s to call; `rms_rope_split_half` is `author.kernels`'.
+# The modules are `internal.prebuilt`'s to call; `rms_rope_split_half` is `accel.kernels`'.
 __all__ = ["_attn4", "_fa3", "_gemm", "_norm", "_sage3", "rms_rope_split_half"]

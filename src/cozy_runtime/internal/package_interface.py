@@ -17,8 +17,8 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError
 from cozy_runtime.author._describe import validate
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._markers import (
     AUDIO_PREPARATION_PROFILE,
     IMAGE_PREPARATION_PROFILE,
@@ -345,8 +345,8 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
     """One model slot. The PATH is the binding point, the CLASS carries `encoded_leaves` and
     the precision tolerances, and the per-public-method component sets are the
     ComponentUseContracts. `default` is an unresolved release; the machine resolves it and
-    picks its lane. `components` names the components the callable runs; absent means all. A
-    `weights` slot is raw checkpoint data, so its `components` are checkpoint components."""
+    picks its lane. `components` names the components the slot fetches: the function's own
+    `components=`, else its class's hints (`ModelSpec.selects`); absent means all."""
     spec, parameter = slot.spec, slot.parameter
     doc: dict[str, Json] = {
         "path": f"{declared.name}.models.{parameter}",
@@ -366,6 +366,8 @@ def model_slot(declared: Declaration, slot: Slot) -> dict[str, Json]:
         doc["phase"] = spec.phase
     if uses := declared.model_components.get(parameter):
         doc["components"] = sorted(set(uses))
+    elif not slot.weights and spec.selects:
+        doc["components"] = list(spec.selects)
     if spec.sequence_parallel:
         # The author's opt-in to a group lane (cr-068): the degrees the class's attention
         # shards at. Closed and optional; a slot without it is never sharded.
@@ -647,12 +649,8 @@ def _model_slot(slot: ModelSlot, name: str, source: str, path: str) -> None:
     if slot.components is not msgspec.UNSET and (
         not slot.components
         or len(set(slot.components)) != len(slot.components)
-        or not (
-            slot.weights
-            or set(slot.components) <= {c for names in slot.component_use.values() for c in names}
-        )
     ):
-        _invalid(source, f"{path}.components", "must be non-empty, unique and within component_use")
+        _invalid(source, f"{path}.components", "must be non-empty and unique")
     prefix = f"{name}.models."
     if not slot.path.startswith(prefix) or not slot.path[len(prefix) :]:
         _invalid(source, f"{path}.path", f"must start with {prefix!r}")

@@ -1,6 +1,6 @@
 """Mixture-of-experts layers on Runtime's weight paging: every routed expert is its own block.
 
-    from cozy_runtime import moe
+    from cozy_runtime.accel import moe
 
     experts = [moe.RoutedExpert(4096, 3072, gate_first=False) for _ in range(64)]
     self.experts = moe.Experts(experts, layer=3)
@@ -36,18 +36,18 @@ from functools import partial
 import torch
 from torch import nn
 
-from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.author._model import Building
-from cozy_runtime.author.kernels import (
+from cozy_runtime.accel.kernels import (
     INT8_CONVROT,
     KernelsUnavailable,
     Launch,
     Plan,
     TritonKernels,
 )
+from cozy_runtime.accel.moe import _kernels
+from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._model import Building
 from cozy_runtime.graphs import say
 from cozy_runtime.internal import int8_linear
-from cozy_runtime.moe import _kernels
 
 #: Routed-expert caches a `Routing` replays, in experts.
 CACHES = (256, 512, 1024)

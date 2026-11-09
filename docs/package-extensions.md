@@ -6,7 +6,7 @@ code. All are typed and documented at their definitions.
 
 Memory is the Runtime's: a package never sizes a tile, a chunk or a batch for a card.
 
-## Kernels — `cozy_runtime.author.kernels`
+## Kernels — `cozy_runtime.accel.kernels`
 
 Hand-written kernels only (never `torch.compile`), compiled on the GPU that runs them.
 
@@ -31,7 +31,7 @@ sequence parallelism, outside the construction guards. Install fused forwards an
 here; return the plan's identity (`""` for none), which enters the generation's identity
 and the prepare's `execution_plan` fact. A raise refuses the construction with its `code`.
 
-## Fused DiT blocks — `cozy_runtime.fusion`
+## Fused DiT blocks — `cozy_runtime.accel.fusion`
 
 A package declares its single-stream adaLN block once, at module scope (`DiTBlock`: block class,
 widths, norms, a `modulation(block, arguments)` hook giving per-token adaLN rows, gate
@@ -48,7 +48,7 @@ plain pre-norm block whose gates are layer scales; with `compose` Runtime compos
 block's attention from its projections, as it does a parallel block's. qwen-image-2, flux-3-klein and MiniMax-H3's
 video VAE decoder are the users.
 
-## Step caching — `cozy_runtime.stepcache`
+## Step caching — `cozy_runtime.accel.stepcache`
 
 A package declares its DiT's block stack once (`Stack`: the transformer class, the blocks' list,
 the block arguments a block's output carries) and installs it in its plan

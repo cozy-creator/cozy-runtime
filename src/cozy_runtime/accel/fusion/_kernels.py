@@ -1,5 +1,5 @@
 """The Runtime's fused DiT elementwise kernels: the chains a single-stream block runs between its
-GEMMs, one pass each (`cozy_runtime.fusion` declares where they apply).
+GEMMs, one pass each (`cozy_runtime.accel.fusion` declares where they apply).
 
 Each kernel rounds wherever eager rounds: bf16 rows round every step to bf16 (`_rb`, in the
 integer domain so the compiler cannot fold the round trip); fp16 rows (a block under fp16
@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from cozy_runtime.author.kernels import Launch, TritonEntry
+from cozy_runtime.accel.kernels import Launch, TritonEntry
 
 try:
     import torch

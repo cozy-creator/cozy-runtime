@@ -1,6 +1,6 @@
 """Memoized Model methods, executor side (tracker #298, design pipeline-memoization.md).
 
-One general mechanism: every method marked `@uses_components(..., memoize=True)` takes this
+One general mechanism: every method marked `@memoize` takes this
 path, and nothing here names a package, model or component. The key binds the method's code
 and declared helpers, the installation (third-party versions, the Runtime and TensorFS builds),
 the weights of the components it declares, the checkpoint's non-tensor assets, the call's
@@ -49,10 +49,9 @@ from cozy_runtime.author._executor_requests import (
 from cozy_runtime.author._files import File
 from cozy_runtime.author._model import WARNINGS, deterministic
 from cozy_runtime.author._stage_memo import exactness
-from cozy_runtime.internal import attention, hostfacts, installed
+from cozy_runtime.internal import attention, hostfacts, installed, memo_implementation
 from cozy_runtime.internal.executor_commands import MemoSettings
 from cozy_runtime.internal.hostfacts import HostFacts
-from cozy_runtime.internal.memo_implementation import describe
 from cozy_runtime.internal.numerical_environment import fingerprint
 
 if TYPE_CHECKING:
@@ -484,7 +483,7 @@ class Engine:
         found = self._stages.get(fn)
         if found is None:
             found = self._stages[fn] = (
-                describe(fn).get("operation_identity"),
+                memo_implementation.stage(fn),
                 inspect.signature(fn),
             )
         return found
@@ -638,6 +637,7 @@ class GenerationMemo:
         run: Callable[[], object],
     ) -> object:
         started = time.perf_counter()
+        components = components or tuple(sorted(self.components))  # no hint: all of them
         engine, name = self.engine, f"{type(model).__qualname__}.{fn.__name__}"
         stats = engine.stats.setdefault(name, MethodStats())
         stage, signature = engine.stage(fn)

@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.accel.kernels import Launch, TritonEntry, TritonKernels
 
 TOKEN_TILE, CHANNEL_TILE = 256, 32
 #: The largest power-of-two tile count `finish_mean` is built for: 2048 x 256 tokens.

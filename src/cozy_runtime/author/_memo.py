@@ -1,6 +1,6 @@
-"""Explicit, inert dependencies of a deterministic operation."""
+"""The result-cache declaration of a deterministic function."""
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ._errors import ConformanceError
@@ -41,50 +41,3 @@ def one_memo(invocable: Memoize | None, registration: Memoize | None) -> Memoize
             "declare memoize once, on invocable or App registration", code="invocable_memoize"
         )
     return registration if invocable is None else invocable
-
-
-@dataclass(frozen=True, slots=True)
-class MemoResource:
-    """One named package resource whose bytes affect the operation's result."""
-
-    package: str
-    name: str
-
-
-@dataclass(frozen=True, slots=True)
-class MemoDistribution:
-    """A native dependency's installed version and immutable build provenance.
-
-    This reads distribution metadata, never its file inventory or native binaries.
-    Editable or unavailable metadata disables memo reuse, not execution.
-    """
-
-    name: str
-
-
-type MemoDependency = Callable[..., object] | str | MemoResource | MemoDistribution
-
-
-def declare(
-    fn: Callable[..., object],
-    *,
-    version: str | None,
-    dependencies: tuple[MemoDependency, ...],
-) -> None:
-    if version is not None and (not isinstance(version, str) or len(version) > 128):
-        raise ConformanceError("memo_version must be a bounded string", code="invocable_memoize")
-    if (
-        not isinstance(dependencies, tuple)
-        or len(dependencies) > 64
-        or any(
-            not callable(item) and not isinstance(item, (str, MemoResource, MemoDistribution))
-            for item in dependencies
-        )
-    ):
-        raise ConformanceError("memo_dependencies must be bounded", code="invocable_memoize")
-    if version is not None or dependencies:
-        declaration = (version or "", dependencies)
-        previous = getattr(fn, "_cozy_memo_declaration", declaration)
-        if previous != declaration:
-            raise ConformanceError("declare memo behavior once", code="invocable_memoize")
-        fn.__dict__["_cozy_memo_declaration"] = declaration

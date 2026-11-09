@@ -41,8 +41,7 @@ from cozy_runtime.author._executor_requests import (
     SavedFile,
 )
 from cozy_runtime.author._files import _UNBOUND, File, Files, References, Tree, asset_dec_hook
-from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
-from cozy_runtime.author._memo import declare as declare_memo
+from cozy_runtime.author._memo import Memoize, memo_policy
 from cozy_runtime.author._model import WARNINGS, Model
 from cozy_runtime.author._model_defaults import model_components, model_defaults
 from cozy_runtime.author._observations import Scalar
@@ -105,8 +104,6 @@ def invocable[**P, R](
     /,
     *,
     memoize: bool | Memoize = False,
-    memo_version: str | None = None,
-    memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, str] | None = None,
     components: Mapping[str, Sequence[str]] | None = None,
 ) -> Callable[P, PendingCall[R]]: ...
@@ -116,8 +113,6 @@ def invocable[**P, R](
 def invocable[**P, R](
     *,
     memoize: bool | Memoize = False,
-    memo_version: str | None = None,
-    memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, str] | None = None,
     components: Mapping[str, Sequence[str]] | None = None,
 ) -> Callable[[Callable[Concatenate[Context, P], Awaitable[R]]], Callable[P, PendingCall[R]]]: ...
@@ -128,8 +123,6 @@ def invocable[**P, R](
     /,
     *,
     memoize: bool | Memoize = False,
-    memo_version: str | None = None,
-    memo_dependencies: tuple[MemoDependency, ...] = (),
     defaults: Mapping[str, str] | None = None,
     components: Mapping[str, Sequence[str]] | None = None,
 ) -> (
@@ -146,11 +139,7 @@ def invocable[**P, R](
     a retained ModelArtifact) or LoRAs over the parent's; None keeps the parent's. The
     injected Model object itself belongs to its current attempt and cannot be forwarded.
 
-    Memoized operations automatically bind their Python implementation. Declare
-    helper callables or Python modules in ``memo_dependencies`` when their logic
-    affects the result; source changes invalidate reuse without a manual version
-    bump. Optional ``memo_version`` salts behavior outside those sources, such as
-    native algorithms or data tables. Unavailable source disables reuse, not execution.
+    A memoized operation's key is its package release, its models and its request.
     ``memoize=Memoize(requires=("seed",))`` memoizes only requests that explicitly provide
     each named optional parameter; any other request runs without lookup or storage.
     """
@@ -159,8 +148,6 @@ def invocable[**P, R](
         return lambda target: invocable(
             target,
             memoize=memoize,
-            memo_version=memo_version,
-            memo_dependencies=memo_dependencies,
             defaults=defaults,
             components=components,
         )
@@ -168,7 +155,6 @@ def invocable[**P, R](
         raise ConformanceError(
             "an invocable must be a module-level async function", code="invocable_signature"
         )
-    declare_memo(fn, version=memo_version, dependencies=memo_dependencies)
     export = _Export(
         fn,
         fn.__module__,

@@ -1,12 +1,9 @@
-"""The `Model` boundary: role classes, the class keywords, component-use scopes, the
-construction transaction, and construction-identity coalescing.
+"""The `Model` boundary: its serving facts (`Serving`), component hints, the construction
+transaction, and construction-identity coalescing.
 
-THE SIGNATURE IS THE SLOT (§1.1): a bare typed parameter (`model: Fl2VAModel`) is the whole
-declaration and its derived canonical path (`generate.models.model`) is the binding point.
-There is no slot object, no `artifacts=` dict, and the `Annotated` override-marker plane is
-EMPTY at launch. The CLASS carries closed keywords (`encoded_leaves`, `min_bits`, `phase`,
-`attention_bits`); there are no stamps, no `task=`/`objective=`/`structure=`, and no model or
-release name anywhere in code (model-code-fit §1, D1). A semantic twin is a component name or a config fact.
+A bare typed handler parameter (`model: Fl2VAModel`) is the whole slot declaration, and its
+derived path (`generate.models.model`) is the binding point. A class states its serving facts
+in one `serving = Serving(...)` attribute.
 
 Construction identity is (package release, model class, exact artifact snapshot + immutable
 config, construction/provider variant). Equal identities coalesce ONE single-flight model
@@ -32,12 +29,12 @@ from dataclasses import dataclass, field, replace
 from fnmatch import fnmatchcase
 from types import MappingProxyType
 from typing import (
+    TYPE_CHECKING,
     Any,
     Concatenate,
     Literal,
     ParamSpec,
     Protocol,
-    Self,
     TypeVar,
     cast,
     final,
@@ -71,9 +68,12 @@ from cozy_runtime.author._loader import (
     Scheduler,
     loading,
 )
-from cozy_runtime.author._memo import MemoDependency, declare
-from cozy_runtime.author._stage_memo import StageMemo, memoized
-from cozy_runtime.author.kernels import Plan
+from cozy_runtime.author._stage_memo import StageMemo, is_memoized, memoized
+
+if TYPE_CHECKING:
+    import torch
+
+    from cozy_runtime.accel.kernels import Plan
 
 _LOG = logging.getLogger(__name__)
 
@@ -163,7 +163,7 @@ def attention_bits(owner: str, value: object) -> int | dict[str, int]:
     ):
         return dict(value)
     raise ConformanceError(
-        f"class {owner}(attention_bits={value!r}): 16, 8 or 4, or a mapping of "
+        f"{owner}(attention_bits={value!r}): 16, 8 or 4, or a mapping of "
         "component-qualified module prefixes to them",
         code="attention_bits_value",
     )
@@ -176,10 +176,58 @@ def coverage_patterns(owner: str, keyword: str, value: object) -> tuple[str, ...
     if isinstance(value, (tuple, list)) and value and all(type(p) is str and p for p in value):
         return tuple(value)
     raise ConformanceError(
-        f"class {owner}({keyword}={value!r}): a tuple of component-qualified key patterns "
+        f"{owner}({keyword}={value!r}): a tuple of component-qualified key patterns "
         '(`"text_encoder.lm_head.weight"`, `"model.mtp.*"`)',
         code=f"{keyword}_value",
     )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Serving:
+    """A Model class's serving facts, as its `serving` attribute. Every field has a default, so
+    a class states only what differs; a subclass's `serving` replaces its base's.
+
+    - `encoded_leaves`: the Runtime may replace a linear with one whose weight is its stored
+      encoding (the code reaches its components through their forward only). False refuses.
+    - `min_bits`: the lowest weight precision the lane rules pick by themselves (`MIN_BITS`).
+    - `attention_bits`: the lowest attention precision its sites tolerate, whole or per
+      component-qualified module prefix.
+    - `phase`: "decode" for an LM's token loop, else "compute" (`PHASES`).
+    - `unloaded` / `derived`: component-qualified key patterns a load does not warn about.
+    - `loras`: the components that take LoRAs.
+    """
+
+    encoded_leaves: bool = True
+    min_bits: Literal[16, 8, 4] = 8
+    attention_bits: Literal[16, 8, 4] | Mapping[str, Literal[16, 8, 4]] = 16
+    phase: Literal["compute", "decode"] = "compute"
+    unloaded: tuple[str, ...] = ()
+    derived: tuple[str, ...] = ()
+    loras: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.encoded_leaves) is not bool:
+            raise ConformanceError(
+                f"Serving(encoded_leaves={self.encoded_leaves!r}): True or False",
+                code="encoded_leaves_value",
+            )
+        for keyword, vocabulary in (("min_bits", MIN_BITS), ("phase", PHASES)):
+            value = getattr(self, keyword)
+            if not closed(vocabulary, value):
+                raise ConformanceError(
+                    f"Serving({keyword}={value!r}): one of "
+                    + " | ".join(f"{k!r}: {why}" for k, why in vocabulary.items()),
+                    code=f"{keyword}_value",
+                )
+        attention_bits("Serving", self.attention_bits)
+        for keyword in ("unloaded", "derived"):
+            if getattr(self, keyword):
+                coverage_patterns("Serving", keyword, getattr(self, keyword))
+        names = self.loras
+        if not isinstance(names, tuple) or any(type(n) is not str or not n for n in names):
+            raise ConformanceError(
+                f"Serving(loras={names!r}): a tuple of component names", code="loras_value"
+            )
 
 
 def uncovered(
@@ -225,50 +273,13 @@ _RUNTIME_MEMBERS = frozenset(
         "load",
         "unload",
         "for_request",
-        "for_test",
         "checkpoint_ref",
-        "harness",
+        "serving",
     }
 )
 
 
 # --------------------------------------------------------------------------- scopes
-
-
-@dataclass(frozen=True, slots=True)
-class ScopeCall:
-    """One component-use scope the harness observed. Records, never invents (§1.6)."""
-
-    method: str
-    components: tuple[str, ...]
-
-
-@final
-class ModelTestHarness:
-    """Installs immutable construction facts and records component-scope calls.
-
-    It never invents outputs for model-specific methods: a package test supplies model
-    behavior explicitly as author-built doubles (`for_test(pipe=FakeH3Pipeline())`).
-    """
-
-    __slots__ = ("calls",)
-
-    def __init__(self) -> None:
-        self.calls: list[ScopeCall] = []
-
-    def __repr__(self) -> str:
-        return f"ModelTestHarness({len(self.calls)} scope calls)"
-
-    def components(self) -> tuple[str, ...]:
-        seen: list[str] = []
-        for call in self.calls:
-            seen += [c for c in call.components if c not in seen]
-        return tuple(seen)
-
-    def assert_scopes(self, *expected: str) -> None:
-        got = tuple(c.method for c in self.calls)
-        if got != expected:
-            raise AssertionError(f"component scopes were {got}, expected {expected}")
 
 
 class _ScopedModel(Protocol):
@@ -381,7 +392,7 @@ LANDED: list[int] = [0]
 TRANSPARENT = "_cozy_transparent"
 
 
-def hold_dtype(module: Any, dtype: Any) -> None:
+def hold_dtype(module: torch.nn.Module, dtype: torch.dtype) -> None:
     """Serve a component root in floating `dtype` from now on. A placed one keeps its stored
     bytes; the Runtime casts them when it next fills the weights, so nothing loads here."""
     if next(module.parameters()).dtype == dtype:
@@ -393,7 +404,7 @@ def hold_dtype(module: Any, dtype: Any) -> None:
         placed[0].represent(placed[1], dtype)()
 
 
-def plain_forward(module: Any) -> bool:
+def plain_forward(module: torch.nn.Module) -> bool:
     """Whether calling `module` runs its class's forward: it has no forward of its own but the
     Runtime's transparent wrappers, which call the class's forward at each call."""
     own = vars(module).get("forward")
@@ -616,7 +627,7 @@ _DETERMINISTIC_SCOPE: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 #: How a local `deterministic=True` scope sets deterministic cuDNN on this process's device:
 #: the Runtime's numerics policy (`internal/numerical_environment.apply`) installs it at
-#: executor start. Unset (`for_test`, no Torch), a scope changes nothing.
+#: executor start. Unset (no executor, no Torch), a scope changes nothing.
 DETERMINISTIC: list[Callable[[], AbstractContextManager[None]]] = [nullcontext]
 
 
@@ -649,32 +660,20 @@ def remote_scope(model: object) -> tuple[str, tuple[str, ...]] | None:
 
 
 def uses_components(
-    *names: str,
-    memoize: bool = False,
-    memo_version: str | None = None,
-    memo_dependencies: tuple[MemoDependency, ...] = (),
-    deterministic: bool = False,
+    *names: str, deterministic: bool = False
 ) -> Callable[[Callable[Concatenate[M, P], R]], Callable[Concatenate[M, P], R]]:
-    """Declare the possible heavyweight component set of ONE public `Model` method.
+    """Optional: name the components ONE public `Model` method may touch, so the Runtime fetches
+    and holds them for the call. Without it the method just runs, and each component is staged
+    at its first forward. Where every public method of a class has one, a model argument of that
+    class fetches only the components they name.
 
-    A component-use contract, not a phase declaration: while this method executes, any
-    branch may touch these components. Omitted means ALL (conservatively safe); explicitly
-    empty REFUSES — a method touching no components is module code, not a Model method.
-
-    `memoize=True` marks an encoder-like method whose result is a pure function of its
-    code, declared helpers (`memo_dependencies`, `memo_version` as on `@invocable`), the
-    components' weights, its arguments and the numerics it runs under. The Runtime checks
-    for a stored result before the scope opens, so a hit stages nothing.
-
-    `deterministic=True`: the method's scope, and what it calls on this GPU, runs with cuDNN
+    `deterministic=True`: the method, and what it calls on this GPU, runs with cuDNN
     deterministic and without benchmarking, as do its component calls on a group's other
-    GPUs; the setting is restored when the scope closes, and stage memos key on it. Every
-    other global numeric setting is the Runtime's policy, torch's defaults pinned (float32
-    matmuls at "highest" without TF32, cuDNN with it); a package never sets `torch.backends.*`.
+    GPUs; the setting is restored when the method returns, and `@memoize` keys on it. Every
+    other global numeric setting is the Runtime's policy; a package never sets
+    `torch.backends.*`.
     """
-    components = component_set(
-        names, memoize=memoize, memo=memo_version is not None or bool(memo_dependencies)
-    )
+    components = component_set(names)
     if not isinstance(deterministic, bool):
         raise ConformanceError(
             f"@uses_components(deterministic={deterministic!r}): True or False",
@@ -682,10 +681,12 @@ def uses_components(
         )
 
     def decorate(fn: Callable[Concatenate[M, P], R]) -> Callable[Concatenate[M, P], R]:
+        memo = is_memoized(fn)
+        if memo:  # `@uses_components` above `@memoize`: the lookup still comes first
+            fn = cast("Callable[Concatenate[M, P], R]", inspect.unwrap(fn))
         component_method(fn.__qualname__, inspect.signature(fn).parameters)
         wrapper = _async_wrapper(fn, components) if _is_async(fn) else _sync_wrapper(fn, components)
-        if memoize:
-            declare(fn, version=memo_version, dependencies=memo_dependencies)
+        if memo:
             wrapper = memoized(fn, wrapper, components, is_async=_is_async(fn))
         declared: _Declared = cast("_Declared", wrapper)
         declared.__uses_components__ = components
@@ -693,6 +694,23 @@ def uses_components(
         return wrapper
 
     return decorate
+
+
+def memoize[M: _ScopedModel, **P, R](
+    fn: Callable[Concatenate[M, P], R],
+) -> Callable[Concatenate[M, P], R]:
+    """Mark ONE `Model` method's result a pure function of its code, the weights of the
+    components it uses (those `@uses_components` names, else all of the model's), its arguments
+    and the numerics it runs under. The Runtime looks for a stored result before anything is
+    staged, so a hit stages nothing. Use it alone or with `@uses_components`, in either order."""
+    components: tuple[str, ...] = getattr(fn, "__uses_components__", ())
+    target = cast("Callable[Concatenate[M, P], R]", inspect.unwrap(fn))
+    wrapper = memoized(target, fn, components, is_async=_is_async(target))
+    if components:
+        declared: _Declared = cast("_Declared", wrapper)
+        declared.__uses_components__ = components
+        declared.__deterministic__ = bool(getattr(fn, "__deterministic__", False))
+    return cast("Callable[Concatenate[M, P], R]", wrapper)
 
 
 def sequence_parallel(*, degrees: Sequence[int]) -> Callable[[type[ModelT]], type[ModelT]]:
@@ -801,12 +819,11 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     return cast("Callable[Concatenate[M, P], R]", wrapper)
 
 
-def component_set(names: Sequence[object], *, memoize: bool, memo: bool) -> tuple[str, ...]:
-    """One `@uses_components` declaration's names; `memo`: it names a memo version or helpers."""
+def component_set(names: Sequence[object]) -> tuple[str, ...]:
+    """One `@uses_components` hint's names."""
     if not names:
         raise ConformanceError(
-            "@uses_components() is empty: a method that touches no components is pure "
-            "orchestration and belongs in module code, never on a Model",
+            "@uses_components() names no component: leave the decorator off",
             code="empty_component_set",
         )
     seen: list[str] = []
@@ -821,11 +838,6 @@ def component_set(names: Sequence[object], *, memoize: bool, memo: bool) -> tupl
                 f"@uses_components: {name!r} is declared twice", code="duplicate_component"
             )
         seen.append(name)
-    if memo and not memoize:
-        raise ConformanceError(
-            "a stage's memo_version and memo_dependencies need memoize=True",
-            code="invocable_memoize",
-        )
     return tuple(seen)
 
 
@@ -915,27 +927,15 @@ class Model[PipelineT]:
     __graph_keys__: Mapping[str, tuple[str, ...]] = MappingProxyType({})
     """`@graph_keys(...)`: per component, the root attributes that key its CUDA graphs."""
 
-    __encoded_leaves__: str = "refuse"
-    """The class's `encoded_leaves=` declaration, defaulted to the conservative answer.
-
-    REFUSE is the default because the absence of a statement is not consent. A package
-    written before the native rung existed cannot have thought about whether its code
-    survives leaf replacement, and reading its silence as "yes" would be the runtime
-    deciding a question only the author can answer."""
-
+    serving: Serving = Serving()
+    """The class's serving facts. The dunders below are the Runtime's reading of it."""
+    __encoded_leaves__: str = "accept"
     __min_bits__: int = 8
-    """`min_bits=`: the lowest weight precision the lane rules may pick (`MIN_BITS`)."""
     __phase__: str = "compute"
-    """`phase=`: "decode" for an LM's token loop, else "compute" (`PHASES`)."""
     __attention_bits__: int | dict[str, int] = 16
-    """`attention_bits=`: the attention precision its sites tolerate (`attention_bits`)."""
     __unloaded__: tuple[str, ...] = ()
-    """`unloaded=`: stored tensors a load leaves unloaded on purpose (`coverage_patterns`)."""
     __derived__: tuple[str, ...] = ()
-    """`derived=`: persistent buffers a load keeps constructed on purpose (`coverage_patterns`)."""
-
     __adapter_compatibility__: tuple[AdapterCompatibility, ...] = ()
-    """Closed generic adapter declarations; empty means overlays are refused."""
 
     checkpoint_ref: str = ""
     _cozy_selection_ref: str = ""
@@ -944,63 +944,39 @@ class Model[PipelineT]:
 
     _cozy_ready = False
     _cozy_loading = False
-    _cozy_harness: ModelTestHarness | None = None
     _cozy_record: ConstructionRecord | None = None
     _cozy_identity: ConstructionIdentity | None = None
     _cozy_schedulers: Mapping[str, Scheduler] = {}
     _cozy_caches: tuple[DerivedCache, ...] = ()
     _cozy_adapters: tuple[AdapterRef, ...] = ()
     _cozy_residency: Residency | None = None
-    """Runtime-installed. Absent under `for_test`, which is the whole
-    reason a scope works without one: a test double has no bytes to stage."""
+    """Runtime-installed; absent when package code runs outside an executor."""
     _cozy_placement: Placement | None = None
     """Runtime-installed on the first GPU of a group that hosts a component on another."""
     _cozy_memo: StageMemo | None = None
     """Runtime-installed: where `memoize=True` methods look before their scope opens."""
 
-    def __init_subclass__(cls, /, **keywords: object) -> None:
-        """The class-keyword plane: `encoded_leaves` (model-code-fit §1), the closed consent
-        about what the runtime may substitute, and the precision tolerances `min_bits`, `phase`
-        and `attention_bits` (xs-042). Each is inherited by subclasses. A package's own fused
-        plan is its `execution_plan`.
-
-        Anything else refuses typed: the open stamp vocabulary (`task=`, `objective=`),
-        `structure=` and `self_loading=` are deleted (D1), and a keyword the runtime does not
-        read is not a fact anyone else would look for.
-        """
+    def __init_subclass__(cls) -> None:
         super().__init_subclass__()
-        vocabularies: tuple[tuple[str, Mapping[Any, str], str], ...] = (
-            ("encoded_leaves", ENCODED_LEAVES, "__encoded_leaves__"),
-            ("min_bits", MIN_BITS, "__min_bits__"),
-            ("phase", PHASES, "__phase__"),
-        )
-        for keyword, vocabulary, attribute in vocabularies:
-            if keyword in keywords:
-                value = keywords.pop(keyword)
-                if not closed(vocabulary, value):
-                    raise ConformanceError(
-                        f"class {cls.__name__}({keyword}={value!r}): the vocabulary is CLOSED — "
-                        + " | ".join(f"{k!r}: {why}" for k, why in vocabulary.items()),
-                        code=f"{keyword}_value",
-                    )
-                setattr(cls, attribute, value)
-        if "attention_bits" in keywords:
-            cls.__attention_bits__ = attention_bits(cls.__name__, keywords.pop("attention_bits"))
-        for keyword in ("unloaded", "derived"):
-            if keyword in keywords:
-                value = coverage_patterns(cls.__name__, keyword, keywords.pop(keyword))
-                setattr(cls, f"__{keyword}__", value)
-        if keywords:
-            names = ", ".join(f"{key}=…" for key in keywords)
+        serving = cls.__dict__.get("serving")
+        if serving is None:
+            return
+        if not isinstance(serving, Serving):
             raise ConformanceError(
-                f"class {cls.__name__}({names}): a Model class carries encoded_leaves, "
-                "min_bits, phase, attention_bits, unloaded and derived — fusion=, stamps, task=, "
-                "objective= and "
-                "structure= are deleted (model-code-fit D1); a semantic twin is a component "
-                "name or a config fact",
-                code="class_keyword",
-                fields=sorted(keywords),
+                f"class {cls.__name__}: serving is a Serving(...)", code="serving_value"
             )
+        bits = serving.attention_bits
+        cls.__encoded_leaves__ = "accept" if serving.encoded_leaves else "refuse"
+        cls.__min_bits__ = serving.min_bits
+        cls.__phase__ = serving.phase
+        cls.__attention_bits__ = bits if isinstance(bits, int) else dict(bits)
+        cls.__unloaded__ = serving.unloaded
+        cls.__derived__ = serving.derived
+        cls.__adapter_compatibility__ = (
+            (AdapterCompatibility("lora", "", serving.loras, -math.inf, math.inf),)
+            if serving.loras
+            else ()
+        )
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -1008,7 +984,7 @@ class Model[PipelineT]:
         """Construct this model from the bound artifact. The runtime owns WHEN it runs."""
         raise ConformanceError(
             f"{type(self).__name__} defines no load(loader): a Model constructs through "
-            "loader.construct(T, factory=…) — the one construction primitive",
+            "loader.construct(factory) — the one construction primitive",
             code="no_load",
         )
 
@@ -1083,52 +1059,6 @@ class Model[PipelineT]:
                 )
         effective = derive_seed(ctx.request_id) if seed is None else seed
         return RequestView._make(effective, self._cozy_adapters, self._cozy_schedulers, sampler)
-
-    # ----------------------------------------------------------------- testing
-
-    @classmethod
-    def for_test(cls, *, checkpoint_ref: str = "test://model", **members: object) -> Self:
-        """Author-built doubles standing in for construction — no hub, no GPU, no weights.
-
-        The SDK cannot generically fake an arbitrary pipeline's behavior, so the test
-        provides it. `@uses_components` becomes a no-op lease that RECORDS (§1.6).
-        """
-        if not checkpoint_ref.startswith("test://"):
-            raise ConformanceError(
-                f"for_test(checkpoint_ref={checkpoint_ref!r}): a test double names a "
-                "test:// ref — author code never names an artifact identifier",
-                code="identifier_in_code",
-                fields=["checkpoint_ref"],
-            )
-        declared = _declared_state(cls)
-        unknown = [name for name in members if name not in declared]
-        if unknown:
-            raise ConformanceError(
-                f"{cls.__name__}.for_test({', '.join(unknown)}=…): the class declares no such "
-                f"state (declared: {', '.join(declared) or 'none'})",
-                code="unknown_member",
-                fields=unknown,
-            )
-        model = cls()
-        for name, value in members.items():
-            object.__setattr__(model, name, value)
-        harness = ModelTestHarness()
-        object.__setattr__(model, "checkpoint_ref", checkpoint_ref)
-        object.__setattr__(model, "_cozy_harness", harness)
-        object.__setattr__(model, "_cozy_schedulers", _schedulers(list(members.values()), members))
-        object.__setattr__(model, "_cozy_ready", True)
-        return model
-
-    @property
-    def harness(self) -> ModelTestHarness:
-        """The test harness installed by `for_test`. Absent in production, by construction."""
-        if self._cozy_harness is None:
-            raise CapabilityError(
-                f"{type(self).__name__} was constructed by the runtime, not by for_test: "
-                "there is no harness and no parallel fake runtime",
-                code="no_harness",
-            )
-        return self._cozy_harness
 
     # ----------------------------------------------------------------- scopes
 
@@ -1264,8 +1194,6 @@ class _ComponentScope:
                 (*_REMOTE_SCOPES.get(), (model, self._method, self._components))
             )
             self._enter_numerics(device=False)
-            if model._cozy_harness is not None:
-                model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
             return
         self._call = CURRENT.get()
         if self._call is not None:
@@ -1296,8 +1224,6 @@ class _ComponentScope:
         except BaseException:
             self.__exit__(*sys.exc_info())
             raise
-        if model._cozy_harness is not None:
-            model._cozy_harness.calls.append(ScopeCall(self._method, self._components))
 
     def __exit__(self, *exc: object) -> None:
         model = self._model
@@ -1548,7 +1474,7 @@ class ModelRegistry:
             if not records:
                 raise ConformanceError(
                     f"{cls.__name__}.load did not construct anything: the one construction "
-                    "primitive is loader.construct(T, factory=…)",
+                    "primitive is loader.construct(factory)",
                     code="no_construction",
                 )
             record = records[0] if len(records) == 1 else _merge(records)

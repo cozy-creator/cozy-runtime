@@ -66,7 +66,7 @@ def reap() -> None:
 _EXPECT = """
 import json, sys, threading
 from importlib import import_module
-from cozy_runtime.author.kernels import _SETS
+from cozy_runtime.accel.kernels import _SETS
 from cozy_runtime.internal import accel, config, kernel_cache, triton_kernels
 kernel_cache.configure(kernel_cache.from_sealed(config.inherited_environment()))
 plan = json.loads(sys.argv[1])

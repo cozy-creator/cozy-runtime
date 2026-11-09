@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Any, get_origin
 
 import msgspec
 
-from cozy_runtime import author
 from cozy_runtime.author._files import Files
 from cozy_runtime.author._services import SERVICES
 from cozy_runtime.author._signature import (
@@ -20,6 +19,7 @@ from cozy_runtime.author._signature import (
     check_parameter_markers,
 )
 from cozy_runtime.author._walker import is_struct, strip
+from cozy_runtime.internal import vocabulary as author
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.static_interface import Reader, Registration

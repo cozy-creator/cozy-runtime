@@ -15,7 +15,7 @@ from __future__ import annotations
 import sys
 from types import ModuleType
 
-from cozy_runtime.author.kernels import PreQuantized
+from cozy_runtime.accel.kernels import PreQuantized
 from cozy_runtime.internal import int8_linear, prebuilt
 from cozy_runtime.internal.encoding.formats import E4M3_MAX, Tensor
 

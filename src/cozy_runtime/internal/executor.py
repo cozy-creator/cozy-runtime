@@ -71,16 +71,20 @@ from msgspec import UNSET, UnsetType
 from tensorfs.varena import _runtime as varena
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime import graphs, stepcache, weights_store
-from cozy_runtime.author import ModelRegistry, _activity, _split, describe
+from cozy_runtime import graphs, weights_store
+from cozy_runtime.accel import stepcache
+from cozy_runtime.accel.attention import _close as close_producer_states
+from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
+from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
+from cozy_runtime.author import _activity, _split
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelChoice
-from cozy_runtime.author._attention import _close as close_producer_states
 from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
 from cozy_runtime.author._demand import shape_cell
+from cozy_runtime.author._describe import describe
 from cozy_runtime.author._errors import (
     DEVICE_FAULT,
     DEVICE_OOM,
@@ -121,6 +125,7 @@ from cozy_runtime.author._model import (
     SCOPES,
     WARNINGS,
     Model,
+    ModelRegistry,
     WarningRow,
     component_use,
 )
@@ -128,8 +133,6 @@ from cozy_runtime.author._observations import DEVICE, PLANS, Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
-from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
-from cozy_runtime.author.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.derive import recipes as declared_recipes
 from cozy_runtime.derive.operations import app as builtin_operations_app
 from cozy_runtime.derive.operations import run_recipe
@@ -3612,8 +3615,6 @@ class Executor:
                     said = f"attention kernel {removed} is gone: the normal choice runs"
                     WARNINGS.append((said, {"code": "attention_kernel_removed"}))
                 served_attention = self._attention_selection(served_attention)
-                if prepared.phases:
-                    self._plan_request(command.request_id, prepared.phases)
                 envelope, outcome, record = run_prepared(
                     prepared,
                     Invocation(
@@ -3625,7 +3626,6 @@ class Executor:
                         models=self.models,
                         recipes=self.discovered.recipes,
                         progress=boundary,
-                        plan=functools.partial(self._plan_request, command.request_id),
                         # cr-012: the inputs the WORKER already fetched, verified and spooled.
                         # Every value is a path inside this attempt's own spool: this process is
                         # `sandbox.refuse_network` rejects ungranted network access.

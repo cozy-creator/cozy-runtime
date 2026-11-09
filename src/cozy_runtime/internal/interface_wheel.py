@@ -8,7 +8,7 @@ from collections import defaultdict
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.invocable_interface import Invocable
@@ -53,12 +53,12 @@ def _module(module: str, entries: list[tuple[CallableDoc, Invocable]], digest: s
         "from typing import Annotated, Any, Literal, cast",
         "from enum import Enum",
         "import msgspec",
-        "from cozy_runtime.author import "
-        "FileBound, Files, AudioPreparation, ImagePreparation, VideoPreparation, "
-        "ImageFile, AudioFile, VideoFile, File, Tree",
-        "from cozy_runtime.author import ModelArtifact, ModelChoice",
-        "from cozy_runtime.author import AspectRatio, Audio, Image, Latents, Pickup, Prompt, Seed",
-        "from cozy_runtime.author import Video",
+        "from cozy_runtime.fields import "
+        "FileBound, AudioPreparation, ImagePreparation, VideoPreparation",
+        "from cozy_runtime.media import "
+        "Files, ImageFile, AudioFile, VideoFile, File, Tree, Latents",
+        "from cozy_runtime.author import ModelArtifact, ModelChoice, Seed",
+        "from cozy_runtime.fields import AspectRatio, Audio, Image, Pickup, Prompt, Video",
         "from cozy_runtime.author._calls import _CallType, _invoke_proxy",
         "from cozy_runtime.author import PendingCall",
         "",

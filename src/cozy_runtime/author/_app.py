@@ -1,37 +1,29 @@
 """The `App` registry — the one object a package module exports as `app = App()`.
 
-The decorators are sugar for explicit registration calls (`app.entrypoint(...)(fn)`):
-sibling modules export plain functions and the entry module registers them, so merely
-IMPORTING a module never mutates any registry (§1.0). Both spellings register the same
-way — `def` is the compute default, `async def` is for genuinely async-shaped handlers
-(§1.2) — and both are ParamSpec-preserving, so a decorated handler keeps its exact
-signature and callers stay fully typed under `mypy --strict` (§1.7).
+The decorators are sugar for explicit registration calls (`app.entrypoint(fn)`): sibling
+modules export plain functions and the entry module registers them, so merely IMPORTING a
+module never mutates any registry. `def` and `async def` register the same way, and a
+decorated handler keeps its exact signature.
 
 Registration is CHEAP: nothing here resolves annotations, so a forward reference to a class
 defined later in the module is fine. The surface is derived on first inspection (describe),
 and after describe the registry is frozen.
-
-Deliberately absent, and NOT to be added here: any import of cozy_runtime.internal, any
-environment or config read, any device/allocator surface. Those are fenced (§7).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ParamSpec, TypedDict, TypeVar, Unpack, overload
 
 from cozy_runtime.author._calls import _export
 from cozy_runtime.author._errors import ConformanceError
-from cozy_runtime.author._markers import Bound
-from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy, one_memo
-from cozy_runtime.author._memo import declare as declare_memo
+from cozy_runtime.author._memo import Memoize, memo_policy, one_memo
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._model_defaults import (
     model_components,
     model_defaults,
     model_on_demand,
-    model_phases,
 )
 from cozy_runtime.author._signature import Surface, analyze
 from cozy_runtime.author._tool import Tool
@@ -42,22 +34,17 @@ R = TypeVar("R")
 
 
 class RegistrationOptions(TypedDict, total=False):
-    """The registration options `entrypoint` and `child_task` share."""
+    """The options `entrypoint` and `tool` share."""
 
     name: str | None
-    preflight: Callable[..., object] | None
-    phases: Sequence[str | Collection[str]]
-    demand: Bound | None
     defaults: Mapping[str, str] | None
     components: Mapping[str, Sequence[str]] | None
-    on_demand: Sequence[str]
     memoize: bool | Memoize
-    memo_version: str | None
-    memo_dependencies: tuple[MemoDependency, ...]
-    publishes: bool
-    emits_media: bool
-    weights: tuple[WeightsOutput, ...]
+    on_demand: Sequence[str]
     accelerator: bool | None
+    weights: tuple[WeightsOutput, ...]
+    private: bool
+    preflight: Callable[..., object] | None
 
 
 class RegistrationError(ConformanceError):
@@ -68,7 +55,7 @@ class RegistrationError(ConformanceError):
 
 @dataclass(slots=True)
 class Registration:
-    """One registered callable plus the doors it opened. cr-003 reads `surface`."""
+    """One registered callable plus the doors it opened."""
 
     name: str
     fn: Callable[..., object]
@@ -77,23 +64,16 @@ class Registration:
     model_defaults: Mapping[str, str] = field(default_factory=dict)
     model_components: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     model_on_demand: tuple[str, ...] = ()
-    #: A model argument's class where the registration names it (`cozy_runtime.derive.recipes`).
+    #: A model argument's class where the Runtime names it (`cozy_runtime.derive.recipes`).
     model_classes: Mapping[str, type[Model[Any]]] = field(default_factory=dict)
-    publishes: bool = False
-    emits_media: bool = False
     weights_outputs: tuple[WeightsOutput, ...] = ()
-    demand_bound: Bound | None = None
     preflight: Callable[..., object] | None = None
-    phases: tuple[tuple[str, ...], ...] = ()
     child_task: bool = False
-    """Called by this installed package revision's own code only; never a root request."""
+    """`private=True`: called by this package's own code only; never a root request."""
     accelerator: bool = True
     """False: CPU only. True (the default): the machine's GPU when it has one."""
     tool: Tool | None = None
     """`app.tool`'s own options: this function is a box."""
-    hidden: bool = False
-    """DECLARED but NOT PUBLISHED (#572d): absent from the package interface, so no binding
-    is staged and no request reaches it. An author fact (an unbuilt seam), not a deployment one."""
     checked: bool = field(default=False, repr=False)
     """Set once the describe-time conformance layer has passed this surface."""
     _surface: Surface | None = field(default=None, repr=False)
@@ -102,15 +82,11 @@ class Registration:
     def surface(self) -> Surface:
         """The derived surface — schemas, capabilities, models, and preflight identity."""
         if self._surface is None:
-            surface = analyze(
+            self._surface = analyze(
                 self.fn,
                 name=self.name,
-                publishes=self.publishes,
-                emits_media=self.emits_media,
                 weights_outputs=self.weights_outputs,
-                demand_bound=self.demand_bound,
                 preflight=self.preflight,
-                hidden=self.hidden,
                 child_task=self.child_task,
                 accelerator=self.accelerator,
                 tool=self.tool,
@@ -121,7 +97,6 @@ class Registration:
                 model_on_demand=self.model_on_demand,
                 model_classes=self.model_classes,
             )
-            self._surface = surface
         return self._surface
 
 
@@ -134,52 +109,35 @@ class App:
 
     @overload
     def entrypoint(
-        self,
-        fn: Callable[P, R],
-        /,
-        *,
-        hidden: bool = False,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
-        **options: Unpack[RegistrationOptions],
+        self, fn: Callable[P, R], /, **options: Unpack[RegistrationOptions]
     ) -> Callable[P, R]: ...
 
     @overload
     def entrypoint(
-        self,
-        /,
-        *,
-        hidden: bool = False,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
-        **options: Unpack[RegistrationOptions],
+        self, /, **options: Unpack[RegistrationOptions]
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
     def entrypoint(
-        self,
-        fn: Callable[P, R] | None = None,
-        /,
-        *,
-        hidden: bool = False,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
-        **options: Unpack[RegistrationOptions],
+        self, fn: Callable[P, R] | None = None, /, **options: Unpack[RegistrationOptions]
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register a public function, bare (`app.entrypoint(fn)`) or as a decorator (§1.2).
+        """Register a function, bare (`app.entrypoint(fn)`) or as a decorator.
 
-        `weights=` names the TensorFS model outputs it writes; `publishes=`/`emits_media=`
-        declare its `Outputs`. `accelerator=False` runs it on CPU only; otherwise (`True`,
-        or absent) it gets the machine's GPU when there is one. `hidden=True` keeps it out of
-        the published interface.
-
-        `memoize=True` admits deterministic results to the operation cache (never for a
-        writer); `memo_dependencies`/`memo_version` declare what else decides the result, and
-        `Memoize(requires=("seed",))` memoizes only requests that name each listed option.
-        `components={"model": ("transformer", "vae")}` names the components each model argument
-        uses, so a machine fetches those first; absent means all. `on_demand=("upsampler",)`
-        names the model arguments a request may leave unused: each is built, and its weights
-        fetched, when the function first reads it. `model_classes` names a model argument's class
-        in place of its annotation (the Runtime's own generic functions). `phases=` declares
-        immutable component groups in execution order, available to queued preparation before
-        handler entry; it has the same residency meaning as the handler's `ctx.plan` hints."""
-        return self._register(fn, False, hidden=hidden, model_classes=model_classes, **options)
+        - `name`: its public name; the function's own by default.
+        - `defaults={"model": "org/name@release"}`: each model argument's default release.
+        - `components={"model": ("transformer", "vae")}`: optional; the components of a model
+          argument this function fetches. Without it: those its class's `@uses_components`
+          hints name when every public method has one, else all of them.
+        - `memoize=True`: its results are deterministic, so a repeat is answered from the
+          result cache (never for a function that writes weights);
+          `Memoize(requires=("seed",))` memoizes only requests that name each listed option.
+        - `on_demand=("upsampler",)`: model arguments a request may leave unused; each is
+          built, and its weights fetched, when the function first reads it.
+        - `accelerator=False`: CPU only; otherwise it gets the machine's GPU when there is one.
+        - `weights=`: the TensorFS model outputs it writes.
+        - `private=True`: only this package's own calls run it, never a root request.
+        - `preflight=`: the function that resolves a request's `Preflight[T]` before it runs.
+        """
+        return self._register(fn, **options)
 
     @overload
     def tool(
@@ -191,8 +149,6 @@ class App:
         named: str = "",
         reserved: Sequence[str] = (),
         ui: str = "",
-        hidden: bool = False,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R]: ...
 
@@ -205,8 +161,6 @@ class App:
         named: str = "",
         reserved: Sequence[str] = (),
         ui: str = "",
-        hidden: bool = False,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
 
@@ -219,8 +173,6 @@ class App:
         named: str = "",
         reserved: Sequence[str] = (),
         ui: str = "",
-        hidden: bool = False,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
         **options: Unpack[RegistrationOptions],
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
         """A public function that is a box: its request struct is the box's fields (tools.md).
@@ -230,62 +182,29 @@ class App:
 
         Placed on a model's own function, it is the shortcut: its arguments are already the box."""
         box = Tool(label=label, named=named, reserved=reserved, ui=ui)
-        return self._register(
-            fn, False, hidden=hidden, model_classes=model_classes, tool=box, **options
-        )
-
-    @overload
-    def child_task(
-        self, fn: Callable[P, R], /, **options: Unpack[RegistrationOptions]
-    ) -> Callable[P, R]: ...
-
-    @overload
-    def child_task(
-        self, /, **options: Unpack[RegistrationOptions]
-    ) -> Callable[[Callable[P, R]], Callable[P, R]]: ...
-
-    def child_task(
-        self, fn: Callable[P, R] | None = None, /, **options: Unpack[RegistrationOptions]
-    ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
-        """Register a function only this package's own calls run: never a root request or
-        another package's call. It takes `entrypoint`'s options except `hidden` and
-        `model_classes`."""
-        return self._register(fn, True, **options)
+        return self._register(fn, tool=box, **options)
 
     def _register(
         self,
         fn: Callable[P, R] | None,
-        child_task: bool,
         /,
         *,
-        hidden: bool = False,
-        model_classes: Mapping[str, type[Model[Any]]] | None = None,
         name: str | None = None,
-        preflight: Callable[..., object] | None = None,
-        phases: Sequence[str | Collection[str]] = (),
-        demand: Bound | None = None,
         defaults: Mapping[str, str] | None = None,
         components: Mapping[str, Sequence[str]] | None = None,
-        on_demand: Sequence[str] = (),
         memoize: bool | Memoize = False,
-        memo_version: str | None = None,
-        memo_dependencies: tuple[MemoDependency, ...] = (),
-        publishes: bool = False,
-        emits_media: bool = False,
-        weights: tuple[WeightsOutput, ...] = (),
+        on_demand: Sequence[str] = (),
         accelerator: bool | None = None,
+        weights: tuple[WeightsOutput, ...] = (),
+        private: bool = False,
+        preflight: Callable[..., object] | None = None,
         tool: Tool | None = None,
+        model_classes: Mapping[str, type[Model[Any]]] | None = None,
     ) -> Callable[P, R] | Callable[[Callable[P, R]], Callable[P, R]]:
-        # Immutable CPU metadata; the source reader uses the same closed validator.
-        declared_phases = model_phases(phases)
         policy = memo_policy(memoize)
-        if child_task and (hidden or model_classes):
-            raise RegistrationError("child_task takes no hidden= or model_classes=")
-        if accelerator is not None and type(accelerator) is not bool:
-            raise RegistrationError(
-                "accelerator is True or False: a function gets the machine's GPU unless it "
-                "declares accelerator=False"
-            )
+        for option, value in (("accelerator", accelerator), ("private", private)):
+            if value is not None and type(value) is not bool:
+                raise RegistrationError(f"{option} is True or False")
         declared_defaults = model_defaults(defaults)
         declared_components = model_components(components)
         declared_on_demand = model_on_demand(on_demand)
@@ -311,30 +230,19 @@ class App:
                     "declare components once, on invocable or App registration",
                     code="model_components",
                 )
-            memo = one_memo(export.memoize, policy) if export is not None else policy
-            declare_memo(
-                export.implementation if export is not None else target,
-                version=memo_version,
-                dependencies=memo_dependencies,
-            )
             self._registry[registered] = Registration(
                 name=registered,
                 fn=export.implementation if export is not None else target,
                 invocable=export is not None,
-                memoize=memo,
+                memoize=one_memo(export.memoize, policy) if export is not None else policy,
                 model_defaults=declared_defaults or (export.defaults if export is not None else {}),
                 model_components=declared_components
                 or (export.components if export is not None else {}),
                 model_on_demand=declared_on_demand,
                 model_classes=dict(model_classes or {}),
-                publishes=publishes,
-                emits_media=emits_media,
                 weights_outputs=weights,
-                demand_bound=demand,
                 preflight=preflight,
-                phases=declared_phases,
-                hidden=hidden,
-                child_task=child_task,
+                child_task=private,
                 accelerator=accelerator is not False,
                 tool=tool,
             )
