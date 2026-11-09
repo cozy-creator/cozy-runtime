@@ -390,6 +390,10 @@ _SEQUENCE_BUILTINS: dict[str, Callable[[Sequence[object]], object]] = {
 #: A fold carries no local names unless a comprehension binds its own target.
 _NO_SCOPE: Mapping[str, object] = types.MappingProxyType({})
 _MODEL_MEMBERS = frozenset(name for name in dir(Model) if not name.startswith("_"))
+#: Method decorators that make something other than a plain function on the class.
+_DESCRIPTORS = frozenset(
+    {"property", "staticmethod", "classmethod", "cached_property", "setter", "getter", "deleter"}
+)
 #: `app.entrypoint`'s closed keyword set (`author.App`).
 _ENTRYPOINT_KEYWORDS = frozenset(
     {
@@ -1199,11 +1203,13 @@ class Reader:
                 target = decorator.func if isinstance(decorator, ast.Call) else decorator
                 if not isinstance(target, (ast.Name, ast.Attribute)):
                     continue
-                found = self.resolve(module, target)
-                if isinstance(found, Vocab) and found.key in (
-                    "builtins.staticmethod", "builtins.classmethod", "builtins.property",
-                ):  # fmt: skip
-                    public = False
+                if (target.id if isinstance(target, ast.Name) else target.attr) in _DESCRIPTORS:
+                    public = False  # not a plain function on the class: `Model` skips it too
+                    continue
+                try:
+                    found = self.resolve(module, target)
+                except StaticRefusal:
+                    continue  # any other decorator: ordinary Python, nothing the interface reads
                 if not (isinstance(found, Vocab) and found.key == "author.uses_components"):
                     continue
                 if not isinstance(decorator, ast.Call):

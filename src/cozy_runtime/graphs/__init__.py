@@ -38,6 +38,7 @@ from cozy_runtime.accel.attention import (
     AttentionLayout,
     active_attention_layout,
     attention_scope,
+    producer_sites,
 )
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT
@@ -1021,12 +1022,12 @@ def _region_call(
         if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-        # A sparse step picks its key blocks from the values, and a package's producer runs
-        # Python and keeps request state at each call: a replay would freeze one call's.
+        # A sparse step picks its key blocks from the values, and a package's producer may
+        # keep request state at a call: a replay would freeze one call's.
         else "under a sparse attention layout"
         if layout is not None and layout.sparse
-        else "under an attention layout a package's producer serves"
-        if layout is not None and _produced(module)
+        else "under an attention layout its producer keeps state for"
+        if layout is not None and _stateful(module, layout)
         else _unplain(torch, leaves)
     )
     if why:
@@ -1079,12 +1080,11 @@ def _under(layout: AttentionLayout, call: Callable[..., Any], *args: Any, **kwar
         return call(*args, **kwargs)
 
 
-def _produced(module: Any) -> bool:
-    """Whether a package's attention producer serves a site under `module` now."""
-    return any(
-        getattr(getattr(sub, "processor", None), "serving", None) is not None
-        for sub in module.modules()
-    )
+def _stateful(module: Any, layout: AttentionLayout) -> bool:
+    """Whether a package's attention producer serving a site under `module` now does not state
+    this call stateless (`AttentionProducer.stateless`): its `produce` must run."""
+    producers = {site.producer.name: site.producer for site in producer_sites(module)}
+    return any(p.stateless is None or not p.stateless(layout) for p in producers.values())
 
 
 def _queue(

@@ -909,6 +909,17 @@ class Loader:
         self._objects.append(obj)
         return obj
 
+    def cache(self, name: str, *, max_entries: int = 64, max_bytes: int = 1 << 30) -> DerivedCache:
+        """Declare a model-generation-scoped derived cache. Memory-only, by construction."""
+        self._require_open("loader.cache")
+        if not name or not name.replace("_", "").isalnum():
+            raise ConformanceError(
+                f"cache name {name!r} must be a plain identifier", code="cache_name"
+            )
+        cache = DerivedCache(name, max_entries=max_entries, max_bytes=max_bytes, owner=self._owner)
+        self._caches.append(cache)
+        return cache
+
     def records(self) -> tuple[ConstructionRecord, ...]:
         return tuple(self._records)
 

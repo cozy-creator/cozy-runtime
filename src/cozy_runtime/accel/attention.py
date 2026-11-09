@@ -146,6 +146,13 @@ class AttentionProducer:
     it has one) when the request ends; what it holds for one loop the package frees after it.
     `context_parallel` admits Ulysses sequence parallelism;
     one without it steps to the next kernel under a group.
+
+    `stateless(layout)`: whether, for a component call under `layout` made now, `produce`
+    only passes each site's call on to `call.original` and keeps nothing (a dense step that
+    seeds no statistics). The Runtime then records the component call as a CUDA graph with the
+    sites' own processors and replays it, skipping `produce`. It is asked at each call, in the
+    caller's context. Without it every call under a layout at the producer's sites runs as
+    written.
     """
 
     name: str
@@ -155,6 +162,7 @@ class AttentionProducer:
     requires: tuple[str, ...] = ()
     state: Callable[[], Any] = dict
     context_parallel: bool = False
+    stateless: Callable[[AttentionLayout], bool] | None = None
 
     def request_state(self) -> Any | None:
         """This request's state on this GPU, made on first use; None outside a request."""
