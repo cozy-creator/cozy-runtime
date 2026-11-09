@@ -461,6 +461,11 @@ def audit(event: str, args: tuple[Any, ...]) -> None:
             )
             if row not in WARNINGS:
                 WARNINGS.append(row)
+    elif event in ("os.putenv", "os.unsetenv"):
+        # A library's own write is its own: torch's inductor writes back its cache directory
+        # (TensorD's, made absolute) when diffusers imports it, so every diffusers package's
+        # import was refused on a GPU (0.21.3 RC, izuna run 42773).
+        if (site := _site(sys._getframe(2), through=False)) is not None:
+            _refuse("env_write", f"{event}({str(args[:1])[1:-2][:80]})", site)
     elif (site := _site(sys._getframe(2))) is not None:
-        rule = "env_write" if event in ("os.putenv", "os.unsetenv") else "process"
-        _refuse(rule, f"{event}({str(args[:1])[1:-2][:80]})", site)
+        _refuse("process", f"{event}({str(args[:1])[1:-2][:80]})", site)
