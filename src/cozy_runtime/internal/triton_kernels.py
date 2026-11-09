@@ -472,7 +472,7 @@ class _Launcher:
             operands = list(args)
             for i, value in zip(at, real, strict=True):
                 operands[i] = value
-            found[grid](*operands)
+            found[(*grid, 1, 1)[:3]](*operands)  # a compiled kernel reads all three dims
 
 
 #: Loaded sets by (name, device index).
