@@ -76,9 +76,8 @@ class Join(Command, frozen=True, kw_only=True, tag="join"):
 class Form(Command, frozen=True, kw_only=True, tag="form"):
     """Every follower said it is ready: all GPUs enter group init together."""
 
-    #: Every GPU then times NCCL against these exchanges and keeps the fastest
-    #: (`copy_engine.calibrate`, `links.Links.exchanges`).
-    calibrate: tuple[str, ...] = ()
+    #: Every GPU then maps this exchange and checks its bytes (`copy_engine.form`).
+    exchange: str = ""
 
 
 class Fork(Command, frozen=True, kw_only=True, tag="fork"):

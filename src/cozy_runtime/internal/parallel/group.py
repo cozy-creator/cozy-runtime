@@ -19,7 +19,7 @@ import socket
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import timedelta
 from types import ModuleType
@@ -487,7 +487,7 @@ class RankGroup:
         sealed: Mapping[str, str],
         again: bool = False,
         nccl: Mapping[str, str] | None = None,
-        calibrate: Sequence[str] = (),
+        exchange: str = "",
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group in two steps, so a partial group never forms. `join`: every
@@ -497,7 +497,7 @@ class RankGroup:
         `again` forms it AGAIN after an `interrupt`: every follower joins a new store.
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
         barrier, while each follower runs its half before it answers `form`: there, every GPU
-        times the `calibrate` exchanges against NCCL."""
+        maps `exchange` (`copy_engine.form`)."""
         dist = torch.distributed
 
         self.check_alive()
@@ -531,7 +531,7 @@ class RankGroup:
         self._unformed(self.collect("join"), "join")
         self.initializing = True
         try:
-            self.broadcast({"cmd": "form", "calibrate": list(calibrate)})
+            self.broadcast({"cmd": "form", "exchange": exchange})
             self.waiting(f"forming the group: {self.gpu(0)} and {len(self.followers)} more in init")
             dist.init_process_group(
                 self.backend,

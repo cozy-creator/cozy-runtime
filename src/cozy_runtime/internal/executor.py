@@ -1293,9 +1293,9 @@ class Executor:
         if self.comms is not None:
             self.comms.pg = self.pg
         reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
-        if command.calibrate:
-            exchange, reply["calibration"] = copy_engine.calibrate(
-                self.torch, self.pg, self.rank, self.world, command.calibrate, self._host_tier()
+        if command.exchange:
+            exchange, reply["check"] = copy_engine.form(
+                self.torch, self.pg, self.rank, self.world, command.exchange, self._host_tier()
             )
             copy_engine.install(exchange, self.pg)
         return reply
@@ -1310,21 +1310,23 @@ class Executor:
             "traceback": prepare_diagnostics.exception_trace(exc),
         }
 
-    def _exchanges(self) -> tuple[str, ...]:
-        """The exchanges this group's formation times against NCCL (`links.Links.exchanges`)."""
-        nccl = self.group is not None and self.group.backend == "nccl"
-        return self.transport.links.exchanges if nccl and self.transport is not None else ()
+    def _group_exchange(self) -> str:
+        """The exchange this group forms with beside NCCL (`links.Links.exchange`), or none."""
+        if self.group is None or self.group.backend != "nccl" or self.transport is None:
+            return ""
+        name = self.transport.links.exchange
+        return "" if name == "nccl" else name
 
     def _host_tier(self) -> Any:
         """This GPU's host tier, which a host-staged exchange's inbox comes from."""
         memory = self.host.memory
         return memory.pages if memory is not None else None
 
-    def _calibrated(self, pg: Any) -> None:
-        """Rank 0's half of the formation's calibration: NCCL against `_exchanges`."""
+    def _formed(self, pg: Any) -> None:
+        """Rank 0 maps the exchange of the group and checks its bytes (`copy_engine.form`)."""
         assert self.transport is not None
-        exchange, self.transport.calibration = copy_engine.calibrate(
-            self.torch, pg, 0, self.world, self._exchanges(), self._host_tier()
+        exchange, self.transport.check = copy_engine.form(
+            self.torch, pg, 0, self.world, self._group_exchange(), self._host_tier()
         )
         copy_engine.install(exchange, pg)
         self.transport.route = exchange.name if exchange is not None else "nccl"
@@ -1345,13 +1347,13 @@ class Executor:
         """Rank 0's half of `mirror.mirror_component`: after a GPU ran short of memory in a
         call, the group forms again for the next attempt (§5.5)."""
         assert self.group is not None and self.torch is not None
-        exchanges = self.host._exchanges()
+        exchange = self.host._group_exchange()
         self.host.pg = self.group.form(
             self.torch,
             _SEALED,
             again=True,
-            calibrate=exchanges,
-            formed=self.host._calibrated if exchanges else None,
+            exchange=exchange,
+            formed=self.host._formed if exchange else None,
         )
         if self.host.comms is not None:
             self.host.comms.pg = self.host.pg
@@ -1906,13 +1908,13 @@ class Executor:
                     self.transport = links.Transport(
                         degree, _gpu_numbers(degree), "nccl", measured.nccl(), measured
                     )
-                    exchanges = self._exchanges()
+                    exchange = self._group_exchange()
                     self.pg = self.group.form(
                         self.torch,
                         _SEALED,
                         nccl=self.transport.nccl,
-                        calibrate=exchanges,
-                        formed=self._calibrated if exchanges else None,
+                        exchange=exchange,
+                        formed=self._formed if exchange else None,
                     )
                     stage("group_form")
         except GroupRefusal as exc:

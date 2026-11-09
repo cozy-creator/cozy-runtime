@@ -4,8 +4,9 @@ NCCL moves an exchange with kernels on the SMs, which across a CPU root complex 
 magnitude slower than the copy engines (H100 NVL, 4 GPUs: 3.3 GB/s against 20.8 GB/s per GPU).
 Without peer access its shared-memory transport has those kernels write and read host memory
 across PCIe (2x RTX 4090, cl-816: an H3 step took 15 s at degree 2 against 9 s at degree 1,
-moving 27 GB a GPU each way). So a group times NCCL against the copy-engine exchanges its links
-allow as it forms (`calibrate`) and keeps the fastest; the result is the same bytes either way.
+moving 27 GB a GPU each way). So the links of a group name its exchange (`links.Links.exchange`):
+peer memory on every pair, or host memory where a pair has none. `form` maps it as the group forms
+and checks one crossing against the bytes NCCL lands; the result is the same bytes either way.
 
 - `CopyEngineExchange` (every pair peer-accessible): each GPU maps one receive buffer of every
   other (torch symmetric memory). A round is a barrier, one copy-engine copy per peer into that
@@ -29,7 +30,6 @@ from __future__ import annotations
 import ctypes
 import math
 from collections.abc import Callable, Sequence
-from functools import partial
 from typing import Any
 
 from cozy_runtime.graphs import streams
@@ -380,85 +380,47 @@ def _host(torch: Any, staging: Any) -> Any:
     )
 
 
-#: Bytes each GPU sends in the calibration: the size class of one Ulysses exchange.
-_CALIBRATION_BYTES = 64 << 20
+#: Bytes each GPU sends in the check a formation runs, in two rounds.
+_CHECK_BYTES = 8 << 20
 
 
-def calibrate(
-    torch: Any,
-    pg: Any,
-    rank: int,
-    world: int,
-    candidates: Sequence[str] = ("copy-engine",),
-    pages: Any = None,
-) -> tuple[Exchange | None, dict[str, float]]:
-    """Collective, on every GPU of a just-formed group: the same all-to-all through NCCL and
-    through each candidate exchange, timed and checked against NCCL's bytes; every GPU keeps the
-    fastest alike. A candidate any GPU cannot map is dropped on all of them. `pages`: this GPU's
-    host tier, which a host-staged inbox comes from."""
+def form(
+    torch: Any, pg: Any, rank: int, world: int, name: str, pages: Any = None
+) -> tuple[Exchange | None, dict[str, bool]]:
+    """Collective, on every GPU of a just-formed group: `name` (`links.Links.exchange`) mapped,
+    and one all-to-all through it checked against the bytes NCCL lands. An exchange any GPU cannot
+    map, or whose bytes differ on any, goes on all of them alike and NCCL carries the group.
+    `pages`: the host tier of this GPU, which a host-staged inbox comes from."""
     from torch.distributed.distributed_c10d import _get_process_group_store
 
     dist = torch.distributed
 
-    def everyone(value: float, op: Any) -> float:
-        agreed = torch.tensor([value], dtype=torch.float64, device="cuda")
-        dist.all_reduce(agreed, op=op, group=pg)
-        return float(agreed.item())
-
     def agree(ok: bool) -> bool:
-        return everyone(1.0 if ok else 0.0, dist.ReduceOp.MIN) >= 1.0
+        agreed = torch.tensor([int(ok)], dtype=torch.int32, device="cuda")
+        dist.all_reduce(agreed, op=dist.ReduceOp.MIN, group=pg)
+        return bool(agreed.item())
 
-    # A formation again (after a call ran short of memory) frees the last one's buffers first.
+    # A formation again (after a call ran short of memory) frees the buffers of the last first.
     _drop()
-    rows = _CALIBRATION_BYTES // 2 // 1024 // world * world
-    # Two rounds, the second short: every formation checks the rounds against NCCL's bytes.
-    half = rows // world // 2 + 1
+    exchange = _open(name, torch, pg, rank, world, agree, _get_process_group_store(pg), pages)
+    if exchange is None:
+        return None, {"mapped": False, "exact": False}
+    rows = _CHECK_BYTES // 2 // 1024 // world * world
     send = torch.randn(rows, 1024, dtype=torch.bfloat16, device="cuda")
     received = torch.empty_like(send)
+    dist.all_to_all_single(received, send, group=pg)
     matrix = [[rows // world] * world for _ in range(world)]
-    sent = send.numel() * send.element_size() * (world - 1) / world
-
-    def timed(run: Any) -> float:
-        run()
-        torch.cuda.synchronize()
-        dist.barrier(group=pg)
-        began, ended = (torch.cuda.Event(enable_timing=True) for _ in range(2))
-        began.record()
-        for _ in range(3):
-            run()
-        ended.record()
-        ended.synchronize()
-        seconds = everyone(max(began.elapsed_time(ended) / 3000, 1e-9), dist.ReduceOp.MAX)
-        return float(round(sent / seconds / 1e9, 2))
-
-    timings: dict[str, float] = {
-        "nccl_gbps": timed(lambda: dist.all_to_all_single(received, send, group=pg))
-    }
-    best: Exchange | None = None
-    for name in candidates:
-        label = name.replace("-", "_")
-        exchange = _open(name, torch, pg, rank, world, agree, _get_process_group_store(pg), pages)
-        timings[f"{label}_mapped"] = 0.0 if exchange is None else 1.0
-        if exchange is None:
-            continue
-        try:
-            timings[f"{label}_gbps"] = timed(partial(exchange.all_to_all, [send], matrix, half))
-            exact = torch.equal(received, exchange.all_to_all([send], matrix, half)[0])
-        except Exception:  # the whole group then drops it, every GPU alike
-            exact = False
-            timings[f"{label}_gbps"] = 0.0
-        timings[f"{label}_exact"] = 1.0 if agree(exact) else 0.0
-        floor = (
-            timings["nccl_gbps"] if best is None else timings[f"{best.name.replace('-', '_')}_gbps"]
-        )
-        if timings[f"{label}_exact"] < 1.0 or timings[f"{label}_gbps"] <= floor:
-            exchange.close()
-            continue
-        if best is not None:
-            best.close()
-        best = exchange
+    try:
+        # Two rounds, the second short.
+        landed = exchange.all_to_all([send], matrix, rows // world // 2 + 1)[0]
+        exact = bool(torch.equal(received, landed))
+    except Exception:  # the whole group then drops it, every GPU alike
+        exact = False
+    exact = agree(exact)
+    if not exact:
+        exchange.close()
     torch.cuda.synchronize()
-    return best, timings
+    return (exchange if exact else None), {"mapped": True, "exact": exact}
 
 
 def _open(
