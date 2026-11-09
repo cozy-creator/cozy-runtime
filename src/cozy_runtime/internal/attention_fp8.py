@@ -25,6 +25,8 @@ try:
     import triton
     import triton.language as tl
 except ImportError:  # pragma: no cover - a CPU-only or non-Linux environment
+    if TYPE_CHECKING:
+        raise
     triton = None
 
 #: The largest finite e4m3fn magnitude, and the value a head's amax is mapped onto instead.

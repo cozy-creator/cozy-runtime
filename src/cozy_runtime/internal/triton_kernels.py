@@ -35,7 +35,7 @@ import sysconfig
 from collections.abc import Callable, Iterable
 from importlib import import_module
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import msgspec
 from msgspec import Struct
@@ -69,6 +69,8 @@ try:
     from triton.runtime.driver import driver as triton_driver
     from triton.runtime.jit import JITFunction
 except ImportError as _absent:  # pragma: no cover - exercised by the typed refusal
+    if TYPE_CHECKING:
+        raise
     TRITON_ABSENT = f"torch and triton do not import ({_absent})"
 else:
     TRITON_ABSENT = ""

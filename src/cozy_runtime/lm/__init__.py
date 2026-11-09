@@ -57,7 +57,7 @@ from collections import deque
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
-from typing import Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 import tensorfs.varena.torch as vt
 from tensorfs.varena import Exhausted
@@ -95,6 +95,8 @@ try:
         get_layer_types_and_kwargs,
     )
 except ImportError as _absent:  # pragma: no cover - the base package has neither
+    if TYPE_CHECKING:
+        raise
     ABSENT = f"torch and transformers do not import ({_absent})"
     StaticLayer = LinearAttentionLayer = Cache = TorchFunctionMode = StoppingCriteria = object
 else:

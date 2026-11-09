@@ -46,7 +46,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.accel.kernels import Plan
 from cozy_runtime.author._model import WARNINGS, WarningRow
@@ -54,6 +54,8 @@ from cozy_runtime.author._model import WARNINGS, WarningRow
 try:
     import torch
 except ImportError:  # pragma: no cover - the base package is torch-free
+    if TYPE_CHECKING:
+        raise
     torch = None
 
 

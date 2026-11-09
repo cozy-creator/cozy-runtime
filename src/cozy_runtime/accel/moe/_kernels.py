@@ -11,7 +11,7 @@ routing's own tiles exits. `GROUP` row tiles take each weight block in turn whil
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.accel.kernels import TritonEntry
 
@@ -19,6 +19,8 @@ try:
     import triton
     import triton.language as tl
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
+    if TYPE_CHECKING:
+        raise
     TRITON_ABSENT = f"triton does not import ({_absent})"
 else:
     TRITON_ABSENT = ""

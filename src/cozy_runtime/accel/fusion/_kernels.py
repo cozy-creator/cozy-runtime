@@ -14,7 +14,7 @@ Adapted from MiniMax-H3's glue (itself from NVlabs/Sana `sol-engine`, Apache-2.0
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from cozy_runtime.accel.kernels import Launch, TritonEntry
 
@@ -24,6 +24,8 @@ try:
     import triton.language as tl
     from triton.language.extra import libdevice
 except ImportError as _absent:  # pragma: no cover - a CPU-only or non-Linux environment
+    if TYPE_CHECKING:
+        raise
     TRITON_ABSENT = f"torch and triton do not import ({_absent})"
 else:
     TRITON_ABSENT = ""

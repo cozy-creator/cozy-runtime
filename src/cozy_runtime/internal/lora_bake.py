@@ -42,6 +42,8 @@ try:
     import triton
     import triton.language as tl
 except ImportError:  # a host without Triton bakes eagerly
+    if TYPE_CHECKING:
+        raise
     triton = None
 
 Strategy = Literal["bake", "per_step"]

@@ -36,6 +36,8 @@ try:
     import triton
     import triton.language as tl
 except ImportError:  # the eager reference still runs
+    if TYPE_CHECKING:
+        raise
     triton = None
 
 TORCH = {

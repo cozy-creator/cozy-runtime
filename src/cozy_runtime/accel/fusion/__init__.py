@@ -47,7 +47,7 @@ from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from cozy_runtime.accel.fusion import _kernels
 from cozy_runtime.accel.kernels import (
@@ -62,11 +62,15 @@ from cozy_runtime.accel.kernels import (
 try:
     import torch
 except ImportError:  # pragma: no cover - the base package is torch-free
+    if TYPE_CHECKING:
+        raise
     torch = None
 
 try:
     from diffusers.models.attention_dispatch import _AttentionBackendRegistry, dispatch_attention_fn
 except ImportError:  # pragma: no cover - only a parallel block composes Diffusers' attention
+    if TYPE_CHECKING:
+        raise
     _AttentionBackendRegistry = dispatch_attention_fn = None
 
 
