@@ -52,8 +52,7 @@ class AttentionProducer:
     not serve. `requires` names the callables it needs in the base's kernel module; one the
     build lacks makes the producer unavailable there, as a failed build does. `state()`
     makes one object per request on each GPU (`request_state`), closed (its `close()`, when
-    it has one) when the request ends; its `end_loop()`, when it has one, runs as each
-    `denoise_loop` returns, so what it holds for one loop goes before the decode after it.
+    it has one) when the request ends; what it holds for one loop the package frees after it.
     `context_parallel` admits Ulysses sequence parallelism;
     one without it steps to the next kernel under a group.
     """
@@ -88,8 +87,7 @@ class ProducerSite:
 
 def producer_sites(root: Any) -> tuple[ProducerSite, ...]:
     """The attention modules under `root` a producer serves now (their site's backend is the
-    producer's), in module order. A package that carries a producer's per-site state across a
-    `denoise_loop` declares it from these before the loop."""
+    producer's), in module order: where a package finds a producer's per-site state."""
     sites = []
     for module in root.modules():
         processor = getattr(module, "processor", None)
@@ -125,14 +123,6 @@ def _request(held: dict[str, Any] | None = None) -> Iterator[dict[str, Any]]:
         _REQUEST.reset(token)
         if held is None:
             _close(store)
-
-
-def end_loop() -> None:
-    """A `denoise_loop` returned: each of this request's producer states ends its loop."""
-    for state in list((_REQUEST.get() or {}).values()):
-        end = getattr(state, "end_loop", None)
-        if callable(end):
-            end()
 
 
 def _close(store: dict[str, Any]) -> None:

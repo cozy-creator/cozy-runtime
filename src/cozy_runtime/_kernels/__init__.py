@@ -1,8 +1,7 @@
 """Cozy's prebuilt CUDA kernels (`kernels/`), carried by cozy-runtime's native wheels: one per OS
 and CPU, every GPU target inside. The pure wheel carries none (`ABSENT` says why).
 
-Kernel modules use nanobind; the execution owner uses Rust/PyO3. Both use the static CUDA runtime
-and Python's stable ABI. A module
+Kernel modules use nanobind, the static CUDA runtime and Python's stable ABI. A module
 carries a cubin for each target in `ARCHS` and PTX that the driver compiles for a card none names.
 Runtime verifies every kernel on the device before it serves (`internal.prebuilt`); package
 authors reach `_norm` through `author.kernels`.
@@ -58,10 +57,6 @@ FAMILIES = ("mma.sync", "wgmma", "tcgen05")
 
 #: Each module's cubin targets and PTX, as the CUDA toolkit names them (`cuobjdump`).
 ARCHS: dict[str, dict[str, tuple[str, ...]]] = {
-    "_execution": {
-        "cubin": ("sm_80", "sm_86", "sm_89", "sm_90", "sm_100", "sm_103", "sm_120", "sm_121"),
-        "ptx": (),
-    },
     "_gemm": {
         "cubin": (
             "sm_80",

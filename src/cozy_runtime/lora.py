@@ -11,7 +11,6 @@ and the hook adds nothing then."""
 from __future__ import annotations
 
 from collections.abc import Callable
-from contextvars import ContextVar
 from typing import Any, Protocol
 
 import torch
@@ -64,13 +63,6 @@ class Factors(Protocol):
         ...
 
 
-#: While a `denoise_loop` records: each linear an overlay was armed on (`internal.loop`).
-ARMED: ContextVar[list[str] | None] = ContextVar("cozy_lora_armed", default=None)
-#: While a `denoise_loop` runs: the overlays armed before it began, by identity. A loop's program is
-#: recorded and kept for those, so an overlay its step arms is refused, eager or not.
-LOOP: ContextVar[frozenset[int] | None] = ContextVar("cozy_lora_loop", default=None)
-
-
 class Hook:
     """A linear's permanent forward hook for an overlay: `armed()` is this linear's factors while
     an overlay is armed, else None (a base forward)."""
@@ -82,14 +74,8 @@ class Hook:
 
     def __call__(self, module: Any, args: tuple[Any, ...], out: torch.Tensor) -> None:
         factors = self.armed()
-        if factors is not None and (before := LOOP.get()) is not None and id(factors) not in before:
-            raise ValueError(
-                "an overlay was armed inside a denoise_loop step: arm overlays before denoise_loop"
-            )
         if self._cozy_baked or factors is None:
             return  # Bound weights already contain the delta; the fill owns factor reads.
-        if (armed := ARMED.get()) is not None:
-            armed.append(type(module).__name__)
         factors(args[0], out)
 
     def lora_factors(self) -> tuple[object, torch.Tensor, torch.Tensor, float] | None:

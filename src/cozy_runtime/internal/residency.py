@@ -99,10 +99,6 @@ _DTYPES = {
     )
 }
 _REQUEST: ContextVar[Request | None] = ContextVar("cozy_residency_request", default=None)
-# During authored stage preparation, undeclared model reads must not page in sibling blocks.
-#: A native loop recording its pass in stages (`internal.loop`): block hooks mark each cut.
-#: A native loop's eager call (`internal.loop`): the models and blocks it ran.
-ENTERED: ContextVar[set[Any] | None] = ContextVar("cozy_loop_entered", default=None)
 #: TensorFS tallies working memory by the pass and site it was born in (`vt.pass_mark`); an older
 #: one has no tally, and nothing is marked.
 _ESCAPES = hasattr(vt, "pass_mark")
@@ -1639,18 +1635,16 @@ class Memory:
         self.regions.add(region)
         return region
 
-    def retained(self, nbytes: int) -> Retained | None:
+    def retained(self, nbytes: int) -> Retained:
         """Where a call keeps `nbytes` of cross-step state, decided once before its loop: varena
         regions. They stay on the card where half the room nothing live holds takes them, with
         none of it spilled; else each is spilled to a pinned host page behind compute and evicted
-        like a weight. None: the card and host RAM cannot hold them, and the call recomputes that
-        state instead. A TensorFS without retained regions holds the tensors as they are."""
+        like a weight, and varena keeps trying to fit them as it does any memory. A TensorFS
+        without retained regions holds the tensors as they are."""
         if self.native is None or not (hasattr(varena, "Retained") and hasattr(vt, "room")):
             return Retained(None)
         room = vt.room(self.device.index or 0)
         card = room["capacity"] - room["working_live"] - room["pinned"]
-        if nbytes > self.pages.retained_room() + card:
-            return None
         return Retained(self, spill=2 * nbytes > card - room["weights_resident"])
 
     def _empty(self, nbytes: int, reclaim: bool) -> Tensor:
@@ -2104,8 +2098,6 @@ class Memory:
             model._release()
 
     def _open(self, model: Model, key: str, *, executing: bool = False) -> None:
-        if executing and (seen := ENTERED.get()) is not None:
-            seen.add(model)
         model._claim()
         depth = getattr(model.local, "depth", 0)
         model.local.depth = depth + 1
@@ -2361,7 +2353,7 @@ class _Kept:
 
 
 class _Retaining:
-    def retained(self, nbytes: int) -> Retained | None:
+    def retained(self, nbytes: int) -> Retained:
         request = _REQUEST.get()
         if request is None:
             return Retained(None)
@@ -3029,8 +3021,6 @@ def _hooks(model: Model) -> None:
 
         def entered(*_: object, b: _Block = block) -> None:
             pacing.tick()
-            if (seen := ENTERED.get()) is not None:
-                seen.add(b)
             model._claim()
             try:
                 memory._enter(b)

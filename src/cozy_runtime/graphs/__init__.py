@@ -33,7 +33,9 @@ from typing import Any, NamedTuple, cast
 import tensorfs.varena.torch as vt
 from tensorfs import varena
 
+from cozy_runtime import stepcache
 from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._attention_scope import active_attention_layout
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, OutputError, fault, is_capacity
@@ -472,8 +474,6 @@ class _Recorder:
         #: ms a call
         self.bound: dict[tuple[object, ...], tuple[float, float | None, float | None]] = {}
         self.binding: Any = None
-        #: Native prepared definitions owned by this same component retirement boundary.
-        self.prepared: weakref.WeakSet[Any] = weakref.WeakSet()
         #: its graphs' capture pool (`domain.Pool`), made at its first capture
         self.pool: domain.Pool | None = None
         self.replays = 0
@@ -792,14 +792,7 @@ def retire(torch: Any, root: Any) -> None:
     """Drain `root`'s graphs and drop them, keeping its region: its calls run as written until
     an idle period records them again (an idle offload, a changed fill)."""
     recorder = _RECORDERS.get(root)
-    if recorder is None:
-        return
-    with recorder.lock:
-        prepared = tuple(recorder.prepared)
-    # Native close can join CUDA and invoke Python owner destructors; never hold this lock.
-    for definition in prepared:
-        definition._retire_if_idle()
-    if not recorder.recordings and recorder.pool is None:
+    if recorder is None or (not recorder.recordings and recorder.pool is None):
         return
     scope = recorder.domain.using() if recorder.domain is not None else nullcontext()
     with scope, recorder.lock:
@@ -809,35 +802,11 @@ def retire(torch: Any, root: Any) -> None:
 
 def retire_stale(torch: Any, *roots: Any) -> None:
     """Before a scope binds `roots`' weights: graphs recorded against another fill (a LoRA mode
-    or bake recipe this attempt changed) go first, so nothing replays over a refill. A
-    definition several roots own is checked once."""
-    recorders = [(root, r) for root in roots if (r := _RECORDERS.get(root)) is not None]
-    prepared: dict[int, Any] = {}
-    for _, recorder in recorders:
-        with recorder.lock:
-            prepared.update((id(d), d) for d in recorder.prepared)
-    for definition in prepared.values():
-        if not definition.valid():
-            definition._retire_if_idle()
-    for root, recorder in recorders:
-        if recorder.binding is not None and not recorder.binding.valid():
+    or bake recipe this attempt changed) go first, so nothing replays over a refill."""
+    for root in roots:
+        recorder = _RECORDERS.get(root)
+        if recorder is not None and recorder.binding is not None and not recorder.binding.valid():
             retire(torch, root)
-
-
-def own_prepared(root: Any, definition: Any) -> None:
-    """Attach a native definition to the existing component owner, without graph interception."""
-    recorder = _RECORDERS.get(root)
-    if recorder is None:
-        recorder = _RECORDERS[root] = _Recorder(())
-    with recorder.lock:
-        recorder.prepared.add(definition)
-
-
-def forget_prepared(root: Any, definition: Any) -> None:
-    recorder = _RECORDERS.get(root)
-    if recorder is not None:
-        with recorder.lock:
-            recorder.prepared.discard(definition)
 
 
 def release(torch: Any, root: Any) -> None:
@@ -975,6 +944,7 @@ def _dispatch(torch: Any, module: Any, call: Callable[..., Any], args: Any, kwar
     if (
         recorder is None  # a copy of a root: no region of its own
         or BYPASS.get()
+        or stepcache._RUN.get() is not None  # its verdicts are host reads in the forward
         or _WARMING.get()
         or placed_device().type != "cuda"
         or torch.cuda.is_current_stream_capturing()
@@ -1046,6 +1016,9 @@ def _region_call(
         if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
+        # The layout routes its attention calls; a graph keys on none of it.
+        else "under a model attention layout"
+        if active_attention_layout() is not None
         else _unplain(torch, leaves)
     )
     if why:
@@ -1404,18 +1377,15 @@ def _capture_state(torch: Any, module: Any, stream: Any) -> Iterator[_State]:
             _SETTLING.reset(settling)
 
 
-def _hooked(module: Any, overlays: bool = False) -> str:
+def _hooked(module: Any) -> str:
     """Why a component's forward is no graph: a package hook on one of its modules runs Python
     at every call, which a replay would skip (Runtime's binding and scope hooks are served). A
     LoRA overlay hook (`lora.Hook`) asks the package at every call which overlay is armed, and
-    the bound pages follow that answer: a replay would keep the captured one. With `overlays`, a
-    recording that finds none armed (`lora.ARMED`) records the base forward, so it is served."""
+    the bound pages follow that answer: a replay would keep the captured one."""
     for sub in module.modules():
         for hooks in (sub._forward_pre_hooks, sub._forward_hooks):
             for hook in hooks.values():
                 if callable(getattr(hook, "lora_factors", None)):
-                    if overlays:
-                        continue
                     return f"a LoRA overlay hook on {type(sub).__name__}"
                 if not getattr(hook, "__module__", "").startswith(("tensorfs.", "cozy_runtime.")):
                     return f"a package forward hook on {type(sub).__name__}"

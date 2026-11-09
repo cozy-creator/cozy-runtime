@@ -79,9 +79,9 @@ class Processor:
             return self.original(attn, *args, **kwargs)
         layout, state = _ACTIVE_LAYOUT.get(), self.producer.request_state()
         if layout is None or state is None:
-            raise ValueError(
-                f"{self.producer.name} requires the model's attention layout and a request scope"
-            )
+            # Outside an `attention_scope` (or a request) the model's default layout holds: dense.
+            attention_sol._count("dense_default")
+            return self.original(attn, *args, **kwargs)
         if attention_sol.outlier_keys(getattr(attn, "norm_k", None)):
             # Its dense rows are exact on Runtime's route: the producer leaves it, as an exact path.
             layout = replace(layout, exact_paths=(*layout.exact_paths, self.path))

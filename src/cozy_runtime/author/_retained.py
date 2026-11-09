@@ -6,6 +6,7 @@ Runtime manages like weights: resident while the card has room, else evicted and
 pinned host copy taken behind compute, and filled ahead of its next use. Its bytes count in the
 room every other decision sees. The state dies with the loop that made it: the store is closed
 (or left as a `with`) when that loop returns, and its memory is free for what comes after.
+Outside an executor (plain Python) the store holds the tensors as they are.
 """
 
 from __future__ import annotations
@@ -36,7 +37,39 @@ class Store(Protocol):
 
 
 class Memory(Protocol):
-    def retained(self, nbytes: int) -> Store | None: ...
+    def retained(self, nbytes: int) -> Store: ...
+
+
+class _Held:
+    def __init__(self, tensors: tuple[Any, ...]) -> None:
+        self.tensors: tuple[Any, ...] | None = tensors
+
+    def get(self) -> tuple[Any, ...]:
+        if self.tensors is None:
+            raise RuntimeError("retained state read after its loop ended")
+        return self.tensors
+
+
+class Plain:
+    """A store of the tensors as they are: where no Runtime memory runs."""
+
+    def __init__(self) -> None:
+        self.states: list[_Held] = []
+
+    def put(self, *tensors: Any) -> State:
+        self.states.append(_Held(tensors))
+        return self.states[-1]
+
+    def close(self) -> None:
+        for state in self.states:
+            state.tensors = None
+        self.states.clear()
+
+    def __enter__(self) -> Plain:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 _RUNTIME: Memory | None = None
@@ -47,11 +80,8 @@ def install(runtime: Memory | None) -> None:
     _RUNTIME = runtime
 
 
-def retained(nbytes: int) -> Store | None:
-    """Where a loop keeps `nbytes` of cross-step state, decided once, before it: None when
-    neither the card nor host RAM has room for them, and the loop recomputes that state instead
-    of keeping it (the general fallback, never a model's special case). Close the store when the
-    loop returns."""
-    if _RUNTIME is None:
-        raise RuntimeError("retained state is held inside a Runtime executor")
-    return _RUNTIME.retained(nbytes)
+def retained(nbytes: int) -> Store:
+    """Where a loop keeps `nbytes` of cross-step state, decided once, before it. Always a store:
+    the Runtime's memory keeps trying to hold it (on the card, else spilled to host). Close the
+    store when the loop returns."""
+    return Plain() if _RUNTIME is None else _RUNTIME.retained(nbytes)

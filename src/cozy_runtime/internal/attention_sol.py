@@ -95,8 +95,17 @@ _KERNEL_ROWS: ContextVar[list[dict[str, Scalar]] | None] = ContextVar(
 )
 #: This request's word on each object it asked for, by key digest: building, served or failed.
 _SAID: ContextVar[dict[str, str] | None] = ContextVar("cozy_sol_said", default=None)
-#: What a step serves in place of a sparse one, by count.
-COUNTS = ("sparse", "dense_step", "dense_building", "dense_path", "dense_prefix", "prefix_heavy")
+#: What a step serves in place of a sparse one, by count; `dense_default` a call outside any
+#: `attention_scope`.
+COUNTS = (
+    "sparse",
+    "dense_step",
+    "dense_building",
+    "dense_path",
+    "dense_prefix",
+    "prefix_heavy",
+    "dense_default",
+)
 
 
 @contextmanager
@@ -780,10 +789,13 @@ def _attention(
     if torch.compiler.is_compiling():
         raise ValueError("Sol's model layout and site scope require eager execution")
     layout, site = _ACTIVE_LAYOUT.get(), _SITE.get()
-    if layout is None or site is None:
-        raise ValueError(
-            "Sol requires model-owned attention layout and a registered attention site"
-        )
+    if layout is None:
+        # Outside an `attention_scope` the model's default layout holds: every row dense.
+        output = dense(query=query, key=key, value=value, scale=scale)
+        _count("dense_default")
+        return output
+    if site is None:
+        raise ValueError("Sol requires a registered attention site")
     if dropout_p != 0:
         raise ValueError("Sol is an inference kernel and does not support dropout")
     tensors = (query, key, value)

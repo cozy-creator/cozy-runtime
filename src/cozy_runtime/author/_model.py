@@ -775,7 +775,7 @@ def _sync_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> R:
         with self._cozy_scope(fn.__name__, components):
-            steps = _steps()
+            steps = _entered(fn.__name__)
             result = fn(self, *args, **kwargs)
             _refuse_lazy(fn.__name__, result)
             _refuse_nan(fn.__name__, result, steps)
@@ -792,7 +792,7 @@ def _async_wrapper[M: _ScopedModel, **P, R](
     @functools.wraps(fn)
     async def wrapper(self: M, /, *args: P.args, **kwargs: P.kwargs) -> object:
         with self._cozy_scope(fn.__name__, components):
-            steps = _steps()
+            steps = _entered(fn.__name__)
             result = await fn(self, *args, **kwargs)  # type: ignore[misc]
             _refuse_lazy(fn.__name__, result)
             _refuse_nan(fn.__name__, result, steps)
@@ -868,6 +868,16 @@ def _refuse_lazy(method: str, result: object) -> None:
 def _steps() -> int:
     context = CURRENT.get()
     return 0 if context is None else context._steps
+
+
+def _entered(method: str) -> int:
+    """A model method call begins: the run shows it as activity (`Context._called`)."""
+    context = CURRENT.get()
+    if context is None:
+        return 0
+    if context._called is not None:
+        context._called(method)
+    return context._steps
 
 
 def _refuse_nan(method: str, result: object, before: int) -> None:

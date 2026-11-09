@@ -24,15 +24,12 @@ import asyncio
 import functools
 import hashlib
 import sys
-import threading
 from collections.abc import Callable, Collection, Mapping, Sequence
-from concurrent.futures import Future
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from pathlib import Path
-from types import TracebackType
-from typing import TYPE_CHECKING, Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, get_args
 
 import msgspec
 
@@ -54,13 +51,10 @@ from cozy_runtime.author._errors import (
     AuthorError,
     CapabilityError,
     ConformanceError,
-    Fault,
     InvalidRequest,
     Outcome,
     OutputError,
-    RuntimeFailure,
     classify,
-    fault,
     unwind,
 )
 from cozy_runtime.author._executor_requests import Publish, Published
@@ -79,7 +73,6 @@ from cozy_runtime.author._markers import FileBound, ImagePreparation
 from cozy_runtime.author._media import KIND_MEDIA, admits, slot_kind
 from cozy_runtime.author._model import Model
 from cozy_runtime.author._observations import Observation, Track
-from cozy_runtime.author._prepared import Execution, PreparedWork
 from cozy_runtime.author._recipes import DeclaredRecipe
 from cozy_runtime.author._services import (
     MAX_OUTPUT_BYTES,
@@ -96,164 +89,6 @@ from cozy_runtime.author._weights import ReadBytes, ReadValues, Weights
 
 if TYPE_CHECKING:
     from cozy_runtime.weights_store import Checkpoint, Derivation, Output
-
-
-class _PreparedScope:
-    """Own every accepted submission in request order, independently of its implementation.
-
-    Ordinary staged calls wait for their predecessor before entering the next provider.
-    PreparedSequence instead submits one native plan; its Rust worker advances those stages.
-    No admission lock spans provider callbacks, result waits or cancellation.
-    """
-
-    def __init__(self, context: Context) -> None:
-        self.context = context
-        self.lock = threading.Lock()
-        self.accepting = True
-        self.pending: list[Future[Execution]] = []
-        self.submitting: set[int] = set()
-        self.original: BaseException | None = None
-        self.failure: BaseException | None = None
-
-    def submit(self, work: PreparedWork) -> Execution:
-        pending: Future[Execution] = Future()
-        with self.lock:
-            if not self.accepting:
-                raise CapabilityError(
-                    "this request no longer accepts prepared work", code="prepared_request_closed"
-                )
-            thread = threading.get_ident()
-            if thread in self.submitting:
-                raise CapabilityError(
-                    "a prepared provider cannot recursively submit another stage",
-                    code="prepared_request_recursive",
-                )
-            previous = self.pending[-1] if self.pending else None
-            self.pending.append(pending)
-            self.submitting.add(thread)
-        execution: Execution | None = None
-        try:
-            if previous is not None:
-                predecessor = previous.result()
-                predecessor.wait()  # a prior failure prevents every following provider call
-                if predecessor.poll().canceled:
-                    raise RuntimeFailure(
-                        "the preceding prepared stage was canceled", code="prepared_stage_canceled"
-                    )
-            self.context.raise_if_cancelled()
-            with self.lock:
-                if not self.accepting:
-                    raise CapabilityError(
-                        "this request no longer accepts prepared work",
-                        code="prepared_request_closed",
-                    )
-            execution = work.submit(self.context)
-            pending.set_result(execution)
-        except BaseException as error:
-            if not pending.done():
-                if execution is None:
-                    pending.set_exception(error)
-                else:
-                    # Publication itself was interrupted: closure still owns the returned work.
-                    pending.set_result(execution)
-            raise
-        finally:
-            with self.lock:
-                self.submitting.discard(thread)
-        return execution
-
-    def stop(self) -> tuple[Future[Execution], ...]:
-        with self.lock:
-            self.accepting = False
-            return tuple(self.pending)
-
-    def join(self) -> None:
-        for pending in self.stop():
-            pending.result().wait()
-            self.context.raise_if_cancelled()
-
-    @staticmethod
-    def _fatal(error: BaseException) -> bool:
-        return fault(error) in (Fault.STICKY, Fault.DEVICE) or (
-            isinstance(error, RuntimeFailure) and error.code == "device_fault"
-        )
-
-    def settle(self) -> None:
-        for pending in self.stop():
-            error = self._settle_one(pending)
-            if error is not None and (self.failure is None or self._fatal(error)):
-                self.failure = error
-        with self.lock:
-            self.pending.clear()
-
-    def _settle_one(self, pending: Future[Execution]) -> BaseException | None:
-        execution: Execution | None = None
-        try:
-            execution = pending.result()
-            if not execution.poll().done:
-                cancel_error: BaseException | None = None
-                try:
-                    execution.cancel()
-                except BaseException as error:
-                    cancel_error = error
-                try:
-                    execution.wait()  # a failed cancel does not excuse an unproven completion
-                except BaseException as waiting_error:
-                    if cancel_error is not None and fault(cancel_error) in (
-                        Fault.STICKY,
-                        Fault.DEVICE,
-                    ):
-                        raise cancel_error from waiting_error
-                    raise
-                if cancel_error is not None:
-                    raise cancel_error
-        except BaseException as error:
-            complete = False
-            if execution is not None and fault(error) not in (Fault.STICKY, Fault.DEVICE):
-                with suppress(BaseException):
-                    # A terminal failed operation may keep raising from poll()/wait().
-                    # Ask its owner for the independent checked-completion certificate.
-                    proven = getattr(execution, "completion_proven", None)
-                    if callable(proven):
-                        complete = proven() is True
-                    if not complete:
-                        complete = execution.poll().done
-            if (
-                execution is not None
-                and not complete
-                and fault(error) not in (Fault.STICKY, Fault.DEVICE)
-            ):
-                failure = RuntimeFailure(
-                    "prepared-work completion is unproven; retire executor", code="device_fault"
-                )
-                failure.__cause__ = error
-                return failure
-            return error
-        return None
-
-    def __exit__(
-        self,
-        kind: type[BaseException] | None,
-        value: BaseException | None,
-        traceback: TracebackType | None,
-    ) -> Literal[False]:
-        errors = (self.original, self.failure, value)
-        fatal = next(
-            (
-                error
-                for error in errors
-                if error is not None
-                and (
-                    fault(error) in (Fault.STICKY, Fault.DEVICE)
-                    or (isinstance(error, RuntimeFailure) and error.code == "device_fault")
-                )
-            ),
-            None,
-        )
-        chosen = fatal or self.original or value or self.failure
-        if chosen is not None and chosen is not value:
-            raise chosen
-        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -471,10 +306,8 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     ctx = Context(inv.request_id, inv.deadline, inv.device, inv.cancel)
     ctx._recipes = inv.recipes
     ctx._plan = inv.plan
+    ctx._progress, ctx._called = Telemetry(record, ctx).loop_progress()
     handles = ExitStack()
-    prepared_scope = _PreparedScope(ctx)
-    handles.push(prepared_scope.__exit__)  # failure projection runs after resource cleanup
-    ctx._submit_prepared = prepared_scope.submit
     _bind_tensorfs(ctx, record, inv, surface, handles)
     kwargs = _inject(surface, attempt, ctx, overlay, prepared.facts, inv)
     for model in inv.models.values():
@@ -488,15 +321,9 @@ def invoke(prepared: PreparedRequest, inv: Invocation, record: Attempt) -> Invoc
     token, context = _current.set(inv.calls), CURRENT.set(ctx)
     try:
         result = _call(surface, kwargs)
-        prepared_scope.join()  # every submitted execution settles before success serialization
         if inv.calls is not None:
             inv.calls.finish()
-    except BaseException as error:
-        prepared_scope.original = error
-        raise
     finally:
-        prepared_scope.stop()
-        handles.callback(prepared_scope.settle)  # before source/checkpoint handles can close
         try:
             if inv.calls is not None:
                 inv.calls.close()

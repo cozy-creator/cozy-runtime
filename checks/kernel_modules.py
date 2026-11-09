@@ -6,10 +6,9 @@ PTX (cuobjdump). Each needs only the OS's C runtime (readelf, dumpbin): no torch
 no version-specific libpython (Windows' stable-ABI `python3.dll` is the one Python it may name).
 Each loads on every Python given, and a call on a machine without a GPU returns CUDA's error
 rather than crashing. The driver floor equals the `platform` crate's (`--platform-floor`, the
-Rust source TensorD checks at startup). Rust execution may use the OS libgcc unwinder.
-Each exports `PyInit_*` alone (nm, dumpbin): an exported libstdc++
-symbol binds process-wide and crashed torch imported after it. With `--torch-python`, each module
-loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
+Rust source TensorD checks at startup). Each exports `PyInit_*` alone (nm, dumpbin): an exported
+libstdc++ symbol binds process-wide and crashed torch imported after it. With `--torch-python`,
+each module loads before torch in a fresh interpreter. Any failure is named, and the run exits 1.
 """
 
 from __future__ import annotations

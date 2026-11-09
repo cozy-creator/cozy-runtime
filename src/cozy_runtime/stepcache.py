@@ -3,14 +3,17 @@ little reuses the stack's cached residual instead of running its blocks.
 
 It is approximate by construction, so a package turns it on per call, for a preset that trades
 quality for speed, never by default. Declare the stack at module scope, install it in the
-execution plan, and name the policy where the denoise loop runs:
+execution plan, and run the denoise loop under the policy:
 
     STACK = stepcache.Stack(MyTransformer, blocks="transformer_blocks", carried=(0,))
 
     def execution_plan(self, plan):
         return stepcache.install(plan, STACK, self.transformer)
 
-    denoise_loop(step, steps, state=(latents,), cache=stepcache.FirstBlockCache(0.08))
+    with stepcache.running(stepcache.FirstBlockCache(0.08), n, device) as run:
+        for i in range(n):
+            run.step(i)
+            ...
 
 `carried` names the block arguments its output returns, in order: a positional index or a
 keyword (`(0,)` for a single-stream block, `("encoder_hidden_states", "hidden_states")` for a
@@ -18,9 +21,9 @@ dual-stream one). The stack runs as one `for` over its list, in the transformer'
 the step; a skipped forward's iteration ends after block 0, so not inside `zip(..., strict=True)`.
 Embeddings and the final layer run every forward; a skipped forward runs none of the stack's
 blocks after its first, so their weights, AdaLN and carried state stay as the last computed
-forward left them. State starts with every call. Each forward's verdict comes from fixed-order
-reductions on the device, so the same inputs and policy give the same verdicts and bytes. The
-loop's record carries `cache` (its forwards, computed and skipped).
+forward left them. State starts with every `running`. Each forward's verdict comes from
+fixed-order reductions on the device, so the same inputs and policy give the same verdicts and
+bytes. `run.document()` counts its forwards, computed and skipped.
 
 - `FirstBlockCache(t)` (NVIDIA sol-engine `first_block_cache.py`): block 0 runs, `r0 = h0 - x`;
   the rest run when there is no reference yet or `Σ|r0 - r0_ref| > t·Σ|r0_ref|`, and then
@@ -31,11 +34,9 @@ loop's record carries `cache` (its forwards, computed and skipped).
   computes once `acc ≥ t`. A computed forward sets `k = mean|y - Y_c| / mean|x - X_c|`,
   `X_c = x`, `Y_c = y`, `R = y - x` and clears `acc`; a skip is `y = x + R`.
 
-Its state lives in device buffers updated in place. An eager step reads each forward's verdict on
-the host once; a recorded step keeps it on the device: the step's graph holds both branches, the
-rest of the stack and the cached residual, and the verdict picks one (`internal.loop`'s cut). Both
-run the same operations, so they give the same verdicts and bytes. Each step's `plans` line names
-its verdict when the step ran eagerly; the loop's `cache` counts every step's, read after the loop.
+Its state lives in device buffers updated in place; each forward reads its verdict on the host
+once, so component calls under `running` run eagerly, never from a CUDA graph. Each step's `plans`
+line names its verdict.
 """
 
 from __future__ import annotations
@@ -189,10 +190,10 @@ def _listed(base: type) -> type:
 @dataclass(slots=True)
 class _State:
     """One slot's references (a stack forward's place within its step), in device buffers updated
-    in place, so a recorded step's graph reads what the last forward left. They begin unset, and
+    in place. They begin unset, and
     count only once its flags say so: `has` FirstBlockCache's has-reference, EasyCache's
     has-computed and has-rate; `hits` EasyCache's skips in a row. The flags are a row of the
-    call's (`_Run.flags`), zeroed with every call."""
+    run's (`Run.flags`), zeroed with every `running`."""
 
     has: Any
     hits: Any
@@ -225,33 +226,29 @@ def _like(tensors: Sequence[Any]) -> tuple[Any, ...]:
     return tuple(torch.empty_like(t) for t in tensors)
 
 
-#: The forwards a step's stacks hold state for (`_Run.flags`): every slot's row is the call's.
+#: The forwards a step's stacks hold state for (`Run.flags`): every slot's row is the run's.
 SLOTS = 64
 
 
 @dataclass(slots=True)
-class _Run:
-    """One loop call's cache: its policy, its slots' state and its verdicts. `computes` and
-    `forwards` count each step's computed and all forwards on the device, read once after the
-    loop; `flags` holds each slot's. While a step's graph records, `cut` splits it at each
-    forward's verdict (`_Graph.cut`): the rest of the stack in one branch, the cached residual in
-    the other."""
+class Run:
+    """One loop's cache (`running`): its policy, its slots' state (`flags`) and its verdicts."""
 
     policy: Policy
-    steps: range
-    computes: Any
-    forwards: Any
+    steps: int
     flags: Any
     index: Any = None
-    step: int | None = None
-    cut: Any = None
+    current: int | None = None
     slot: int = 0
     states: dict[tuple[int, int], _State] = field(default_factory=dict)
     verdicts: list[tuple[int, bool]] = field(default_factory=list)
 
-    def begin(self, index: Any, step: int | None = None, cut: Any = None) -> None:
-        """A step: its device index, its host index when it runs eagerly, the recording's cut."""
-        self.index, self.step, self.cut, self.slot = index, step, cut, 0
+    def step(self, i: int) -> None:
+        """Step `i` (0-based, of `steps`) begins: call before its model calls."""
+        if not 0 <= i < self.steps:
+            raise ValueError(f"step {i} is outside the cached loop's {self.steps} steps")
+        self.current, self.slot = i, 0
+        self.index = torch.full((1,), i, dtype=torch.int64, device=self.flags.device)
 
     def forward(self, blocks: Any, installed: _Installed) -> Iterator[Any]:
         """An iteration of the stack. Its first item stands for block 0 (attribute reads pass
@@ -277,47 +274,32 @@ class _Run:
             self.states[key] = _State(row[:3], row[3:])
         return self.states[key]
 
-    def counted(self) -> tuple[Any, Any, Any]:
-        """What a recorded program's graphs write and a later call zeroes (`adopt`)."""
-        return self.computes, self.forwards, self.flags
-
-    def adopt(self, counted: tuple[Any, Any, Any]) -> None:
-        """A kept program's counters and flags, which its graphs write: this call's."""
-        self.computes, self.forwards, self.flags = counted
-        for tensor in counted:
-            tensor.zero_()
-
     def verdict(self) -> str:
-        if self.step is None:
+        if self.current is None:
             return ""
-        mine = [computed for step, computed in self.verdicts if step == self.step]
+        mine = [computed for step, computed in self.verdicts if step == self.current]
         return "" if not mine else "cache:compute" if any(mine) else "cache:skip"
 
     def document(self) -> dict[str, object]:
-        computes, forwards = self.computes.tolist(), self.forwards.tolist()
+        """The policy, and its forwards: computed and skipped, by step."""
         return {
             **self.policy.document(),
-            "forwards": sum(forwards),
-            "computed": sum(computes),
-            "skipped_steps": [
-                step
-                for step, (done, total) in enumerate(zip(computes, forwards, strict=True))
-                for _ in range(total - done)
-            ],
+            "forwards": len(self.verdicts),
+            "computed": sum(computed for _, computed in self.verdicts),
+            "skipped_steps": [step for step, computed in self.verdicts if not computed],
         }
 
 
 class _Gate:
     """The stack's first call each forward: the signal, the verdict, block 0 when it runs."""
 
-    def __init__(self, run: _Run, blocks: Any, installed: _Installed, first: Any) -> None:
+    def __init__(self, run: Run, blocks: Any, installed: _Installed, first: Any) -> None:
         self.run, self.blocks, self.installed, self.first = run, blocks, installed, first
         self.state: _State | None = None
         self.computed = True
         self.inputs: tuple[Any, ...] = ()
         self.head: tuple[Any, ...] = ()
         self.r0: tuple[Any, ...] = ()
-        self.merged: tuple[Any, ...] = ()
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):
@@ -326,9 +308,10 @@ class _Gate:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         run, installed = self.run, self.installed
+        if run.current is None:
+            raise ValueError("a step-cached loop calls `run.step(i)` before each step's forwards")
         self.inputs = xs = installed.inputs(args, kwargs)
         self.state = state = run.claim(self.blocks)
-        relative = run.index - run.steps.start
         out = None
         if isinstance(run.policy, FirstBlockCache):
             out = self.first(*args, **kwargs)
@@ -340,18 +323,12 @@ class _Gate:
                 _diff(self.r0, state.ref) > run.policy.threshold * _sum(state.ref).clamp_min(1e-8)
             )
         else:
-            computed = self._easy(run.policy, state, xs, relative)
-        run.computes.index_add_(0, relative, computed.int().reshape(1))
-        run.forwards.index_add_(0, relative, torch.ones_like(run.forwards[:1]))
-        if run.cut is not None:  # recording: both branches, the device decides
-            self.merged = _like(self.head or xs)
-            run.cut(computed.int())
-        else:
-            self.computed = bool(computed.item())
-            run.verdicts.append((run.step, self.computed))
-            if not self.computed:
-                skipped = self.skip()
-                return installed.pack(out if out is not None else state.like, skipped)
+            computed = self._easy(run.policy, state, xs, run.index)
+        self.computed = bool(computed.item())
+        run.verdicts.append((run.current, self.computed))
+        if not self.computed:
+            skipped = self.skip()
+            return installed.pack(out if out is not None else state.like, skipped)
         return out if out is not None else self.first(*args, **kwargs)
 
     def _easy(self, policy: EasyCache, state: _State, xs: tuple[Any, ...], relative: Any) -> Any:
@@ -360,7 +337,7 @@ class _Gate:
                 _like(xs), _like(xs), _like(xs), _like(xs)
             )
             state.rate, state.acc = (torch.empty(1, device=xs[0].device) for _ in range(2))
-        last = len(self.run.steps) - 1
+        last = self.run.steps - 1
         forced = (
             (relative < policy.retain)
             | (relative >= last - policy.cooldown)
@@ -386,11 +363,10 @@ class _Gate:
 
 
 class _Last:
-    """The stack's last block on a computed forward: its output, then the references. Recording,
-    the skipped branch follows: the stack's output is `merged` either way."""
+    """The stack's last block on a computed forward: its output, then the references."""
 
     def __init__(
-        self, run: _Run, state: _State, installed: _Installed, last: Any, gate: _Gate
+        self, run: Run, state: _State, installed: _Installed, last: Any, gate: _Gate
     ) -> None:
         self.run, self.state, self.installed, self.last, self.gate = (
             run,
@@ -430,25 +406,19 @@ class _Last:
             state.hits.zero_()
             state.has[1].fill_(1)
             state.like = out
-        if self.run.cut is None:
-            return out
-        for merged, y in zip(gate.merged, ys, strict=True):
-            merged.copy_(y)
-        self.run.cut(None)  # the skipped branch
-        for merged, value in zip(gate.merged, gate.skip(), strict=True):
-            merged.copy_(value)
-        self.run.cut(None)  # after the branches
-        return self.installed.pack(out, gate.merged)
+        return out
 
 
-_RUN: ContextVar[_Run | None] = ContextVar("cozy_stepcache", default=None)
+_RUN: ContextVar[Run | None] = ContextVar("cozy_stepcache", default=None)
 
 
 @contextmanager
-def running(policy: Policy, steps: range, device: Any) -> Iterator[_Run]:
-    """A loop call under `policy` (`author.denoise_loop(cache=…)`): its stacks' forwards cache."""
-    counted = (torch.zeros(len(steps), dtype=torch.int32, device=device) for _ in range(2))
-    run = _Run(policy, steps, *counted, torch.zeros(SLOTS, 4, dtype=torch.int32, device=device))
+def running(policy: Policy, steps: int, device: torch.device | str) -> Iterator[Run]:
+    """A loop of `steps` steps under `policy`: its installed stacks' forwards cache. Call
+    `run.step(i)` as each step begins. Component calls inside run eagerly (no CUDA graph)."""
+    if steps < 1:
+        raise ValueError("a step-cached loop has at least one step")
+    run = Run(policy, steps, torch.zeros(SLOTS, 4, dtype=torch.int32, device=device))
     token = _RUN.set(run)
     try:
         yield run

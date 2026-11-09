@@ -846,8 +846,6 @@ class Executor:
         self.execution: ModuleType | None = None
         #: HOST ONLY: each attempt's open request, by request id (`ctx.plan` replaces its plan)
         self.requests: dict[str, MemoryRequest] = {}
-        #: each request's `author.denoise_loop` rows (`internal.loop.ROWS`), once memory opens
-        self.loops: dict[str, list[dict[str, object]]] = {}
         #: HOST ONLY: TensorD's lease namespace from `Start` (None: no lease, its rows alone);
         #: rank 0 forwards it in its followers' Start
         #: The machine's sealed TensorFS cache directory.
@@ -1115,7 +1113,7 @@ class Executor:
 
     def _open_memory(self, torch: Any) -> None:
         """This executor's local residency and its pure-site execution helpers."""
-        from cozy_runtime.internal import execution, loop
+        from cozy_runtime.internal import execution
         from cozy_runtime.internal.residency import Memory
 
         host = self.host
@@ -1129,9 +1127,7 @@ class Executor:
         PLANS[:] = [host.serving]
         _split.install(execution)
         attention_ulysses.install(execution)
-        loop.install()
         host.execution = execution
-        host.loops = loop.ROWS
         host.memory = memory
 
     def _rank_identity(self) -> dict[str, Any]:
@@ -3837,7 +3833,6 @@ class Executor:
                     segments if len(segments) > 1 else (),
                     served_impls.refused,
                 ),
-                "loops": self.host.loops.pop(command.request_id, []),
                 "safeguards": safeguards,
                 # When this reply was built, and (`_send_reply`) when it went on the seam: a
                 # request's time after its observations splits into this process's and the host's.

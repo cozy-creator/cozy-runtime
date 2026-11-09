@@ -19,7 +19,6 @@ import tensorfs
 from cozy_runtime._cpus import cpus
 from cozy_runtime.author import Context, Telemetry, UnsupportedInput
 from cozy_runtime.author._loader import TENSORFS_NAMES
-from cozy_runtime.author._prepared import Progress
 from cozy_runtime.weights_store import Checkpoint, Output
 
 from .microscale import CONVROT_GROUP, NVFP4_BLOCK, W4A8_GROUP
@@ -206,6 +205,13 @@ def snapshot(
             yield checkpoint
         finally:
             checkpoint.close()
+
+
+@dataclass(frozen=True, slots=True)
+class Progress:
+    completed_steps: int
+    canceled: bool
+    done: bool
 
 
 class _Execution:

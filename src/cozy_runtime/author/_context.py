@@ -22,7 +22,6 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, final
 
 from cozy_runtime.author._errors import Cancelled, CapabilityError, DeadlineExceeded
-from cozy_runtime.author._prepared import Execution, PreparedWork
 
 if TYPE_CHECKING:
     from contextlib import AbstractContextManager
@@ -153,14 +152,16 @@ class Context:
         default=None, repr=False
     )
     _recipes: tuple[DeclaredRecipe, ...] = field(default=(), repr=False)
-    _submit_prepared: Callable[[PreparedWork], Execution] | None = field(default=None, repr=False)
     _pause_stall_watch: Callable[[], AbstractContextManager[None]] | None = field(
         default=None, repr=False
     )
     #: the sums of what its last component root returned (`graphs.Finite`)
     _finite: Any = field(default=None, repr=False)
-    #: steps reported (`on_step`): a component method that ran some handed back latents
+    #: steps reported (`progress`, `on_step`): a component method that ran some handed back latents
     _steps: int = field(default=0, repr=False)
+    #: `progress(step, total)`'s frame, and a model method call's (`uses_components`) activity
+    _progress: Callable[[int, int], None] | None = field(default=None, repr=False)
+    _called: Callable[[str], None] | None = field(default=None, repr=False)
 
     def tensorfs_source(self, weights: Weights[Any]) -> Checkpoint:
         """An admitted `Weights` argument's checkpoint: its pipeline, components and stored
@@ -220,6 +221,13 @@ class Context:
         """
         if self._plan is not None:
             self._plan(steps)
+
+    def progress(self, step: int, total: int) -> None:
+        """Step `step` (0-based) of `total` is done: the run shows step+1/total and its step time,
+        under the enclosing `tel.stage` (else "denoise"). Optional; also a cancellation point."""
+        self.raise_if_cancelled()
+        if self._progress is not None:
+            self._progress(step, total)
 
     def raise_if_cancelled(self) -> None:
         """THE cancellation spelling."""

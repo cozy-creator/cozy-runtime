@@ -1372,6 +1372,46 @@ class Telemetry(_Bound):
 
         return on_step
 
+    def loop_progress(self) -> tuple[Callable[[int, int], None], Callable[[str], None]]:
+        """`ctx.progress(step, total)` and a model method call's activity (`ctx._called`).
+
+        Progress is `step_callback`'s frame under the enclosing stage (else "denoise"); a step 0
+        starts a new count, timed from the first model call after the previous progress. Until
+        the attempt reports progress, model calls show as a count, at most two frames a second.
+        """
+        attempt = self._attempt
+        counts: dict[tuple[str, int], Callable[[int], None]] = {}
+        state: dict[str, Any] = {"said": False, "calls": 0, "shown": 0.0, "began": None}
+
+        def stage(otherwise: str) -> str:
+            current = _stage.get()
+            ours = current is not None and current[0]._attempt is attempt
+            return current[1] if current is not None and ours else otherwise
+
+        def progress(step: int, total: int) -> None:
+            state["said"] = True
+            key = (stage("denoise"), total)
+            if step == 0 or key not in counts:
+                counts[key] = self.step_callback(total, stage=key[0])
+                if state["began"] is not None:
+                    attempt._step_mark, attempt._step_device = state["began"]
+            state["began"] = None
+            counts[key](step)
+
+        def called(method: str) -> None:
+            if state["began"] is None:
+                clock = DEVICE[0] if DEVICE else None
+                state["began"] = (work_clock(), clock.mark() if clock is not None else None)
+            if state["said"] or attempt.closed:
+                return
+            state["calls"] += 1
+            now = work_clock()
+            if now - state["shown"] >= 0.5:
+                state["shown"] = now
+                self._progress_frame(stage(method), position=state["calls"])
+
+        return progress, called
+
     def log(self, message: str, /, *, level: str = "info", **fields: Scalar) -> None:
         self._attempt.check_open("Telemetry.log")
         self._attempt.emit("log", message, level, **fields)

@@ -2,8 +2,8 @@
 
 `noise` draws a request's noise on the CPU and moves it. `counter_noise` and `counter_uniform`
 compute a step's noise where it is used, from (seed, step, stream) alone (`internal.philox`): no
-generator state, no table and no host read, so a `denoise_loop` step draws them, eager or
-recorded."""
+generator state, no table and no host read, so a loop's step `i` draws the same noise on any device
+and inside a captured graph."""
 
 from __future__ import annotations
 
@@ -33,12 +33,6 @@ def noise(
     return torch.randn(tuple(shape), generator=source, dtype=dtype).to(device)
 
 
-def counter_seed(seed: int, device: torch.device | str) -> torch.Tensor:
-    """`seed` as the one-element int64 tensor `counter_noise` takes. A keyed `denoise_loop` passes
-    it in `inputs`, so its kept program serves every seed; a host int seed is baked into it."""
-    return torch.tensor([philox.int64(seed)], dtype=torch.int64, device=device)
-
-
 def counter_noise(
     shape: Sequence[int],
     seed: int | torch.Tensor,
@@ -51,10 +45,9 @@ def counter_noise(
     """Standard normal noise of `shape`: a function of (`seed`, `step`, `stream`), computed in
     float32 on `device` and cast to `dtype`.
 
-    Inside a `denoise_loop` step, `step` is the step's index `i`, the int64 device tensor a
-    recorded program advances on each replay, and `seed` is a `counter_seed` tensor the loop
-    takes in `inputs` (or a host int its `key` names). Either may be a host int or a one-element
-    int64 tensor; the values are the same. `stream`, 32 bits, keeps one step's draws apart.
+    In a loop, `step` is the step's index `i` and `seed` the request's seed. Either may be a host
+    int or a one-element int64 tensor (a value a captured graph reads on each replay); the values
+    are the same. `stream`, 32 bits, keeps one step's draws apart.
     `device` defaults to a tensor argument's device, else the CPU.
 
     Element n of the flattened result depends on (seed, step, stream, n) alone, bit for bit, in

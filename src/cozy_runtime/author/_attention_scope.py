@@ -1,4 +1,5 @@
-"""Explicit model-owned layout for approximate attention calls."""
+"""Explicit model-owned layout for approximate attention calls. Opt-in: a model call outside any
+`attention_scope` attends with its default layout, every row dense."""
 
 from __future__ import annotations
 
@@ -70,7 +71,7 @@ _ACTIVE_LAYOUT: ContextVar[AttentionLayout | None] = ContextVar(
 
 @contextmanager
 def attention_scope(layout: AttentionLayout) -> Iterator[None]:
-    """Apply layout only within this inference call; restore it even on failure."""
+    """Apply `layout` to the model calls inside; restore the previous one even on failure."""
     if not isinstance(layout, AttentionLayout):
         raise TypeError("attention_scope requires an AttentionLayout")
     token = _ACTIVE_LAYOUT.set(layout)
