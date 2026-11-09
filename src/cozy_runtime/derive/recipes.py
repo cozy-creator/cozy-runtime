@@ -43,20 +43,7 @@ from cozy_runtime.author._recipes import (
 
 
 # The code that decides a lane's bytes: its replay key changes with any of it.
-@invocable(
-    memo_dependencies=(
-        "cozy_runtime.derive.recipes",
-        "cozy_runtime.derive.operations",
-        "cozy_runtime.derive.facade",
-        "cozy_runtime.derive.quantization",
-        "cozy_runtime.derive.native_quantization",
-        "cozy_runtime.derive.microscale",
-        "cozy_runtime.derive.safetensors_io",
-        "cozy_runtime.weights_store",
-        MemoDistribution("tensorfs"),
-        MemoDistribution("numpy"),
-    )
-)
+@invocable
 async def quantize(
     ctx: Context,
     *,
@@ -72,21 +59,7 @@ async def quantize(
     return _run(ctx, tel, source, None, lane=lane, package=package, release=release, recipe=recipe)
 
 
-@invocable(
-    memo_dependencies=(
-        "cozy_runtime.derive.recipes",
-        "cozy_runtime.derive.operations",
-        "cozy_runtime.derive.facade",
-        "cozy_runtime.derive.quantization",
-        "cozy_runtime.derive.native_quantization",
-        "cozy_runtime.derive.microscale",
-        "cozy_runtime.derive.svdq",
-        "cozy_runtime.derive.safetensors_io",
-        "cozy_runtime.weights_store",
-        MemoDistribution("tensorfs"),
-        MemoDistribution("numpy"),
-    )
-)
+@invocable
 async def quantize_calibrated(
     ctx: Context,
     *,
@@ -159,7 +132,7 @@ def register(app: App, declared: Sequence[DeclaredRecipe]) -> None:
         return
     if len(calibrated) > 1:
         raise ConformanceError("calibrated recipes of two model classes", code="recipe_declaration")
-    app.entrypoint(
+    app._register(
         quantize_calibrated, name=ENTRYPOINT, weights=lanes, on_demand=("model",),
         model_classes={"model": calibrated.pop()},
     )  # fmt: skip

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+
 import msgspec
 
 from cozy_runtime.author._context import AdapterRef

@@ -62,12 +62,12 @@ from typing import Any, NamedTuple, Protocol
 import tensorfs.varena.torch as vt
 from tensorfs.varena import Exhausted
 
+from cozy_runtime.accel.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._context import CURRENT, Context
 from cozy_runtime.author._errors import Cancelled, DoesNotFit, is_capacity
 from cozy_runtime.author._model import LANDED, PLACED, WARNINGS, Building
 from cozy_runtime.author._services import stage_progress
-from cozy_runtime.accel.kernels import KernelsUnavailable, Launch, Plan, TritonKernels
 from cozy_runtime.graphs import (
     BYPASS,
     DECODERS,

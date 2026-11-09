@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, ClassVar, Protocol
 
-from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.accel.kernels import (
     INT8_CONVROT,
     ROWWISE_FP8,
@@ -35,6 +34,7 @@ from cozy_runtime.accel.kernels import (
     readable,
     shared_operand,
 )
+from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.internal import (
     fp8_linear,
     int8_linear,

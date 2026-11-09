@@ -119,7 +119,7 @@ _NAMED: dict[str, str] = {
 }
 #: `cozy_runtime`'s modules a package may import (CONTRACT.md).
 _PUBLIC = _words(
-    "author lm vlm rng tiles stepcache lora attention moe fusion rows schedule weights_store derive"
+    "author image fields media accel lm vlm rng tiles attention weights_store derive"
 )
 #: Draws that are not the global stream: a generator built from a seed.
 _SEEDED = frozenset({"Random", "SystemRandom"})

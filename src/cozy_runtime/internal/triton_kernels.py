@@ -40,8 +40,6 @@ from typing import Any, cast
 import msgspec
 from msgspec import Struct
 
-from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author._model import LANDED
 from cozy_runtime.accel.kernels import (
     KernelsUnavailable,
     Launch,
@@ -50,6 +48,8 @@ from cozy_runtime.accel.kernels import (
     entry_key,
     readable,
 )
+from cozy_runtime.author import _request_path as request_path
+from cozy_runtime.author._model import LANDED
 from cozy_runtime.internal import kernel_cache, kernel_compile, kernel_ready, tools, verify
 
 try:

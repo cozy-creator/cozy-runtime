@@ -49,6 +49,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from cozy_runtime.accel.kernels import Plan
+from cozy_runtime.author._model import WARNINGS, WarningRow
 
 try:
     import torch
@@ -415,10 +416,18 @@ _RUN: ContextVar[Run | None] = ContextVar("cozy_stepcache", default=None)
 @contextmanager
 def running(policy: Policy, steps: int, device: torch.device | str) -> Iterator[Run]:
     """A loop of `steps` steps under `policy`: its installed stacks' forwards cache. Call
-    `run.step(i)` as each step begins. Component calls inside run eagerly (no CUDA graph)."""
+    `run.step(i)` as each step begins. Component calls inside run eagerly (no CUDA graph).
+    Across the GPUs of a group the cache is off: every step computes."""
     if steps < 1:
         raise ValueError("a step-cached loop has at least one step")
     run = Run(policy, steps, torch.zeros(SLOTS, 4, dtype=torch.int32, device=device))
+    if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
+        # Each rank's verdict would differ (its sums are not all-reduced): every step computes.
+        row: WarningRow = ("step cache: off across ranks", {})
+        if row not in WARNINGS:
+            WARNINGS.append(row)
+        yield run
+        return
     token = _RUN.set(run)
     try:
         yield run

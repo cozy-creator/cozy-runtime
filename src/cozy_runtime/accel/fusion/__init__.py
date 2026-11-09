@@ -49,6 +49,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+from cozy_runtime.accel.fusion import _kernels
 from cozy_runtime.accel.kernels import (
     KernelsUnavailable,
     Launch,
@@ -57,7 +58,6 @@ from cozy_runtime.accel.kernels import (
     int8_rows,
     quantize_once,
 )
-from cozy_runtime.accel.fusion import _kernels
 
 try:
     import torch

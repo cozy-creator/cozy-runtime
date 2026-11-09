@@ -36,8 +36,6 @@ from functools import partial
 import torch
 from torch import nn
 
-from cozy_runtime.author._errors import CapabilityError
-from cozy_runtime.author._model import Building
 from cozy_runtime.accel.kernels import (
     INT8_CONVROT,
     KernelsUnavailable,
@@ -45,9 +43,11 @@ from cozy_runtime.accel.kernels import (
     Plan,
     TritonKernels,
 )
+from cozy_runtime.accel.moe import _kernels
+from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._model import Building
 from cozy_runtime.graphs import say
 from cozy_runtime.internal import int8_linear
-from cozy_runtime.accel.moe import _kernels
 
 #: Routed-expert caches a `Routing` replays, in experts.
 CACHES = (256, 512, 1024)

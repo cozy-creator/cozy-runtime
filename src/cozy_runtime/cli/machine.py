@@ -21,8 +21,8 @@ from pathlib import Path
 
 import msgspec
 
-from cozy_runtime.author._errors import AuthorError, ConformanceError
 from cozy_runtime.author._codec import FRAME_MEDIA_TYPES, encode_frame
+from cozy_runtime.author._errors import AuthorError, ConformanceError
 from cozy_runtime.internal import static_interface
 from cozy_runtime.internal.exits import Exit
 from cozy_runtime.internal.installed import record_digest

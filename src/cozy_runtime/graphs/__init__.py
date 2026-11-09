@@ -34,8 +34,12 @@ import tensorfs.varena.torch as vt
 from tensorfs import varena
 
 from cozy_runtime.accel import stepcache
+from cozy_runtime.accel.attention import (
+    AttentionLayout,
+    active_attention_layout,
+    attention_scope,
+)
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.accel.attention import active_attention_layout
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, OutputError, fault, is_capacity
@@ -1009,6 +1013,7 @@ def _region_call(
     exists (an idle period records it)."""
     placed = PLACED.get(module)
     leaves, spec = torch.utils._pytree.tree_flatten((args, kwargs))
+    layout = active_attention_layout()
     why = (
         "with gradients"
         if torch.is_grad_enabled()
@@ -1016,9 +1021,12 @@ def _region_call(
         if torch.utils._python_dispatch._get_current_dispatch_mode() is not None
         else "across GPUs"
         if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1
-        # The layout routes its attention calls; a graph keys on none of it.
-        else "under a model attention layout"
-        if active_attention_layout() is not None
+        # A sparse step picks its key blocks from the values, and a package's producer runs
+        # Python and keeps request state at each call: a replay would freeze one call's.
+        else "under a sparse attention layout"
+        if layout is not None and layout.sparse
+        else "under an attention layout a package's producer serves"
+        if layout is not None and _produced(module)
         else _unplain(torch, leaves)
     )
     if why:
@@ -1036,7 +1044,9 @@ def _region_call(
     )
     autocast = torch.is_autocast_enabled("cuda"), torch.get_autocast_dtype("cuda")
     declared = tuple(functools.reduce(getattr, p.split("."), module) for p in recorder.keys)
-    key = (*_signature(torch, leaves, spec), declared, addresses, autocast)
+    key = (*_signature(torch, leaves, spec), declared, addresses, autocast, _dense(layout))
+    if layout is not None:  # an idle recording runs outside the caller's scope: under its own
+        call = functools.partial(_under, layout, call)
     if recorder.last is not None and recorder.last != key:
         _changed(torch, module, recorder, key, (args, kwargs), len(leaves))
     recorder.last = key
@@ -1048,6 +1058,33 @@ def _region_call(
     elif key not in recorder.queued and key not in recorder.failed and key not in recorder.judged:
         _queue(torch, module, recorder, call, key, spec, leaves, placed)
     return recorder.eager.run(torch, lambda: call(module, *args, **kwargs))
+
+
+def _dense(layout: AttentionLayout | None) -> tuple[object, ...] | None:
+    """What a dense step's kernels read of its layout: every field but the step itself."""
+    if layout is None:
+        return None
+    return (
+        layout.live_tokens,
+        layout.protected_prefix,
+        layout.step >= layout.dense_until_step,
+        layout.dense_paths,
+        layout.exact_paths,
+        layout.tau,
+    )
+
+
+def _under(layout: AttentionLayout, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    with attention_scope(layout):
+        return call(*args, **kwargs)
+
+
+def _produced(module: Any) -> bool:
+    """Whether a package's attention producer serves a site under `module` now."""
+    return any(
+        getattr(getattr(sub, "processor", None), "serving", None) is not None
+        for sub in module.modules()
+    )
 
 
 def _queue(

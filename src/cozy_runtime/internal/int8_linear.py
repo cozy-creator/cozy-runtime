@@ -22,9 +22,9 @@ from importlib import import_module, util
 from pathlib import Path
 from types import ModuleType
 
+from cozy_runtime.accel.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.author._errors import Fault, fault
 from cozy_runtime.author._model import WARNINGS, Building, Yielded
-from cozy_runtime.accel.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.internal import (
     arch,
     kernel_cache,

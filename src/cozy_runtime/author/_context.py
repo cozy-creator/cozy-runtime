@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import random
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, final
@@ -148,9 +148,6 @@ class Context:
     _tensorfs_output: Callable[[str, Derivation], Output] | None = field(default=None, repr=False)
     _tensorfs_adopt: Callable[[Output], ModelArtifact] | None = field(default=None, repr=False)
     _release_gpus: Callable[[], None] | None = field(default=None, repr=False)
-    _plan: Callable[[Sequence[str | Collection[str]]], None] | None = field(
-        default=None, repr=False
-    )
     _recipes: tuple[DeclaredRecipe, ...] = field(default=(), repr=False)
     _pause_stall_watch: Callable[[], AbstractContextManager[None]] | None = field(
         default=None, repr=False
@@ -213,14 +210,6 @@ class Context:
     def cancelled(self) -> bool:
         """THE cancellation question. A passed deadline IS cancellation, not a second flag."""
         return self._cancel() or time.monotonic() >= self.deadline
-
-    def plan(self, *steps: str | Collection[str]) -> None:
-        """The models this call runs, in order, so GPU memory evicts and restores by them: each
-        step a component name, or a set of names used together (`{"unet", "controlnet"}`).
-        Declare it before the first model runs; calling again replaces it. No sizes or times.
-        """
-        if self._plan is not None:
-            self._plan(steps)
 
     def progress(self, step: int, total: int) -> None:
         """Step `step` (0-based) of `total` is done: the run shows step+1/total and its step time,

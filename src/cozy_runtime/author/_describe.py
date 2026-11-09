@@ -276,19 +276,10 @@ def _models(declared: Declaration) -> None:
         if slot.weights:
             continue
         path, spec = f"{declared.name}.models.{slot.parameter}", slot.spec
-        uses = declared.model_components.get(slot.parameter, ())
-        unknown = sorted(set(uses) - {c for names in spec.components.values() for c in names})
-        if unknown:
-            raise ConformanceError(
-                f"{path}: components names {', '.join(unknown)}, which no "
-                f"@uses_components method of {spec.name} declares",
-                code="model_components",
-                fields=unknown,
-            )
         if not spec.loads:
             raise ConformanceError(
                 f"{path}: {spec.name} defines no load(loader) — a Model constructs "
-                "through loader.construct(T, factory=…), the one construction primitive",
+                "through loader.construct(factory), the one construction primitive",
                 code="no_load",
             )
         if spec.arguments:
