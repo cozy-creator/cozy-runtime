@@ -515,14 +515,18 @@ _PRIMER = "kernel-ready: triton sets"
 
 
 def warm_host() -> None:
-    """What every set's key reads from the host, cached for the process and with no device: the
-    toolchains' versions (a `ptxas` run each), the driver's directories (an `ldconfig` run) and
-    each declared kernel's source hash. An import-only parent runs it, so its forks find them."""
+    """What every set's key reads from the host, cached for the process and with no device:
+    Triton's own key (a hash of its 500 MB `libtriton.so` and its compiler's sources: 0.26 s warm,
+    0.4-1.2 s on a cold pod, at each executor's first kernel key), the toolchains' versions (a
+    `ptxas` run each), the driver's directories (an `ldconfig` run) and each declared kernel's
+    source hash. An import-only parent runs it, so its forks find them."""
     if TRITON_ABSENT:
         return
     from triton import knobs
+    from triton.runtime.cache import triton_key
 
     reads: list[Callable[[], object]] = [
+        triton_key,
         lambda: knobs.nvidia.ptxas.version,
         lambda: knobs.nvidia.ptxas_blackwell.version,
         _cuda_driver.libcuda_dirs,
