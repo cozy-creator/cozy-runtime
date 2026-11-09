@@ -1,5 +1,6 @@
 name: build
-# The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, and the package imports on CPU.
+# The PR check (tracker/design/ci-v2.md §1): errors-only lint, every source compiles, the package imports on CPU, and
+# the type check (scripts/typecheck.sh).
 # Required for merges into master and rc/*: it runs on the merge queue's group (merge_group), on the final
 # PR + branch state; on a pull request it is skipped, which lets the PR be queued. A docs-only group passes
 # without building.
@@ -49,3 +50,11 @@ jobs:
         run: uv run --locked python -m compileall -q src
       - if: steps.scope.outputs.run == 'true'
         run: uv run --locked python -c "import cozy_runtime"
+      # The type check: new errors fail, .basedpyright/baseline.json holds the known ones.
+      - if: steps.scope.outputs.run == 'true'
+        uses: actions/cache@v5
+        with:
+          path: .venv-typecheck
+          key: typecheck-${{ runner.os }}-${{ hashFiles('scripts/typecheck-requirements.txt') }}
+      - if: steps.scope.outputs.run == 'true'
+        run: scripts/typecheck.sh

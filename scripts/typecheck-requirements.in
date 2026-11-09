@@ -1,0 +1,16 @@
+# The type check's environment (scripts/typecheck.sh): the libraries the Runtime's source imports, CPU-only.
+# `scripts/typecheck.sh lock` pins them into typecheck-requirements.txt.
+basedpyright
+tensorfs>=0.22.1,<0.23
+msgspec
+numpy
+packaging
+pillow
+torch @ https://download.pytorch.org/whl/cpu/torch-2.15.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl
+triton
+diffusers
+transformers
+peft>=0.20,<0.21
+safetensors
+tokenizers
+av

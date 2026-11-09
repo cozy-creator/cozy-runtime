@@ -19,3 +19,4 @@ corpus/pipeline/tokenizer_2/
 .task-owner*.md
 .worktree-owner*.md
 .owner-agent/
+.venv-typecheck/

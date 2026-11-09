@@ -65,6 +65,15 @@ package = true
 [tool.uv.sources]
 tensorfs = { git = "https://github.com/cozy-creator/cozy-creator", rev = "2df21cbc053a6a793e56ab59d02a25aaad5f6727", subdirectory = "crates/tensorfs-py" }
 
+[tool.basedpyright]
+# scripts/typecheck.sh runs this against real torch, Diffusers, Transformers and TensorFS.
+include = ["src", "checks", "examples"]
+extraPaths = ["src", "kernels/src", "examples/marco-polo"]
+pythonVersion = "3.12"
+pythonPlatform = "Linux"
+typeCheckingMode = "standard"
+reportMissingModuleSource = false  # the native kernel modules ship as stubs
+
 [tool.mypy]
 python_version = "3.12"
 files = ["src", "checks", "examples"]

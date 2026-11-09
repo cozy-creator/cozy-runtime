@@ -2,6 +2,11 @@ version: "3"
 silent: true
 
 tasks:
+  typecheck:
+    desc: basedpyright against the real dependencies; only errors missing from .basedpyright/baseline.json fail
+    cmds:
+      - scripts/typecheck.sh {{.CLI_ARGS}}
+
   # A native wheel is the pure one plus one platform's kernel modules: kernels.yaml's artifact
   # `kernels-<target>`, an install prefix holding `cozy_runtime/_kernels`.
   wheel:
