@@ -1,11 +1,11 @@
 """The package contract at describe (ENFORCEMENT §1): every `.py` under a package's own import
 roots, read as `ast` like the rest of the static reader, executing nothing of it.
 
-A construct the contract gives the Runtime alone is refused in one line, `file:line: <rule>:
-<construct>: use <API>`; a rule turns on in the release that lands the API it names. Names
-resolve through each file's imports, its own package's re-exports and single-assignment aliases;
-an attribute of an object (`self.vae.decode`) is not judged here: the executor's seal catches
-those calls."""
+A construct that harms the process a package shares is refused in one line, `file:line: <rule>:
+<construct>: <the harm>`. Only harm is judged, never the shape of the code: loops, attention
+calls, host reads and waits, threads and library decode are the author's. Names resolve through each
+file's imports, its own package's re-exports and single-assignment aliases; an attribute of an
+object (`self.vae.decode`) is not judged here: the executor's seal catches those calls."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import cozy_runtime.internal.static_interface as static_interface
-from cozy_runtime.internal.contract import USE
+from cozy_runtime.internal.contract import WHY
 
 if TYPE_CHECKING:
     from cozy_runtime.internal.static_interface import Module, Reader
@@ -75,12 +75,12 @@ _NAMED: dict[str, str] = {
     **_names(
         "own_stream",
         """torch.cuda.Stream torch.cuda.Event torch.cuda.ExternalStream torch.cuda.StreamContext
-        torch.cuda.stream torch.cuda.streams torch.cuda.set_stream torch.cuda.synchronize
+        torch.cuda.stream torch.cuda.streams torch.cuda.set_stream
         torch.cuda.CUDAGraph torch.cuda.graph torch.cuda.graphs torch.cuda.graph_pool_handle
-        torch.cuda.make_graphed_callables torch.cuda.is_current_stream_capturing
-        torch.cuda.set_device torch.cuda.device torch.cuda.device_of torch.Stream torch.Event
-        torch.accelerator.set_stream torch.accelerator.synchronize
-        torch.accelerator.set_device_index torch.accelerator.set_device_idx torch.mps.synchronize
+        torch.cuda.make_graphed_callables torch.cuda.set_device torch.cuda.device
+        torch.cuda.device_of torch.Stream torch.Event
+        torch.accelerator.set_stream
+        torch.accelerator.set_device_index torch.accelerator.set_device_idx
         torch.mps.Event cuda.bindings cuda.cuda cuda.cudart cuda.core pycuda""",
     ),
     **_names("compile", "torch.compile torch._dynamo torch._inductor triton.autotune"),
@@ -103,33 +103,17 @@ _NAMED: dict[str, str] = {
         asyncio.create_subprocess_shell os:fork os:forkpty os:system os:popen os:posix_spawn
         os:posix_spawnp {_EXEC}""",
     ),
-    **_names(
-        "thread",
-        """threading.Thread threading.Timer concurrent.futures.ThreadPoolExecutor
-        concurrent.futures.thread _thread.start_new_thread _thread.start_new
-        multiprocessing.pool.ThreadPool multiprocessing.dummy""",
-    ),
     **_names("internal_import", "tensorfs varena"),
-    **_names(
-        "attention",
-        """torch.nn.functional.scaled_dot_product_attention
-        torch._C._nn.scaled_dot_product_attention torch.nn.attention.flex_attention flash_attn
-        flash_attn_interface sageattention xformers""",
-    ),
 }
-#: `cozy_runtime`'s modules a package may import (CONTRACT.md).
-_PUBLIC = _words(
-    "author image fields media accel lm vlm rng tiles attention weights_store derive"
-)
+#: Reads of capture state: they change nothing.
+_READS = frozenset({"torch.cuda.CUDAGraph.get_currently_capturing_graph"})
+#: `cozy_runtime`'s own machinery: every other module of it is the author's to import.
+_INTERNAL = _words("internal graphs cli")
 #: Draws that are not the global stream: a generator built from a seed.
 _SEEDED = frozenset({"Random", "SystemRandom"})
 _NUMPY_SEEDED = _words(
     """default_rng Generator RandomState SeedSequence BitGenerator PCG64 PCG64DXSM Philox MT19937
     SFC64"""
-)
-_CACHES = _words(
-    """DynamicCache StaticCache HybridCache HybridChunkedCache SlidingWindowCache OffloadedCache
-    OffloadedStaticCache QuantizedCache EncoderDecoderCache"""
 )
 _ENVIRON_WRITES = frozenset({"setdefault", "update", "pop", "popitem", "clear", "__setitem__"})
 _WEIGHT_FILES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
@@ -143,12 +127,12 @@ class Finding:
     construct: str
 
     def __str__(self) -> str:
-        return f"{self.path}:{self.line}: {self.code}: {self.construct}: use {USE[self.code]}"
+        return f"{self.path}:{self.line}: {self.code}: {self.construct}: {WHY[self.code]}"
 
 
 def check(reader: Reader, modules: Sequence[Module]) -> None:
-    """Refuse the package (`StaticRefusal` `package_contract`) on any construct the contract
-    gives the Runtime: the first on the first line, every other after it."""
+    """Refuse the package (`StaticRefusal` `package_contract`) on any construct that harms the
+    process it shares: the first on the first line, every other after it."""
     files = [_File(reader, module) for module in _files(reader, modules)]
     every = {file.module.name: file.aliases for file in files}
     found = [finding for file in files for finding in file.findings(every)]
@@ -326,8 +310,6 @@ class _File:
                 self._call(node)
             elif isinstance(node, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.Delete)):
                 self._store(node)
-            elif isinstance(node, ast.ClassDef):
-                self._class(node)
             elif isinstance(node, ast.ExceptHandler):
                 self._handler(node)
             elif (
@@ -362,17 +344,14 @@ class _File:
             return None
         if parts[0] == "cozy_runtime":
             private = any(p.startswith("_") and not p.startswith("__") for p in parts[1:])
-            named = len(parts) > 1 and not parts[1].startswith("__")
-            return "internal_import" if private or (named and parts[1] not in _PUBLIC) else None
+            internal = private or (len(parts) > 1 and parts[1] in _INTERNAL)
+            return "internal_import" if internal else None
         if parts[0] == "random" and len(parts) > 1 and parts[1] not in _SEEDED:
             return "global_rng"
         if parts[:2] == ["numpy", "random"] and len(parts) > 2 and parts[2] not in _NUMPY_SEEDED:
             return "global_rng"
-        if parts[0] in ("transformers", "diffusers") and parts[-1] in (
-            "generate",
-            "generate_captions",
-        ):
-            return "own_decode"
+        if dotted in _READS:
+            return None
         for cut in range(len(parts), 0, -1):
             if (rule := _NAMED.get(".".join(parts[:cut]))) is not None:
                 return rule
@@ -395,7 +374,7 @@ class _File:
         if isinstance(func, ast.Attribute):
             if func.attr in ("from_pretrained", "from_single_file"):
                 self._add(node, "weights_io", f".{func.attr}(...)")
-            if func.attr in ("synchronize", "wait_stream", "wait_event", "record_event") and (
+            if func.attr in ("wait_stream", "wait_event", "record_event") and (
                 isinstance(func.value, ast.Call)
                 and self._resolve(func.value.func)
                 in ("torch.cuda.current_stream", "torch.cuda.default_stream")
@@ -403,11 +382,8 @@ class _File:
                 self._add(node, "own_stream", f"current_stream().{func.attr}()")
             if func.attr in _ENVIRON_WRITES and self._resolve(func.value) == "os.environ":
                 self._add(node, "env_write", f"os.environ.{func.attr}(...)")
-        if dotted is not None:
-            if dotted.startswith("transformers.") and dotted.rsplit(".", 1)[-1] in _CACHES:
-                self._add(node, "own_decode", f"{dotted.rsplit('.', 1)[-1]}(...)")
-            if dotted == "torch.Generator" and self._device_generator(node):
-                self._add(node, "global_rng", "torch.Generator(device=<not cpu>)")
+        if dotted == "torch.Generator" and self._device_generator(node):
+            self._add(node, "device_rng", "torch.Generator(device=<not cpu>)")
         name = func.id if isinstance(func, ast.Name) and func.id not in self.aliases else None
         opens = name == "open" or dotted in ("io.open", "builtins.open")
         if opens and node.args and (suffix := _literal_suffix(node.args[0])) is not None:
@@ -416,14 +392,6 @@ class _File:
             label = node.args[1]
             if isinstance(label, ast.Constant) and label.value == "PURE_WINDOWS":
                 self._add(node, "internal_import", "PURE_WINDOWS")
-        for keyword in node.keywords:
-            value = keyword.value
-            if (
-                keyword.arg == "use_cache"
-                and isinstance(value, ast.Constant)
-                and value.value is True
-            ):
-                self._add(node, "own_decode", "use_cache=True")
 
     def _store(self, node: ast.Assign | ast.AugAssign | ast.AnnAssign | ast.Delete) -> None:
         targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
@@ -451,13 +419,6 @@ class _File:
                 and isinstance(self.parents.get(id(node)), ast.ClassDef)
             ):
                 self._add(target, "internal_import", "PURE_WINDOWS")
-
-    def _class(self, node: ast.ClassDef) -> None:
-        for base in node.bases:
-            dotted = self._resolve(base) or ""
-            cache = dotted.rsplit(".", 1)[-1]
-            if dotted.startswith("transformers.") and cache in _CACHES:
-                self._add(node, "own_decode", f"class {node.name}({cache})")
 
     def _handler(self, node: ast.ExceptHandler) -> None:
         for inner in (n for stmt in node.body for n in ast.walk(stmt)):
