@@ -1296,7 +1296,7 @@ class Executor:
         reply = {"ok": True, "rank": self.rank, "world": self.world, "backend": spec.backend}
         if command.calibrate:
             exchange, reply["calibration"] = copy_engine.calibrate(
-                self.torch, self.pg, self.rank, self.world, command.calibrate
+                self.torch, self.pg, self.rank, self.world, command.calibrate, self._host_tier()
             )
             copy_engine.install(exchange, self.pg)
         return reply
@@ -1316,11 +1316,16 @@ class Executor:
         nccl = self.group is not None and self.group.backend == "nccl"
         return self.transport.links.exchanges if nccl and self.transport is not None else ()
 
+    def _host_tier(self) -> Any:
+        """This GPU's host tier, which a host-staged exchange's inbox comes from."""
+        memory = self.host.memory
+        return memory.pages if memory is not None else None
+
     def _calibrated(self, pg: Any) -> None:
         """Rank 0's half of the formation's calibration: NCCL against `_exchanges`."""
         assert self.transport is not None
         exchange, self.transport.calibration = copy_engine.calibrate(
-            self.torch, pg, 0, self.world, self._exchanges()
+            self.torch, pg, 0, self.world, self._exchanges(), self._host_tier()
         )
         copy_engine.install(exchange, pg)
         self.transport.route = exchange.name if exchange is not None else "nccl"

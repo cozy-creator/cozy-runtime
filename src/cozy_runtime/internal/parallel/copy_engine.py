@@ -12,9 +12,10 @@ allow as it forms (`calibrate`) and keeps the fastest; the result is the same by
   peer's buffer (each on its own stream, so the NVLink and PCIe engines run at once), a second
   barrier, and the local copies out.
 - `HostStagedExchange` (any pair not direct): each GPU's inbox is pinned host memory every GPU of
-  the group maps. A round writes a GPU's rows for each peer into that peer's inbox (D2H), a
-  barrier, and reads its own inbox back (H2D), in two halves, so one round's reads overlap the
-  next round's writes on the other engine.
+  the group maps, made from varena's host number (TensorFS `Pages.staging`: host RAM is varena's,
+  REVIEW #3). A round writes a GPU's rows for each peer into that peer's inbox (D2H), a barrier,
+  and reads its own inbox back (H2D), in two halves, so one round's reads overlap the next round's
+  writes on the other engine.
 
 Mapping happens when the group forms, never inside a call. Barriers are NCCL collectives of the
 group, so a GPU that fails between them ends its peers' wait when the group interrupts
@@ -25,10 +26,8 @@ ends it: Ulysses overlaps it with the attention of the head group before (`ulyss
 
 from __future__ import annotations
 
-import contextlib
+import ctypes
 import math
-import os
-import secrets
 from collections.abc import Callable, Sequence
 from functools import partial
 from typing import Any
@@ -43,8 +42,6 @@ _BY_GROUP: dict[int, Exchange] = {}
 BUFFER_BYTES = 256 << 20
 #: Each GPU's host inbox, both halves: a region per source GPU in each.
 INBOX_BYTES = 128 << 20
-#: Where an inbox is made: unlinked as soon as every GPU of the group mapped it.
-_SHM = "/dev/shm"
 #: Exchange streams outrank compute, so a barrier's one block is never queued behind a wave.
 _PRIORITY = -1
 
@@ -239,16 +236,17 @@ class CopyEngineExchange(Exchange):
 
 
 class HostStagedExchange(Exchange):
-    """Through pinned host memory every GPU of the group maps: a file under `/dev/shm` per GPU,
-    registered with each GPU's driver context (`cudaHostRegister`), unlinked once all mapped.
-    Its inbox holds two halves of one region per source GPU. A round on the write stream waits
-    for its half to be free, copies this GPU's rows for each peer into that peer's region for it;
-    the read stream then barriers (every GPU's writes of the round landed, and its reads of the
-    round before ended), marks the other half free, and copies its own inbox's regions out."""
+    """Through pinned host memory every GPU of the group maps. Each GPU's inbox comes from its
+    host tier (`pages`): varena's host number holds it until the exchange closes, and no other
+    executor maps or counts it twice (TensorFS `Staging`). Its inbox holds two halves of one region
+    per source GPU. A round on the write stream waits for its half to be free, copies this GPU's
+    rows for each peer into that peer's region for it; the read stream then barriers (every GPU's
+    writes of the round landed, and its reads of the round before ended), marks the other half
+    free, and copies its own inbox's regions out."""
 
     name = "host-staged"
 
-    def __init__(self, torch: Any, pg: Any, rank: int, world: int) -> None:
+    def __init__(self, torch: Any, pg: Any, rank: int, world: int, pages: Any) -> None:
         self.torch, self.pg, self.rank, self.world = torch, pg, rank, world
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.slot = INBOX_BYTES // (2 * world) // 4096 * 4096
@@ -258,61 +256,52 @@ class HostStagedExchange(Exchange):
         self.flag = torch.zeros(1, dtype=torch.int32, device=self.device)
         self.half = 0
         self.inboxes: list[Any] = []
-        self.registered: list[int] = []
-        self.path = os.path.join(_SHM, f"cozy-staged-{os.getpid()}-{rank}-{secrets.token_hex(6)}")
-        handle = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
-        try:
-            os.posix_fallocate(handle, 0, self.size)  # ENOSPC now, never SIGBUS mid-call
-        except BaseException:
-            os.close(handle)
-            self._unlink()
-            raise
-        os.close(handle)
-
-    def _unlink(self) -> None:
-        with contextlib.suppress(OSError):
-            os.unlink(self.path)
+        self.peers: list[Any] = []
+        self.own: Any = pages.staging(self.size) if pages is not None else None
+        if self.own is None:
+            raise MemoryError("varena's host number has no room for this GPU's exchange inbox")
 
     def map(self, store: Any, agree: Callable[[bool], bool]) -> bool:
-        """Collective, once per formation: every GPU maps and registers every inbox; each unlinks
-        its own once all agreed. False on every GPU alike when any could not."""
-        torch = self.torch
-        store.set(f"cozy.staged/{self.rank}", self.path)
-        paths = [
-            bytes(p).decode()
-            for p in store.multi_get([f"cozy.staged/{r}" for r in range(self.world)])
+        """Collective, once per formation: every GPU maps every inbox for its own; each unlinks
+        its inbox's name once all agreed. False on every GPU alike when any could not."""
+        from tensorfs.varena import _runtime as varena
+
+        store.set(f"cozy.staged/{self.rank}", self.own.name)
+        names = [
+            bytes(name).decode()
+            for name in store.multi_get([f"cozy.staged/{r}" for r in range(self.world)])
         ]
         ok = True
         try:
-            cudart = torch.cuda.cudart()
-            for path in paths:
-                inbox = torch.from_file(path, shared=True, size=self.size, dtype=torch.uint8)
-                self.inboxes.append(inbox)
-                if int(cudart.cudaHostRegister(inbox.data_ptr(), self.size, 0)) != 0:
-                    raise RuntimeError(f"cudaHostRegister refused {path}")
-                self.registered.append(inbox.data_ptr())
+            for rank, name in enumerate(names):
+                staging = self.own
+                if rank != self.rank:
+                    staging = varena.Staging.open(self.device.index, name, self.size)
+                    self.peers.append(staging)
+                self.inboxes.append(_host(self.torch, staging))
         except Exception:
             ok = False
         agreed = agree(ok)
-        self._unlink()
+        self.own.unlink()
         if not agreed:
             self.close()
             return False
-        self.free = [torch.cuda.Event(), torch.cuda.Event()]
+        self.free = [self.torch.cuda.Event(), self.torch.cuda.Event()]
         for event in self.free:
             event.record(self.reads)
         return True
 
     def close(self) -> None:
-        torch = self.torch
-        if self.registered:
+        if self.inboxes:
             self.writes.synchronize()
             self.reads.synchronize()
-            cudart = torch.cuda.cudart()
-            for pointer in self.registered:
-                cudart.cudaHostUnregister(pointer)
-        self.registered, self.inboxes = [], []
-        self._unlink()
+        self.inboxes = []
+        for staging in self.peers:
+            staging.close()
+        self.peers = []
+        if self.own is not None:
+            self.own.close()
+            self.own = None
 
     def _barrier(self) -> None:
         self.torch.distributed.all_reduce(self.flag, group=self.pg)
@@ -384,16 +373,29 @@ class HostStagedExchange(Exchange):
         return done
 
 
+def _host(torch: Any, staging: Any) -> Any:
+    """`staging`'s bytes as a CPU uint8 tensor, valid while it is open."""
+    return torch.frombuffer(
+        (ctypes.c_uint8 * staging.bytes).from_address(staging.ptr), dtype=torch.uint8
+    )
+
+
 #: Bytes each GPU sends in the calibration: the size class of one Ulysses exchange.
 _CALIBRATION_BYTES = 64 << 20
 
 
 def calibrate(
-    torch: Any, pg: Any, rank: int, world: int, candidates: Sequence[str] = ("copy-engine",)
+    torch: Any,
+    pg: Any,
+    rank: int,
+    world: int,
+    candidates: Sequence[str] = ("copy-engine",),
+    pages: Any = None,
 ) -> tuple[Exchange | None, dict[str, float]]:
     """Collective, on every GPU of a just-formed group: the same all-to-all through NCCL and
     through each candidate exchange, timed and checked against NCCL's bytes; every GPU keeps the
-    fastest alike. A candidate any GPU cannot map is dropped on all of them."""
+    fastest alike. A candidate any GPU cannot map is dropped on all of them. `pages`: this GPU's
+    host tier, which a host-staged inbox comes from."""
     from torch.distributed.distributed_c10d import _get_process_group_store
 
     dist = torch.distributed
@@ -435,7 +437,7 @@ def calibrate(
     best: Exchange | None = None
     for name in candidates:
         label = name.replace("-", "_")
-        exchange = _open(name, torch, pg, rank, world, agree, _get_process_group_store(pg))
+        exchange = _open(name, torch, pg, rank, world, agree, _get_process_group_store(pg), pages)
         timings[f"{label}_mapped"] = 0.0 if exchange is None else 1.0
         if exchange is None:
             continue
@@ -467,6 +469,7 @@ def _open(
     world: int,
     agree: Callable[[bool], bool],
     store: Any,
+    pages: Any,
 ) -> Exchange | None:
     """`name`'s exchange mapped on every GPU of the group, or None on every one alike."""
     made: Exchange | None = None
@@ -476,8 +479,8 @@ def _open(
 
             made = CopyEngineExchange(torch, symm, pg, rank, world)
         elif name == "host-staged":
-            made = HostStagedExchange(torch, pg, rank, world)
-    except Exception:  # an unsupported driver, container or /dev/shm: the group stays on NCCL
+            made = HostStagedExchange(torch, pg, rank, world, pages)
+    except Exception:  # an unsupported driver, no host room, no shared memory: NCCL stays
         made = None
     if not agree(made is not None):
         if made is not None:
