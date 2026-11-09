@@ -111,9 +111,14 @@ class Connection:
 
 
 def open_checkpoint(store: Path, ref: str, connection: Connection | None = None) -> Checkpoint:
-    """Open a checkpoint through the public TensorFS API in the shared cache."""
+    """Open a checkpoint through the public TensorFS API in the shared cache. A digest names its
+    header exactly: no GPU chooses a lane, so TensorFS probes none (NVML leaves a driver thread,
+    and the import-only parent that reads headers must hold none to fork)."""
     options = connection or Connection()
-    return tensorfs.open(ref, cache_dir=store, endpoint=options.endpoint, token=options.token)
+    gpus = [] if ref.startswith("sha256:") else None
+    return tensorfs.open(
+        ref, cache_dir=store, endpoint=options.endpoint, token=options.token, gpus=gpus
+    )
 
 
 def open_view(
