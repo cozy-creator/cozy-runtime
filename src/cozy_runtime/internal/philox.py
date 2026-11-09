@@ -22,7 +22,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.accel.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import kernel_ready, verify
 
 try:

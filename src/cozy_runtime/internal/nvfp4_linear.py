@@ -26,7 +26,7 @@ from functools import partial
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-from cozy_runtime.author.kernels import (
+from cozy_runtime.accel.kernels import (
     Launch,
     TritonEntry,
     TritonKernels,
@@ -280,7 +280,7 @@ def _entries() -> list[TritonEntry]:
     return entries
 
 
-#: Built on every executor's GPUs when it starts (`author.kernels`): a request never compiles.
+#: Built on every executor's GPUs when it starts (`accel.kernels`): a request never compiles.
 KERNELS = TritonKernels("cozy-nvfp4", _entries())
 
 

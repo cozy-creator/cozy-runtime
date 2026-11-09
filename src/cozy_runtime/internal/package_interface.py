@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._describe import validate
 from cozy_runtime.author._markers import (
     AUDIO_PREPARATION_PROFILE,

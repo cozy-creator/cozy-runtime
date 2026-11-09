@@ -42,7 +42,7 @@ from cozy_runtime.author._model import LANDED, Building, Yielded
 from cozy_runtime.internal import kernel_compile, verify
 
 if TYPE_CHECKING:
-    from cozy_runtime.author.kernels import Launch
+    from cozy_runtime.accel.kernels import Launch
 
 #: `opener(wait)`: the kernel ready to dispatch. With `wait` it may wait for its build; without,
 #: None while the build runs. It raises when the kernel cannot serve here.

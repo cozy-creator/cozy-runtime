@@ -43,7 +43,7 @@ USE = {
     "global_flag": "the Runtime's numerics policy, hold_dtype, "
     "@uses_components(deterministic=True)",
     "own_stream": "denoise_loop, uncaptured, graph_keys: the Runtime owns streams",
-    "compile": "author.kernels.TritonKernels, prebuilt",
+    "compile": "accel.kernels.TritonKernels, prebuilt",
     "weights_io": "loader.construct or loader.load, loader.assets.read or .open",
     "own_decode": "lm.generate (allowed=lm.Constraint for a constrained decode)",
     "global_rng": "rng.noise, rng.generator(seed), view.generator",

@@ -14,7 +14,7 @@ from typing import Any
 
 import msgspec
 
-from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT
+from cozy_runtime.accel.attention import _ACTIVE_LAYOUT
 from cozy_runtime.author._errors import MEMORY_EXHAUSTED, Cancelled, classify
 from cozy_runtime.author._model import remote_scope
 from cozy_runtime.internal import attention_sol, execution_evidence, kernel_ready

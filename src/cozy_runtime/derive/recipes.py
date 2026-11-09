@@ -23,9 +23,7 @@ from typing import Any, Protocol
 
 from cozy_runtime.author import (
     App,
-    ConformanceError,
     Context,
-    MemoDistribution,
     Model,
     ModelArtifact,
     Recipe,
@@ -33,6 +31,7 @@ from cozy_runtime.author import (
     Weights,
     invocable,
 )
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.author._recipes import (
     ENTRYPOINT,
     DeclaredRecipe,

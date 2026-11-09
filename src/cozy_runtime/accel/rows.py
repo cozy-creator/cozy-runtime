@@ -24,8 +24,8 @@ from typing import Any, Protocol
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from cozy_runtime import lora
-from cozy_runtime.author.kernels import INT8_CONVROT, ROWWISE_FP8, PreQuantized, readable
+from cozy_runtime.accel import lora
+from cozy_runtime.accel.kernels import INT8_CONVROT, ROWWISE_FP8, PreQuantized, readable
 from cozy_runtime.internal.encoding.leaves import NVFP4
 
 

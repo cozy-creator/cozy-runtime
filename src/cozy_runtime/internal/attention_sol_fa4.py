@@ -24,7 +24,7 @@ import triton.language as tl
 from torch import Tensor
 
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.accel.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import attention_sol
 from cozy_runtime.internal import attention_upstream as upstream
 

@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from torch import Generator, Tensor
     from torch import device as Device
 
-from cozy_runtime.author.kernels import Launch, TritonEntry, TritonKernels
+from cozy_runtime.accel.kernels import Launch, TritonEntry, TritonKernels
 from cozy_runtime.internal import kernel_ready, verify
 from cozy_runtime.internal.encoding.formats import E2M1_VALUES, E4M3_MAX, NVFP4_BLOCK, hadamard256
 
@@ -1021,5 +1021,5 @@ def _entries() -> list[TritonEntry]:
     return entries
 
 
-#: Built on every executor's GPUs when it starts (`author.kernels`): a request never compiles.
+#: Built on every executor's GPUs when it starts (`accel.kernels`): a request never compiles.
 KERNELS = TritonKernels("cozy-lora-bake", _entries())

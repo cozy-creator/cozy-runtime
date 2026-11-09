@@ -71,13 +71,16 @@ from msgspec import UNSET, UnsetType
 from tensorfs.varena import _runtime as varena
 
 from cozy_runtime import __version__ as RUNTIME_VERSION
-from cozy_runtime import graphs, stepcache, weights_store
-from cozy_runtime.author import ModelRegistry, _activity, _split, describe
+from cozy_runtime import graphs, weights_store
+from cozy_runtime.accel import stepcache
+from cozy_runtime.author import _activity, _split
+from cozy_runtime.author._describe import describe
+from cozy_runtime.author._model import ModelRegistry
 from cozy_runtime.author import _request_path as request_path
 from cozy_runtime.author._activity import ThreadPoolExecutor
 from cozy_runtime.author._app import Registration
 from cozy_runtime.author._artifacts import ModelChoice
-from cozy_runtime.author._attention import _close as close_producer_states
+from cozy_runtime.accel.attention import _close as close_producer_states
 from cozy_runtime.author._calls import Nudges, _Broker, _CallType, _export
 from cozy_runtime.author._context import CURRENT, AdapterRef, Device, place
 from cozy_runtime.author._demand import shape_cell
@@ -128,8 +131,8 @@ from cozy_runtime.author._observations import DEVICE, PLANS, Attribution
 from cozy_runtime.author._services import AdjustmentRow, ProgressFrame
 from cozy_runtime.author._services import Attempt as AuthorAttempt
 from cozy_runtime.author._weights import Weights as RawWeights
-from cozy_runtime.author.kernels import _SETS as KERNEL_SETS
-from cozy_runtime.author.kernels import Launch, Plan, TritonKernels
+from cozy_runtime.accel.kernels import _SETS as KERNEL_SETS
+from cozy_runtime.accel.kernels import Launch, Plan, TritonKernels
 from cozy_runtime.derive import recipes as declared_recipes
 from cozy_runtime.derive.operations import app as builtin_operations_app
 from cozy_runtime.derive.operations import run_recipe

@@ -70,14 +70,14 @@ is what derives `gpu`. Nothing else declares either.
 
 import msgspec
 
-from cozy_runtime.author import App, Context, ImageFile, ImageFrame, Outputs
+from cozy_runtime.author import App, Context, ImageFrame, Outputs
+from cozy_runtime.media import ImageFile
 
 app = App()
 
 
 class GenerateRequest(msgspec.Struct, forbid_unknown_fields=True):
     prompt: str
-    # Axis-named fields normalize into RequestFeatures with nothing authored.
     width: int = 64
     height: int = 64
     seed: int | None = None
@@ -90,8 +90,7 @@ class GenerateResult(msgspec.Struct):
 
 @app.entrypoint
 def generate(ctx: Context, payload: GenerateRequest, out: Outputs) -> GenerateResult:
-    # Weightless: no model parameter yet, so this package derives gpu=False. Adding
-    # `model: MyModel` binds real weights and gives you `model.for_request(ctx, seed=...)`.
+    # Weightless: no model parameter yet. Adding `model: MyModel` binds real weights.
     ctx.raise_if_cancelled()
     pixels = bytearray()
     for y in range(payload.height):
@@ -108,46 +107,10 @@ def _module(pkg: str) -> str:
     return _MODULE.replace("__PKG__", pkg)
 
 
-_EXAMPLE = '''"""Runnable, weightless, no GPU: `uv run python -m __PKG__`.
-
-The fakes are capability adapters over the PRODUCTION invocation kernel — the decode,
-injection, validation and encode below are the ones a served request runs.
-"""
-
-from cozy_runtime.author import describe
-from cozy_runtime.author.fakes import invoke_with_fakes
-
-from __PKG__ import app
-
-
-def main() -> None:
-    for surface in describe(app):
-        caps = ", ".join(sorted(surface.capabilities)) or "(none)"
-        print(f"registered: {surface.name}  gpu={surface.accelerator}  capabilities: {caps}")
-    envelope, outcome, _ = invoke_with_fakes(
-        app.get("generate"), {"prompt": "a cozy cabin in the woods", "seed": 7}
-    )
-    print("outcome: ", outcome.terminal, outcome.message)
-    if envelope is not None:
-        print("result:  ", envelope.result)
-        print("outputs: ", envelope.outputs)
-        print("features:", envelope.features.values)
-
-
-if __name__ == "__main__":
-    main()
-'''
-
-
-def _example(pkg: str) -> str:
-    return _EXAMPLE.replace("__PKG__", pkg)
-
-
 def _readme(name: str, pkg: str) -> str:
     return f"""# {name}
 
     uv sync
-    uv run python -m {pkg}
     uv run cozy-runtime --json describe
 
 `cozy package publish` invokes Runtime's read-only describe command and sends the canonical
@@ -179,7 +142,6 @@ def run(name: str, target_dir: str) -> Result:
         "README.md": _readme(name, pkg),
         ".gitignore": ".venv/\n__pycache__/\ndist/\n",
         f"src/{pkg}/__init__.py": _module(pkg),
-        f"src/{pkg}/__main__.py": _example(pkg),
     }
     for rel, body in files.items():
         path = target / rel

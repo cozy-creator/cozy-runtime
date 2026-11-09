@@ -45,8 +45,8 @@ if TYPE_CHECKING:
     from torch.nn import Module
 
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author._attention import _request
-from cozy_runtime.author._attention_scope import _ACTIVE_LAYOUT, AttentionLayout
+from cozy_runtime.accel.attention import _request
+from cozy_runtime.accel.attention import _ACTIVE_LAYOUT, AttentionLayout
 from cozy_runtime.author._observations import Scalar
 from cozy_runtime.internal import accel, arch, config, kernel_cache, kernel_compile, kernel_ready
 from cozy_runtime.internal.attention_ulysses import Local

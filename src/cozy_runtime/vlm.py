@@ -36,23 +36,22 @@ from transformers import (
 from transformers.initialization import no_init_weights
 from transformers.video_utils import VideoMetadata
 
-from cozy_runtime import lm, moe
+from cozy_runtime import lm
+from cozy_runtime.accel import moe
 from cozy_runtime.author import (
     Config,
-    ConformanceError,
     Context,
-    DecodedVideoFrame,
-    FileBound,
-    ImageFile,
     InvalidRequest,
     Loader,
     Model,
     ModelAssets,
     Telemetry,
     UnsupportedInput,
-    VideoFile,
     uses_components,
 )
+from cozy_runtime.author._errors import ConformanceError
+from cozy_runtime.fields import FileBound
+from cozy_runtime.media import DecodedVideoFrame, ImageFile, VideoFile
 from cozy_runtime.author._model import WARNINGS
 
 COMPONENT = "model"

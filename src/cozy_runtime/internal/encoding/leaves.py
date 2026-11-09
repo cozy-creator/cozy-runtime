@@ -27,7 +27,7 @@ from types import ModuleType
 from typing import Any, ClassVar, Protocol
 
 from cozy_runtime.author._context import device as placed_device
-from cozy_runtime.author.kernels import (
+from cozy_runtime.accel.kernels import (
     INT8_CONVROT,
     ROWWISE_FP8,
     PreQuantized,

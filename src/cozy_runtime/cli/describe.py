@@ -19,7 +19,7 @@ import typing
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.cli.io import CliError, Options, Result
 from cozy_runtime.derive.recipes import declared_plan
 from cozy_runtime.internal import package_interface, static_interface

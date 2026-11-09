@@ -1,4 +1,5 @@
-"""The attention calls a package brings (`register_attention`)."""
+"""Sparse attention layouts and a package's own attention producers. Opt-in: a call with no
+layout attends dense."""
 
 from __future__ import annotations
 
@@ -8,8 +9,98 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import Any
 
-from cozy_runtime.author._attention_scope import AttentionLayout
-from cozy_runtime.author.kernels import PreQuantized
+from cozy_runtime.accel.kernels import PreQuantized
+
+
+@dataclass(frozen=True, slots=True)
+class AttentionLayout:
+    """One live document and its protected prefix, supplied by model inference.
+
+    Dense paths are component-relative attention module prefixes. They protect
+    refiners or sensitive layers without making a generic backend infer model
+    semantics from tensor values. Exact paths are the layers whose dense rows take
+    the exact kernel when the dense kernel quantizes (a layer whose keys a coarse
+    scale cannot carry): Kitchen INT8 where the route has it, else BF16 SDPA. Runtime
+    adds every layer whose key RMSNorm gain has outlier channels
+    (`attention_sol.outlier_keys`), so a model names only the rest. Step indices are
+    zero-based. `tau` is the sparse steps' block-selection threshold (Sol-Attn's: higher
+    keeps fewer key blocks; NVIDIA's Regenerate presets run 1.0 and 1.75), read by every
+    sparse route. `sparse` says which steps those are. This describes inference only; it
+    does not authorize a backend or select a kernel.
+    """
+
+    live_tokens: int
+    protected_prefix: int
+    step: int
+    dense_until_step: int = 0
+    dense_paths: tuple[str, ...] = ()
+    exact_paths: tuple[str, ...] = ()
+    tau: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in ("live_tokens", "protected_prefix", "step", "dense_until_step"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a nonnegative integer")
+        if not self.live_tokens or self.protected_prefix > self.live_tokens:
+            raise ValueError("attention layout requires a live document containing its prefix")
+        if type(self.tau) is not float or not 0.0 <= self.tau < float("inf"):
+            raise ValueError("tau must be a finite nonnegative float")
+        for name in ("dense_paths", "exact_paths"):
+            paths = getattr(self, name)
+            if not isinstance(paths, tuple) or any(
+                not isinstance(path, str) or not path or path.startswith(".") or path.endswith(".")
+                for path in paths
+            ):
+                raise ValueError(f"{name} must be a tuple of nonempty module prefixes")
+
+    @property
+    def sparse(self) -> bool:
+        """Whether this step attends sparsely: past the dense steps, unless the protected prefix
+        leaves half the score matrix exact (its rows against every key, every other row against
+        its keys: a prefix of 29% or more). That half alone costs a dense step on 8-bit kernels,
+        and routing costs more: an H3 plate shot (prefix 51%) ran its Sol steps 1.7x its dense
+        ones on an RTX 4090 (xs-142). Such a step runs dense, on the kernel its route gives the
+        protected rows."""
+        n, p = self.live_tokens, self.protected_prefix
+        return self.step >= self.dense_until_step and 2 * (2 * n * p - p * p) < n * n
+
+
+_ACTIVE_LAYOUT: ContextVar[AttentionLayout | None] = ContextVar(
+    "cozy_attention_layout", default=None
+)
+
+
+@contextmanager
+def attention_scope(layout: AttentionLayout) -> Iterator[None]:
+    """Apply `layout` to the model calls inside; restore the previous one even on failure."""
+    if not isinstance(layout, AttentionLayout):
+        raise TypeError("attention_scope requires an AttentionLayout")
+    token = _ACTIVE_LAYOUT.set(layout)
+    try:
+        yield
+    finally:
+        _ACTIVE_LAYOUT.reset(token)
+
+
+def active_attention_layout() -> AttentionLayout | None:
+    """The layout the model supplied for the inference call in progress, or None."""
+    return _ACTIVE_LAYOUT.get()
+
+
+#: What the runtime does with an early length statement; the executor's attention installs it.
+_EXPECTED: list[Callable[[int, Any], None]] = []
+
+
+def expect_attention(live_tokens: int, module: Any) -> None:
+    """State, before inference reaches it, the live document length `module`'s attention sites
+    will see, so a kernel specialized on that length can start preparing now (h3a-087).
+
+    Advisory only: the layout each forward supplies stays the authority, and a wrong length
+    costs a wasted background compile, never an output."""
+    if type(live_tokens) is int and live_tokens > 0:
+        for listener in _EXPECTED:
+            listener(live_tokens, module)
 
 
 @dataclass(frozen=True, slots=True)

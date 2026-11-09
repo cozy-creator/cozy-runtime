@@ -48,7 +48,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-from cozy_runtime.author.kernels import Plan
+from cozy_runtime.accel.kernels import Plan
 
 try:
     import torch

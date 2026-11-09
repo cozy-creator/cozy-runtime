@@ -15,7 +15,6 @@ from cozy_runtime.author import (
     App,
     Context,
     DerivationHook,
-    MemoDistribution,
     Model,
     ModelArtifact,
     QuantizationPlan,

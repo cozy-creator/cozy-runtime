@@ -33,9 +33,9 @@ from typing import Any, NamedTuple, cast
 import tensorfs.varena.torch as vt
 from tensorfs import varena
 
-from cozy_runtime import stepcache
+from cozy_runtime.accel import stepcache
 from cozy_runtime.author import _request_path as request_path
-from cozy_runtime.author._attention_scope import active_attention_layout
+from cozy_runtime.accel.attention import active_attention_layout
 from cozy_runtime.author._context import CURRENT
 from cozy_runtime.author._context import device as placed_device
 from cozy_runtime.author._errors import CAPTURE_ERRORS, Fault, OutputError, fault, is_capacity

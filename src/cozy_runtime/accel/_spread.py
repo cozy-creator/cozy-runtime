@@ -1,17 +1,17 @@
 """Spread one component's pure method calls over the GPUs of its group."""
 
-from collections.abc import Iterable, Iterator
-from typing import Any
+from collections.abc import Callable, Iterable, Iterator
+from typing import cast
 
 
-def spread(
-    component: Any,
-    method: str,
-    arguments: Iterable[tuple[Any, ...]],
+def spread[*Ts, R](
+    method: Callable[[*Ts], R],
+    arguments: Iterable[tuple[*Ts]],
     *,
     spare: bool = False,
-) -> Iterator[Any]:
-    """`getattr(component, method)(*args)` for each entry of `arguments`, results in order.
+) -> Iterator[R]:
+    """`method(*args)` for each entry of `arguments`, results in order. `method` is a bound
+    method of a component (`vae.encode`).
 
     The author's statement: the method is a pure function of its tensor and JSON arguments
     and returns one tensor. Inside a sequence-parallel group the runtime offers the calls to
@@ -24,10 +24,12 @@ def spread(
     needs what they hold (a spread before the sharded denoise). A GPU homing a `placeable`
     component always spares.
     """
+    component = getattr(method, "__self__", None)
+    name = getattr(method, "__name__", None)
+    if component is None or not isinstance(name, str):
+        raise TypeError("spread takes a bound method of a component: spread(vae.encode, args)")
     runner = getattr(component, "_cozy_spread", None)
     calls = iter(arguments)
     if runner is None:
-        local = getattr(component, method)
-        return (local(*args) for args in calls)
-    result: Iterator[Any] = runner(method, calls, spare)
-    return result
+        return (method(*args) for args in calls)
+    return cast("Iterator[R]", runner(name, calls, spare))

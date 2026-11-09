@@ -19,7 +19,9 @@ from dataclasses import replace
 
 import msgspec
 
-from cozy_runtime.author import Artifact, CapabilityError, Config as ModelConfig, Model
+from cozy_runtime.author import Config as ModelConfig, Model
+from cozy_runtime.author._errors import CapabilityError
+from cozy_runtime.author._loader import Artifact
 from cozy_runtime.author._loader import TENSORFS_DTYPES, TORCH_DTYPES, canonical_dtype
 from cozy_runtime.internal.lora_contract import (
     CAPABILITY as CAPABILITY,
@@ -52,7 +54,7 @@ def composer(graph: Graph, magnitudes: Mapping[str, str]) -> Callable[[object], 
         from peft.tuners.lora.layer import Conv2d as PeftConv2d, Linear as PeftLinear
         from torch import nn
 
-        from cozy_runtime import lora
+        from cozy_runtime.accel import lora
     except ImportError as exc:
         raise _refuse(
             "backend_unavailable",

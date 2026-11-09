@@ -73,7 +73,7 @@ from cozy_runtime.author._loader import (
 )
 from cozy_runtime.author._memo import MemoDependency, declare
 from cozy_runtime.author._stage_memo import StageMemo, memoized
-from cozy_runtime.author.kernels import Plan
+from cozy_runtime.accel.kernels import Plan
 
 _LOG = logging.getLogger(__name__)
 

@@ -14,7 +14,7 @@ from __future__ import annotations
 from functools import partial
 from types import ModuleType
 
-from cozy_runtime.author.kernels import INT8_CONVROT, PreQuantized
+from cozy_runtime.accel.kernels import INT8_CONVROT, PreQuantized
 from cozy_runtime.internal import arch, int8_linear, kernel_ready, prebuilt
 from cozy_runtime.internal.encoding.formats import Tensor
 

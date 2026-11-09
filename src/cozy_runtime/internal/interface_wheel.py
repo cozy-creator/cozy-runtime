@@ -8,7 +8,7 @@ from collections import defaultdict
 
 import msgspec
 
-from cozy_runtime.author import ConformanceError
+from cozy_runtime.author._errors import ConformanceError
 from cozy_runtime.internal import package_interface
 from cozy_runtime.internal.canonical import Json
 from cozy_runtime.internal.invocable_interface import Invocable

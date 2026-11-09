@@ -28,7 +28,7 @@ import time
 from collections.abc import Mapping
 from importlib import import_module
 
-from cozy_runtime.author.kernels import TritonKernels
+from cozy_runtime.accel.kernels import TritonKernels
 from cozy_runtime.internal import (
     accel,
     arch,

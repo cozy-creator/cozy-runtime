@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from cozy_runtime.author.kernels import TritonEntry
+from cozy_runtime.accel.kernels import TritonEntry
 
 try:
     import triton

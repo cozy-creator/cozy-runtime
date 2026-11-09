@@ -26,7 +26,7 @@ from types import MappingProxyType, ModuleType
 from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 from cozy_runtime import graphs
-from cozy_runtime.author import CapabilityError
+from cozy_runtime.author._errors import CapabilityError
 from cozy_runtime.author._loader import (
     TENSORFS_NAMES,
     Census,
