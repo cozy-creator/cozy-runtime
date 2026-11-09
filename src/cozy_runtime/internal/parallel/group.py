@@ -166,10 +166,16 @@ def abortable(backend: str) -> None:
     torch's watchdog otherwise tears the process down on the error an abort leaves (its
     default handling), and `_abort_process_group` asks for it off. Its heartbeat monitor kills
     the process after 8 min without a watchdog beat, a clock on a GPU that may be slow: off too.
-    Read when the communicator is made, and these are its only switches."""
+    Its stream runs at high priority: Ulysses crosses one head group while the next attends, and
+    a collective's blocks must not wait behind that kernel's waves. Read when the communicator
+    is made, and these are its only switches."""
     if "nccl" in backend:
         update_environment(
-            {"TORCH_NCCL_ASYNC_ERROR_HANDLING": "0", "TORCH_NCCL_ENABLE_MONITORING": "0"}
+            {
+                "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
+                "TORCH_NCCL_ENABLE_MONITORING": "0",
+                "TORCH_NCCL_HIGH_PRIORITY": "1",
+            }
         )
 
 
@@ -481,6 +487,7 @@ class RankGroup:
         sealed: Mapping[str, str],
         again: bool = False,
         nccl: Mapping[str, str] | None = None,
+        exchange: str = "",
         formed: Callable[[Any], None] | None = None,
     ) -> Any:
         """Form the process group in two steps, so a partial group never forms. `join`: every
@@ -489,7 +496,8 @@ class RankGroup:
         only then do all GPUs enter group init, rank 0 last, with one barrier as the proof.
         `again` forms it AGAIN after an `interrupt`: every follower joins a new store.
         `nccl` is the route every GPU forms under; `formed` runs on rank 0 right after the
-        barrier, while each follower runs its half before it answers `form`."""
+        barrier, while each follower runs its half before it answers `form`: there, every GPU
+        maps `exchange` (`copy_engine.form`)."""
         dist = torch.distributed
 
         self.check_alive()
@@ -523,7 +531,7 @@ class RankGroup:
         self._unformed(self.collect("join"), "join")
         self.initializing = True
         try:
-            self.broadcast({"cmd": "form", "calibrate": formed is not None})
+            self.broadcast({"cmd": "form", "exchange": exchange})
             self.waiting(f"forming the group: {self.gpu(0)} and {len(self.followers)} more in init")
             dist.init_process_group(
                 self.backend,

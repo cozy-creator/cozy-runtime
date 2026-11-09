@@ -99,13 +99,24 @@ class Links:
     @property
     def copy_engines(self) -> bool:
         """Copy engines may carry the exchange where every pair copies correctly and a group of
-        processes mapped each other's memory; the calibration then times them against NCCL."""
+        processes mapped each other's memory."""
         return self.all_peers and bool(self.processes.get("copy_engines"))
 
     def nccl(self) -> dict[str, str]:
         """NCCL's peer memory where every pair measured direct-and-faster and a group of
         processes formed over it, else only over NVLink, with host memory between the rest."""
         return {"NCCL_P2P_LEVEL": "SYS" if self.peer_route else "NVL"}
+
+    @property
+    def exchange(self) -> str:
+        """What carries the Ulysses exchange of a group, from its pairs alone: the copy engines
+        over peer memory where every pair reaches the other; NCCL where peer memory works for it
+        but not for them; else the copy engines through pinned host memory, which NCCL would
+        cross with SM kernels reading and writing host memory over PCIe (2.6 GB/s against 11).
+        `copy_engine.form` maps it and checks its bytes; NCCL carries a group it fails."""
+        if self.copy_engines:
+            return "copy-engine"
+        return "nccl" if self.peer_route else "host-staged"
 
     def why(self, number: Mapping[int, int] | None = None) -> str:
         """Why the group takes its route; GPUs by `number` (position -> nvidia-smi number)."""
@@ -118,7 +129,7 @@ class Links:
                 f"GPU {(number or {}).get(pair.src, pair.src)} to GPU "
                 f"{(number or {}).get(pair.dst, pair.dst)} copies directly at "
                 f"{pair.direct_gbps:.1f} GB/s, through host memory at {pair.staged_gbps:.1f}: "
-                "NCCL keeps peer memory on NVLink; copy engines are timed against it"
+                "NCCL keeps peer memory on NVLink; the copy engines carry the exchange"
             )
         if not slow:
             if not self.peer_route:
@@ -463,7 +474,8 @@ class Transport:
     route: str
     nccl: dict[str, str]
     links: Links
-    calibration: dict[str, float] = field(default_factory=dict)
+    #: the formation check of `route` (`copy_engine.form`): mapped, exact
+    check: dict[str, bool] = field(default_factory=dict)
 
     def document(self) -> dict[str, Any]:
         """GPUs by their nvidia-smi numbers; each pair's route is direct or through host memory."""
@@ -485,7 +497,7 @@ class Transport:
                 }
                 for pair in self.links.pairs
             ],
-            "calibration": dict(self.calibration),
+            "check": dict(self.check),
         }
 
 
