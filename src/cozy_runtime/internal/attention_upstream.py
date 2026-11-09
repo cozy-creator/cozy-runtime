@@ -94,6 +94,10 @@ def _first(output: Tensor | tuple[Tensor, ...] | list[Tensor]) -> Tensor:
 # ------------------------------------------------------------------ torch's own dispatch
 
 
+def _lower_right(query: Tensor, key: Tensor, mask: Tensor | None, causal: bool) -> bool:
+    return causal and mask is None and query.shape[1] != key.shape[1]
+
+
 def sdpa(
     query: Tensor,
     key: Tensor,
@@ -105,7 +109,10 @@ def sdpa(
     scale: float | None = None,
     enable_gqa: bool = False,
 ) -> Tensor:
-    """`scaled_dot_product_attention` with Diffusers' native semantics, 2D key masks included."""
+    """`scaled_dot_product_attention` with Diffusers' native semantics, 2D key masks included.
+    Causal attention at a query length other than the keys' is aligned bottom-right, as every
+    Runtime kernel aligns it (`attention.Candidate.causal_cross`); torch's `is_causal` alone
+    aligns it top-left."""
     import torch
 
     if (
@@ -115,6 +122,10 @@ def sdpa(
         and attn_mask.shape[1] == key.shape[1]
     ):
         attn_mask = attn_mask[:, None, None, :]
+    if _lower_right(query, key, attn_mask, is_causal):
+        from torch.nn.attention.bias import causal_lower_right
+
+        attn_mask, is_causal = causal_lower_right(query.shape[1], key.shape[1]), False
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
     return torch.nn.functional.scaled_dot_product_attention(
         q,
@@ -129,23 +140,33 @@ def sdpa(
 
 
 def sdpa_impl(query: Tensor, key: Tensor, value: Tensor, options: Options) -> str:
-    """The backend torch's SDPA dispatcher picks for exactly these operands."""
+    """The backend torch's SDPA dispatcher picks for exactly these operands; for bottom-right
+    causal attention, the one `CausalBias` dispatches to (flash, efficient, else a mask)."""
     import torch
+    from torch.backends import cuda
     from torch.nn.attention import SDPBackend
+    from torch.nn.attention.bias import causal_lower_right
 
     if query.is_mps:  # MPS has no backend choice: its SDPA is its own fused kernel
         return "mps"
     q, k, v = (tensor.transpose(1, 2) for tensor in (query, key, value))
-    mask = options["attn_mask"]
+    mask, causal = options["attn_mask"], options["is_causal"]
     if mask is not None and mask.ndim == 2:
         mask = mask[:, None, None, :]
+    if _lower_right(query, key, mask, causal):
+        params = cuda.SDPAParams(q, k, v, None, options["dropout_p"], False, options["enable_gqa"])
+        if cuda.can_use_flash_attention(params):
+            return "flash"
+        if cuda.can_use_efficient_attention(params):
+            return "efficient"
+        mask, causal = causal_lower_right(q.shape[2], k.shape[2])._materialize(q.device), False
     choice = torch._fused_sdp_choice(
         q,
         k,
         v,
         attn_mask=mask,
         dropout_p=options["dropout_p"],
-        is_causal=options["is_causal"],
+        is_causal=causal,
         scale=options["scale"],
         enable_gqa=options["enable_gqa"],
     )

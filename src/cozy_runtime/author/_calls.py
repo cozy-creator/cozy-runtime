@@ -18,6 +18,17 @@ from dataclasses import dataclass, field
 from typing import Any, Concatenate, ParamSpec, Protocol, TypeVar, cast, overload
 
 import msgspec
+from tensorfs.executor import (
+    Answer,
+    ChildCall,
+    ChildCancel,
+    ChildForget,
+    ChildPoll,
+    GpuRelease,
+    ModelPrefetch,
+    Request,
+    SavedFile,
+)
 
 from cozy_runtime import _application_json as application_json
 from cozy_runtime import canonical_json
@@ -27,19 +38,6 @@ from cozy_runtime.author._context import Context
 from cozy_runtime.author._decode import MediaReads
 from cozy_runtime.author._defaults import fit
 from cozy_runtime.author._errors import CapabilityError, ConformanceError
-from cozy_runtime.author._executor_requests import (
-    MAX_CALL_INDEX,
-    Answer,
-    CallState,
-    ChildCall,
-    ChildCancel,
-    ChildForget,
-    ChildPoll,
-    Exchange,
-    GpuRelease,
-    ModelPrefetch,
-    SavedFile,
-)
 from cozy_runtime.author._files import _UNBOUND, File, Files, References, Tree, asset_dec_hook
 from cozy_runtime.author._memo import MemoDependency, Memoize, memo_policy
 from cozy_runtime.author._memo import declare as declare_memo
@@ -61,6 +59,10 @@ P = ParamSpec("P")
 R = TypeVar("R")
 MAX_ACTIVE_CALLS = 32
 MAX_CALL_BYTES = 48 * 1024
+MAX_CALL_INDEX = (1 << 32) - 1
+
+#: One request to the machine; blocks until its answer.
+type Exchange = Callable[[Request], Answer]
 
 
 class Nudges(Protocol):
@@ -241,13 +243,10 @@ def prefetch(
         raise ConformanceError(
             "prefetch models require named ModelChoice values", code="child_arguments"
         )
-    broker.chooses(selected)
     payload = canonical_json.encode(msgspec.to_builtins(selected))
     if len(payload) > MAX_CALL_BYTES:
         raise CapabilityError("model prefetch exceeds inline bound", code="child_payload_bound")
-    answer = broker.exchange(
-        ModelPrefetch(module=module, export=name, payload=payload.decode()), Answer
-    )
+    answer = broker.exchange(ModelPrefetch(module=module, export=name, payload=payload.decode()))
     # The machine can decline an optional optimization; the call prepares on demand.
     if answer.code != "model_prefetch_unsupported":
         broker._check(answer, 0)
@@ -323,16 +322,10 @@ class _Broker:
         bindings: Mapping[tuple[str, str], _CallType],
         exchange: Exchange,
         watch: Callable[[], Nudges],
-        yielding: Callable[[], contextlib.AbstractContextManager[None]] | None = None,
-        model_choices: bool = False,
     ) -> None:
         self.request_id, self.bindings, self.exchange = request_id, dict(bindings), exchange
-        #: The machine takes a ModelChoice per slot (`Start.model_choices`).
-        self.model_choices = model_choices
         #: Opens the worker's nudges, at the first wait on a call; None once opened.
         self.watch: Callable[[], Nudges] | None = watch
-        #: Around each wait on a child: the attempt's memory yields its step to the child's.
-        self.yielding = yielding
         self.nudges: Nudges | None = None
         self.nudged = 0
         self.nudge = asyncio.Event()
@@ -364,24 +357,11 @@ class _Broker:
         self.attempt = attempt
         ctx._release_gpus = self.release_gpus
 
-    def chooses(self, models: object) -> None:
-        """A call's model choices, refused at once when the machine predates them."""
-        if (
-            isinstance(models, Mapping)
-            and any(choice is not None for choice in models.values())
-            and not self.model_choices
-        ):
-            raise CapabilityError(
-                "this machine's TensorD predates per-call model choices (ref, lora); "
-                "update it: `cozy machine update`",
-                code="child_model_choice_unsupported",
-            )
-
     def release_gpus(self) -> None:
         """`ctx.release_gpus()` of this attempt: its root's GPU lease ends at the worker."""
         if self.closed:
             raise CapabilityError("GPU release escaped its attempt", code="escaped_handle")
-        self._check(self.exchange(GpuRelease(), Answer), 0)
+        self._check(self.exchange(GpuRelease()), 0)
 
     def _saved(self, value: object) -> SavedFile | None:
         """`value` as a file this attempt saved, whole in its spool for TensorD to check: a frame
@@ -435,7 +415,6 @@ class _Broker:
                 "payload": {k: v for k, v in arguments.items() if k not in slots},
                 "models": {k: v for k, v in arguments.items() if k in slots},
             }
-        self.chooses(arguments.get("models"))
         if self.next_index > MAX_CALL_INDEX:
             raise CapabilityError("package call index is exhausted", code="child_index_exhausted")
         saved: dict[str, SavedFile] = {}
@@ -518,12 +497,12 @@ class _Broker:
                     raise ChildCallError("escaped_handle", "parent attempt closed", call.index)
                 for ready in tuple(self.calls.values()):
                     if ready.task is not None and ready.index not in self.activated:
-                        answer = self.exchange(self._intent(ready), CallState)
+                        answer = self.exchange(self._intent(ready))
                         self._observe(ready, answer)
                         self._check(answer, ready.index, call.ctx)
                         self.activated.add(ready.index)
                 seen = self.nudged
-                answer = self.exchange(ChildPoll(call_index=call.index), CallState)
+                answer = self.exchange(ChildPoll(call_index=call.index))
                 self._observe(call, answer)
                 self._check(answer, call.index, call.ctx)
                 if answer.state == "succeeded":
@@ -545,7 +524,7 @@ class _Broker:
                         result = decode(
                             value,
                             call.binding.result,
-                            list(answer.byte_grants),
+                            answer.byte_grants,
                             request_id=self.request_id,
                             guard=guard,
                             grant_token=self.grant_token,
@@ -559,16 +538,15 @@ class _Broker:
                             "child result differs from its interface",
                             call.index,
                         ) from exc
-                with self.yielding() if self.yielding is not None else contextlib.nullcontext():
-                    await self._changed(seen, call.ctx.deadline, call.index)
+                await self._changed(seen, call.ctx.deadline, call.index)
         except asyncio.CancelledError:
             if call.index in self.activated and not self.closed:
-                self.exchange(ChildCancel(call_index=call.index), CallState)
+                self.exchange(ChildCancel(call_index=call.index))
             raise
         finally:
             try:
                 if call.index in self.activated and not self.closed:
-                    self.exchange(ChildForget(call_index=call.index), Answer)
+                    self.exchange(ChildForget(call_index=call.index))
             finally:
                 self.activated.discard(call.index)
                 self.calls.pop(call.index, None)
@@ -619,7 +597,7 @@ class _Broker:
             nudges.close()
 
     @staticmethod
-    def _observe(call: PendingCall[Any], answer: CallState) -> None:
+    def _observe(call: PendingCall[Any], answer: Answer) -> None:
         child_id = answer.child_request_id
         if child_id:
             if len(child_id) > 256 or call.request_id not in ("", child_id):
@@ -657,8 +635,8 @@ class _Broker:
                 answer.code,
                 answer.detail,
                 index,
-                getattr(answer, "child_request_id", ""),
-                getattr(answer, "traceback", ""),
+                answer.child_request_id,
+                answer.traceback,
             )
 
     def close(self) -> None:

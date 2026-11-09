@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections.abc import Callable, Hashable, Sequence
 from typing import Any, Protocol
 
+from cozy_runtime.author import _attention
+
 
 class Loops(Protocol):
     """The Runtime's side of `denoise_loop`, installed by an executor."""
@@ -58,12 +60,17 @@ def denoise_loop(
     are declared. `i` is a one-element int64 tensor on the device holding the global step index.
     The step reads its schedule with `table.index_select(0, i)` and updates `state` and `carried`
     in place. It runs tensor operations only: no host read of a device value, no random draw
-    (noise is an input) and no host decision except one taken from its `label`. Every mode runs
-    this same function, so eager and native execution compute the same values.
+    (noise is an input, or `rng.counter_noise` from the step's `i`) and no host decision except
+    one taken from its `label`. Every mode runs this same function, so eager and native
+    execution compute the same values.
 
     - `state`: what the loop advances (latents). On return the tensors hold the final values.
     - `carried`: tensors one step leaves for the next that are not outputs.
-    - `inputs`: read-only tensors of this call.
+    - `inputs`: read-only tensors of this call, and `retained` States (a prefix's K/V): the
+      step receives the tensors a State's `get()` returns in its place. Each step run eagerly
+      reads it again, so its memory may leave the card between steps; a recorded program reads
+      it once, beside the program's pool, when there is room for both, and otherwise the call
+      runs eagerly and the run says why. Keyed or not, the same. Never call `get()` in the step.
     - `labels`: one hashable host-side label per step, which the step receives: what differs
       between steps (dense or sparse attention, an expert, a batch). Each distinct label records
       one body, run for each of its steps in order; a first call runs its steps eagerly through
@@ -82,7 +89,8 @@ def denoise_loop(
     - `cache`: a `stepcache` policy for the transformers whose stacks the package installed
       (`stepcache.install`): approximate, for a preset that asks for it, never a default.
 
-    LoRA overlays (`lora.Hook`) are armed before the loop; one a step arms raises.
+    LoRA overlays (`lora.Hook`) are armed before the loop; one a step arms raises. As it
+    returns, each attention producer's request state ends its loop (`end_loop()`).
 
     A step that runs components is called inside a `@uses_components` method, whose components
     they are. A step of tensor work alone may run outside one; it records resident too.
@@ -101,4 +109,7 @@ def denoise_loop(
     runtime = _RUNTIME
     if runtime is None:
         raise RuntimeError("denoise_loop runs inside a Runtime executor")
-    runtime.run(step, steps, state, carried, inputs, labels, key, on_step, before, after, cache)
+    try:
+        runtime.run(step, steps, state, carried, inputs, labels, key, on_step, before, after, cache)
+    finally:
+        _attention.end_loop()

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import socket
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 if sys.platform != "win32":
     import resource
@@ -95,8 +95,16 @@ def unix_seam(event: str, args: tuple[object, ...]) -> bool:
     return unix is not None and getattr(args[0], "family", None) == unix
 
 
-def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
-    """Refuse every `NETWORK_EVENTS` spelling in THIS process. IRREVERSIBLE.
+def refuse_network(
+    why: str,
+    *,
+    allow_unix_seam: bool = False,
+    also: frozenset[str] = frozenset(),
+    judge: Callable[[str, tuple[object, ...]], None] | None = None,
+) -> None:
+    """Refuse every `NETWORK_EVENTS` spelling in THIS process. IRREVERSIBLE. The same hook hands
+    the events in `also` to `judge` (the executor's package contract, `contract.audit`): one
+    hook and one set test per audited event, never a second hook.
 
     WHICH ADVERSARY (law 15). This is a bound on Python-level dialling: `socket`, `urllib`,
     `http.client`, `requests`, and everything built on them. It stops a BUGGY or careless
@@ -110,8 +118,16 @@ def refuse_network(why: str, *, allow_unix_seam: bool = False) -> None:
     on the real serving executor, so this paragraph cannot quietly become a bigger claim.
     """
 
+    network = frozenset(NETWORK_EVENTS)
+    watched = network | also
+
     def hook(event: str, args: tuple[object, ...]) -> None:
-        if event in NETWORK_EVENTS and not (allow_unix_seam and unix_seam(event, args)):
+        if event not in watched:
+            return
+        if event not in network:
+            if judge is not None:
+                judge(event, args)
+        elif not (allow_unix_seam and unix_seam(event, args)):
             raise FenceViolation("no_network", f"{event}{args[1:2] or args[:1]}: {why}")
 
     sys.addaudithook(hook)

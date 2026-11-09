@@ -18,7 +18,6 @@ class Options:
     fields: tuple[str, ...] = ()
     dir: str = "."
     package_interface: str = ""
-    conformance: bool = False
     environment_python: str = ""
     distribution: str = ""
     builtin: str = ""

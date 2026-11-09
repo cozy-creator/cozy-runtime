@@ -72,6 +72,7 @@ from cozy_runtime.internal.residency import (
     Weights,
     paging,
     split,
+    uncached,
 )
 from cozy_runtime.internal.resolution import ResolvedModelPlan, TensorResolution
 from tensorfs.raw import parts as stored_parts
@@ -375,6 +376,7 @@ class Backend:
         self.gemm_sites = leaf_sites(self.leaves)
         leg = self._leg("leaves", leg)
         for name, root in self.roots.items():
+            uncached(root)  # every component the loader built, weights or none
             keys = [key for key in order if self.plan[key].component == name]
             if keys:
                 self.models[name] = self._register(name, root, keys)
@@ -1271,7 +1273,7 @@ class Placement:
         shrink: Callable[[], bool] | None = None,
     ) -> Region:
         """An explicitly owned cache. Its owner releases entries at safe scope boundaries."""
-        return self.memory.region(owner, kind, sets=sets, release=release, shrink=shrink)
+        return self.memory.region(owner, release=release, shrink=shrink)
 
     def graph_pool(self, component: str) -> graphs.domain.Pool:
         """Stock Torch owns the graph pool; the recording retains its binding and tensors."""

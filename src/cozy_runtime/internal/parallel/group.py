@@ -27,7 +27,7 @@ from typing import Any, Protocol, TypedDict
 
 import msgspec
 
-from cozy_runtime.author._errors import DEVICE_OOM, MEMORY_EXHAUSTED
+from cozy_runtime.author._errors import DEVICE_OOM, DOES_NOT_FIT, MEMORY_EXHAUSTED
 from cozy_runtime.internal import execution_evidence, spawn
 from cozy_runtime.internal.config import inherited_environment, update_environment
 from cozy_runtime.internal.exits import Exit
@@ -40,8 +40,9 @@ from cozy_runtime.internal.seam import Channel, SeamError
 #: then written, never "only when unset" - and every rank REQUIRES it before forming a
 #: communicator: the executor asserts the seal, it does not write its own environment.
 NVLS_ENV = "NCCL_NVLS_ENABLE"
-#: A GPU's part of a call ended short of memory: the attempt fails, the group stays whole.
-SHORT = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED})
+#: A GPU's part of a call ended short of memory, or was refused it up front: the attempt fails,
+#: the group stays whole.
+SHORT = frozenset({DEVICE_OOM, MEMORY_EXHAUSTED, DOES_NOT_FIT})
 #: Another GPU ended the collective this one waited in (`RankGroup.interrupt`).
 ENDED = "group_call_ended"
 #: Every group wait's deadline. torch has no "none": its store gives up after 5 min, group init and
@@ -569,10 +570,8 @@ class RankGroup:
                 ) from exc
 
     def start(self, command: Mapping[str, object]) -> None:
-        """Hand every follower rank 0's Start. The descriptors that follow TensorD's Start are
-        rank 0's: the Start a follower gets names none, or it would wait for descriptors nobody
-        sends."""
-        self.broadcast({**command, "ledgers": 0})
+        """Hand every follower rank 0's Start."""
+        self.broadcast(command)
 
     def collect(self, name: str, shown: bool = True) -> list[dict[str, Any]]:
         """One reply named `name` from every follower, in rank order. Each wait ends with the

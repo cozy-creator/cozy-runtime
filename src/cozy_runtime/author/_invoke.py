@@ -35,6 +35,7 @@ from types import TracebackType
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import msgspec
+from tensorfs.executor import Answer, Publish
 
 from cozy_runtime.author._activity import asides
 from cozy_runtime.author._app import Registration
@@ -63,7 +64,6 @@ from cozy_runtime.author._errors import (
     fault,
     unwind,
 )
-from cozy_runtime.author._executor_requests import Publish, Published
 from cozy_runtime.author._files import (
     File,
     Files,
@@ -297,7 +297,7 @@ class Invocation:
     observations alike. Best-effort, never authoritative."""
     plan: Callable[[Sequence[str | Collection[str]]], None] | None = None
     calls: _Broker | None = None
-    publish: Callable[[Publish], Published] | None = None
+    publish: Callable[[Publish], Answer] | None = None
     """`Outputs.publish`'s exchange with the machine, which journals the run's output log."""
     #: No worker settles this attempt's frames (the fakes), so each encodes at its save.
     settle_at_save: bool = False
