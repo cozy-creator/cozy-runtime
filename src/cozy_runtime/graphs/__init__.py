@@ -1202,6 +1202,9 @@ def _capture_pending(pending: _Pending) -> bool:
                 return False
         idle = placed[0].graph_idle() if placed is not None else nullcontext()
         try:
+            # Each step that runs no torch op of its own looks for a command first: handles,
+            # a capture, a replay check and its timing hold the host where no op yields.
+            IDLE.check()
             owner.initialize()
             owner.prime_blas()  # before the idle request: Torch owns the shared workspaces
             with idle:
@@ -1317,6 +1320,7 @@ def _record(
                     outputs.append(call(module, *sargs, **skwargs))
 
                 took = time.perf_counter_ns()
+                IDLE.check()
                 try:
                     graph, why = capture(torch, step, pool, owner, reserve)
                 except varena.Exhausted as exc:  # its admission: nothing was captured
@@ -1336,6 +1340,7 @@ def _record(
                 for target, value in zip(statics, inputs, strict=True):
                     if target is not None:
                         target.copy_(value)
+                IDLE.check()
                 with owner.recovery_blocked(replay=True):
                     # Serve only when replay reproduces eager bit for bit.
                     vt.replay(graph, stream=torch.cuda.current_stream(owner.device))
@@ -1343,6 +1348,12 @@ def _record(
                     _failed(module, recorder, key, differs, "replay_mismatch")
                     return True
                 entry = _Recording(torch, graph, pool, statics, outputs[0], key, served, owner)
+                try:
+                    IDLE.check()
+                except Yielded:
+                    entry.close()
+                    graph = None
+                    raise
                 why, replayed = _no_gain(torch, entry, recorder.eager)
                 recorder.bound[key] = (submit, busy, replayed)
                 if why:

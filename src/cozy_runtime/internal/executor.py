@@ -3274,6 +3274,7 @@ class Executor:
                 construction.prepared.pop(request_id, None)
                 construction.awaiting.discard(request_id)
         IDLE_WAITED.pop(request_id, None)
+        IDLE_STAGE.pop(request_id, None)
         if self.order is not None:
             self.order.wake()  # an idle period may open now (`awaiting_invoke`)
 
@@ -3692,8 +3693,9 @@ class Executor:
                 )
             for message, raised in (*warnings, *tools.warnings()):
                 record.emit("log", message, "warn", **raised)
+            on = IDLE_STAGE.pop(command.request_id, (0.0, ""))[1]
             if (waited := IDLE_WAITED.pop(command.request_id, 0.0)) >= 1:
-                record.emit("confession", "idle.waited", _IDLE_WORK, ms=round(waited, 1))
+                record.emit("confession", "idle.waited", _IDLE_WORK, ms=round(waited, 1), on=on)
                 if waited >= IDLE_BLOCKING_MS:
                     blocking[_IDLE_WORK] = (waited, 1)
             for work, (ms, times) in blocking.items():
@@ -5173,6 +5175,8 @@ IDLE_BLOCKING_MS = 100.0
 #: call -> ms its commands waited for idle work, until its run's record takes it (`_Order.turn`);
 #: on a follower "", until its request's end hands it to rank 0's record
 IDLE_WAITED: dict[str, float] = {}
+#: call -> the idle work its longest wait was on (`_Order.stage`), for its record
+IDLE_STAGE: dict[str, tuple[float, str]] = {}
 
 
 class _Order:
@@ -5191,17 +5195,24 @@ class _Order:
         self.answered = 0
         #: the idle holder's ticket while it holds the order, and when each command since came
         self._idle: int | None = None
-        self._arrived: dict[int, float] = {}
-        #: ticket -> ms it waited for the idle holder
-        self._waited: dict[int, float] = {}
+        #: what the idle holder does now (`stage`), and each command's arrival and the work then
+        self._stage = _IDLE_WORK
+        self._arrived: dict[int, tuple[float, str]] = {}
+        #: ticket -> ms it waited for the idle holder, and on what
+        self._waited: dict[int, tuple[float, str]] = {}
 
     def ticket(self, alone: bool, what: str) -> int:
         with self._changed:
             self._next += 1
             self._open[self._next] = (alone, what)
             if self._idle is not None:
-                self._arrived[self._next] = time.perf_counter()
+                self._arrived[self._next] = (time.perf_counter(), self._stage)
             return self._next
+
+    def stage(self, what: str) -> None:
+        """The idle holder moves on to `what`: a command arriving now waits on it."""
+        with self._changed:
+            self._stage = what
 
     def first(self, ticket: int) -> bool:
         with self._changed:
@@ -5223,10 +5234,12 @@ class _Order:
                     "",
                 ),
             )
-            waited = self._waited.pop(ticket, 0.0)
+            waited, on = self._waited.pop(ticket, (0.0, ""))
         if waited:  # a follower's commands are in no call: its request's end takes them ("")
             call = _CALL.get()
             IDLE_WAITED[call] = IDLE_WAITED.get(call, 0.0) + waited
+            if waited > IDLE_STAGE.get(call, (0.0, ""))[0]:
+                IDLE_STAGE[call] = (waited, on)
         try:
             yield
         finally:
@@ -5253,9 +5266,10 @@ class _Order:
                 del self._open[ticket]
                 self._idle = None
                 now = time.perf_counter()
-                for came, at in self._arrived.items():
-                    self._waited[came] = (now - at) * 1e3
+                for came, (at, on) in self._arrived.items():
+                    self._waited[came] = ((now - at) * 1e3, on)
                 self._arrived.clear()
+                self._stage = _IDLE_WORK
                 self._changed.notify_all()
 
     def holders(self) -> list[str]:
@@ -5304,8 +5318,10 @@ def _idle(executor: Executor, order: _Order) -> None:
             if executor.poisoned:
                 return
             try:
+                order.stage("idle graph capture")
                 graphs.capture_idle(order.waiting)
                 if (memory := executor.host.memory) is not None and memory.host_pending():
+                    order.stage("idle host page pin")
                     memory.pin_idle(order.waiting)
             except Exception as exc:
                 traceback.print_exc()
