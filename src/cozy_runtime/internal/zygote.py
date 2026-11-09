@@ -34,9 +34,10 @@ def driverless(
     """Imports that ask whether CUDA exists (Diffusers does, at import) get the seal's answer.
     Torch asks the CUDA driver (`cuInit`) or NVML, and on current drivers either opens the
     device and starts a driver thread that outlives it: no child of that process can fork.
-    `starting`: the device starts on another thread, and a touch of it waits there first. Every
-    device op enters torch's lazy CUDA init (C++ factories call it by its module name), so each
-    module holding that function holds this one instead."""
+    `starting`: told of every device touch first: it waits for the device starting on another
+    thread, or refuses one (the import-only parent's builds ahead). Every device op enters
+    torch's lazy CUDA init (C++ factories call it by its module name), so each module holding
+    that function holds this one instead."""
     cuda = torch.cuda
     saved = cuda.is_available, cuda.device_count
     cuda.is_available = lambda: devices > 0

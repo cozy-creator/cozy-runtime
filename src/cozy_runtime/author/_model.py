@@ -1375,6 +1375,23 @@ class Generation:
     paths: list[str] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class Built:
+    """A model whose `load()` ran and whose constructions are not filled (`ModelRegistry.build`):
+    what a registry places once a device is up, in this process or a fork of it."""
+
+    identity: ConstructionIdentity
+    cls: type[Model[Any]]
+    artifact: Artifact
+    adapters: tuple[AdapterRef, ...]
+    model: Model[Any]
+    loader: Loader
+    #: The build's own legs, seconds.
+    legs: dict[str, float]
+    #: What the registry's substrate yielded (the serving substrate's card answer), if any.
+    substrate: object
+
+
 def component_use(cls: type) -> Mapping[str, tuple[str, ...]]:
     """The class's ComponentUseContract: method -> possible components. Descriptor content
     (cr-003), validated against the census at exact binding."""
@@ -1435,8 +1452,38 @@ class ModelRegistry:
         *,
         mode: Mode = "serve",
         adapters: Sequence[AdapterRef] = (),
+        built: Built | None = None,
     ) -> ModelT:
-        """Bind one path. Equal identity -> the SAME generation, constructed once."""
+        """Bind one path. Equal identity -> the SAME generation, constructed once. `built`: its
+        `load()` already ran (`build`, here or in the import-only parent); only its fill runs."""
+        identity, adapter_rows = self._identity(cls, artifact, adapters)
+        with self._lock:
+            generation = self._generations.get(identity)
+            if generation is None:
+                if built is None or built.identity != identity:
+                    built = self._build(identity, cls, artifact, mode, adapter_rows)
+                generation = self._place(built)
+                self._generations[identity] = generation
+            generation.paths.append(binding_path)
+            self._by_path[binding_path] = generation
+            return cast("ModelT", generation.model)
+
+    def build(
+        self,
+        cls: type[Model[Any]],
+        artifact: Artifact,
+        *,
+        mode: Mode = "serve",
+        adapters: Sequence[AdapterRef] = (),
+    ) -> Built:
+        """Run `cls.load()` and fill nothing: what `acquire(built=)` then places. It needs no
+        device; with this registry's substrate it needs no card unless it asks for one."""
+        identity, adapter_rows = self._identity(cls, artifact, adapters)
+        return self._build(identity, cls, artifact, mode, adapter_rows)
+
+    def _identity(
+        self, cls: type[Model[Any]], artifact: Artifact, adapters: Sequence[AdapterRef]
+    ) -> tuple[ConstructionIdentity, tuple[AdapterRef, ...]]:
         adapter_rows = artifact._adapters or tuple(adapters)
         cls.validate_adapter_stack(adapter_rows)
         variant = artifact.variant
@@ -1462,14 +1509,7 @@ class ModelRegistry:
             artifact=artifact.snapshot,
             variant=variant,
         )
-        with self._lock:
-            generation = self._generations.get(identity)
-            if generation is None:
-                generation = self._construct(identity, cls, artifact, mode, adapter_rows)
-                self._generations[identity] = generation
-            generation.paths.append(binding_path)
-            self._by_path[binding_path] = generation
-            return cast("ModelT", generation.model)
+        return identity, adapter_rows
 
     def models(self, callable_name: str) -> Mapping[str, Model[Any]]:
         """What `Invocation.models` needs for ONE callable, keyed by parameter name.
@@ -1506,14 +1546,14 @@ class ModelRegistry:
 
     # ----------------------------------------------------------------- internals
 
-    def _construct(
+    def _build(
         self,
         identity: ConstructionIdentity,
         cls: type[Model[Any]],
         artifact: Artifact,
         mode: Mode,
-        adapters: Sequence[AdapterRef] = (),
-    ) -> Generation:
+        adapters: tuple[AdapterRef, ...],
+    ) -> Built:
         started = time.perf_counter()
         model = cls()
         loader = self._loader(model, artifact, mode)
@@ -1527,29 +1567,45 @@ class ModelRegistry:
                 # plane reserves the real destinations (cr-005) and the two graphs stay
                 # byte-identical because there is one substrate and one census. Absent a
                 # substrate this is exactly the old behaviour: an ordinary construction.
-                if self._substrate is not None:
-                    stack.enter_context(self._substrate())
+                substrate = stack.enter_context(self._substrate()) if self._substrate else None
                 began = time.perf_counter()
                 with loading(loader):
                     model.load(loader)
                 loaded = time.perf_counter()
             exited = time.perf_counter()
-            records = loader.records()
-            if not records:
+            if not loader.built():
                 raise ConformanceError(
                     f"{cls.__name__}.load did not construct anything: the one construction "
                     "primitive is loader.construct(T, factory=…)",
                     code="no_construction",
                 )
+        except Exception:
+            for cache in loader.caches():
+                cache.drop()
+            raise
+        finally:
+            object.__setattr__(model, "_cozy_loading", False)
+        # The package's whole load() beside its constructions' legs: what its own code spent
+        # after them (tokenizers, schedulers, its assets).
+        legs = {
+            "model": made - started,  # the package's model and its loader
+            "substrate_enter": began - made,
+            "package_load": loaded - began,
+            "substrate_exit": exited - loaded,
+        }
+        return Built(identity, cls, artifact, adapters, model, loader, legs, substrate)
+
+    def _place(self, built: Built) -> Generation:
+        identity, cls, artifact, adapters = (
+            built.identity, built.cls, built.artifact, built.adapters,
+        )  # fmt: skip
+        model, loader = built.model, built.loader
+        object.__setattr__(model, "_cozy_loading", True)
+        try:
+            placed = time.perf_counter()
+            records = loader.place(self._backend)
             record = records[0] if len(records) == 1 else _merge(records)
-            # The package's whole load() beside its constructions' legs: what its own code spent
-            # after them (tokenizers, schedulers, its assets).
-            legs = {
-                "model": made - started,  # the package's model and its loader
-                "substrate_enter": began - made,
-                "package_load": loaded - began,
-                "substrate_exit": exited - loaded,
-            }
+            legs = {**built.legs, "place": time.perf_counter() - placed}
             record = replace(
                 record,
                 stage_ms=(*record.stage_ms, *((k, round(v * 1000, 1)) for k, v in legs.items())),
@@ -1596,8 +1652,9 @@ class ModelRegistry:
             object.__setattr__(model, "_cozy_record", record)
             object.__setattr__(model, "_cozy_identity", identity)
             object.__setattr__(model, "_cozy_ready", True)
-            # The whole construction; beside construct_and_register it leaves only the registry.
-            done = round((time.perf_counter() - started) * 1000, 1)
+            # The whole construction (its build, wherever it ran, and its place); beside
+            # construct_and_register it leaves only the registry.
+            done = round((sum(built.legs.values()) + time.perf_counter() - placed) * 1000, 1)
             record = replace(record, stage_ms=(*record.stage_ms, ("construct", done)))
             object.__setattr__(model, "_cozy_record", record)
         except Exception:

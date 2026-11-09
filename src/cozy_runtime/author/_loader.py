@@ -804,6 +804,19 @@ class ConstructionRecord:
     and a slow materialization is not observable from a prepare reply."""
 
 
+@dataclass(slots=True)
+class _Built:
+    """One `construct` call's object and census, its fit and fill deferred to `Loader.place`."""
+
+    obj: object
+    walked: Census
+    skipped: tuple[str, ...]
+    weightless: tuple[int, int, int]
+    legs: list[tuple[str, float]]
+    #: The substrate's fill observer at the build (`FILLED`), told once the fill has run.
+    filled: Callable[[object], None] | None
+
+
 # --------------------------------------------------------------------------- loader
 
 
@@ -816,6 +829,7 @@ class Loader:
         "_artifact",
         "_assets",
         "_backend",
+        "_built",
         "_caches",
         "_mode",
         "_objects",
@@ -839,6 +853,7 @@ class Loader:
         self._owner = owner
         self._open = True
         self._records: list[ConstructionRecord] = []
+        self._built: list[_Built] = []
         self._objects: list[object] = []
         self._caches: list[DerivedCache] = []
 
@@ -857,7 +872,9 @@ class Loader:
         return self._assets
 
     def construct(self, t: type[T], *, factory: Callable[[Config], T]) -> T:
-        """THE construction primitive: typed config in, walk and match, then one fill path."""
+        """THE construction primitive: typed config in, built and walked. Its fit and its one
+        fill path run once `load()` returns (`place`): until then the object's weights are meta
+        and its derived buffers hold their constructed values off the device."""
         self._require_open("loader.construct")
         identity = factory_identity(factory)
         _legs: list[tuple[str, float]] = []
@@ -895,9 +912,29 @@ class Loader:
             )
         if self._artifact._prepare is not None:
             self._artifact._prepare(obj)
-        _weightless = _weightless_census(obj)
+        weightless = _weightless_census(obj)
         walked, skipped = census(obj).only(self._backend.bound)
         _legs.append(("census", round((time.perf_counter() - _t0) * 1000, 1)))
+        self._built.append(_Built(obj, walked, skipped, weightless, _legs, FILLED.get()))
+        self._objects.append(obj)
+        return obj
+
+    def built(self) -> int:
+        """How many objects `construct` built and `place` has not filled."""
+        return len(self._built)
+
+    def place(self, backend: Backend | None = None) -> tuple[ConstructionRecord, ...]:
+        """Fit, fill and commit what `construct` built, once `load()` has returned (§1.1): what
+        `load()` does needs no device, so it may run before one is up, or in the import-only
+        parent a forked executor adopts it from. `backend` replaces the build's (the device's)."""
+        if backend is not None:
+            self._backend = backend
+        while self._built:
+            self._records.append(self._place(self._built.pop(0)))
+        return tuple(self._records)
+
+    def _place(self, built: _Built) -> ConstructionRecord:
+        legs, walked, obj = list(built.legs), built.walked, built.obj
         _t0 = time.perf_counter()
         # THE ONE VERDICT, before a byte is reserved (model-code-fit §3). The backend holds
         # the checkpoint header and asks `tensorfs.fit`; this plane matches nothing itself.
@@ -908,11 +945,11 @@ class Loader:
         warned = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("warnings", ())))
         unstored = tuple(str(k) for k in cast("Sequence[object]", (fit or {}).get("unstored", ())))
         walked = walked.without(frozenset(k.replace("/", ".", 1) for k in unstored))
-        _legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
+        legs.append(("fit", round((time.perf_counter() - _t0) * 1000, 1)))
         _t0 = time.perf_counter()
-        filled, filled_bytes = self._fill(walked, obj)
-        _legs.append(("fill", round((time.perf_counter() - _t0) * 1000, 1)))
-        record = ConstructionRecord(
+        filled, filled_bytes = self._fill(walked, obj, built.filled)
+        legs.append(("fill", round((time.perf_counter() - _t0) * 1000, 1)))
+        return ConstructionRecord(
             destinations=walked.destinations,
             components=walked.components,
             schedulers=walked.schedulers,
@@ -921,14 +958,11 @@ class Loader:
             ignored_extras=ignored,
             ignored_warnings=warned,
             unstored=unstored,
-            skipped=skipped,
+            skipped=built.skipped,
             fit=dict(fit) if fit is not None else None,
-            stage_ms=tuple(_legs),
-            weightless=_weightless,
+            stage_ms=tuple(legs),
+            weightless=built.weightless,
         )
-        self._records.append(record)
-        self._objects.append(obj)
-        return obj
 
     def load(self, t: type[T]) -> T:
         """Sugar over a REGISTERED exact adapter. Never a `from_pretrained` duck-type."""
@@ -991,7 +1025,9 @@ class Loader:
                 code="loader_closed",
             )
 
-    def _fill(self, walked: Census, obj: object) -> tuple[int, int]:
+    def _fill(
+        self, walked: Census, obj: object, filled: Callable[[object], None] | None
+    ) -> tuple[int, int]:
         """The SINGLE fill path. Failure rolls the whole construction back (§1.1).
 
         The destinations filled are the ones `materialize` reserved, re-censused — never
@@ -1013,7 +1049,7 @@ class Loader:
         except Exception:
             self._backend.poison(done)
             raise
-        if (filled := FILLED.get()) is not None:
+        if filled is not None:
             filled(obj)
         return len(done), total
 

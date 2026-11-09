@@ -165,8 +165,18 @@ class _Capability:
     first diffusers import sits in the factory.
     """
 
-    variant: str
+    #: The variant, read the first time a construction asks which card (`variant`).
+    asked: Callable[[], str]
+    #: A CUDA card is there (`is_available`): answered without reading the variant.
+    cuda: bool
     read: bool = False
+    _variant: str = ""
+
+    @property
+    def variant(self) -> str:
+        if not self._variant:
+            self._variant = self.asked()
+        return self._variant
 
     @property
     def major_minor(self) -> tuple[int, int]:
@@ -193,7 +203,7 @@ def _capability(cap: _Capability) -> Iterator[None]:
         for name in ("get_device_capability", "get_device_name", "is_available", "device_count")
     }
 
-    def mark(name: str, value: object, *, read: bool = True) -> Callable[..., object]:
+    def mark(name: str, value: Callable[[], object], *, read: bool = True) -> Callable[..., object]:
         def answer(*args: object, **kwargs: object) -> object:
             # The Runtime's own placement and kernel probes read the real card: under a count of
             # 1, torch's `get_device_properties(1)` refused a group follower's probe.
@@ -201,15 +211,14 @@ def _capability(cap: _Capability) -> Iterator[None]:
                 return saved[name](*args, **kwargs)
             if read:
                 cap.read = True
-            return value
+            return value()
 
         return answer
 
-    cuda = cap.variant not in _NO_CUDA
-    torch.cuda.get_device_capability = mark("get_device_capability", cap.major_minor)  # type: ignore[assignment]
-    torch.cuda.get_device_name = mark("get_device_name", cap.variant)  # type: ignore[assignment]
-    torch.cuda.is_available = mark("is_available", cuda, read=False)  # type: ignore[assignment]
-    torch.cuda.device_count = mark("device_count", 1 if cuda else 0, read=False)  # type: ignore[assignment]
+    torch.cuda.get_device_capability = mark("get_device_capability", lambda: cap.major_minor)  # type: ignore[assignment]
+    torch.cuda.get_device_name = mark("get_device_name", lambda: cap.variant)  # type: ignore[assignment]
+    torch.cuda.is_available = mark("is_available", lambda: cap.cuda, read=False)  # type: ignore[assignment]
+    torch.cuda.device_count = mark("device_count", lambda: int(cap.cuda), read=False)  # type: ignore[assignment]
     try:
         yield
     finally:
@@ -450,7 +459,9 @@ _CONSTANT_BYTES = 1 << 20
 
 
 @contextmanager
-def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]:
+def serving_substrate(
+    variant: str | Callable[[], str], seen: Observations, *, cuda: bool | None = None
+) -> Iterator[_Capability]:
     """The SERVE substrate: parameters weightless, DERIVED BUFFERS REAL (cr-008b).
 
     Derive mode puts everything on `meta`, and for derive that is exactly right — it walks
@@ -474,10 +485,18 @@ def serving_substrate(variant: str, seen: Observations) -> Iterator[_Capability]
     rotary_embedding_torch's frequencies) keeps its value until the factory returns (`BUILT`),
     so a buffer derived from it there has one: SeedVR2's F32 rotary frequencies were a meta
     buffer no checkpoint stores, an unbound placeholder at their first read.
+
+    `variant` may be read only when a construction first asks which card (`cuda` then says
+    whether there is one): a construction built before its device is up (or in the
+    import-only parent) waits for it, or is refused, only if it asks (`_Capability.read`).
     """
     torch = torch_module()
     nn = torch.nn
-    cap = _Capability(variant)
+    if isinstance(variant, str):
+        cap = _Capability(lambda: variant, variant not in _NO_CUDA)
+    else:
+        assert cuda is not None, "a variant read when asked needs `cuda`"
+        cap = _Capability(variant, cuda)
     original = nn.Module.register_parameter
     original_buffer = nn.Module.register_buffer
     constants: list[tuple[Any, str, Any]] = []

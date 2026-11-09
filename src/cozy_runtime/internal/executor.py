@@ -115,11 +115,12 @@ from cozy_runtime.author._invoke import (
     prepare,
     run_prepared,
 )
-from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused
+from cozy_runtime.author._loader import Artifact, Config, ModelFitRefused, _NullBackend
 from cozy_runtime.author._model import (
     LANDED,
     SCOPES,
     WARNINGS,
+    Built,
     Model,
     WarningRow,
     component_use,
@@ -172,7 +173,7 @@ from cozy_runtime.internal import (
 )
 from cozy_runtime.internal.accel import ResidencyError
 from cozy_runtime.internal.config import inherited_environment, restore_seal, seal_snapshot
-from cozy_runtime.internal.derive import Observations, serving_substrate
+from cozy_runtime.internal.derive import Observations, placing, serving_substrate
 from cozy_runtime.internal.discovery import discover_installed
 from cozy_runtime.internal.encoding import leaves
 from cozy_runtime.internal.encoding.formats import TORCH_DTYPES
@@ -445,6 +446,70 @@ class _Slot:
     first: bool
     leaving: bool = False
     last: bool = False
+
+
+@dataclasses.dataclass(slots=True)
+class _Build:
+    """One model slot's device-free construction (`Executor._build_slot`): its checkpoints'
+    headers, its config and the package's `load()`, nothing filled."""
+
+    #: by component; one dict, so what binds the artifact's adapters reads them again (`reopen`)
+    checkpoints: dict[str, Checkpoint]
+    rows: list[Any]
+    present: list[str]
+    config_checkpoint: Checkpoint
+    model_cls: type[Model[Any]]
+    artifact: Artifact
+    built: Built
+    stages: list[tuple[str, float]]
+    #: the import-only parent that built it (`_build_ahead`), 0 when built here
+    parent: int = 0
+
+    def reopen(self, host: Executor, connection: Any, binding: Binding) -> None:
+        """Its checkpoints opened again in this process, for this call's endpoint: the parent
+        read them local-only, and TensorFS's handles do not cross a fork (`release_threads`)."""
+        opened = {
+            ck.id: host._checkpoint(ck.id, connection, binding.views)
+            for ck in [*self.checkpoints.values(), self.config_checkpoint]
+        }
+        self.checkpoints.update({name: opened[ck.id] for name, ck in self.checkpoints.items()})
+        self.config_checkpoint = opened[self.config_checkpoint.id]
+        self.stages = [(f"parent.{name}", ms) for name, ms in self.stages]
+
+
+def _build_key(binding: Binding) -> str:
+    """What a slot's device-free construction depends on: its binding, but where it lands and
+    which executor reads its interface."""
+    kept = msgspec.structs.replace(
+        binding, homes={}, package_interface="", model_parameter_name="", model_parameter_names=()
+    )
+    return hashlib.sha256(msgspec.json.encode(kept, order="deterministic")).hexdigest()
+
+
+def _adapter_rows(binding: Binding) -> tuple[AdapterRef, ...]:
+    return tuple(
+        AdapterRef(
+            ref=row.model_id or row.ref,
+            scale=row.scale,
+            kind=row.kind,
+            component=row.component,
+            source_component=row.source_component,
+            family=row.family,
+        )
+        for row in binding.adapters
+    )
+
+
+class _CardAsked(RuntimeError):
+    """A construction in the import-only parent asked which card it builds for."""
+
+
+def _no_card() -> str:
+    raise _CardAsked("the import-only parent has no card to answer")
+
+
+def _no_device() -> None:
+    raise RuntimeError("a construction touched the GPU in the import-only parent")
 
 
 class _InFlight:
@@ -872,6 +937,7 @@ class Executor:
         world: int = 1,
         host: Executor | None = None,
         construction: str = "",
+        prebuilt: dict[str, _Build] | None = None,
     ) -> None:
         self.channel = channel
         self.root = root
@@ -881,6 +947,9 @@ class Executor:
         self.bearers: weights_store.Bearers = (
             host.bearers if host is not None else weights_store.Bearers()
         )
+        #: HOST ONLY: model slots built ahead without a device, by `_build_key`: the import-only
+        #: parent's (`_build_ahead`), which a process forked from it adopts at its load
+        self.prebuilt: dict[str, _Build] = {} if prebuilt is None else prebuilt
         #: HOST ONLY: the seam every thread reads through, the attempts in flight and the lock
         #: their fetch channel opens and closes under
         self.mux: Mux = (
@@ -2185,6 +2254,7 @@ class Executor:
             channel,
             Path(command.root),
             fill_forensics_dir=_SEALED.get(child_env.FILL_FORENSICS_DIR, "").strip(),
+            prebuilt=dict(self.prebuilt),
         )
         child.imported = True
         child.discovered = self.discovered
@@ -2352,6 +2422,9 @@ class Executor:
             return self._follower_load(command)
         if self.poisoned:
             return {"ok": False, "code": "poisoned_generation", "detail": self.poisoned}
+        if self.imported and not self.started and self.world == 1 and self.group is None:
+            # The import-only parent: what needs no device, ahead of the fork that adopts it.
+            return self._build_ahead(command)
         if not self.started:
             return self._refusal("executor_not_started", "load before start")
         key = command.construction
@@ -2561,6 +2634,153 @@ class Executor:
             "active": self.active,
         }
 
+    def _card(self, binding: Binding) -> str:
+        """The hardware variant a construction asked for (`serving_substrate`): the binding's,
+        else this executor's device family, else its card, awaited and measured."""
+        if binding.variant:
+            return binding.variant
+        if self.device_kind != "cuda":
+            return self.device_kind
+        refused = self._initialize_device(self.torch)
+        if refused is not None:
+            raise RuntimeError(f"this GPU did not start: {refused['detail']}"[:900])
+        with placing():
+            return f"sm{measure_device(self.torch, self.rank if self.world > 1 else 0).sm}"
+
+    def _build_slot(self, binding: Binding, connection: Any, card: Callable[[], str]) -> _Build:
+        """THE DEVICE-FREE HALF OF A SLOT'S CONSTRUCTION: its checkpoints' headers, its config, its
+        artifact and the package's `load()` (`ModelRegistry.build`), nothing filled. `card`
+        answers a construction that asks which card it builds for."""
+        stages: list[tuple[str, float]] = []
+        mark = [time.perf_counter()]
+
+        def stage(name: str) -> None:
+            now = time.perf_counter()
+            stages.append((name, round((now - mark[0]) * 1000, 1)))
+            mark[0] = now
+
+        host = self.host
+        # The header ref identifies stored weights and metadata, opened through TensorFS in the
+        # shared store, one checkpoint per header ref. The component SET is the contract's own
+        # declared order (cr-008b); `snapshots` names ONE snapshot per component, because a
+        # TensorFS read plan is complete over its header (tfs-007).
+        names = list(binding.components or [binding.component])
+        per_component = dict(binding.snapshots)
+        manifests = dict.fromkeys(per_component.get(name, binding.snapshot) for name in names)
+        opened = {m: host._checkpoint(m, connection, binding.views) for m in manifests}
+        checkpoints = {name: opened[per_component.get(name, binding.snapshot)] for name in names}
+        # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
+        # carries: a constructed component the checkpoint lacks is the fit's own
+        # `component_missing`, judged at construction with the §3 text, so the plan is
+        # resolved over the rows the header does supply and nothing here refuses first.
+        present = [name for name in names if checkpoints[name].has(name)]
+        rows = [r for name in present for r in checkpoints[name].rows(name)]
+        stage("checkpoint_headers")
+        model_cls = next(
+            cls for cls in self._model_classes() if cls.__name__ == binding.model_class
+        )
+        config_checkpoint = next(
+            (c for c in checkpoints.values() if c.id == binding.snapshot), None
+        ) or host._checkpoint(binding.snapshot, connection, binding.views)
+        config_bytes = model_config.construction_config(config_checkpoint.configs())
+        config_document = canonical.parse_canonical(config_bytes)
+        if not isinstance(config_document, dict):
+            raise RuntimeError("the CozyTensors construction config is not an object")
+        stage("construction_config")
+        artifact = Artifact(
+            binding.snapshot,
+            tensor_schema_of(rows),
+            Config(config_document, "model.config"),
+            assets=config_checkpoint.assets(),
+            # CUSTODY is a BINDING fact: canonical refuses a serve-time extra key, local
+            # tiers it (§1.1).
+            custody=binding.custody,
+            unnormalized=normalized(config_checkpoint),
+        )
+        adapter_graphs = [
+            (checkpoint.id, checkpoint.asset(component, model_config.ADAPTERS))
+            for checkpoint in {c.id: c for c in checkpoints.values()}.values()
+            for component, held in checkpoint.ck.components.items()
+            if model_config.ADAPTERS in held.assets
+        ]
+        if adapter_graphs:
+            manifest, data = adapter_graphs[0]
+            graph = read_adapter_graph(data)
+            if any(read_adapter_graph(other) != graph for _, other in adapter_graphs[1:]):
+                raise CapabilityError(
+                    "one model slot selects different prepared adapter graphs",
+                    code="adapter_graph_conflict",
+                )
+            artifact = bind_adapters(
+                artifact,
+                model_cls,
+                data,
+                lambda component, name: checkpoints[component].binding(component)(name),
+                prepared_snapshot=manifest,
+            )
+        seen = Observations()
+        registry = ModelRegistry(
+            release=binding.release,
+            backend=_NullBackend(frozenset(checkpoints)),
+            substrate=lambda: serving_substrate(card, seen, cuda=self.device_kind == "cuda"),
+        )
+        built = registry.build(model_cls, artifact, adapters=_adapter_rows(binding))
+        stage("build")
+        return _Build(
+            checkpoints, rows, present, config_checkpoint, model_cls, artifact, built, stages
+        )
+
+    def _build_ahead(self, command: Load) -> dict[str, Any]:
+        """HOST ONLY, in the import-only parent: each model slot's device-free construction
+        (`_build_slot`), kept by binding for the executors forked from here to adopt (`_forked`).
+        It fails closed: a slot whose construction asks which card, touches the GPU or raises is
+        not kept, and a parent left holding a thread refuses this load and every fork."""
+        import torch
+
+        started = time.perf_counter()
+        connection = _connection(command.tensorfs, command.actor, self.bearers)
+        rows = command.models if command.models is not UNSET else (command.single(),)
+        kept: dict[str, float] = {}
+        refused: dict[str, str] = {}
+        # Its CPU ops run on this thread: an intra-op pool's threads would outlive them.
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        try:
+            for row in rows:
+                binding = row.binding
+                key = _build_key(binding)
+                path = binding.model_binding_path
+                if not binding.model_class or path in self.on_demand or key in self.prebuilt:
+                    continue
+                began = time.perf_counter()
+                try:
+                    with zygote.driverless(torch, len(_sealed_entries()), _no_device):
+                        build = self._build_slot(binding, connection, _no_card)
+                    if getattr(build.built.substrate, "read", False):
+                        raise _CardAsked("its construction asks which card it builds for")
+                except Exception as exc:
+                    refused[path] = f"{type(exc).__name__}: {exc}"[:300]
+                    continue
+                build.parent = os.getpid()
+                self.prebuilt[key] = build
+                kept[path] = round((time.perf_counter() - began) * 1000, 1)
+        finally:
+            torch.set_num_threads(threads)
+        # TensorFS read its headers and assets on its fetch runtime and dropped natives on its
+        # release worker: their threads end here, or it can't fork.
+        tensorfs.release_threads()
+        unsafe = zygote.unsafe(torch)
+        said = (
+            f"built ahead {kept or 'nothing'} in {(time.perf_counter() - started) * 1000:.0f} ms"
+            + (f"; not kept {refused}" if refused else "")
+            + f"; rss {_rss() >> 20} MiB"
+        )
+        why = f"; cannot fork: {unsafe}" if unsafe else ""
+        print(f"[zygote] {said}{why}", file=sys.stderr, flush=True)
+        if unsafe:
+            return self._refusal("fork_unsafe", f"{unsafe}; {said}"[:900])
+        return {"ok": True, "detail": said[:900], "built": kept, "refused": refused}
+
     def _prepare_first(self, command: Load) -> dict[str, Any]:
         """Construct and fill one construction (or one model of a many-model one)."""
         if self.poisoned:
@@ -2693,16 +2913,23 @@ class Executor:
         if self.discovered is None:
             self._discover_provisioned(binding)
         stage("package_import")
-
-        # The header ref identifies stored weights and metadata. Runtime opens it through
-        # TensorFS in the shared store, then plans reads from its components.
-        # The component SET, in the contract's own declared order. A single-component
-        # binding is the same code with a one-element set: cr-008b did not add a second
-        # path, it widened the one that existed. `snapshots` names ONE snapshot per
-        # component, because a TensorFS read plan is complete over its header and a
-        # partial read of a whole-pipeline snapshot has no representation (tfs-007).
-        names = list(binding.components or [binding.component])
-        per_component = dict(binding.snapshots)
+        host = self.host
+        connection = _connection(command.tensorfs, command.actor, host.bearers)
+        # THE DEVICE-FREE HALF (`_build_slot`): the headers, the config and the package's
+        # `load()`, beside the device coming up, or already done by the import-only parent this
+        # process forked from (`_build_ahead`), whose checkpoints open again for this call.
+        build = host.prebuilt.pop(_build_key(binding), None)
+        if build is not None:
+            build.reopen(host, connection, binding)
+            stage("reopen")
+            stages.extend(build.stages)
+        else:
+            build = self._build_slot(binding, connection, functools.partial(self._card, binding))
+            stages.extend(build.stages)
+            _mark[0] = time.perf_counter()
+        checkpoints, rows, present = build.checkpoints, build.rows, build.present
+        model_cls, config_checkpoint = build.model_cls, build.config_checkpoint
+        artifact, per_component = build.artifact, dict(binding.snapshots)
 
         # --------------------------------------------------------- PLAN RESOLUTION (#549.1)
         #
@@ -2725,36 +2952,6 @@ class Executor:
         # the executor's device; a repository lane is never a hardware claim. THE DEVICE IS
         # ORDINAL 0 BY CONSTRUCTION (cr-066): the worker sealed this process to exactly its
         # lane's devices, so there is nothing to select here and no index to carry.
-        host = self.host
-        # One checkpoint per header ref, through the public TensorFS API.
-        opened: dict[str, Checkpoint] = {}
-        for manifest in {per_component.get(name, binding.snapshot) for name in names}:
-            opened[manifest] = host._checkpoint(
-                manifest, _connection(command.tensorfs, command.actor, host.bearers), binding.views
-            )
-        checkpoints = {name: opened[per_component.get(name, binding.snapshot)] for name in names}
-        # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
-        # carries: a constructed component the checkpoint lacks is the fit's own
-        # `component_missing`, judged at construction with the §3 text, so the plan is
-        # resolved over the rows the header does supply and nothing here refuses first.
-        present = [name for name in names if checkpoints[name].has(name)]
-        rows = [r for name in present for r in checkpoints[name].rows(name)]
-        stage("checkpoint_headers")
-        model_cls = next(
-            cls for cls in self._model_classes() if cls.__name__ == binding.model_class
-        )
-        config_checkpoint = next(
-            (c for c in checkpoints.values() if c.id == binding.snapshot), None
-        ) or host._checkpoint(
-            binding.snapshot,
-            _connection(command.tensorfs, command.actor, host.bearers),
-            binding.views,
-        )
-        config_bytes = model_config.construction_config(config_checkpoint.configs())
-        config_document = canonical.parse_canonical(config_bytes)
-        if not isinstance(config_document, dict):
-            raise RuntimeError("the CozyTensors construction config is not an object")
-        stage("construction_config")
         # THE DEVICE'S FIRST USE: what Start began, awaited (its wait is this leg).
         waited = time.perf_counter()
         refused = self._initialize_device(torch)
@@ -2818,7 +3015,7 @@ class Executor:
         construction = ConstructionFacts(
             release=binding.release,
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
-            components=tuple(names),
+            components=tuple(checkpoints),
             custody=binding.custody,
         )
         # CONSENT IS AN INPUT TO RESOLUTION (#549.1). It used to fire at `materialize`, with
@@ -2887,37 +3084,6 @@ class Executor:
             custody=binding.custody,
         )
         stage("backend_ctor")
-        artifact = Artifact(
-            reference.snapshot,
-            tensor_schema_of(rows),
-            Config(config_document, "model.config"),
-            assets=config_checkpoint.assets(),
-            # CUSTODY is a BINDING fact: canonical refuses a serve-time extra key, local
-            # tiers it (§1.1).
-            custody=binding.custody,
-            unnormalized=normalized(config_checkpoint),
-        )
-        adapter_graphs = [
-            (checkpoint.id, checkpoint.asset(component, model_config.ADAPTERS))
-            for checkpoint in {c.id: c for c in checkpoints.values()}.values()
-            for component, held in checkpoint.ck.components.items()
-            if model_config.ADAPTERS in held.assets
-        ]
-        if adapter_graphs:
-            manifest, data = adapter_graphs[0]
-            graph = read_adapter_graph(data)
-            if any(read_adapter_graph(other) != graph for _, other in adapter_graphs[1:]):
-                raise CapabilityError(
-                    "one model slot selects different prepared adapter graphs",
-                    code="adapter_graph_conflict",
-                )
-            artifact = bind_adapters(
-                artifact,
-                model_cls,
-                data,
-                lambda component, name: checkpoints[component].binding(component)(name),
-                prepared_snapshot=manifest,
-            )
         seen = Observations()
         registry = ModelRegistry(
             release=binding.release,
@@ -2929,19 +3095,12 @@ class Executor:
                 {name: tuple(r.key for r in checkpoints[name].rows(name)) for name in present}
             )
             stage("expect")
-            adapter_rows = tuple(
-                AdapterRef(
-                    ref=row.model_id or row.ref,
-                    scale=row.scale,
-                    kind=row.kind,
-                    component=row.component,
-                    source_component=row.source_component,
-                    family=row.family,
-                )
-                for row in binding.adapters
-            )
             model = registry.acquire(
-                binding.model_binding_path, model_cls, artifact, adapters=adapter_rows
+                binding.model_binding_path,
+                model_cls,
+                artifact,
+                adapters=_adapter_rows(binding),
+                built=build.built,
             )
             stage("construct_and_register")
         except ModelFitRefused as exc:
