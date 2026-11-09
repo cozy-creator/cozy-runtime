@@ -2,10 +2,16 @@
 names, and the exchange around a head-local kernel (`attention_ulysses`). Sequence shards cross
 to whole sequences per head subset, `compute` runs, and its output crosses back.
 
-Two rounds of metadata over the group's store come first. Every rank proposes its rows and the
-level native selection takes for it, its room made; every rank takes the finest proposed, admits it
-and allocates its first buffers; every rank reports ready or refused. No rank enters a collective
-alone: a refusal on any rank is every rank's, before anything crosses, and nothing runs twice.
+The heads cross in groups, pipelined: the next group's Q/K/V and the last group's output cross
+while this group's attention runs (an exchange's own streams, or NCCL's), so the links and the
+SMs work at once. A level of the native split is a head group; an exchange large enough to
+pipeline runs in at least `_ROUNDS` of them (`_pipelined`).
+
+One round of metadata over the group's store comes first: every rank proposes its rows and the
+level native selection takes for it, its room made, or its refusal; every rank takes the finest
+proposed. A refusal there is every rank's, before anything crosses. Room taken after it (another
+program, between selection and the split) fails that rank alone: the group's interrupt ends the
+collectives its peers entered and the attempt ends short of memory (`mirror.mirror_component`).
 """
 
 from __future__ import annotations
@@ -30,6 +36,12 @@ from cozy_runtime.internal.parallel import copy_engine
 from cozy_runtime.internal.parallel.group import abort_process_group
 
 type Compute = Callable[[Tensor, Tensor, Tensor], Tensor]
+type Wait = Callable[[], None]
+
+#: Head groups an exchange that pipelines runs in, at least.
+_ROUNDS = 4
+#: Each group's Q/K/V to one peer, at least, for a group's crossing to outlast its launches.
+_ROUND_BYTES = 16 << 20
 
 
 def group(config: object) -> ProcessGroup:
@@ -58,19 +70,18 @@ class _Rendezvous:
         self.rank, self.world = dist.get_rank(handle), dist.get_world_size(handle)
         self.sequence = 0
         self.lock = threading.Lock()
+        #: the level an exchange's geometry pipelines from, as the last agreed rows made it: the
+        #: same on every rank, so every rank's menu starts there
+        self.floors: dict[tuple[int, ...], int] = {}
 
-    def gather(self, stage: str, value: dict[str, Any]) -> list[dict[str, Any]]:
-        prefix = f"{self.sequence}/{stage}/"
-        keys = [f"{prefix}{rank}" for rank in range(self.world)]
+    def gather(self, value: dict[str, Any]) -> list[dict[str, Any]]:
+        """Every rank's `value` for this sequence: three store calls a rank. Each rank has read
+        the last sequence's values before it proposes this one, so its own of them goes."""
+        keys = [f"{self.sequence}/{rank}" for rank in range(self.world)]
         self.store.set(keys[self.rank], json.dumps(value))
         rows = [json.loads(data) for data in self.store.multi_get(keys)]
-        # Rank 0 deletes once every rank has read, so a long-lived group's store stays small.
-        done = [f"{prefix}read/{rank}" for rank in range(self.world)]
-        self.store.set(done[self.rank], b"1")
-        if self.rank == 0:
-            self.store.multi_get(done)
-            for key in (*keys, *done):
-                self.store.delete_key(key)
+        if self.sequence > 1:
+            self.store.delete_key(f"{self.sequence - 1}/{self.rank}")
         return rows
 
 
@@ -94,18 +105,31 @@ def _steps(heads: int, world: int) -> list[int]:
 def _need(
     step: int, batch: int, rows: int, heads: int, dim: int, b: int, world: int
 ) -> tuple[int, ...]:
-    """A group of `step` heads: the output held throughout; its q, k and v sent and received; then
-    received beside the local attention; then the attended rows and their return. Every rank's rows
-    are taken as this one's: an estimate."""
+    """A group of `step` heads: the output held throughout. Whole: its q, k and v sent and
+    received; then received beside the local attention; then the attended rows and their return.
+    Pipelined: beside a group's received q, k, v and its attention, the next group's sent and
+    received and the last group's return. Every rank's rows are taken as this one's: an estimate."""
     total, local = rows * world, step // world
     each = batch * rows * step * dim * b
     attention = sizing.Attention(batch, total, local, local, total, dim, b).need(local, total)
-    return sizing.peak(
-        batch * rows * heads * dim * b,
-        (each, each, each, each, each, each),
-        (each, each, each, *attention),
-        (each, each),
-    )
+    out = batch * rows * heads * dim * b
+    if step == heads:
+        return sizing.peak(out, (each,) * 6, (each, each, each, *attention), (each, each))
+    return sizing.peak(out, (*(each,) * 11, *attention))
+
+
+def _pipelined(steps: Sequence[int], sizes: Sequence[int], batch: int, dim: int, b: int) -> int:
+    """The coarsest level of at least `_ROUNDS` groups whose Q/K/V to a peer is `_ROUND_BYTES`,
+    or the finest that still is; 0 where even the whole exchange is smaller (latency-bound)."""
+    world, rows, heads = len(sizes), max(sizes), steps[0]
+    found = 0
+    for at, step in enumerate(steps):
+        if 3 * batch * rows * (step // world) * dim * b < _ROUND_BYTES:
+            break
+        found = at
+        if heads // step >= _ROUNDS:
+            break
+    return found
 
 
 def _refusal(rows: Sequence[dict[str, Any]]) -> None:
@@ -126,18 +150,25 @@ def _failure(exc: BaseException) -> dict[str, Any]:
     return {"error": f"{type(exc).__name__}: {exc}", "kind": kind}
 
 
-def _cross(
+def _start(
     handle: ProcessGroup,
-    engines: copy_engine.CopyEngineExchange | None,
+    engines: copy_engine.Exchange | None,
     sends: list[Tensor],
     receives: list[Tensor],
     matrix: list[list[int]],
     rank: int,
-) -> None:
-    """One crossing of `matrix`'s rows, over the copy engines when the group formed over them."""
+) -> Wait:
+    """One crossing of `matrix`'s rows in flight after the current stream's work so far, over
+    the group's exchange when it formed with one, else on NCCL's stream. The call returned
+    orders the current stream after it; it holds the crossing's tensors, so no allocation on
+    the current stream takes their memory before then."""
     if engines is not None:
-        engines.all_to_all_into(sends, matrix, receives)
-        return
+        done = engines.start(sends, matrix, receives)
+
+        def landed(held: tuple[list[Tensor], list[Tensor]] = (sends, receives)) -> None:
+            torch.cuda.current_stream(held[0][0].device).wait_event(done)
+
+        return landed
     works = [
         dist.all_to_all_single(
             out,
@@ -149,8 +180,12 @@ def _cross(
         )
         for value, out in zip(sends, receives, strict=True)
     ]
-    for work in works:
-        work.wait()
+
+    def waited(held: tuple[list[Tensor], list[Tensor]] = (sends, receives)) -> None:
+        for work in works:
+            work.wait()
+
+    return waited
 
 
 def _pack(source: Tensor, target: Tensor, start: int, world: int) -> None:
@@ -170,12 +205,100 @@ def _pack(source: Tensor, target: Tensor, start: int, world: int) -> None:
             )
 
 
-def _buffers(query: Tensor, world: int, total: int, local: int) -> list[list[Tensor]]:
-    """A head group's sends and receives, for q, k and v."""
-    batch, rows, _, dim = (int(n) for n in query.shape)
-    return [
-        [query.new_empty((n, batch, local, dim)) for _ in range(3)] for n in (world * rows, total)
-    ]
+def _send(
+    handle: ProcessGroup,
+    engines: copy_engine.Exchange | None,
+    sources: tuple[Tensor, Tensor, Tensor],
+    start: int,
+    total: int,
+    local: int,
+    matrix: list[list[int]],
+    rank: int,
+) -> tuple[Wait, list[Tensor]]:
+    """A head group's q, k and v packed and crossing; its receivers."""
+    batch, rows, _, dim = (int(n) for n in sources[0].shape)
+    world = len(matrix)
+    sends = [sources[0].new_empty((world * rows, batch, local, dim)) for _ in range(3)]
+    receives = [sources[0].new_empty((total, batch, local, dim)) for _ in range(3)]
+    for source, target in zip(sources, sends, strict=True):
+        _pack(source, target, start, world)
+    return _start(handle, engines, sends, receives, matrix, rank), receives
+
+
+def _land(out: Tensor, wait: Wait, returned: Tensor, start: int, world: int) -> None:
+    """A group's attended rows, back on this GPU, into its heads of `out`."""
+    batch, mine, _, dim = out.shape
+    local = returned.shape[2]
+    wait()
+    part = out[:, :, start : start + world * local].view(batch, mine, world, local, dim)
+    part.copy_(returned.view(world, mine, batch, local, dim).permute(2, 1, 0, 3, 4))
+
+
+class _Clock:
+    """This GPU's exchanges on their calling stream, by CUDA events read once complete: each
+    one's span and the attention inside, so the rest is what communication left exposed."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.pending: list[tuple[Any, Any, list[tuple[Any, Any]], int, int]] = []
+        self.totals = dict.fromkeys(("calls", "groups", "crossed", "exchange", "attention"), 0.0)
+
+    @staticmethod
+    def mark(on: Tensor) -> Any:
+        if not on.is_cuda or torch.cuda.is_current_stream_capturing():
+            return None
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        return event
+
+    def add(self, began: Any, ended: Any, inner: list[tuple[Any, Any]], crossed: int) -> None:
+        if began is None or ended is None:
+            return
+        with self.lock:
+            self.pending.append((began, ended, inner, crossed, len(inner)))
+            if len(self.pending) > 256:
+                self._fold(wait=False)
+
+    def _fold(self, *, wait: bool) -> None:
+        while self.pending:
+            began, ended, inner, crossed, groups = self.pending[0]
+            if wait:
+                ended.synchronize()
+            elif not ended.query():
+                return
+            self.pending.pop(0)
+            totals = self.totals
+            totals["calls"] += 1
+            totals["groups"] += groups
+            totals["crossed"] += crossed
+            totals["exchange"] += began.elapsed_time(ended)
+            totals["attention"] += sum(
+                a.elapsed_time(z) for a, z in inner if a is not None and z is not None
+            )
+
+    def take(self) -> dict[str, float]:
+        with self.lock:
+            self._fold(wait=True)
+            totals, self.totals = self.totals, dict.fromkeys(self.totals, 0.0)
+        exchange, attention = totals["exchange"], totals["attention"]
+        return {
+            "calls": int(totals["calls"]),
+            "groups": int(totals["groups"]),
+            "crossed_gb": round(totals["crossed"] / 1e9, 3),
+            "exchange_ms": round(exchange, 1),
+            "attention_ms": round(attention, 1),
+            "exposed_ms": round(exchange - attention, 1),
+        }
+
+
+_CLOCK = _Clock()
+
+
+def taken() -> dict[str, float]:
+    """What this GPU's exchanges moved and took since the last take (`cozy run show`:
+    `transport.exchange`): device ms on the calling stream, the attention inside them, and the
+    rest, which communication and its packing left exposed."""
+    return _CLOCK.take()
 
 
 def exchange(
@@ -205,14 +328,17 @@ def _exchange(
 ) -> Tensor:
     rank, world = meet.rank, meet.world
     batch, mine, heads, dim = (int(n) for n in query.shape)
+    b = query.element_size()
     padded = heads + (-heads % world)
     steps = _steps(padded, world)
+    geometry = (batch, padded, dim, b)
+    floor = min(meet.floors.get(geometry, 0), len(steps) - 1)
     # What a rank's rows and heads make of a group fixes the menu; each rank's menu stays its own.
     menu = tuple(
-        (str(at), _need(step, batch, mine, padded, dim, query.element_size(), world))
-        for at, step in enumerate(steps)
+        (str(at), _need(step, batch, mine, padded, dim, b, world)) for at, step in enumerate(steps)
     )
-    site = f"ulysses:{hash(menu):x}"
+    levels = menu[floor:]
+    site = f"ulysses:{hash(levels):x}"
     device = query.device.index or 0
     request = catch.CURRENT.get()
     native = (
@@ -226,63 +352,65 @@ def _exchange(
         assert request is not None
         stream = int(torch.cuda.current_stream(device).cuda_stream)
         request.memory.remember_working_phase(site, catch.owners(request))
-    proposal: dict[str, Any] = {"rows": mine, "at": catch.LEVELS.get(site, 0)}
+    proposal: dict[str, Any] = {"rows": mine, "at": max(catch.LEVELS.get(site, floor), floor)}
     selection: dict[str, Any] = {}
     try:
         if native:
-            selection = catch.select(device, site, "ulysses", menu, stream)
+            selection = catch.select(device, site, "ulysses", levels, stream)
             proposal["at"] = int(selection["choice_id"])
     except Exception as exc:
         proposal |= _failure(exc)
-    proposals = meet.gather("propose", proposal)
+    proposals = meet.gather(proposal)
     _refusal(proposals)
     sizes = [int(row["rows"]) for row in proposals]
-    at = max(int(row["at"]) for row in proposals)
-    step, total, local = steps[at], sum(sizes), steps[at] // world
-    token, buffers, ready = None, None, {}
-    try:
-        if native:
-            token = catch.begin(device, site, "ulysses", menu, at, selection, stream)
-        out = query.new_empty((batch, mine, padded, dim))
-        buffers = _buffers(query, world, total, local)
-    except Exception as exc:
-        ready = _failure(exc)
-    answers = meet.gather("ready", ready)
-    if any(row.get("error") for row in answers):
-        if token is not None:
-            vt.split_end(device, token, submitted=False)
-        _refusal(answers)
+    total = sum(sizes)
+    pipelined = meet.floors[geometry] = _pipelined(steps, sizes, batch, dim, b)
+    at = max(pipelined, *(int(row["at"]) for row in proposals))
+    step, local = steps[at], steps[at] // world
+    token = None
+    if native:
+        token = catch.begin(device, site, "ulysses", menu, at, selection, stream)
     catch.LEVELS[site] = at
     if request is not None:
         catch.note(request, site, "ulysses", at)
-    assert buffers is not None
-    sends, receives = buffers
-    del buffers
     sent = [[n] * world for n in sizes]
     back = [list(sizes) for _ in range(world)]
     engines = copy_engine.for_group(handle)
+    starts = range(0, padded, step)
     crossed = submitted = False
+    began, inner = _Clock.mark(query), []
     try:
-        for start in range(0, padded, step):
-            for source, target in zip((query, key, value), sends, strict=True):
-                _pack(source, target, start, world)
-            crossed = True
-            _cross(handle, engines, sends, receives, sent, rank)
-            del sends
+        out = query.new_empty((batch, mine, padded, dim))
+        sources = (query, key, value)
+        # In flight: the next group's q, k, v, and the last group's output (`_need`).
+        arriving = [_send(handle, engines, sources, starts[0], total, local, sent, rank)]
+        crossed = True
+        returning: list[tuple[Wait, Tensor, int]] = []
+        for index, start in enumerate(starts):
+            wait, receives = arriving.pop()
+            wait()
+            del wait  # its sends go: the current stream is past their crossing
+            if index + 1 < len(starts):
+                following = starts[index + 1]
+                arriving.append(
+                    _send(handle, engines, sources, following, total, local, sent, rank)
+                )
+            first = _Clock.mark(query)
             attended = compute(*(t.permute(1, 0, 2, 3).contiguous() for t in receives))
+            inner.append((first, _Clock.mark(query)))
             del receives
             if attended.shape != (batch, total, local, dim) or attended.dtype != query.dtype:
                 raise ValueError("Ulysses attention returned incompatible output")
-            returned = query.new_empty((world * mine, batch, local, dim))
-            _cross(
-                handle, engines, [attended.permute(1, 0, 2, 3).contiguous()], [returned], back, rank
-            )
+            if returning:
+                _land(out, *returning.pop(), world)
+            flat = attended.permute(1, 0, 2, 3).contiguous()
             del attended
-            part = out[:, :, start : start + step].view(batch, mine, world, local, dim)
-            part.copy_(returned.view(world, mine, batch, local, dim).permute(2, 1, 0, 3, 4))
-            del returned
-            if start + step < padded:
-                sends, receives = _buffers(query, world, total, local)
+            returned = query.new_empty((world * mine, batch, local, dim))
+            returning.append(
+                (_start(handle, engines, [flat], [returned], back, rank), returned, start)
+            )
+            del flat, returned
+        _land(out, *returning.pop(), world)
         submitted = True
     except BaseException:
         if crossed:
@@ -291,6 +419,13 @@ def _exchange(
     finally:
         if token is not None:
             vt.split_end(device, token, submitted=submitted)
+    row = batch * local * dim * b
+    _CLOCK.add(
+        began,
+        _Clock.mark(query),
+        inner,
+        len(starts) * row * (3 * mine * (world - 1) + total - mine),
+    )
     return out[:, :, :heads] if padded != heads else out
 
 
