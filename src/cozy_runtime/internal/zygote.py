@@ -28,17 +28,39 @@ LOADED = ("OMP_NUM_THREADS",)
 
 
 @contextlib.contextmanager
-def driverless(torch: Any, devices: int) -> Iterator[None]:
+def driverless(
+    torch: Any, devices: int, starting: Callable[[], object] | None = None
+) -> Iterator[None]:
     """Imports that ask whether CUDA exists (Diffusers does, at import) get the seal's answer.
     Torch asks the CUDA driver (`cuInit`) or NVML, and on current drivers either opens the
-    device and starts a driver thread that outlives it: no child of that process can fork."""
-    saved = torch.cuda.is_available, torch.cuda.device_count
-    torch.cuda.is_available = lambda: devices > 0
-    torch.cuda.device_count = lambda: devices
+    device and starts a driver thread that outlives it: no child of that process can fork.
+    `starting`: the device starts on another thread, and a touch of it waits there first. Every
+    device op enters torch's lazy CUDA init (C++ factories call it by its module name), so each
+    module holding that function holds this one instead."""
+    cuda = torch.cuda
+    saved = cuda.is_available, cuda.device_count
+    cuda.is_available = lambda: devices > 0
+    cuda.device_count = lambda: devices
+    lazy = cuda._lazy_init
+    holders = [
+        module
+        for module in list(sys.modules.values())
+        if starting is not None and getattr(module, "__dict__", {}).get("_lazy_init") is lazy
+    ]
+
+    def waiting() -> None:
+        assert starting is not None
+        starting()
+        lazy()
+
+    for module in holders:
+        module._lazy_init = waiting
     try:
         yield
     finally:
-        torch.cuda.is_available, torch.cuda.device_count = saved
+        cuda.is_available, cuda.device_count = saved
+        for module in holders:
+            module._lazy_init = lazy
 
 
 #: Kernel compiles this process started in a child, reaped when they end.

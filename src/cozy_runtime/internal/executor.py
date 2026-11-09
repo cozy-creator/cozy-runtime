@@ -503,6 +503,41 @@ class _InFlight:
             return slot.last
 
 
+class _DeviceStart:
+    """The device coming up on its own thread while Start replies and construction does its CPU
+    work (`Executor._start_device`). `ready`: its context, stream and memory serve; `warm`: its
+    libraries' first launches are made too. Torch's device answers and its lazy init wait for
+    `ready` on any other thread until then (`zygote.driverless`)."""
+
+    def __init__(self) -> None:
+        self.ready = threading.Event()
+        self.warm = threading.Event()
+        self.refused: dict[str, Any] | None = None
+        self.raised: BaseException | None = None
+        #: each step's ms on the device thread, the executor record's `cuda_init.*` legs
+        self.legs: dict[str, float] = {}
+        self.guard = contextlib.ExitStack()
+        self.thread: threading.Thread | None = None
+        self.began = time.perf_counter()
+
+    def leg(self, name: str, since: float) -> float:
+        now = time.perf_counter()
+        self.legs[f"cuda_init.{name}"] = round((now - since) * 1000, 1)
+        return now
+
+    def serve(self) -> None:
+        """The device serves, or never will: waiters go on. Torch's own answers come back once
+        it serves; one that never will keeps every touch failing, never initializing CUDA."""
+        if not self.ready.is_set():
+            if self.refused is None and self.raised is None:
+                self.guard.close()
+            self.legs["cuda_init.ready"] = round((time.perf_counter() - self.began) * 1000, 1)
+            self.ready.set()
+
+    def serving(self) -> bool:
+        return self.ready.is_set() and self.refused is None and self.raised is None
+
+
 def _distribution_version(name: str) -> str:
     """An installed distribution's version in this environment, or ""."""
     try:
@@ -896,6 +931,8 @@ class Executor:
         #: a follower's watcher aborted its collectives; cleared when the group forms again
         self._interrupted = threading.Event()
         self._device_ready = False
+        #: HOST ONLY: the device Start began bringing up, awaited by its first use
+        self._starting: _DeviceStart | None = None
         #: HOST ONLY: process-lifetime execution stream, selected on every Runtime worker.
         #: Library workspaces/tensors may retain it until exit; do not destroy it at unload.
         self.execution_stream: Any = None
@@ -1044,15 +1081,29 @@ class Executor:
     # ------------------------------------------------------------- the group (cr-068)
 
     def _initialize_device(self, torch: Any) -> dict[str, Any] | None:
-        """Runtime's ONE explicit accelerator init boundary, idempotent per process.
+        """Runtime's ONE explicit accelerator init boundary, idempotent per process: the device
+        Start began (`_start_device`, begun here when it did not), awaited and current on this
+        thread. A refusal its thread met (`device_out_of_memory`, ...) comes back here."""
+        if self._device_ready:
+            return None
+        refused = self.host._start_device(torch) or self.host._await_device()
+        self._device_ready = refused is None
+        return refused
+
+    def _start_device(self, torch: Any) -> dict[str, Any] | None:
+        """HOST ONLY. Bring the device up on its own thread (`_bring_up`): its context, stream
+        and memory, then its libraries' first launches. What needs no device happens here first,
+        before any package code can touch one; the CPU work after it runs beside the thread.
 
         Under a group every rank pins its own card: rank r of a seal naming K entries is
         card r of that seal, made current before any allocation. A CUDA context that
         already exists when this runs is a refusal (`cuda_initialized_before_runtime`) -
         something else picked a device first.
         """
-        owner = self.host
-        if not owner._startup_reported:
+        if self._starting is not None:
+            return None
+        self.torch = self.torch or torch
+        if not self._startup_reported:
             # Observe before the explicit boundary on every rank, including a
             # previously adopted context. Stderr survives even a pre-reply crash.
             print(
@@ -1066,9 +1117,7 @@ class Executor:
                 file=sys.stderr,
                 flush=True,
             )
-            owner._startup_reported = True
-        if self._device_ready:
-            return None
+            self._startup_reported = True
         if accel.initialized(torch, self.device_kind):
             return {
                 "ok": False,
@@ -1080,38 +1129,137 @@ class Executor:
         contract.pin(torch)
         try:
             accel.bind_allocator(torch, self.device_kind)
+        except ResidencyError as exc:
+            return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
+        # Imported here: the device thread imports nothing a package import could be holding.
+        from cozy_runtime.internal import execution, loop  # noqa: F401
+        from cozy_runtime.internal.residency import Memory  # noqa: F401
+
+        starting = self._starting = _DeviceStart()
+        try:
+            if self.device_kind == "cuda":
+                starting.guard.enter_context(
+                    zygote.driverless(torch, len(_sealed_entries()), self._touched)
+                )
+            place(self._device())
+            starting.thread = threading.Thread(
+                target=self._bring_up, args=(torch, starting), name="device-start", daemon=True
+            )
+            starting.thread.start()
+        except BaseException as exc:
+            starting.raised = exc
+            starting.serve()
+            starting.warm.set()
+            raise
+        return None
+
+    def _touched(self) -> None:
+        """HOST ONLY. Any thread's device touch while the device starts (`zygote.driverless`):
+        it waits for the device thread, and fails when the device did not start."""
+        starting = self._starting
+        if starting is None or threading.current_thread() is starting.thread:
+            return
+        starting.ready.wait()
+        if starting.refused is not None or starting.raised is not None:
+            why = starting.refused["detail"] if starting.refused else repr(starting.raised)
+            raise RuntimeError(f"this GPU did not start: {why}"[:900])
+
+    def _bring_up(self, torch: Any, starting: _DeviceStart) -> None:
+        """The device thread: varena's context and ledger row, torch's CUDA, the execution
+        stream and the memory (`ready`), then the GPU libraries' first launches (`warm`)."""
+        mark = starting.began
+        try:
             if self.device_kind == "cuda":
                 # A rank takes its own GPU; a plan that constructs nothing holds them all here.
                 for index in [self.rank] if self.world > 1 else range(len(_sealed_entries()) or 1):
-                    varena.activate(index, shared=owner.shared)
+                    varena.activate(index, shared=self.shared)
+                mark = starting.leg("activate", mark)
             accel.initialize(torch, self.device_kind)
+            mark = starting.leg("torch", mark)
             if self.device_kind == "cuda":
                 index = self.rank if self.world > 1 else 0
                 torch.cuda.set_device(index)
-                owner.execution_stream = accel.owned_stream(torch, index)
-                # This first command entered before a stream existed. Select it now, before
-                # Memory, library warm-up or any package allocation/launch can run.
-                torch.cuda.set_stream(owner.execution_stream)
+                self.execution_stream = accel.owned_stream(torch, index)
+                # Before Memory, library warm-up or any launch on this thread; a thread that
+                # awaits the device selects it itself (`_await_device`).
+                torch.cuda.set_stream(self.execution_stream)
                 kernel_ready.EXECUTION[0] = functools.partial(
-                    torch.cuda.stream, owner.execution_stream
+                    torch.cuda.stream, self.execution_stream
                 )
                 _activity.WORKER_CONTEXT = lambda: torch.cuda.stream(torch.cuda.current_stream())
             self._open_memory(torch)
+            mark = starting.leg("memory", mark)
+            starting.serve()
+            accel.first_launches(torch, self.device_kind)
+            starting.leg("first_launches", mark)
         except ResidencyError as exc:
-            return {"ok": False, "code": "weight_residency_unavailable", "detail": str(exc)}
-        accel.first_launches(torch, self.device_kind)
+            starting.refused = {
+                "ok": False,
+                "code": "weight_residency_unavailable",
+                "detail": str(exc),
+            }
+        except RuntimeError as exc:
+            # No room for a context is the device's memory, not its absence: the worker
+            # starts again once a call beside it has given the room.
+            full = fault(exc) is Fault.OOM
+            next_step = "Its memory is full: end what holds it" if full else "Update its driver"
+            starting.refused = {
+                "ok": False,
+                "code": "device_out_of_memory" if full else "accelerator_unavailable",
+                "detail": f"GPU {_SEALED.get('CUDA_VISIBLE_DEVICES')} could not be "
+                f"started: {exc}. {next_step}, or run it --on new"[:900],
+            }
+        except BaseException as exc:
+            starting.raised = exc
+        finally:
+            starting.serve()
+            starting.legs["cuda_init"] = round((time.perf_counter() - starting.began) * 1000, 1)
+            starting.warm.set()
+
+    def _await_device(self, *, warm: bool = False) -> dict[str, Any] | None:
+        """HOST ONLY. The device Start began, once it serves (`warm`: with its libraries' first
+        launches made), current on this thread with the execution stream. Its refusal poisons
+        the process; what its thread raised raises here. The device thread never waits."""
+        starting = self._starting
+        if starting is None or threading.current_thread() is starting.thread:
+            return None
+        (starting.warm if warm else starting.ready).wait()
+        if starting.refused is not None:
+            self.poisoned = self.poisoned or f"start refused: {starting.refused['code']}"
+            return starting.refused
+        if starting.raised is not None:
+            self.poisoned = self.poisoned or "device start raised"
+            raise RuntimeError(f"the device start raised: {starting.raised!r}") from starting.raised
         self._device_ready = True
-        place(self._device())
+        legs = self.boot.setdefault("legs_ms", {})
+        if "cuda_init" not in legs:
+            legs.update(starting.legs)
+        if self.execution_stream is not None:
+            if self.world > 1:
+                self.torch.cuda.set_device(self.rank)
+            self.torch.cuda.set_stream(self.execution_stream)
         return None
 
-    def _execution_context(self) -> contextlib.AbstractContextManager[Any]:
-        """Enter the process's CUDA stream on a command, idle or readiness worker.
+    def _device_settled(self) -> bool:
+        """HOST ONLY. No device is starting: it started (warm) or none was asked for."""
+        starting = self._starting
+        return starting is None or (starting.warm.is_set() and starting.serving())
+
+    def _execution_context(self, *, settle: bool = True) -> contextlib.AbstractContextManager[Any]:
+        """Enter the process's CUDA stream on a command, idle or readiness worker; `settle`: once
+        the device Start began is up and warm (a load awaits it at its first device step). A
+        device that did not start has poisoned the process, which every command reads.
 
         Before device initialization this is cold, preserving Hello/Fork behavior. Torch's
         stream context selects the stream's device and restores the caller's actual stream.
         """
-        stream = self.host.execution_stream
-        return contextlib.nullcontext() if stream is None else self.torch.cuda.stream(stream)
+        host = self.host
+        if settle:
+            host._await_device(warm=True)
+        stream = host.execution_stream
+        if stream is None or (host._starting is not None and not host._starting.serving()):
+            return contextlib.nullcontext()
+        return self.torch.cuda.stream(stream)
 
     def _open_memory(self, torch: Any) -> None:
         """This executor's local residency and its pure-site execution helpers."""
@@ -1824,23 +1972,13 @@ class Executor:
                     stage("torch_import")
                 if not command.import_only:
                     self.torch = torch
-                    try:
-                        refused = self._initialize_device(torch)
-                    except RuntimeError as exc:
-                        # No room for a context is the device's memory, not its absence: the
-                        # worker starts again once a call beside it has given the room.
-                        full = fault(exc) is Fault.OOM
-                        next_step = "Its memory is full: end what holds it" if full else "Update its driver"
-                        refused = {
-                            "ok": False,
-                            "code": "device_out_of_memory" if full else "accelerator_unavailable",
-                            "detail": f"GPU {_SEALED.get('CUDA_VISIBLE_DEVICES')} could not be "
-                            f"started: {exc}. {next_step}, or run it --on new"[:900],
-                        }
+                    # The device comes up on its own thread: Start replies at once, and its first
+                    # use awaits it (`_initialize_device`), where a refusal comes back.
+                    refused = self._start_device(torch)
                     if refused is not None:
                         self.poisoned = f"start refused: {refused['code']}"
                         return self._close_after(refused)
-                    stage("cuda_init")
+                    stage("cuda_start")
                 if constructs and not imported:
                     for name in _CONSTRUCTION_MODULES:
                         importlib.import_module(name)
@@ -1878,6 +2016,11 @@ class Executor:
                             code="group_unformed",
                         )
                 if not command.import_only:
+                    # The group forms on the device: the first use of it here.
+                    refused = self._initialize_device(self.torch)
+                    if refused is not None:
+                        return self._close_after(refused)
+                    stage("cuda_init")
                     measured = links.measured(
                         links.directory(_SEALED),
                         _sealed_entries()[:degree],
@@ -2013,7 +2156,8 @@ class Executor:
         compiles: str = "",
     ) -> dict[str, Any]:
         total = free = -1
-        if self.torch is not None and accel.present(self.torch, self.device_kind):
+        # A device still starting is not read: the reply never waits for it.
+        if self._device_ready and accel.present(self.torch, self.device_kind):
             memory = accel.allocation(self.torch, self.device_kind, self.host.memory)
             total, free = memory["driver_total_bytes"], memory["driver_free_bytes"]
         return {
@@ -2467,30 +2611,16 @@ class Executor:
 
         self.torch = torch
         stage("torch_import")
-        # Kernel integration imports may query the CUDA device (for example,
-        # Diffusers importing TorchAO's optional Triton kernels). Runtime must
-        # establish the selected device before loading those modules.
-        refused = self._initialize_device(torch)
-        if refused is not None:
-            self.poisoned = f"prepare refused: {refused['code']}"
-            return refused
-        cuda_ms = (time.perf_counter() - started) * 1000
-        stage("cuda_init")
+        # The device Start began comes up on its own thread beside what needs none of it here:
+        # these imports, the package's and the headers. Its first use below awaits it. A kernel
+        # integration import that queries the device (Diffusers importing TorchAO's optional
+        # Triton kernels) waits for it (`zygote.driverless`).
         from cozy_runtime.internal.triton_kernels import load as load_kernels
         from cozy_runtime.internal.triton_kernels import ready as kernels_ready
         from cozy_runtime.internal.weights import Backend, Placement
 
         stage("runtime_imports")
         _restore_seal()
-        if self.device_kind == "cuda":
-            # Every encoded GEMM's kernels open from here, on threads of their own, before the
-            # first construction and beside its weight fill: one first asked mid-request served
-            # its whole stage on a fallback while it landed (Klein's on-demand upsampler; H3's
-            # nvfp4 layers through step 1 on an RTX 5090, cr-241; on two 5060 Tis, cr-261). Each
-            # first ask waits for it; a group's GPUs state theirs in their load's reply. So does
-            # counter noise's kernel, which a recorded step's draw needs before its capture.
-            leaves.prime(torch, torch.cuda.current_device())
-            philox.prime(torch.cuda.current_device())
         if self.world > 1 and self.rank == 0:
             # THE FOLLOWERS RESOLVE BESIDE RANK 0, not after it: the load goes to every rank
             # before this one reads a header, and the plans are compared at the residence
@@ -2546,6 +2676,53 @@ class Executor:
         # the executor's device; a repository lane is never a hardware claim. THE DEVICE IS
         # ORDINAL 0 BY CONSTRUCTION (cr-066): the worker sealed this process to exactly its
         # lane's devices, so there is nothing to select here and no index to carry.
+        host = self.host
+        # One checkpoint per header ref, through the public TensorFS API.
+        opened: dict[str, Checkpoint] = {}
+        for manifest in {per_component.get(name, binding.snapshot) for name in names}:
+            opened[manifest] = host._checkpoint(
+                manifest, _connection(command.tensorfs, command.actor, host.bearers), binding.views
+            )
+        checkpoints = {name: opened[per_component.get(name, binding.snapshot)] for name in names}
+        # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
+        # carries: a constructed component the checkpoint lacks is the fit's own
+        # `component_missing`, judged at construction with the §3 text, so the plan is
+        # resolved over the rows the header does supply and nothing here refuses first.
+        present = [name for name in names if checkpoints[name].has(name)]
+        rows = [r for name in present for r in checkpoints[name].rows(name)]
+        stage("checkpoint_headers")
+        model_cls = next(
+            cls for cls in self._model_classes() if cls.__name__ == binding.model_class
+        )
+        config_checkpoint = next(
+            (c for c in checkpoints.values() if c.id == binding.snapshot), None
+        ) or host._checkpoint(
+            binding.snapshot,
+            _connection(command.tensorfs, command.actor, host.bearers),
+            binding.views,
+        )
+        config_bytes = model_config.construction_config(config_checkpoint.configs())
+        config_document = canonical.parse_canonical(config_bytes)
+        if not isinstance(config_document, dict):
+            raise RuntimeError("the CozyTensors construction config is not an object")
+        stage("construction_config")
+        # THE DEVICE'S FIRST USE: what Start began, awaited (its wait is this leg).
+        waited = time.perf_counter()
+        refused = self._initialize_device(torch)
+        if refused is not None:
+            self.poisoned = f"prepare refused: {refused['code']}"
+            return refused
+        cuda_ms = (time.perf_counter() - waited) * 1000
+        stage("cuda_init")
+        if self.device_kind == "cuda":
+            # Every encoded GEMM's kernels open from here, on threads of their own, before the
+            # first construction and beside its weight fill: one first asked mid-request served
+            # its whole stage on a fallback while it landed (Klein's on-demand upsampler; H3's
+            # nvfp4 layers through step 1 on an RTX 5090, cr-241; on two 5060 Tis, cr-261). Each
+            # first ask waits for it; a group's GPUs state theirs in their load's reply. So does
+            # counter noise's kernel, which a recorded step's draw needs before its capture.
+            leaves.prime(torch, torch.cuda.current_device())
+            philox.prime(torch.cuda.current_device())
         device_index = self.rank if self.world > 1 else 0
         device_facts = measure_device(torch, device_index)
         # The request this executor loads for pins a kernel: its build is imported first.
@@ -2571,22 +2748,6 @@ class Executor:
             snapshot=binding.snapshot,
             snapshots=dict(per_component),
         )
-        vmap = reference.snapshot_map()
-        host = self.host
-        # One checkpoint per header ref, through the public TensorFS API.
-        opened: dict[str, Checkpoint] = {}
-        for manifest in {vmap.get(name, reference.snapshot) for name in names}:
-            opened[manifest] = host._checkpoint(
-                manifest, _connection(command.tensorfs, command.actor, host.bearers), binding.views
-            )
-        checkpoints = {name: opened[vmap.get(name, reference.snapshot)] for name in names}
-        # `names` is what the DERIVE constructed (model-code-fit D9), not what the header
-        # carries: a constructed component the checkpoint lacks is the fit's own
-        # `component_missing`, judged at construction with the §3 text, so the plan is
-        # resolved over the rows the header does supply and nothing here refuses first.
-        present = [name for name in names if checkpoints[name].has(name)]
-        rows = [r for name in present for r in checkpoints[name].rows(name)]
-        stage("checkpoint_headers")
         if self.device_kind == "mps":
             # One pool, every weight resident (cr-021): past the GPU's working set never fits.
             # A CPU's weights are host memory, which pages: it is never refused here.
@@ -2605,26 +2766,6 @@ class Executor:
         # tensor cores (`selection.admit`, xs-065): no suite runs and nothing is measured.
         stored = {row.encoded.scheme for row in rows}
         providers = {s: c for s, c in launch_providers().items() if s in stored}
-        model_cls = next(
-            cls for cls in self._model_classes() if cls.__name__ == binding.model_class
-        )
-        config_checkpoint = next(
-            (
-                checkpoint
-                for checkpoint in checkpoints.values()
-                if checkpoint.id == reference.snapshot
-            ),
-            None,
-        ) or host._checkpoint(
-            reference.snapshot,
-            _connection(command.tensorfs, command.actor, host.bearers),
-            binding.views,
-        )
-        config_bytes = model_config.construction_config(config_checkpoint.configs())
-        config_document = canonical.parse_canonical(config_bytes)
-        if not isinstance(config_document, dict):
-            raise RuntimeError("the CozyTensors construction config is not an object")
-        stage("construction_config")
         construction = ConstructionFacts(
             release=binding.release,
             model_class=f"{model_cls.__module__}:{model_cls.__qualname__}",
@@ -2919,6 +3060,11 @@ class Executor:
                 }
         self.attention_defaults = attention.snapshot(dict(backend.roots))
         group_facts = dict(self.facts)
+        # The GPU libraries' first launches ran beside this construction: its figures follow them.
+        refused = self.host._await_device(warm=True)
+        if refused is not None:
+            self.poisoned = f"prepare refused: {refused['code']}"
+            return refused
         memory = accel.allocation(torch, self.device_kind, self.host.memory)
         self.ready = True
         self.facts = {
@@ -5070,6 +5216,10 @@ def answer(executor: Executor, frame: Frame) -> Frame | None:
 #: The commands whose refusals carry the raising traceback to the worker.
 _TRACED_COMMANDS = frozenset({"start", "load", "join", "form"})
 
+#: The commands that do not wait for the device Start began: Start itself, and a load, which
+#: awaits it at its first device step (any other command enters once it is up and warm).
+_OWN_DEVICE_WAIT = frozenset({"start", "load"})
+
 #: A follower's refusal codes rank 0 relays as-is; any other refusal is the group not
 #: forming, named with the follower's own detail.
 _GROUP_CODES = frozenset({"gpu_divergence", "context_parallel_unavailable", "group_broken"})
@@ -5308,7 +5458,8 @@ def _idle(executor: Executor, order: _Order) -> None:
 
     def ready() -> bool:
         return (
-            (bool(graphs.IDLE.jobs) or pins())
+            executor.host._device_settled()
+            and (bool(graphs.IDLE.jobs) or pins())
             and not executor.awaiting_invoke()
             and executor.host._rank_request is None
         )
@@ -5381,8 +5532,10 @@ def serve(executor: Executor, channel: Channel) -> int:
 
 
 def _shut(executor: Executor, channel: Channel) -> int:
-    with executor._execution_context():
-        if executor.host.execution_stream is not None:
+    with contextlib.suppress(RuntimeError):  # a device that did not start has nothing to drain
+        executor.host._await_device(warm=True)
+    with executor._execution_context(settle=False):
+        if executor.host.execution_stream is not None and executor.host._device_settled():
             accel.drain(executor.torch, executor.device_kind)
         if executor.group is not None:
             executor.group.close()
@@ -5424,7 +5577,7 @@ def _reply(executor: Executor, frame: Frame) -> Frame | None:
         # command reads `poisoned_generation` and rebuilds the whole cgroup.
         executor.poisoned = f"group: {executor.group.broken}"[:200]
     try:
-        with executor._execution_context():
+        with executor._execution_context(settle=name not in _OWN_DEVICE_WAIT):
             reply = answer(executor, frame)
         if reply is None:
             return None
