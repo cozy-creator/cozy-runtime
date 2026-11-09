@@ -52,14 +52,16 @@ video VAE decoder are the users.
 
 A package declares its DiT's block stack once (`Stack`: the transformer class, the blocks' list,
 the block arguments a block's output carries) and installs it in its plan
-(`stepcache.install(plan, STACK, transformer)`). A `denoise_loop(..., cache=policy)` call then
+(`stepcache.install(plan, STACK, transformer)`). A loop under
+`with stepcache.running(policy, n, device) as run:`, calling `run.step(i)` as each step begins, then
 reuses the stack's cached residual on forwards that would change it little: `FirstBlockCache(t)`
 or `EasyCache(t, retain, cooldown, max_hits)`, NVIDIA sol-engine's formulas. It is approximate,
 so a package names a policy only for a preset that asks for it, never by default. Each verdict is
 computed on the device from fixed-order reductions (the same inputs and policy give the same bytes);
 a skipped forward runs no block after the first. The stack must run as one `for` over its list.
-A cached loop runs eagerly and is off across ranks; the loop's record carries `cache`, and each
-step's `plans` line ends `cache:compute` or `cache:skip`. MiniMax-H3's full model and Qwen-Image
+Model calls under `running` run eagerly (no CUDA graph) and the cache is off across ranks;
+`run.document()` counts its forwards, and each step's `plans` line ends `cache:compute` or
+`cache:skip`. MiniMax-H3's full model and Qwen-Image
 2.1 are the users.
 
 ## Attention producers — `AttentionProducer`, `register_attention`
@@ -72,7 +74,7 @@ base's kernel module, the request's `state()`, the Ulysses group and `exchange`,
 quantizer, `original` and `served`. `AttentionProducer.request_state()` reaches the same state
 from a package hook. A package name takes precedence over a Runtime one it repeats.
 `producer_sites(root)` lists the modules under a root a producer serves now (`ProducerSite`: module,
-component, path, producer): a `denoise_loop` step that carries a producer's per-site state declares it from them.
+component, path, producer): where a package finds a producer's per-site state.
 
 MiniMax-H3 (`minimax_h3/glue.py`, `minimax_h3/producer.py`) and Anima (`anima/optimization.py`)
 are the reference users.
