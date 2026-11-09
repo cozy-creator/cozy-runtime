@@ -1,19 +1,24 @@
-"""The package contract's seal (CONTRACT §9, ENFORCEMENT §2): what a package may not reach raises
-`ContractViolation` with the contract's API named. Applied once per executor before its package
-imports (a zygote's forks inherit it); nothing is checked per op.
+"""The package contract's seal (CONTRACT §9, ENFORCEMENT §2): what harms the process a package
+shares raises `ContractViolation` naming the rule and the harm. Applied once per executor before
+its package imports (a zygote's forks inherit it); nothing is checked per op. A package's own
+code shape is not judged: its loops, attention calls, host reads, threads and library decode pass.
 
 A call is the package's when the innermost frame that is not the standard library or a library
 (a distribution other than the package's) is package code; the Runtime's own frames, and anything
-under `owned()`, pass. So a library's call on the package's behalf is the package's, and a
-library's call under a Runtime frame is the Runtime's. Code the Runtime builds and loads on the
-package's behalf is the Runtime's by where it lives: a kernel tree in the kernel store
-(SageAttention, comfy-kitchen), and what it calls. The room readers raise for every caller:
-the Runtime reads varena (`vt.stats`, `vt.room`). An env write that leaves the variable as it
-is passes for every caller, since it changes nothing: torch's `cache_dir()` writes TensorD's own
-`TORCHINDUCTOR_CACHE_DIR` back at import.
+under `owned()`, pass. So a library's call on the package's behalf is the package's (the refusal
+names the library), and a library's call under a Runtime frame is the Runtime's. Never the
+package's:
+- what a library's module body does as it is imported (an env default, a helper it spawns);
+- a library reading a file of its own installed tree;
+- code the Runtime builds and loads, by where it lives: a kernel tree in the kernel store
+  (SageAttention, comfy-kitchen), and what it calls;
+- wrapping the stream that is already current (`torch.cuda.current_stream()`);
+- an env write that leaves the variable as it is, since it changes nothing: torch's
+  `cache_dir()` writes TensorD's own `TORCHINDUCTOR_CACHE_DIR` back at import.
+The room readers raise for every caller: the Runtime reads varena (`vt.stats`, `vt.room`).
 
-Behaviour found after the fact warns instead (a swallowed OOM, a package's thread), since its
-output is already made; the release gate fails on those warnings."""
+Behaviour found after the fact warns instead (a swallowed OOM, a package thread that ran a
+component), since its output is already made; the release gate fails on those warnings."""
 
 from __future__ import annotations
 
@@ -22,7 +27,9 @@ import functools
 import importlib.metadata
 import os
 import sys
+import sysconfig
 import threading
+import weakref
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -34,24 +41,21 @@ from cozy_runtime.author._errors import ContractViolation
 from cozy_runtime.author._model import WARNINGS, WarningRow
 from cozy_runtime.internal import kernel_cache, numerical_environment
 
-#: The API each rule's construct is replaced by (static_contract's refusals say the same).
-USE = {
-    "oom_catch": "author.split(fn, x, Cut(...)): varena picks a level that fits",
-    "room_query": "author.split or author.retained: a package never asks for room",
-    "allocator": "nothing: varena owns the allocator and reclaims",
-    "env_write": "Config or Settings: TensorD seals the environment",
-    "global_flag": "the Runtime's numerics policy, hold_dtype, "
-    "@uses_components(deterministic=True)",
-    "own_stream": "denoise_loop, uncaptured, graph_keys: the Runtime owns streams",
-    "compile": "accel.kernels.TritonKernels, prebuilt",
-    "weights_io": "loader.construct or loader.load, loader.assets.read or .open",
-    "own_decode": "lm.generate (allowed=lm.Constraint for a constrained decode)",
-    "global_rng": "rng.noise, rng.generator(seed), view.generator",
-    "process": "concurrently, spread or an invocable child call",
-    "thread": "author.ThreadPoolExecutor",
-    "internal_import": "the public names (CONTRACT.md); a package split is Final",
-    "attention": "cozy_runtime.attention.Attention(heads, head_dim, dtype, causal=) or a "
-    "Diffusers attention module",
+#: Each rule's harm, said in its refusal (static_contract's refusals say the same).
+WHY = {
+    "oom_catch": "memory is varena's, and a caught OOM hides its refusal while the call goes on",
+    "room_query": "memory is varena's, and room read from the driver counts other work's bytes",
+    "allocator": "the allocator is varena's, which reclaims on its own",
+    "env_write": "TensorD seals the process environment that every call here shares",
+    "global_flag": "the flag is process-wide and changes every other call's numerics",
+    "own_stream": "the Runtime orders all device work on its own streams, graphs and device",
+    "compile": "it spawns compiler processes and makes a first call take minutes; ship kernels "
+    "prebuilt",
+    "weights_io": "weights come only from the bound artifact through TensorFS, where their "
+    "memory is counted",
+    "global_rng": "the global RNG is process-wide; seed a generator of your own",
+    "process": "a child process is outside the sandbox and holds memory varena cannot see",
+    "internal_import": "Runtime internals bypass the contract and move without notice",
 }
 
 #: The Runtime's own work done through a library on its behalf (`lm.generate`'s Transformers
@@ -78,41 +82,50 @@ _LIBRARIES: list[frozenset[str] | None] = [None]
 
 
 def _site(frame: FrameType | None, *, through: bool = True) -> str | None:
-    """`file:line` of the package frame a call comes from, else None. `through`: past library
-    frames to the code that called the library; otherwise a library's own call is its own."""
+    """`file:line` of the package frame a call comes from (`, via <library>` when a library made
+    it for the package), else None. `through`: past library frames to the code that called the
+    library; otherwise a library's own call is its own. A library's module body is always its
+    own: the package asked only for the import."""
     libraries = _LIBRARIES[0]
     if libraries is None or OWNED.get():
         return None
+    via = ""
     while frame is not None:
         top = str(frame.f_globals.get("__name__") or "").partition(".")[0]
         if top in _RUNTIME or kernel_cache.holds(frame.f_code.co_filename):
             return None
         library = not top or top in libraries
         if not library and top not in _STDLIB:
-            return f"{frame.f_code.co_filename}:{frame.f_lineno}"
-        if library and not through:
-            return None
+            return f"{frame.f_code.co_filename}:{frame.f_lineno}{via}"
+        if library:
+            if not through or frame.f_code.co_name == "<module>":
+                return None
+            via = f", via {top}" if top else via
         frame = frame.f_back
     return None
 
 
 def _refuse(rule: str, what: str, site: str) -> NoReturn:
     raise ContractViolation(
-        f"{what} is not in the package contract ({rule}, {site}): use {USE[rule]}",
+        f"{what} is not allowed in a package ({rule}, {site}): {WHY[rule]}",
         code="contract_violation",
         fields=[rule],
     )
 
 
-def _guard(rule: str, what: str, original: Callable[..., Any], *, owned_only: bool = False) -> Any:
-    """`original`, refusing the package's calls; `owned_only`: every call outside `owned()`."""
+def _guard(
+    rule: str,
+    what: str,
+    original: Callable[..., Any],
+    *,
+    passes: Callable[[dict[str, Any]], bool] | None = None,
+) -> Any:
+    """`original`, refusing the package's calls; `passes(kwargs)`: a call that does no harm."""
 
     @functools.wraps(original)
     def guarded(*args: Any, **kwargs: Any) -> Any:
-        if owned_only:
-            if not OWNED.get() and _LIBRARIES[0] is not None:
-                _refuse(rule, what, "outside cozy_runtime.lm")
-        elif (site := _site(sys._getframe(1))) is not None:
+        harmless = passes is not None and passes(kwargs)
+        if not harmless and (site := _site(sys._getframe(1))) is not None:
             _refuse(rule, what, site)
         return original(*args, **kwargs)
 
@@ -161,7 +174,13 @@ def _replace(rule: str, owners: tuple[Any, ...], name: str, spelled: str) -> Non
             setattr(owner, name, _guard(rule, spelled, found))
 
 
-def _construction(rule: str, cls: Any, spelled: str, method: str = "__new__") -> None:
+def _construction(
+    rule: str,
+    cls: Any,
+    spelled: str,
+    method: str = "__new__",
+    passes: Callable[[dict[str, Any]], bool] | None = None,
+) -> None:
     """Guard building `cls` (or calling `method`) in place, so `isinstance` and subclasses
     keep their class."""
     if (
@@ -171,7 +190,7 @@ def _construction(rule: str, cls: Any, spelled: str, method: str = "__new__") ->
     ):
         return
     found = getattr(cls, method)
-    guarded = _guard(rule, spelled, found)
+    guarded = _guard(rule, spelled, found, passes=passes)
     setattr(cls, method, staticmethod(guarded) if method == "__new__" else guarded)
 
 
@@ -189,8 +208,11 @@ def seal(torch: Any, application: str = "") -> None:
     for name in ("synchronize", "set_device"):
         _replace("own_stream", (cuda,), name, f"torch.cuda.{name}")
     _replace("own_stream", (cuda, graphs), "make_graphed_callables", "make_graphed_callables")
+    # `current_stream()` and `default_stream()` wrap a stream that exists: they make none.
+    _construction(
+        "own_stream", getattr(cuda, "Stream", None), "torch.cuda.Stream", passes=_wraps_stream
+    )
     for cls, spelled in (
-        (getattr(cuda, "Stream", None), "torch.cuda.Stream"),
         (getattr(cuda, "ExternalStream", None), "torch.cuda.ExternalStream"),
         (getattr(cuda, "Event", None), "torch.cuda.Event"),
         (getattr(cuda, "CUDAGraph", None), "torch.cuda.CUDAGraph"),
@@ -210,7 +232,6 @@ def seal(torch: Any, application: str = "") -> None:
         _replace("global_rng", (cuda, random), name, f"torch.cuda.{name}")
     for name in ("set_float32_matmul_precision", "use_deterministic_algorithms"):
         _replace("global_flag", (torch,), name, f"torch.{name}")
-    seal_libraries()
     if _EXPECTED[0] is None:
         pin(torch)
     if application and _LIBRARIES[0] is None:
@@ -218,20 +239,8 @@ def seal(torch: Any, application: str = "") -> None:
         _model.CONTRACT[0] = _Scopes(torch)
 
 
-def seal_libraries() -> None:
-    """Transformers' own decode (`GenerationMixin.generate`, a `DynamicCache`) passes only under
-    `owned()` (`lm.generate`'s). Sealed once Transformers is imported; nothing is imported here."""
-    utils = sys.modules.get("transformers.generation.utils")
-    caches = sys.modules.get("transformers.cache_utils")
-    if utils is not None:
-        mixin = getattr(utils, "GenerationMixin", None)
-        if mixin is not None and not hasattr(mixin.generate, "__contract_original__"):
-            mixin.generate = _guard(
-                "own_decode", "GenerationMixin.generate", mixin.generate, owned_only=True
-            )
-    cache = getattr(caches, "DynamicCache", None) if caches is not None else None
-    if cache is not None and not hasattr(cache.__init__, "__contract_original__"):
-        cache.__init__ = _guard("own_decode", "DynamicCache", cache.__init__, owned_only=True)
+def _wraps_stream(kwargs: dict[str, Any]) -> bool:
+    return "stream_id" in kwargs and "stream_ptr" not in kwargs
 
 
 def _libraries(application: str) -> frozenset[str]:
@@ -347,13 +356,6 @@ def restore_flags(torch: Any) -> list[str]:
     return moved
 
 
-def check_flags(torch: Any, during: str) -> None:
-    """Refuse a package that moved a process-wide flag `during` an import or a scope, once the
-    flag is put back."""
-    if moved := restore_flags(torch):
-        _refuse("global_flag", ", ".join(moved), f"changed during {during}")
-
-
 # ------------------------------------------------------------------------------- the scopes
 
 
@@ -367,7 +369,8 @@ class _Scopes:
     checked, and a refusal varena counted while it ran (`vt.ooms`) that the scope returned past,
     and that no Runtime Retry answered (`finer_splits`), is a swallowed OOM: a run warning
     (`oom_swallowed`) and the request's `swallowed_ooms`. Scopes overlapping on two threads are
-    not judged for it: varena's count is the device's."""
+    not judged for it: varena's count is the device's. A scope that ran on a thread the package
+    started is a run warning (`contract_thread`): a package's thread launches no device work."""
 
     def __init__(self, torch: Any) -> None:
         self.torch = torch
@@ -400,6 +403,14 @@ class _Scopes:
                 and not self._open.keys() - {thread}
             )
         moved = restore_flags(self.torch)
+        if (started := _THREADS.get(threading.current_thread())) is not None:
+            row: WarningRow = (
+                f"{method} ran on a thread the package started at {started}: a package thread "
+                "launches no device work, which the Runtime orders per call",
+                {"code": "contract_thread", "site": started, "method": method},
+            )
+            if row not in WARNINGS:
+                WARNINGS.append(row)
         if ok and alone and REFUSALS[0] is not None and (read := REFUSALS[0]()) is not None:
             assert entered is not None
             ooms, request = read
@@ -412,7 +423,7 @@ class _Scopes:
                 WARNINGS.append(
                     (
                         f"{method} returned past {swallowed} refused allocation(s) (an OOM it "
-                        f"swallowed): use {USE['oom_catch']}",
+                        f"swallowed): {WHY['oom_catch']}",
                         {"code": "oom_swallowed", "method": method, "refused": swallowed},
                     )
                 )
@@ -435,8 +446,11 @@ _SPAWNS = frozenset(
     }
 )
 _ENV_WRITES = frozenset({"os.putenv", "os.unsetenv"})
+_THREAD_STARTS = frozenset({"_thread.start_new_thread", "_thread.start_joinable_thread"})
 #: The events `audit` judges, folded into the executor's one audit hook (`sandbox.refuse_network`).
-AUDITED = _SPAWNS | _ENV_WRITES | {"open", "_thread.start_new_thread"}
+AUDITED = _SPAWNS | _ENV_WRITES | _THREAD_STARTS | {"open"}
+#: Each live thread the package's own code started, with where.
+_THREADS: weakref.WeakKeyDictionary[threading.Thread, str] = weakref.WeakKeyDictionary()
 _WEIGHT_FILES = (".safetensors", ".bin", ".pt", ".pth", ".ckpt", ".gguf")
 _READ_ONLY = ("r", "rb", "rt", "br", "tr")
 
@@ -474,10 +488,25 @@ def _unchanged(event: str, args: tuple[Any, ...]) -> bool:
     return _COPY.get(key) == value and _held(key) == value
 
 
+def _library_file(path: str) -> bool:
+    """`path` is inside an installed library's own tree: its data, never a model's weights."""
+    libraries = _LIBRARIES[0] or frozenset()
+    return any(
+        path.startswith(root) and path[len(root) :].partition(os.sep)[0] in libraries
+        for root in _installed()
+    )
+
+
+@functools.cache
+def _installed() -> tuple[str, ...]:
+    paths = sysconfig.get_paths()
+    return tuple({os.path.join(paths[name], "") for name in ("purelib", "platlib")})
+
+
 def audit(event: str, args: tuple[Any, ...]) -> None:
     """One of `AUDITED`, called by the audit hook itself (its frame and the hook's are skipped):
-    refuse the package's env change, spawn or weight read; warn on its thread. The Runtime's own
-    (zygote forks, compile children, media encodes) pass."""
+    refuse the package's env change, spawn or weight read; remember its thread (`_Scopes`). The
+    Runtime's own (zygote forks, compile children, media encodes) pass."""
     if _LIBRARIES[0] is None or OWNED.get():
         return
     if event == "open":
@@ -490,16 +519,15 @@ def audit(event: str, args: tuple[Any, ...]) -> None:
             return
         if mode is None and len(args) > 2 and isinstance(args[2], int) and args[2] & 3:
             return  # os.open for writing
+        if _library_file(path):
+            return
         if (site := _site(sys._getframe(2))) is not None:
             _refuse("weights_io", f"reading {path}", site)
-    elif event == "_thread.start_new_thread":
-        if (site := _site(sys._getframe(2), through=False)) is not None:
-            row: WarningRow = (
-                f"a package thread started at {site}: use {USE['thread']}",
-                {"code": "contract_thread", "site": site},
-            )
-            if row not in WARNINGS:
-                WARNINGS.append(row)
+    elif event in _THREAD_STARTS:
+        thread = getattr(args[0], "__self__", None) if args else None
+        site = _site(sys._getframe(2), through=False)
+        if site is not None and isinstance(thread, threading.Thread):
+            _THREADS[thread] = site
     elif (site := _site(sys._getframe(2))) is not None:
         if event not in _ENV_WRITES:
             _refuse("process", f"{event}({str(args[:1])[1:-2][:80]})", site)

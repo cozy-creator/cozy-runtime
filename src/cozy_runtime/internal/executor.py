@@ -3198,9 +3198,14 @@ class Executor:
         path = release.package_interface
         recipes = package_interface.parse(Path(path).read_bytes(), path).recipes
         discovered = discover_installed(release.application, seconds=None, recipes=recipes)
-        if torch is not None:
-            contract.seal_libraries()
-            contract.check_flags(torch, f"the import of {release.application}")
+        if torch is not None and (moved := contract.restore_flags(torch)):
+            # A library's import moved them (a package's own write is refused at describe).
+            print(
+                f"[executor] put back numerics flags moved while importing "
+                f"{release.application}: {', '.join(moved)}",
+                file=sys.stderr,
+                flush=True,
+            )
         self.discovered = discovered
         self.surface_names = {surface.name: surface for surface in discovered.surfaces}
 
