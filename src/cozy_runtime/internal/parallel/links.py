@@ -107,6 +107,15 @@ class Links:
         processes formed over it, else only over NVLink, with host memory between the rest."""
         return {"NCCL_P2P_LEVEL": "SYS" if self.peer_route else "NVL"}
 
+    @property
+    def exchanges(self) -> tuple[str, ...]:
+        """The exchanges a group times against NCCL as it forms (`copy_engine.calibrate`): the
+        copy engines over peer memory where every pair reaches the other's, and through pinned
+        host memory where a pair is not direct, which NCCL crosses with SM kernels reading and
+        writing host memory over PCIe."""
+        peer = ("copy-engine",) if self.copy_engines else ()
+        return (*peer, *(() if self.all_direct else ("host-staged",)))
+
     def why(self, number: Mapping[int, int] | None = None) -> str:
         """Why the group takes its route; GPUs by `number` (position -> nvidia-smi number)."""
         if self.reason:
